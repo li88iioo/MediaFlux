@@ -224,7 +224,7 @@ def test_schema_errors_obey_existing_tool_budget(mode, store):
         assert not executed
         assert events[-1].type.name == 'TURN_FAILED'
         assert events[-1].payload['code'] == 'invalid_arguments'
-        assert not wire.requests[-1].get('tools')
+        assert wire.requests[-1].get('tools')
         failures = [event.payload for event in events if event.type.name == 'TOOL_FAILED']
         assert [(event['call_id'], event['code']) for event in failures] == [
             ('call-0', 'invalid_arguments'), ('call-1', 'invalid_arguments'),

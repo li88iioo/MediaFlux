@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from app import database
+from app import database, sdk
 from app.discovery.cache import DiscoveryCache
 from app.discovery.calendar.http import CalendarHttp
 from app.discovery.calendar.metadata import CalendarMetadata
@@ -104,7 +104,13 @@ class FreeCalendarIntegrationTests(_BaseClientTests):
         data = response.json()
         self.assertEqual(self.unexpected, [])
         self.assertEqual(len(self.calls), 9)  # 腾讯动漫7 POST、爱奇艺/优酷动漫各1 GET；禁止TV请求。
-        self.assertEqual([source["status"] for source in data["sources"]], ["partial"] * 3)
+        self.assertEqual([source["status"] for source in data["sources"]], ["ok", "partial", "partial"])
+        tencent = data["sources"][0]
+        self.assertEqual((tencent["ignored"], len(tencent["covered_dates"])), (0, 7))
+        self.assertIn("官方追漫周历", tencent["message"])
+        self.assertIn("不代表全站片库", tencent["message"])
+        with patch("app.discovery.calendar.service.get_calendar_service", return_value=self.service):
+            self.assertEqual(sdk.media.calendar()["sources"], data["sources"])
         self.assertEqual(len(data["days"]), 7)
         self.assertTrue(all(day["items"] for day in data["days"]))
         self.assertEqual(data["items_count"], self.expected_programmes)
@@ -175,7 +181,7 @@ class FreeCalendarIntegrationTests(_BaseClientTests):
         self.tick += 7200
         data = self.client.post("/api/discovery/calendar/refresh", headers=headers).json()
         self.assertEqual(data["items_count"], original["items_count"])
-        self.assertEqual([source["status"] for source in data["sources"]], ["partial", "partial", "stale"])
+        self.assertEqual([source["status"] for source in data["sources"]], ["ok", "partial", "stale"])
         self.assertTrue(all(card["stale"] for day in data["days"] for card in day["items"] if card["source"] == "youku"))
         calls = len(self.calls)
         self.client.post("/api/discovery/calendar/refresh", headers=headers)

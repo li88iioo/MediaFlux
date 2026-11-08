@@ -14,7 +14,7 @@ from cryptography.fernet import InvalidToken
 from app.agent.errors import _ReadPermitRejected
 from app.agent.feature_gate import RuntimeFence, require_runtime_fence
 
-from .batch_progress import observe_batch
+from .batch_progress import observe_batch, restored_effect_tool
 from .completion_receipts import EFFECT_PENDING, _completion_cipher, _late_receipt
 from .conversation_codec import conversation_payload, json_text
 from .conversation_state import commit_conversation
@@ -31,6 +31,62 @@ CLAIM_SECONDS = 30
 ACTIVE_SECONDS = 60
 SCAN_LIMIT = 16
 ACTIVE = {"pending", "claimed", "running"}
+
+# 同一对象用于前台、READ等待与effect续行；usage另行报告，不参与退款。
+BUDGET_COUNTERS = ("model", "tool", "token")
+
+
+def active_remaining(budget, now):
+    since = budget.get("active_since")
+    spent = budget.get("active_spent", 0) + (max(0, now - since) if since is not None else 0)
+    limit = budget.get("active_limit")
+    return None if limit is None else max(0, limit - spent)
+
+
+def reserve_budget_values(budget, value, now):
+    """先扣后请求，不退款；旧有限上限只能收紧，缺失历史成本不补造。"""
+    updated = dict(budget)
+    for kind in (*BUDGET_COUNTERS, "active"):
+        key = kind + "_limit"
+        limits = [v for v in (updated.get(key), value.get(key)) if v is not None]
+        updated[key] = min(limits) if limits else None
+    # 新预算保留前台max_tool_calls的业务调用口径；旧签名记录不追溯减去发现次数。
+    if "discovery_spent" in updated:
+        updated["discovery_spent"] += value.get("discovery_spent", 0)
+    for kind in BUDGET_COUNTERS:
+        key, limit = kind + "_spent", updated[kind + "_limit"]
+        amount = value.get(key, 0)
+        if type(amount) is not int or amount < 0:
+            raise ValueError("invalid budget debit")
+        spent = updated.get(key, 0) + amount
+        counted = spent - (updated.get("discovery_spent", 0) if kind == "tool" else 0)
+        if amount and limit is not None and counted > limit:
+            raise ValueError(kind + "_budget_exceeded")
+        updated[key] = spent
+    since = updated.get("active_since")
+    updated["active_spent"] = updated.get("active_spent", 0) + value.get("active_spent", 0) + (max(0, now - since) if since is not None else 0)
+    updated["active_since"] = None if value.get("stop") else now
+    if not value.get("stop") and active_remaining(updated, now) == 0:
+        raise ValueError("active_time_budget_exceeded")
+    budget.update(updated)
+
+
+def exhausted(budget, now):
+    return active_remaining(budget, now) == 0 or any(
+        budget.get(kind + "_limit") is not None and budget.get(kind + "_spent", 0)
+        - (budget.get("discovery_spent", 0) if kind == "tool" else 0) >= budget[kind + "_limit"]
+        for kind in BUDGET_COUNTERS)
+
+
+def record_budget(state, record):
+    # 已有task的effect引用原预算，不能复制出可分别消费的两份余额。
+    task_id = record.get("budget_task_id")
+    if task_id:
+        source = state.metadata.get("read_wait") or {}
+        if source.get("task_id") != task_id:
+            raise ValueError("task budget no longer available")
+        return source["budget"]
+    return record["budget"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +239,7 @@ def apply_actions(state, lease, updates, now, conn=None):
             require_runtime_fence(conn, update.binding.fence)
         if operation == "finish":
             record = continuation_record(state, lease.continuation_id, lease.continuation_kind)
+            reserve_budget_values(record_budget(state, record), {"stop": True}, now)
             record.update(state="terminal", terminal_reason=value["reason"])
             if lease.continuation_kind == "effect":
                 row = state.metadata["effect_waits"][record["wait_id"]]
@@ -214,9 +271,7 @@ def apply_actions(state, lease, updates, now, conn=None):
                 "v": 1, "task_id": task["task_id"], "expected_task": identity(task),
                 "state": "idle", "terminal_reason": "", "wait_id": "",
                 "owner": state.owner, "session_id": state.session_id,
-                "budget": {"model_limit": value["model_limit"], "tool_limit": value["tool_limit"],
-                           "model_spent": value["model_spent"], "tool_spent": value["tool_spent"],
-                           "wait_segments": 0, "wait_seconds_spent": 0},
+                "budget": deepcopy(value["budget"]),
             }
             continue
         if not record or not task or record["task_id"] != task["task_id"]:
@@ -225,13 +280,7 @@ def apply_actions(state, lease, updates, now, conn=None):
         if operation == "reserve":
             if value.get("task_id") and value["task_id"] != task["task_id"]:
                 raise ValueError("selected task budget changed")
-            budget["model_limit"] = min(budget["model_limit"], value["model_limit"])
-            budget["tool_limit"] = min(budget["tool_limit"], value["tool_limit"])
-            for counter, limit in (("model_spent", "model_limit"), ("tool_spent", "tool_limit")):
-                amount = value.get(counter, 0)
-                if type(amount) is not int or amount < 0 or budget[counter] + amount > budget[limit]:
-                    raise ValueError("cumulative task budget exhausted")
-                budget[counter] += amount
+            reserve_budget_values(budget, value, now)
             if lease.continuation_id:
                 record["state"] = "running"
                 record["last_checked_at"] = now
@@ -244,8 +293,7 @@ def apply_actions(state, lease, updates, now, conn=None):
             if ((type(due) is not float and type(due) is not int) or not math.isfinite(due) or due < now
                     or state.pending_effect_plan_id or task["status"] in {"complete", "cancelled"}
                     or budget["wait_segments"] >= MAX_WAIT_SEGMENTS
-                    or budget["model_spent"] >= budget["model_limit"]
-                    or budget["tool_spent"] >= budget["tool_limit"]
+                    or exhausted(budget, now)
                     or due - now + budget["wait_seconds_spent"] > MAX_WAIT_SECONDS):
                 raise ValueError("read wait budget or eligibility rejected")
             if record["state"] in ACTIVE and not lease.continuation_id:
@@ -267,6 +315,7 @@ def apply_actions(state, lease, updates, now, conn=None):
                           last_checked_at=now, claim_id=lease.continuation_claim_id, claim_until=0,
                           resume_turn_id=lease.turn_id if lease.continuation_id else "",
                           expected_task=identity(task))
+            reserve_budget_values(budget, {"stop": True}, now)
             budget["wait_segments"] += 1
         else:
             raise ValueError("invalid read wait operation")
@@ -350,15 +399,20 @@ def effect_origin(state, context, plan):
             or (context.channel == "telegram" and not context.delivery_route)
             or goal.get("role") != "user" or not str(goal.get("content") or "").strip()):
         return None
+    frozen = plan.metadata.get("continuation_budget") or {}
+    budget = policy.get("budget") or frozen.get("budget") or {
+        "model_limit": policy["model_limit"], "tool_limit": policy["tool_limit"],
+        "model_spent": 0, "tool_spent": 0, "wait_segments": 0, "wait_seconds_spent": 0}
     return {"goal": deepcopy(goal), "arguments": dict(plan.arguments),
+            "budget": deepcopy(budget), "budget_task_id": frozen.get("task_id", policy.get("budget_task_id", "")),
             **({"reobservation_source": deepcopy(plan.metadata["reobservation_source"])}
                if plan.metadata.get("reobservation_source") is not None else {}),
             "owner": state.owner, "session_id": state.session_id,
             "source_request_id": context.lease.request_id, "source_turn_id": context.lease.turn_id,
             "origin_generation": context.lease.generation, "expected_task": identity(state.metadata.get("task")),
             "admission_fence": asdict(binding.fence), "effective_digest": binding.effective_digest,
-            "model_policy": policy["model_policy"], "model_limit": policy["model_limit"],
-            "tool_limit": policy["tool_limit"], "channel": context.channel,
+            "model_policy": policy["model_policy"], "model_limit": budget["model_limit"],
+            "tool_limit": budget["tool_limit"], "channel": context.channel,
             "delivery_route": dict(context.delivery_route)}
 
 
@@ -370,10 +424,13 @@ def register_effect(row, scope, now):
         "owner", "session_id", "source_request_id", "source_turn_id", "origin_generation",
         "expected_task", "admission_fence", "effective_digest", "model_policy", "channel")}
     row["continuation"].update(kind="effect", wait_id=scope.plan_id, state="waiting", terminal_reason="",
+        budget_task_id=origin.get("budget_task_id"),
         due_at=now, expires_at=row["expires_at"], last_checked_at=now,
         publication_generation=scope.lease.generation, claim_id="", claim_until=0, resume_turn_id="",
-        budget={"model_limit": origin["model_limit"], "tool_limit": origin["tool_limit"],
-                "model_spent": 0, "tool_spent": 0, "wait_segments": 0, "wait_seconds_spent": 0})
+        **({} if origin.get("budget_task_id") else {
+            "budget": deepcopy(origin.get("budget") or {
+                "model_limit": origin["model_limit"], "tool_limit": origin["tool_limit"],
+                "model_spent": 0, "tool_spent": 0, "wait_segments": 0, "wait_seconds_spent": 0})}))
 
 
 def release_effect(row, now):
@@ -410,7 +467,7 @@ def effect_payload(state, record):
         raise ValueError("effect continuation scope mismatch")
     if any(record.get(key) != origin.get(key) for key in (
             "owner", "session_id", "source_request_id", "source_turn_id", "origin_generation",
-            "expected_task", "admission_fence", "effective_digest", "model_policy", "channel")):
+            "expected_task", "admission_fence", "effective_digest", "model_policy", "channel", "budget_task_id")):
         raise ValueError("effect continuation origin changed")
     return {"seed": seed, "origin": origin, "result": deepcopy(row["final_result"])}
 
@@ -466,6 +523,7 @@ def claim_effect(state, candidate, now, binding, conn=None):
         return None
     try:
         payload = effect_payload(state, record)
+        record_budget(state, record)
         # Confirmation has its own request ID within the same user generation.
         # Only a newer publication supersedes the frozen tail authorization.
         if payload["origin"].get("batch_plan") and state.generation != record["publication_generation"]:
@@ -489,14 +547,9 @@ def claim_effect(state, candidate, now, binding, conn=None):
 
 def apply_effect_action(state, lease, update, now):
     record = continuation_record(state, lease.continuation_id, lease.continuation_kind)
-    value, budget = update.value, record["budget"]
+    value, budget = update.value, record_budget(state, record)
     if value["operation"] == "reserve":
-        for counter, limit in (("model_spent", "model_limit"), ("tool_spent", "tool_limit")):
-            budget[limit] = min(budget[limit], value[limit])
-            amount = value.get(counter, 0)
-            if type(amount) is not int or amount < 0 or budget[counter] + amount > budget[limit]:
-                raise ValueError("cumulative effect continuation budget exhausted")
-            budget[counter] += amount
+        reserve_budget_values(budget, value, now)
         record.update(state="running", last_checked_at=now, claim_until=now + EFFECT_ACTIVE_SECONDS + CLAIM_SECONDS)
     elif value["operation"] == "park":
         permit = value["permit"]
@@ -505,11 +558,12 @@ def apply_effect_action(state, lease, update, now):
         due = permit.rate_limit["retry_at_epoch"]
         if ((type(due) is not float and type(due) is not int) or not math.isfinite(due) or not now <= due < record["expires_at"]
                 or state.pending_effect_plan_id or budget["wait_segments"] >= MAX_WAIT_SEGMENTS
-                or budget["model_spent"] >= budget["model_limit"] or budget["tool_spent"] >= budget["tool_limit"]
+                or exhausted(budget, now)
                 or budget["wait_seconds_spent"] + due - now > MAX_WAIT_SECONDS):
             raise ValueError("effect continuation wait budget exhausted")
         # Only an acquire refusal is resumable; no started external call is retried here.
         anchor = anchor_for(state, value["call_id"], permit.tool_name)
+        reserve_budget_values(budget, {"stop": True}, now)
         budget["wait_segments"] += 1
         budget["wait_seconds_spent"] += due - now
         record.update(state="pending", anchor=anchor, due_at=due, claim_until=0, last_checked_at=now)
@@ -522,10 +576,15 @@ async def adopt_foreground(store, lease, plan_id):
     def adopt(state):
         row = (state.metadata.get("effect_waits") or {}).get(plan_id) or {}
         record = row.get("continuation") or {}
-        if not record or record.get("state") not in {"pending", "waiting"} or not isinstance(row.get("final_result"), dict):
+        if not record or record.get("state") not in {"pending", "waiting"}:
             return None
         if state.generation != lease.generation or state.metadata.get("confirmed_publication") != {
                 "generation": lease.generation, "turn_id": lease.turn_id, "plan_id": plan_id}:
+            return None
+        # 前台写入和回执已收束；后台等待不算活跃执行。task预算由同一turn的reserve收尾。
+        if not record.get("budget_task_id"):
+            reserve_budget_values(record["budget"], {"stop": True}, store._clock())
+        if not isinstance(row.get("final_result"), dict):
             return None
         effect_payload(state, record)
         record.update(state="claimed", claim_id=secrets.token_urlsafe(18), claim_until=store._clock() + EFFECT_ACTIVE_SECONDS + CLAIM_SECONDS,
@@ -536,13 +595,13 @@ async def adopt_foreground(store, lease, plan_id):
 
 
 def confirmed_result(catalog, state, record):
-    from .effects import EffectPlan
+    from .tool_calls import EffectPlan
     from .projection import ToolOutcome
     payload = effect_payload(state, record)
     seed, origin, result = payload["seed"], payload["origin"], payload["result"]
-    tool = catalog.get(seed["tool"]).for_arguments(origin["arguments"])
+    tool = restored_effect_tool(catalog, seed["tool"], origin["arguments"])
     batch = origin.get("batch_plan") or {}
-    if batch and (tool.name != "agent.batch" or batch["effect"] != tool.effect.value):
+    if batch and (tool.name not in {"session.batch", "agent.batch"} or batch["effect"] != tool.effect.value):
         raise ValueError("frozen batch risk changed")
     plan = EffectPlan(seed["plan_id"], state.owner, state.session_id, origin["origin_generation"],
                       tool.name, tool.effect, origin["arguments"], batch.get("snapshot", ""), {}, 0,

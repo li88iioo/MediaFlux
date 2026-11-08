@@ -13,9 +13,9 @@ from unittest.mock import Mock, patch
 
 import app.modules.directory_scrape as directory_scrape_module
 import app.modules.local_media_service as local_media_module
-from app.agent.domains.guangya.organize_actions import _run_guangya_organize_once
-from app.agent.domains.guangya.schedule_actions import get_guangya_connection_status
-from app.agent.domains.resources.indexer_actions import download_target_readiness
+from app.modules.organize_service import run as run_organize
+from app.modules.guangya_account import connection_status
+from app.indexers.downloads import download_target_readiness
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.clients.qbittorrent import QBittorrentClient
 from app.clients.tmdb import TMDBClient
@@ -758,16 +758,16 @@ class ClientResourceLifecycleTests(unittest.TestCase):
     def test_agent_readiness_checks_close_short_lived_guangya_clients(self) -> None:
         status_client = Mock(logged_in=False)
         with patch(
-            "app.agent.domains.guangya.schedule_actions.GuangYaClient",
+            "app.modules.guangya_account.GuangYaClient",
             return_value=status_client,
         ):
-            result = get_guangya_connection_status({})
-        self.assertEqual(result.status, "not_configured")
+            result = connection_status()
+        self.assertEqual(result["status"], "not_configured")
         status_client.close.assert_called_once_with()
 
         indexer_client = Mock(logged_in=True)
         with patch(
-            "app.agent.domains.resources.indexer_actions.GuangYaClient",
+            "app.indexers.downloads.GuangYaClient",
             return_value=indexer_client,
         ):
             self.assertEqual(download_target_readiness("guangya"), {"guangya": True})
@@ -792,26 +792,22 @@ class ClientResourceLifecycleTests(unittest.TestCase):
         rejected_manager = Mock()
         rejected_manager.start.return_value = {"ok": False, "error": "busy"}
         with patch(
-            "app.agent.domains.guangya.organize_actions.get_organize_manager",
+            "app.modules.organize_service.get_organize_manager",
             return_value=rejected_manager,
-        ):
-            result = _run_guangya_organize_once(
-                sources, rules, "", rejected_client,
-            )
-        self.assertFalse(result.ok)
+        ), patch("app.modules.organize_service.configured_inputs", return_value=(sources, rules, "")), patch("app.modules.organize_service.GuangYaClient", return_value=rejected_client):
+            result = run_organize()
+        self.assertFalse(result["ok"])
         rejected_client.close.assert_called_once_with()
 
         accepted_client = Mock(logged_in=True, credential_generation=4)
         accepted_manager = Mock()
         accepted_manager.start.return_value = {"ok": True, "task_id": "task", "run_id": 1}
         with patch(
-            "app.agent.domains.guangya.organize_actions.get_organize_manager",
+            "app.modules.organize_service.get_organize_manager",
             return_value=accepted_manager,
-        ):
-            result = _run_guangya_organize_once(
-                sources, rules, "", accepted_client,
-            )
-        self.assertTrue(result.ok)
+        ), patch("app.modules.organize_service.configured_inputs", return_value=(sources, rules, "")), patch("app.modules.organize_service.GuangYaClient", return_value=accepted_client):
+            result = run_organize()
+        self.assertTrue(result["ok"])
         accepted_client.close.assert_not_called()
         accepted_manager.start.assert_called_once_with(
             sources,

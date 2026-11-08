@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import services
-from app.agent.domains.library import batch_presence as actions
+from app.sdk import library
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.repositories import media_refresh_queue as queue
 from tests.support import isolated_test_database
@@ -64,7 +64,7 @@ class MediaBatchProjectionAuditTests(unittest.TestCase):
                 ("jellyfin", "Jellyfin", "https://jf.invalid", second),
             ],
         ):
-            result = actions.batch_library_presence({"items": self.identities})
+            result = library.presence(self.identities)
         for client in (first, second):
             self.assertEqual(client.closed, 1)
             self.assertEqual([call[0] for call in client.calls], ["movie", "tv"])
@@ -74,38 +74,38 @@ class MediaBatchProjectionAuditTests(unittest.TestCase):
                     for call in client.calls
                 )
             )
-        self.assertEqual(result.data["total"], 50)
+        self.assertEqual(result["data"]["total"], 50)
         self.assertEqual(
-            [item["tmdb_id"] for item in result.data["items"]],
+            [item["tmdb_id"] for item in result["data"]["items"]],
             [str(i) for i in range(1, 51)],
         )
-        self.assertNotIn("https://", str(result.data))
+        self.assertNotIn("https://", str(result["data"]))
         return result
 
     def test_truncated_source_cannot_turn_unseen_tv_into_missing(self):
         result = self.inspect(
             InventoryClient(mapped="movie"), InventoryClient(truncated=True)
         )
-        self.assertEqual(result.status, "partial")
+        self.assertEqual(result["status"], "partial")
         self.assertEqual(
-            result.data["counts"],
+            result["data"]["counts"],
             {"present": 25, "possible": 0, "missing": 0, "indeterminate": 25},
         )
 
     def test_missing_requires_both_complete_sources_and_keeps_input_order(self):
         result = self.inspect(InventoryClient(), InventoryClient())
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.data["counts"]["missing"], 50)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["counts"]["missing"], 50)
 
     def test_failed_source_does_not_hide_other_servers_exact_hits(self):
         result = self.inspect(
             InventoryClient(mapped="movie", fail_tv=True), InventoryClient(mapped="all")
         )
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.data["counts"]["present"], 50)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["counts"]["present"], 50)
         self.assertEqual(
-            [source["status"] for source in result.data["sources"]],
-            ["unavailable", "ready"],
+            [source["status"] for source in result["data"]["sources"]],
+            ["partial", "ready"],
         )
 
     def test_ambiguous_binding_keeps_retryable_path_and_never_refreshes_global_library(

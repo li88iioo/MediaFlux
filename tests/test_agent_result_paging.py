@@ -12,7 +12,9 @@ from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffec
 from app.agent.kernel.conversation_state import retain_conversation
 from app.agent.kernel.model import ModelMessage
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel.pipeline import InMemoryRateLimiter, ToolPipeline
+from app.agent.kernel.effects import InMemoryRateLimiter
+from app.agent.kernel.session_service import SessionService
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import DefaultProjector
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
@@ -55,15 +57,21 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
                               projector=DefaultProjector(max_model_chars=2000), rate_limiter=InMemoryRateLimiter(limit=10000))
 
         async def read(path, offset=0, limit=1000, *, history_budgets=(), storage_bytes=160 * 1024):
-            result = await reader.execute("agent.read_result", {"handle": observed["result_handle"], "path": path,
-                                          "offset": offset, "limit": limit}, context=context)
-            self.assertLessEqual(len(result.outcome.model_content), 2000)
-            self.assertNotIn("secret-not-for-model", result.outcome.model_content)
-            self.assertNotIn("/srv/private/file", result.outcome.model_content)
+            # 旧持久分页是历史解码夹具；活动读取只返回完整节点，Python 自行切片。
+            full = await SessionService(reader, context).result(observed["result_handle"], path)
+            node = full["data"]
+            kind = type(node).__name__
+            values = [{"key": k, "value": v} for k, v in node.items()] if isinstance(node, dict) else node if isinstance(node, (list, str)) else [node]
+            items = values[offset:offset + limit]
+            end = offset + len(items)
+            page = {"ok": True, "status": "success", "result_handle": full["result_handle"], "read_tool": "agent.read_result",
+                    "data": {"path": path, "kind": kind, "offset": offset, "total": len(values), "items": items,
+                             "returned": len(items), "has_more": end < len(values), "next_offset": end if end < len(values) else None}}
+            content = compact_tool_content(json.dumps(page, ensure_ascii=False), maximum=2000, result_page=True, trusted=True)
+            self.assertNotIn("secret-not-for-model", content)
+            self.assertNotIn("/srv/private/file", content)
             self.assertEqual(calls, [True])
-            page = json.loads(result.outcome.model_content)
-            self.assertEqual(page["result_handle"], observed["result_handle"])
-            message = ModelMessage(role="tool", tool_name="agent.read_result", content=result.outcome.model_content)
+            message = ModelMessage(role="tool", tool_name="agent.read_result", content=content)
             for maximum in history_budgets:
                 message = _compact_chain([message], max_tool_chars=maximum)[0]
                 conversation = retain_conversation([message.to_dict()], maximum_bytes=storage_bytes)
@@ -169,7 +177,7 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
         root = next(row for row in view["truncation"] if row["path"] == "")
         self.assertEqual(root["scope"], "subtree")
         self.assertEqual(root["total"], oracle["total"])
-        self.assertEqual(root["returned"], len(view.keys() - {"truncation", "truncated", "read_tool", "result_handle"}))
+        self.assertEqual(root["returned"], len(view.keys() - {"truncation", "truncated", "read_tool", "read_method", "result_handle"}))
         self.assertLess(root["returned"], root["total"])
 
     def test_collision_root_count_survives_model_chain(self):
@@ -562,9 +570,9 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
         self.assertEqual(outcome.public_content["data"], data)
         self.assertFalse(outcome.full_model_content)
 
-    def test_result_reader_is_loaded_only_after_a_snapshot_is_issued(self):
+    def test_snapshots_never_register_a_narrow_reader(self):
         from app.agent.kernel.adapters import consume_events
-        from app.agent.kernel.capabilities import CapabilityRetriever
+
         from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
         from app.agent.kernel.session import AgentSession
         from app.agent.kernel.state import InMemorySessionStateStore
@@ -582,11 +590,11 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
                 ModelEvent(ModelEventType.TEXT_DELTA, text="已取得快照，明细可继续读取"),
                 ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
             pipeline = ToolPipeline(catalog=catalog, state_store=state, projector=DefaultProjector(max_model_chars=2000))
-            session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=state)
+            session = AgentSession(model=model, catalog=catalog,  pipeline=pipeline, state_store=state)
             result = await consume_events(session.run(AgentInput(owner="owner", session_id="paging", message="读取库存")))
             self.assertEqual(result.status, "success")
             self.assertNotIn("agent__read_result", [tool["name"] for tool in model.requests[0].tools])
-            self.assertIn("agent__read_result", [tool["name"] for tool in model.requests[1].tools])
+            self.assertNotIn("agent__read_result", [tool["name"] for tool in model.requests[1].tools])
             self.assertIn("tool_result", (await state.load(owner="owner", session_id="paging")).ref_kinds)
         asyncio.run(run())
 
@@ -609,114 +617,49 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
             self.assertLessEqual(len(content), 2000)
             self.assertTrue(view["truncated"])
             self.assertIn("/data/items", [row["path"] for row in view["truncation"]])
-            self.assertEqual(view["read_tool"], "agent.read_result")
+            self.assertEqual(view["read_method"], "session.result")
             handle = view["result_handle"]
             # 重建存储和Pipeline后继续读取同一加密快照，不重复外部查询。
             restored = SQLiteKernelStore(secret_provider=lambda: "result-paging-test")
             reader = ToolPipeline(catalog=ToolCatalog([]), state_store=restored, reference_store=restored,
                                   projector=DefaultProjector(max_model_chars=24000))
-            received, offset = [], 0
-            while True:
-                page = await reader.execute("agent.read_result", {"handle": handle, "path": "/data/items", "offset": offset, "limit": 100}, context=context)
-                self.assertLessEqual(len(page.outcome.model_content), 24000)
-                payload = json.loads(page.outcome.model_content)
-                self.assertNotIn("secret-not-for-model", page.outcome.model_content)
-                received.extend(payload["data"]["items"])
-                if not payload["data"]["has_more"]:
-                    break
-                self.assertGreater(payload["data"]["next_offset"], offset)
-                offset = payload["data"]["next_offset"]
-            self.assertEqual(received, data)
+            payload = await SessionService(reader, context).result(handle, "/data/items")
+            self.assertEqual(payload["data"], data)
+            self.assertNotIn("secret-not-for-model", json.dumps(payload))
             with self.assertRaises(ToolPipelineError) as missing:
-                await reader.execute("agent.read_result", {"handle": handle, "path": "/data/missing"}, context=context)
+                await SessionService(reader, context).result(handle, "/data/missing")
             self.assertEqual(missing.exception.code, "invalid_arguments")
             for other in (replace(context, owner="other"), replace(context, session_id="other")):
                 with self.assertRaises(ToolPipelineError) as caught:
-                    await reader.execute("agent.read_result", {"handle": handle, "path": "/data/items"}, context=other)
+                    await SessionService(reader, other).result(handle, "/data/items")
                 self.assertEqual(caught.exception.code, "reference_invalid")
             wrong_kind = await restored.put(owner="owner", session_id="session", kind="resource_candidates", value={"parts": []}, ttl_seconds=900)
             with self.assertRaises(ToolPipelineError) as wrong_type:
-                await reader.execute("agent.read_result", {"handle": wrong_kind.ref, "path": ""}, context=context)
+                await SessionService(reader, context).result(wrong_kind.ref)
             self.assertEqual(wrong_type.exception.code, "reference_invalid")
             restored._clock = lambda: 10**12
             with self.assertRaises(ToolPipelineError) as expired:
-                await reader.execute("agent.read_result", {"handle": handle, "path": "/data/items"}, context=context)
+                await SessionService(reader, context).result(handle, "/data/items")
             self.assertEqual(expired.exception.code, "reference_invalid")
         asyncio.run(run())
 
-    def test_complete_capability_catalog_uses_existing_result_reader_when_large(self):
-        """真实目录→Pipeline→SQLite冷启动→通用读取；不调用外部模型或业务工具。"""
-        from app.agent.domain_catalog import build_tool_specs
-        from app.agent.kernel.discovery import CapabilityDiscovery
-        from app.agent.kernel.ports.existing_actions import adapt_tool_spec
-        from tests.test_agent_kernel_core import read_tool
-
-        async def run():
-            executed = []
-            tools = [read_tool(f"sample.item{i:02d}", domain="sample", description="read capability " * 45,
-                               handler=lambda *_: executed.append(True)) for i in range(30)]
-            spec = next(s for s in build_tool_specs() if s.name == "agent.capabilities")
-            hidden = replace(read_tool("sample.hidden", domain="sample"), authorize=lambda _: False)
-            catalog = ToolCatalog([adapt_tool_spec(spec), *tools, hidden])
-            finder = CapabilityDiscovery(catalog, context={})
-            store = SQLiteKernelStore(secret_provider=lambda: "catalog-complete-test")
-            lease, _ = await store.begin_turn(owner="owner", session_id="catalog", request_id="query")
-            context = ToolCallContext(owner="owner", session_id="catalog", request_id=lease.request_id,
-                                      turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(),
-                                      report_progress=AsyncMock(), capability_search=finder.search)
-            pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
-                                    projector=DefaultProjector(max_model_chars=2000))
-            result = await pipeline.execute("agent.capabilities", {"catalog": {"domains": ["sample"]}}, context=context)
-            wire = json.loads(result.outcome.model_content)
-            self.assertLessEqual(len(result.outcome.model_content), 2000)
-            handle = wire["result_handle"]
-            await store.commit(lease, conversation=[ModelMessage(role="tool", tool_name="agent.capabilities",
-                                                               content=result.outcome.model_content).to_dict()])
-            cold = SQLiteKernelStore(secret_provider=lambda: "catalog-complete-test")
-            manifest = await cold.resolve(handle, owner="owner", session_id="catalog", expected_kind="tool_result")
-            chunks = [await cold.resolve(ref, owner="owner", session_id="catalog", expected_kind="tool_result_part")
-                      for ref in manifest["parts"]]
-            original = json.loads("".join(chunks))["data"]
-            self.assertEqual(original["catalog_summary"], {"total": 30, "by_effect": {"read": 30}})
-            self.assertEqual(len(original["tools"]), 30)
-            self.assertNotIn("next_offset", original)
-            self.assertEqual(original["loaded_tools"], [])
-            reader = ToolPipeline(catalog=ToolCatalog([]), state_store=cold, reference_store=cold,
-                                  projector=DefaultProjector(max_model_chars=2000),
-                                  rate_limiter=InMemoryRateLimiter(limit=10000))
-            names, offset = [], 0
-            for _ in range(31):
-                page = await reader.execute("agent.read_result", {"handle": handle, "path": "/data/tools",
-                                                                 "offset": offset, "limit": 30}, context=context)
-                self.assertLessEqual(len(page.outcome.model_content), 2000)
-                data = json.loads(page.outcome.model_content)["data"]
-                self.assertEqual(data["total"], 30)
-                names.extend(item["name"] for item in data["items"])
-                if data["next_offset"] is None:
-                    break
-                self.assertGreater(data["next_offset"], offset)
-                offset = data["next_offset"]
-            self.assertEqual(names, [tool.name for tool in tools])
-            self.assertEqual(executed, [])
-            self.assertEqual(finder.requests, 1)
-        asyncio.run(run())
 
 
     def test_batch_missing_episodes_survive_existing_paging_and_cold_restart(self):
-        from app.agent.domains.library.update_actions import check_library_updates
+        from app.modules.episode_audit import EpisodeAuditResult, check_library_updates
 
         expected = [{"season": season, "episode": episode}
                     for season in (1, 3) for episode in range(1, 151) if episode % 5]
         titles = [f"缺集完整性{i}" for i in range(20)]
 
         def audit(arguments, **_):
-            return ToolResult(True, "updates_available", "已核对库存", data={
+            return EpisodeAuditResult(True, "updates_available", "已核对库存", data={
                 "title": arguments["query"], "missing_count": len(expected),
                 "missing_sample": expected, "missing_sample_truncated": False,
             })
 
         async def run():
-            with patch("app.agent.domains.library.update_actions.audit_series_episodes", side_effect=audit):
+            with patch("app.modules.episode_audit.audit_series_episodes", side_effect=audit):
                 result = check_library_updates({"queries": titles, "as_of": "2026-10-14"})
             observed, read = await self.snapshot_reader(result, raw=True)
             self.assertIn("result_handle", observed)
@@ -732,5 +675,5 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
                     self.assertGreater(data["next_offset"], offset)
                     offset = data["next_offset"]
                 self.assertEqual(restored, expected, title)
-            self.assertEqual(result.data["counts"]["requested"], 20)
+            self.assertEqual(result["data"]["counts"]["requested"], 20)
         asyncio.run(run())

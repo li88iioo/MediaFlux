@@ -10,93 +10,52 @@ import pytest
 
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
     ToolCatalog,
-    ToolEffect,
 )
 from app.agent.kernel.conversation_state import retain_conversation
 from app.agent.kernel.model import (
-    ModelEvent,
-    ModelEventType,
     ModelMessage,
     ModelToolCall,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import DefaultProjector
-from app.agent.kernel.session import AgentSession
-from app.agent.kernel.state_types import AgentInput, CancellationToken
+from app.agent.kernel.session_service import SessionService
+from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.agent.model_context_budget import _compact_chain, compact_tool_content
 from tests.support import isolated_test_database
 
 
-async def session_reader_message(*, provider_alias):
-    calls = []
-    source = {"data": {"items": [{"id": i, "description": str(i) * 1000} for i in range(8)]}}
-
-    def inventory(*_):
-        calls.append(True)
-        return source
-
-    catalog = ToolCatalog([KernelToolSpec(
-        name="library.inventory", domain="library", effect=ToolEffect.READ,
-        description="读取库存", input_schema={"type": "object", "properties": {}}, read=inventory,
-    )])
+async def legacy_reader_message(*, provider_alias):
+    # 迁移前的持久页与工具绑定；仅作为历史解码输入，不重新注册退役运行时。
     store = SQLiteKernelStore(secret_provider=lambda: "paging-quality-test")
-    pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
-                            projector=DefaultProjector(max_model_chars=2000))
-    reader = catalog.get("agent.read_result")
-    assert reader.model_name == "agent__read_result"
-    reader_name = reader.model_name if provider_alias else reader.name
-
-    class LocalModel:
-        def __init__(self):
-            self.requests = []
-
-        async def stream(self, request, *, cancellation):
-            self.requests.append(request)
-            if len(self.requests) == 1:
-                call = ModelToolCall("scan", "library__inventory", {})
-            elif len(self.requests) == 2:
-                observed = json.loads(next(m.content for m in request.messages if m.tool_call_id == "scan"))
-                assert reader.model_name in [tool["name"] for tool in request.tools]
-                call = ModelToolCall("page", reader_name, {
-                    "handle": observed["result_handle"], "path": "/data/items", "offset": 3, "limit": 1,
-                })
-            else:
-                yield ModelEvent(ModelEventType.TEXT_DELTA, text="已读取快照。")
-                yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
-                return
-            yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=call)
-            yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
-
-    session = AgentSession(model=LocalModel(), catalog=catalog, retriever=CapabilityRetriever(),
-                           pipeline=pipeline, state_store=store)
-    events = [event async for event in session.run(AgentInput(
-        owner="quality", session_id="alias", message="读取库存",
-    ))]
-    assert events[-1].payload["status"] == "success"
-    assert calls == [True]
-    reopened = SQLiteKernelStore(secret_provider=lambda: "paging-quality-test")
-    state = await reopened.load(owner="quality", session_id="alias")
-    messages = [ModelMessage.from_dict(row) for row in state.conversation]
-    message = next(row for row in messages if row.tool_call_id == "page")
-    caller = next(row for row in messages if any(call.call_id == "page" for call in row.tool_calls))
-    assert message.tool_name == caller.tool_calls[0].name == reader_name
-    page = json.loads(message.content)
-    assert page["data"]["items"][0]["description"] == "3" * 1000
-    assert caller.tool_calls[0].arguments is not None
-    assert page["result_handle"] == caller.tool_calls[0].arguments["handle"]
-    return message, caller, calls, reopened
+    lease, _ = await store.begin_turn(owner="quality", session_id="alias", request_id="original")
+    context = ToolCallContext(owner="quality", session_id="alias", request_id=lease.request_id,
+        turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
+    pipeline = ToolPipeline(catalog=ToolCatalog([]), state_store=store, reference_store=store)
+    source = {"data": {"items": [{"id": i, "description": str(i) * 1000} for i in range(8)]}}
+    handle = await pipeline.save_result(json.dumps(source), context)
+    reader_name = "agent__read_result" if provider_alias else "agent.read_result"
+    page = {"ok": True, "status": "success", "result_handle": handle, "read_tool": "agent.read_result",
+        "data": {"path": "/data/items", "kind": "list", "offset": 3, "total": 8, "items": [source["data"]["items"][3]],
+                 "returned": 1, "has_more": True, "next_offset": 4}}
+    message = ModelMessage(role="tool", tool_call_id="page", tool_name=reader_name, content=json.dumps(page))
+    caller = ModelMessage(role="assistant", tool_calls=(ModelToolCall("page", reader_name,
+        {"handle": handle, "path": "/data/items", "offset": 3, "limit": 1}),))
+    await store.commit(lease, conversation=[caller.to_dict(), message.to_dict()])
+    cold = SQLiteKernelStore(secret_provider=lambda: "paging-quality-test")
+    saved = await cold.load(owner="quality", session_id="alias")
+    assert ModelMessage.from_dict(saved.conversation[0]) == caller
+    assert ModelMessage.from_dict(saved.conversation[1]) == message
+    return message, caller, cold
 
 
 @pytest.mark.parametrize("provider_alias", [True, False], ids=["provider-alias", "canonical"])
 @pytest.mark.parametrize("route", ["model", "history"])
-def test_session_reader_coordinates_after_sqlite_reopen(provider_alias, route):
+def test_legacy_page_coordinates_after_sqlite_reopen(provider_alias, route):
     async def run():
-        original, caller, calls, store = await session_reader_message(provider_alias=provider_alias)
+        original, caller, store = await legacy_reader_message(provider_alias=provider_alias)
         if route == "model":
             chain = _compact_chain([caller, original], max_tool_chars=800)
             assert chain[0] == caller
@@ -133,14 +92,9 @@ def test_session_reader_coordinates_after_sqlite_reopen(provider_alias, route):
         context = ToolCallContext(owner="quality", session_id="alias", request_id=lease.request_id,
                                   turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(),
                                   report_progress=AsyncMock())
-        tail_result = await reader.execute("agent.read_result", {
-            "handle": handle, "path": row["path"], "offset": row["next_offset"], "limit": 1000,
-        }, context=context)
-        tail = json.loads(tail_result.outcome.model_content)
-        assert tail["result_handle"] == handle
-        assert prefix + tail["data"]["items"] == "3" * 1000
-        assert tail["data"]["has_more"] is False
-        assert calls == [True]
+        original_node = await SessionService(reader, context).result(handle, row["path"])
+        assert original_node["result_handle"] == handle
+        assert prefix + original_node["data"][row["next_offset"]:] == "3" * 1000
 
     with isolated_test_database():
         asyncio.run(run())
@@ -160,11 +114,11 @@ def test_lossless_pretty_json_preserves_complete_semantics(metadata):
 
 
 def test_valid_arguments_survive_real_sqlite_retention_losslessly():
-    from app.agent.domains.shared_arguments import _library_update_arguments
+    from app.modules.episode_audit import normalize_library_update_arguments
 
     arguments = {"queries": [str(i).zfill(2) + "x" * 92 for i in range(20)], "refresh": True}
     arguments["queries"][0] += "y" * 12
-    assert _library_update_arguments(arguments)
+    assert normalize_library_update_arguments(arguments)
     assert len(json.dumps(arguments, ensure_ascii=False)) == 2002
     assert len(json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))) <= 2000
 

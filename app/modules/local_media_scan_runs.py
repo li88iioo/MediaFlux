@@ -23,6 +23,7 @@ _RESULT_COUNTS = (
     "completed", "requires_manual", "failed", "moved_items", "skipped_items",
 )
 SCAN_FAILURE_MESSAGES = {
+    "source_changed": "来源或归档目标在扫描前变化，或扫描已取消，请重新核对后预检。",
     "source_unavailable": "来源目录不可访问或配置无效，请检查目录与挂载。",
     "scan_incomplete": "部分来源目录未能完整扫描，请检查读取权限后重试。",
     "enqueue_failed": "部分媒体候选未能加入整理队列，请检查服务状态后重试。",

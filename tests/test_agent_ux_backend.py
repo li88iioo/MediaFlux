@@ -16,9 +16,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import database as db
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.domains.resources.candidate_context import (
-    RecentResourceCandidateStore,
+from tests.resource_presentation_test_harness import (
     new_resource_search_id,
     safe_resource_snapshot,
 )
@@ -28,12 +26,11 @@ from app.agent.domains.resources.selection import (
     validate_selection,
 )
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import CapabilityRetriever
+
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import (
@@ -45,9 +42,8 @@ from app.agent.kernel.state_types import (
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.agent.models import ToolReference, ToolResult
 from app.agent.transports import QueryEnvelope
-from app.modules.share_transfer import ShareTransferPreviewStore
 from app.routes import agent_api
-from tests.test_agent_ux_model_context import model_resource_candidates
+from tests.resource_presentation_test_harness import present, observe_fixture, model_resource_candidates
 
 SECRET = "agent-ux-backend-test-secret"
 OWNER = "owner-ux"
@@ -57,11 +53,11 @@ CSRF = {"X-CSRF-Token": "ux-csrf"}
 
 @pytest.fixture
 def store(tmp_path):
-    from tests.support import initialized_web_runtime
+    from tests.support import initialized_web_runtime, isolated_indexer_results
 
     # Store and API middleware share one explicitly installed physical database.
     # Do not import main against a schema-only DB or bypass startup admission.
-    with initialized_web_runtime():
+    with initialized_web_runtime(), isolated_indexer_results():
         yield SQLiteKernelStore(secret_provider=lambda: SECRET)
 
 
@@ -119,8 +115,8 @@ def _row_snapshot():
 
 
 def test_next_actions_login_feature_gate_rate_limit_and_no_runtime(api, monkeypatch):
-    reader = Mock(return_value=ToolResult(True, "empty", "无待办", data={"snapshot_status": "empty"}))
-    monkeypatch.setattr(agent_api, "summarize_workspace_next_actions", reader)
+    reader = Mock(return_value={"ok": True, "status": "empty", "data": {"snapshot_status": "empty"}})
+    monkeypatch.setattr(agent_api, "read_next_actions", reader)
     runtime = Mock(side_effect=AssertionError("首页不能初始化 Kernel/模型"))
     monkeypatch.setattr(agent_api, "get_agent_kernel_runtime", runtime)
     assert api.client.get("/api/agent/next-actions").status_code == 401
@@ -138,7 +134,7 @@ def test_next_actions_login_feature_gate_rate_limit_and_no_runtime(api, monkeypa
     response = api.client.get("/api/agent/next-actions")
     assert response.json() == {"actions": [], "snapshot_status": "empty"}
     assert "no-store" in response.headers["cache-control"]
-    reader.assert_called_once_with({})
+    reader.assert_called_once_with()
     runtime.assert_not_called()
 
 
@@ -146,11 +142,11 @@ def test_next_actions_existing_local_projection_max_three_and_unavailable(api, m
     _login(api)
     sources = [("downloads", "download_needs_review"), ("rss", "rss_failed"),
                ("organize", "organize_issue"), ("strm", "strm_open_failure")]
-    todo = ToolResult(True, "attention", "待办", data={
+    todo = {"ok": True, "status": "attention", "data": {
         "areas": [{"source": source, "status": "attention", "attention_count": 1,
                    "reason_codes": [reason]} for source, reason in sources],
-    })
-    with patch("app.agent.domains.workspace.next_actions.summarize_workspace_todo", return_value=todo) as reader:
+    }}
+    with patch("app.modules.workspace._backlog", return_value=todo) as reader:
         response = api.client.get("/api/agent/next-actions")
     assert response.status_code == 200
     payload = response.json()
@@ -158,12 +154,12 @@ def test_next_actions_existing_local_projection_max_three_and_unavailable(api, m
     assert len(payload["actions"]) == 3
     assert [item["id"] for item in payload["actions"]] == ["review_downloads", "review_rss", "review_organize"]
     assert all(set(item) == {"id", "title", "description", "prompt"} for item in payload["actions"])
-    reader.assert_called_once_with({})
-    monkeypatch.setattr(agent_api, "summarize_workspace_next_actions", Mock(side_effect=RuntimeError("https://private/token")))
+    reader.assert_called_once_with()
+    monkeypatch.setattr(agent_api, "read_next_actions", Mock(side_effect=RuntimeError("https://private/token")))
     failed = api.client.get("/api/agent/next-actions")
     assert failed.status_code == 200
     assert failed.json() == {"actions": [], "snapshot_status": "unavailable"}
-    monkeypatch.setattr(agent_api, "summarize_workspace_next_actions", lambda _: ToolResult(False, "unavailable", "失败"))
+    monkeypatch.setattr(agent_api, "read_next_actions", lambda: {"ok": False, "status": "unavailable"})
     assert api.client.get("/api/agent/next-actions").json() == failed.json()
 
 
@@ -270,7 +266,7 @@ def test_metadata_patch_keeps_inflight_pending_generation_and_concurrent_turn(st
             store.patch_session_display(owner=OWNER, session_id=SESSION, patch={"pinned": True}),
         )
         state = await second_store.load(owner=OWNER, session_id=SESSION)
-        assert state.conversation == [{"role": "user", "content": "新回合内容", "history_id": "concurrent-user-event"}]
+        assert state.conversation == [{"role": "user", "content": "新回合内容", "history_id": "concurrent-user-event", "history_order": 1}]
         assert state.metadata == {
             "inflight": {"operation": "protected"}, "title": "用户标题", "pinned": True,
             "new_turn": True,
@@ -338,10 +334,24 @@ def test_pinned_older_than_recent_fifty_is_visible_and_corrupt_rows_do_not_hide_
     asyncio.run(exercise())
 
 
+def _cache_candidates(items):
+    from app.indexers.runtime import get_indexer_service
+    from app.indexers.models import IndexerItem
+    for item in items:
+        get_indexer_service().result_store.restore(item["result_id"], IndexerItem(
+            title=item["title"], site_id=item.get("site_id", "demo"), site_name=item.get("site_name", "Demo"),
+            magnet="magnet:?xt=urn:btih:" + "a" * 40, download_state="ready", download_kinds=("magnet",),
+        ))
+
+
 def _resources(*, ttl=900):
+    from app.indexers.models import IndexerItem
+
+    size = IndexerItem("demo", "Demo", "Example", size_bytes=377_162_579).to_public_dict()
     items = [
         {"result_id": f"ux-resource-result-{position:03}", "title": f"Example.S01E0{position}.2160p",
-         "site_id": "demo", "site_name": "Demo", "size_text": "2 GB", "download_state": "ready",
+         "site_id": "demo", "site_name": "Demo", "size_text": size["size_text"],
+         "size_bytes": size["size_bytes"], "download_state": "ready",
          "download_kinds": ["magnet"], "quality": {
              "tags": {"resolution": "2160p", "audio": "Atmos", "token": "SECRET"},
              "reasons": ["精确匹配", "https://10.0.0.9/token"], "warnings": ["需要人工确认", "/private/secret"],
@@ -353,6 +363,12 @@ def _resources(*, ttl=900):
     snapshot = safe_resource_snapshot(result, search_id=new_resource_search_id())
     result.references.append(ToolReference("resource_candidates", snapshot, ttl_seconds=ttl))
     return result
+
+
+async def _download_intent(store, view, positions=None, target="guangya", *, owner=OWNER, session=SESSION):
+    from app.agent.domains.resources.selection import resource_download_arguments
+    snapshot = await store.resolve(view["ref"], owner=owner, session_id=session, expected_kind="resource_candidates")
+    return resource_download_arguments(snapshot, positions or [1], target)
 
 
 def _selection(view, positions=None, target="guangya"):
@@ -369,19 +385,31 @@ class SelectionModel:
         self.requests.append(request)
         intent = json.loads(request.messages[-1].content.splitlines()[-1])
         if self.forged_position is not None:
-            intent["positions"] = [self.forged_position]
+            intent["result_ids"] = [f"foreign-resource-{self.forged_position}"]
         yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                         tool_call=ModelToolCall("selection-preview", "ingest.submit", intent))
+                         tool_call=ModelToolCall("selection-preview", "resources.download", intent))
         yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
 
 
-def _runtime(store=None, *, ttl=900, model=None):
-    specs = {item.name: item for item in build_tool_specs(RecentResourceCandidateStore(), ShareTransferPreviewStore())}
-    specs["indexer.search_resources"] = replace(specs["indexer.search_resources"], handler=lambda _: _resources(ttl=ttl))
-    catalog = catalog_from_tool_specs((specs["indexer.search_resources"], specs["indexer.present_candidates"], specs["ingest.submit"]))
+def _runtime(store=None, *, ttl=900, model=None, resource_result=None, present_result=False):
+    from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+    from app.agent.kernel.ports.resource_presentation import ResourceSelection
+    from app.agent.kernel.ports.sdk_effects import resource_download_tool
     states = store or InMemorySessionStateStore()
+    catalog = ToolCatalog([resource_download_tool()], selection=ResourceSelection())
     pipeline = ToolPipeline(catalog=catalog, state_store=states, reference_store=store)
-    session = AgentSession(model=model or SelectionModel(), catalog=catalog, retriever=CapabilityRetriever(),
+    async def read_resources(arguments, context):
+        result = resource_result if resource_result is not None else _resources(ttl=ttl)
+        _cache_candidates(result.references[0].value["candidates"])
+        outcome = await observe_fixture(pipeline, context, result, arguments)
+        if present_result:
+            identities = [item["result_id"] for item in result.data["items"]]
+            return (await present(pipeline, context, identities)).outcome
+        return outcome
+    catalog.register(KernelToolSpec(name="fixture.resource_read", domain="fixture", effect=ToolEffect.READ,
+        description="测试外部资源I/O；正式原生RPC发布", input_schema={"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]},
+        read=read_resources, metadata={"publishes_selection": True}))
+    session = AgentSession(model=model or SelectionModel(), catalog=catalog,
                            pipeline=pipeline, state_store=states)
     return session, pipeline, states
 
@@ -391,16 +419,18 @@ async def _publish_candidates(pipeline, states, *, owner=OWNER, session_id=SESSI
         lease, _ = await states.begin_turn(owner=owner, session_id=session_id, request_id="search")
         context = ToolCallContext(owner=owner, session_id=session_id, request_id="search", turn_id=lease.turn_id,
                                   lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
-    result = await pipeline.execute("indexer.search_resources", {"title": "Example"}, context=context)
+    result = await pipeline.execute("fixture.resource_read", {"title": "Example"}, context=context)
+    from app.agent.kernel.ports.resource_presentation import ResourcePresentation
+    from app.agent.kernel.references import ResultSnapshotReader
+    from app.agent.domains.resources.selection import _recommend
+    from app.modules.resource_candidates import candidate_sources
+    scope = await ResourcePresentation(context, pipeline, ResultSnapshotReader(pipeline.reference_store)).snapshot()
+    assert scope is not None
+    items = [item for source in candidate_sources(scope) for item in source["_display_items"]]
+    recommended = _recommend(items)
+    selected = recommended if any(item.get("requested_episode") for item in items) else [item["position"] for item in items]
+    result = await present(pipeline, context, [item["result_id"] for item in items if item["position"] in selected])
     view = result.outcome.public_content["candidate_view"]
-    if view is None:
-        numbers = model_resource_candidates(json.loads(result.outcome.model_content))
-        if not any(item.get("requested_episode") for item in numbers):
-            result = await pipeline.execute("indexer.present_candidates", {
-                **result.outcome.public_content["reference_arguments"],
-                "positions": [item["position"] for item in numbers],
-            }, context=context)
-            view = result.outcome.public_content["candidate_view"]
     return view, context
 
 
@@ -412,25 +442,25 @@ def test_candidate_projection_is_allowlisted_and_current_view_restores(store):
     async def exercise():
         _, pipeline, states = _runtime(store)
         view, context = await _publish_candidates(pipeline, states)
-        result = await pipeline.execute("indexer.search_resources", {"title": "Example"}, context=context)
+        result = await pipeline.execute("fixture.resource_read", {"title": "Example"}, context=context)
         assert result.outcome.public_content["candidate_view"] is None
-        presented = await pipeline.execute("indexer.present_candidates", {
-            **result.outcome.public_content["reference_arguments"], "positions": [1, 2],
-        }, context=context)
+        presented = await present(pipeline, context, [item["result_id"] for item in model_resource_candidates(json.loads(result.outcome.model_content))])
         view = presented.outcome.public_content["candidate_view"]
         public = json.dumps(presented.outcome.public_content, ensure_ascii=False)
-        assert "result_id" not in public
+        assert [item["result_id"] for item in view["items"]] == ["ux-resource-result-001", "ux-resource-result-002"]
         model = json.loads(result.outcome.model_content)
         assert model["data"]["items"][0]["result_id"] == "ux-resource-result-001"
+        assert model["data"]["items"][0]["size_text"] == view["items"][0]["size_text"] == "359.69 MiB"
         encoded = public + result.outcome.model_content
         for private in ("rawresult", "torrent_url", "SECRET", "10.0.0.9", "/private/", "https://"):
             assert private not in encoded
         assert set(view) == {"ref", "selection_ref", "expires_at", "items", "turn_id", "recommended_positions", "target", "target_source", "targets", "explicit_selection"}
         assert view["expires_at"] > time.time()
         item = view["items"][0]
-        assert set(item) == {"position", "title", "site_name", "size_text", "tags", "reasons", "warnings", "coverage", "media_title", "media_scope", "requested_episode", "match"}
+        assert set(item) == {"position", "result_id", "title", "site_name", "size_text", "tags", "reasons", "warnings", "coverage", "media_title", "media_scope", "requested_episode", "match"}
         # 展示只信引用内的安全快照，不从早先原始结果恢复额外字段。
-        assert item["tags"] == {} and item["reasons"] == [] and item["warnings"] == []
+        assert item["tags"] == {"audio": "Atmos", "resolution": "2160p"}
+        assert item["reasons"] == ["精确匹配"] and item["warnings"] == ["需要人工确认"]
         assert view["explicit_selection"] is True
         assert view["selection_ref"] != view["ref"]
         reloaded = SQLiteKernelStore(secret_provider=lambda: SECRET)
@@ -486,7 +516,7 @@ def test_invalid_selection_never_calls_model_provider_or_consumes_pending(store,
         rows_before = _row_snapshot()
         with patch.object(pipeline, "cancel_effect", new_callable=AsyncMock) as cancel, \
              patch.object(pipeline, "execute", new_callable=AsyncMock) as execute, \
-             patch("app.agent.domains.resources.candidate_context.restore_resource_candidate_reference", side_effect=AssertionError("restore forbidden")) as restore:
+             patch("app.modules.resource_candidates.restore_resource_candidate_reference", side_effect=AssertionError("restore forbidden")) as restore:
             events = await _events(session.run(AgentInput(message="选择并预览", owner=owner, session_id=session_id, metadata={"selection": value})))
         assert len(events) == 1 and events[0].type is AgentEventType.TURN_FAILED
         assert events[0].payload["code"] == "selection_invalid"
@@ -527,10 +557,13 @@ def test_selection_click_only_previews_and_explicit_confirmation_has_one_effect(
         session, pipeline, states = _runtime(store, model=model)
         view, _ = await _publish_candidates(pipeline, states)
         envelope = QueryEnvelope(owner=OWNER, session_id=SESSION, message="选择并预览", selection=_selection(view))
-        with patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource") as prepare, \
-             patch("app.agent.domains.resources.candidate_actions.submit_resource_confirmed") as execute:
-            prepare.side_effect = lambda args: (ToolResult(True, "confirmation_required", "确认后提交", data={"resource": {"title": "Example"}}), f"{args['result_id']}:{args['target']}")
-            execute.return_value = ToolResult(True, "accepted", "已提交")
+        with patch("app.indexers.downloads.preview_indexer_download_batch") as prepare, \
+             patch("app.indexers.downloads.submit_indexer_download_batch") as execute:
+            from tests.support import _prepare_batch
+            prepare.side_effect = _prepare_batch
+            execute.return_value = {"ok": True, "status": "accepted", "summary": "已提交", "error": "",
+                                    "total": 1, "succeeded": 1, "failed": 0,
+                                    "items": [{"result_id": "ux-resource-result-001", "status": "submitted", "request_id": 81}]}
             events = await _events(session.run(envelope.to_agent_input()))
             approvals = [event for event in events if event.type is AgentEventType.EFFECT_APPROVAL_REQUIRED]
             assert len(approvals) == 1, [(event.type, event.payload) for event in events]
@@ -538,7 +571,7 @@ def test_selection_click_only_previews_and_explicit_confirmation_has_one_effect(
             execute.assert_not_called()
             assert isinstance(session.model, ScriptedModel)
             assert session.model.requests == []
-            assert prepare.call_args.args[0]["target"] == "guangya"
+            assert prepare.call_args.args[2] == "guangya"
             state = await states.load(owner=OWNER, session_id=SESSION)
             pending = state.pending_effect_plan_id
             assert pending == approvals[0].payload["plan"]["plan_id"]
@@ -548,6 +581,8 @@ def test_selection_click_only_previews_and_explicit_confirmation_has_one_effect(
             assert session.model.requests == []
             first = await _events(session.confirm(owner=OWNER, session_id=SESSION, plan_id=pending))
             assert any(event.type is AgentEventType.EFFECT_COMPLETED for event in first)
+            receipt = next(event.payload["result"]["data"] for event in first if event.type is AgentEventType.EFFECT_COMPLETED)
+            assert (receipt["total"], receipt["items"][0]["request_id"]) == (1, 81)
             completed = [event for event in first if event.type is AgentEventType.TURN_COMPLETED]
             assert completed
             assert "后台任务尚未完成" in completed[-1].payload["answer"]
@@ -565,16 +600,44 @@ def test_pipeline_rejects_model_rewriting_verified_choice_before_provider(store)
         state = await states.load(owner=OWNER, session_id=SESSION)
         verified = await validate_selection(_selection(view), state=state, store=store)
         context = replace(context, selection_arguments=verified.arguments)
-        with patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource") as prepare:
+        with patch("app.indexers.downloads.preview_indexer_download_batch") as prepare:
             for arguments in ({**verified.arguments, "positions": [2]},
                               {**verified.arguments, "positions": [True]},
                               {**verified.arguments, "target": "both"}):
                 with pytest.raises(ToolPipelineError, match="只能预览"):
-                    await pipeline.execute("ingest.submit", arguments, context=context)
+                    await pipeline.execute("resources.download", arguments, context=context)
             with pytest.raises(ToolPipelineError, match="只能预览"):
-                await pipeline.execute("indexer.search_resources", {"title": "重新搜索"}, context=context)
+                await pipeline.execute("fixture.resource_read", {"title": "重新搜索"}, context=context)
             prepare.assert_not_called()
     asyncio.run(exercise())
+
+
+def test_pending_preview_restores_activity_without_executing_or_changing_plan(api):
+    _login(api)
+    owner = _web_owner(api)
+    session = api.runtime.session
+    view, _ = asyncio.run(_publish_candidates(session.pipeline, api.store, owner=owner))
+    from tests.support import _prepare_batch
+    with patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=_prepare_batch), \
+         patch("app.indexers.downloads.submit_indexer_download_batch") as execute:
+        events = asyncio.run(_events(session.run(QueryEnvelope(
+            owner=owner, session_id=SESSION, message="选择并预览", selection=_selection(view),
+        ).to_agent_input())))
+        approval = next(event.payload["plan"] for event in events
+                        if event.type is AgentEventType.EFFECT_APPROVAL_REQUIRED)
+        before = asyncio.run(api.store.load(owner=owner, session_id=SESSION))
+        frozen = asyncio.run(session.pipeline.get_pending_plan(owner=owner, session_id=SESSION))
+        assert frozen.plan_id == approval["plan_id"]
+        response = api.client.get(f"/api/agent/sessions/{SESSION}")
+        assert response.status_code == 200, response.text
+        restored = response.json()["pending_approval"]
+        activities = restored.pop("activities")
+        assert restored == frozen.public_approval_dict()
+        assert activities[-1]["method"] == "resources.download"
+        assert activities[-1]["status"] == "approval_required"
+        assert activities[-1]["label"]
+        assert asyncio.run(api.store.load(owner=owner, session_id=SESSION)) == before
+        execute.assert_not_called()
 
 
 def test_get_session_restores_only_valid_current_candidates_and_query_accepts_selection(api):
@@ -623,35 +686,6 @@ def test_patch_preserves_signed_unknown_fields_and_full_conversation_json(store)
     assert after["generation"] == row["generation"] and after["updated_at"] == row["updated_at"]
 
 
-@pytest.mark.parametrize("failed", [False, True])
-def test_empty_or_failed_same_turn_search_invalidates_old_candidate(store, failed):
-    async def exercise():
-        session, pipeline, states = _runtime(store)
-        view, context = await _publish_candidates(pipeline, states)
-        original = pipeline.catalog.get("indexer.search_resources")
-        read = Mock(side_effect=RuntimeError("offline")) if failed else Mock(return_value=ToolResult(
-            True, "empty", "没有候选", data={"items": [], "rawresult": {"url": "https://10.0.0.9/private"}},
-        ))
-        catalog = type(pipeline.catalog)(
-            [replace(original, read=read), pipeline.catalog.get("ingest.submit")],
-            projector=pipeline.catalog.projector, selection=pipeline.catalog.selection,
-        )
-        newer = ToolPipeline(catalog=catalog, state_store=states, reference_store=store)
-        if failed:
-            with pytest.raises(ToolPipelineError, match="工具执行失败"):
-                await newer.execute("indexer.search_resources", {"title": "new search"}, context=context)
-        else:
-            result = await newer.execute("indexer.search_resources", {"title": "new search"}, context=context)
-            assert result.outcome.public_content["candidate_view"] is None
-            assert "rawresult" not in str(result.outcome.public_content) + result.outcome.model_content
-        state = await states.load(owner=OWNER, session_id=SESSION)
-        assert await current_candidate_view(state=state, store=store) is None
-        events = await _events(session.run(AgentInput(message="选择并预览", owner=OWNER, session_id=SESSION,
-                                                     metadata={"selection": _selection(view)})))
-        assert events[0].payload["code"] == "selection_invalid"
-        assert isinstance(session.model, SelectionModel)
-        assert session.model.requests == []
-    asyncio.run(exercise())
 
 
 def test_scope_binds_to_owner_used_for_session_list_even_during_account_change(api):
@@ -685,53 +719,6 @@ def test_concurrent_selection_admission_accepts_only_one_cross_store_turn(store)
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("second_result", ["failed", "empty"])
-def test_same_turn_read_invalidation_reaches_real_progress_stream_before_terminal_event(store, second_result):
-    class SearchTwiceModel:
-        def __init__(self):
-            self.requests = []
-
-        async def stream(self, request, *, cancellation):
-            cancellation.raise_if_cancelled()
-            self.requests.append(request)
-            if len(self.requests) <= 2:
-                yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                    f"search-{len(self.requests)}", "indexer.search_resources", {"title": "Example"},
-                ))
-                yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
-            else:
-                yield ModelEvent(ModelEventType.TEXT_DELTA, text="第二次搜索没有可选候选。")
-                yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
-
-    async def exercise():
-        _, original, states = _runtime(store)
-        reader = Mock(side_effect=[
-            _episode_candidates_result(match="exact_episode"), RuntimeError("offline") if second_result == "failed" else ToolResult(True, "empty", "无候选", data={"items": []}),
-        ])
-        catalog = type(original.catalog)(
-            [replace(original.catalog.get("indexer.search_resources"), read=reader)],
-            projector=original.catalog.projector, selection=original.catalog.selection,
-        )
-        pipeline = ToolPipeline(catalog=catalog, state_store=states, reference_store=store)
-        model = SearchTwiceModel()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=states)
-        events = await _events(session.run(AgentInput(message="搜索资源，再重新搜索", owner=OWNER, session_id=SESSION)))
-        completed = [event for event in events if event.type is AgentEventType.TOOL_COMPLETED]
-        first_view = completed[0].payload["result"]["candidate_view"]
-        invalidations = [event for event in events if event.type is AgentEventType.TOOL_PROGRESS and "candidate_view" in event.payload]
-        assert len(invalidations) == 2 and all(event.payload["candidate_view"] is None for event in invalidations)
-        assert invalidations[1].payload["tool"] == "indexer.search_resources"
-        terminal = next(event for event in events if event.type is AgentEventType.TOOL_FAILED) if second_result == "failed" else completed[1]
-        assert completed[0].sequence < invalidations[1].sequence < terminal.sequence
-        if second_result == "empty":
-            assert terminal.payload["result"]["candidate_view"] is None
-        state = await states.load(owner=OWNER, session_id=SESSION)
-        assert await current_candidate_view(state=state, store=store) is None
-        assert len(model.requests) == 3
-        rejected = await _events(session.run(AgentInput(message="选择并预览", owner=OWNER, session_id=SESSION,
-                                                       metadata={"selection": _selection(first_view)})))
-        assert rejected[0].payload["code"] == "selection_invalid" and len(model.requests) == 3
-    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("rejection", ["arguments", "rate_limit"])
@@ -746,7 +733,7 @@ def test_pre_read_rejection_keeps_current_card_and_emits_no_invalidation(store, 
         if rejection == "rate_limit":
             pipeline.rate_limiter.acquire = AsyncMock(side_effect=ToolPipelineError("limited", code="rate_limited"))
         with pytest.raises(ToolPipelineError):
-            await pipeline.execute("indexer.search_resources", {} if rejection == "arguments" else {"title": "new search"}, context=context)
+            await pipeline.execute("fixture.resource_read", {} if rejection == "arguments" else {"title": "new search"}, context=context)
         context.report_progress.assert_not_called()
         after = await states.load(owner=OWNER, session_id=SESSION)
         assert after == before
@@ -879,10 +866,10 @@ def test_general_search_does_not_recommend_old_episodes_or_suggest_ingest(store)
     async def exercise():
         _, pipeline, states = _runtime(store)
         view, context = await _publish_candidates(pipeline, states)
-        result = await pipeline.execute("indexer.search_resources", {"title": "Example"}, context=context)
+        result = await pipeline.execute("fixture.resource_read", {"title": "Example"}, context=context)
         assert view["items"], "普通搜索仍应允许用户手动挑选"
         assert view["recommended_positions"] == []
-        assert '"recommended_ingest_arguments":' not in result.outcome.model_content
+        assert '"recommended_download_arguments":' not in result.outcome.model_content
         assert model_resource_candidates(json.loads(result.outcome.model_content))
         view, _ = await _publish_candidates(pipeline, states, context=context)
         # 旧会话曾按标题给出自动推荐，重新读取时不能继续沿用。
@@ -892,7 +879,7 @@ def test_general_search_does_not_recommend_old_episodes_or_suggest_ingest(store)
         assert restored is not None
         assert restored["recommended_positions"] == []
         selection = await validate_selection(_selection(restored), state=state, store=store)
-        assert selection.arguments["positions"] == [1]
+        assert selection.arguments["result_ids"] == [restored["items"][0]["result_id"]]
     asyncio.run(exercise())
 
 
@@ -945,11 +932,11 @@ def test_missing_episode_search_without_verified_coverage_does_not_issue_a_card(
         _, pipeline, states = _runtime(store)
         _, context = await _publish_candidates(pipeline, states)
         with patch(__name__ + "._resources", return_value=_episode_candidates_result(match)):
-            result = await pipeline.execute("indexer.search_resources", {"title": "仙逆"}, context=context)
+            result = await pipeline.execute("fixture.resource_read", {"title": "仙逆"}, context=context)
         assert result.outcome.public_content["candidate_view"] is None
         assert result.outcome.public_content["summary"] == "已检索,缺集覆盖仍需核对"
-        assert '"candidate_numbers":' in result.outcome.model_content
-        assert '"recommended_ingest_arguments":' not in result.outcome.model_content
+        assert model_resource_candidates(json.loads(result.outcome.model_content))
+        assert '"recommended_download_arguments":' not in result.outcome.model_content
         state = await states.load(owner=OWNER, session_id=SESSION)
         assert state.metadata[CANDIDATE_VIEW_KEY] is None
         assert await current_candidate_view(state=state, store=store) is None
@@ -978,19 +965,19 @@ def test_restored_empty_or_unverified_episode_card_is_not_resurrected(store, leg
     asyncio.run(exercise())
 
 
-def test_mixed_episode_candidates_keep_verified_global_positions(store):
+def test_mixed_episode_candidates_keep_verified_identity_in_selected_card(store):
     async def exercise():
         _, pipeline, states = _runtime(store)
         with patch(__name__ + "._resources", return_value=_episode_candidates_result(include_match=True)):
             view, _ = await _publish_candidates(pipeline, states)
-        assert view["recommended_positions"] == [2]
-        assert [item["position"] for item in view["items"]] == [2]
+        assert view["recommended_positions"] == [1]
+        assert [item["position"] for item in view["items"]] == [1]
         state = await states.load(owner=OWNER, session_id=SESSION)
         current_candidate_view_result = await current_candidate_view(state=state, store=store)
         assert current_candidate_view_result is not None
-        assert (current_candidate_view_result)["recommended_positions"] == [2]
-        result = await validate_selection(_selection(view, [2]), state=state, store=store)
-        assert result.arguments["positions"] == [2]
+        assert (current_candidate_view_result)["recommended_positions"] == [1]
+        result = await validate_selection(_selection(view, [1]), state=state, store=store)
+        assert result.arguments["result_ids"] == [view["items"][0]["result_id"]]
     asyncio.run(exercise())
 
 
@@ -1001,11 +988,11 @@ def test_raw_search_keeps_model_evidence_without_publishing_unselected_cards(sto
         context = ToolCallContext(owner=OWNER, session_id=SESSION, request_id="remaining-resources", turn_id=lease.turn_id,
                                   lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
         for title in ("狐妖小红娘", "Fox Spirit Matchmaker"):
-            result = await pipeline.execute("indexer.search_resources", {"title": title}, context=context)
+            result = await pipeline.execute("fixture.resource_read", {"title": title}, context=context)
             assert result.outcome.public_content["candidate_view"] is None
             assert model_resource_candidates(json.loads(result.outcome.model_content))
-            assert "resource_candidates_ref" in result.outcome.model_content
-            assert '"recommended_ingest_arguments":' not in result.outcome.model_content
+            assert {item["result_id"] for item in model_resource_candidates(json.loads(result.outcome.model_content))} == {"ux-resource-result-001", "ux-resource-result-002"}
+            assert '"recommended_download_arguments":' not in result.outcome.model_content
         state = await states.load(owner=OWNER, session_id=SESSION)
         assert state.metadata[CANDIDATE_VIEW_KEY] is None
         assert await current_candidate_view(state=state, store=store) is None
@@ -1024,27 +1011,23 @@ def test_legacy_generic_card_does_not_reappear_as_a_recommendation(store):
     asyncio.run(exercise())
 
 
-def test_explicit_presentation_preserves_positions_and_can_clear_the_view(store):
+def test_explicit_presentation_numbers_selected_ids_and_can_clear_the_view(store):
     async def exercise():
         _, pipeline, states = _runtime(store)
         original, context = await _publish_candidates(pipeline, states)
-        result = await pipeline.execute("indexer.present_candidates", {
-            "resource_candidates_ref": original["ref"], "positions": [2],
-        }, context=context)
+        result = await present(pipeline, context, [original["items"][1]["result_id"]])
         view = result.outcome.public_content["candidate_view"]
-        assert [item["position"] for item in view["items"]] == [2]
+        assert [item["position"] for item in view["items"]] == [1]
         assert view["explicit_selection"] is True
         assert view["recommended_positions"] == []
         state = await states.load(owner=OWNER, session_id=SESSION)
         current_candidate_view_result_2 = await current_candidate_view(state=state, store=store)
         assert current_candidate_view_result_2 is not None
         assert (current_candidate_view_result_2)["items"] == view["items"]
-        assert (await validate_selection(_selection(view, [2]), state=state, store=store)).arguments["positions"] == [2]
+        assert (await validate_selection(_selection(view, [1]), state=state, store=store)).arguments["result_ids"] == [view["items"][0]["result_id"]]
         with pytest.raises(SelectionInvalidError):
-            await validate_selection(_selection(view, [1]), state=state, store=store)
-        cleared = await pipeline.execute("indexer.present_candidates", {
-            "resource_candidates_ref": view["ref"], "positions": [],
-        }, context=context)
+            await validate_selection(_selection(view, [2]), state=state, store=store)
+        cleared = await present(pipeline, context, [])
         assert cleared.outcome.public_content["candidate_view"] is None
         assert not json.loads(cleared.outcome.model_content).get("candidate_numbers")
         state = await states.load(owner=OWNER, session_id=SESSION)
@@ -1061,79 +1044,37 @@ def test_candidate_refinement_filters_model_card_and_selection_from_one_result(s
     async def exercise():
         _, pipeline, states = _runtime(store)
         original, context = await _publish_candidates(pipeline, states)
-        result = await pipeline.execute("indexer.present_candidates", {
-            "resource_candidates_ref": original["ref"], "positions": [1, 2],
-            "resolution": "2160p", "dynamic_range": "SDR",
-        }, context=context)
+        result = await present(pipeline, context, [item["result_id"] for item in original["items"]], resolution="2160p", dynamic_range="SDR")
         model = json.loads(result.outcome.model_content)
         view = result.outcome.public_content["candidate_view"]
-        assert model["data"]["positions"] == [2]
-        assert model["data"]["technical_filter"]["unknown_excluded"] == 1
-        assert model["data"]["scope"]["complete"] is True
-        assert [item["position"] for item in model["candidate_numbers"]] == [2]
-        assert [item["position"] for item in view["items"]] == [2]
+        assert model["result_ids"] == [original["items"][1]["result_id"]]
+        assert model["technical_filter"]["unknown_excluded"] == 1
+        assert model["scope"]["complete"] is True
+        assert model["result_ids"] == [view["items"][0]["result_id"]]
+        assert [item["position"] for item in view["items"]] == [1]
         state = await states.load(owner=OWNER, session_id=SESSION)
         current_candidate_view_result_3 = await current_candidate_view(state=state, store=store)
         assert current_candidate_view_result_3 is not None
         assert (current_candidate_view_result_3)["items"] == view["items"]
-        assert (await validate_selection(_selection(view, [2]), state=state, store=store)).arguments["positions"] == [2]
+        assert (await validate_selection(_selection(view, [1]), state=state, store=store)).arguments["result_ids"] == [view["items"][0]["result_id"]]
         with pytest.raises(SelectionInvalidError):
-            await validate_selection(_selection(view, [1]), state=state, store=store)
+            await validate_selection(_selection(view, [2]), state=state, store=store)
 
-        empty = await pipeline.execute("indexer.present_candidates", {
-            "resource_candidates_ref": original["ref"], "positions": [1, 2], "dynamic_range": "HDR",
-        }, context=context)
+        empty = await present(pipeline, context, [item["result_id"] for item in original["items"]], dynamic_range="HDR")
         model = json.loads(empty.outcome.model_content)
-        assert model["data"]["positions"] == []
+        assert model["result_ids"] == []
         assert not model.get("candidate_numbers")
         assert empty.outcome.public_content["candidate_view"] is None
         assert await current_candidate_view(state=await states.load(owner=OWNER, session_id=SESSION), store=store) is None
         # 筛选不破坏原快照，也不把当前展示作为隐藏的永久检索条件。
-        unrestricted = await pipeline.execute("indexer.present_candidates", {
-            "resource_candidates_ref": original["ref"], "positions": [1, 2],
-        }, context=context)
+        unrestricted = await present(pipeline, context, [item["result_id"] for item in original["items"]])
         assert len(unrestricted.outcome.public_content["candidate_view"]["items"]) == 2
 
     asyncio.run(exercise())
 
 
-def test_explicit_presentation_cannot_override_missing_episode_coverage(store):
-    async def exercise():
-        _, pipeline, states = _runtime(store)
-        _, context = await _publish_candidates(pipeline, states)
-        with patch(__name__ + "._resources", return_value=_episode_candidates_result("unknown")):
-            searched = await pipeline.execute("indexer.search_resources", {"title": "缺集"}, context=context)
-        assert json.loads(searched.outcome.model_content)["candidate_numbers"] == []
-        presented = await pipeline.execute("indexer.present_candidates", {
-            **searched.outcome.public_content["reference_arguments"], "positions": [1],
-        }, context=context)
-        assert presented.outcome.public_content["candidate_view"] is None
-        assert '"recommended_ingest_arguments":' not in presented.outcome.model_content
-        detail = json.loads(presented.outcome.model_content)["candidate_numbers"][0]
-        assert detail["position"] == 1 and detail["match"] == "unknown"
-        assert detail["title"] and "coverage" in detail
-    asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("scope", ["expired", "foreign_owner", "foreign_session"])
-@pytest.mark.parametrize("tool", ["indexer.present_candidates", "indexer.search_resources"])
-def test_refinement_requires_a_live_reference_in_this_session(store, scope, tool):
-    async def exercise():
-        _, pipeline, states = _runtime(store)
-        view, context = await _publish_candidates(pipeline, states)
-        if scope == "expired":
-            store._clock = lambda: time.time() + 901
-        else:
-            owner, session_id = ("another-owner", SESSION) if scope == "foreign_owner" else (OWNER, "another_session_123456")
-            lease, _ = await states.begin_turn(owner=owner, session_id=session_id, request_id="other")
-            context = replace(context, owner=owner, session_id=session_id, lease=lease, turn_id=lease.turn_id)
-        with pytest.raises(ToolPipelineError) as error:
-            await pipeline.execute(tool, {
-                "resource_candidates_ref": view["ref"],
-                **({"positions": [1]} if tool == "indexer.present_candidates" else {"resolution": "2160p"}),
-            }, context=context)
-        assert error.value.code == "reference_invalid"
-    asyncio.run(exercise())
 
 
 def test_cloud_remaining_resource_search_has_no_cards_without_relevant_selection(store):
@@ -1148,7 +1089,7 @@ def test_cloud_remaining_resource_search_has_no_cards_without_relevant_selection
             self.requests.append(request)
             if len(self.requests) <= 2:
                 yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                    f"search-{len(self.requests)}", "indexer.search_resources",
+                    f"search-{len(self.requests)}", "fixture.resource_read",
                     {"title": "狐妖小红娘" if len(self.requests) == 1 else "Fox Spirit Matchmaker"},
                 ))
                 yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
@@ -1195,134 +1136,47 @@ def test_cloud_remaining_resource_search_has_no_cards_without_relevant_selection
     asyncio.run(exercise())
 
 
-def test_general_resource_search_can_explicitly_present_a_relevant_subset(store):
-    from app.agent.kernel.adapters import TurnViewBuilder
-    from app.agent.public_view import public_conversation_messages
-
-    class PickModel:
-        def __init__(self):
-            self.calls = 0
-
-        async def stream(self, request, *, cancellation):
-            self.calls += 1
-            if self.calls == 1:
-                tool = ModelToolCall("search", "indexer.search_resources", {"title": "Example"})
-            elif self.calls == 2:
-                evidence = next(message.content for message in reversed(request.messages) if message.role == "tool")
-                payload = json.loads(evidence)
-                assert all(row["technical_evidence"]["stream_verified"] is False
-                           for row in model_resource_candidates(payload))
-                refs = payload["reference_arguments"]
-                tool = ModelToolCall("present", "indexer.present_candidates", {**refs, "positions": [2]})
-            else:
-                yield ModelEvent(ModelEventType.TEXT_DELTA, text="已挑选第2个版本，可先预览，尚未下载。")
-                yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
-                return
-            yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=tool)
-            yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
-
-    async def exercise():
-        session, _, states = _runtime(store, model=PickModel())
-        events = await _events(session.run(AgentInput(message="找Example资源，挑选合适的版本", owner=OWNER, session_id=SESSION)))
-        builder = TurnViewBuilder()
-        for event in events:
-            builder.apply(event)
-        result = builder.build()
-        assert result.status == "success"
-        assert result.approval is None
-        assert result.candidate_view is not None
-        assert result.candidate_view["explicit_selection"] is True
-        assert [item["position"] for item in result.candidate_view["items"]] == [2]
-        state = await states.load(owner=OWNER, session_id=SESSION)
-        restored = await current_candidate_view(state=state, store=store)
-        messages = public_conversation_messages(state.conversation, candidate_view=restored)
-        assert sum(bool(message.get("candidate_view")) for message in messages) == 1
-        assert "尚未下载" in result.answer
-    asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("suffix,dynamic,depth", [
-    ("1080p.H264", None, None),
-    ("1080p.HEVC.10-bit", None, "10-bit"),
-    ("1080p.SDR.H264", "SDR", None),
-    ("2160p.HDR10.HEVC.10-bit", "HDR10", "10-bit"),
-    ("2160p.DoVi.HEVC", "DoVi", None),
-    ("2160p.DV.HDR10.HEVC", "DoVi", None),
-    ("2160p.HLG.HEVC", "HLG", None),
-])
-def test_candidate_technical_evidence_is_title_only_and_unknown_is_not_sdr(suffix, dynamic, depth):
-    from app.agent.domains.resources.selection import annotate_resource_candidates
-
-    item = {"position": 1, "media_title": "Example", "requested_episode": "",
-            "match": "unknown", "title": f"Example.S03E01.{suffix}", "coverage": {}}
-    for positions in (None, [1]):
-        payload = {}
-        annotate_resource_candidates(payload, [item], selected_positions=positions)
-        evidence = model_resource_candidates(payload)[0]["technical_evidence"]
-        assert evidence["basis"] == "release_title_only"
-        assert evidence["stream_verified"] is False
-        assert evidence["dynamic_range"] == dynamic
-        assert evidence["bit_depth"] == depth
-    assert "technical_evidence" not in item  # 不改变已冻结的历史候选或持久化格式。
 
 
-def test_eight_step_query_contract_survives_empty_results_and_database_reload(store, monkeypatch):
-    """八步工具合同回归，非真实模型八轮对话验收。"""
+def test_explicit_sdk_query_contract_survives_empty_results_and_json_reload(tmp_path, monkeypatch):
+    """查询事实显式存文件；不保留已退役的普通搜索引用续查协议。"""
+    from app import sdk
+    from app.indexers.ranking import filter_technical_candidates
     from tests.test_agent_indexer_actions import FakeIndexerService, _resource_item
 
     service = FakeIndexerService(items=[], partial=False)
-    monkeypatch.setattr('app.agent.domains.resources.indexer_actions.config.get_bool', lambda _: True)
-    monkeypatch.setattr('app.agent.domains.resources.indexer_actions.get_indexer_service', lambda: service)
-
-    async def exercise():
-        specs = build_tool_specs(RecentResourceCandidateStore(), ShareTransferPreviewStore())
-        catalog = catalog_from_tool_specs(spec for spec in specs if spec.name in {
-            'indexer.search_resources', 'indexer.present_candidates', 'ingest.inspect', 'ingest.submit',
-        })
-        pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
-        reference = None
-        expected = {}
-        steps = [
-            ('search', {'title': 'Black Mirror', 'season': 1, 'episode': 1, 'resolution': '1080p', 'media_type': 'tv'}),
-            ('search', {'season': 2}), ('search', {'resolution': '2160p'}),
-            ('present', {'exclude_hdr': True}), ('search', {'season': 3}),
-            ('present', {'dynamic_range': 'SDR'}), ('search', {'resolution': '1080p'}), ('present', {}),
-        ]
-        for turn, (action, patch_args) in enumerate(steps, 1):
-            if turn == 7:
-                service.items = [_resource_item(title='Black.Mirror.S03E01.1080p.SDR')]
-            # 真正切换回合/SQLite实例，确保条件不是同一个 Python 局部对象在续接。
-            lease, _ = await store.begin_turn(owner=OWNER, session_id=SESSION, request_id=f'query-{turn}')
-            context = ToolCallContext(owner=OWNER, session_id=SESSION, request_id=f'query-{turn}',
-                                      turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
-            pipeline.reference_store = SQLiteKernelStore(secret_provider=lambda: SECRET)
-            arguments = {**({'resource_candidates_ref': reference} if reference else {}), **patch_args}
-            if action == 'present':
-                arguments['positions'] = [1] if turn == 8 else []
-            result = await pipeline.execute('indexer.' + ('search_resources' if action == 'search' else 'present_candidates'), arguments, context=context)
-            expected.update(patch_args)
-            document = json.loads(result.outcome.model_content)
-            effective = document['data']['effective_query']
-            assert {key: effective[key] for key in expected} == expected
-            reference = result.outcome.public_content['reference_arguments']['resource_candidates_ref']
-            snapshot = await pipeline.reference_store.resolve(reference, owner=OWNER, session_id=SESSION, expected_kind='resource_candidates')
-            assert snapshot['_query_arguments'] == effective
-            if turn < 7:
-                assert snapshot['candidates'] == [] and not document.get('candidate_numbers')
-                assert result.outcome.public_content['candidate_view'] is None
-                assert 'recommended_ingest_arguments' not in document
-            if turn == 3:
-                intent = {'source_type': 'resource_candidates', 'resource_candidates_ref': reference, 'positions': [1]}
-                for tool, extra in [('ingest.inspect', {}), ('ingest.submit', {'target': 'guangya'})]:
-                    with pytest.raises(ToolPipelineError) as error:
-                        await pipeline.execute(tool, {**intent, **extra}, context=context)
-                    assert error.value.code == 'precondition_failed'
-                    assert '过期' not in str(error.value)
-            if turn == 8:
-                assert document['data']['positions'] == [1]
-                view = result.outcome.public_content['candidate_view']
-                assert [item['position'] for item in view['items']] == [1]
-                assert document['candidate_numbers'][0]['technical_evidence']['dynamic_range'] == 'SDR'
-                assert not (await store.load(owner=OWNER, session_id=SESSION)).pending_effect_plan_id
-        assert len(service.search_calls) == 5  # 展示只读快照，不重新搜站点。
-    asyncio.run(exercise())
+    monkeypatch.setattr("app.indexers.runtime.get_indexer_service", lambda: service)
+    path = tmp_path / "query.json"
+    query = {"title": "Example", "season": 1, "episode": 1, "resolution": "1080p", "media_type": "tv"}
+    result = None
+    for turn, (action, change) in enumerate((
+        ("search", {}), ("search", {"season": 2}), ("search", {"resolution": "2160p"}),
+        ("filter", {"exclude_hdr": True}), ("search", {"season": 3}),
+        ("filter", {"dynamic_range": "SDR"}), ("search", {"resolution": "1080p"}), ("filter", {}),
+    ), 1):
+        if path.exists():
+            query = json.loads(path.read_text())
+        query.update(change)
+        path.write_text(json.dumps(query))
+        if turn == 7:
+            service.items = [_resource_item(title="Example.S03E01.1080p.SDR")]
+        if action == "search":
+            result = sdk.resources.search(**json.loads(path.read_text()))
+            assert result["request"]["season"] == query["season"]
+            assert result["request"]["episode"] == query["episode"]
+        else:
+            assert result is not None
+            result["items"], result["technical_filter"] = filter_technical_candidates(result["items"], query)
+        assert result["technical_filter"]["requested"]["resolution"] == query["resolution"]
+        if turn < 7:
+            assert result["items"] == [] and result["recommendation"]["selected"] is None
+        if turn >= 4:
+            assert result["technical_filter"]["requested"]["exclude_hdr"] is True
+        if turn >= 6:
+            assert result["technical_filter"]["requested"]["dynamic_range"] == "SDR"
+        if turn == 8:
+            assert len(result["items"]) == 1
+            assert result["items"][0]["technical_evidence"]["dynamic_range"] == "SDR"
+    assert len(service.search_calls) == 5  # 本地过滤不重新搜索。

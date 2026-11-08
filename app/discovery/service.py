@@ -5,12 +5,14 @@ import asyncio
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date
 from functools import partial
+from itertools import groupby
 from typing import Any
 
 from app import config, database
@@ -35,7 +37,7 @@ from app.discovery.registry import (
     validate_request,
 )
 from app.logger import get_logger
-from app.repositories.discovery import count_media_watchlist
+from app.repositories.discovery import count_media_watchlist, media_watchlist_snapshot
 
 _DISCOVERY_CLOSED_MESSAGE = "探索服务已关闭，请重试"
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -51,6 +53,37 @@ _ERROR_TYPES = {
     "timeout": ProviderTimeout,
     "unavailable": ProviderUnavailable,
 }
+
+
+def require_discovery_enabled() -> None:
+    """公开探索入口的总开关；本地收藏读取不受此开关限制。"""
+    if not config.get_bool("DISCOVERY_ENABLED"):
+        raise ValueError("影视探索功能当前已关闭")
+
+
+def watchlist_identity(provider: str, media_type: str, external_id: str) -> tuple[str, str, str]:
+    """收藏写入共用的来源身份校验；不截断目标 ID。"""
+    if not all(isinstance(value, str) for value in (provider, media_type, external_id)):
+        raise ValueError("收藏来源、媒体类型和来源 ID 必须是字符串")
+    provider, media_type, external_id = (
+        unicodedata.normalize("NFKC", value).strip() for value in (provider, media_type, external_id)
+    )
+    provider, media_type = provider.lower(), media_type.lower()
+    if provider not in {"tmdb", "douban", "bangumi"}:
+        raise ValueError("不支持的数据源")
+    if media_type not in {"movie", "tv"} or (provider == "bangumi" and media_type != "tv"):
+        raise ValueError("数据源与媒体类型组合无效")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", external_id):
+        raise ValueError("来源 ID 无效")
+    if provider in {"tmdb", "bangumi"} and not re.fullmatch(r"\d{1,20}", external_id):
+        raise ValueError("来源 ID 无效")
+    return provider, media_type, external_id
+
+
+def _watchlist_text(value: str, limit: int) -> str:
+    normalized = unicodedata.normalize("NFKC", (value or "")).strip()
+    cleaned = "".join(" " if unicodedata.category(char).startswith("C") else char for char in normalized)
+    return " ".join(cleaned.split())[:limit]
 
 
 def project_watchlist_state(items: tuple[MediaCard, ...]) -> tuple[MediaCard, ...]:
@@ -254,8 +287,7 @@ class DiscoveryService:
 
     def list_items(self, provider: str, category: str, media_type: str,
                    page: int = 1, filters: dict[str, Any] | None = None) -> DiscoveryPage:
-        page = page
-        if page < 1 or page > 100:
+        if type(page) is not int or page < 1 or page > 100:
             raise ValueError("页码必须在 1 到 100 之间")
         provider, category, media_type = validate_request(provider, category, media_type)
         normalized = validate_filters(provider, category, media_type, filters)
@@ -405,6 +437,7 @@ class DiscoveryService:
                 year = detail["year"]
             if not (release_date or "").strip() and self._valid_release_date(detail.get("release_date", "")):
                 release_date = detail["release_date"]
+            stale = stale or (detail.get("stale") is True and (year, release_date) != (item.year, item.release_date))
             items.append(replace(
                 item, year=year, release_date=release_date,
             ))
@@ -493,18 +526,104 @@ class DiscoveryService:
                         logger.warning("写入探索详情日期缓存失败: %s", exc)
             return detail
 
+    def describe_media(self, provider: str, media_type: str, external_id: str) -> dict[str, Any] | None:
+        """来源详情与本地映射确认事实；读取不保存或猜选映射。"""
+        provider, media_type, external_id = watchlist_identity(provider, media_type, external_id)
+        card = self.get_detail(provider, media_type, external_id)
+        if card is None:
+            return None
+        mapping = None if provider == "tmdb" else database.get_media_external_id(provider, external_id, media_type)
+        return {**card.to_dict(), "mapping_confirmed": provider == "tmdb" or bool(mapping and mapping["confirmed"]),
+                "credits_state": "not_queried"}
+
+    def prepare_watchlist_add(self, provider: str, media_type: str, external_id: str) -> dict[str, Any] | None:
+        """核对来源并冻结待添加内容；已有收藏不查询来源，也不写入收藏。"""
+        identity = watchlist_identity(provider, media_type, external_id)
+        provider, media_type, external_id = identity
+        if database.get_media_watchlist(provider, external_id, media_type) is not None:
+            return {"operation": "add", "expected_absent": False}
+        try:
+            card = self.get_detail(provider, media_type, external_id)
+        except ValueError as exc:
+            raise ProviderInvalidResponse("影视数据源返回的条目信息无效。") from exc
+        if not isinstance(card, MediaCard):
+            return None
+        if (card.provider, card.media_type, card.external_id) != identity:
+            raise ValueError("影视数据源返回的条目标识不一致")
+        title = _watchlist_text(card.title, 160)
+        if not title:
+            raise ValueError("影视条目缺少可用标题")
+        return {"operation": "add", "expected_absent": True, "canonical": {
+            "provider": provider, "media_type": media_type, "external_id": external_id,
+            "title": title, "year": _watchlist_text(card.year, 12), "poster_key": (card.poster_key or "")[:500],
+        }}
+
     @staticmethod
-    def add_watchlist(card: MediaCard) -> None:
-        database.add_media_watchlist(
-            card.provider, card.external_id, card.media_type, card.title, card.year, card.poster_key
+    def add_watchlist(card: MediaCard, *, expected_absent: bool = False) -> int | None:
+        provider, media_type, external_id = watchlist_identity(card.provider, card.media_type, card.external_id)
+        return database.add_media_watchlist(
+            provider, external_id, media_type, card.title, card.year, card.poster_key,
+            expected_absent=expected_absent,
         )
 
     @staticmethod
-    def remove_watchlist(provider: str, media_type: str, external_id: str) -> bool:
-        return database.delete_media_watchlist(provider, external_id, media_type)
+    def get_watchlist_snapshot(watchlist_number: int) -> dict[str, Any]:
+        if isinstance(watchlist_number, bool) or not isinstance(watchlist_number, int) or not 1 <= watchlist_number <= 2_147_483_647:
+            raise ValueError("watchlist_number 必须是正整数")
+        return media_watchlist_snapshot(database.get_media_watchlist_by_id(watchlist_number))
+
+    @staticmethod
+    def get_watchlist(watchlist_id: int) -> dict[str, Any]:
+        """按真实收藏编号读取作品身份；不展示确认快照中的私有海报及并发校验字段。"""
+        snapshot = DiscoveryService.get_watchlist_snapshot(watchlist_id)
+        item = None
+        if snapshot["exists"]:
+            item = {
+                "id": snapshot["watchlist_number"],
+                **{key: snapshot[key] for key in ("provider", "external_id", "media_type")},
+                "title": _watchlist_text(snapshot["title"], 160) or "未命名条目",
+                "year": _watchlist_text(snapshot["year"], 12),
+            }
+        return {"item": item}
+
+    @staticmethod
+    def watchlist_statistics() -> dict[str, Any]:
+        """同一数据库快照统计全库各类型和各类型最新三项，不受列表页长影响。"""
+        rows = database.get_media_watchlist_statistics()
+        groups = []
+        for media_type, group in groupby(rows, key=lambda row: row["media_type"]):
+            latest = list(group)
+            groups.append({
+                "media_type": media_type,
+                "count": int(latest[0]["type_count"]),
+                "latest": [{
+                    "id": int(row["id"]), "provider": row["provider"],
+                    "media_type": row["media_type"],
+                    "title": _watchlist_text(row["title"], 160) or "未命名条目",
+                    "year": _watchlist_text(row["year"], 12),
+                } for row in latest],
+            })
+        return {"total": int(rows[0]["total"]) if rows else 0, "by_media_type": groups}
+
+    @staticmethod
+    def remove_watchlist(
+        provider: str, media_type: str, external_id: str, *, expected_snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        identity = watchlist_identity(provider, media_type, external_id)
+        if expected_snapshot is not None and (
+            not isinstance(expected_snapshot, dict) or expected_snapshot.get("exists") is not True
+            or tuple(expected_snapshot.get(key) for key in ("provider", "media_type", "external_id")) != identity
+        ):
+            raise ValueError("收藏快照与目标不一致")
+        provider, media_type, external_id = identity
+        return database.delete_media_watchlist(provider, external_id, media_type, expected_snapshot=expected_snapshot)
 
     @staticmethod
     def list_watchlist(*, limit: int = 200, before_number: int | None = None) -> dict[str, Any]:
+        if type(limit) is not int:
+            raise ValueError("limit 必须是整数")
+        if before_number is not None and (type(before_number) is not int or not 1 <= before_number <= 2**63 - 1):
+            raise ValueError("before_number 必须是有效的正整数收藏编号")
         limit = max(1, min(limit, 200))
         rows = database.list_media_watchlist(limit=limit + 1, before_number=before_number)
         has_more = len(rows) > limit
@@ -554,6 +673,33 @@ class DiscoveryService:
         )
         return {"tmdb_id": requested_id, "confirmed": True, "candidates": []}
 
+    def _tmdb_mapping_source(self, provider: str, external_id: str, media_type: str) -> dict[str, Any] | None:
+        card = self.get_detail(provider, media_type, external_id)
+        if card is None:
+            return None
+        if not isinstance(card, MediaCard) or (card.provider, card.external_id, card.media_type) != (provider, external_id, media_type):
+            raise ValueError("影视数据源返回的条目标识不一致")
+        # 推荐质量指标不参与映射确认，保持既有身份快照格式。
+        return {key: value for key, value in card.to_dict().items() if key not in {"vote_count", "popularity"}}
+
+    def prepare_tmdb_mapping(
+        self, provider: str, external_id: str, media_type: str, tmdb_id: str,
+    ) -> dict[str, Any] | None:
+        """只读冻结显式映射的来源详情、核验目标和当前映射；不保存候选或确认票据。"""
+        provider, media_type, external_id = watchlist_identity(provider, media_type, external_id)
+        if provider == "tmdb" and external_id != tmdb_id:
+            raise ValueError("TMDB 来源身份不一致")
+        source = self._tmdb_mapping_source(provider, external_id, media_type)
+        if source is None:
+            return None
+        target = self.verify_tmdb_mapping_candidate(tmdb_id, media_type)
+        existing = database.get_media_external_id(provider, external_id, media_type)
+        mapping = None if existing is None else {
+            "tmdb_id": str(existing["tmdb_id"] or ""), "confirmed": bool(existing["confirmed"]),
+            "version": int(existing["version"] or 0), "updated_at": str(existing["updated_at"] or ""),
+        }
+        return {"source": source, "target": target, "mapping": mapping}
+
     def confirm_tmdb_mapping_if_unchanged(
         self,
         provider: str,
@@ -561,13 +707,24 @@ class DiscoveryService:
         media_type: str,
         tmdb_id: str,
         expected_mapping: dict[str, Any] | None,
+        *,
+        expected_source: dict[str, Any] | None = None,
+        expected_target: dict[str, str] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None:
-        """核验候选并以 CAS 保存；映射已变化时返回 ``None``。"""
+        """复核冻结来源与目标后以 CAS 保存；任一快照已变化时返回 ``None``。"""
+        provider, media_type, external_id = watchlist_identity(provider, media_type, external_id)
+        if expected_source is not None and self._tmdb_mapping_source(provider, external_id, media_type) != expected_source:
+            return None
         if provider == "tmdb":
             if external_id != tmdb_id:
                 raise ValueError("TMDB 来源身份不一致")
             return {"tmdb_id": tmdb_id, "confirmed": True, "candidates": []}
         verified = self.verify_tmdb_mapping_candidate(tmdb_id, media_type)
+        if expected_target is not None and verified != expected_target:
+            return None
+        if check_cancelled is not None:
+            check_cancelled()
         requested_id = verified["tmdb_id"]
         if not database.confirm_media_external_id_if_unchanged(
             provider,
@@ -585,12 +742,15 @@ class DiscoveryService:
         """只读核验一个显式 TMDB 候选，供预检与最终提交共同复用。"""
         if media_type not in {"movie", "tv"}:
             raise ValueError("媒体类型无效")
-        requested_id = (tmdb_id or "").strip()
-        if not requested_id.isdigit() or not 1 <= len(requested_id) <= 10:
+        if not isinstance(tmdb_id, str):
+            raise ValueError("TMDB ID 无效")
+        requested_id = tmdb_id.strip()
+        if not re.fullmatch(r"[0-9]{1,10}", requested_id):
             raise ValueError("TMDB ID 无效")
         with self._network_operation(), self._scraper_operation() as scraper:
             match = scraper.match_from_tmdb(requested_id, media_type)
-        if bool(getattr(match, "need_confirm", True)) or str(getattr(match, "tmdb_id", "")) != requested_id:
+        if (bool(getattr(match, "need_confirm", True)) or str(getattr(match, "tmdb_id", "")) != requested_id
+                or getattr(match, "media_type", "") != media_type):
             raise ValueError("无法核验所选 TMDB 映射")
         return {
             "tmdb_id": requested_id,

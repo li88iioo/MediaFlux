@@ -4,10 +4,14 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 from typing import Any
+
+from app.logger import redact_sensitive_text
+from app.modules.local_media_models import LOCAL_TASK_STATUSES
 
 _PLACEHOLDER_TITLES = ("", "磁力任务", "链接任务", "ED2K 任务", "未命名任务", "未命名下载请求", "离线下载", "torrent", "resource")
 
@@ -189,6 +193,172 @@ _DOWNLOAD_ATTENTION_BASE_WHERE = (
 _DOWNLOAD_ATTENTION_WHERE = (
     f"({_DOWNLOAD_ATTENTION_BASE_WHERE}) AND COALESCE(attention_cleared_at,'')=''"
 )
+
+
+_DOWNLOAD_REQUEST_SCOPE_NOTE = (
+    "仅查询当前 MediaFlux 实例本地 SQLite 的 download_requests 记录（按所选范围及条数限制）；"
+    "不查询光鸭，也不代表光鸭实时全账户离线任务队列。"
+)
+_SENSITIVE_TITLE_PATTERN = re.compile(
+    r"(?:magnet:\?|ed2k://|https?://|ftp://|(?:pass(?:word|key)?|secret|token|api[_-]?key|auth(?:orization|key)?|cookie|session|uid)\s*[=:]|authorization\s*:\s*bearer\b)",
+    re.IGNORECASE,
+)
+
+
+def safe_download_text(value: Any, *, limit: int = 180, fallback: str = "下载任务") -> str:
+    redacted = redact_sensitive_text(value).strip()
+    title = unicodedata.normalize("NFKC", redacted)
+    if (
+        not title
+        or _SENSITIVE_TITLE_PATTERN.search(title)
+        or title.startswith(("/", "\\"))
+        or re.search(r"(?:^|\s)[A-Za-z]:[\\/]", title)
+        or re.search(r"(?:^|\s)/(?:[^/\s]+/)+", title)
+    ):
+        return fallback
+    title = "".join(
+        " " if unicodedata.category(char).startswith("C") else char for char in redacted
+    )
+    title = " ".join(title.split())
+    if len(title) > limit:
+        title = title[: limit - 1].rstrip() + "…"
+    return title or fallback
+
+
+def _safe_request_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    return (
+        status
+        if status
+        in {
+            "pending",
+            "submitting",
+            "submitted",
+            "accepted",
+            "queued",
+            "running",
+            "downloading",
+            "completed",
+            "success",
+            "failed",
+            "partial",
+            "manual_review",
+            "requires_manual",
+            "skipped",
+            "cancelled",
+            "resubmitted",
+            "outcome_unknown",
+            "not_started",
+        } | LOCAL_TASK_STATUSES
+        else "unknown"
+    )
+
+
+def _safe_targets(value: Any) -> list[str]:
+    raw = str(value or "").strip().lower()
+    if raw == "both":
+        return ["qb", "guangya"]
+    normalized = re.sub(r"[+|/、，\s]+", ",", raw)
+    return list(
+        dict.fromkeys(
+            item
+            for item in (part.strip() for part in normalized.split(","))
+            if item in {"qb", "guangya"}
+        )
+    )
+
+
+_PUBLIC_TARGET_REVIEW_STATES = frozenset({
+    "manual_review",
+    "requires_manual",
+    "outcome_unknown",
+})
+
+
+def download_request_public_summary(row: Any) -> dict[str, Any]:
+    """投影单条下载请求；统一供列表与资源接入状态查询复用。"""
+    from app.modules.download_dispatcher import public_download_error
+
+    targets = _safe_targets(row["targets"])
+    stage_statuses = {
+        "qb": _safe_request_status(row["qb_status"]),
+        "guangya": _safe_request_status(row["gy_status"]),
+    }
+    if not targets:
+        targets = [target for target, status in stage_statuses.items() if status != "unknown"]
+    root_status = _safe_request_status(row["status"])
+    failed = [target for target in targets if stage_statuses[target] == "failed"]
+    review_required = (
+        root_status in _PUBLIC_TARGET_REVIEW_STATES
+        or any(stage_statuses[target] in _PUBLIC_TARGET_REVIEW_STATES for target in targets)
+    )
+    has_failure_evidence = bool(
+        failed or review_required or root_status in {"failed", "partial"}
+    )
+    error = ""
+    if has_failure_evidence:
+        succeeded = [
+            target for target in targets
+            if stage_statuses[target] in {"submitted", "downloading", "completed"}
+        ]
+        raw_error = row["error"] if "error" in row.keys() else ""
+        error = public_download_error(
+            succeeded=succeeded,
+            failed=failed,
+            review_required=review_required,
+            error=raw_error,
+        )
+    postprocess = download_postprocess_issues(row)
+    cleanup_status = str(row["gy_staging_cleanup_status"] or "") if "gy_staging_cleanup_status" in row.keys() else ""
+    if cleanup_status in {"retained", "failed"}:
+        postprocess.append({"key": "staging_cleanup", "label": "暂存清理", "status": cleanup_status,
+                            "error": str(row["gy_staging_cleanup_error"] or "")})
+    postprocess = [{**item, "error": safe_download_text(item["error"], limit=500, fallback="需要处理，请查看原任务；无需重复下载")}
+                   for item in postprocess]
+    error = "；".join(filter(None, (error, *(f"{item['label']}：{item['error']}" for item in postprocess))))
+    return {
+        "request_number": int(row["id"]),
+        "title": safe_download_text(download_display_title(row)),
+        "kind": str(row["kind"] or "unknown")[:24],
+        "targets": targets,
+        "status": root_status,
+        "qb_status": stage_statuses["qb"],
+        "guangya_status": stage_statuses["guangya"],
+        "organize_status": _safe_request_status(row["organize_status"]),
+        "local_import_status": _safe_request_status(row["local_import_status"] if "local_import_status" in row.keys() else ""),
+        "strm_status": _safe_request_status(row["strm_status"]),
+        "postprocess_issues": postprocess,
+        "updated_at": str(row["updated_at"] or "")[:32],
+        "error": error,
+    }
+
+
+def list_download_request_summaries(
+    scope: str = "active", limit: int = 12, offset: int = 0,
+) -> dict[str, Any]:
+    """分页读取 MF 本地请求；active/attention 与 tracker/待处理列表共用筛选条件。"""
+    if not isinstance(scope, str) or scope.strip().lower() not in {"active", "attention", "recent"}:
+        raise ValueError("scope 仅支持 active、attention 或 recent")
+    if type(limit) is not int or not 1 <= limit <= 30:
+        raise ValueError("limit 必须是 1 到 30 的整数")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset 必须是非负整数")
+    scope = scope.strip().lower()
+    predicate, order = {
+        "active": (_active_download_request_predicate(), "id ASC"),
+        "attention": (_DOWNLOAD_ATTENTION_WHERE, "COALESCE(updated_at,created_at) DESC,id DESC"),
+        "recent": ("1", "id DESC"),
+    }[scope]
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM download_requests WHERE {predicate} ORDER BY {order} LIMIT ? OFFSET ?",
+            (limit + 1, offset),
+        ).fetchall()
+    items = [download_request_public_summary(row) for row in rows[:limit]]
+    has_more = len(rows) > limit
+    return {"scope": scope, "count": len(items), "items": items, "has_more": has_more,
+            "next_offset": offset + len(items) if has_more else None,
+            "scope_note": _DOWNLOAD_REQUEST_SCOPE_NOTE}
 
 
 def _normalized_request_keys(
@@ -394,7 +564,9 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                             display_title: str = "",
                             initial_targets: str = "",
                             retry_source_request_id: int | None = None,
-                            retry_source_status: str = "") -> tuple[int, bool]:
+                            retry_source_status: str = "",
+                            verification_targets: list[dict] | None = None,
+                            verification_owner: str = "") -> tuple[int, bool]:
     """原子创建下载请求，并把等价历史 key 纳入同一防重边界。
 
     运行中的同源请求继续幂等返回；用户再次显式提交已经完成、失败或取消的普通下载时，
@@ -449,6 +621,15 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                     conn, request_id, source_request_id=retry_source_request_id,
                     targets=initial_targets,
                 )
+            if verification_targets:
+                from app.repositories.agent_download_verification import enqueue_agent_download_verification
+
+                registration = enqueue_agent_download_verification(
+                    request_id, targets=verification_targets, owner=verification_owner,
+                    chat_id=chat_id, conn=conn,
+                )
+                if created and registration not in {"queued", "existing"}:
+                    raise ValueError("下载复核目标未能与新请求一同保存")
             return request_id, created
 
         # 串行化“检查所有等价 key → 归档历史 → 新建 canonical 请求”。
@@ -1741,13 +1922,7 @@ def recover_stale_submitting_download_requests(stale_minutes: int = 15) -> int:
         )
 
 
-def list_active_download_requests(
-    limit: int = 100,
-    *,
-    include_local_import: bool = False,
-    after_id: int = 0,
-    wrap: bool = False,
-) -> list[sqlite3.Row]:
+def _active_download_request_predicate(*, include_local_import: bool = False) -> str:
     clauses = [
         "status IN ('submitting','submitted','downloading')",
         "(qb_status IN ('submitted','downloading','outcome_unknown') OR "
@@ -1765,9 +1940,19 @@ def list_active_download_requests(
         clauses.append(
             "(qb_status='completed' AND COALESCE(local_import_status,'') IN ('','pending'))"
         )
+    return f"(status!='cancelled' AND ({' OR '.join(clauses)}))"
+
+
+def list_active_download_requests(
+    limit: int = 100,
+    *,
+    include_local_import: bool = False,
+    after_id: int = 0,
+    wrap: bool = False,
+) -> list[sqlite3.Row]:
     normalized_limit = max(1, limit)
     normalized_after = max(0, (after_id or 0))
-    predicate = f"(status!='cancelled' AND ({' OR '.join(clauses)}))"
+    predicate = _active_download_request_predicate(include_local_import=include_local_import)
     with db.get_conn() as conn:
         rows = conn.execute(
             f"SELECT * FROM download_requests WHERE {predicate} AND id>? "

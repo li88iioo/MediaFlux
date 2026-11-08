@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import threading
 import unittest
+from copy import deepcopy
 from datetime import datetime
 from unittest.mock import Mock, patch
 
@@ -12,13 +13,14 @@ from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmission,
     RecentDownloadVerification,
     build_recent_download_status,
-    enqueue_recent_download_library_verification,
 )
 from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.models import ToolResult
 from app.modules.agent_download_verification_scheduler import (
     DownloadLibraryVerificationScheduler,
 )
+from app.indexers.downloads import enqueue_download_verification, prepare_download_verifications
+from app.modules.episode_audit import EpisodeAuditResult
 from app.notifier import TelegramSendResult
 from tests.support import IsolatedDatabaseTestCase
 
@@ -43,8 +45,64 @@ class MutableClock:
         return self.value
 
 
-def _submission_result(request_id: int, *, created: bool = True) -> ToolResult:
-    return ToolResult(True, "accepted", "submitted", data={
+class DownloadVerificationPreparationTests(unittest.TestCase):
+    def test_preparation_groups_pack_targets_by_resource_and_shares_authoritative_audit(self):
+        service = Mock()
+        target = {"query": "alias", "tmdb_id": "12345", "season": 2,
+                  "as_of": "2026-08-03", "library_name": "动漫库"}
+        targets = [{**target, "result_id": resource, "episode": episode}
+                   for resource, episode in (("pack", 3), ("pack", 4), ("single", 3), ("pack", 3))]
+        original = deepcopy(targets)
+        audit = EpisodeAuditResult(True, "updates_available", "missing", {
+            **_CONTEXT, "title": "Server title", "missing_sample_truncated": False,
+            "missing_sample": [{"season": 2, "episode": 3}, {"season": 2, "episode": 4}],
+            "sources": [{"path": "/private/library"}],
+        })
+        with patch("app.indexers.downloads.episode_audit.audit_series_episodes", return_value=audit) as run, \
+             patch.object(db, "get_conn", side_effect=AssertionError("preparation must not write")):
+            prepared = prepare_download_verifications(service, ["pack", "single", "unrelated"], targets, scope="agent")
+        run.assert_called_once_with(target, refresh=True)
+        self.assertEqual(prepared, {
+            "pack": [{**_CONTEXT, "title": "Server title", "episode": n} for n in (3, 4)],
+            "single": [{**_CONTEXT, "title": "Server title"}],
+        })
+        self.assertEqual(targets, original)
+        self.assertEqual(service.get_result.call_count, 2)
+        self.assertTrue(all(call.kwargs == {"scope": "agent"} for call in service.get_result.call_args_list))
+        service.resolve.assert_not_called()
+
+    def test_preparation_rejects_unselected_ids_and_client_evidence_before_audit(self):
+        valid = {"result_id": "selected", "query": "The Show", "season": 2, "episode": 3}
+        for invalid in ({**valid, "result_id": "other"}, {**valid, "verified_missing": True},
+                        {**valid, "season": True}, {**valid, "as_of": "9999-12-31"}):
+            service = Mock()
+            with self.subTest(target=invalid), \
+                 patch("app.indexers.downloads.episode_audit.audit_series_episodes") as audit:
+                with self.assertRaises(ValueError):
+                    prepare_download_verifications(service, ["selected"], [invalid])
+                audit.assert_not_called()
+                service.get_result.assert_not_called()
+
+    def test_preparation_needs_current_authoritative_missing_verdict(self):
+        target = {"result_id": "selected", "query": "The Show", "season": 2, "episode": 3}
+        for ok, status, data in (
+            (False, "inconclusive", {"target_missing": True}),
+            (True, "up_to_date", {"target_missing": True}),
+            (True, "updates_available", {"target_missing": False}),
+            (True, "updates_available", {"target_missing": True, "tmdb_id": ""}),
+        ):
+            with self.subTest(status=status, data=data), \
+                 patch("app.indexers.downloads.episode_audit.audit_series_episodes", return_value=EpisodeAuditResult(
+                     ok, status, "audit", {**_CONTEXT, "target_episode": 3, **data},
+                 )) as audit, patch.object(db, "get_conn", side_effect=AssertionError("no write")):
+                with self.assertRaises(ValueError):
+                    prepare_download_verifications(Mock(), ["selected"], [target])
+                self.assertTrue(audit.call_args.kwargs["refresh"])
+                self.assertEqual(audit.call_args.args[0]["target_episode"], 3)
+
+
+def _submission_result(request_id: int, *, created: bool = True) -> dict:
+    return {
         "request_id": request_id,
         "target": "qb",
         "status": "submitted",
@@ -55,7 +113,7 @@ def _submission_result(request_id: int, *, created: bool = True) -> ToolResult:
         "magnet": "magnet:?xt=urn:btih:must-not-persist",
         "path": "/volume/private/must-not-persist",
         "session_token": "must-not-persist",
-    })
+    }
 
 
 def _audit_missing() -> ToolResult:
@@ -63,11 +121,15 @@ def _audit_missing() -> ToolResult:
         "missing_count": 1,
         "missing_sample": [{"season": 2, "episode": 3}],
         "missing_sample_truncated": False,
+        "episodes": [{"season": 2, "episode": episode, "aired": True, "local": episode != 3} for episode in (3, 4)],
     })
 
 
 def _audit_visible() -> ToolResult:
-    return ToolResult(True, "up_to_date", "visible", data={"missing_count": 0})
+    return ToolResult(True, "up_to_date", "visible", data={
+        "missing_count": 0,
+        "episodes": [{"season": 2, "episode": episode, "aired": True, "local": True} for episode in (3, 4)],
+    })
 
 
 class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
@@ -77,6 +139,82 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM agent_download_verification_notification_outbox")
             conn.execute("DELETE FROM agent_download_verifications")
             conn.execute("DELETE FROM download_requests")
+
+    def test_multitarget_registration_uses_callers_transaction_and_owner_identity(self):
+        request_id, _ = db.create_download_request("atomic-intent", "magnet", origin="agent:native")
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            with db.get_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self.assertEqual(db.enqueue_agent_download_verification(
+                    request_id, targets=[_CONTEXT], owner="owner-a", conn=conn,
+                ), "queued")
+                self.assertIsNotNone(conn.execute("SELECT request_id FROM agent_download_verifications").fetchone())
+                raise RuntimeError("rollback")
+        self.assertIsNone(db.get_agent_download_verification(request_id))
+        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[_CONTEXT], owner="owner-a"), "queued")
+        job = db.claim_due_agent_download_verification(current_time="9999-12-31 23:59:59")
+        assert job is not None
+        same = {**_CONTEXT, "as_of": "2026-08-04", "title": "Updated title"}
+        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[same], owner="owner-a"), "existing")
+        stored_row_2 = db.get_agent_download_verification(request_id)
+        assert stored_row_2 is not None
+        self.assertEqual(stored_row_2["lease_generation"], job["lease_generation"])
+        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[same], owner="owner-b"), "conflict")
+        self.assertEqual(db.enqueue_agent_download_verification(
+            request_id, targets=[same, {**_CONTEXT, "episode": 4}], owner="owner-a",
+        ), "queued")
+        merged = db.get_agent_download_verification(request_id)
+        assert merged is not None
+        self.assertEqual([target["episode"] for target in merged["targets"]], [3, 4])
+        self.assertNotIn("episode", merged)
+        self.assertGreater(merged["lease_generation"], job["lease_generation"])
+        self.assertFalse(db.update_agent_download_verification(
+            request_id, status="visible", result="visible", attempts=1, next_check_at=db.now(),
+            expected_lease_generation=job["lease_generation"],
+        ))
+
+    def test_new_target_reopens_same_job_and_invalidates_old_notification_lease(self):
+        from app.modules.agent_download_verification_notifications import dump_download_verification_payload
+        request_id = self._request()
+        db.enqueue_agent_download_verification(request_id, targets=[_CONTEXT], owner="owner-a")
+        job = db.claim_due_agent_download_verification(current_time="9999-12-31 23:59:59")
+        assert job is not None
+        targets = [{**_CONTEXT, "result": "visible"}]
+        self.assertTrue(db.finish_agent_download_verification(
+            request_id, status="visible", result="visible", attempts=1, next_check_at=db.now(),
+            expected_lease_generation=job["lease_generation"], targets=targets,
+            payload_json=dump_download_verification_payload(targets=targets, status="visible", result="visible", attempts=1),
+        ))
+        notification = db.claim_due_agent_download_verification_notification(current_time="9999-12-31 23:59:59")
+        assert notification is not None
+        stored_row_7 = db.get_agent_download_verification(request_id)
+        assert stored_row_7 is not None
+        self.assertEqual(stored_row_7["targets"][0]["title"], "")
+        self.assertEqual(db.enqueue_agent_download_verification(
+            request_id, targets=[{**_CONTEXT, "episode": 4}], owner="owner-a",
+        ), "queued")
+        reopened = db.get_agent_download_verification(request_id)
+        assert reopened is not None
+        self.assertEqual((reopened["status"], reopened["result"]), ("pending", ""))
+        self.assertEqual([target["result"] for target in reopened["targets"]], ["", ""])
+        outbox = db.list_agent_download_verification_notifications()
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual((outbox[0]["id"], outbox[0]["status"]), (notification["id"], "discarded"))
+        self.assertFalse(db.complete_agent_download_verification_notification(
+            notification["id"], expected_lease_generation=notification["lease_generation"],
+        ))
+        next_job = db.claim_due_agent_download_verification(current_time="9999-12-31 23:59:59")
+        assert next_job is not None
+        targets = [{**target, "result": "visible"} for target in next_job["targets"]]
+        self.assertTrue(db.finish_agent_download_verification(
+            request_id, status="visible", result="visible", attempts=1, next_check_at=db.now(),
+            expected_lease_generation=next_job["lease_generation"], targets=targets,
+            payload_json=dump_download_verification_payload(targets=targets, status="visible", result="visible", attempts=1),
+        ))
+        outbox = db.list_agent_download_verification_notifications()
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual((outbox[0]["id"], outbox[0]["status"]), (notification["id"], "pending"))
+        self.assertGreater(outbox[0]["lease_generation"], notification["lease_generation"])
 
     def _request(self, key: str = "auto-verify", *, completed: bool = False) -> int:
         request_id, _ = db.create_download_request(
@@ -95,29 +233,22 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
 
     def test_confirmation_enqueue_is_strict_unique_and_safe(self):
         request_id = self._request()
-        self.assertTrue(enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT
-        ))
-        self.assertFalse(enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "queued")
+        self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "existing")
         row = db.get_agent_download_verification(request_id)
         assert (row) is not None
         self.assertEqual(row["status"], "pending")
-        self.assertEqual(row["tmdb_id"], "12345")
-        self.assertEqual((row["season"], row["episode"]), (2, 3))
-        self.assertEqual(row["library_name"], "动漫库")
+        self.assertEqual(row["targets"][0]["tmdb_id"], "12345")
+        self.assertEqual((row["targets"][0]["season"], row["targets"][0]["episode"]), (2, 3))
+        self.assertEqual(row["targets"][0]["library_name"], "动漫库")
         serialized = repr(dict(row))
         for secret in ("magnet:", "torrent", "/volume", "session"):
             self.assertNotIn(secret, serialized)
 
         other_id = self._request("invalid-auto-verify")
-        self.assertFalse(enqueue_recent_download_library_verification(
-            _submission_result(other_id, created=False), _CONTEXT
-        ))
-        self.assertFalse(enqueue_recent_download_library_verification(
-            _submission_result(other_id), {**_CONTEXT, "as_of": "9999-12-31"}
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(other_id, created=False), _CONTEXT, owner="")["status"], "queued")
+        other_id = self._request("invalid-date-auto-verify")
+        self.assertEqual(enqueue_download_verification(_submission_result(other_id), {**_CONTEXT, "as_of": "9999-12-31"}, owner="")["status"], "not_eligible")
         self.assertIsNone(db.get_agent_download_verification(other_id))
 
     def test_namespaced_agent_indexer_origin_can_enqueue(self):
@@ -131,16 +262,102 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
             request_id, targets="qb", status="submitted", qb_status="submitted"
         )
 
-        self.assertTrue(enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "queued")
         assert (db.get_agent_download_verification(request_id)) is not None
+
+    def test_existing_web_rss_requests_accept_verified_goals_without_changing_download(self):
+        for origin in ("indexer:nyaa", "rss"):
+            with self.subTest(origin=origin):
+                request_id, _ = db.create_download_request(f"verified-{origin}", "magnet", origin=origin)
+                stored_row_6 = db.get_download_request(request_id)
+                assert stored_row_6 is not None
+                request = dict(stored_row_6)
+                self.assertEqual(db.enqueue_agent_download_verification(
+                    request_id, targets=[_CONTEXT], owner=_TG_OWNER, chat_id=_TG_CHAT_ID,
+                ), "queued")
+                job = db.get_agent_download_verification(request_id)
+                assert job is not None
+                self.assertEqual(job["targets"], [{**_CONTEXT, "result": ""}])
+                self.assertEqual(db.enqueue_agent_download_verification(
+                    request_id, targets=[_CONTEXT], owner=_TG_OWNER, chat_id=_TG_CHAT_ID,
+                ), "existing")
+                for owner, chat_id in (("foreign-owner", _TG_CHAT_ID), (_TG_OWNER, "999")):
+                    self.assertEqual(db.enqueue_agent_download_verification(
+                        request_id, targets=[{**_CONTEXT, "episode": 4}], owner=owner, chat_id=chat_id,
+                    ), "conflict")
+                self.assertEqual(db.get_agent_download_verification(request_id), job)
+                stored_row_8 = db.get_download_request(request_id)
+                assert stored_row_8 is not None
+                self.assertEqual(dict(stored_row_8), request)
+
+    def test_verification_cannot_register_without_an_existing_request(self):
+        request_id = 2_147_483_647
+        self.assertIsNone(db.get_download_request(request_id))
+        self.assertEqual(db.enqueue_agent_download_verification(
+            request_id, targets=[_CONTEXT], owner=_TG_OWNER, chat_id=_TG_CHAT_ID,
+        ), "not_eligible")
+        self.assertIsNone(db.get_agent_download_verification(request_id))
+
+    def test_existing_request_merges_only_same_owner_targets(self):
+        request_id = self._request()
+        receipt = _submission_result(request_id)
+        self.assertEqual(enqueue_download_verification(receipt, _CONTEXT, owner="owner-a")["status"], "queued")
+        stored_row_1 = db.get_agent_download_verification(request_id)
+        assert stored_row_1 is not None
+        original = dict(stored_row_1)
+        self.assertEqual(enqueue_download_verification(receipt, {**_CONTEXT, "episode": 4}, owner="owner-b"),
+                         {"status": "conflict", "request_id": request_id})
+        stored_row_3 = db.get_agent_download_verification(request_id)
+        assert stored_row_3 is not None
+        self.assertEqual(dict(stored_row_3), original)
+        self.assertEqual(enqueue_download_verification(receipt, {**_CONTEXT, "episode": 4}, owner="owner-a")["status"], "queued")
+        stored_row_9 = db.get_agent_download_verification(request_id)
+        assert stored_row_9 is not None
+        self.assertEqual([target["episode"] for target in stored_row_9["targets"]], [3, 4])
+
+    def test_partial_unknown_duplicate_and_multiple_target_receipts_keep_their_facts(self):
+        request_id = self._request()
+        db.update_download_request(request_id, targets="both", gy_status="manual_review")
+        partial = {**_submission_result(request_id), "target": "both", "status": "partial", "failed": ["guangya"]}
+        original = deepcopy(partial)
+        self.assertEqual(enqueue_download_verification(partial, _CONTEXT, owner="owner-a")["status"], "queued")
+        self.assertEqual(partial, original)
+        stored_row_4 = db.get_download_request(request_id)
+        assert stored_row_4 is not None
+        self.assertEqual(stored_row_4["gy_status"], "manual_review")
+        for receipt in (
+            {**partial, "created": False, "duplicate": True, "status": "duplicate", "batch_result": partial},
+            {**partial, "status": "manual_review", "succeeded": []},
+            {**partial, "status": "outcome_unknown", "succeeded": []},
+            {**partial, "status": "failed", "succeeded": []},
+            {**partial, "target": "qb"},
+        ):
+            with self.subTest(status=receipt["status"]):
+                self.assertEqual(enqueue_download_verification(receipt, _CONTEXT, owner="owner-a")["status"], "not_eligible")
+        result = enqueue_download_verification(partial, [_CONTEXT, {**_CONTEXT, "episode": 4}], owner="owner-a")
+        self.assertEqual(result["status"], "queued")
+        stored_row_10 = db.get_agent_download_verification(request_id)
+        assert stored_row_10 is not None
+        self.assertEqual([target["episode"] for target in stored_row_10["targets"]], [3, 4])
+
+    def test_registration_failure_does_not_relabel_or_erase_accepted_download(self):
+        request_id = self._request()
+        receipt = _submission_result(request_id)
+        original = deepcopy(receipt)
+        with patch.object(db, "enqueue_agent_download_verification", side_effect=RuntimeError("private database path")):
+            result = enqueue_download_verification(receipt, _CONTEXT, owner="owner-a")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["request_id"], request_id)
+        self.assertNotIn("private", repr(result))
+        self.assertEqual(receipt, original)
+        stored_row_5 = db.get_download_request(request_id)
+        assert stored_row_5 is not None
+        self.assertEqual(stored_row_5["status"], "downloading")
+        self.assertIsNone(db.get_agent_download_verification(request_id))
 
     def test_due_claim_is_atomic_and_terminal_rows_are_not_reclaimed(self):
         request_id = self._request()
-        self.assertTrue(enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "queued")
         first = db.claim_due_agent_download_verification(
             current_time="9999-12-31 23:59:59"
         )
@@ -156,6 +373,7 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
             request_id,
             status="visible",
             result="visible",
+            targets=[{**_CONTEXT, "result": "visible"}],
             attempts=1,
             next_check_at="9999-12-31 23:59:59",
             last_checked_at="9999-12-31 23:59:59",
@@ -176,15 +394,13 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
         get_agent_download_verification_result = db.get_agent_download_verification(request_id)
         assert get_agent_download_verification_result is not None
         self.assertEqual(
-            get_agent_download_verification_result["title"],
+            get_agent_download_verification_result["targets"][0]["title"],
             "",
         )
 
     def test_running_lease_can_only_be_renewed_by_current_generation(self):
         request_id = self._request("renew-auto-verify")
-        self.assertTrue(enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "queued")
         claimed = db.claim_due_agent_download_verification(
             current_time="9999-12-31 23:59:59"
         )
@@ -214,9 +430,7 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
             )
         }
         for request_id in request_ids.values():
-            self.assertTrue(enqueue_recent_download_library_verification(
-                _submission_result(request_id), _CONTEXT
-            ))
+            self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "queued")
         states = {
             "old-visible": ("visible", "2026-07-26 11:59:59"),
             "old-attention": ("attention", "2026-07-20 12:00:00"),
@@ -262,9 +476,7 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
     def test_retention_respects_per_table_batch_limit(self):
         request_ids = [self._request(f"retention-limit-{index}") for index in range(2)]
         for request_id in request_ids:
-            self.assertTrue(enqueue_recent_download_library_verification(
-                _submission_result(request_id), _CONTEXT
-            ))
+            self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")["status"], "queued")
         with db.get_conn() as conn:
             conn.executemany(
                 "UPDATE agent_download_verifications SET status='visible',updated_at=? "
@@ -286,37 +498,21 @@ class DownloadLibraryVerificationDatabaseTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(remaining, 1)
 
-    def test_enqueue_rejects_non_agent_pending_and_failed_submission(self):
+    def test_enqueue_rejects_pending_and_failed_submission(self):
         pending_id, _ = db.create_download_request(
             "pending-auto-verify", "magnet", origin="agent"
         )
-        self.assertFalse(enqueue_recent_download_library_verification(
-            _submission_result(pending_id), _CONTEXT
-        ))
-
-        foreign_id, _ = db.create_download_request(
-            "foreign-auto-verify", "magnet", origin="telegram"
-        )
-        db.update_download_request(
-            foreign_id, targets="qb", status="submitted", qb_status="submitted"
-        )
-        self.assertFalse(enqueue_recent_download_library_verification(
-            _submission_result(foreign_id), _CONTEXT
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(pending_id), _CONTEXT, owner="")["status"], "not_eligible")
 
         failed = _submission_result(pending_id)
-        failed.data["succeeded"] = []
-        failed.data["failed"] = ["qb"]
-        failed.data["status"] = "failed"
-        self.assertFalse(enqueue_recent_download_library_verification(
-            failed, _CONTEXT
-        ))
+        failed["succeeded"] = []
+        failed["failed"] = ["qb"]
+        failed["status"] = "failed"
+        self.assertEqual(enqueue_download_verification(failed, _CONTEXT, owner="")["status"], "not_eligible")
 
     def test_init_recovers_interrupted_running_job(self):
         request_id = self._request()
-        enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT
-        )
+        enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner="")
         claimed = db.claim_due_agent_download_verification(
             current_time="9999-12-31 23:59:59"
         )
@@ -408,9 +604,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         elif phase == "failed":
             fields.update(status="failed", qb_status="failed")
         db.update_download_request(request_id, **fields)
-        self.assertTrue(enqueue_recent_download_library_verification(
-            _submission_result(request_id), _CONTEXT, owner
-        ))
+        self.assertEqual(enqueue_download_verification(_submission_result(request_id), _CONTEXT, owner=owner)["status"], "queued")
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE agent_download_verifications SET status='pending',result='',"
@@ -459,6 +653,103 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["next_check_at"], "2026-08-03 12:00:30")
         executor.assert_not_called()
 
+    def test_atomic_intent_waits_for_submission_without_backend_and_unknown_never_reposts(self):
+        executor = Mock()
+        scheduler = DownloadLibraryVerificationScheduler(audit_executor=executor, clock=self.clock)
+        for phase in ("pending", "submitting", "unknown"):
+            with self.subTest(phase=phase):
+                request_id, _ = db.create_download_request(f"intent-{phase}", "magnet", origin="agent")
+                db.update_download_request(request_id, status=phase)
+                self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[_CONTEXT]), "queued")
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE agent_download_verifications SET next_check_at=? WHERE request_id=?", (self.clock().strftime("%Y-%m-%d %H:%M:%S"), request_id))
+                self.assertEqual(scheduler.run_once(limit=1), 1)
+                job = db.get_agent_download_verification(request_id)
+                assert job is not None
+                self.assertEqual(job["status"], "attention" if phase == "unknown" else "pending")
+                self.assertEqual(job["attempts"], 0)
+                stored_row_11 = db.get_download_request(request_id)
+                assert stored_row_11 is not None
+                self.assertEqual(stored_row_11["status"], phase)
+        executor.assert_not_called()
+
+    def test_pack_records_every_target_and_unavailable_group_cannot_become_visible(self):
+        request_id = self._request("mixed-pack", owner=_TG_OWNER)
+        extra = [{**_CONTEXT, "episode": 4}, {**_CONTEXT, "tmdb_id": "999", "episode": 5}]
+        db.enqueue_agent_download_verification(request_id, targets=extra, owner=_TG_OWNER, chat_id=_TG_CHAT_ID)
+        partial_inventory = _audit_missing()
+        partial_inventory.data["missing_sample"] = [{"season": 2, "episode": 4}]
+        partial_inventory.data["episodes"] = [
+            {"season": 2, "episode": episode, "aired": True, "local": episode == 3} for episode in (3, 4)
+        ]
+        executor = Mock(side_effect=[(partial_inventory, 1), (ToolResult(False, "inconclusive", "offline"), 1)])
+        scheduler = DownloadLibraryVerificationScheduler(audit_executor=executor, clock=self.clock, max_attempts=1, terminal_notifier=Mock(return_value=True))
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_download_verifications SET next_check_at=?,last_checked_at=? WHERE request_id=?",
+                         (self.clock().strftime("%Y-%m-%d %H:%M:%S"),) * 2 + (request_id,))
+        self.assertEqual(scheduler.run_once(limit=1), 1)
+        job = db.get_agent_download_verification(request_id)
+        assert job is not None
+        self.assertEqual((job["status"], job["result"]), ("attention", "inconclusive"))
+        self.assertEqual([target["result"] for target in job["targets"]], ["visible", "missing", "inconclusive"])
+        self.assertEqual([target["title"] for target in job["targets"]], ["", "", ""])
+        self.assertEqual(executor.call_count, 2)
+        self.assertNotIn("target_episode", executor.call_args_list[0].args[0])
+        self.assertEqual(len(db.list_agent_download_verification_notifications()), 1)
+
+    def test_pack_all_visible_uses_one_job_and_one_notification(self):
+        request_id = self._request("visible-pack", owner=_TG_OWNER)
+        db.enqueue_agent_download_verification(request_id, targets=[{**_CONTEXT, "episode": 4}], owner=_TG_OWNER, chat_id=_TG_CHAT_ID)
+        executor, notifier = Mock(return_value=(_audit_visible(), 1)), Mock(return_value=True)
+        scheduler = DownloadLibraryVerificationScheduler(audit_executor=executor, clock=self.clock, terminal_notifier=notifier)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_download_verifications SET next_check_at=?,last_checked_at=? WHERE request_id=?",
+                         (self.clock().strftime("%Y-%m-%d %H:%M:%S"),) * 2 + (request_id,))
+        self.assertEqual(scheduler.run_once(limit=1), 1)
+        job = db.get_agent_download_verification(request_id)
+        assert job is not None
+        self.assertEqual((job["status"], job["result"]), ("visible", "visible"))
+        self.assertEqual([target["result"] for target in job["targets"]], ["visible", "visible"])
+        self.assertEqual(len(db.list_agent_download_verification_notifications()), 1)
+        executor.assert_called_once()
+        notifier.assert_called_once()
+
+    def test_completed_backend_is_audited_without_relabeling_other_unknown_backend(self):
+        request_id = self._request("partial-backend", owner=_TG_OWNER)
+        db.update_download_request(request_id, targets="both", status="manual_review",
+                                   qb_status="completed", gy_status="manual_review", local_import_status="completed")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_download_verifications SET last_checked_at=? WHERE request_id=?", (db.now(), request_id))
+        executor = Mock(return_value=(_audit_visible(), 1))
+        scheduler = DownloadLibraryVerificationScheduler(audit_executor=executor, clock=self.clock, terminal_notifier=Mock(return_value=True))
+        self.assertEqual(scheduler.run_once(limit=1), 1)
+        executor.assert_called_once()
+        job = db.get_agent_download_verification(request_id)
+        assert job is not None
+        self.assertEqual((job["status"], job["result"]), ("visible", "visible"))
+        request = db.get_download_request(request_id)
+        assert request is not None
+        self.assertEqual((request["status"], request["qb_status"], request["gy_status"]), ("manual_review", "completed", "manual_review"))
+
+    def test_new_target_during_audit_blocks_old_terminal_result(self):
+        request_id = self._request("merge-during-audit", owner=_TG_OWNER)
+        def audit(_arguments):
+            self.assertEqual(db.enqueue_agent_download_verification(
+                request_id, targets=[{**_CONTEXT, "episode": 4}], owner=_TG_OWNER, chat_id=_TG_CHAT_ID,
+            ), "queued")
+            return _audit_visible(), 1
+        notifier = Mock()
+        scheduler = DownloadLibraryVerificationScheduler(audit_executor=audit, clock=self.clock, terminal_notifier=notifier)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_download_verifications SET last_checked_at=? WHERE request_id=?", (db.now(), request_id))
+        self.assertEqual(scheduler.run_once(limit=1), 1)
+        job = db.get_agent_download_verification(request_id)
+        assert job is not None
+        self.assertEqual((job["status"], job["result"]), ("pending", ""))
+        self.assertEqual([target["result"] for target in job["targets"]], ["", ""])
+        self.assertEqual(db.list_agent_download_verification_notifications(), [])
+        notifier.assert_not_called()
+
     def test_completed_download_becomes_visible_after_exact_audit(self):
         request_id = self._request("visible-auto-verify", owner=_TG_OWNER)
         executor = Mock(return_value=(_audit_visible(), 3))
@@ -491,7 +782,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["status"], "visible")
         self.assertEqual(row["result"], "visible")
         self.assertEqual(row["attempts"], 1)
-        self.assertEqual(row["title"], "")
+        self.assertEqual(row["targets"][0]["title"], "")
         self.assertEqual(row["last_checked_at"], "2026-08-03 12:00:31")
         notifier.assert_called_once_with(
             owner=_TG_OWNER,
@@ -501,6 +792,44 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.clock.value = datetime(2026, 8, 3, 12, 1, 0)
         self.assertEqual(scheduler.run_once(), 0)
         self.assertEqual(notifier.call_count, 1)
+
+    def test_default_executor_verifies_exact_download_without_library_batch_arguments(self):
+        from app.modules.episode_audit import reset_episode_audit_cache_for_tests
+
+        reset_episode_audit_cache_for_tests()
+        self.addCleanup(reset_episode_audit_cache_for_tests)
+        request_id = self._request("default-exact-auto-verify", owner=_TG_OWNER)
+        notifier = Mock(return_value=True)
+        scheduler = DownloadLibraryVerificationScheduler(clock=self.clock, terminal_notifier=notifier)
+        client = Mock()
+        client.detail.return_value = {"name": "The Show", "seasons": [{"season_number": 2}]}
+        client.tv_season_detail.return_value = {
+            "episodes": [{"episode_number": 3, "air_date": "2026-08-01"}],
+        }
+        source = {
+            "server_type": "jellyfin", "server_name": "Jellyfin", "status": "ready",
+            "selected": {"name": "The Show", "tmdb_id": "12345", "year": "2026"},
+            "episodes": [(2, 3)], "truncated": False,
+        }
+        with (
+            patch("app.modules.episode_audit.inspect_series_episode_sources", return_value=[source]) as inventory,
+            patch("app.modules.episode_audit.TMDBClient", return_value=client),
+            patch("socket.socket.connect", side_effect=AssertionError("禁止实际网络连接")),
+        ):
+            self.assertEqual(scheduler.run_once(), 1)
+            inventory.assert_not_called()
+            self.clock.value = datetime(2026, 8, 3, 12, 0, 31)
+            self.assertEqual(scheduler.run_once(), 1)
+        inventory.assert_called_once()
+        self.assertEqual(inventory.call_args.args, ("The Show",))
+        self.assertEqual(inventory.call_args.kwargs["tmdb_id"], "12345")
+        self.assertEqual(inventory.call_args.kwargs["library_name"], "动漫库")
+        client.tv_season_detail.assert_called_once_with("12345", 2)
+        client.close.assert_called_once_with()
+        row = db.get_agent_download_verification(request_id)
+        self.assertIsNotNone(row)
+        self.assertEqual((row["status"], row["result"], row["attempts"]), ("visible", "visible", 1))
+        notifier.assert_called_once_with(owner=_TG_OWNER, chat_id=_TG_CHAT_ID, request_id=request_id)
 
     def test_runtime_invalidation_stops_remaining_verification_batch(self):
         first_id = self._request("generation-batch-first")
@@ -566,10 +895,12 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
         )
+        assert job is not None
         scheduler = DownloadLibraryVerificationScheduler(
             audit_executor=Mock(),
             clock=self.clock,
         )
+        job["targets"] = [{**target, "result": 'missing'} for target in job["targets"]]
         scheduler._finish(
             job,
             status="attention",
@@ -613,7 +944,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(first["status"], "retry_wait")
         self.assertEqual(first["result"], "missing")
         self.assertEqual(first["attempts"], 1)
-        self.assertEqual(first["title"], "The Show")
+        self.assertEqual(first["targets"][0]["title"], "The Show")
         self.assertEqual(first["next_check_at"], "2026-08-03 12:01:31")
 
         self.clock.value = datetime(2026, 8, 3, 12, 1, 32)
@@ -763,12 +1094,14 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
         )
+        assert job is not None
         notifier = Mock(return_value=True)
         scheduler = DownloadLibraryVerificationScheduler(
             audit_executor=Mock(),
             terminal_notifier=notifier,
             clock=self.clock,
         )
+        job["targets"] = [{**target, "result": 'missing'} for target in job["targets"]]
         scheduler._finish(
             job,
             status="attention",
@@ -806,6 +1139,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
         )
+        assert job is not None
         scheduler = DownloadLibraryVerificationScheduler(
             audit_executor=Mock(),
             terminal_notifier=Mock(return_value=TelegramSendResult(
@@ -813,6 +1147,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
             )),
             clock=self.clock,
         )
+        job["targets"] = [{**target, "result": 'missing'} for target in job["targets"]]
         scheduler._finish(
             job,
             status="attention",
@@ -833,9 +1168,11 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
         )
+        assert job is not None
         scheduler = DownloadLibraryVerificationScheduler(
             audit_executor=Mock(), terminal_notifier=Mock(), clock=self.clock,
         )
+        job["targets"] = [{**target, "result": 'missing'} for target in job["targets"]]
         scheduler._finish(
             job, status="attention", result="missing", attempts=2,
             current="2026-08-03 12:00:00",
@@ -929,6 +1266,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
             clock=self.clock,
         )
 
+        old_job["targets"] = [{**target, "result": 'visible'} for target in old_job["targets"]]
         scheduler._finish(
             old_job,
             status="visible",
@@ -944,6 +1282,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
             "running",
         )
 
+        new_job["targets"] = [{**target, "result": 'inconclusive'} for target in new_job["targets"]]
         scheduler._finish(
             new_job,
             status="attention",
@@ -959,13 +1298,14 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["status"], "attention")
         self.assertEqual(row["result"], "inconclusive")
         self.assertEqual(row["attempts"], 2)
-        self.assertEqual(row["title"], "")
+        self.assertEqual(row["targets"][0]["title"], "")
         self.assertEqual(row["lease_generation"], 2)
         notifier.assert_called_once_with(
             owner=_TG_OWNER,
             chat_id=_TG_CHAT_ID,
             request_id=request_id,
         )
+        new_job["targets"] = [{**target, "result": 'inconclusive'} for target in new_job["targets"]]
         scheduler._finish(
             new_job,
             status="attention",
@@ -1018,20 +1358,8 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         )
         with (
             patch(
-                "app.modules.guangya_rename.maintain_rename_plans",
-                side_effect=RuntimeError("rename cleanup failed"),
-            ) as rename_cleanup,
-            patch(
-                "app.modules.guangya_residual_cleanup.maintain_cleanup_plans",
-                return_value={"removed": 1, "remaining": 0, "bytes": 0},
-            ) as residual_cleanup,
-            patch(
-                "app.modules.guangya_workspace.maintain_workspace_observations",
-                return_value={"removed": 1, "remaining": 0, "bytes": 0},
-            ) as workspace_cleanup,
-            patch(
                 "app.modules.guangya_fs_change.maintain_fs_change_plans",
-                return_value={"removed": 1, "remaining": 0},
+                side_effect=RuntimeError("plan cleanup failed"),
             ) as fs_change_cleanup,
             patch(
                 "app.modules.agent_download_verification_scheduler."
@@ -1043,9 +1371,6 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
             ) as purge,
         ):
             self.assertEqual(scheduler.run_once(), 0)
-        rename_cleanup.assert_called_once_with()
-        residual_cleanup.assert_called_once_with()
-        workspace_cleanup.assert_called_once_with()
         fs_change_cleanup.assert_called_once_with()
         purge.assert_called_once()
 
@@ -1102,13 +1427,15 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
 
     def test_status_projection_exposes_only_safe_automatic_state(self):
         request_id = self._request("projection-auto-verify")
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE agent_download_verifications SET status='retry_wait',"
-                "result='missing',attempts=2,next_check_at=?,last_checked_at=? "
-                "WHERE request_id=?",
-                ("2026-08-03 12:05:00", "2026-08-03 12:00:00", request_id),
-            )
+        db.enqueue_agent_download_verification(request_id, targets=[{**_CONTEXT, "episode": 4}])
+        job = db.claim_due_agent_download_verification(current_time="9999-12-31 23:59:59")
+        assert job is not None
+        self.assertTrue(db.update_agent_download_verification(
+            request_id, status="retry_wait", result="missing", attempts=2,
+            next_check_at="2026-08-03 12:05:00", last_checked_at="2026-08-03 12:00:00",
+            expected_lease_generation=job["lease_generation"],
+            targets=[{**target, "result": "visible" if target["episode"] == 3 else "missing"} for target in job["targets"]],
+        ))
         record = RecentDownloadSubmission(
             request_id=request_id,
             target="qb",
@@ -1128,7 +1455,10 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(projected["status"], "retry_wait")
         self.assertEqual(projected["result"], "missing")
         self.assertEqual(projected["attempts"], 2)
-        self.assertEqual((projected["season"], projected["episode"]), (2, 3))
+        self.assertEqual([(target["tmdb_id"], target["season"], target["episode"], target["result"])
+                          for target in projected["targets"]], [("12345", 2, 3, "visible"), ("12345", 2, 4, "missing")])
+        self.assertNotIn("season", projected)
+        self.assertTrue(all(target["library_name"] == "动漫库" for target in projected["targets"]))
         serialized = repr(projected)
         for secret in ("request_id", "magnet", "path", "error"):
             self.assertNotIn(secret, serialized)

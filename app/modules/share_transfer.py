@@ -184,6 +184,8 @@ class ShareTransferPreviewStore:
         access_token = str((inspected or {}).get("access_token") or "").strip()
         if not share_id or not access_token:
             raise ValueError("分享预览缺少必要信息")
+        if inspected.get("has_more"):
+            raise ValueError("分享文件读取未完成，不能建立转存快照")
         normalized: dict[str, dict[str, Any]] = {}
         order: list[str] = []
         for raw in (inspected or {}).get("files") or []:
@@ -230,6 +232,9 @@ class ShareTransferPreviewStore:
                 "preview_id": entry.preview_id,
                 "share_id": entry.share_id,
                 "files": files,
+                "count": len(files),
+                "has_more": False,
+                "scope": "top_level",
                 "selected_ids": selected,
                 "target_id": entry.target_id,
                 "target_name": entry.target_name,
@@ -417,6 +422,11 @@ def inspect_share_for_transfer(
     client: GuangYaClient | None = None,
     store: ShareTransferPreviewStore | None = None,
 ) -> dict[str, Any]:
+    from app.modules.download_dispatcher import is_guangya_share_url
+
+    if not isinstance(share_url, str) or len(share_url) > 8192 or not is_guangya_share_url(share_url):
+        raise ValueError("请提供有效的光鸭分享链接")
+    ShareTransferPreviewStore.owner_key(chat_id, user_id)
     with _guangya_client_scope(client) as runtime_client:
         inspected = runtime_client.inspect_share((share_url or "").strip())
         store = store or get_share_transfer_store()
@@ -432,6 +442,68 @@ def inspect_share_for_transfer(
             target_name=target_name,
         )
         return store.snapshot(preview_id, chat_id, user_id)
+
+
+def prepare_share_transfer(
+    share_url: str, file_ids: list[str], chat_id: str | int, user_id: str | int = "",
+    *, client: GuangYaClient | None = None, store: ShareTransferPreviewStore | None = None,
+) -> dict[str, Any]:
+    """只读冻结选定的真实文件和当前配置目标；不持久化分享访问令牌。"""
+    owner = ShareTransferPreviewStore.owner_key(chat_id, user_id)
+    if (not isinstance(file_ids, list) or not file_ids
+            or any(not isinstance(item, str) or not item.strip() for item in file_ids)):
+        raise ValueError("file_ids 必须是非空文件ID列表")
+    selected = sorted({item.strip() for item in file_ids})
+    with _guangya_client_scope(client) as runtime_client:
+        if not runtime_client.logged_in:
+            raise ValueError("光鸭未登录，请先重新登录")
+        preview = inspect_share_for_transfer(
+            share_url, chat_id, user_id, client=runtime_client, store=store,
+        )
+    files = {item["id"]: item for item in preview["files"]}
+    if any(identity not in files for identity in selected):
+        raise ValueError("选择中包含不属于该分享的文件")
+    return {
+        "preview_id": preview["preview_id"],
+        "snapshot": {
+            "owner": owner, "url": share_url.strip(), "share_id": preview["share_id"],
+            "files": [files[identity] for identity in selected],
+            "target_id": preview["target_id"], "target_name": preview["target_name"],
+        },
+    }
+
+
+def submit_prepared_share_transfer(
+    prepared: dict[str, Any], chat_id: str | int, *, user_id: str | int = "",
+    origin: str = "telegram", tracker_chat_id: str | None = None,
+    client: GuangYaClient | None = None, store: ShareTransferPreviewStore | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """冷确认重新获取令牌和核对冻结事实，再使用唯一持久转存核心。"""
+    from app.repositories.download_requests import download_request_public_summary
+
+    if (not isinstance(prepared, dict)
+            or prepared.get("owner") != ShareTransferPreviewStore.owner_key(chat_id, user_id)):
+        raise ValueError("分享确认归属已失效，请重新检查")
+    with _guangya_client_scope(client) as runtime_client:
+        current = prepare_share_transfer(
+            prepared["url"], [item["id"] for item in prepared["files"]], chat_id, user_id,
+            client=runtime_client, store=store,
+        )
+        if current["snapshot"] != prepared:
+            raise ValueError("光鸭分享内容或目标目录已变化，请重新检查")
+        if cancel_check is not None:
+            cancel_check()
+        result = create_share_request(
+            current["preview_id"], [item["id"] for item in prepared["files"]],
+            prepared["target_id"], chat_id, user_id=user_id,
+            target_name=prepared["target_name"], origin=origin, tracker_chat_id=tracker_chat_id,
+            client=runtime_client, store=store,
+        )
+    row = db.get_download_request(result["request_id"])
+    if row is not None:
+        result["request"] = download_request_public_summary(row)
+    return result
 
 
 def _share_staging_name(request_id: int) -> str:

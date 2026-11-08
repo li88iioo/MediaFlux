@@ -3,21 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from app import config
 from app import database as db
-from app.agent.domains.automation.rule_actions import (
-    create_media_rule_arguments,
-    create_media_rule_confirmed,
-    digest_set_arguments,
-    list_digest_rules,
-    prepare_create_media_rule,
-    prepare_set_digest,
-    set_digest_confirmed,
-)
+from app.modules.media_automation_rules import digest_arguments, digests, prepare_set_digest, set_digest
+from app.modules.media_subscriptions import MediaSubscriptionError, subscription_create_arguments
 from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext, ToolResult
+from app.agent.models import ToolContext
 from app.agent.owner_routes import web_kernel_owner
 from app.modules.media_automation_rules import drain_automation_rules, next_summary_at
 from app.repositories import media_automation_rules as rules
@@ -49,149 +42,146 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
 
     def test_digest_prepares_without_writing_and_ownership_rejects(self):
         args = {"enabled": True, "hour": 21}
-        preview, token = prepare_set_digest(args, self.context)
-        self.assertEqual(preview.status, "confirmation_required")
-        self.assertEqual(list_digest_rules({}, self.context).data["items"], [])
+        prepared = prepare_set_digest(args, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        preview, token = prepared["preview"], prepared["snapshot"]
+        self.assertEqual(preview["status"], "confirmation_required")
+        self.assertEqual(digests(owner=self.context.owner)["data"]["items"], [])
         with self.assertRaises(AgentToolError):
-            set_digest_confirmed(args, token, ToolContext(owner="other"))
-        saved = set_digest_confirmed(args, token, self.context)
-        self.assertTrue(saved.ok)
-        self.assertEqual(len(list_digest_rules({}, self.context).data["items"]), 1)
+            set_digest(args, expected_snapshot=token, owner="other")
+        saved = set_digest(args, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertTrue(saved["ok"])
+        self.assertEqual(len(digests(owner=self.context.owner)["data"]["items"]), 1)
         self.assertEqual(
-            list_digest_rules({}, ToolContext(owner="other")).data["items"], []
+            digests(owner="other")["data"]["items"], []
         )
 
     def test_digest_update_cas_and_tampered_arguments(self):
         args = {"enabled": True, "hour": 21}
-        _, token = prepare_set_digest(args, self.context)
-        first = set_digest_confirmed(args, token, self.context).data
+        prepared = prepare_set_digest(args, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
+        first = set_digest(args, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)["data"]
         change = {"rule_id": first["rule_id"], "enabled": False, "hour": 21}
-        _, old_token = prepare_set_digest(change, self.context)
+        prepared = prepare_set_digest(change, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, old_token = prepared["preview"], prepared["snapshot"]
         with self.assertRaises(AgentToolError):
-            set_digest_confirmed({**change, "hour": 20}, old_token, self.context)
-        self.assertTrue(set_digest_confirmed(change, old_token, self.context).ok)
+            set_digest({**change, "hour": 20}, expected_snapshot=old_token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertTrue(set_digest(change, expected_snapshot=old_token, owner=self.context.owner, delivery_route=self.context.delivery_route)["ok"])
         with self.assertRaises(AgentToolError):
-            set_digest_confirmed(change, old_token, self.context)
+            set_digest(change, expected_snapshot=old_token, owner=self.context.owner, delivery_route=self.context.delivery_route)
 
     def test_digest_partial_edit_preserves_unspecified_options(self):
         args = {"enabled": True, "hour": 21, "minute": 17, "errors_only": True, "send_empty": True}
-        _, token = prepare_set_digest(args, self.context)
-        original = set_digest_confirmed(args, token, self.context).data
+        prepared = prepare_set_digest(args, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
+        original = set_digest(args, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)["data"]
         change = {"rule_id": original["rule_id"], "enabled": True, "hour": 22}
-        preview, token = prepare_set_digest(change, self.context)
+        prepared = prepare_set_digest(change, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        preview, token = prepared["preview"], prepared["snapshot"]
         for key, value in (("minute", 17), ("errors_only", True), ("send_empty", True)):
-            self.assertEqual(preview.data[key], value)
-        updated = set_digest_confirmed(change, token, self.context)
-        self.assertEqual(updated.data["settings"], {
+            self.assertEqual(preview["data"][key], value)
+        updated = set_digest(change, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertEqual(updated["data"]["settings"], {
             "hour": 22, "minute": 17, "errors_only": True, "send_empty": True,
         })
         explicit = {**change, "minute": 0, "errors_only": False, "send_empty": False}
-        _, token = prepare_set_digest(explicit, self.context)
-        reset = set_digest_confirmed(explicit, token, self.context)
-        self.assertEqual(reset.data["settings"], {
+        prepared = prepare_set_digest(explicit, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
+        reset = set_digest(explicit, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertEqual(reset["data"]["settings"], {
             "hour": 22, "minute": 0, "errors_only": False, "send_empty": False,
         })
-        self.assertEqual(len(list_digest_rules({}, self.context).data["items"]), 1)
+        self.assertEqual(len(digests(owner=self.context.owner)["data"]["items"]), 1)
 
     def test_existing_digest_can_stop_without_a_notification_destination(self):
         args = {"enabled": True, "hour": 21, "minute": 17, "errors_only": True}
-        _, token = prepare_set_digest(args, self.context)
-        original = set_digest_confirmed(args, token, self.context).data
+        prepared = prepare_set_digest(args, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
+        original = set_digest(args, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)["data"]
         stop = {"rule_id": original["rule_id"], "enabled": False, "hour": 21}
         original_get = config.get
         with patch("app.modules.media_automation_rules.config.get", side_effect=lambda key, *a, **kw: (
             "" if key == "TG_CHAT_ID" else original_get(key, *a, **kw)
         )):
-            preview, token = prepare_set_digest(stop, self.context)
-            self.assertFalse(preview.data["enabled"])
-            stopped = set_digest_confirmed(stop, token, self.context)
-            self.assertTrue(stopped.ok)
-            self.assertFalse(stopped.data["enabled"])
-            self.assertEqual(stopped.data["settings"]["minute"], 17)
-            self.assertTrue(stopped.data["settings"]["errors_only"])
+            prepared = prepare_set_digest(stop, owner=self.context.owner, delivery_route=self.context.delivery_route)
+            preview, token = prepared["preview"], prepared["snapshot"]
+            self.assertFalse(preview["data"]["enabled"])
+            stopped = set_digest(stop, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+            self.assertTrue(stopped["ok"])
+            self.assertFalse(stopped["data"]["enabled"])
+            self.assertEqual(stopped["data"]["settings"]["minute"], 17)
+            self.assertTrue(stopped["data"]["settings"]["errors_only"])
             with self.assertRaises(AgentToolError):
-                prepare_set_digest({**stop, "enabled": True}, self.context)
+                prepare_set_digest({**stop, "enabled": True}, owner=self.context.owner, delivery_route=self.context.delivery_route)
             with self.assertRaises(AgentToolError):
-                prepare_set_digest({**stop, "rule_id": "missing-rule"}, self.context)
-        self.assertEqual(len(list_digest_rules({}, self.context).data["items"]), 1)
+                prepare_set_digest({**stop, "rule_id": "missing-rule"}, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertEqual(len(digests(owner=self.context.owner)["data"]["items"]), 1)
 
     def test_digest_destination_change_still_invalidates_enable_confirmation(self):
         args = {"enabled": True, "hour": 21}
-        _, token = prepare_set_digest(args, self.context)
+        prepared = prepare_set_digest(args, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
         original_get = config.get
         with patch("app.modules.media_automation_rules.config.get", side_effect=lambda key, *a, **kw: (
             "999" if key == "TG_CHAT_ID" else original_get(key, *a, **kw)
         )):
             with self.assertRaises(AgentToolError):
-                set_digest_confirmed(args, token, self.context)
-        self.assertEqual(list_digest_rules({}, self.context).data["items"], [])
+                set_digest(args, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertEqual(digests(owner=self.context.owner)["data"]["items"], [])
 
     def test_new_disabled_digest_is_not_reported_as_stopping_an_existing_rule(self):
         active = {"enabled": True, "hour": 21}
-        _, token = prepare_set_digest(active, self.context)
-        existing = set_digest_confirmed(active, token, self.context).data
+        prepared = prepare_set_digest(active, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
+        existing = set_digest(active, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)["data"]
         disabled = {"enabled": False, "hour": 22}
-        preview, token = prepare_set_digest(disabled, self.context)
-        self.assertIn("新增", preview.summary)
-        created = set_digest_confirmed(disabled, token, self.context)
-        self.assertIn("新增", created.summary)
-        self.assertIn("当前停用", created.summary)
-        rows = list_digest_rules({}, self.context).data["items"]
+        prepared = prepare_set_digest(disabled, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        preview, token = prepared["preview"], prepared["snapshot"]
+        self.assertIn("新增", preview["summary"])
+        created = set_digest(disabled, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        self.assertIn("新增", created["summary"])
+        self.assertIn("当前停用", created["summary"])
+        rows = digests(owner=self.context.owner)["data"]["items"]
         self.assertEqual(len(rows), 2)
         self.assertTrue(next(row for row in rows if row["rule_id"] == existing["rule_id"])["enabled"])
 
-    def test_previous_complete_confirmation_payload_remains_executable(self):
-        import json
-
-        from app.modules.media_automation_rules import notification_route_settings
-        from app.repositories.agent_jobs import agent_job_owner_digest
-        # Existing signed plans already persisted all optional fields explicitly.
-        args = {"rule_id": "", "enabled": True, "hour": 21, "minute": 0,
-                "errors_only": False, "send_empty": False}
-        old_payload = json.dumps({"owner": agent_job_owner_digest(self.context.owner),
-                                  "arguments": args, "revision": 0,
-                                  "route": notification_route_settings(self.context.owner)})
-        saved = set_digest_confirmed(args, old_payload, self.context)
-        self.assertTrue(saved.ok)
-        self.assertEqual(saved.data["settings"], {
-            "hour": 21, "minute": 0, "errors_only": False, "send_empty": False,
-        })
 
     def test_digest_update_without_hour_preserves_schedule_and_only_changes_requested_fields(self):
         args = {"enabled": True, "hour": 21, "minute": 17, "errors_only": True, "send_empty": True}
-        _, token = prepare_set_digest(args, self.context)
-        saved = set_digest_confirmed(args, token, self.context)
+        prepared = prepare_set_digest(args, owner=self.context.owner, delivery_route=self.context.delivery_route)
+        _, token = prepared["preview"], prepared["snapshot"]
+        saved = set_digest(args, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
         for update, expected in (({"enabled": False}, {"hour": 21, "minute": 17}),
                                  ({"enabled": True, "minute": 35}, {"hour": 21, "minute": 35})):
-            update = {"rule_id": saved.data["rule_id"], **update}
-            preview, token = prepare_set_digest(update, self.context)
-            self.assertEqual(preview.data["hour"], expected["hour"])
-            saved = set_digest_confirmed(update, token, self.context)
-            self.assertEqual(saved.data["enabled"], update["enabled"])
-            self.assertEqual(saved.data["settings"], {**expected, "errors_only": True, "send_empty": True})
+            update = {"rule_id": saved["data"]["rule_id"], **update}
+            prepared = prepare_set_digest(update, owner=self.context.owner, delivery_route=self.context.delivery_route)
+            preview, token = prepared["preview"], prepared["snapshot"]
+            self.assertEqual(preview["data"]["hour"], expected["hour"])
+            saved = set_digest(update, expected_snapshot=token, owner=self.context.owner, delivery_route=self.context.delivery_route)
+            self.assertEqual(saved["data"]["enabled"], update["enabled"])
+            self.assertEqual(saved["data"]["settings"], {**expected, "errors_only": True, "send_empty": True})
 
     def test_digest_schema_and_validator_agree_on_create_and_update(self):
-        from app.agent.domain_catalog import build_tool_specs
+        from app.agent.kernel.ports.sdk_effects import automation_tools
         from app.agent.errors import ToolPipelineError
         from app.agent.schema import validate_json_schema
 
-        tool = next(spec for spec in build_tool_specs() if spec.name == "automation.set_digest")
+        tool = next(spec for spec in automation_tools() if spec.name == "automation.set_digest")
         valid = [{"enabled": True, "hour": 21}, {"enabled": True, "hour": 0, "rule_id": ""},
                  {"enabled": False, "rule_id": "existing"},
                  {"enabled": True, "rule_id": "existing", "minute": 35}]
         for payload in valid:
             with self.subTest(payload=payload):
-                validate_json_schema(payload, tool.parameters)
-                normalized = tool.validator(payload)
+                validate_json_schema(payload, tool.input_schema)
+                normalized = digest_arguments(payload)
                 self.assertEqual("hour" in normalized, "hour" in payload)
         invalid = [{"enabled": True}, {"enabled": False, "rule_id": ""},
                    {"enabled": True, "hour": None}, {"enabled": True, "rule_id": 123}]
         for payload in invalid:
             with self.subTest(payload=payload):
                 with self.assertRaises(ToolPipelineError):
-                    validate_json_schema(payload, tool.parameters)
+                    validate_json_schema(payload, tool.input_schema)
                 with self.assertRaises(AgentToolError):
-                    tool.validator(payload)
+                    digest_arguments(payload)
 
     def test_rule_claim_is_exclusive_recovers_expired_and_cancel_invalidates(self):
         row = rules.save_rule(
@@ -318,9 +308,9 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
             {"resolution": "2160p"},
             {"api_key": "private"},
         ):
-            with self.assertRaises(AgentToolError):
-                create_media_rule_arguments(
-                    {"tmdb_id": "123", "media_type": "tv", **extra}
+            with self.assertRaises(MediaSubscriptionError):
+                subscription_create_arguments(
+                    {"provider": "tmdb", "external_id": "123", "media_type": "tv", **extra}
                 )
         for args in (
             {"enabled": "yes", "hour": 21},
@@ -328,89 +318,9 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
             {"enabled": True, "hour": 25},
         ):
             with self.assertRaises(AgentToolError):
-                digest_set_arguments(args)
+                digest_arguments(args)
 
-    def test_subscription_rule_uses_existing_service_once_after_confirmation(self):
-        args = {
-            "tmdb_id": "123",
-            "media_type": "tv",
-            "download_target": "qb",
-            "action": "auto",
-            "sites": ["nyaa"],
-        }
-        frozen = {
-            "snapshot": {"exists": False, "tmdb_id": "123", "media_type": "tv"},
-            "tmdb_id": "123",
-        }
-        import json
 
-        with (
-            patch(
-                "app.agent.domains.automation.rule_actions.prepare_create_media_subscription",
-                return_value=(
-                    ToolResult(True, "confirmation_required", "preview"),
-                    json.dumps(frozen),
-                ),
-            ),
-            patch(
-                "app.agent.domains.automation.rule_actions.db.media_subscription_identity_snapshot",
-                return_value=frozen["snapshot"],
-            ),
-            patch(
-                "app.agent.domains.automation.rule_actions.get_media_subscription_service"
-            ) as get_service,
-            patch(
-                "app.agent.domains.automation.rule_actions._reload_scheduler", return_value=True
-            ),
-        ):
-            preview, token = prepare_create_media_rule(args)
-            get_service.assert_not_called()
-            expected = {
-                "id": 9,
-                "title": "作品",
-                "tmdb_id": "123",
-                "media_type": "tv",
-                "action": "auto",
-                "download_target": "qb",
-                "sites": ["nyaa"],
-                "enabled": True,
-                "check_interval_minutes": 10080,
-            }
-            service = get_service.return_value
-            service.create_subscription = AsyncMock(
-                return_value={"subscription": expected}
-            )
-            service.get_subscription.return_value = expected
-            result = create_media_rule_confirmed(args, token)
-            self.assertTrue(result.ok)
-            self.assertEqual(result.data["subscription_number"], 9)
-            self.assertEqual(service.create_subscription.await_count, 1)
-            self.assertIn("持续自动提交", preview.data["effects"][1])
-
-    def test_changed_subscription_never_calls_service(self):
-        args = {"tmdb_id": "123", "media_type": "tv"}
-        import json
-
-        with patch(
-            "app.agent.domains.automation.rule_actions.prepare_create_media_subscription",
-            return_value=(
-                ToolResult(True, "confirmation_required", "preview"),
-                json.dumps({"snapshot": {"exists": False}}),
-            ),
-        ):
-            _, token = prepare_create_media_rule(args)
-        with (
-            patch(
-                "app.agent.domains.automation.rule_actions.db.media_subscription_identity_snapshot",
-                return_value={"exists": True},
-            ),
-            patch(
-                "app.agent.domains.automation.rule_actions.get_media_subscription_service"
-            ) as service,
-        ):
-            with self.assertRaises(AgentToolError):
-                create_media_rule_confirmed(args, token)
-            service.assert_not_called()
 
     @patch(
         "app.modules.media_automation_rules._authorized_notification_chat",
@@ -552,21 +462,24 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
                               delivery_route={"chat_id": "123", "message_thread_id": 99})
         args = {"enabled": True, "hour": 21, "send_empty": True}
         with patch("app.modules.media_automation_rules.telegram_owner_route_is_currently_authorized", return_value=True):
-            _, token = prepare_set_digest(args, context)
-            saved = set_digest_confirmed(args, token, context)
-            rule_id = saved.data["rule_id"]
+            prepared = prepare_set_digest(args, owner=context.owner, delivery_route=context.delivery_route)
+            _, token = prepared["preview"], prepared["snapshot"]
+            saved = set_digest(args, expected_snapshot=token, owner=context.owner, delivery_route=context.delivery_route)
+            rule_id = saved["data"]["rule_id"]
             owner = agent_job_owner_digest(context.owner)
             # 停用是控制操作；即使从默认聊天发起，也不应丢掉规则原话题。
             disabled = {"rule_id": rule_id, "enabled": False, "hour": 21}
             default_context = ToolContext(owner=context.owner, session_id="default")
-            _, token = prepare_set_digest(disabled, default_context)
-            set_digest_confirmed(disabled, token, default_context)
+            prepared = prepare_set_digest(disabled, owner=default_context.owner, delivery_route=default_context.delivery_route)
+            _, token = prepared["preview"], prepared["snapshot"]
+            set_digest(disabled, expected_snapshot=token, owner=default_context.owner, delivery_route=default_context.delivery_route)
             row = rules.get_rule(owner, rule_id)
             assert row is not None
             self.assertEqual(row["settings"]["notification_message_thread_id"], 99)
             enabled = {"rule_id": rule_id, "enabled": True, "hour": 21}
-            _, token = prepare_set_digest(enabled, context)
-            set_digest_confirmed(enabled, token, context)
+            prepared = prepare_set_digest(enabled, owner=context.owner, delivery_route=context.delivery_route)
+            _, token = prepared["preview"], prepared["snapshot"]
+            set_digest(enabled, expected_snapshot=token, owner=context.owner, delivery_route=context.delivery_route)
             row = rules.get_rule(owner, rule_id)
             assert row is not None
             with patch("app.modules.media_automation_rules.publish_notification_event", return_value=Mock(status="pending")) as publish:

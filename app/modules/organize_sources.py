@@ -130,3 +130,12 @@ def list_nsfw_download_sources() -> list[dict[str, str]]:
     if error:
         return []
     return [source for source in sources if source["id"] in selected]
+
+
+def configured_organize_sources() -> list[dict[str, str]]:
+    """读取正式多源配置；错误由各调用边界决定展示方式。"""
+    from app import config
+    sources, error = normalize_organize_sources(config.get("GY_ORGANIZE_SOURCE_DIRS", ""))
+    if error:
+        raise ValueError("光鸭整理来源配置无效，请先在网盘整理页面修正。")
+    return sources

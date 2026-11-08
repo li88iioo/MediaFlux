@@ -7,15 +7,11 @@ import json
 import pytest
 
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import InMemoryRateLimiter
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
-from app.agent.kernel.pipeline import InMemoryRateLimiter, ToolPipeline
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput
@@ -42,7 +38,7 @@ async def execute(tools, calls, *, limiter=None, limits=None):
          ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
     ])
     session = AgentSession(model=model, catalog=catalog, state_store=state,
-        retriever=CapabilityRetriever(minimum=len(tools), maximum=len(tools)),
+
         pipeline=ToolPipeline(catalog=catalog, state_store=state, rate_limiter=limiter), limits=limits)
     events = [event async for event in session.run(AgentInput(
         owner="owner", session_id="batch", message="读取这些独立媒体的信息"))]
@@ -131,7 +127,7 @@ def test_parallel_success_settles_syntax_but_not_operational_read_failure(first_
             if arguments["query"] == "bad":
                 if not first_fails_fast:
                     await asyncio.sleep(.02)
-                raise ToolPipelineError("bad对象参数无效", code=code, invalid_fields=("query",))
+                raise ToolPipelineError("bad对象参数无效", code=code)
             if first_fails_fast:
                 await asyncio.sleep(.02)
             return {"ok": True, "summary": "good对象已核验", "data": {"query": "good"}}

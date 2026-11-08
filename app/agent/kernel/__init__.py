@@ -7,8 +7,8 @@ from app.agent.kernel.session_state import SessionState
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput, PublicationLease
 
-from .capabilities import CapabilityRetriever, KernelToolSpec, ToolCatalog, ToolEffect
-from .effects import EffectPlan, PreparedEffect
+from .capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from .tool_calls import EffectPlan, PreparedEffect
 from .events import AgentEvent, AgentEventType
 from .model import ModelAdapter, ModelEvent, ModelEventType, ModelMessage, ModelToolCall
 from .pipeline import ToolPipeline
@@ -19,7 +19,6 @@ __all__ = [
     "AgentEventType",
     "AgentInput",
     "AgentSession",
-    "CapabilityRetriever",
     "EffectPlan",
     "InMemorySessionStateStore",
     "KernelToolSpec",

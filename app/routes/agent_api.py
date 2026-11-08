@@ -19,10 +19,6 @@ from app.agent.domains.resources.selection import (
     current_candidate_view,
     normalize_selection,
 )
-from app.agent.domains.workspace.next_actions import (
-    resolve_workspace_action_handoff,
-    summarize_workspace_next_actions,
-)
 from app.agent.errors import AgentToolError, ToolPipelineError
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime
@@ -33,7 +29,7 @@ from app.agent.kernel.task_state import task_projection
 from app.agent.kernel.turn_display import active_turn_view, last_turn_view
 from app.agent.kernel.ux_display import next_actions_view, session_display_patch
 from app.agent.owner_routes import web_kernel_owner
-from app.agent.public_view import public_conversation_messages
+from app.agent.public_view import public_active_turn_events, public_activities, public_conversation_messages
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.transports import (
     EffectEnvelope,
@@ -42,6 +38,8 @@ from app.agent.transports import (
     TransportInputError,
 )
 from app.modules.web_secret import get_web_secret
+from app.modules.workspace import next_actions as read_next_actions
+from app.modules.workspace import resolve_action_handoff
 from app.web import api_error, api_response, require_api_login
 
 logger = logging.getLogger(__name__)
@@ -152,7 +150,7 @@ async def next_actions(request: Request):
         _require_enabled()
         _check_rate_limit("next-actions", limit=30)
         try:
-            result = await asyncio.to_thread(summarize_workspace_next_actions, {})
+            result = await asyncio.to_thread(read_next_actions)
             payload = next_actions_view(result)
         except Exception as exc:  # noqa: BLE001 - 本地快照不可用时不影响首页
             logger.warning("Agent 下一步快照不可用 type=%s", type(exc).__name__)
@@ -195,11 +193,13 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
         request_id = _request_id(data.get("request_id"))
         message = data.get("message")
         initial_read_tool = ""
+        initial_read_arguments = {}
         if "action_key" in data:
             if {"message", "selection"}.intersection(data):
                 raise TransportInputError("工作区行动不能与 message 或 selection 混用")
-            handoff = await asyncio.to_thread(resolve_workspace_action_handoff, {"action_key": data["action_key"]})
+            handoff = await asyncio.to_thread(resolve_action_handoff, {"action_key": data["action_key"]})
             message, initial_read_tool = handoff["label"], handoff["target_tool"]
+            initial_read_arguments = handoff["arguments"]
         elif not isinstance(message, str):
             raise TransportInputError("message 必须是字符串")
         envelope = QueryEnvelope(
@@ -210,6 +210,7 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
             channel="web",
             selection=normalize_selection(data["selection"]) if "selection" in data else None,
             initial_read_tool=initial_read_tool,
+            initial_read_arguments=initial_read_arguments,
         )
         envelope.to_agent_input()
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
@@ -470,17 +471,23 @@ async def get_session(request: Request, session_id: str):
         # 终态事件在会话结果提交之后发布：先读事件再读状态，避免
         # 空→活动→空的快速轮次返回“新完成事件 + 旧对话”。
         events = await runtime.store.list_events(
-            owner=owner, session_id=normalized, limit=64,
+            owner=owner, session_id=normalized, limit=500 if activity_before else 64,
         )
+        turn_events = (await runtime.store.list_events(owner=owner, session_id=normalized,
+            request_id=activity_before["request_id"], turn_id=activity_before["turn_id"])) if activity_before else []
         state = await runtime.store.load(owner=owner, session_id=normalized)
         activity_after = await runtime.web.activity(owner=owner, session_id=normalized)
         if activity_before != activity_after:
             events = await runtime.store.list_events(
-                owner=owner, session_id=normalized, limit=64,
+                owner=owner, session_id=normalized, limit=500 if activity_after else 64,
             )
+            turn_events = (await runtime.store.list_events(owner=owner, session_id=normalized,
+                request_id=activity_after["request_id"], turn_id=activity_after["turn_id"])) if activity_after else []
             state = await runtime.store.load(owner=owner, session_id=normalized)
 
         active_turn = active_turn_view(activity_after, events)
+        if active_turn:
+            active_turn["events"] = public_active_turn_events(turn_events, active_turn)
         candidate_view = await current_candidate_view(
             state=state, store=runtime.store,
         )
@@ -501,6 +508,14 @@ async def get_session(request: Request, session_id: str):
             plan = await runtime.session.pipeline.get_pending_plan(owner=owner, session_id=normalized)
             if plan is not None:
                 pending_approval = plan.public_approval_dict()
+                preview = next((row for row in reversed(state.conversation)
+                                if row.get("role") == "tool" and row.get("effect_plan_id") == plan.plan_id), {})
+                activities = public_activities(preview.get("activities"))
+                for activity in activities:
+                    if activity.get("method") == plan.tool_name and activity.get("status") == "running":
+                        activity["status"] = "approval_required"
+                if activities:
+                    pending_approval["activities"] = activities
         last_turn = last_turn_view(
             [event for event in events if not observed_request or event.get("request_id") == observed_request],
             active_turn,

@@ -11,6 +11,7 @@ from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffec
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import DefaultProjector
+from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests.support import isolated_test_database
@@ -60,18 +61,15 @@ def test_complete_dto_cold_reader(sequence):
         assert "never-store-secret" not in "".join(parts)
         assert "/private/media" not in json.dumps(result.outcome.public_content)
         cold = ToolPipeline(catalog=ToolCatalog([]), state_store=cold_store, reference_store=cold_store)
-        root = await cold.execute("agent.read_result", {"handle": handle, "path": "", "limit": 100}, context=context)
-        data = json.loads(root.outcome.model_content)["data"]
-        assert {row["key"]: row["value"] for row in data["items"]} == source
-        assert (data["total"], data["returned"], data["has_more"]) == (len(source), len(source), False)
+        root = await SessionService(cold, context).result(handle)
+        assert root["data"] == source
         path = ("/data/0" if sequence else "/tree") + "/next" * 18 + "/tail"
-        tail = await cold.execute("agent.read_result", {"handle": handle, "path": path, "offset": 700, "limit": 100}, context=context)
-        page = json.loads(tail.outcome.model_content)["data"]
-        assert page["items"] == expected_leaf["tail"][700:800]
-        assert (page["total"], page["returned"], page["has_more"]) == (720, 20, False)
+        tail = await SessionService(cold, context).result(handle, path)
+        assert tail["data"] == expected_leaf["tail"]
+        assert tail["data"][700:800] == expected_leaf["tail"][700:800]
         for wrong in (replace(context, owner="other"), replace(context, session_id="other")):
             with pytest.raises(ToolPipelineError):
-                await cold.execute("agent.read_result", {"handle": handle, "path": ""}, context=wrong)
+                await SessionService(cold, wrong).result(handle)
         assert calls == [1]
     with isolated_test_database():
         asyncio.run(exercise())

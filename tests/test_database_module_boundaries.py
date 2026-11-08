@@ -18,14 +18,24 @@ from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 class DatabaseModuleImportTests(unittest.TestCase):
     def test_facade_exports_the_single_local_media_implementation(self):
-        connection_helpers = {
+        repository_only = {
             "_recover_after_restart",  # 启动 hook 接收既有事务，不属于 CRUD 门面API。
+            "_check_source_snapshot",
+            "local_media_source_snapshot",
+            "local_media_task_snapshot",
+            "local_media_task_page",
         }
+        owned = set()
         for name, function in inspect.getmembers(local_media, inspect.isfunction):
-            if function.__module__ != local_media.__name__ or name in connection_helpers:
+            if function.__module__ != local_media.__name__:
                 continue
+            owned.add(name)
             with self.subTest(name=name):
-                self.assertIs(getattr(db, name), function)
+                if name in repository_only:
+                    self.assertFalse(hasattr(db, name))
+                else:
+                    self.assertIs(getattr(db, name), function)
+        self.assertTrue(repository_only <= owned)
         self.assertIs(
             db._LOCAL_MEDIA_TERMINAL_TASK_STATUSES,
             local_media._LOCAL_MEDIA_TERMINAL_TASK_STATUSES,

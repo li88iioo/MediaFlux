@@ -382,6 +382,113 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(observed, [owner_loop])
 
+    async def test_cancelled_sdk_search_does_not_start_provider(self):
+        from app import sdk
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from tests.test_indexer_service import FakeAdapter
+
+        runtime.bind_indexer_event_loop(asyncio.get_running_loop())
+        adapter = FakeAdapter("nyaa")
+        service = IndexerService(registry=IndexerRegistry({"nyaa": adapter}), result_store=IndexerResultStore())
+        try:
+            with patch.object(runtime, "get_indexer_service", return_value=service), sdk.call_owner(
+                "reader", cancelled=lambda: True,
+            ):
+                with self.assertRaises(InterruptedError):
+                    await asyncio.to_thread(sdk.resources.search, "Demo", sites=["nyaa"])
+            self.assertEqual(adapter.calls, 0)
+        finally:
+            await service.aclose()
+
+    async def test_sync_bridge_keeps_completion_that_races_poll_timeout(self):
+        from concurrent.futures import Future
+
+        class CompletingFuture(Future):
+            def result(self, timeout=None):
+                if not self.done():
+                    # 模拟一次等待已超时、但检查done前服务刚完成的窗口。
+                    self.set_result("ready")
+                    raise TimeoutError()
+                return super().result(timeout)
+
+        async def read():
+            return "ready"
+
+        runtime.bind_indexer_event_loop(asyncio.get_running_loop())
+        pending = read()
+        try:
+            with patch.object(runtime, "_submit_to_runtime_loop", return_value=CompletingFuture()):
+                result = await asyncio.to_thread(runtime.run_indexer_awaitable_sync, pending,
+                                                 cancelled=lambda: False)
+            self.assertEqual(result, "ready")
+        finally:
+            pending.close()
+
+    async def test_sdk_search_cancellation_preserves_other_waiter_and_allows_retry(self):
+        from app import sdk
+        from app.indexers.models import IndexerMediaSearchRequest
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from tests.test_indexer_service import FakeAdapter
+
+        runtime.bind_indexer_event_loop(asyncio.get_running_loop())
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                stop = threading.Event()
+
+                class GatedAdapter(FakeAdapter):
+                    async def search(self, request):
+                        entered.set()
+                        try:
+                            await release.wait()
+                            return await super().search(request)
+                        finally:
+                            finished.set()
+
+                adapter = GatedAdapter("nyaa")
+                service = IndexerService(registry=IndexerRegistry({"nyaa": adapter}),
+                                         result_store=IndexerResultStore(),
+                                         site_timeout_seconds=3, total_timeout_seconds=4)
+                workers: list[asyncio.Task[object]] = []
+                other = None
+                try:
+                    with patch.object(runtime, "get_indexer_service", return_value=service):
+                        with sdk.call_owner("reader", cancelled=stop.is_set):
+                            worker = asyncio.create_task(asyncio.to_thread(sdk.resources.search, "Demo", sites=["nyaa"]))
+                        workers.append(worker)
+                        await asyncio.wait_for(entered.wait(), 1)
+                        if shared:
+                            other = asyncio.create_task(service.search_media(
+                                IndexerMediaSearchRequest.create(title="Demo"), ["nyaa"], scope="agent"))
+                            workers.append(other)
+                            # 等第二个真实等待者接入后再取消第一个，避免调度竞态。
+                            async with asyncio.timeout(1):
+                                while sum(service._search_waiters.values()) < 2:
+                                    await asyncio.sleep(0)
+                        stop.set()
+                        done, _ = await asyncio.wait([worker], timeout=0.5)
+                        self.assertIn(worker, done, "取消后同步SDK仍被慢站点阻塞")
+                        with self.assertRaises(InterruptedError):
+                            worker.result()
+                        if shared:
+                            self.assertFalse(finished.is_set(), "取消一个等待者不能终止其他请求共享的搜索")
+                        else:
+                            await asyncio.wait_for(finished.wait(), 1)
+                        release.set()
+                        if other is not None:
+                            self.assertEqual((await other).sites_succeeded, ("nyaa",))
+                        result = await asyncio.to_thread(sdk.resources.search, "Demo", sites=["nyaa"])
+                        self.assertEqual(result["sites_succeeded"], ["nyaa"])
+                        self.assertTrue(result["complete"])
+                finally:
+                    release.set()
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    await service.aclose()
+
     async def test_sync_bridge_closes_service_on_same_bound_loop(self):
         owner_loop = asyncio.get_running_loop()
         runtime.bind_indexer_event_loop(owner_loop)

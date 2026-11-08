@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import requests
 
-from app.agent.async_bridge import (
+from app.concurrency import (
     AsyncBridgeUnavailable,
     ensure_sync_bridge_available,
     run_awaitable_sync,
@@ -307,9 +307,7 @@ class AIRecognitionClient:
     ) -> None:
         raw_url = (api_url or "").strip()
         try:
-            location = normalize_provider_location(
-                raw_url, https_only=True, public_only=True
-            )
+            location = normalize_provider_location(raw_url)
         except ValueError as exc:
             raise AIRecognitionError(str(exc)) from exc
         raw_protocol = (protocol or "").strip().lower().replace("-", "_")
@@ -329,7 +327,7 @@ class AIRecognitionClient:
             raise AIRecognitionError("未配置有效的 AI 模型")
         self.api_key = (api_key or "").strip()
         self.timeout_seconds = max(2, min((timeout_seconds or 15), 60))
-        # 注入 Session 仅作为单元测试/兼容适配缝；生产请求统一走固定公网 HTTPS 客户端。
+        # 注入 Session 仅作为测试缝；生产请求统一走管理员配置的固定端点客户端。
         self.session = session
         if session is not None:
             proxy = (proxy_url or "").strip()
@@ -352,6 +350,7 @@ class AIRecognitionClient:
     ) -> Any:
         client = FixedHostHttpClient(
             allowed_hosts={self.location.host},
+            configured_origin=self.location.base_url,
             timeout_seconds=self.timeout_seconds,
             max_response_bytes=64 * 1024,
             max_redirects=0,

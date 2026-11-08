@@ -9,13 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import config
-from app.agent.domains.strm import schedule_actions as strm_schedule_config_actions
-from app.agent.domains.strm.schedule_actions import (
-    prepare_strm_schedule_policy_confirmation,
-    strm_schedule_policy_arguments,
-    summarize_strm_schedule_policy,
-)
-from app.agent.errors import AgentToolError
+from app.modules import schedule_policy
+from app.modules.schedule_policy import normalize_changes, prepare_policy_change, summarize_policy
 from app.modules.scheduler import STRMScheduler
 from tests.agent_kernel_test_harness import get_kernel_test_service as get_agent_service
 
@@ -25,7 +20,7 @@ _STRM_KEYS = {"STRM_SCHEDULE_ENABLED", "STRM_SCHEDULE_CRON", "STRM_NOTIFY_ENABLE
 class StrmSchedulePolicyUnitTests(unittest.TestCase):
     def test_arguments_are_partial_bounded_and_strict(self):
         self.assertEqual(
-            strm_schedule_policy_arguments(
+            normalize_changes("strm",
                 {"enabled": True, "cron": "  0   4 * * * ", "notify_enabled": False}
             ),
             {"enabled": True, "cron": "0 4 * * *", "notify_enabled": False},
@@ -41,8 +36,8 @@ class StrmSchedulePolicyUnitTests(unittest.TestCase):
             {"key": "STRM_SCHEDULE_ENABLED"},
             {"token": "secret"},
         ):
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                strm_schedule_policy_arguments(arguments)
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                normalize_changes("strm", arguments)
 
     def test_summary_preview_context_do_not_leak_other_config(self):
         with tempfile.TemporaryDirectory() as root:
@@ -63,16 +58,16 @@ class StrmSchedulePolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
             ):
-                summary = summarize_strm_schedule_policy({})
-                preview, context = prepare_strm_schedule_policy_confirmation(
+                summary = summarize_policy("strm")
+                preview, context = prepare_policy_change("strm",
                     {"enabled": True}
                 )
-        rendered = repr((summary.to_dict(), preview.to_dict(), context))
+        rendered = repr((summary, preview, context))
         self.assertNotIn(secret, rendered)
         self.assertNotIn("GY_TOKEN", rendered)
         self.assertNotIn(str(env_file), rendered)
         self.assertEqual(len(context), 64)
-        self.assertIn("不会立即", " ".join(preview.suggestions))
+        self.assertIn("不会立即", " ".join(preview["suggestions"]))
 
     def test_confirmation_preparer_uses_one_snapshot(self):
         with tempfile.TemporaryDirectory() as root:
@@ -91,17 +86,17 @@ class StrmSchedulePolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
                 patch.object(
-                    strm_schedule_config_actions,
-                    "_capture",
-                    wraps=strm_schedule_config_actions._capture,
+                    schedule_policy,
+                    "capture_policy_state",
+                    wraps=schedule_policy.capture_policy_state,
                 ) as capture,
             ):
                 prepared = get_agent_service().prepare(
-                    "strm.set_schedule_policy",
+                    "strm.set_schedule",
                     {"enabled": True},
                     owner="owner",
                 )
-        self.assertEqual(prepared["tool_call"]["name"], "strm.set_schedule_policy")
+        self.assertEqual(prepared["tool_call"]["name"], "strm.set_schedule")
         self.assertEqual(prepared["tool_call"]["argument_keys"], ["enabled"])
         self.assertTrue(prepared["result"]["ok"])
         self.assertEqual(capture.call_count, 1)

@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from functools import wraps
 from typing import Any
 
 # 后台业务终态至少覆盖回执恢复窗口，不能只按条数淘汰待核验结果。
@@ -90,7 +89,6 @@ class ToolContext:
     session_id: str = ""
     request_id: str = ""
     confirmation_bootstrap: bool = False
-    capability_search: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     cancelled: Callable[[], bool] = field(default=lambda: False, repr=False, compare=False)
     admit_background_operation: Callable[[Any, Any, bool], None] | None = field(
         default=None, repr=False, compare=False,
@@ -108,72 +106,3 @@ ContextFreeConfirmationPreparer = Callable[[dict[str, Any]], tuple[ToolResult, s
 ContextualConfirmationPreparer = Callable[
     [dict[str, Any], ToolContext], tuple[ToolResult, str]
 ]
-
-
-@dataclass(frozen=True, kw_only=True)
-class ToolSpec:
-    """领域 action 的原子能力声明；由 Kernel 适配为统一工具契约。"""
-
-    name: str
-    description: str
-    risk: RiskLevel
-    parameters: dict[str, Any]
-    validator: ArgumentsValidator
-    handler: ToolHandler | None = None
-    requires_confirmation: bool = False
-    context_handler: ContextualToolHandler | None = None
-    context_confirmation_preparer: ContextualConfirmationPreparer | None = None
-    context_confirmed_handler: ContextualConfirmedToolHandler | None = None
-    post_write_verifier: PostWriteVerifier | None = None
-    runtime_status: Callable[[], dict[str, str]] | None = None
-    model_name: str = ""
-    related_tools: tuple[str, ...] = ()
-    domains: tuple[str, ...] = ()
-    source_kind: str = "system_state"
-    freshness: str = "snapshot"
-    parallel_read: bool = False
-    # sync为独立同步写；tracked为有原子受理与稳定后台句柄的前项。空值不参与组合。
-    batch_mode: str = ""
-    workflow: str = ""
-    workflow_stage: int = 0
-    examples: tuple[str, ...] = ()
-
-    @staticmethod
-    def context_free_confirmation_preparer(
-        handler: ContextFreeConfirmationPreparer,
-    ) -> ContextualConfirmationPreparer:
-        """把无需调用身份的预检函数绑定到唯一的上下文确认协议。"""
-
-        @wraps(handler)
-        def adapted(
-            arguments: dict[str, Any],
-            _context: ToolContext,
-        ) -> tuple[ToolResult, str]:
-            return handler(arguments)
-
-        return adapted
-
-    @staticmethod
-    def context_free_confirmed_handler(
-        handler: ContextFreeConfirmedToolHandler,
-    ) -> ContextualConfirmedToolHandler:
-        """把无需调用身份的执行函数绑定到唯一的上下文确认协议。"""
-
-        @wraps(handler)
-        def adapted(
-            arguments: dict[str, Any],
-            expected_context: str,
-            _context: ToolContext,
-        ) -> ToolResult:
-            return handler(arguments, expected_context)
-
-        return adapted
-
-    def public_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "risk": self.risk.value,
-            "parameters": self.parameters,
-            "requires_confirmation": self.requires_confirmation,
-        }

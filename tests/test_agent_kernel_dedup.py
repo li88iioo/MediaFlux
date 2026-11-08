@@ -9,32 +9,25 @@ from typing import cast
 
 import asyncio
 import json
+import time
 from copy import deepcopy
 from dataclasses import asdict
 from itertools import count
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from app.agent.domains.resources.presentation import ResourceSelection
-from app.agent.domains.resources.selection import ValidatedSelection
+from app.agent.kernel.ports.resource_presentation import ResourceSelection
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import adapt_tool_spec
 from app.agent.kernel.session import AgentSession, SessionLimits
-from app.agent.kernel.session_state import CandidateSelectionGuard, SessionState
+from app.agent.kernel.session_state import SessionState
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput, StateUpdate
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from tests.test_agent_kernel_core import ScriptedModel
 
 SESSION_CASES = (
@@ -106,8 +99,8 @@ async def capture_session_contract(case):
         description="读取状态", input_schema=schema, effect=ToolEffect.READ, read=read,
     )
     writer = KernelToolSpec(
-        name="ingest.submit", domain="library", description="准备写入",
-        input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+        name="resources.download", domain="resources", description="准备写入",
+        input_schema={"type": "object", "required": ["result_ids", "target"], "properties": {"result_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "target": {"type": "string", "enum": ["guangya"]}}, "additionalProperties": False}, effect=ToolEffect.WRITE,
         prepare=prepare, execute_confirmed=execute,
     )
     catalog = ToolCatalog([reader, writer], selection=ResourceSelection())
@@ -118,7 +111,7 @@ async def capture_session_contract(case):
     elif case == "invalid_alias":
         calls = [ModelToolCall("call-1", "inspect_alias", {})]
     elif case in {"approval_siblings", "over_budget"}:
-        calls = [ModelToolCall("call-1", "ingest__submit", {}),
+        calls = [ModelToolCall("call-1", "resources__download", {"result_ids": ["fixture-result-1"], "target": "guangya"}),
                  ModelToolCall("call-2", "inspect_alias", {"query": "fixture"})]
     model = ScriptedModel([
         [*[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=call) for call in calls],
@@ -129,26 +122,33 @@ async def capture_session_contract(case):
     pipeline = ToolPipeline(catalog=catalog, state_store=cast(SessionStateStore, store))
     session = AgentSession(
         model=model, catalog=catalog, pipeline=pipeline, state_store=cast(SessionStateStore, store),
-        journal=Journal(), retriever=CapabilityRetriever(), system_prompt="R0 compatibility fixture",
+        journal=Journal(),  system_prompt="R0 compatibility fixture",
         limits=SessionLimits(max_model_rounds=2, max_tool_calls=1 if case == "over_budget" else 4),
     )
     metadata = {}
-    # Session-only selection control: admission retains the real generation/ref
-    # guard, while reference validation is covered by test_agent_ux_backend.
-    selection = ValidatedSelection(
-        CandidateSelectionGuard(1, "ref_fixture", 4_000_000_000.0),
-        {"source_type": "resource_candidates", "positions": [1], "target": "guangya"},
-    )
     serial = count(1)
-    with patch("secrets.token_urlsafe", side_effect=lambda *args: f"fixture_{next(serial):024d}"), \
-            patch("app.agent.domains.resources.selection.validate_selection", new=AsyncMock(return_value=selection)):
+    with patch("secrets.token_urlsafe", side_effect=lambda *args: f"fixture_{next(serial):024d}"):
         if case == "selection":
+            from tests.resource_presentation_test_harness import safe_resource_snapshot
+            from app.agent.models import ToolResult
+            from app.agent.domains.resources.selection import RESOURCE_KIND, SELECTION_KIND
+            snapshot = safe_resource_snapshot(ToolResult(True, "found", "候选", data={"items": [{
+                "result_id": "fixture-result-1", "title": "fixture.mkv", "download_state": "ready",
+                "download_kinds": ["magnet"],
+            }]}), search_id="rs_fixture_search_123456")
+            assert len(snapshot["candidates"]) == 1
+            reference = await pipeline.reference_store.put(owner="owner", session_id="session",
+                kind=RESOURCE_KIND, value=snapshot, ttl_seconds=900)
+            view = {"generation": 1, "ref": reference.ref, "expires_at": time.time() + 900,
+                    "items": snapshot["candidates"]}
+            selection = await pipeline.reference_store.put(owner="owner", session_id="session",
+                kind=SELECTION_KIND, value={key: view[key] for key in ("ref", "generation", "expires_at")},
+                ttl_seconds=900)
+            view["selection_ref"] = selection.ref
             lease, _ = await store.begin_turn(owner="owner", session_id="session", request_id="seed")
-            await store.commit(lease, updates=(StateUpdate("metadata.ux_candidate_view", {
-                "generation": 1, "ref": "ref_fixture", "expires_at": 4_000_000_000.0,
-            }),))
+            await store.commit(lease, updates=(StateUpdate("metadata.ux_candidate_view", view),))
             timeline.clear()
-            metadata["selection"] = {"fixture": True}
+            metadata["selection"] = {"ref": selection.ref, "positions": [1], "target": "guangya"}
         events = [event async for event in session.run(AgentInput(
             message="读取状态并准备写入", owner="owner", session_id="session", request_id="r0",
             metadata=metadata,
@@ -218,55 +218,14 @@ def test_session_closure_preserves_protocol_events_and_persistence(case):
         assert {event["payload"]["code"] for event in tool_events} == {"tool_budget_exceeded"}
         assert events[-1]["payload"]["tool_calls"] == 0
     if case == "selection":
+        assert result["executions"][0][1]["result_ids"] == ["fixture-result-1"]
+        assert "source_type" not in result["executions"][0][1]
         assert result["requests"] == []
         assert events[-1]["payload"]["model_calls"] == 0
         assert events[-1]["payload"]["tool_calls"] == 1
         assert events[-1]["payload"]["answer"] == ""
 
 
-@pytest.mark.parametrize("risk,confirmation,effect", [
-    (RiskLevel.READ, False, ToolEffect.READ),
-    (RiskLevel.READ, True, ToolEffect.WRITE),
-    (RiskLevel.WRITE, True, ToolEffect.WRITE),
-    (RiskLevel.DANGER, True, ToolEffect.DANGER),
-])
-@pytest.mark.parametrize("freshness", ["live", "snapshot"])
-@pytest.mark.parametrize("parallel_read", [False, True])
-def test_adapted_specs_keep_shared_fields_costs_and_disjoint_handlers(risk, confirmation, effect, freshness, parallel_read):
-    schema = {"type": "object", "properties": {"query": {"type": "string"}}}
-    value = ToolResult(True, "success", "兼容对照")
-    spec = ToolSpec(
-        name="fixture.inspect", model_name="fixture_alias", description="兼容字段",
-        risk=risk, requires_confirmation=confirmation, parameters=schema,
-        validator=lambda arguments: arguments, handler=lambda arguments: value,
-        runtime_status=lambda: {"status": "ready"}, domains=("Custom Domain",),
-        context_confirmation_preparer=lambda arguments, context: (value, "snapshot"),
-        context_confirmed_handler=lambda arguments, snapshot, context: value,
-        examples=("例子",), source_kind="fixture_source", freshness=freshness, parallel_read=parallel_read,
-        workflow="fixture_workflow", workflow_stage=3,
-        related_tools=("fixture.next", "fixture.next", " "),
-    )
-    adapted = adapt_tool_spec(spec)
-    assert adapted.name == spec.name and adapted.model_name == spec.model_name
-    assert adapted.description == spec.description and adapted.domain == "custom_domain"
-    assert adapted.examples == spec.examples and adapted.effect is effect
-    assert adapted.input_schema is schema and adapted.validator is spec.validator
-    assert adapted.runtime_status is spec.runtime_status
-    assert adapted.metadata == {
-        "source_kind": "fixture_source", "freshness": freshness, "parallel_read": parallel_read,
-        "workflow": "fixture_workflow", "workflow_stage": 3,
-        "related_tools": ("fixture.next",),
-        "retrieval_terms": ("Custom Domain", "fixture_source"), "risk": risk.value,
-    }
-    if effect is ToolEffect.READ:
-        assert adapted.cost == (1.25 if freshness == "live" else 1.0)
-        assert adapted.read is not None
-        assert adapted.prepare is None and adapted.execute_confirmed is None and adapted.verify is None
-        assert adapted.read({}, None) is value
-    else:
-        assert adapted.cost == (2.0 if effect is ToolEffect.DANGER else 1.5)
-        assert adapted.read is None
-        assert adapted.prepare is not None and adapted.execute_confirmed is not None and adapted.verify is not None
 
 
 @pytest.mark.parametrize("mutate_clone", [True, False])

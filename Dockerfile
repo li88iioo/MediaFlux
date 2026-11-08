@@ -30,10 +30,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # 本地与云端媒体规格探测依赖 ffprobe；Debian 的 ffmpeg 包同时提供该命令。
+# Agent 与源码部署共用 Bubblewrap 子进程，运行时加载系统 libseccomp2。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg gosu \
+    && apt-get install -y --no-install-recommends ffmpeg gosu bubblewrap libseccomp2 \
     && /usr/bin/ffprobe -version >/dev/null 2>&1 \
     && gosu --version >/dev/null 2>&1 \
+    && bwrap --version >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 mediaflux \

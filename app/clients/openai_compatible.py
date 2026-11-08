@@ -26,6 +26,8 @@ PROTOCOLS = frozenset({
     "anthropic_messages",
 })
 SUPPORTED_PROTOCOLS_TEXT = "auto、responses、chat_completions 或 anthropic_messages"
+# 三种协议共同支持的推理强度；空值表示不发送，沿用服务商默认。
+REASONING_EFFORTS = ("low", "medium", "high")
 _REASONING_MODEL_PREFIXES = (
     "o1",
     "o3",
@@ -389,34 +391,28 @@ def provider_headers(
 def normalize_provider_location(
     raw_url: object,
     *,
-    https_only: bool = True,
-    public_only: bool = True,
     max_length: int = 2048,
 ) -> ProviderLocation:
+    """规范化管理员配置的模型端点；允许本机、内网与公网 HTTP(S)。"""
     raw = str(raw_url or "").strip().rstrip("/")
-    if not raw or len(raw) > max_length or "\r" in raw or "\n" in raw:
+    if not raw or len(raw) > max_length or any(ord(char) < 32 or ord(char) == 127 for char in raw):
         raise ValueError("AI Base URL 格式无效")
     try:
         parsed = urlsplit(raw)
         port = parsed.port
     except ValueError as exc:
         raise ValueError("AI Base URL 格式无效") from exc
-    schemes = {"https"} if https_only else {"http", "https"}
     if (
-        parsed.scheme.lower() not in schemes
+        parsed.scheme.lower() not in {"http", "https"}
         or not parsed.hostname
-        or parsed.username
-        or parsed.password
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or (https_only and port not in {None, 443})
+        or port == 0
     ):
-        raise ValueError("AI Base URL 必须是无内嵌凭据、无查询参数的 HTTPS 地址")
+        raise ValueError("AI Base URL 必须是无内嵌凭据、无查询参数和片段的 HTTP 或 HTTPS 地址")
     host = parsed.hostname.rstrip(".").lower()
-    if public_only and (
-        host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost")
-    ):
-        raise ValueError("AI Base URL 不允许 localhost")
     path = parsed.path.rstrip("/")
     for suffix in KNOWN_ENDPOINT_SUFFIXES:
         if path.lower().endswith(suffix):
@@ -572,8 +568,9 @@ def extract_provider_usage(
     elif normalized == "responses":
         prompt = _usage_int(raw.get("input_tokens"), maximum=2_000_000)
         completion = _usage_int(raw.get("output_tokens"), maximum=2_000_000)
-        input_details = raw.get("input_token_details")
-        output_details = raw.get("output_token_details")
+        # Responses 协议字段为复数 *_tokens_details；单数写法会让缓存与推理计数恒为 0。
+        input_details = raw.get("input_tokens_details")
+        output_details = raw.get("output_tokens_details")
         cached = _usage_int(
             input_details.get("cached_tokens", 0) if isinstance(input_details, dict) else 0,
             maximum=2_000_000,
@@ -638,7 +635,7 @@ def native_tool_definitions(
     definitions: list[dict[str, Any]] = []
     for capability in capabilities:
         name = str(capability.get("name") or "").strip()
-        description = str(capability.get("description") or "").strip()[:600]
+        description = str(capability.get("description") or "").strip()
         parameters = capability.get("parameters")
         if not name or not isinstance(parameters, dict):
             continue
@@ -684,7 +681,11 @@ def native_tool_request_body(
     generation_profile: Mapping[str, str] | None = None,
     stream: bool = False,
     allow_parallel_tool_calls: bool = False,
+    reasoning_effort: str = "",
+    stable_system_chars: int = 0,
 ) -> dict[str, Any]:
+    if reasoning_effort and reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError("推理强度无效")
     body: dict[str, Any]
     if protocol == "responses":
         body = {
@@ -703,8 +704,8 @@ def native_tool_request_body(
     elif protocol == "anthropic_messages":
         body = {
             "model": model,
-            "system": system_prompt,
-            "messages": history,
+            "system": _anthropic_cached_system(system_prompt, stable_system_chars),
+            "messages": _anthropic_cached_history(history),
         }
         if tools:
             body.update({
@@ -729,9 +730,48 @@ def native_tool_request_body(
         protocol=protocol, model=model, max_tokens=max_tokens,
         generation_profile=generation_profile,
     ))
+    if reasoning_effort:
+        # 推理模式不接受采样参数；thinking/reasoning 计入输出额度。
+        body.pop("temperature", None)
+        if protocol == "responses":
+            body["reasoning"] = {"effort": reasoning_effort}
+        elif protocol == "anthropic_messages":
+            body["thinking"] = {"type": "adaptive"}
+            body["output_config"] = {"effort": reasoning_effort}
+        else:
+            body["reasoning_effort"] = reasoning_effort
     if stream:
         body["stream"] = True
     return body
+
+
+def _anthropic_cached_system(system_prompt: str, stable_chars: int) -> str | list[dict[str, Any]]:
+    """稳定头部单独设缓存断点；易变尾部变化时，工具定义与头部仍可命中。"""
+    head = system_prompt[:stable_chars] if 0 < stable_chars < len(system_prompt) else system_prompt
+    if not head.strip():
+        return system_prompt
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": head, "cache_control": {"type": "ephemeral"}}]
+    tail = system_prompt[len(head):]
+    if tail.strip():
+        blocks.append({"type": "text", "text": tail})
+    return blocks
+
+
+def _anthropic_cached_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """滚动断点放在末条用户输入，下一轮工具循环按前缀复用整段历史。"""
+    if not history or history[-1].get("role") != "user":
+        return history
+    content = history[-1].get("content")
+    if isinstance(content, str) and content.strip():
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": content}]
+    elif isinstance(content, list) and content and all(isinstance(block, dict) for block in content):
+        blocks = [dict(block) for block in content]
+    else:
+        return history
+    if blocks[-1].get("type") not in {"text", "tool_result"}:
+        return history
+    blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    return [*history[:-1], {**history[-1], "content": blocks}]
 
 
 def text_stream_request_body(
@@ -1315,7 +1355,7 @@ def parse_native_tool_turn(envelope: object, protocol: str, *, allow_argument_er
             validate_repair_batch(calls, [(item.get("id"), item["function"].get("name"))
                                          for item in message.get("tool_calls") or []
                                          if isinstance(item, dict) and isinstance(item.get("function"), dict)])
-            if envelope.get("error") or ("reasoning_content" in message and not isinstance(message["reasoning_content"], str)):
+            if envelope.get("error") or (message.get("reasoning_content") is not None and not isinstance(message["reasoning_content"], str)):
                 raise ValueError("Invalid native repair envelope")
         return NativeToolTurn(
             text=visible_text,
@@ -1324,7 +1364,7 @@ def parse_native_tool_turn(envelope: object, protocol: str, *, allow_argument_er
             assistant_entry=assistant_entry,
             usage=usage,
             private_layout_json=json.dumps([{"type": "reasoning_content", "text": message["reasoning_content"]}], ensure_ascii=False)
-            if isinstance(message.get("reasoning_content"), str) and message["reasoning_content"] else "[]" if any(call.argument_error for call in calls) else "",
+            if isinstance(message.get("reasoning_content"), str) else "[]" if any(call.argument_error for call in calls) else "",
         )
 
     finish_reason = provider_finish_reason(protocol, envelope.get("stop_reason"))

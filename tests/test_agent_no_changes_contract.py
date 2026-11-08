@@ -12,18 +12,15 @@ from unittest.mock import Mock, patch
 
 from app import config
 from app import database as db
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.domains.configuration.feature_actions import verify_feature_state_write
-from app.agent.domains.resources.indexer_config_actions import verify_indexer_sites_write
-from app.agent.kernel.capabilities import CapabilityRetriever
+
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
+from app.agent.kernel.capabilities import ToolCatalog
+from app.agent.kernel.ports.sdk_effects import policy_config_tool, cloud_organize_tools, feature_config_tool, rss_delivery_tools, indexer_configuration_tool, schedule_policy_tools, watchlist_tools, strm_failure_tools
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput
-from app.agent.models import Evidence, ToolResult
 from tests.support import isolated_test_database
 from tests.test_agent_kernel_core import ScriptedModel, collect
 from tests.test_agent_kernel_existing_ports import context_for
@@ -31,17 +28,17 @@ from tests.test_agent_kernel_existing_ports import context_for
 
 _WATCHLIST_ARGUMENTS = {"provider": "tmdb", "external_id": "8801", "media_type": "movie"}
 _NO_CHANGES_CASES = (
-    ("config.set_indexer_sites", {"site_ids": ["nyaa"]}),
+    ("resources.configure_sites", {"site_ids": ["nyaa"]}),
     ("library.set_patrol_policy", {"enabled": False}),
-    ("guangya.organize.set_schedule_policy", {"enabled": False}),
-    ("guangya.organize.run_once", {}),
-    ("discovery.add_watchlist", _WATCHLIST_ARGUMENTS),
-    ("rss.retry_failed", {"limit": 10}),
-    ("rss.submit_pending_to_qb", {"limit": 10}),
-    ("strm.retry_failures", {"scope": "all"}),
-    ("config.set_feature_state", {"feature": "discovery", "enabled": True}),
-    ("strm.set_schedule_policy", {"enabled": False}),
-    ("config.set_safe_policy", {"policy": "tmdb_match_mode", "value": "strict"}),
+    ("cloud.set_organize_schedule", {"enabled": False}),
+    ("cloud.organize", {}),
+    ("watchlist.add", _WATCHLIST_ARGUMENTS),
+    ("rss.retry", {"limit": 10}),
+    ("rss.download", {"limit": 10}),
+    ("strm.retry_failures", {"ids": []}),
+    ("settings.set_feature", {"feature": "discovery", "enabled": True}),
+    ("strm.set_schedule", {"enabled": False}),
+    ("settings.set_policy", {"policy": "tmdb_match_mode", "value": "strict"}),
 )
 
 
@@ -69,22 +66,22 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()))
         self.writer = self.enterContext(patch.object(config, "update_runtime_env_file"))
         self.discovery = self.enterContext(patch(
-            "app.agent.domains.discovery.watchlist_actions.get_discovery_service"
+            "app.discovery.service.DiscoveryService.get_detail"
         ))
         self.manager = Mock()
         self.manager.task_status.return_value = {"status": "idle"}
         self.enterContext(patch(
-            "app.agent.domains.guangya.organize_actions.get_organize_manager",
+            "app.modules.organize_service.get_organize_manager",
             return_value=self.manager,
         ))
         self.enterContext(patch(
-            "app.agent.domains.guangya.organize_actions.GuangYaClient",
+            "app.modules.organize_service.GuangYaClient",
             return_value=SimpleNamespace(logged_in=True, credential_generation=1, close=Mock()),
         ))
         self.organizer = Mock()
         self.organizer.organize.return_value = ([], {"total": 0})
         self.enterContext(patch(
-            "app.agent.domains.guangya.organize_actions.Organizer",
+            "app.modules.organize_service.Organizer",
             return_value=self.organizer,
         ))
         self.enterContext(patch(
@@ -99,9 +96,10 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
         self.strm_retry = self.enterContext(patch("app.modules.strm.retry_strm_failures"))
         db.add_media_watchlist("tmdb", "8801", "movie", "已收藏影片", "2026", "")
         names = {name for name, _arguments in _NO_CHANGES_CASES}
-        self.catalog = catalog_from_tool_specs([
-            spec for spec in build_tool_specs() if spec.name in names
-        ])
+        self.catalog = ToolCatalog()
+        for tool in (policy_config_tool(), *cloud_organize_tools(), feature_config_tool(), indexer_configuration_tool(), *watchlist_tools(), *rss_delivery_tools(), *schedule_policy_tools(), *strm_failure_tools()):
+            if tool.name in names:
+                self.catalog.register(tool)
         self.state = InMemorySessionStateStore()
         self.pipeline = ToolPipeline(catalog=self.catalog, state_store=self.state)
         self.freeze = self.enterContext(patch.object(
@@ -134,7 +132,7 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.organizer.organize.call_args.kwargs["dry_run"], True)
 
     async def test_duplicate_watchlist_finishes_a_real_session_successfully(self):
-        tool = self.catalog.get("discovery.add_watchlist")
+        tool = self.catalog.get("watchlist.add")
         model = ScriptedModel([
             [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
                         tool_call=ModelToolCall("already-saved", tool.model_name, _WATCHLIST_ARGUMENTS)),
@@ -143,7 +141,7 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
              ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         session = AgentSession(
-            model=model, catalog=self.catalog, retriever=CapabilityRetriever(),
+            model=model, catalog=self.catalog,
             pipeline=self.pipeline, state_store=self.state,
         )
         events = await collect(session.run(AgentInput(
@@ -169,17 +167,3 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
         state = await self.state.load(owner="owner", session_id="watchlist")
         self.assertFalse(state.pending_effect_plan_id)
         self.assertEqual(len(db.list_media_watchlist()), 1)
-
-    async def test_write_verifiers_preserve_no_changes_without_reading_persistence(self):
-        cases = (
-            (verify_feature_state_write, {"feature": "discovery", "enabled": True}),
-            (verify_indexer_sites_write, {"site_ids": ["nyaa"]}),
-        )
-        for verifier, arguments in cases:
-            with self.subTest(verifier=verifier.__name__):
-                result = ToolResult(True, "no_changes", "已经符合目标状态",
-                                    evidence=[Evidence("server_configuration", "无需写入", "now")])
-                with patch.object(config, "read_env_snapshot", return_value=(None, {})) as readback:
-                    checked = verifier(arguments, result)
-                self.assertIs(checked, result)
-                readback.assert_not_called()

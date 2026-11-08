@@ -29,9 +29,9 @@ from app.main import create_app
 from app.modules.organize import OrganizeRules
 from app.modules.scraper import Candidate, MatchResult, TMDBScraper
 from tests.support import (
+    _ParsingScraper, _DirectoryScrapeTMDB,
     InitializedWebTestCase,
     IsolatedDatabaseTestCase,
-    release_parse_result,
     isolated_test_database,
 )
 
@@ -171,31 +171,6 @@ class _EventuallyConsistentTreeClient(_MutableTreeClient):
         return file_id
 
 
-class _ParsingScraper:
-    @staticmethod
-    def _fields(filename: str) -> dict[str, object]:
-        tmdb = re.search(r"(?i)tmdb-(\d+)", filename)
-        season_episode = re.search(r"(?i)S(\d{1,2})E(\d{1,3})", filename)
-        if season_episode:
-            return {
-                "type": "tv",
-                "title": re.split(r"(?i)[._ -]S\d{1,2}E\d{1,3}", filename)[0],
-                "season": int(season_episode.group(1)),
-                "episode": int(season_episode.group(2)),
-                "tmdb_id": tmdb.group(1) if tmdb else "",
-            }
-        stem = filename.rsplit(".", 1)[0]
-        title = re.sub(r"[._ -]+(?:19|20)\d{2}.*$", "", stem)
-        return {
-            "type": "movie", "title": title, "season": None, "episode": None,
-            "tmdb_id": tmdb.group(1) if tmdb else "",
-        }
-
-    @classmethod
-    def parse_media(cls, filename: str, parent_path: str = "", match=None, *, filename_only=False):
-        return release_parse_result(
-            cls._fields(filename), filename=filename, parent_path=parent_path
-        )
 
 
 class DirectoryMediaInspectorTests(unittest.TestCase):
@@ -1648,119 +1623,6 @@ class SingleFileInspectionTests(IsolatedDatabaseTestCase):
             self.assertEqual(client.infos[file_id].parent_id, "inbox")
 
 
-class _DirectoryScrapeTMDB:
-    confirm: Mock
-    api_key = "tmdb-test-key"
-
-    def __init__(self):
-        self.search_calls: list[tuple[str, str, str]] = []
-        self.detail_calls: list[tuple[str, str]] = []
-        self.auto_result = MatchResult(
-            tmdb_id="1726",
-            title="钢铁侠",
-            year="2008",
-            media_type="movie",
-            confidence=0.96,
-            status="matched",
-            matched_by="search",
-            threshold=0.9,
-        )
-
-    def search_candidates(
-        self,
-        query: str,
-        year: str = "",
-        media_type: str = "movie",
-    ) -> list[Candidate]:
-        self.search_calls.append((query, year, media_type))
-        if media_type == "tv":
-            return [
-                Candidate(
-                    "123",
-                    "钢铁侠：装甲冒险",
-                    "2009",
-                    0.81,
-                    "tv",
-                    original_title="Iron Man: Armored Adventures",
-                )
-            ]
-        return [
-            Candidate(
-                "1726",
-                "钢铁侠",
-                "2008",
-                0.96,
-                "movie",
-                original_title="Iron Man",
-                overview="托尼·斯塔克制造钢铁战甲。",
-                poster_path="/movie.jpg",
-                backdrop_path="/movie-bg.jpg",
-                release_date="2008-04-30",
-            )
-        ]
-
-    def get_detail_with_credits(self, tmdb_id: str, media_type: str) -> dict:
-        self.detail_calls.append((tmdb_id, media_type))
-        if media_type == "tv":
-            return {
-                "id": int(tmdb_id),
-                "name": "钢铁侠：装甲冒险",
-                "original_name": "Iron Man: Armored Adventures",
-                "first_air_date": "2009-04-24",
-                "overview": "少年托尼·斯塔克的装甲冒险。",
-                "vote_average": 7.2,
-                "poster_path": "/tv.jpg",
-                "backdrop_path": "/tv-bg.jpg",
-                "genres": [{"name": "动画"}],
-                "created_by": [{"name": "Craig Kyle"}],
-                "credits": {"cast": [{"name": "Adrian Petriw"}], "crew": []},
-            }
-        return {
-            "id": int(tmdb_id),
-            "title": "钢铁侠",
-            "original_title": "Iron Man",
-            "release_date": "2008-04-30",
-            "overview": "托尼·斯塔克制造钢铁战甲。",
-            "vote_average": 7.6,
-            "poster_path": "/movie.jpg",
-            "backdrop_path": "/movie-bg.jpg",
-            "genres": [{"name": "动作"}, {"name": "科幻"}],
-            "credits": {
-                "cast": [
-                    {"name": "小罗伯特·唐尼"},
-                    {"name": "格温妮斯·帕特洛"},
-                ],
-                "crew": [{"name": "乔恩·费儒", "job": "Director"}],
-            },
-        }
-
-    def match_from_tmdb(self, tmdb_id: str, media_type: str) -> MatchResult:
-        detail = self.get_detail_with_credits(tmdb_id, media_type)
-        title = detail.get("name") or detail.get("title") or ""
-        date = detail.get("first_air_date") or detail.get("release_date") or ""
-        return MatchResult(
-            tmdb_id=tmdb_id,
-            title=title,
-            year=str(date)[:4],
-            media_type=media_type,
-            confidence=1.0,
-            locked=True,
-            status="matched",
-            matched_by="tmdb_id",
-            threshold=1.0,
-        )
-
-    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False):
-        return release_parse_result(
-            _ParsingScraper._fields(filename),
-            filename=filename, parent_path=parent_path,
-        )
-
-    def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False) -> dict:
-        return self.get_detail_with_credits(tmdb_id, media_type)
-
-    def match(self, _filename: str, _parent_path: str = "") -> MatchResult:
-        return self.auto_result
 
 
 class _RecordingTMDBClient:
@@ -1941,6 +1803,22 @@ class DirectoryScrapeServiceTests(unittest.TestCase):
             self.scraper.search_calls,
             [("钢铁侠", "", "movie")],
         )
+        self.assertEqual(self.scraper.detail_calls, [])
+
+    def test_native_reads_keep_all_candidates_and_real_file_facts(self):
+        candidates = [Candidate(str(1726 + i), f"候选{i}", "2008", 0.9, "movie") for i in range(12)]
+        with patch.object(self.scraper, "search_candidates", return_value=candidates):
+            result = self.service.search_target("owner", "movie-dir", "Iron Man", "movie", "2008")
+        self.assertEqual(len(result["candidates"]), 12)
+        self.assertEqual({row["external_id"] for row in result["candidates"]}, {str(1726 + i) for i in range(12)})
+        self.assertTrue(all(row["provider"] == "tmdb" and row["external_id"] == row["tmdb_id"]
+                            for row in result["candidates"]))
+        self.assertEqual({row["file_id"] for row in result["videos"]}, {"v1", "v2"})
+        self.assertEqual({row["file_id"] for row in result["companions"]}, {"s1"})
+        self.client.infos.update({row.file_id: row for row in self.tree["movie-dir"]})
+        single = self.service.inspect_target("owner-b", "v1")
+        self.assertEqual((single["scope_type"], single["scope_id"]), ("file", "v1"))
+        self.assertEqual([row["file_id"] for row in single["videos"]], ["v1"])
         self.assertEqual(self.scraper.detail_calls, [])
 
     def test_external_hints_are_read_only_and_do_not_change_tmdb_scoring(self):
@@ -2235,11 +2113,147 @@ def test_manual_metatube_identity_drives_preview_and_execution(scope, filename):
 
 
 class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
+    def test_native_selection_uses_the_numbering_modes_supported_by_the_service(self):
+        for mode in ("auto", "standard", "absolute", "season_continuous"):
+            with self.subTest(mode=mode):
+                built = self.service.build_execution("owner", "movie-dir", "movie", tmdb_id="1726", numbering_mode=mode)
+                self.assertEqual(built["execution_payload"]["flow"]["preview_arguments"]["numbering_mode"], mode)
+                self.assertEqual({row["file_id"] for row in built["preview"]["plans"]}, {"v1", "v2"})
+                self.assertEqual(built["preview"]["match"]["provider"], "tmdb")
+                self.assertEqual(built["preview"]["match"]["external_id"], "1726")
+                self.assertNotIn("preview_id", built["preview"])
+
+    def test_native_submission_restores_in_cold_store_and_replays_original_durable_receipt(self):
+        from app.modules.directory_scrape import DirectoryScrapeService, DirectoryScrapeStore
+        from app.modules.organize_tasks import OrganizeTaskManager
+        from app.repositories.organize_operation_jobs import (
+            claim_organize_operation_job, finish_organize_operation_job, get_organize_operation_job,
+            organize_operation_job_id_from_public_ref,
+        )
+
+        built = self.service.build_execution("owner", "movie-dir", "movie", tmdb_id="1726")
+        payload = json.loads(json.dumps(built["execution_payload"]))
+        self.assertEqual((payload["version"], payload["flow"]["selection_source"]), (2, "automatic"))
+        fresh = DirectoryScrapeService(client=cast(GuangYaClient, self.client), scraper=cast(TMDBScraper, self.scraper),
+            store=DirectoryScrapeStore(), rules_loader=lambda: self.rules)
+        self.addCleanup(fresh.close)
+        manager = OrganizeTaskManager()
+        admitted = []
+        def on_admitted(conn, row, replayed):
+            self.assertIsNotNone(conn.execute("SELECT job_id FROM organize_operation_jobs WHERE job_id=?", (row["job_id"],)).fetchone())
+            admitted.append((row["job_id"], replayed))
+        self.scraper.confirm = Mock()
+        with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), \
+            patch.object(manager._lock, "acquire", return_value=False), patch.object(manager, "_ensure_operation_dispatcher"), \
+            patch("app.modules.directory_scrape.get_directory_scrape_service", return_value=fresh):
+            before = dict(self.client.infos)
+            manager._shutting_down = True
+            rejected = fresh.submit_execution("owner", payload, on_admitted=on_admitted)
+            self.assertFalse(rejected["ok"])
+            self.assertEqual(self.client.infos, before)
+            self.assertEqual(admitted, [])
+            manager._shutting_down = False
+            first = fresh.submit_execution("owner", payload, on_admitted=on_admitted)
+            self.assertEqual(first["status"], "accepted")
+            job_id = organize_operation_job_id_from_public_ref(first["data"]["operation_ref"])
+            saved = get_organize_operation_job(job_id)
+            assert saved is not None
+            self.assertEqual(json.loads(saved["payload_json"]), payload)
+            pending = fresh.submit_execution("owner", payload, on_admitted=on_admitted)
+            self.assertTrue(pending["data"]["replayed"])
+            self.assertEqual(pending["data"]["operation_ref"], first["data"]["operation_ref"])
+            claimed = claim_organize_operation_job(job_id)
+            assert claimed is not None
+            result = OrganizeTaskManager._execute_durable_operation(dict(claimed))
+            assert isinstance(result, dict)
+            self.assertGreater(result["stats"]["moved"], 0)
+            self.assertTrue(finish_organize_operation_job(job_id, expected_lease_generation=claimed["lease_generation"],
+                status="completed", result=result))
+            after = dict(self.client.infos)
+            terminal = fresh.submit_execution("owner", payload, on_admitted=on_admitted)
+            self.assertEqual(terminal["status"], "completed")
+            self.assertEqual(terminal["data"]["operation_ref"], first["data"]["operation_ref"])
+            self.assertEqual(self.client.infos, after)
+        self.assertEqual(admitted, [(job_id, False), (job_id, True), (job_id, True)])
+        self.scraper.confirm.assert_not_called()
+
+    def test_native_payload_rejects_owner_or_object_drift_before_admission(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+        owner = self.id()
+        built = self.service.build_execution(owner, "movie-dir", "movie", tmdb_id="1726")
+        before = dict(self.client.infos)
+        with patch("app.modules.organize_tasks.get_organize_manager") as manager:
+            with self.assertRaises(DirectoryScrapeConflictError):
+                self.service.submit_execution("another-owner", built["execution_payload"])
+            self.client.rename("v1", "Iron.Man.2008.720p.mkv")
+            with self.assertRaises(DirectoryScrapeConflictError):
+                self.service.submit_execution(owner, built["execution_payload"])
+            manager.return_value.start_durable_operation.assert_not_called()
+        self.assertEqual(self.client.infos["v1"].parent_id, before["v1"].parent_id)
+
+    def _durable_payload(self):
+        from app.modules.directory_scrape import scrape_execution_fingerprint, summarize_scrape_preview
+
+        record = self.store.get_preview("owner", self.preview_id)
+        candidate = {"candidate_number": 1, "provider": "tmdb", "external_id": "1726",
+                     "tmdb_id": "1726", "media_type": "movie"}
+        summary = summarize_scrape_preview(record.payload, {**candidate, "title": "钢铁侠", "year": "2008"})
+        snapshot = {"scope_type": "directory", "scope_id": "movie-dir",
+                    "selected_candidate": candidate,
+                    "preview_arguments": {"candidate_number": 1, "numbering_mode": "auto"},
+                    "preview_guard": {key: summary[key] for key in (
+                        "candidate_number", "plan_count", "companion_count", "conflict_count", "actions")}}
+        return {"version": 1, "execution_owner": "a" * 64, "flow": snapshot,
+                "expected_context": scrape_execution_fingerprint(snapshot, record)}
+
+    def test_durable_job_cold_store_executes_without_agent_session(self):
+        from app.modules.directory_scrape import DirectoryScrapeService, DirectoryScrapeStore
+        from app.modules.directory_scrape_errors import DirectoryScrapePublicError
+        from app.modules.organize_tasks import OrganizeTaskManager
+        from app.repositories.organize_operation_jobs import enqueue_organize_operation_job, claim_organize_operation_job
+
+        payload = self._durable_payload()
+        job, _ = enqueue_organize_operation_job(job_kind="agent_directory_scrape", owner="owner",
+            operation="目录刮削", reference="已确认目录", payload=payload, dedupe_key="cold-scrape")
+        row = claim_organize_operation_job(job["job_id"])
+        self.assertIsNotNone(row)
+        fresh = DirectoryScrapeService(client=cast(GuangYaClient, self.client),
+            scraper=cast(TMDBScraper, self.scraper), store=DirectoryScrapeStore(),
+            rules_loader=lambda: self.rules)
+        self.addCleanup(fresh.close)
+        with patch("app.modules.directory_scrape.get_directory_scrape_service", return_value=fresh):
+            result = OrganizeTaskManager._execute_durable_operation(dict(row))
+            assert isinstance(result, dict)
+            self.assertEqual(result["stats"]["moved"], 1)
+            self.assertNotEqual(self.client.infos["v1"].parent_id, "movie-dir")
+            after = dict(self.client.infos)
+            with self.assertRaises(DirectoryScrapePublicError):
+                OrganizeTaskManager._execute_durable_operation(dict(row))
+            self.assertEqual(self.client.infos, after)
+
+    def test_durable_job_rechecks_rules_and_cancellation_before_writing(self):
+        from app.modules.directory_scrape import execute_durable_directory_scrape_job
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+        from app.repositories.organize_operation_jobs import OrganizeOperationCancelled
+
+        payload = self._durable_payload()
+        before = dict(self.client.infos)
+        cancel = Mock(side_effect=OrganizeOperationCancelled("取消"))
+        with patch("app.modules.directory_scrape.get_directory_scrape_service", return_value=self.service) as get_service:
+            with self.assertRaises(OrganizeOperationCancelled):
+                execute_durable_directory_scrape_job(payload, cancel_check=cancel)
+            get_service.assert_not_called()
+            self.assertEqual(self.client.infos, before)
+            self.rules = replace(self.rules, year_split=True)
+            with self.assertRaises(DirectoryScrapeConflictError):
+                execute_durable_directory_scrape_job(payload)
+            self.assertEqual(self.client.infos, before)
+
     def test_strm_handoff_survives_execution_persistence_and_agent_query(self):
         import threading
         from contextlib import ExitStack
-        from app.agent.domains.guangya.runtime import guangya_organize_status
-        from app.agent.models import ToolContext
+        from app.modules.organize_tasks import get_organize_operation_status
+        from app.agent.models import ToolResult
         from app.modules.directory_scrape_errors import DirectoryScrapeGoneError
         from app.modules.organize_tasks import OrganizeTaskManager
         from app.modules.scheduler import STRMScheduler
@@ -2302,7 +2316,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                     if durable:
                         stack.enter_context(patch("app.modules.organize_tasks.get_organize_manager", return_value=manager))
                         stack.enter_context(patch.object(manager, "status", return_value={}))
-                        response = guangya_organize_status({"operation_ref": organize_operation_public_ref(task_id)}, ToolContext(owner="owner"))
+                        response = ToolResult(**get_organize_operation_status(organize_operation_public_ref(task_id), owner="owner"))
                         self.assertEqual(response.ok, outcome == "accepted")
                         self.assertEqual(response.data["task"]["stats"]["strm"]["ok"], outcome == "accepted")
                         self.assertNotIn("private-audit-token", json.dumps(response.data))
@@ -2578,8 +2592,8 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
     def test_postwrite_receipt_error_survives_worker_archive_and_agent_status(self):
         import threading
 
-        from app.agent.domains.guangya.runtime import guangya_organize_status
-        from app.agent.models import ToolContext
+        from app.modules.organize_tasks import get_organize_operation_status
+        from app.agent.models import ToolResult
         from app.modules.organize_tasks import OrganizeTaskManager
         from app.repositories.organize_operation_jobs import (
             claim_organize_operation_job,
@@ -2644,9 +2658,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                 return_value={"schedule": {}, "operation_queue": {"total": 0}},
             ),
         ):
-            agent_result = guangya_organize_status(
-                {"operation_ref": operation_ref}, ToolContext(owner=owner)
-            )
+            agent_result = ToolResult(**get_organize_operation_status(operation_ref, owner=owner))
         self.assertEqual(agent_result.status, "attention")
         self.assertEqual(agent_result.data["task"]["stats"]["moved"], 1)
         self.assertEqual(agent_result.data["task"]["stats"]["audit_failures"], 1)

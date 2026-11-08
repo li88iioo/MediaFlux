@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app import database as db
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.conversation_context import restore_messages
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -148,6 +148,7 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
         protocol="anthropic_messages",
         model="model-one",
         url="https://api.example.com/v1",
+        reasoning_effort="",
     ):
         def handler(_arguments, _context):
             self.handled.append("inspect")
@@ -156,11 +157,11 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
         catalog = ToolCatalog([read_tool("inspect", handler=handler)])
         return AgentSession(
             model=OpenAICompatibleModelAdapter(
-                ProviderSettings(api_url=url, model=model, protocol=protocol),
+                ProviderSettings(api_url=url, model=model, protocol=protocol, reasoning_effort=reasoning_effort),
                 client_factory=lambda **_: wire,
             ),
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=self.store),
             state_store=self.store,
             journal=self.store,
@@ -686,8 +687,8 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(THINKING, repr(events))
 
     async def test_chat_reasoning_content_and_tool_arguments_equivalent_sse_json(self):
-        for streamed in (True, False):
-            with self.subTest(streamed=streamed):
+        for streamed, reasoning in ((True, THINKING), (False, THINKING), (True, ""), (False, "")):
+            with self.subTest(streamed=streamed, reasoning=reasoning):
                 call = {
                     "id": "call-1",
                     "type": "function",
@@ -695,25 +696,27 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
                 }
                 message = {
                     "role": "assistant",
-                    "reasoning_content": THINKING,
+                    "reasoning_content": reasoning,
                     "content": "<think>hidden-markup</think>核实中",
                     "tool_calls": [call],
                 }
                 first = (
                     [
-                        {"choices": [{"delta": {"reasoning_content": THINKING[:9]}}]},
+                        {"choices": [{"delta": {"reasoning_content": None}}]},
+                        {"choices": [{"delta": {"reasoning_content": reasoning[:9]}}]},
                         {
                             "choices": [
                                 {
                                     "delta": {
                                         **message,
-                                        "reasoning_content": THINKING[9:],
+                                        "reasoning_content": reasoning[9:],
                                         "tool_calls": [{**call, "index": 0}],
                                     },
                                     "finish_reason": "tool_calls",
                                 }
                             ]
                         },
+                        {"choices": [{"delta": {"reasoning_content": None}}]},
                         "[DONE]",
                     ]
                     if streamed
@@ -723,12 +726,12 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
                 )
                 answer = {
                     "choices": [
-                        {"message": {"content": "已核实"}, "finish_reason": "stop"}
+                        {"message": {"content": "已核实", "reasoning_content": reasoning}, "finish_reason": "stop"}
                     ]
                 }
                 wire = WireClient([first, answer, answer])
                 events = await self.run_session(
-                    self.session(wire, "chat_completions"), str(streamed)
+                    self.session(wire, "chat_completions"), f"{streamed}-{len(reasoning)}"
                 )
                 assistant = [
                     row for row in wire.requests[1]["messages"] if row.get("tool_calls")
@@ -738,22 +741,27 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
                     secret_provider=lambda: "synthetic-state-secret"
                 )
                 events += await self.run_session(
-                    self.session(wire, "chat_completions"), "restored"
+                    self.session(wire, "chat_completions"), f"restored-{streamed}-{len(reasoning)}"
                 )
                 assistant = [
                     row for row in wire.requests[2]["messages"] if row.get("tool_calls")
                 ][-1]
-                self.assertEqual(assistant["reasoning_content"], THINKING)
+                self.assertEqual(assistant["reasoning_content"], reasoning)
+                previous_answer = [row for row in wire.requests[2]["messages"]
+                                   if row["role"] == "assistant" and row.get("content") == "已核实"][-1]
+                self.assertEqual(previous_answer["reasoning_content"], reasoning)
                 self.assertNotIn(THINKING, repr(events))
                 self.assertNotIn("hidden-markup", repr(events))
 
     async def test_responses_reasoning_order_and_encrypted_content_roundtrip_sse_and_json(
         self,
     ):
+        public_summary = "Check the library before answering."
         reasoning = {
             "type": "reasoning",
             "id": "rs_1",
-            "summary": [{"type": "summary_text", "text": THINKING}],
+            "summary": [{"type": "summary_text", "text": public_summary}],
+            "content": [{"type": "reasoning_text", "text": THINKING}],
             "encrypted_content": REDACTED,
             "status": "completed",
         }
@@ -824,6 +832,65 @@ class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertNotIn(THINKING, public)
                 self.assertNotIn(REDACTED, public)
+                self.assertIn(public_summary, public)
+
+    async def test_public_summary_redacts_cross_chunk_credentials_without_changing_native_replay(self):
+        from app.agent.kernel.adapters import consume_events, iter_ndjson
+        from app.agent.kernel.events import AgentEventType
+        from tests.test_agent_kernel_core import _events_stream
+
+        secret = "summary-credential-canary"
+        summary = f"  Check source https://example.com/info .\n\napi_key={secret}  "
+        public_summary = "  Check source https://example.com/info .\n\napi_key=********  "
+        reasoning = {
+            "type": "reasoning", "id": "rs_summary", "encrypted_content": REDACTED,
+            "summary": [{"type": "summary_text", "text": summary}],
+            "content": [{"type": "reasoning_text", "text": THINKING}],
+        }
+        call = {"type": "function_call", "id": "fc_summary", "call_id": "call-summary",
+                "name": "inspect", "arguments": "{}"}
+        done = {"type": "response.reasoning_summary_text.done", "item_id": "rs_summary",
+                "output_index": 0, "summary_index": 0, "text": summary}
+        frames = [
+            {"type": "response.reasoning_summary_text.delta", "item_id": "rs_summary",
+             "output_index": 0, "summary_index": 0, "delta": character}
+            for character in summary
+        ] + [
+            done, done,
+            {"type": "response.reasoning_text.delta", "delta": THINKING},
+            {"type": "response.output_item.done", "output_index": 0, "item": reasoning},
+            {"type": "response.output_item.done", "output_index": 1, "item": call},
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ]
+        answer = {"status": "completed", "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已核实"}]},
+        ]}
+        wire = WireClient([frames, answer, answer], split=1)
+        events = await self.run_session(self.session(wire, "responses", reasoning_effort="high"))
+        summaries = [event for event in events if event.type is AgentEventType.MODEL_REASONING_SUMMARY_DELTA]
+        self.assertEqual([dict(event.payload) for event in summaries], [
+            {"delta": public_summary, "round": 1, "summary_id": "rs_summary:0"},
+        ])
+        self.assertEqual(wire.requests[0]["reasoning"], {"effort": "high", "summary": "auto"})
+        self.assertEqual(len(wire.requests), 2)
+        self.assertIn(reasoning, wire.requests[1]["input"])
+        view = await consume_events(_events_stream(events))
+        self.assertEqual(view.answer, "已核实")
+        state = await self.store.load(owner="owner", session_id="session")
+        self.assertTrue(all(summary not in message.content for message in restore_messages(state)))
+        journal = await self.store.list_events(owner="owner", session_id="session")
+        ndjson = b"".join([part async for part in iter_ndjson(_events_stream(events))]).decode()
+        public = repr(events) + repr(journal) + ndjson + repr(public_conversation_messages(state.conversation))
+        for private in (secret, THINKING, REDACTED):
+            self.assertNotIn(private, public)
+
+        self.store = SQLiteKernelStore(secret_provider=lambda: "synthetic-state-secret")
+        restored_events = await self.run_session(
+            self.session(wire, "responses", reasoning_effort="high"), "summary-restored",
+        )
+        self.assertIn(reasoning, wire.requests[2]["input"])
+        self.assertFalse(any(event.type is AgentEventType.MODEL_REASONING_SUMMARY_DELTA for event in restored_events))
+        self.assertEqual(self.handled, ["inspect"])
 
     async def test_anthropic_text_block_tails_survive_tool_round_and_sqlite_restore(self):
         # A block boundary ends markup lookahead; delta boundaries do not.

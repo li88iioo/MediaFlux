@@ -49,11 +49,11 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         db.upsert_local_library_target(source_id, "movie", str(target), owner=owner)
         return source_id, source, target
 
-    def _service(self, provider="metatube", external_id="javbus:first"):
+    def _service(self, provider="metatube", external_id="javbus:first", *, number="SODAH-003"):
         match = MatchResult(
             title="SODAH-003", media_type="movie", confidence=1.0, status="matched",
             provider=provider, external_id=external_id,
-            metadata={"number": "SODAH-003", "title": "SODAH-003"},
+            metadata={"number": number, "title": "SODAH-003"},
         )
         service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(match)))
         self.addCleanup(service.close)
@@ -90,13 +90,15 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         db.update_local_media_task(task_id, owner=owner, status=status)
         return task_id
 
-    def test_independent_tasks_check_provider_and_external_id(self):
-        for index, (provider, external_id, blocked) in enumerate((
-            ("metatube", "javbus:second", True),
-            ("clean_title", "SODAH-003", True),
-            ("metatube", "javbus:first", False),
+    def test_independent_tasks_compare_numbers_and_reject_other_media(self):
+        for index, (first_provider, provider, external_id, number, blocked) in enumerate((
+            ("metatube", "metatube", "javbus:second", "SODAH-003", False),
+            ("metatube", "clean_title", "SODAH-003", "SODAH-003", False),
+            ("clean_title", "metatube", "JAV321:sodah00003", "SODAH-003", False),
+            ("metatube", "metatube", "javbus:first", "SODAH-003", False),
+            ("metatube", "metatube", "javbus:first", "SODAH-004", True),
         )):
-            with self.subTest(provider=provider, external_id=external_id):
+            with self.subTest(first_provider=first_provider, provider=provider, external_id=external_id, number=number):
                 source_id, source, _target = self._source(
                     f"source-{index}", target=self.root / f"movies-{index}",
                 )
@@ -107,11 +109,12 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
                 first.write_bytes(b"first-video")
                 second.write_bytes(b"second-video")
                 first_task = self._task(source_id, first)
-                first_result = self._service().execute_task("admin", first_task)
+                first_id = "SODAH-003" if first_provider == "clean_title" else "javbus:first"
+                first_result = self._service(first_provider, first_id).execute_task("admin", first_task)
                 self.assertEqual(first_result["status"], "completed")
                 self.assertTrue(first_result["moved"])
                 second_task = self._task(source_id, second)
-                result = self._service(provider, external_id).execute_task("admin", second_task)
+                result = self._service(provider, external_id, number=number).execute_task("admin", second_task)
                 self.assertEqual(result["status"], "requires_manual" if blocked else "completed")
                 if blocked:
                     self.assertTrue(second.exists())
@@ -162,6 +165,7 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
             ("completed", "", None, False),
             ("failed", "rolled_back", None, False),
             ("requires_manual", "completed", None, True),
+            ("completed", "completed", "tv:metatube:javbus:first:__root__", True),
             ("completed", "completed", "", None),
         )):
             with self.subTest(status=status, step_status=step_status, group=group):

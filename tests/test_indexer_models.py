@@ -132,6 +132,20 @@ class IndexerModelTests(unittest.TestCase):
         self.assertEqual(cloned.site_item_counts, {"nyaa": 1, "mikan": 1})
         self.assertIsNot(cloned.site_item_counts, result.site_item_counts)
 
+    def test_public_size_fills_missing_label_without_replacing_source_text(self):
+        for size, label, expected in (
+            (None, None, None), (0, None, "0 B"), (1023, "", "1023 B"),
+            (1024, None, "1.00 KiB"), (377_162_579, None, "359.69 MiB"),
+            (1024**3, None, "1.00 GiB"), (1024**6, None, "1.00 EiB"),
+            (377_162_579, "377.2 MB", "377.2 MB"),
+        ):
+            with self.subTest(size=size, label=label):
+                item = IndexerItem("demo", "Demo", "Example", size_bytes=size, size_text=label)
+                payload = item.to_public_dict()
+                self.assertEqual(payload["size_text"], expected)
+                self.assertEqual(payload["size_bytes"], size)
+                self.assertEqual(item.size_text, label)
+
     def test_public_item_hides_upstream_download_locations(self):
         item = IndexerItem(
             site_id="nyaa",

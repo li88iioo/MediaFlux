@@ -8,11 +8,59 @@ from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from typing import Any
 
 from app.modules.episode_mapping import classify_episode_position
+from app.modules.media_probe import infer_dynamic_ranges, infer_media_profile
 
 from .models import IndexerItem, IndexerMediaSearchRequest
 from .release import parse_indexer_release_position
+
+TECHNICAL_FILTER_CHOICES = {
+    "resolution": ("", "2160p", "1080p", "720p", "480p"),
+    "dynamic_range": ("", "SDR", "HDR", "HDR10", "HDR10+", "DoVi", "HLG"),
+    "exclude_hdr": (False, True),
+}
+
+
+def technical_filter_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """搜索和既有候选筛选使用相同规格；省略/空值不限，不继承别次搜索条件。"""
+    quality = {key: arguments[key] for key in TECHNICAL_FILTER_CHOICES if key in arguments}
+    for key, value in quality.items():
+        choices = TECHNICAL_FILTER_CHOICES[key]
+        if type(value) is not type(choices[0]) or value not in choices:
+            raise ValueError(f"{key} 不在允许范围内")
+    return quality
+
+
+def filter_technical_candidates(
+    items: list[dict[str, Any]], arguments: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """仅使用可见发布名证据，未知与冲突分开统计；保留原候选身份/序号。"""
+    requirements = {key: value for key, value in technical_filter_arguments(arguments).items() if value}
+    matched, unknown, mismatched = [], 0, 0
+    for item in items:
+        title = " ".join(str(item.get("title") or "").split())
+        profile = infer_media_profile(title) if requirements else None
+        observed = {key: getattr(profile, key) for key in requirements if key != "exclude_hdr"}
+        ranges = infer_dynamic_ranges(title) if requirements.get("exclude_hdr") or requirements.get("dynamic_range") else ()
+        if requirements.get("exclude_hdr"):
+            observed["exclude_hdr"] = not any(value != "SDR" for value in ranges)
+        if desired := requirements.get("dynamic_range"):
+            matches = (ranges == ("SDR",) if desired == "SDR" else
+                       any(value != "SDR" for value in ranges) if desired == "HDR" else desired in ranges)
+            observed["dynamic_range"] = desired if matches else "mismatch" if ranges else ""
+        if any(value != requirements[key] for key, value in observed.items() if value != ""):
+            mismatched += 1
+        elif any(not value for value in observed.values()):
+            unknown += 1
+        else:
+            matched.append(item)
+    return matched, {"requested": requirements, "basis": "release_title_only", "considered": len(items),
+                     "scope": "input_candidate_titles",
+                     "unknown_excluded": unknown, "mismatched_excluded": mismatched,
+                     "stream_verified": False}
+
 
 _SEPARATORS = re.compile(r"[^0-9a-z\u3400-\u9fff\u3040-\u30ff]+", re.IGNORECASE)
 _HAN_ONLY = re.compile(r"^[\u3400-\u9fff]+$")
@@ -82,17 +130,12 @@ def _contains_evidence(raw_candidate: str, normalized_candidate: str, evidence: 
     return False
 
 
-def rank_item(
-    item: IndexerItem,
-    *,
-    media: IndexerMediaSearchRequest | None,
-    fallback_query: str,
-    now: datetime | None = None,
-) -> IndexerItem:
-    candidate = _normalize(item.title)
+def match_media_title(
+    title: str, *, media: IndexerMediaSearchRequest | None, fallback_query: str,
+) -> tuple[float, str]:
+    """搜索排序与缺集推荐复用同一作品名称/别名证据。"""
+    candidate = _normalize(title)
     evidences = _evidence_values(media, fallback_query)
-    score = 0.0
-    reasons: list[str] = []
     best_ratio = 0.0
     best_kind = ""
     for evidence in evidences:
@@ -100,12 +143,25 @@ def rank_item(
             continue
         if candidate == evidence:
             ratio, kind = 1.0, "title_exact"
-        elif _contains_evidence(item.title, candidate, evidence):
+        elif _contains_evidence(title, candidate, evidence):
             ratio, kind = min(0.98, len(evidence) / max(len(candidate), 1) + 0.45), "title_contains"
         else:
             ratio, kind = SequenceMatcher(None, evidence, candidate).ratio(), "title_similar"
         if ratio > best_ratio:
             best_ratio, best_kind = ratio, kind
+    return best_ratio, best_kind
+
+
+def rank_item(
+    item: IndexerItem,
+    *,
+    media: IndexerMediaSearchRequest | None,
+    fallback_query: str,
+    now: datetime | None = None,
+) -> IndexerItem:
+    best_ratio, best_kind = match_media_title(item.title, media=media, fallback_query=fallback_query)
+    score = 0.0
+    reasons: list[str] = []
     if best_kind == "title_exact":
         score += 72
         reasons.append(best_kind)

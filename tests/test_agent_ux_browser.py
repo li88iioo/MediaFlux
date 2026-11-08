@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import unittest
 from pathlib import Path
@@ -118,6 +119,52 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.evaluate(harness.MOCK_FETCH, config)
         page.add_script_tag(content=self.source)
         page.wait_for_function("() => document.querySelector('#agentSessionList').getAttribute('aria-busy') === 'false'")
+
+    def progress_page(self, *, width: int = 1280):
+        page = self.browser.new_page(viewport={'width': width, 'height': 844})
+        self.addCleanup(page.close)
+        # 在应用加载前安装时钟，发起请求前暂停，计时只由测试显式推进。
+        page.clock.install(time='2026-11-07T00:00:00Z')
+        page.route('http://mediaflux.test/agent', lambda route: route.fulfill(
+            status=200, content_type='text/html', body=harness.HTML,
+        ))
+        page.goto('http://mediaflux.test/agent')
+        page.add_style_tag(content=self.styles)
+        page.evaluate(harness.MOCK_FETCH, {'sessions': {'sessions': [], 'draft_scope': SCOPE}})
+        page.add_script_tag(content=self.source)
+        page.wait_for_function("() => document.querySelector('#agentSessionList').getAttribute('aria-busy') === 'false'")
+        page.add_script_tag(path=str(harness.ROOT / 'app/static/js/lucide.min.js'))
+        page.evaluate(r"""() => {
+            window.renderLucideIcons = () => window.lucide.createIcons();
+            const original = window.fetch;
+            window.fetch = (url, options = {}) => {
+                if (String(url) !== '/api/agent/query') return original(url, options);
+                window.__kernelCalls.push({url: String(url), method: options.method || 'GET', body: String(options.body || '')});
+                const request = JSON.parse(options.body);
+                let sequence = 0;
+                return new Response(new ReadableStream({start(controller) {
+                    window.emitProgress = (type, payload) => controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                        event_id: `progress-${++sequence}`, sequence, type, payload,
+                        session_id: request.session_id, request_id: request.request_id, turn_id: 'progress-turn',
+                    }) + '\n'));
+                }}), {headers: {'Content-Type': 'application/x-ndjson'}});
+            };
+        }""")
+        page.clock.pause_at('2026-11-07T01:00:00Z')
+        return page
+
+    def emit_progress(self, page, kind: str, payload: dict | None = None):
+        page.evaluate('([kind, payload]) => window.emitProgress(kind, payload)', [kind, payload or {}])
+        page.clock.run_for(100)
+
+    def elapsed_seconds(self, page) -> float:
+        elapsed = page.locator('.agent-stream-head time.agent-stream-elapsed')
+        self.assertEqual(elapsed.count(), 1)
+        self.assertTrue(elapsed.is_visible())
+        match = re.fullmatch(r'·\s*(\d+)秒', elapsed.inner_text())
+        self.assertIsNotNone(match, elapsed.inner_text())
+        assert match is not None
+        return float(match[1])
 
     def snapshot(self, page, name: str):
         output = os.getenv('MEDIAFLUX_BROWSER_EVIDENCE_DIR')
@@ -358,20 +405,30 @@ class AgentUXBrowserTests(unittest.TestCase):
 
     def test_candidate_comparison_uses_safe_fields_and_only_selects_for_preview(self):
         view = candidate_view()
+        coverage_notice = '部分来源未返回或尚有未读取页；结果仅覆盖已返回范围。<img src=x onerror=window.__coverage_xss=1>'
+        view['coverage_notice'] = coverage_notice
         page = self.page({'queryEvents': events_for_candidates(view)})
         page.locator('#agentPrompt').fill('找第一集的版本')
         page.locator('#agentSend').click()
         page.wait_for_selector('.agent-candidate-select:not([disabled])')
         self.assertEqual(page.locator('.agent-candidate-row').count(), 2)
         self.assertFalse(page.locator('.agent-candidates-more').evaluate('(node) => node.open'))
+        notice = page.locator('[data-candidate-coverage-notice]')
+        self.assertEqual(notice.count(), 1)
+        self.assertEqual(notice.inner_text(), coverage_notice)
+        self.assertIn('确认一次', page.locator('.agent-candidates-note:not([data-candidate-coverage-notice])').inner_text())
         self.assertEqual(page.locator('.agent-candidates img').count(), 0)
         self.assertFalse(page.evaluate('Boolean(window.__ux_xss)'))
+        self.assertFalse(page.evaluate('Boolean(window.__coverage_xss)'))
+        page.evaluate("window.__coverageNotice = document.querySelector('[data-candidate-coverage-notice]')")
         page.locator('.agent-candidates-more > summary').click()
         self.assertIn('1080p', page.locator('.agent-candidate-info').first.inner_text())
         page.locator('.agent-candidate-detail > summary').first.click()
         self.assertIn('字幕需要人工核对', page.locator('.agent-candidate-detail').first.inner_text())
         page.locator('[data-candidate-position="2"]').check()
         page.locator('.agent-candidate-target select').select_option('both')
+        self.assertEqual(notice.inner_text(), coverage_notice)
+        self.assertTrue(notice.evaluate('(node) => node === window.__coverageNotice'))
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 1)
         page.locator('#agentPrompt').fill('下一句草稿保持原样')
         messages_before = page.locator('.agent-message').count()
@@ -389,7 +446,22 @@ class AgentUXBrowserTests(unittest.TestCase):
         assert after is not None
         assert before is not None
         self.assertEqual((before['width'], before['height']), (after['width'], after['height']))
+        self.assertEqual(notice.inner_text(), coverage_notice)
         self.snapshot(page, 'candidates-desktop')
+
+    def test_candidate_coverage_notice_is_absent_when_empty(self):
+        for coverage_notice in (None, '', ' \n '):
+            with self.subTest(coverage_notice=coverage_notice):
+                view = candidate_view()
+                if coverage_notice is not None:
+                    view['coverage_notice'] = coverage_notice
+                page = self.page({'queryEvents': events_for_candidates(view)})
+                page.locator('#agentPrompt').fill('搜索资源')
+                page.locator('#agentSend').click()
+                page.wait_for_selector('.agent-candidate-select:not([disabled])')
+                self.assertEqual(page.locator('[data-candidate-coverage-notice]').count(), 0)
+                self.assertEqual(page.locator('.agent-candidates-note').count(), 1)
+                self.assertIn('确认一次', page.locator('.agent-candidates-note').inner_text())
 
     def test_same_turn_search_invalidation_removes_previous_cards(self):
         for signal in ('progress', 'empty_result'):
@@ -473,13 +545,17 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
 
     def test_expired_candidates_are_readonly_and_mobile_stays_inside_viewport(self):
-        page = self.page({'queryEvents': events_for_candidates(candidate_view(expires_at=time.time() - 5))}, viewport={'width': 390, 'height': 844})
+        view = candidate_view(expires_at=time.time() - 5)
+        coverage_notice = '部分来源未返回或尚有未读取页；结果仅覆盖已返回范围。'
+        view['coverage_notice'] = coverage_notice
+        page = self.page({'queryEvents': events_for_candidates(view)}, viewport={'width': 390, 'height': 844})
         page.locator('#agentPrompt').fill('显示旧的搜索结果')
         page.locator('#agentSend').click()
         page.wait_for_selector('.agent-candidate-row', state='attached')
         page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
         self.assertTrue(page.locator('.agent-candidate-select').first.is_disabled())
-        self.assertIn('仅供回看', page.locator('.agent-candidates-note').inner_text())
+        self.assertEqual(page.locator('[data-candidate-coverage-notice]').inner_text(), coverage_notice)
+        self.assertIn('仅供回看', page.locator('.agent-candidates-note:not([data-candidate-coverage-notice])').inner_text())
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
         self.snapshot(page, 'candidates-mobile')
 
@@ -525,6 +601,82 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator('.agent-message-assistant').count(), 1)
         self.assertEqual(page.locator('#agentPrompt').input_value(), '保留未发送草稿')
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
+
+    def test_running_journal_preserves_body_without_replaying_snapshots_or_resubmitting(self):
+        for enabled, width in ((True, 1280), (False, 390)):
+            with self.subTest(stream_display=enabled, width=width):
+                current = active_turn('journal-request', 'journal-turn', detail='正在整理回复')
+                rows = [
+                    ('turn.started', {'stream_display_enabled': enabled}),
+                    ('model.started', {'round': 1}),
+                    ('model.tool_call', {'call_id': 'original-call', 'label': '工作区代码执行'}),
+                    ('tool.completed', {'call_id': 'original-call', 'label': '工作区代码执行',
+                                        'result': {'summary': '命令已退出（退出码 0）'}}),
+                    ('model.started', {'round': 2}),
+                    ('model.delta', {'round': 2, 'delta': '已收到 marker'}),
+                    ('tool.progress', {'activity': {'id': 'sdk-journal', 'kind': 'tool', 'label': '查询媒体库',
+                        'method': 'library.search', 'status': 'running', 'summary': '正在核对媒体记录。'}}),
+                    ('model.reasoning_summary.delta', {'round': 2, 'summary_id': 'journal', 'delta': '公开摘要 marker'}),
+                ]
+                current['events'] = [{**harness._event(index, kind, data),
+                    'request_id': current['request_id'], 'turn_id': current['turn_id']}
+                    for index, (kind, data) in enumerate(rows, 1)]
+                payload = session_snapshot(SESSION_A, messages=[{'role': 'user', 'content': '原用户请求'}], active_turn=current)
+                page = self.page({'sessionDetails': {SESSION_A: payload}}, stored_session=SESSION_A,
+                                 viewport={'width': width, 'height': 844})
+                page.locator('.agent-stream-head').wait_for()
+                self.assertEqual(page.locator('.agent-stream-text').inner_text(), '已收到 marker' if enabled else '')
+                self.assertNotIn('命令已退出', page.locator('#agentTranscript').inner_text())
+                self.assertNotIn('退出码', page.locator('#agentTranscript').inner_text())
+                toggle = page.locator('.agent-process-toggle')
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'false')
+                toggle.click()
+                self.assertEqual(page.locator('.agent-process-item').count(), 2)
+                page.evaluate("window.__activeCard = document.querySelector('.agent-result-card')")
+                before = page.locator('.agent-result-card').bounding_box()
+                self.assertIsNotNone(before)
+                page.wait_for_function("id => window.__kernelCalls.filter(c => c.url === '/api/agent/sessions/'+id).length >= 2", arg=SESSION_A)
+                self.assertTrue(page.evaluate("window.__activeCard === document.querySelector('.agent-result-card')"))
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'true')
+                self.assertEqual(page.locator('.agent-process-item[data-kind="reasoning"] .agent-activity-summary').inner_text(), '公开摘要 marker')
+                self.assertEqual(page.locator('.agent-stream-text').inner_text(), '已收到 marker' if enabled else '')
+                after = page.locator('.agent-result-card').bounding_box()
+                assert before is not None and after is not None
+                self.assertLessEqual(abs(after['height'] - before['height']), 0.5)
+                page.evaluate("""id => {
+                    const current = window.__kernelConfig.sessionDetails[id].active_turn;
+                    current.events.push({...current.events[3], event_id:'late-observation', sequence:3,
+                        payload:{call_id:'late-call',label:'网络查询',result:{summary:'已完成的迟到观察'}}});
+                    current.events.push({...current.events[5], event_id:'new-text', sequence:8,
+                        payload:{round:2,delta:' 继续'}});
+                    current.events.push({...current.events[5], event_id:'foreign-text', sequence:9,
+                        turn_id:'another-turn',payload:{round:2,delta:'不应串入的文字'}});
+                }""", SESSION_A)
+                reads = page.evaluate("id => window.__kernelCalls.filter(c => c.url === '/api/agent/sessions/'+id).length", SESSION_A)
+                page.wait_for_function("({id, reads}) => window.__kernelCalls.filter(c => c.url === '/api/agent/sessions/'+id).length > reads",
+                                       arg={'id': SESSION_A, 'reads': reads})
+                if enabled:
+                    page.get_by_text('已收到 marker 继续', exact=True).wait_for()
+                self.assertEqual(page.locator('.agent-stream-text').inner_text(), '已收到 marker 继续' if enabled else '')
+                self.assertNotIn('不应串入的文字', page.locator('#agentTranscript').inner_text())
+                self.assertEqual(page.locator('.agent-result-card').count(), 1)
+                self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
+                # 只读恢复进入终态时从持久字段重建，保留展开选择与键盘焦点。
+                toggle.focus()
+                page.evaluate("""({id, current}) => { window.__kernelConfig.sessionDetails[id] = {
+                    messages: [{role: 'user', content: '原用户请求'}, {role: 'assistant', content: '持久的最终回复', activities: [
+                        {id: 'sdk-journal', kind: 'tool', label: '查询媒体库', method: 'library.search', status: 'success', summary: '已核对媒体记录。'},
+                        {id: 'reasoning:2:journal', kind: 'reasoning', text: '公开摘要 marker'},
+                    ]}], active_turn: null, last_turn: {...current, status: 'completed'},
+                }; }""", {'id': SESSION_A, 'current': current})
+                page.get_by_text('持久的最终回复', exact=True).wait_for()
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'true')
+                self.assertTrue(toggle.evaluate('node => node === document.activeElement'))
+                self.assertTrue(page.locator('.agent-stream-head').is_visible())
+                self.assertEqual(page.locator('time.agent-stream-elapsed:visible').count(), 0)
+                self.assertEqual(page.locator('.agent-process-item').count(), 2)
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
 
     def test_pending_receipt_restore_is_read_only_and_preserves_draft_and_scroll(self):
         messages = []
@@ -797,11 +949,20 @@ class AgentUXBrowserTests(unittest.TestCase):
 
     def test_resume_nonempty_history_preserves_focused_resume_control(self):
         page = self.page({'sessions': {'sessions': [{'session_id': SESSION_A, 'title': '已保存的历史'}]},
-                          'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '之前已经完成的排障记录。'}]}}})
+                          'sessionDetails': {SESSION_A: {'messages': [{
+                              'role': 'assistant', 'content': '之前已经完成的排障记录。',
+                              'tools': ['agent.run_code', 'cloud.list'],
+                              'tool_labels': ['工作区代码执行', '光鸭文件查询'],
+                          }]}}})
         page.locator('#agentResumeLatestSession').click()
         page.wait_for_selector('.agent-narrative')
         self.assertTrue(page.locator('#agentResumeLatestSession').evaluate('(node) => document.activeElement === node'))
         self.assertTrue(page.locator('#agentComposer #agentResumeLatestSession').is_visible())
+        self.assertEqual(page.locator('.agent-narrative').inner_text(), '之前已经完成的排障记录。')
+        self.assertEqual(page.locator('time.agent-stream-elapsed').count(), 0)
+        for tool in ('agent.run_code', 'cloud.list', '工作区代码执行', '光鸭文件查询'):
+            self.assertNotIn(tool, page.locator('#agentTranscript').inner_text())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
 
     def test_candidate_preview_message_never_splits_an_emoji_surrogate_pair(self):
         view = candidate_view()
@@ -951,6 +1112,21 @@ class AgentUXBrowserTests(unittest.TestCase):
                 self.assertTrue(all(item.is_visible() for item in card.locator('.agent-confirmation-scope li').all()))
                 self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.method === 'POST').length"), 0)
 
+    def test_file_change_card_lists_frozen_samples_and_states_unlisted_count(self):
+        samples = [f'改名：第{index}集.mkv → 测试剧 S01E{index:02d}.mkv' for index in range(1, 7)]
+        for total, unlisted in ((6, None), (13, '其余 7 项未逐条列出')):
+            with self.subTest(total=total):
+                approval = {
+                    'plan_id': f'plan_fs_samples_{total:05d}', 'effect': 'DANGER',
+                    'preview': {'data': {'total': total, 'sample_changes': samples}}, 'confirmation': {},
+                }
+                page = self.page({'sessionDetails': {SESSION_A: session_snapshot(SESSION_A, pending_approval=approval)}}, stored_session=SESSION_A)
+                card = page.locator('.agent-confirmation-card')
+                card.wait_for()
+                items = card.locator('.agent-confirmation-scope li').all_text_contents()
+                self.assertEqual(items[:6], samples)
+                self.assertEqual(items[6:], [unlisted] if unlisted else [])
+
     def test_confirmation_waiting_keeps_composer_slot_stable_and_shows_safe_progress(self):
         approval = {
             'plan_id': 'plan_ux_followup_0001',
@@ -1038,25 +1214,19 @@ class AgentUXBrowserTests(unittest.TestCase):
 
                 metrics = page.evaluate("""() => {
                   const text = document.querySelector('.agent-narrative')?.innerText || '';
-                  const effectSteps = [...document.querySelectorAll('.agent-stream-step[data-step-key^="effect:"]')];
                   return {
                     viewportWidth: innerWidth,
                     narrativeCount: document.querySelectorAll('.agent-narrative').length,
                     receiptReferenceCount: (text.match(/#276/g) || []).length,
-                    traceCount: document.querySelectorAll('.agent-tool-trace').length,
-                    effectStepCount: effectSteps.length,
-                    effectCompletionCheckCount: effectSteps.filter(step => step.querySelector('[data-lucide="check"]')).length,
                     narrativeText: text,
                   };
                 }""")
                 self.assertEqual(metrics['viewportWidth'], viewport['width'])
                 self.assertEqual(metrics['narrativeCount'], 1)
                 self.assertEqual(metrics['receiptReferenceCount'], 1)
-                self.assertEqual(metrics['traceCount'], 1)
-                self.assertEqual(metrics['effectStepCount'], 1)
-                self.assertEqual(metrics['effectCompletionCheckCount'], 0)
                 self.assertIn('后台任务尚未完成', metrics['narrativeText'])
                 self.assertNotIn('✅', metrics['narrativeText'])
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
                 reports.append(metrics)
                 if evidence_dir:
                     self.snapshot(page, f'submitted-276-{viewport["width"]}')
@@ -1081,7 +1251,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator('.agent-narrative').last.inner_text(), '还有一个目录待处理。')
         self.assertEqual(page.locator('#agentTranscript').inner_text().count('#276'), 1)
 
-    def test_confirmation_continues_to_later_plan_and_reuses_one_trace(self):
+    def test_confirmation_continues_to_later_plan_and_preserves_real_receipts(self):
         first = {
             'plan_id': 'plan_ux_continue_0001', 'tool_name': 'download.pause', 'effect': 'WRITE',
             'preview': {'summary': '暂停下载任务'}, 'confirmation': {},
@@ -1116,9 +1286,8 @@ class AgentUXBrowserTests(unittest.TestCase):
 
         next_plan = page.locator('.agent-confirmation-card[data-plan-id="plan_ux_continue_0002"]')
         next_plan.wait_for()
-        self.assertEqual(page.locator('.agent-tool-trace').count(), 1)
-        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-steps').count(), 1)
-        self.assertIn('查询下载任务完成', ' '.join(page.locator('.agent-tool-trace .agent-stream-step').all_text_contents()))
+        self.assertTrue(next_plan.locator('[data-effect-confirm]').is_enabled())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
         self.assertEqual(next_plan.inner_text().count('暂停请求已受理'), 1)
         self.assertNotIn('上一项已完成', next_plan.inner_text())
 
@@ -1134,9 +1303,6 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.locator('[data-effect-confirm="plan_ux_continue_0002"]').click()
         page.locator('.agent-narrative').wait_for()
 
-        self.assertEqual(page.locator('.agent-tool-trace').count(), 1)
-        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-steps').count(), 1)
-        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-step').count(), 5)
         self.assertEqual(
             page.locator('.agent-narrative').inner_text(),
             '后续真实查询发现 3 个下载任务；继续请求已受理。',
@@ -1207,8 +1373,6 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertIn('后台任务尚未完成', text)
         self.assertIn('任务状态未确认', text)
         self.assertEqual(text.count('#276'), 1)
-        self.assertEqual(page.locator('.agent-tool-trace').count(), 1)
-        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-step[data-step-key^="effect:"]').count(), 1)
         self.assertEqual(page.evaluate('window.__uxConfirmCalls'), 1)
 
     def test_legacy_effect_summary_without_receipt_is_marked_unknown(self):
@@ -1239,12 +1403,8 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertIn('执行状态未知', text)
         self.assertIn('服务端摘要：下载请求 #276 已提交', text)
         self.assertNotIn('✅', text)
-        effect_step = page.locator('.agent-tool-trace .agent-stream-step[data-step-key^="effect:"]')
-        self.assertEqual(effect_step.count(), 1)
-        text_content = effect_step.text_content()
-        assert text_content is not None
-        self.assertIn('执行状态未知', text_content)
-        self.assertEqual(effect_step.locator('[data-lucide="check"]').count(), 0)
+        self.assertEqual(text.count('#276'), 1)
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
 
     def test_confirmation_rejects_stop_while_protected_job_stream_waits(self):
         approval = {
@@ -1382,7 +1542,7 @@ class AgentUXBrowserTests(unittest.TestCase):
             for width in (1440, 390):
                 with self.subTest(status=status, answer=answer, width=width):
                     events = [harness._event(1, 'turn.started'), harness._event(2, 'tool.completed', {
-                        'tool': 'library.search_missing_episode_resources', 'result': {'candidate_view': None},
+                        'tool': 'fixture.resource_read', 'result': {'candidate_view': None},
                     }), harness._event(3, 'turn.completed', {'status': status, 'answer': answer})]
                     page = self.page({'queryEvents': events}, viewport={'width': width, 'height': 844})
                     page.locator('#agentPrompt').fill('仙逆完美世界有更新吗？4K排除1080')
@@ -1463,3 +1623,376 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertIn('预检已完成', page.locator('.agent-confirmation-card').inner_text())
         self.assertIn('连接中断', page.locator('.agent-candidate-feedback').inner_text())
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
+
+    def test_public_process_expands_without_mixing_answer_or_changing_choice(self):
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                page = self.progress_page(width=width)
+                page.locator('#agentPrompt').fill('查找收藏剧集的最新资源')
+                page.locator('#agentSend').click()
+                self.emit_progress(page, 'turn.started')
+                outer = {'tool': 'agent.run_code', 'label': '工作区代码执行',
+                         'arguments': {'secret': 'RAW_ARGUMENTS'}, 'stdout': 'RAW_STDOUT',
+                         'result': {'summary': '命令已退出（退出码 0）'}}
+                self.emit_progress(page, 'model.tool_call', outer)
+                self.emit_progress(page, 'tool.started', outer)
+                toggle = page.locator('.agent-process-toggle')
+                self.assertTrue(toggle.is_hidden())
+                self.assertEqual(page.locator('.agent-process').count(), 0)
+                before = page.locator('.agent-result-card').bounding_box()
+                activity = {'id': 'sdk-resource', 'kind': 'tool', 'label': '查询资源',
+                            'method': 'resource.search', 'status': 'running', 'summary': '查询：光阴之外'}
+                self.emit_progress(page, 'tool.progress', {**outer, 'activity': activity})
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'false')
+                self.assertTrue(toggle.is_visible())
+                after = page.locator('.agent-result-card').bounding_box()
+                assert before is not None and after is not None
+                self.assertAlmostEqual(after['height'], before['height'], delta=0.5)
+                self.assertEqual(page.locator('.agent-process').get_attribute('id'), toggle.get_attribute('aria-controls'))
+                self.emit_progress(page, 'model.reasoning_summary.delta', {'round': 1, 'summary_id': 'public', 'delta': '先核对剧集，'})
+                self.emit_progress(page, 'model.reasoning_summary.delta', {'round': 1, 'summary_id': 'public', 'delta': '再比较资源版本。'})
+                self.emit_progress(page, 'model.reasoning_summary.delta', {'round': 2, 'summary_id': 'public', 'delta': '核对下一轮结果。'})
+                self.emit_progress(page, 'model.reasoning_summary.delta', {'round': 2, 'summary_id': 'other', 'delta': '检查未读页。'})
+                self.emit_progress(page, 'model.reasoning.delta', {'delta': 'PRIVATE_REASONING'})
+                self.emit_progress(page, 'model.delta', {'round': 2, 'delta': '这是单独流式显示的答案。'})
+                self.assertEqual(page.locator('.agent-stream-text').inner_text(), '这是单独流式显示的答案。')
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'false')
+                self.snapshot(page, f'expand-collapsed-{width}')
+                toggle.focus()
+                toggle.press('Enter')
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'true')
+                self.assertTrue(page.locator('.agent-process').is_visible())
+                self.assertEqual(page.locator('.agent-process-item').count(), 4)
+                self.assertEqual(page.locator('.agent-process-item[data-kind="reasoning"] .agent-activity-summary').all_text_contents(),
+                                 ['先核对剧集，再比较资源版本。', '核对下一轮结果。', '检查未读页。'])
+                page.evaluate("window.__activityNode = document.querySelector('.agent-process-item')")
+                # 同一个 SDK 调用可附在直接工具、effect 或后续公共事件上；只更新原行。
+                for kind, status in (('tool.started', 'running'), ('effect.preview_started', 'running'),
+                                     ('effect.approval_required', 'approval_required'), ('tool.failed', 'failed'),
+                                     ('tool.completed', 'partial'), ('effect.completed', 'success'),
+                                     ('effect.failed', 'failed')):
+                    self.emit_progress(page, kind, {'activity': {**activity, 'status': status, 'summary': '实际查询：已读 20 条，还有未读页。'}})
+                    self.assertTrue(page.evaluate("window.__activityNode === document.querySelector('.agent-process-item')"))
+                    self.assertEqual(page.locator('.agent-process-item').count(), 4)
+                    self.assertEqual(toggle.get_attribute('aria-expanded'), 'true')
+                self.assertEqual(page.locator('.agent-activity-status').first.inner_text(), '失败')
+                self.snapshot(page, f'expand-open-{width}')
+                if width == 390:
+                    toggle.press('Space')
+                self.emit_progress(page, 'model.delta', {'round': 2, 'delta': '答案继续更新。'})
+                self.emit_progress(page, 'turn.completed', {'status': 'partial', 'answer': '资源查询部分完成，答案与过程独立。'})
+                self.assertEqual(toggle.get_attribute('aria-expanded'), 'false' if width == 390 else 'true')
+                self.assertEqual(page.locator('.agent-narrative').inner_text(), '资源查询部分完成，答案与过程独立。')
+                transcript = page.locator('#agentTranscript').text_content()
+                assert transcript is not None
+                for raw in ('agent.run_code', '工作区代码执行', 'RAW_ARGUMENTS', 'RAW_STDOUT', '退出码', 'PRIVATE_REASONING'):
+                    self.assertNotIn(raw, transcript)
+                self.assertTrue(toggle.is_enabled())
+                toggle_box = toggle.bounding_box()
+                assert toggle_box is not None
+                self.assertGreaterEqual(toggle_box['height'], 44)
+                self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.method === 'POST').length"), 1)
+                self.snapshot(page, f'expand-final-{width}')
+                page.close()
+
+    def test_process_is_bounded_and_updates_do_not_scroll_the_reader(self):
+        page = self.progress_page(width=390)
+        page.emulate_media(reduced_motion='reduce')
+        page.locator('#agentPrompt').fill('核对资源列表')
+        page.locator('#agentSend').click()
+        self.emit_progress(page, 'turn.started')
+        page.evaluate("""() => {
+            for (let index = 0; index < 85; index++) window.emitProgress('tool.progress', {activity: {
+                id: `sdk-${index}`, kind: 'tool', label: `核对资源 ${index}`, method: 'resource.search',
+                status: 'success', summary: `已核对第 ${index} 项。`,
+            }});
+            window.emitProgress('model.reasoning_summary.delta', {round: 1, delta: '公开摘要。'.repeat(1800)});
+        }""")
+        page.clock.run_for(100)
+        self.assertEqual(page.locator('.agent-process-item').count(), 80)
+        self.assertEqual(page.locator('.agent-activity-label').first.text_content(), '核对资源 6')
+        summary = page.locator('.agent-process-item[data-kind="reasoning"] .agent-activity-summary').text_content()
+        assert summary is not None
+        self.assertEqual(len(summary), 8000)
+        page.locator('.agent-process-toggle').click()
+        self.emit_progress(page, 'model.delta', {'round': 1, 'delta': '独立答案正文。\n\n' * 50})
+        page.evaluate("""() => {
+            const process = document.querySelector('.agent-process');
+            const transcript = document.querySelector('#agentTranscript');
+            process.scrollTop = 70;
+            transcript.scrollTop = 20;
+            transcript.dispatchEvent(new Event('scroll'));
+            window.__reading = [process.scrollTop, transcript.scrollTop];
+        }""")
+        self.emit_progress(page, 'tool.progress', {'activity': {'id': 'sdk-84', 'kind': 'tool', 'label': '核对资源 84',
+                           'method': 'resource.search', 'status': 'partial', 'summary': '<img src=x onerror=window.__ux_xss=1> 有未读页'}})
+        self.emit_progress(page, 'model.reasoning_summary.delta', {'round': 1, 'delta': '超过上限的摘要不会增长。'})
+        self.emit_progress(page, 'model.delta', {'round': 1, 'delta': '答案继续追加。'})
+        self.emit_progress(page, 'turn.completed', {'status': 'partial', 'answer': '独立答案正文。\n\n' * 50 + '答案继续追加。'})
+        positions = page.evaluate("""() => ({before: window.__reading,
+            after: [document.querySelector('.agent-process').scrollTop, document.querySelector('#agentTranscript').scrollTop]})""")
+        for before, after in zip(positions['before'], positions['after']):
+            self.assertAlmostEqual(after, before, delta=1)
+        self.assertEqual(page.locator('.agent-process-toggle').get_attribute('aria-expanded'), 'true')
+        self.assertEqual(page.locator('.agent-process img').count(), 0)
+        self.assertFalse(page.evaluate('Boolean(window.__ux_xss)'))
+        self.assertEqual(page.locator('.agent-stream-head > svg').evaluate('node => getComputedStyle(node).animationName'), 'none')
+
+    def test_persisted_activities_expand_without_elapsed_or_invented_old_process(self):
+        activities = [
+            {'id': 'sdk-history', 'kind': 'tool', 'label': '查询媒体库', 'method': 'library.search', 'status': 'success', 'summary': '已核对 37 集。'},
+            {'id': 'sdk-unconfirmed', 'kind': 'tool', 'label': '核对云盘', 'method': 'cloud.list', 'status': 'running', 'summary': '已开始查询，尚无最终回执。'},
+            {'id': 'reasoning:2:public', 'kind': 'reasoning', 'text': '只展示后端保存的公开摘要。'},
+        ]
+        config = {'sessionDetails': {SESSION_A: session_snapshot(SESSION_A, messages=[
+            {'role': 'assistant', 'content': '旧对话，没有过程。', 'activities': [], 'tools': ['agent.run_code']},
+            {'role': 'assistant', 'content': '已保存的最终答案。', 'activities': activities},
+        ])}}
+        page = self.page(config, stored_session=SESSION_A, viewport={'width': 390, 'height': 844})
+        page.locator('.agent-narrative').last.wait_for()
+        self.assertEqual(page.locator('.agent-process').count(), 1)
+        self.assertEqual(page.locator('.agent-process-toggle:visible').count(), 1)
+        self.assertEqual(page.locator('.agent-stream-head:visible').inner_text(), '处理过程')
+        self.assertEqual(page.locator('time.agent-stream-elapsed:visible').count(), 0)
+        self.assertNotRegex(page.locator('.agent-stream-head').inner_text(), r'\d+秒')
+        toggle = page.locator('.agent-process-toggle')
+        self.assertEqual(toggle.get_attribute('aria-expanded'), 'false')
+        toggle.focus()
+        toggle.press('Enter')
+        self.assertEqual(page.locator('.agent-activity-status').all_text_contents(), ['已完成', '结果待核对', ''])
+        self.assertIn('只展示后端保存的公开摘要。', page.locator('.agent-process').inner_text())
+        transcript = page.locator('#agentTranscript').text_content()
+        assert transcript is not None
+        self.assertNotIn('agent.run_code', transcript)
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.method === 'POST').length"), 0)
+        self.snapshot(page, 'expand-history-mobile')
+
+    def test_process_keeps_confirmation_receipt_and_unconfirmed_failure(self):
+        page = self.progress_page()
+        page.locator('#agentPrompt').fill('核对并暂停下载')
+        page.locator('#agentSend').click()
+        self.emit_progress(page, 'turn.started')
+        activity = {'id': 'sdk-pause', 'kind': 'tool', 'label': '暂停下载', 'method': 'download.pause',
+                    'status': 'approval_required', 'summary': '等待用户确认。'}
+        self.emit_progress(page, 'tool.progress', {'activity': activity})
+        page.locator('.agent-process-toggle').click()
+        plan_id = 'plan_process_confirmation_0001'
+        self.emit_progress(page, 'effect.approval_required', {'activity': activity, 'plan': {
+            'plan_id': plan_id, 'effect': 'WRITE', 'tool_name': 'download.pause', 'preview': {'summary': '暂停下载任务'},
+        }})
+        self.emit_progress(page, 'turn.completed', {'status': 'approval_required'})
+        self.assertTrue(page.locator('[data-effect-confirm]').is_enabled())
+        self.assertEqual(page.locator('.agent-process-toggle').get_attribute('aria-expanded'), 'true')
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
+        saved_session = page.evaluate("localStorage.getItem('mediaflux.agent.kernel.session.v1')")
+        self.reload_ui(page, {
+            'sessions': {'draft_scope': SCOPE, 'sessions': [{'session_id': saved_session, 'title': '待确认下载'}]},
+            'sessionDetails': {saved_session: session_snapshot(saved_session,
+                messages=[{'role': 'user', 'content': '核对并暂停下载'}], pending_approval={
+                    'plan_id': plan_id, 'effect': 'WRITE', 'tool_name': 'download.pause',
+                    'preview': {'summary': '暂停下载任务'}, 'activities': [activity],
+                })},
+        })
+        page.locator('[data-effect-confirm]').wait_for()
+        self.assertTrue(page.locator('[data-effect-confirm]').is_enabled())
+        self.assertEqual(page.locator('.agent-stream-head').inner_text(), '等待确认')
+        self.assertEqual(page.locator('time.agent-stream-elapsed:visible').count(), 0)
+        self.assertEqual(page.locator('.agent-process-toggle').get_attribute('aria-expanded'), 'false')
+        page.locator('.agent-process-toggle').click()
+        self.assertEqual(page.locator('.agent-process-item').count(), 1)
+        self.assertTrue(page.evaluate("document.querySelector('.agent-process-view').nextElementSibling.matches('.agent-confirmation-card')"))
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
+        page.locator('.agent-process-toggle').hover()
+        self.assertTrue(page.locator('.agent-stream-label').is_visible())
+        # 整行点击按钮覆盖在状态文字上，悬停背景必须透明，防止遮住实际文字。
+        self.assertEqual(page.locator('.agent-process-toggle').evaluate('node => getComputedStyle(node).backgroundColor'), 'rgba(0, 0, 0, 0)')
+        self.snapshot(page, 'expand-pending-confirmation-restored')
+        self.assertTrue(page.locator('.agent-stream-head > svg').is_visible())
+        page.evaluate("""events => { window.__kernelConfig.confirmEvents = events; }""", [
+            harness._event(1, 'turn.started', {'kind': 'confirmation'}),
+            harness._event(2, 'tool.progress', {'activity': {**activity, 'status': 'success', 'summary': '暂停操作已取得回执。'}}),
+            harness._event(3, 'effect.completed', {'plan_id': plan_id, 'receipt': '下载任务已暂停。',
+                'result': {'ok': True, 'summary': '下载任务已暂停。'}}),
+            harness._event(4, 'tool.progress', {'activity': {'id': 'sdk-verify', 'kind': 'tool', 'label': '核对下载状态',
+                'method': 'download.status', 'status': 'running', 'summary': '已发出核对请求。'}}),
+            harness._event(5, 'turn.failed', {'message': '后续核验连接中断'}),
+        ])
+        page.locator('[data-effect-confirm]').click()
+        page.clock.run_for(200)
+        self.assertIn('下载任务已暂停。', page.locator('.agent-narrative').inner_text())
+        self.assertIn('后续核验连接中断', page.locator('.agent-narrative').inner_text())
+        self.assertEqual(page.locator('.agent-activity-status').all_text_contents(), ['已完成', '结果待核对'])
+        self.assertEqual(page.locator('.agent-process-toggle').get_attribute('aria-expanded'), 'true')
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
+        self.snapshot(page, 'expand-confirmation-failure')
+
+    def test_unfinished_activity_requires_verification_after_cancel_failure_or_stream_end(self):
+        activity = {'id': 'sdk-unfinished', 'kind': 'tool', 'label': '核对云盘结果',
+                    'method': 'cloud.list', 'status': 'running', 'summary': '已发出查询请求。'}
+        for terminal in ('turn.failed', 'turn.cancelled', None):
+            with self.subTest(terminal=terminal):
+                events = [harness._event(1, 'turn.started'),
+                          harness._event(2, 'tool.progress', {'activity': {**activity, 'id': 'sdk-finished', 'status': 'success'}}),
+                          harness._event(3, 'tool.progress', {'activity': activity})]
+                if terminal:
+                    events.append(harness._event(4, terminal, {'message': '未取得后续结果。'}))
+                page = self.page({'queryEvents': events})
+                page.locator('#agentPrompt').fill('核对云盘结果')
+                page.locator('#agentSend').click()
+                page.wait_for_function("document.querySelector('.agent-process-item:last-child .agent-activity-status')?.textContent === '结果待核对'")
+                page.locator('.agent-process-toggle').click()
+                self.assertEqual(page.locator('.agent-activity-status').all_text_contents(), ['已完成', '结果待核对'])
+                self.assertNotIn('处理中', page.locator('.agent-process').inner_text())
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 1)
+                page.close()
+
+    def test_live_progress_keeps_one_status_elapsed_body_and_frozen_terminal(self):
+        # 无公开活动时只显示状态，覆盖重复调用、失败调整和窄屏。
+        outcomes = (
+            (1280, 'success', '已完成', '已核对收藏，已恢复服务并完成核验。'),
+            (390, 'partial', '部分完成', '已核对收藏，部分来源暂时不可用：服务暂时不可用。'),
+            (320, 'waiting', '等待后台结果', '已核对收藏，后台任务仍在处理，等待结果。'),
+            (390, 'failed', '未能完成', '服务暂时不可用，暂时无法核验收藏。'),
+            (1280, 'cancelled', '已停止', '本轮处理已停止。'),
+        )
+        for width, outcome, terminal_label, final_text in outcomes:
+            with self.subTest(width=width, outcome=outcome):
+                page = self.progress_page(width=width)
+                page.locator('#agentPrompt').fill('看看我收藏的剧集有没有更新')
+                page.locator('#agentSend').click()
+                self.emit_progress(page, 'turn.started')
+                self.emit_progress(page, 'model.started', {'round': 1})
+                head = page.locator('.agent-stream-head')
+                label = head.locator('span').first
+                self.assertEqual(label.inner_text(), '正在思考')
+                page.evaluate("""() => {
+                    window.progressHead = document.querySelector('.agent-stream-head');
+                    window.progressLabel = window.progressHead.querySelector('span');
+                    window.progressElapsed = window.progressHead.querySelector('time.agent-stream-elapsed');
+                }""")
+                before_head = head.bounding_box()
+                before_card = page.locator('.agent-result-card').bounding_box()
+                assert before_head is not None and before_card is not None
+                previous_elapsed = self.elapsed_seconds(page)
+
+                def assert_status(expected, *, page=page, head=head, label=label,
+                                  before_head=before_head, width=width):
+                    nonlocal previous_elapsed
+                    self.assertEqual(head.count(), 1)
+                    self.assertTrue(head.is_visible())
+                    self.assertEqual(label.inner_text(), expected)
+                    self.assertEqual(head.locator('span').count(), 1)
+                    self.assertTrue(page.evaluate("""() =>
+                        window.progressHead === document.querySelector('.agent-stream-head') &&
+                        window.progressLabel === window.progressHead.querySelector('span') &&
+                        window.progressElapsed === window.progressHead.querySelector('time.agent-stream-elapsed')
+                    """))
+                    elapsed = self.elapsed_seconds(page)
+                    self.assertGreaterEqual(elapsed, previous_elapsed)
+                    previous_elapsed = elapsed
+                    text = page.locator('#agentTranscript').inner_text()
+                    self.assertNotRegex(text, r'执行过程|退出码|命令已退出|×\s*\d+|其中\s*\d+\s*次')
+                    self.assertNotIn('工作区代码执行', text)
+                    # 一次取同一帧的坐标，避免入场动画在三次跨进程读取之间继续移动。
+                    bounds, label_box, elapsed_box = head.evaluate("""node => [
+                        node, node.querySelector('.agent-stream-label'), node.querySelector('time'),
+                    ].map(item => item.getBoundingClientRect().toJSON())""")
+                    self.assertAlmostEqual(bounds['height'], before_head['height'], delta=0.5)
+                    self.assertAlmostEqual(label_box['y'] + label_box['height'] / 2,
+                                           elapsed_box['y'] + elapsed_box['height'] / 2, delta=0.5)
+                    self.assertLessEqual(elapsed_box['x'] + elapsed_box['width'], bounds['x'] + bounds['width'] + 1)
+                    self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
+
+                assert_status('正在思考')
+                page.clock.run_for(3200)
+                self.assertEqual(self.elapsed_seconds(page), previous_elapsed + 3)
+                assert_status('正在思考')
+                if outcome in ('success', 'partial'):
+                    self.snapshot(page, f'progress-thinking-{width}')
+                call = {'tool': 'agent.run_code', 'label': '工作区代码执行', 'call_id': 'first'}
+                self.emit_progress(page, 'model.tool_call', call)
+                assert_status('正在处理')
+                self.assertEqual(page.locator('.agent-streaming .lucide-loader-circle:visible').count(), 1)
+                self.emit_progress(page, 'tool.started', call)
+                assert_status('正在处理')
+                self.emit_progress(page, 'tool.completed', {**call, 'result': {'summary': '命令已退出（退出码 0）'}})
+                self.emit_progress(page, 'model.started', {'round': 2})
+                assert_status('正在思考')
+                self.emit_progress(page, 'model.tool_call', {**call, 'call_id': 'second'})
+                assert_status('正在处理')
+                after_card = page.locator('.agent-result-card').bounding_box()
+                assert after_card is not None
+                self.assertAlmostEqual(after_card['height'], before_card['height'], delta=0.5)
+                self.emit_progress(page, 'tool.failed', {**call, 'call_id': 'second', 'message': '服务暂时不可用'})
+                assert_status('正在调整方案')
+                self.emit_progress(page, 'model.started', {'round': 3})
+                assert_status('正在思考')
+                streamed_text = '已核对收藏，部分来源暂时不可用。'
+                self.emit_progress(page, 'model.delta', {'round': 3, 'delta': streamed_text})
+                assert_status('正在回复')
+                self.assertEqual(page.locator('.agent-stream-text').inner_text(), streamed_text)
+                self.assertEqual(page.locator('.agent-streaming .lucide-loader-circle:visible').count(), 0)
+                if outcome in ('success', 'partial'):
+                    self.snapshot(page, f'progress-reply-{width}')
+                page.emulate_media(reduced_motion='reduce')
+                # 旧事件仅含 label 也必须使用通用状态，不能泄露工具清单。
+                self.emit_progress(page, 'tool.started', {'label': '工作区代码执行', 'call_id': 'third'})
+                assert_status('正在处理')
+                self.assertEqual(page.locator('.agent-stream-text').inner_text(), streamed_text)
+                self.assertEqual(head.locator(':scope > svg').evaluate('node => getComputedStyle(node).animationName'), 'none')
+                self.emit_progress(page, 'tool.completed', {**call, 'call_id': 'third', 'result': {'summary': '命令已退出（退出码 0）'}})
+                page.clock.run_for(1100)
+                assert_status('正在处理')
+                if outcome in ('failed', 'cancelled'):
+                    self.emit_progress(page, f'turn.{outcome}', {'message': final_text})
+                    self.assertEqual(page.locator('.agent-stream-text').inner_text(), final_text)
+                else:
+                    self.emit_progress(page, 'turn.completed', {'status': outcome, 'answer': final_text})
+                    self.assertEqual(page.locator('.agent-narrative').inner_text(), final_text)
+                assert_status(terminal_label)
+                self.assertEqual(page.locator('.agent-streaming').count(), 0)
+                self.assertEqual(page.locator('#agentSend').get_attribute('aria-busy'), 'false')
+                frozen_elapsed = self.elapsed_seconds(page)
+                self.assertGreaterEqual(frozen_elapsed, 5)
+                frozen_text = head.inner_text()
+                page.clock.run_for(3000)
+                self.assertEqual(self.elapsed_seconds(page), frozen_elapsed)
+                self.assertEqual(head.inner_text(), frozen_text)
+                assert_status(terminal_label)
+                appearance = page.locator('.agent-result-card').evaluate("""node => {
+                    const style = getComputedStyle(node);
+                    return {background: style.backgroundColor, shadow: style.boxShadow,
+                            borders: [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth]};
+                }""")
+                self.assertEqual(appearance, {'background': 'rgba(0, 0, 0, 0)', 'shadow': 'none', 'borders': ['0px'] * 4})
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 1)
+                if outcome in ('success', 'partial'):
+                    self.snapshot(page, f'progress-final-{width}')
+                page.close()
+
+    def test_write_preview_requires_confirmation_without_executing(self):
+        for count, approved in ((1, 0), (2, 0), (2, 1)):
+            with self.subTest(calls=count, approved=approved):
+                plan = {'plan_id': 'plan_grouped_preview', 'tool_name': 'download.pause',
+                        'effect': 'WRITE', 'preview': {'summary': '暂停所选下载'}}
+                calls = [{'call_id': f'pause-{index}', 'tool': 'download.pause', 'label': '暂停下载'}
+                         for index in range(count)]
+                sequence = [('turn.started', {})]
+                sequence += [('model.tool_call', call) for call in calls]
+                sequence += [('effect.approval_required', {**call, 'plan': plan}) if index == approved else
+                             ('tool.failed', {**call, 'code': 'not_executed_after_approval' if index > approved else 'invalid_arguments',
+                                              'message': '前序写操作需要确认，本调用未执行' if index > approved else '参数无效，本调用未执行'})
+                             for index, call in enumerate(calls)]
+                sequence.append(('turn.completed', {'status': 'approval_required'}))
+                page = self.page({'queryEvents': [harness._event(index, kind, payload)
+                                                  for index, (kind, payload) in enumerate(sequence, 1)]})
+                page.locator('#agentPrompt').fill('暂停所选下载')
+                page.locator('#agentSend').click()
+                page.locator('.agent-confirmation-card').wait_for()
+                page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') !== 'true'")
+                self.assertIn('暂停所选下载', page.locator('.agent-confirmation-card').inner_text())
+                self.assertIn('尚未写入任何变更', page.locator('.agent-confirmation-preflight').inner_text())
+                self.assertTrue(page.locator('[data-effect-confirm]').is_enabled())
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
+                page.close()

@@ -2,19 +2,16 @@
 from __future__ import annotations
 
 from typing import cast
-from app.agent.models import ToolContext
 
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domain_catalog import DomainActions
-from app.agent.domains.local_media import task_actions as actions
+from app.modules import local_media_tasks as tasks
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 
 class UnifiedLocalRetryTests(IsolatedDatabaseTestCase):
     def setUp(self):
-        self._domain_actions = DomainActions()
         self.enterContext(isolated_test_database())
         self.source_id = db.create_local_media_source(
             name=f"five-pass-{self._testMethodName}", qb_profile="", qb_path_prefix="",
@@ -102,37 +99,23 @@ class UnifiedLocalRetryTests(IsolatedDatabaseTestCase):
                 self.assertEqual(db.get_local_media_task(task.id, owner="admin"), task)
                 self.assertEqual(len(db.list_local_media_task_items(task.id, owner="admin")), 1)
 
-    def test_agent_preflight_explains_interrupted_write_before_confirming(self):
+    def test_native_preflight_requires_explicit_interruption_confirmation(self):
         task = self._task(interrupted=True)
-        with patch.object(
-            self._domain_actions.local_media, "_current_task", return_value=(None, task)
-        ):
-            result, fingerprint = self._domain_actions.local_media.prepare_retry_local_media_task({"task_number": 1}, ToolContext(owner="owner-a", session_id="session-a"))
-        self.assertTrue(fingerprint)
-        self.assertTrue(result.data["interrupted_write"])
-        self.assertIn("核验", " ".join(result.data["effects"]))
-        self.assertIn("qB", " ".join(result.data["effects"]))
+        with self.assertRaises(tasks.LocalMediaServiceError):
+            tasks.prepare_local_task_retry(task.id)
+        prepared = tasks.prepare_local_task_retry(task.id, confirm_interrupted_write=True)
+        self.assertTrue(prepared["fingerprint"])
+        self.assertTrue(prepared["preview"]["data"]["interrupted_write"])
+        self.assertIn("qB", " ".join(prepared["preview"]["data"]["effects"]))
 
-    def test_agent_confirmed_interrupted_retry_uses_common_reset(self):
+    def test_native_confirmed_interrupted_retry_uses_common_reset(self):
         task = self._task(interrupted=True)
-        with patch.object(
-            self._domain_actions.local_media, "_current_task", return_value=(None, task)
-        ), patch.object(actions, "get_local_media_scheduler") as scheduler:
-            context = ToolContext(owner="owner-a", session_id="session-a")
-            _, fingerprint = self._domain_actions.local_media.prepare_retry_local_media_task({"task_number": 1}, context)
-            result = self._domain_actions.local_media.retry_local_media_task_confirmed({"task_number": 1}, fingerprint, context)
-        self.assertTrue(result.ok)
-        assert task is not None
-        self.assertEqual(
-            result.effect_metadata["completion"],
-            {
-                "kind": "local_media_task",
-                "task_id": task.id,
-                "task_number": 1,
-                "operation": "retry",
-            },
-        )
-        get_local_media_task_result = db.get_local_media_task(task.id, owner="admin")
-        assert get_local_media_task_result is not None
-        self.assertEqual(get_local_media_task_result.confirmation_actor, "")
+        prepared = tasks.prepare_local_task_retry(task.id, confirm_interrupted_write=True)
+        with patch("app.modules.local_media_scheduler.get_local_media_scheduler") as scheduler:
+            result = tasks.retry_local_task(task.id, expected_fingerprint=prepared["fingerprint"], confirm_interrupted_write=True)
+        self.assertTrue(result["ok"])
+        current = db.get_local_media_task(task.id)
+        assert current is not None
+        self.assertEqual(current.confirmation_actor, "")
+        self.assertEqual(result["data"]["task_id"], task.id)
         scheduler.return_value.reload.assert_called_once()

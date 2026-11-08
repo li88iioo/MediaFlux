@@ -74,9 +74,9 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.assertEqual(self.network_attempts, [])
 
-    async def fetch(self):
+    async def fetch(self, expected_status="ok"):
         result = await self.provider.fetch(self.http)
-        self.assertEqual(result.status, "partial")  # 仅公开动漫七天，不声明全站排期完整。
+        self.assertEqual(result.status, expected_status)
         return result, {entry.source_id: entry for entry in result.entries}
 
     async def test_real_week_has_28_anime_45_events_and_six_today_cards(self):
@@ -89,6 +89,10 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(item.category == "animation" for item in entries.values()), 28)
         self.assertEqual({item.category for item in entries.values()}, {"animation"})
         self.assertIn("7/7", result.message)
+        self.assertIn("官方追漫周历", result.message)
+        self.assertIn("不代表全站片库", result.message)
+        self.assertEqual((result.sampled, result.ignored), (28, 0))
+        self.assertEqual(result.covered_dates, tuple(f"2026-09-{day:02d}" for day in range(7, 14)))
         self.assertLessEqual(len(entries), 100)
         self.assertTrue(all(len(item.events) <= 50 and item.evidence for item in entries.values()))
 
@@ -158,7 +162,7 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
         payload["data"]["CardList"] = [module for module in payload["data"]["CardList"]
                                        if module.get("type") != "channel_play_schedule"]
         self.http.initial_override = payload
-        result, entries = await self.fetch()
+        result, entries = await self.fetch("partial")
         self.assertEqual(len(self.http.calls), 1)
         self.assertIn("0/7", result.message)
         self.assertEqual(entries, {})
@@ -172,7 +176,7 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
     async def test_later_day_failure_keeps_real_completed_dates_and_stops(self):
         self.http.fail_at = 3  # 已取得默认周三和周一，周二请求失败。
         self.http.failure = SourceUnavailable("token=private")
-        result, entries = await self.fetch()
+        result, entries = await self.fetch("partial")
         self.assertEqual((len(entries), sum(len(e.events) for e in entries.values())), (10, 11))
         self.assertEqual(len(self.http.calls), 3)
         self.assertIn("2/7", result.message)
@@ -189,7 +193,7 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
                 payload["data"]["CardList"][3]["children_list"] = {"list": {"cards": None}}
             return payload
         self.http.response = response
-        result, entries = await self.fetch()
+        result, entries = await self.fetch("partial")
         self.assertEqual((len(entries), sum(len(e.events) for e in entries.values())), (6, 6))
         self.assertEqual(len(self.http.calls), 2)
         self.assertIn("1/7", result.message)
@@ -230,7 +234,7 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
             result = await self.provider.fetch(http)
         finally:
             await http.aclose()
-        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.status, "ok")
         self.assertEqual((len(result.entries), sum(len(item.events) for item in result.entries)), (28, 45))
         self.assertEqual(len(recording.calls), 7)
         self.assertTrue(all(body["page_params"]["page_id"] == "100119" for _, body in recording.calls))
@@ -247,6 +251,7 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
                 http.failure = TimeoutError("private token")
                 result = await self.provider.fetch(http)
                 verified_dates = set(requested_days[:fail_at - 1])
+                self.assertEqual(set(result.covered_dates), verified_dates)
                 expected = {(entry.source_id, event) for entry in baseline.entries for event in entry.events
                             if event.date in verified_dates}
                 self.assertEqual({(entry.source_id, event) for entry in result.entries for event in entry.events}, expected)
@@ -267,10 +272,52 @@ class TencentWeeklyFixtureTests(unittest.IsolatedAsyncioTestCase):
             return payload
 
         self.http.response = response
-        result, entries = await self.fetch()
+        result, entries = await self.fetch("partial")
         self.assertEqual(entries, {})
         self.assertEqual(len(self.http.calls), 7)
         self.assertIn("7/7", result.message)
+        self.assertGreater(result.ignored, 0)
+
+    async def test_full_week_with_one_ignored_programme_stays_partial(self):
+        baseline = await self.provider.fetch(RecordedTencentHttp())
+        original = self.http.response
+        rejected = []
+
+        def response(url, body):
+            payload = original(url, body)
+            if len(self.http.calls) == 1:
+                card = next(card for card in self.poster_children(payload) if card.get("type") == "poster")
+                rejected.append(card["params"]["cid"])
+                card["params"]["type"] = "2"
+            return payload
+
+        self.http.response = response
+        result, _ = await self.fetch("partial")
+        self.assertEqual((len(self.http.calls), result.ignored), (7, 1))
+        self.assertEqual(result.covered_dates, baseline.covered_dates)
+        self.assertIn("7/7", result.message)
+        self.assertIn("1条", result.message)
+        expected = {(entry.source_id, event) for entry in baseline.entries for event in entry.events
+                    if (entry.source_id, event.date) != (rejected[0], "2026-09-09")}
+        self.assertEqual({(entry.source_id, event) for entry in result.entries for event in entry.events}, expected)
+
+    async def test_missing_day_without_request_error_stays_partial(self):
+        original = self.http.response
+
+        def response(url, body):
+            payload = original(url, body)
+            if body["page_params"].get("week") == "20260907":
+                payload["data"]["CardList"] = [module for module in payload["data"]["CardList"]
+                                               if module.get("type") != "channel_play_schedule"]
+            return payload
+
+        self.http.response = response
+        result, entries = await self.fetch("partial")
+        self.assertEqual((len(self.http.calls), len(result.covered_dates), result.ignored), (7, 6, 0))
+        self.assertNotIn("2026-09-07", result.covered_dates)
+        self.assertTrue(entries)
+        self.assertIn("6/7", result.message)
+        self.assertNotIn("读取失败", result.message)
 
     async def test_old_week_is_not_reassigned_or_followed(self):
         result = await TencentCalendarProvider(clock=lambda: date(2026, 9, 16)).fetch(self.http)

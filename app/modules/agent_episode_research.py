@@ -28,7 +28,6 @@ from app.agent.kernel import (
     AgentEventType,
     AgentInput,
     AgentSession,
-    CapabilityRetriever,
     InMemorySessionStateStore,
     KernelToolSpec,
     ToolCatalog,
@@ -44,6 +43,7 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.session import SessionLimits
 from app.agent.schema import validate_json_schema
 from app.sensitive_data import contains_sensitive_credential, is_sensitive_key
+from app.modules.web_evidence import WebEvidenceError, normalize_public_url, read_web, search_web
 
 _TIMEOUT_SECONDS = 90.0
 _CLEANUP_SECONDS = 1.0
@@ -82,16 +82,6 @@ propose仅暂存选择，不是验证通过。最终只能由服务器reader.val
 def _load_contract():
     # 延迟加载便于依赖尚未落盘时注入契约 fake，不创建占位生产模块。
     return importlib.import_module("app.modules.episode_research")
-
-
-def search_web(arguments):
-    from app.agent.domains.discovery.web_search_actions import search_web as handler
-    return handler(arguments)
-
-
-def read_web(arguments):
-    from app.agent.domains.discovery.web_read_actions import read_web as handler
-    return handler(arguments)
 
 
 def _error(code):
@@ -169,11 +159,9 @@ def _case_projection(case):
 
 
 def _public_url(value):
-    from app.agent.domains.discovery.web_read_actions import web_read_arguments
-    from app.agent.errors import AgentToolError
     try:
-        return web_read_arguments({"url": value, "max_chars": 4000})["url"]
-    except AgentToolError:
+        return normalize_public_url(value)
+    except WebEvidenceError:
         raise _error("unsafe_web_url") from None
 
 
@@ -355,7 +343,7 @@ class _ResearchRun:
             self.searches += 1
             if self.searches > _MAX_WEB_SEARCHES:
                 raise _error("web_search_budget_exceeded")
-            value = await self.worker.call(search_web, {"query": arguments["query"], "max_results": 5})
+            value = await self.worker.call(search_web, query=arguments["query"], max_results=5)
         else:
             self.reads += 1
             if self.reads > _MAX_WEB_READS:
@@ -364,14 +352,14 @@ class _ResearchRun:
             # 精确字符串白名单；不能改query/fragment、拼接路径或跟随正文中的新链接。
             if url not in self.urls or _public_url(url) != url:
                 raise _error("web_url_not_searched")
-            value = await self.worker.call(read_web, {"url": url, "max_chars": 4000})
-        if not getattr(value, "ok", False):
-            status = getattr(value, "status", "")
+            value = await self.worker.call(read_web, url=url, max_chars=4000)
+        if not isinstance(value, dict) or not value.get("ok"):
+            status = value.get("status", "") if isinstance(value, dict) else ""
             if status in {"disabled", "configuration_missing", "no_results"}:
                 return {"available": False, "status": status, "results": []}
             raise _error("web_" + _code(status, "unavailable"))
         if name == "web_search":
-            rows = value.data.get("results")
+            rows = value["data"].get("results")
             if not isinstance(rows, list) or len(rows) > 5:
                 raise _error("invalid_web_evidence")
             results = []
@@ -384,17 +372,16 @@ class _ResearchRun:
                 results.append(item)
                 self.urls.add(url)
             return {"trust": "untrusted_external_evidence", "results": results}
-        data = value.model_data if isinstance(value.model_data, dict) else value.data
-        if (not isinstance(data, dict) or data.get("requested_url") != url
-                or value.data.get("requested_url") != url or data.get("url") != value.data.get("url")):
+        data = value["data"]
+        if not isinstance(data, dict) or data.get("requested_url") != url:
             raise _error("web_url_mismatch")
         # 输入仍必须来自本轮搜索；本地读取器已逐跳验证的公开重定向使用最终来源地址。
         url = _public_url(data.get("url"))
-        chunks = data.get("content_chunks")
-        if not isinstance(chunks, list) or not chunks or any(not isinstance(x, str) for x in chunks):
+        text = data.get("content")
+        if not isinstance(text, str) or not text:
             raise _error("invalid_web_evidence")
-        text = "".join(chunks)
         _safe_text(text, 4000)
+        chunks = [text[offset:offset + 1800] for offset in range(0, len(text), 1800)]
         safe = _safe_data({"url": url, "title": data.get("title", ""), "content_chunks": chunks,
                            "trust": "untrusted_external_evidence"})
         self.web_evidence.append({"provider": "web", "url": url,
@@ -572,7 +559,8 @@ async def research_episode_case_async(payload: dict[str, Any], *, model=None, re
         store = InMemorySessionStateStore()
         session = AgentSession(
             model=_BoundedModel(model, run), catalog=run.catalog,
-            retriever=CapabilityRetriever(minimum=7, maximum=7), state_store=store, journal=None,
+            model_tools=tuple(tool.name for tool in run.catalog.visible()),
+            state_store=store, journal=None,
             pipeline=ToolPipeline(catalog=run.catalog, state_store=store,
                                   projector=DefaultProjector(max_model_chars=48_000)),
             limits=SessionLimits(max_model_rounds=_MAX_ROUNDS, max_tool_calls=_MAX_TOOLS,
@@ -591,15 +579,19 @@ async def research_episode_case_async(payload: dict[str, Any], *, model=None, re
                         run.tool_calls += 1
                     elif event.type in {AgentEventType.TOOL_FAILED, AgentEventType.TURN_FAILED}:
                         code = _code(event.payload.get("code"), "turn_failed")
-                        # Kernel末轮仅总结时不会再执行工具；研究入口仍报告稳定的轮次预算失败。
-                        if code == "not_executed_final_round":
-                            code = "model_round_budget_exceeded"
                         run.failure = run.failure or code
                         break
                     elif event.type is AgentEventType.TURN_CANCELLED:
                         run.failure = "research_cancelled"
                         break
                     elif event.type is AgentEventType.TURN_COMPLETED:
+                        code = _code(event.payload.get("finish_reason"), "")
+                        if code in {
+                            "model_round_budget_exceeded", "tool_budget_exceeded", "task_budget_exceeded",
+                            "token_budget_exceeded", "active_time_budget_exceeded", "context_budget_exceeded",
+                            "model_output_budget_exceeded", "model_incomplete", "model_interrupted", "interrupted",
+                        }:
+                            raise _error(code)
                         completed = True
             if run.failure:
                 raise _error(run.failure)

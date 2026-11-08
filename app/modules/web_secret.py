@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import errno
+import hashlib
+import hmac
+import json
 import os
 import secrets
 import stat
@@ -153,3 +156,35 @@ def get_web_secret() -> str:
             )
         _process_secrets[paths] = persisted
         return persisted
+
+
+def signed_context_fingerprint(value: object, *, domain: str) -> str:
+    """生成部署密钥绑定的业务快照指纹，避免敏感快照形成离线校验 oracle。"""
+    if not isinstance(domain, str):
+        raise ValueError("确认上下文指纹域无效")
+    normalized_domain = domain.strip().casefold()
+    if not normalized_domain or len(normalized_domain) > 80:
+        raise ValueError("确认上下文指纹域无效")
+    try:
+        domain_bytes = normalized_domain.encode("ascii")
+        payload_text = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        payload = payload_text.encode("utf-8")
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+    ) as exc:
+        raise ValueError("确认上下文无法稳定序列化") from exc
+    message = (
+        b"mediaflux-agent-confirmation-context:v1\0" + domain_bytes + b"\0" + payload
+    )
+    return hmac.new(
+        get_web_secret().encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import math
 import secrets
@@ -17,42 +15,9 @@ from typing import Any
 
 from app.agent.action_plan_id import normalize_action_plan_id
 from app.agent.errors import AgentToolError
-from app.modules.web_secret import get_web_secret
 
 # 批量预览留出人工核对时间；只影响新票据，执行时仍校验领域快照。
 _DEFAULT_TTL_SECONDS = 10 * 60
-
-
-def confirmation_context_fingerprint(value: Any, *, domain: str) -> str:
-    """生成部署密钥绑定的确认上下文指纹，避免敏感快照形成离线校验 oracle。"""
-    if not isinstance(domain, str):
-        raise ValueError("确认上下文指纹域无效")
-    normalized_domain = domain.strip().casefold()
-    if not normalized_domain or len(normalized_domain) > 80:
-        raise ValueError("确认上下文指纹域无效")
-    try:
-        domain_bytes = normalized_domain.encode("ascii")
-        payload_text = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        payload = payload_text.encode("utf-8")
-    except (
-        TypeError,
-        ValueError,
-        OverflowError,
-        RecursionError,
-    ) as exc:
-        raise ValueError("确认上下文无法稳定序列化") from exc
-    message = (
-        b"mediaflux-agent-confirmation-context:v1\0" + domain_bytes + b"\0" + payload
-    )
-    return hmac.new(
-        get_web_secret().encode("utf-8"), message, hashlib.sha256
-    ).hexdigest()
 
 
 @dataclass(frozen=True)

@@ -13,6 +13,7 @@ from app.agent.kernel.adapters import ApprovalView, TurnView
 from app.agent.kernel.events import AgentEventType, EventFactory
 from app.agent.kernel.state_types import SessionBusyError
 from app.bot import agent_adapter as adapter
+from app.bot import agent_candidates
 from app.bot.telegram_markdown import telegram_html_text_length
 from tests import test_production
 
@@ -296,6 +297,34 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
                         apply.assert_called_once_with("disable_all")
                     else:
                         apply.assert_not_called()
+
+    def test_candidate_render_coverage_notice_is_plain_text_and_persists(self):
+        view = {
+            "items": [{"position": 1, "title": "示例资源.2160p"}],
+            "recommended_positions": [1],
+            "coverage_notice": '来源 <b>A</b> & "B"；结果仅覆盖已返回范围。',
+        }
+        escaped_notice = '来源 &lt;b&gt;A&lt;/b&gt; &amp; &quot;B&quot;；结果仅覆盖已返回范围。'
+        for expanded, positions, target in ((False, [1], "guangya"), (True, [], "qb")):
+            with self.subTest(expanded=expanded, positions=positions, target=target):
+                draft = {"handle": "ref_" + "x" * 24, "positions": positions,
+                         "target": target, "expanded": expanded, "phase": "select"}
+                text, markup = agent_candidates.render(TELEBOT, view, draft)
+                self.assertIn(escaped_notice, text.splitlines())
+                self.assertEqual(text.count(escaped_notice), 1)
+                self.assertNotIn(view["coverage_notice"], text)
+                self.assertIn("预检后仍需确认一次", text)
+                self.assertTrue(any(button.text == f"预览下载 {len(positions)} 项" for button in markup.buttons))
+
+    def test_candidate_render_omits_empty_coverage_notice(self):
+        view = {"items": [{"position": 1, "title": "示例资源.2160p"}], "recommended_positions": [1]}
+        draft = {"handle": "ref_" + "x" * 24, "positions": [1],
+                 "target": "guangya", "expanded": False, "phase": "select"}
+        baseline, _ = agent_candidates.render(TELEBOT, view, draft)
+        for coverage_notice in ("", " \n "):
+            with self.subTest(coverage_notice=coverage_notice):
+                text, _ = agent_candidates.render(TELEBOT, {**view, "coverage_notice": coverage_notice}, draft)
+                self.assertEqual(text, baseline)
 
     def _query_candidate_response(self, answer, candidates, *, status="success"):
         transport = FakeTelegramTransport(TurnView(
@@ -768,7 +797,7 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("正在核对确认计划", bot.edits[0][0])
         self.assertIsNone(bot.edits[0][3]["reply_markup"])
         self.assertTrue(any(
-            "正在整理执行结果" in edit[0] for edit in bot.edits
+            "正在整理结果" in edit[0] for edit in bot.edits
         ))
         self.assertIn("订阅已创建", bot.edits[-1][0])
 
@@ -886,13 +915,9 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         from pathlib import Path
 
         from app.agent.confirmation import ConfirmationStore
-        from app.agent.kernel.capabilities import (
-            CapabilityRetriever,
-            KernelToolSpec,
-            ToolCatalog,
-            ToolEffect,
-        )
-        from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+        from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.tool_calls import PreparedEffect
         from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
         from app.agent.kernel.pipeline import ToolPipeline
         from app.agent.kernel.session import AgentSession
@@ -938,7 +963,7 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state, effect_store=ConfirmationEffectPlanStore(
                 ConfirmationStore(clock=lambda: clock[0]),
             )),
@@ -1640,13 +1665,9 @@ class TelegramAgentExecutorTests(unittest.TestCase):
         import threading
 
         from app.agent.confirmation import ConfirmationStore
-        from app.agent.kernel.capabilities import (
-            CapabilityRetriever,
-            KernelToolSpec,
-            ToolCatalog,
-            ToolEffect,
-        )
-        from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+        from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.tool_calls import PreparedEffect
         from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
         from app.agent.kernel.persistence import SQLiteKernelStore
         from app.agent.kernel.pipeline import ToolPipeline
@@ -1699,7 +1720,7 @@ class TelegramAgentExecutorTests(unittest.TestCase):
                 model_round("download.resume", "next-write"),
             ])
             session = AgentSession(
-                model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                model=model, catalog=catalog,
                 pipeline=ToolPipeline(
                     catalog=catalog, state_store=store,
                     effect_store=ConfirmationEffectPlanStore(ConfirmationStore()),
@@ -1972,13 +1993,8 @@ class TelegramAgentExecutorTests(unittest.TestCase):
         import threading
         from types import SimpleNamespace
 
-        from app.agent.kernel.capabilities import (
-            CapabilityRetriever,
-            KernelToolSpec,
-            ToolCatalog,
-            ToolEffect,
-        )
-        from app.agent.kernel.effects import PreparedEffect
+        from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+        from app.agent.kernel.tool_calls import PreparedEffect
         from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
         from app.agent.kernel.pipeline import ToolPipeline
         from app.agent.kernel.session import AgentSession
@@ -2010,7 +2026,7 @@ class TelegramAgentExecutorTests(unittest.TestCase):
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
         ]])
         model.rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="completed"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         transport = TelegramKernelTransport(session)
         owner = adapter.telegram_agent_owner(-100, 7)

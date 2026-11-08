@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.agent.kernel.capabilities import CapabilityRetriever, KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import InMemoryRateLimiter
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel.pipeline import InMemoryRateLimiter, ToolPipeline
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from tests.test_agent_kernel_core import ScriptedModel
@@ -90,7 +91,7 @@ async def run_session(model, store, *, parallel=True, with_write=False):
     permits = AsyncMock(wraps=limiter.acquire)
     pipeline = ToolPipeline(catalog=catalog, state_store=store, rate_limiter=limiter)
     session = AgentSession(model=model, catalog=catalog, state_store=store,
-        retriever=CapabilityRetriever(minimum=len(tools), maximum=len(tools)), pipeline=pipeline)
+         pipeline=pipeline)
     with patch.object(limiter, "acquire", permits), patch.object(
         pipeline.effect_store, "freeze", wraps=pipeline.effect_store.freeze,
     ) as freeze:

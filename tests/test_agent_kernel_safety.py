@@ -9,24 +9,15 @@ from typing import Any
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.action_history import action_history_owner_digest
+from app.database import media_owner_digest
 from app.agent.confirmation import ConfirmationStore
 from app.agent.feature_gate import current_agent_runtime_generation
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import (
-    ConfirmationEffectPlanStore,
-    EffectPlan,
-    EffectPlanError,
-    PreparedEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore, EffectPlanError, InMemoryRateLimiter
+from app.agent.kernel.tool_calls import EffectPlan, PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
-from app.agent.kernel.pipeline import InMemoryRateLimiter, ToolPipeline
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
@@ -116,7 +107,7 @@ class KernelPrivacyTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -319,7 +310,7 @@ class EffectLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             fingerprint = lifecycle._configuration_fingerprint()
         plan = EffectPlan(
             plan_id="config-bound-job", owner="job-owner", session_id="session-1",
-            generation=1, tool_name="guangya.fs.change.execute",
+            generation=1, tool_name="cloud.change",
             effect=ToolEffect.DANGER, arguments={}, snapshot_fingerprint="snapshot",
             preview={}, expires_at=0, metadata={"configuration_fingerprint": fingerprint},
         )
@@ -405,7 +396,7 @@ class EffectLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current_agent_runtime_generation(), before)
 
         rows = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(owner),
+            owner_digest=media_owner_digest(owner),
             limit=10,
         )
         self.assertEqual(len(rows), 1)
@@ -413,7 +404,7 @@ class EffectLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["status"], "completed")
         self.assertTrue(bool(rows[0]["ok"]))
         scoped_rows = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(f"kernel:{owner}\x1fsession-1"),
+            owner_digest=media_owner_digest(f"kernel:{owner}\x1fsession-1"),
             limit=10,
         )
         self.assertEqual(scoped_rows, [])

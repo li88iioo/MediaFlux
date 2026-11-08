@@ -17,6 +17,7 @@ from app.clients.http import FixedHostHttpClient
 from app.clients.openai_compatible import (
     PROTOCOL_FALLBACK_MAX_BYTES,
     PROTOCOL_FALLBACK_STATUS_CODES,
+    REASONING_EFFORTS,
     ProviderStreamError,
     ReasoningDeltaFilter,
     ToolArgumentsDecodeError,
@@ -178,10 +179,13 @@ class ProviderSettings:
     telegram_channel: str = ""
     context_window_tokens: int = 128_000
     budget_profiles_json: str = ""
+    reasoning_effort: str = ""
 
     def __post_init__(self) -> None:
         parse_generation_profiles(self.generation_profiles_json)
         parse_budget_profiles(self.budget_profiles_json)
+        if self.reasoning_effort and self.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("reasoning_effort is invalid")
         if not (self.api_url or "").strip():
             raise ValueError("api_url is required")
         if not (self.model or "").strip() or len(self.model) > 200:
@@ -197,7 +201,9 @@ class ProviderSettings:
             "AGENT_LLM_API_URL", "AGENT_LLM_MODEL", "AGENT_LLM_API_KEY",
             "AGENT_LLM_PROTOCOL", "AGENT_LLM_TIMEOUT_SECONDS", "AGENT_LLM_GENERATION_PROFILES",
             "AGENT_LLM_CONTEXT_WINDOW_TOKENS", "AGENT_LLM_BUDGET_PROFILES",
+            "AGENT_LLM_REASONING_EFFORT",
         ))
+        effort = (values.get("AGENT_LLM_REASONING_EFFORT", "") or "").strip().lower()
         try:
             timeout = int(values["AGENT_LLM_TIMEOUT_SECONDS"] or 30)
         except ValueError:
@@ -216,6 +222,8 @@ class ProviderSettings:
             telegram_channel=provider_channel_fingerprint(values),
             context_window_tokens=max(16_384, min(2_000_000, context)),
             budget_profiles_json=values["AGENT_LLM_BUDGET_PROFILES"],
+            # 手改配置的无效值按未设置处理，不让一个可选参数使 Agent 整体不可用。
+            reasoning_effort=effort if effort in REASONING_EFFORTS else "",
         )
 
 
@@ -251,6 +259,25 @@ def _usage_dict(value: Any, protocol: str) -> dict[str, int]:
 
 
 @dataclass(slots=True)
+class _ReasoningSummary:
+    """只累计供应商公开摘要；完整段落才交给公开脱敏，避免跨片凭据泄漏。"""
+
+    summary_id: str = ""
+    text: str = ""
+    completed: bool = False
+
+    def finish(self, text: Any = None) -> ModelEvent | None:
+        if self.completed:
+            return None
+        self.completed = True
+        if isinstance(text, str) and text:
+            self.text = text
+        if self.text:
+            return ModelEvent(ModelEventType.REASONING_SUMMARY_DELTA, text=self.text, summary_id=self.summary_id)
+        return None
+
+
+@dataclass(slots=True)
 class _ProtocolState:
     protocol: str
     reasoning: ReasoningDeltaFilter = field(default_factory=ReasoningDeltaFilter)
@@ -259,11 +286,29 @@ class _ProtocolState:
     finish_reason: str = ""
     completed: bool = False
     native_blocks: dict[int, dict[str, Any]] = field(default_factory=dict)
-    chat_reasoning: str = ""
+    chat_reasoning: str | None = None
     invalid_private: bool = False
     repair_calls: bool = False
     open_private_blocks: set[int] = field(default_factory=set)
     text_filters: dict[int, ReasoningDeltaFilter] = field(default_factory=dict)
+    reasoning_summaries: dict[tuple[str, int], _ReasoningSummary] = field(default_factory=dict)
+
+    def summary_event(self, event: dict[str, Any], *, complete: bool) -> ModelEvent | None:
+        index = event.get("summary_index", 0)
+        text = event.get("text" if complete else "delta")
+        if type(index) is not int or index < 0 or not isinstance(text, str):
+            return None
+        item_id = event.get("item_id")
+        item_id = item_id if isinstance(item_id, str) else ""
+        key = (self.call_key(index=event.get("output_index"), item_id=item_id), index)
+        summary = self.reasoning_summaries.setdefault(
+            key, _ReasoningSummary(summary_id=f"{item_id}:{index}" if item_id else ""),
+        )
+        if complete:
+            return summary.finish(text)
+        if not summary.completed:
+            summary.text += text
+        return None
 
     def anthropic_text(self, index: int, text: str | None = None) -> str:
         # Lookahead belongs to its native block, not the next text/tool block.
@@ -335,6 +380,14 @@ def _consume_responses_event(state: _ProtocolState, event: dict[str, Any]) -> It
     if event_type == "response.output_text.delta":
         if output := state.text_event(event.get("delta")):
             yield output
+    elif event_type in {"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done"}:
+        if output := state.summary_event(event, complete=event_type.endswith(".done")):
+            yield output
+    elif event_type == "response.reasoning_summary_part.done":
+        part = event.get("part")
+        if isinstance(part, dict) and part.get("type") == "summary_text":
+            if output := state.summary_event({**event, "text": part.get("text")}, complete=True):
+                yield output
     elif event_type == "response.output_item.added":
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "function_call":
@@ -356,6 +409,13 @@ def _consume_responses_event(state: _ProtocolState, event: dict[str, Any]) -> It
         item = event if arguments_done else event.get("item")
         if not arguments_done and isinstance(item, dict):
             state.native_blocks[int(event.get("output_index", 0))] = item
+            if item.get("type") == "reasoning":
+                for index, part in enumerate(item.get("summary") or []):
+                    if isinstance(part, dict) and part.get("type") == "summary_text":
+                        output = state.summary_event({"item_id": item.get("id"), "output_index": event.get("output_index"),
+                            "summary_index": index, "text": part.get("text")}, complete=True)
+                        if output:
+                            yield output
         if isinstance(item, dict) and (arguments_done or item.get("type") == "function_call"):
             key = state.call_key(
                 index=event.get("output_index"),
@@ -376,6 +436,10 @@ def _consume_responses_event(state: _ProtocolState, event: dict[str, Any]) -> It
                 yield output
     elif event_type == "response.completed":
         response = event.get("response")
+        if isinstance(response, dict) and response.get("status") == "completed":
+            for summary in state.reasoning_summaries.values():
+                if output := summary.finish():
+                    yield output
         usage = _usage_dict(response, "responses") if isinstance(response, dict) else {}
         if usage:
             yield ModelEvent(ModelEventType.USAGE, usage=usage)
@@ -400,10 +464,10 @@ def _consume_chat_completions_event(state: _ProtocolState, event: dict[str, Any]
             continue
         delta = choice.get("delta")
         if isinstance(delta, dict):
-            if "reasoning_content" in delta and not isinstance(delta["reasoning_content"], str):
+            if delta.get("reasoning_content") is not None and not isinstance(delta["reasoning_content"], str):
                 state.invalid_private = True
             if isinstance(delta.get("reasoning_content"), str):
-                state.chat_reasoning += delta["reasoning_content"]
+                state.chat_reasoning = (state.chat_reasoning or "") + delta["reasoning_content"]
             if output := state.text_event(delta.get("content")):
                 yield output
             for tool_call in delta.get("tool_calls") or ():
@@ -560,7 +624,7 @@ async def _finalize_protocol_events(state: _ProtocolState) -> AsyncIterator[Mode
             refs = [block["call_id"] for block in blocks if block.get("type") == "function_call"]
             if sorted(refs) != sorted(raw["call_id"] for raw in state.calls.values()):
                 raise ModelProviderError("参数错误回合缺少完整原生关联状态")
-    elif state.chat_reasoning:
+    elif state.chat_reasoning is not None:
         layout = json.dumps([{"type": "reasoning_content", "text": state.chat_reasoning}], ensure_ascii=False)
     elif state.repair_calls:
         layout = "[]"
@@ -735,11 +799,7 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
         *,
         cancellation: CancellationToken,
     ) -> AsyncIterator[ModelEvent]:
-        location = normalize_provider_location(
-            self.settings.api_url,
-            https_only=True,
-            public_only=True,
-        )
+        location = normalize_provider_location(self.settings.api_url)
         configured = resolve_protocol(self.settings.protocol, self.settings.api_url)
         if configured == "auto":
             bound_protocols = {
@@ -761,6 +821,7 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
         )
         client = self.client_factory(
             allowed_hosts={location.host},
+            configured_origin=location.base_url,
             # 原生工具模型在首个 chunk 前可能需要较长推理，保留 30 秒
             # 空闲下限。POST 的重试由模型层按可见输出状态统一决定。
             timeout_seconds=network_idle_timeout,
@@ -802,12 +863,18 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                         tools=definitions,
                         max_tokens=request.max_output_tokens,
                         allow_parallel_tool_calls=request.allow_parallel_tool_calls,
+                        reasoning_effort=self.settings.reasoning_effort,
+                        stable_system_chars=request.stable_system_chars,
                         generation_profile=resolve_generation_profile(
                             self.settings.generation_profiles_json, location.base_url,
                             request.model or self.settings.model, protocol,
                         ),
                         stream=True,
                     )
+                    # 复用已显式开启的 Responses 推理配置；不向普通模型或
+                    # Chat/Anthropic 请求强加摘要参数，也不增加额外总结请求。
+                    if protocol == "responses" and isinstance(body.get("reasoning"), dict):
+                        body["reasoning"]["summary"] = "auto"
                     context, output, bounded = self.budget_for_model(
                         request.model, self.settings.context_window_tokens, request.max_output_tokens,
                     )
@@ -938,6 +1005,15 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                                         if emitted:
                                             raise last_error from exc
                                         break
+                                    if protocol == "responses":
+                                        summary_state = _ProtocolState(protocol)
+                                        for index, item in enumerate(envelope.get("output", [])):
+                                            if isinstance(item, dict) and item.get("type") == "reasoning":
+                                                for event in _consume_responses_event(summary_state, {
+                                                    "type": "response.output_item.done", "output_index": index, "item": item,
+                                                }):
+                                                    emitted = True
+                                                    yield event
                                     if turn.text:
                                         emitted = True
                                         yield ModelEvent(ModelEventType.TEXT_DELTA, text=turn.text)

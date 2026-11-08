@@ -95,7 +95,7 @@ class CleanEvidenceTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["data"]["entry_mode"], "clean_title")
                 self.assertEqual(len(result["data"]["files"]), len(names))
 
-    def test_numeric_prefix_parts_keep_clean_evidence_and_no_metadata_boundary(self):
+    def test_alphanumeric_prefix_parts_keep_clean_evidence_and_no_metadata_boundary(self):
         cases = [
             (("300MIUM-1474.mp4",), "300MIUM-1474"),
             (
@@ -103,6 +103,11 @@ class CleanEvidenceTests(IsolatedDatabaseTestCase):
                 "300MIUM-1474",
             ),
             (("200GANA-3419-1.mp4",), "200GANA-3419"),
+            (("4k688.com@T38-073.mp4",), "T38-073"),
+            (("hhd800.com@SPSE-91.mp4",), "SPSE-91"),
+            (("hhd800.com@C-2962.mp4",), "C-2962"),
+            (("091926-001-carib.mp4",), "CARIB-091926-001"),
+            (("4k688.com@T38-073-CD1.mp4", "T38-073-CD2.mp4"), "T38-073"),
         ]
         for names, expected in cases:
             with self.subTest(names=names):

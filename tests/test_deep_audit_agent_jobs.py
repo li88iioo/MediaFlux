@@ -9,13 +9,13 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import database as db
-from app.agent.domains.library.patrol_progress import empty_patrol_projection
-from app.agent.domains.system.jobs_actions import (
-    get_agent_job_status,
-    prepare_start_episode_audit,
-    start_episode_audit_confirmed,
+from app.modules.library_patrol import empty_patrol_projection
+from app.modules.library_audit_jobs import (
+    audit_job,
+    prepare_start_audit,
+    start_audit,
 )
-from app.agent.models import ToolContext, ToolResult
+from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
 from tests.support import isolated_test_database
 
@@ -54,7 +54,7 @@ def create_job(*, checkpoint=None, projection=None):
 
 def batch(*, checked=1, missing=0, cursor="", status=None):
     status = status or ("updates_available" if missing else "up_to_date")
-    return ToolResult(
+    return EpisodeAuditResult(
         True,
         status,
         "已核对",
@@ -89,23 +89,23 @@ def load(job_id):
 
 
 def test_normal_confirmed_audit_has_persisted_business_receipt():
-    context = ToolContext(owner=OWNER)
+    context = OWNER
     arguments = {"as_of": AS_OF, "max_series": 2}
-    preview, fingerprint = prepare_start_episode_audit(arguments, context)
-    assert preview.ok and preview.status == "confirmation_required"
-    with patch("app.agent.domains.system.jobs_actions.get_agent_jobs_scheduler") as scheduler:
-        accepted = start_episode_audit_confirmed(arguments, fingerprint, context)
-    assert accepted.ok and accepted.status == "accepted"
-    assert accepted.data["created"] is True
+    preview, fingerprint = prepare_start_audit(owner=context, **arguments)
+    assert preview["ok"] and preview["status"] == "confirmation_required"
+    with patch("app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler") as scheduler:
+        accepted = start_audit(owner=context, expected_snapshot=fingerprint, **arguments)
+    assert accepted["ok"] and accepted["status"] == "accepted"
+    assert accepted["data"]["created"] is True
     scheduler.return_value.wake.assert_called_once()
-    job_id = accepted.data["job_id"]
+    job_id = accepted["data"]["job_id"]
     executor = Mock(return_value=batch(checked=2))
     run_worker(executor)
     executor.assert_called_once_with({**arguments, "after_tmdb_id": ""})
     assert load(job_id)["status"] == "succeeded"
-    receipt = get_agent_job_status({"job_id": job_id, "limit": 5}, context)
-    assert receipt.ok and receipt.status == "up_to_date"
-    assert "2" in receipt.summary
+    receipt = audit_job(owner=context, **{"job_id": job_id, "limit": 5})
+    assert receipt["ok"] and receipt["status"] == "up_to_date"
+    assert "2" in receipt["summary"]
 
 
 def test_batch_cross_module_accumulates_prior_findings_after_restart():
@@ -123,10 +123,8 @@ def test_batch_cross_module_accumulates_prior_findings_after_restart():
     assert projection["missing_episode_count"] == 3
     assert projection["updates_available_count"] == 1
     assert projection["patrol_status"] == "updates_available"
-    receipt = get_agent_job_status(
-        {"job_id": job_id, "limit": 5}, ToolContext(owner=OWNER)
-    )
-    assert receipt.status == "updates_available"
+    receipt = audit_job(owner=OWNER, **{"job_id": job_id, "limit": 5})
+    assert receipt["status"] == "updates_available"
     assert worker.run_once() == 0
 
 

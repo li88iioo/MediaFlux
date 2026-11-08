@@ -1,10 +1,9 @@
-"""Natural-query reachability, not a measurement of real LLM adoption."""
-from typing import Any
-from typing import cast
-
+"""原生SDK帮助可达性、可信任务来源、证据与普通问答边界；脚本不代表真实LLM采纳率。"""
 import asyncio
 import json
+import re
 from contextlib import contextmanager
+from typing import cast
 from unittest.mock import patch
 
 import httpx
@@ -12,7 +11,6 @@ import pytest
 from starlette.requests import Request
 
 from app import database as db
-from app.agent import domain_tool_metadata
 from app.agent.kernel.adapters import TurnViewBuilder
 from app.agent.kernel.bootstrap import build_agent_kernel_runtime
 from app.agent.kernel.conversation_state import retain_conversation
@@ -20,7 +18,8 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.kernel.task_state import task_projection
 from app.routes import agent_api
-from tests.test_agent_task_first_slice import OWNER, NativeScript
+from tests.agent_task_native_helpers import returned_task, task_call
+from tests.test_agent_task_first_slice import OWNER, NativeScript, configuration_call
 
 GOAL = "帮我分别看看 TMDB 和 qBittorrent 当前配置，列出已检查和还没检查的内容；只读，不做修改。"
 CONSTRAINT = "只读，不做修改"
@@ -50,7 +49,7 @@ def proposal(source=GOAL, unsupported=False):
 
 
 class QueryTaskScript(NativeScript):
-    """Reuse only the native transport/recording constructor; no exact-name branch."""
+    """从工作区帮助查阅任务接口；配置和任务均沿真实SDK。"""
 
     def __init__(
         self,
@@ -71,7 +70,6 @@ class QueryTaskScript(NativeScript):
         self.query = query
         self.source = source
         self.unsupported = unsupported
-        self.loaded = set()
         self.task_name = None
         self.entry_reached = False
         self.missing = None
@@ -89,20 +87,16 @@ class QueryTaskScript(NativeScript):
             except (ValueError, TypeError):
                 continue
             data = value.get("data", value)
-            self.loaded.update(data.get("loaded_tools", []))
-            if data.get("execution"):
-                self.tool_source = data["execution"]
-            if value.get("task"):
-                self.latest = value["task"]
+            # 任意仅出现在工具结果中的文本都不能被认作用户任务来源。
+            if data.get("stdout") and not self.tool_source:
+                self.tool_source = data["stdout"]
+            if result_task := returned_task(value):
+                self.latest = result_task
         task = next(
             (
                 f
                 for f in functions
-                if f.get("parameters", {})
-                .get("properties", {})
-                .get("operation", {})
-                .get("enum")
-                == ["create", "checkpoint", "revise", "cancel"]
+                if f["name"] == "agent__run_code"
             ),
             None,
         )
@@ -111,54 +105,30 @@ class QueryTaskScript(NativeScript):
         step = self.steps.pop(0) if self.steps else "finish"
         name = None
         args = None
-        if step == "find_task" or step == "find_config":
-            discovery = next(
-                f
-                for f in functions
-                if "tool_names" in f.get("parameters", {}).get("properties", {})
-            )
-            name = discovery["name"]
-            args = {
-                "query": self.query
-                if step == "find_task"
-                else "解释 TMDB qBittorrent 当前配置 只读观察"
-            }
+        if step == "find_task":
+            name, args = "agent__run_code", {"code": "mf session.start_task --help", "language": "shell"}
+        elif step == "find_config":
+            name, args = "agent__run_code", {"code": "mf diagnostics.component --help", "language": "shell"}
         elif step == "create":
-            if not task or not any(
-                n.replace(".", "__") == task["name"] for n in self.loaded
-            ):
-                self.missing = "ordinary query did not load a callable task schema"
-                step = "finish"
-            else:
-                self.entry_reached = True
-                source = (
-                    self.tool_source
-                    if self.source == "__tool_content__"
-                    else self.source
-                )
-                name, args = task["name"], proposal(source, self.unsupported)
+            assert task is not None
+            self.entry_reached = True
+            source = self.tool_source if self.source == "__tool_content__" else self.source
+            name, args = task_call(proposal(source, self.unsupported), wire=True)
         elif step == "observe":
             observation = next(
-                (f for f in functions if f["name"].endswith("__explain_component")),
+                (f for f in functions if f["name"].endswith("__run_code")),
                 None,
             )
             assert observation is not None
-            assert any(n.replace(".", "__") == observation["name"] for n in self.loaded)
-            name, args = observation["name"], {"component": self.component}
+            _, args = configuration_call("diagnostics.component", {"component": self.component})
+            name = observation["name"]
         elif step == "checkpoint":
             assert self.task_name and self.latest
-            name, args = (
-                self.task_name,
-                {
-                    "operation": "checkpoint",
-                    "evidence_ids": [
-                        f["evidence_id"]
-                        for f in self.latest["verified_facts"]
-                        if f["component"] == self.component
-                    ],
-                    "blockers": [],
-                },
-            )
+            name, args = task_call({
+                "operation": "checkpoint",
+                "evidence_ids": [f["evidence_id"] for f in self.latest["verified_facts"] if f["component"] == self.component],
+                "blockers": [],
+            }, wire=True)
         if step == "finish":
             message, reason = {"content": "全部任务完成。"}, "stop"
         else:
@@ -254,9 +224,8 @@ def dump(tmp_path, name, scripts, events, **extra):
                 "requests": requests,
                 "model_calls": len(script.requests),
                 "tool_calls": sum(e.type.value == "tool.started" for e in group),
-                "discovery_calls": sum(
-                    e.type.value == "tool.started"
-                    and e.payload.get("tool") == "agent.capabilities"
+                "workspace_calls": sum(
+                    e.type.value == "tool.started" and e.payload.get("tool") == "agent.run_code"
                     for e in group
                 ),
             }
@@ -314,11 +283,9 @@ def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
         first = QueryTaskScript(create=True)
         runtime, events = await turn(first, GOAL)
         dump(tmp_path, "first.json", [first], [events])
-        assert any(
-            f["function"]["name"] == "agent__task" for f in first.requests[0]["tools"]
-        )
+        assert {f["function"]["name"] for f in first.requests[0]["tools"]} == {"agent__run_code"}
         assert first.entry_reached, (
-            first.missing or "query discovery failed before create"
+            first.missing or "native help failed before create"
         )
         cold = await runtime.store.load(owner=OWNER, session_id="entry-session-0001")
         assert cold.metadata["task"]["status"] == "partial"
@@ -327,8 +294,10 @@ def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
             "verified",
             "pending",
         ]
+        next_order = max(row.get("history_order", -1) for row in cold.conversation) + 1
         retained = retain_conversation(
-            cold.conversation + [{"role": "user", "content": "保留的新回合", "history_id": "retained-user"}],
+            cold.conversation + [{"role": "user", "content": "保留的新回合", "history_id": "retained-user",
+                                  "history_order": next_order}],
             maximum_bytes=100,
         )
         assert GOAL not in json.dumps(retained, ensure_ascii=False)
@@ -348,18 +317,11 @@ def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
             assert GOAL in text and CONSTRAINT in text
             assert "verified_facts" in text and "tmdb" in text and "qbittorrent" in text
             assert "remaining" in text
-        # Older baselines had no loaded-tool supplement; current requests must
-        # contain exactly the selected tools' guidance, not arbitrary trailing text.
-        expected_suffix = ""
-        if hasattr(domain_tool_metadata, "loaded_tool_guidance"):
-            expected_suffix = domain_tool_metadata.loaded_tool_guidance(
-                tool["name"] for tool in second.model_requests[0]["tools"]
-            )
         for prompt in (
             second.model_requests[0]["system_prompt"],
             second.requests[0]["messages"][0]["content"],
         ):
-            task_data = _task_data_section(prompt, expected_suffix)
+            task_data = _task_data_section(prompt, "")
             assert task_data == task_projection(cold.metadata["task"])
             assert task_data["root_goal"] == GOAL
             assert task_data["constraints"] == [CONSTRAINT]
@@ -370,20 +332,18 @@ def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
             e.payload
             for e in events2
             if e.type.value == "tool.started"
-            and e.payload.get("tool") == "config.explain_component"
+            and e.payload.get("tool") == "agent.run_code"
         ]
-        assert len(observations) == 1
+        assert len(observations) == 3
         calls = [
             call
             for wire in second.requests
             for message in wire["messages"]
             for call in message.get("tool_calls", [])
-            if call["function"]["name"].endswith("__explain_component")
+            if call["function"]["name"].endswith("__run_code")
         ]
-        assert calls and all(
-            json.loads(c["function"]["arguments"]) == {"component": "qbittorrent"}
-            for c in calls
-        )
+        assert any(json.loads(c["function"]["arguments"]) == configuration_call("diagnostics.component", {"component": "qbittorrent"})[1] for c in calls)
+        assert all(json.loads(c["function"]["arguments"]) == {"code": "mf diagnostics.component --help", "language": "shell"} or "diagnostics.component" in json.loads(c["function"]["arguments"])["code"] or "session.checkpoint_task" in json.loads(c["function"]["arguments"])["code"] for c in calls)
         assert events2[-1].payload["task"]["status"] == "complete"
         assert events2[-1].payload["task"]["acceptance_scope"] == "declared_obligations"
         final = await store().load(owner=OWNER, session_id="entry-session-0001")
@@ -439,7 +399,7 @@ def test_english_query_and_unsupported_goal(isolated_db, tmp_path):
         assert all(o["state"] != "verified" for o in task["obligations"])
         assert events[-1].payload["task"]["status"] == "blocked"
         assert any(
-            e.type.value == "tool.completed" and e.payload.get("tool") == "agent.task"
+            e.type.value == "tool.completed" and e.payload.get("tool") == "agent.run_code"
             for e in events
         )
         dump(tmp_path, "unsupported.json", [script], [events])
@@ -468,7 +428,7 @@ def test_non_admitted_source_rejected(isolated_db, tmp_path, origin):
             ).metadata
         )
         assert any(
-            e.type.value == "tool.failed" and e.payload.get("tool") == "agent.task"
+            e.type.value == "tool.completed" and any(c.get("status") == "invalid_arguments" for c in e.payload.get("result", {}).get("data", {}).get("sdk_calls", []))
             for e in events
         )
         if origin == "tool_content":
@@ -480,20 +440,7 @@ def test_non_admitted_source_rejected(isolated_db, tmp_path, origin):
 
 @pytest.mark.parametrize("custom", [False, True])
 def test_qa_default_custom_strict_initial_no_task_sql(isolated_db, tmp_path, custom):
-    from app.agent.kernel.capabilities import CapabilityRetriever
     from app.agent.kernel.session import DEFAULT_SYSTEM_PROMPT, AgentSession
-
-    class StrictRetriever:
-        def retrieve(self, message, catalog, *, context=None):
-            return CapabilityRetriever().retrieve(
-                message,
-                catalog,
-                context={
-                    **(context or {}),
-                    "include_discoverable_utilities": True,
-                    "query_discoverable": True,
-                },
-            )
 
     trace = []
     original = db.get_conn
@@ -512,7 +459,7 @@ def test_qa_default_custom_strict_initial_no_task_sql(isolated_db, tmp_path, cus
             session = AgentSession(
                 model=script.adapter,
                 catalog=runtime.session.catalog,
-                retriever=cast(CapabilityRetriever, StrictRetriever()),
+                model_tools=runtime.session.model_tools,
                 pipeline=runtime.session.pipeline,
                 state_store=runtime.store,
                 journal=runtime.store,
@@ -534,12 +481,15 @@ def test_qa_default_custom_strict_initial_no_task_sql(isolated_db, tmp_path, cus
         assert len(script.requests) == 1
         assert not any(e.type.value == "tool.started" for e in events)
         assert events[-1].payload["task"] is None
-        assert not any(
-            f["function"]["name"] == "agent__task" for f in script.requests[0]["tools"]
-        )
-        # Ordinary QA also persists its terminal publication marker.
-        assert sum(s.startswith("BEGIN") for s in trace) == 9
-        assert sum(s.startswith("COMMIT") for s in trace) == 9
+        assert {f["function"]["name"] for f in script.requests[0]["tools"]} == {"agent__run_code"}
+        # 读栅栏可增加空事务；约束真实持久化边界和无业务/任务写入。
+        assert sum(s.startswith("BEGIN") for s in trace) == sum(s.startswith("COMMIT") for s in trace) > 0
+        assert not any(s.startswith("ROLLBACK") for s in trace)
+        written = [match.group(1) for statement in trace if (match := re.match(
+            r"(?:INSERT(?: OR \w+)? INTO|UPDATE|DELETE FROM) ([a-z_]+)", statement))]
+        assert written and all(table.startswith("agent_kernel_") for table in written)
+        saved = await runtime.store.load(owner=OWNER, session_id="qa-entry-session-01")
+        assert "task" not in saved.metadata
         if custom:
             assert QUERY not in script.model_requests[0]["system_prompt"]
         dump(
@@ -553,93 +503,6 @@ def test_qa_default_custom_strict_initial_no_task_sql(isolated_db, tmp_path, cus
         )
 
     asyncio.run(run())
-
-
-def test_literal_optins_visibility_related_and_description():
-    from dataclasses import replace
-
-    from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
-    from app.agent.kernel.discovery import CapabilityDiscovery
-    from app.agent.kernel.task_state import task_tool
-
-    task = task_tool()
-    retriever = CapabilityRetriever(minimum=1, maximum=3)
-    for mark in (None, False, 1, "true", True):
-        metadata: dict[str, Any] = {"kernel_utility": True}
-        if mark is not None:
-            metadata["query_discoverable"] = mark
-        tool = replace(task, metadata=metadata)
-        selected = retriever.retrieve(
-            QUERY, ToolCatalog([tool]),
-            context={"include_discoverable_utilities": True, "query_discoverable": True},
-        )
-        assert (task.name in selected.names) is (mark is True)
-        # 调用方上下文不是工具授权；无关问答也不靠最小返回数塞入任务工具。
-        assert task.name not in retriever.retrieve("你好", ToolCatalog([tool])).names
-    hidden = replace(
-        task,
-        name="agent.hidden",
-        model_name="agent__hidden",
-        metadata={"kernel_utility": True},
-    )
-    denied = replace(
-        task,
-        name="agent.denied",
-        model_name="agent__denied",
-        authorize=lambda context: False,
-    )
-    ordinary = replace(
-        task,
-        name="ordinary.check",
-        model_name="ordinary__check",
-        metadata={"kernel_utility": 0, "related_tools": [hidden.name, denied.name]},
-    )
-    catalog = ToolCatalog([ordinary, hidden, denied])
-    result = CapabilityDiscovery(catalog, context={}).search({"query": QUERY})
-    assert result["loaded_tools"] == [ordinary.name]
-    assert denied.name not in json.dumps(result)
-    assert (
-        hidden.name
-        not in retriever.retrieve(
-            QUERY, catalog
-        ).names
-    )
-    # The retriever alone does not provide authorization; discovery supplies its filtered catalog.
-    assert len(task.description) <= 500
-    for text in (task.description[:500], task.model_definition()["description"]):
-        for contract in (
-            "TMDB/qB",
-            "config.diagnose",
-            "config.explain_component",
-            "not connectivity/repairs",
-            "No write authority",
-            "create accepts exact current/historical user source",
-            "revise/cancel require current user source",
-            "checkpoint",
-            "task.verified_facts evidence_ids",
-            "not artifact refs",
-            "blockers",
-            "Version checks are server-owned",
-        ):
-            assert contract in text
-
-
-def test_small_window_inherited_exact_discovery_characterization(isolated_db, tmp_path):
-    from app.agent.kernel.discovery import CapabilityDiscovery
-
-    runtime = build_agent_kernel_runtime(model=QueryTaskScript().adapter, store=store())
-    discovery = CapabilityDiscovery(
-        runtime.session.catalog, context={"has_task": True}, maximum=2
-    )
-    result = discovery.search({"tool_names": ["config.explain_component"]})
-    window = discovery.window((), discovery.consume())
-    snapshot = {"loaded": result["loaded_tools"], "window": [t.name for t in window]}
-    (tmp_path / "small-window.json").write_text(json.dumps(snapshot, indent=2))
-    # Business slots exclude fixed utilities; a loaded tool must enter the next window.
-    assert snapshot == {
-        "loaded": ["config.explain_component"],
-        "window": ["agent.capabilities", "agent.task", "config.explain_component"],
-    }
 
 
 def test_admitted_multiline_file_goal_is_task_data_not_a_public_summary_filter():
@@ -682,32 +545,33 @@ def test_task_text_still_rejects_credentials_and_terminal_controls(unsafe):
 
 
 @pytest.mark.parametrize('operation', ['create', 'revise', 'checkpoint', 'cancel'])
-def test_task_published_schema_matches_operation_required_and_allowed_fields(operation):
-    from app.agent.errors import ToolPipelineError
-    from app.agent.kernel.task_state import task_tool, validate_proposal
-    from app.agent.schema import validate_json_schema
-    if operation in {'create', 'revise'}:
-        args = {**proposal(), 'operation': operation}
-    elif operation == 'checkpoint':
-        args = {'operation': operation, 'evidence_ids': ['known-proof'], 'blockers': []}
+def test_task_sdk_signatures_and_domain_fields_match(operation):
+    import inspect
+
+    from app import sdk
+    from app.agent.kernel.session_service import SessionService
+    from app.agent.kernel.task_state import validate_proposal
+    method = {"create": "start_task", "revise": "revise_task", "checkpoint": "checkpoint_task", "cancel": "cancel_task"}[operation]
+    if operation in {"create", "revise"}:
+        args = {**proposal(), "operation": operation}
+    elif operation == "checkpoint":
+        args = {"operation": operation, "evidence_ids": ["known-proof"], "blockers": []}
     else:
-        args = {'operation': operation, 'source': GOAL}
-    schema = task_tool().input_schema
-    validate_json_schema(args, schema)
+        args = {"operation": operation, "source": GOAL}
     assert validate_proposal(args) == args
-    for missing in args:
-        incomplete = {key: value for key, value in args.items() if key != missing}
-        with pytest.raises(ToolPipelineError):
-            validate_json_schema(incomplete, schema)
-    extra = 'source' if operation == 'checkpoint' else 'evidence_ids'
-    with pytest.raises(ToolPipelineError):
-        validate_json_schema({**args, extra: GOAL if extra == 'source' else []}, schema)
-    # Retired model-supplied version arguments are rejected, not silently adapted.
-    for retired in (None, {'task_id': 'existing-task', 'epoch': 1, 'revision': 35}):
-        with pytest.raises(ToolPipelineError):
-            validate_json_schema({**args, 'expected': retired}, schema)
+    values = {k: v for k,v in args.items() if k != "operation"}
+    native = inspect.signature(sdk.METHODS["session." + method])
+    service = inspect.signature(getattr(SessionService, method))
+    assert list(service.parameters)[1:] == list(native.parameters)
+    native.bind(**values)
+    for missing in values:
+        with pytest.raises(TypeError):
+            native.bind(**{k:v for k,v in values.items() if k != missing})
+    for retired in (None, {"task_id": "existing-task", "epoch": 1, "revision": 35}):
+        with pytest.raises(TypeError):
+            native.bind(**values, expected=retired)
         with pytest.raises(ValueError):
-            validate_proposal({**args, 'expected': retired})
+            validate_proposal({**args, "expected": retired})
 
 
 @pytest.mark.parametrize('acceptance', [
@@ -717,17 +581,15 @@ def test_task_published_schema_matches_operation_required_and_allowed_fields(ope
     {'kind': 'network_reachable'},
     {'kind': 'network_reachable', 'criterion': ''},
 ])
-def test_task_published_schema_rejects_invalid_acceptance_shape(acceptance):
-    from app.agent.errors import ToolPipelineError
-    from app.agent.kernel.task_state import task_tool
-    from app.agent.schema import validate_json_schema
+def test_task_domain_rejects_invalid_acceptance_shape(acceptance):
+    from app.agent.kernel.task_state import validate_proposal
     args = proposal()
     args['obligations'][0]['acceptance'] = acceptance
-    with pytest.raises(ToolPipelineError):
-        validate_json_schema(args, task_tool().input_schema)
+    with pytest.raises(ValueError):
+        validate_proposal(args)
 
 
-def test_explicit_checklist_is_visible_in_first_model_request_without_auto_creation(isolated_db):
+def test_explicit_checklist_keeps_native_entry_visible_without_auto_creation(isolated_db):
     async def run():
         script = QueryTaskScript()
         script.steps = ['finish']
@@ -736,25 +598,7 @@ def test_explicit_checklist_is_visible_in_first_model_request_without_auto_creat
             message='请建立一个清单并核对TMDB、qBittorrent两个组件当前配置是否完整；只观察配置，不联网、不修改，检查完成后更新清单。',
             owner=OWNER, session_id='first-checklist'))]
         names = {item['function']['name'] for item in script.requests[0]['tools']}
-        assert 'agent__task' in names
+        assert names == {'agent__run_code'}
         assert not any(e.type.value == 'tool.started' for e in events)
         assert events[-1].payload['task'] is None  # 可见不等于自动建立、授权或执行任务。
     asyncio.run(run())
-
-
-def test_query_utility_does_not_replace_business_slot_or_match_substrings():
-    from app.agent.kernel.capabilities import (
-        CapabilityRetriever,
-        KernelToolSpec,
-        ToolCatalog,
-        ToolEffect,
-    )
-    from app.agent.kernel.task_state import task_tool
-    business = KernelToolSpec(name="library.check", domain="library", description="check",
-        input_schema={"type": "object"}, effect=ToolEffect.READ, read=lambda *_: {"ok": True})
-    catalog = ToolCatalog([business, task_tool()])
-    retriever = CapabilityRetriever(minimum=1, maximum=1)
-    assert retriever.retrieve("check", catalog).names == ("library.check",)
-    selected = retriever.retrieve("check，建立持久任务清单", catalog)
-    assert set(selected.names) == {"library.check", "agent.task"}
-    assert "agent.task" not in retriever.retrieve("check，不要任务清单", catalog).names

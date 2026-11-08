@@ -101,16 +101,9 @@ class LocalMediaScanRunTests(IsolatedDatabaseTestCase):
             self.assertEqual(resolve_local_media_scan()["scan_ref"], result["scan_ref"])
 
     def test_agent_does_not_substitute_previous_scan_after_receipt_write_failure(self):
-        from app.agent.domains.local_media.task_actions import LocalMediaTaskActions
-        from app.agent.domains.local_media.task_arguments import (
-            local_media_task_summaries_arguments,
-        )
-        from app.agent.models import ToolContext
+        from app.modules.local_media_tasks import local_tasks
         record_local_media_scan({"task_ids": [17]})
-        result = LocalMediaTaskActions().list_local_media_task_summaries(
-            local_media_task_summaries_arguments({"scan_ref": UNRECORDED_LOCAL_SCAN}),
-            ToolContext(owner="scan-receipt-failure-test", session_id="test"),
-        )
-        self.assertEqual(result.status, "not_recorded")
-        self.assertFalse(result.data["scan_recorded"])
-        self.assertEqual(result.data["tasks"], [])
+        result = local_tasks(scan_ref=UNRECORDED_LOCAL_SCAN)
+        self.assertEqual(result["status"], "not_recorded")
+        self.assertFalse(result["scan_recorded"])
+        self.assertEqual(result["items"], [])

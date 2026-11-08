@@ -53,14 +53,14 @@ def observe(task, component="tmdb", *, success=True, owner=OWNER):
         "probe_mode": "configuration_only", "network_accessed": False,
     } if success else None
     return observation_patch(
-        task, owner=owner, session_id="cas", tool="config.explain_component",
+        task, owner=owner, session_id="cas", tool="diagnostics.component",
         call_id="call", observations={component: fact},
     )
 
 
 def observe_batch(task, *, failed=()):
     return observation_patch(
-        task, owner=OWNER, session_id="cas", tool="config.diagnose", call_id="batch-call",
+        task, owner=OWNER, session_id="cas", tool="diagnostics.configuration", call_id="batch-call",
         observations={
             component: None if component in failed else {
                 "component": component, "status": "ready", "enabled": True,
@@ -232,7 +232,7 @@ def test_evidence_scope_lifecycle_and_component_blockers():
             current,
             owner=OWNER,
             session_id="cas",
-            tool="config.explain_component",
+            tool="diagnostics.component",
             call_id="call",
             observations={component: fact},
         )
@@ -327,7 +327,7 @@ def test_blocker_origins_coexist_and_remain_bounded():
 
     def observe(task, fact=None):
         return observation_patch(
-            task, owner=OWNER, session_id="cas", tool="config.explain_component",
+            task, owner=OWNER, session_id="cas", tool="diagnostics.component",
             call_id="call", observations={"tmdb": fact},
         )
 
@@ -656,7 +656,7 @@ def test_batch_factory_ignores_unknown_components_without_trusting_their_facts()
         "component": "unsupported", "status": "ready", "enabled": True,
         "probe_mode": "configuration_only", "network_accessed": False,
     }}
-    kwargs = dict(owner=OWNER, session_id="cas", tool="config.diagnose", call_id="batch-call")
+    kwargs = dict(owner=OWNER, session_id="cas", tool="diagnostics.configuration", call_id="batch-call")
     assert observation_patch(task, observations=observations, **kwargs) is None
     unsupported = observations["unsupported"]
     assert unsupported is not None
@@ -675,19 +675,19 @@ def test_batch_factory_ignores_unknown_components_without_trusting_their_facts()
     {"name": "unknown", "status": "ready", "enabled": True},
 ])
 def test_diagnosis_observer_does_not_trust_invalid_or_unknown_component_rows(bad_row):
-    from app.agent.kernel.ports.existing_actions import observe_configuration
+    from app.agent.kernel.task_state import configuration_observations
     from app.agent.models import ToolResult
 
     result = ToolResult(ok=False, status="attention", summary="configuration fixture", data={
         "probe_mode": "configuration_only", "network_accessed": False,
         "components": [{"name": "tmdb", "status": "ready", "enabled": True}, bad_row],
     })
-    observations = observe_configuration(result, {})
+    observations = configuration_observations(result.to_dict(), {})
     assert set(observations) == {"tmdb", "qbittorrent"}
     assert observations["tmdb"] is not None
     assert observations["tmdb"]["status"] == "ready" and observations["qbittorrent"] is None
     task = reduce_task(None, control(declaration()), owner=OWNER, session_id="cas")
-    patch = observation_patch(task, owner=OWNER, session_id="cas", tool="config.diagnose", call_id="batch-call", observations=observations)
+    patch = observation_patch(task, owner=OWNER, session_id="cas", tool="diagnostics.configuration", call_id="batch-call", observations=observations)
     assert patch is not None
     saved = reduce_task(task, patch, owner=OWNER, session_id="cas")
     assert saved["status"] == "blocked" and len(saved["verified_facts"]) == 1
@@ -728,7 +728,7 @@ def test_batch_sqlite_atomicity_cold_read_and_reference_is_not_task_evidence(tas
 
 @pytest.mark.parametrize("invalid_header", [{"network_accessed": True}, {"network_accessed": 0}, {"probe_mode": "connectivity"}])
 def test_diagnosis_network_claims_are_not_configuration_evidence(invalid_header):
-    from app.agent.kernel.ports.existing_actions import observe_configuration
+    from app.agent.kernel.task_state import configuration_observations
     from app.agent.models import ToolResult
 
     result = ToolResult(ok=False, status="attention", summary="configuration fixture", data={
@@ -736,7 +736,7 @@ def test_diagnosis_network_claims_are_not_configuration_evidence(invalid_header)
         "components": [{"name": component, "status": "ready", "enabled": True} for component in ("tmdb", "qbittorrent")],
         **invalid_header,
     })
-    assert observe_configuration(result, {}) == {"tmdb": None, "qbittorrent": None}
+    assert configuration_observations(result.to_dict(), {}) == {"tmdb": None, "qbittorrent": None}
 
 
 @pytest.mark.parametrize("terminal", ["complete", "cancelled"])

@@ -158,27 +158,11 @@ def test_small_context_blocks_complete_chain(harness, config_api, context):
     events = turn(bootstrap.build_agent_kernel_runtime().session, text=text)
     assert not wire.requests
     assert any(e.payload.get('code') == 'context_budget_exceeded' for e in events)
-    assert traces == [dict(context_window_tokens=context, output_tokens=127)]
+    # 历史全文、精简视图和归档回读提示可分别试装；每次必须保持原窗口/输出额度。
+    assert traces
+    assert all(trace == dict(context_window_tokens=context, output_tokens=127) for trace in traces)
 
 
-def test_capability_index_uses_the_profile_budget_estimator():
-    from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-    from app.agent.kernel.discovery import CapabilityDiscovery
-    from app.agent.model_context_budget import conservative_tokens, estimated_tokens
-
-    tools = [KernelToolSpec(
-        name=name, domain="library", description="读取作品详情", input_schema={},
-        effect=ToolEffect.READ, read=lambda _args, _context: None,
-    ) for name in ["agent.capabilities", *(f"library.item_{i}" for i in range(80))]]
-    discovery = CapabilityDiscovery(ToolCatalog(tools), context={})
-    default_index = discovery.model_index(maximum_tokens=400)
-    assert "library.item_79" in default_index
-    assert estimated_tokens(default_index) <= 400 < conservative_tokens(default_index)
-    conservative_index = discovery.model_index(maximum_tokens=400, conservative=True)
-    assert "library(81)" in conservative_index and "catalog" in conservative_index
-    assert "item_" not in conservative_index
-    assert conservative_tokens(conservative_index) <= 400
-    assert discovery.model_index(maximum_tokens=1, conservative=True) == ""
 
 
 def test_small_context_fitting_complete_chain(harness, config_api):
@@ -267,7 +251,7 @@ def test_current_turn_native_tool_group_keeps_model_budget(harness, config_api):
         if len(wire.requests) == 1:
             select('second', owner, 'topic')
             return httpx.Response(200, json={'content': [opaque, {'type': 'tool_use', 'id': 'native-call-1',
-                'name': 'agent__capabilities', 'input': {'query': '可用能力'}}], 'stop_reason': 'tool_use'})
+                'name': 'agent__run_code', 'input': {'code': "print('fixture')"}}], 'stop_reason': 'tool_use'})
         return result
     wire.handler = tool_then_answer
     session = bootstrap.build_agent_kernel_runtime().session

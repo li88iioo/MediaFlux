@@ -10,14 +10,12 @@ from unittest.mock import patch
 import pytest
 from starlette.requests import Request
 
-from app import config
-from app.agent.domains.library import episode_audit, search
+from app import config, services, sdk
+from app.modules import episode_audit
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime, invalidate_agent_kernel_runtime
-from app.agent.kernel.pipeline import InMemoryRateLimiter
-from app.agent.models import ToolResult
+from app.modules.episode_audit import EpisodeAuditResult
 from app.clients.base import MediaItem, MediaSearchResult, SeriesCandidate, SeriesEpisodeInventory, SeriesSearchResult
 from tests.support import initialized_web_runtime
-from tests.test_agent_kernel_existing_ports import context_for
 
 MEDIA_CONFIG = {
     "EMBY_ENABLED": "0", "EMBY_URL": "http://emby.invalid", "EMBY_TOKEN": "emby-key",
@@ -30,9 +28,12 @@ AUDIT = {"query": "The Show", "tmdb_id": "", "season": None, "as_of": "2026-08-0
 
 @pytest.fixture(autouse=True)
 def clear_caches():
-    search.reset_agent_tool_caches_for_tests()
+    resets = (services.clear_library_search_cache, episode_audit.reset_episode_audit_cache_for_tests,)
+    for reset in resets:
+        reset()
     yield
-    search.reset_agent_tool_caches_for_tests()
+    for reset in resets:
+        reset()
 
 
 @pytest.mark.parametrize("changed_key", [*MEDIA_CONFIG, *TMDB_CONFIG])
@@ -40,19 +41,19 @@ def test_effective_source_changes_partition_cache_and_unchanged_reads_stay_hot(m
     for key, value in {**MEDIA_CONFIG, **TMDB_CONFIG}.items():
         monkeypatch.setenv(key, value)
     with (
-        patch.object(search, "search_media_servers", side_effect=[[{"version": 1}], [{"version": 2}]]) as media,
-        patch.object(episode_audit, "_audit_uncached", side_effect=[ToolResult(True, "up_to_date", "old"), ToolResult(True, "up_to_date", "new")]) as audit,
+        patch.object(services, "search_media_servers", side_effect=[[{"version": 1}], [{"version": 2}]]) as media,
+        patch.object(episode_audit, "_audit_uncached", side_effect=[EpisodeAuditResult(True, "up_to_date", "old"), EpisodeAuditResult(True, "up_to_date", "new")]) as audit,
     ):
-        assert search._search_sources("Same query", 8) == [{"version": 1}]
+        assert services._search_sources("Same query", 8) == [{"version": 1}]
         assert episode_audit.audit_series_episodes(AUDIT).summary == "old"
-        assert search._search_sources("Same query", 8) == [{"version": 1}]
+        assert services._search_sources("Same query", 8) == [{"version": 1}]
         assert episode_audit.audit_series_episodes(AUDIT).summary == "old"
         value = (MEDIA_CONFIG | TMDB_CONFIG)[changed_key]
         monkeypatch.setenv(changed_key, "1" if value == "0" else "0" if value == "1" else value + "-changed")
         expected_search_version = 2 if changed_key in MEDIA_CONFIG else 1
-        assert search._search_sources("Same query", 8) == [{"version": expected_search_version}]
+        assert services._search_sources("Same query", 8) == [{"version": expected_search_version}]
         assert episode_audit.audit_series_episodes(AUDIT).summary == "new"
-        assert search._search_sources("Same query", 8) == [{"version": expected_search_version}]
+        assert services._search_sources("Same query", 8) == [{"version": expected_search_version}]
         assert episode_audit.audit_series_episodes(AUDIT).summary == "new"
     assert media.call_count == expected_search_version
     assert audit.call_count == 2
@@ -71,15 +72,15 @@ def test_search_late_old_backend_response_cannot_replace_new_scope_cache(monkeyp
             assert release.wait(3)
         return [{"backend": url}]
 
-    with patch.object(search, "search_media_servers", side_effect=read), ThreadPoolExecutor(max_workers=1) as pool:
+    with patch.object(services, "search_media_servers", side_effect=read), ThreadPoolExecutor(max_workers=1) as pool:
         try:
-            old = pool.submit(search._search_sources, "Same query", 8)
+            old = pool.submit(services._search_sources, "Same query", 8)
             assert started.wait(3)
             monkeypatch.setenv("JELLYFIN_URL", "http://new-library.invalid")
-            assert search._search_sources("Same query", 8) == [{"backend": "http://new-library.invalid"}]
+            assert services._search_sources("Same query", 8) == [{"backend": "http://new-library.invalid"}]
             release.set()
             assert old.result(3) == [{"backend": "http://old-library.invalid"}]
-            assert search._search_sources("Same query", 8) == [{"backend": "http://new-library.invalid"}]
+            assert services._search_sources("Same query", 8) == [{"backend": "http://new-library.invalid"}]
             assert len(calls) == 2
         finally:
             release.set()
@@ -99,7 +100,7 @@ def test_audit_configuration_scopes_have_independent_flights_and_publishers(monk
             calls.append(config.get("JELLYFIN_URL"))
         started[number].set()
         assert release[number].wait(3)
-        return ToolResult(True, "up_to_date", str(number))
+        return EpisodeAuditResult(True, "up_to_date", str(number))
 
     with patch.object(episode_audit, "_audit_uncached", side_effect=read), ThreadPoolExecutor(max_workers=3) as pool:
         try:
@@ -142,16 +143,16 @@ def test_bound_runtime_snapshot_selects_its_own_effective_cache_scope(monkeypatc
         config_digest="old-file", effective_digest="old-effective",
     )
     with (
-        patch.object(search, "search_media_servers", side_effect=lambda *_args, **_kwargs: [{"url": config.get("JELLYFIN_URL")}]) as media,
-        patch.object(episode_audit, "_audit_uncached", side_effect=lambda _arguments: ToolResult(True, "up_to_date", config.get("JELLYFIN_URL"))) as audit,
+        patch.object(services, "search_media_servers", side_effect=lambda *_args, **_kwargs: [{"url": config.get("JELLYFIN_URL")}]) as media,
+        patch.object(episode_audit, "_audit_uncached", side_effect=lambda _arguments: EpisodeAuditResult(True, "up_to_date", config.get("JELLYFIN_URL"))) as audit,
     ):
         with config.use_runtime_config_snapshot(snapshot):
-            assert search._search_sources("Same query", 8) == [{"url": "http://old-library.invalid"}]
+            assert services._search_sources("Same query", 8) == [{"url": "http://old-library.invalid"}]
             assert episode_audit.audit_series_episodes(AUDIT).summary == "http://old-library.invalid"
-        assert search._search_sources("Same query", 8) == [{"url": "http://new-library.invalid"}]
+        assert services._search_sources("Same query", 8) == [{"url": "http://new-library.invalid"}]
         assert episode_audit.audit_series_episodes(AUDIT).summary == "http://new-library.invalid"
         with config.use_runtime_config_snapshot(snapshot):
-            assert search._search_sources("Same query", 8) == [{"url": "http://old-library.invalid"}]
+            assert services._search_sources("Same query", 8) == [{"url": "http://old-library.invalid"}]
             assert episode_audit.audit_series_episodes(AUDIT).summary == "http://old-library.invalid"
     assert media.call_count == audit.call_count == 2
 
@@ -165,7 +166,7 @@ def test_real_config_save_and_runtime_rebuild_refresh_search_and_episode_invento
         def __init__(self, url, _token):
             self.url = url
 
-        def search_media(self, _query, **options):
+        def search_media(self, _query, *, cancelled=None, **options):
             calls.append(("search", self.url))
             title = "旧服务器库存" if "old" in self.url else "新服务器库存"
             return MediaSearchResult(items=[MediaItem(id="private-item", name=title, type="movie")], total=1, has_more=False, **options)
@@ -201,26 +202,24 @@ def test_real_config_save_and_runtime_rebuild_refresh_search_and_episode_invento
             config.set_and_save({**MEDIA_CONFIG, **TMDB_CONFIG, "AGENT_LLM_API_URL": "http://model.invalid/v1", "AGENT_LLM_MODEL": "test-model"})
             invalidate_agent_kernel_runtime()
             try:
-                async def query(runtime, session):
-                    runtime.session.pipeline.rate_limiter = InMemoryRateLimiter(limit=100)
-                    context = await context_for(runtime.store, owner="webk:v1:" + "c" * 64, session=session)
-                    found = await runtime.session.pipeline.execute("library.search", {"query": "same-query", "limit": 8}, context=context)
-                    audited = await runtime.session.pipeline.execute("library.audit_episodes", {"query": "The Show", "as_of": "2026-08-01"}, context=context)
-                    return found.outcome.public_content, audited.outcome.public_content
+                async def query():
+                    found = await asyncio.to_thread(sdk.library.search, "same-query", limit=8)
+                    audited = await asyncio.to_thread(sdk.library.audit, "The Show", as_of="2026-08-01")
+                    return found, audited
 
                 old_runtime = get_agent_kernel_runtime()
-                before, old_audit = await query(old_runtime, "before")
-                await query(old_runtime, "before-cached")
+                before, old_audit = await query()
+                await query()
                 request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))})
                 with patch.object(api, "require_api_login"):
                     saved = api.save_config(request, {"JELLYFIN_URL": "http://new-library.invalid"})
                 assert isinstance(saved, dict) and saved["success"], saved
                 new_runtime = get_agent_kernel_runtime()
                 assert new_runtime is not old_runtime
-                after, new_audit = await query(new_runtime, "after")
-                await query(new_runtime, "after-cached")
-                assert before["data"]["sources"][0]["items"][0]["title"] == "旧服务器库存"
-                assert after["data"]["sources"][0]["items"][0]["title"] == "新服务器库存"
+                after, new_audit = await query()
+                await query()
+                assert before["data"]["sources"][0]["items"][0]["name"] == "旧服务器库存"
+                assert after["data"]["sources"][0]["items"][0]["name"] == "新服务器库存"
                 assert old_audit["data"]["local_episode_count"] == 1
                 assert new_audit["data"]["local_episode_count"] == 2
                 assert old_audit["status"] == "updates_available" and new_audit["status"] == "up_to_date"
@@ -228,7 +227,8 @@ def test_real_config_save_and_runtime_rebuild_refresh_search_and_episode_invento
                     ("search", "http://old-library.invalid"), ("inventory", "http://old-library.invalid"),
                     ("search", "http://new-library.invalid"), ("inventory", "http://new-library.invalid"),
                 ]
-                for secret in ("private-item", "private-series", "jellyfin-key", "tmdb-key"):
+                assert after["data"]["sources"][0]["items"][0]["id"] == "private-item"
+                for secret in ("jellyfin-key", "tmdb-key"):
                     assert secret not in repr((before, old_audit, after, new_audit))
             finally:
                 invalidate_agent_kernel_runtime()

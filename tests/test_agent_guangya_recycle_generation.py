@@ -6,10 +6,11 @@ import unittest
 from copy import deepcopy
 from unittest import mock
 
-from app.agent.domains.guangya import recycle_actions as actions
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext
-from app.clients.guangya import GuangYaFile
+import asyncio
+from typing import cast
+
+from app.modules import guangya_recycle as recycle
+from app.clients.guangya import GuangYaClient, GuangYaFile
 
 
 class _RecycleClient:
@@ -49,82 +50,109 @@ class _RecycleClient:
 
 
 class GuangYaRecycleGenerationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.context = ToolContext(owner="generation-test", session_id="session")
+    @staticmethod
+    def prepare(client, operation):
+        client = cast(GuangYaClient, client)
+        return recycle.prepare_clear(client) if operation == "clear" else recycle.prepare_restore(client, ["trash-1"])
 
-    def _arguments(self, operation: str, generation: int):
-        if operation == "clear":
-            return {}
-        return {
-            "guangya_recycle_items_ref": "ref_generation_test",
-            "indices": [1],
-            "guangya_recycle_items": {
-                "credential_generation": generation,
-                "page": 1,
-                "page_size": 50,
-                "items": [actions._snapshot(_RecycleClient(generation).items[0])],
-            },
-        }
+    @staticmethod
+    def apply(client, operation, snapshot, **kwargs):
+        handler = recycle.clear_prepared if operation == "clear" else recycle.restore_prepared
+        return handler(cast(GuangYaClient, client), snapshot, **kwargs)
 
-    def _handlers(self, operation: str):
-        if operation == "clear":
-            return (
-                actions.prepare_clear_guangya_recycle,
-                actions.execute_clear_guangya_recycle,
-            )
-        return (
-            actions.prepare_restore_guangya_recycle,
-            actions.execute_restore_guangya_recycle,
-        )
+    def test_restore_and_clear_reject_changed_write_client_generation(self):
+        for operation in ("restore", "clear"):
+            with self.subTest(operation=operation):
+                snapshot = self.prepare(_RecycleClient(7), operation)
+                client = _RecycleClient(8)
+                with self.assertRaises(recycle.GuangYaRecycleStale):
+                    self.apply(client, operation, snapshot)
+                self.assertEqual(client.writes, [])
+                self.assertEqual(client.items[0].file_id, "trash-1")
 
-    def _assert_generation_change_blocked(self, operation: str) -> None:
-        clients = [_RecycleClient(7), _RecycleClient(7), _RecycleClient(8)]
-        arguments = self._arguments(operation, 7)
-        prepare, execute = self._handlers(operation)
-        with mock.patch.object(actions, "GuangYaClient", side_effect=clients) as factory:
-            _preview, fingerprint = prepare(arguments, self.context)
-            with self.assertRaises(AgentToolError) as caught:
-                execute(arguments, fingerprint, self.context)
+    def test_same_generation_submits_including_zero(self):
+        for operation in ("restore", "clear"):
+            for generation in (0, 7):
+                with self.subTest(operation=operation, generation=generation):
+                    snapshot = self.prepare(_RecycleClient(generation), operation)
+                    client = _RecycleClient(generation)
+                    result = self.apply(client, operation, snapshot)
+                    self.assertEqual(result["status"], "accepted")
+                    self.assertFalse(result["verified"])
+                    self.assertTrue(result["verification_pending"])
+                    self.assertEqual(result["task_id"], operation + "-task")
+                    self.assertEqual(client.writes, [(operation, () if operation == "clear" else ("trash-1",))])
 
-        self.assertEqual(caught.exception.code, "confirmation_stale")
-        self.assertEqual(factory.call_count, 3)
-        self.assertTrue(all(not client.writes for client in clients))
-        self.assertTrue(all(client.closed for client in clients))
-        self.assertEqual(clients[-1].items[0].file_id, "trash-1")
+    def test_generation_change_during_revalidation_and_cancellation_both_prevent_write(self):
+        for operation in ("restore", "clear"):
+            for change in ("generation", "cancel"):
+                with self.subTest(operation=operation, change=change):
+                    client = _RecycleClient(7)
+                    snapshot = self.prepare(client, operation)
+                    cancelled = False
+                    def read(**kwargs):
+                        nonlocal cancelled
+                        if change == "generation":
+                            client.credential_generation = 8
+                        cancelled = True
+                        return deepcopy(client.items)
+                    def check():
+                        if cancelled:
+                            raise asyncio.CancelledError()
+                    with mock.patch.object(client, "list_recycle", side_effect=read):
+                        error = recycle.GuangYaRecycleStale if change == "generation" else asyncio.CancelledError
+                        with self.assertRaises(error):
+                            self.apply(client, operation, snapshot, cancel_check=check)
+                    self.assertEqual(client.writes, [])
 
-    def test_restore_rejects_generation_change_when_write_client_is_created(self) -> None:
-        self._assert_generation_change_blocked("restore")
+    def test_changed_or_missing_selected_objects_do_not_restore(self):
+        for field, value in (("name", "replaced.mkv"), ("size", 456), ("etag", "other-content"), ("file_id", "new-id")):
+            with self.subTest(field=field):
+                client = _RecycleClient(7)
+                snapshot = self.prepare(client, "restore")
+                setattr(client.items[0], field, value)
+                with self.assertRaises(recycle.GuangYaRecycleStale):
+                    self.apply(client, "restore", snapshot)
+                self.assertEqual(client.writes, [])
 
-    def test_clear_rejects_generation_change_when_write_client_is_created(self) -> None:
-        self._assert_generation_change_blocked("clear")
+    def test_clear_freezes_entire_set_while_restore_limits_itself_to_selected_ids(self):
+        for operation in ("restore", "clear"):
+            with self.subTest(operation=operation):
+                client = _RecycleClient(7)
+                snapshot = self.prepare(client, operation)
+                client.items.append(GuangYaFile("new", "new.mkv", False, parent_id="source"))
+                if operation == "clear":
+                    with self.assertRaises(recycle.GuangYaRecycleStale):
+                        self.apply(client, operation, snapshot)
+                    self.assertEqual(client.writes, [])
+                else:
+                    result = self.apply(client, operation, snapshot)
+                    self.assertEqual(result["count"], 1)
+                    self.assertEqual([item.file_id for item in client.items], ["new"])
 
-    def _assert_same_generation_submits(self, operation: str) -> None:
-        for generation in (0, 7):
-            with self.subTest(generation=generation):
-                clients = [_RecycleClient(generation) for _ in range(3)]
-                arguments = self._arguments(operation, generation)
-                prepare, execute = self._handlers(operation)
-                with mock.patch.object(actions, "GuangYaClient", side_effect=clients):
-                    preview, fingerprint = prepare(arguments, self.context)
-                    result = execute(arguments, fingerprint, self.context)
+    def test_partial_listing_and_unknown_ids_are_rejected_before_write(self):
+        client = _RecycleClient(7)
+        with self.assertRaises(recycle.GuangYaRecycleStale):
+            recycle.prepare_restore(cast(GuangYaClient, client), ["missing"])
+        for operation in ("restore", "clear"):
+            snapshot = self.prepare(client, operation)
+            with mock.patch.object(client, "list_recycle", side_effect=RuntimeError("page 2 failed")):
+                with self.assertRaises(RuntimeError):
+                    self.apply(client, operation, snapshot)
+            self.assertEqual(client.writes, [])
 
-                self.assertEqual(result.status, "accepted")
-                self.assertFalse(result.data["verified"])
-                self.assertTrue(result.data["verification_pending"])
-                self.assertEqual(result.references[0].kind, "guangya_task")
-                self.assertNotIn("credential_generation", preview.data)
-                self.assertNotIn("credential_generation", result.data)
-                expected_ids = ("trash-1",) if operation == "restore" else ()
-                self.assertEqual(clients[-1].writes, [(operation, expected_ids)])
-                self.assertTrue(all(not client.writes for client in clients[:-1]))
-                self.assertTrue(all(client.closed for client in clients))
-
-    def test_restore_keeps_same_generation_submission_including_zero(self) -> None:
-        self._assert_same_generation_submits("restore")
-
-    def test_clear_keeps_same_generation_submission_including_zero(self) -> None:
-        self._assert_same_generation_submits("clear")
-
+    def test_unknown_write_never_becomes_known_failure_or_exposes_provider_error(self):
+        for operation, method in (("restore", "restore_from_recycle"), ("clear", "clear_recycle_bin")):
+            with self.subTest(operation=operation):
+                client = _RecycleClient(7)
+                snapshot = self.prepare(client, operation)
+                with mock.patch.object(client, method, side_effect=RuntimeError("private-provider-token")) as remote:
+                    result = self.apply(client, operation, snapshot)
+                remote.assert_called_once()
+                self.assertEqual(result["status"], "outcome_unknown")
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["verified"])
+                self.assertNotIn("private-provider-token", str(result))
 
 
 if __name__ == "__main__":

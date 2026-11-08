@@ -9,7 +9,31 @@ from app.sensitive_data import (
 )
 
 
+SESSION_BATCH_HELP = (
+    "Help on function batch in module mf.session:\n\n"
+    "batch(steps: list[dict]) -> dict\n"
+    "    将steps中的原生写method/arguments冻结为一张确认卡；参数与单方法相同。全部复核后串行执行，失败/unknown停止后项，不回滚、不重放。仅支持已声明可组合方法；后台方法只能是唯一第一项，后项须独立同步写，不能依赖前项的新结果。\n\n"
+)
+
+
 class SensitiveDataTests(unittest.TestCase):
+    def test_python_help_preserves_complete_module_heading_and_signature(self):
+        self.assertEqual(len(SESSION_BATCH_HELP), 208)
+        for module in ("mf.session", "package.api_key", "package.password"):
+            value = SESSION_BATCH_HELP.replace("mf.session", module)
+            with self.subTest(module=module):
+                self.assertFalse(contains_sensitive_credential(value))
+                self.assertEqual(redact_sensitive_text(value), value)
+
+    def test_python_help_still_redacts_credentials_in_the_body(self):
+        value = SESSION_BATCH_HELP + "    session:\n\n    private-session\n"
+        self.assertTrue(contains_sensitive_credential(value))
+        redacted = redact_sensitive_text(value)
+        self.assertTrue(redacted.startswith(SESSION_BATCH_HELP))
+        self.assertNotIn("private-session", redacted)
+        self.assertIn("********", redacted)
+        self.assertFalse(contains_sensitive_credential(redacted))
+
     def test_ascii_credential_keys_adjacent_to_chinese_are_not_hidden(self):
         from app.agent.public_safety import sanitize_public_text
         for prefix in ("凭据", "提示：", "状态描述"):
@@ -33,6 +57,16 @@ class SensitiveDataTests(unittest.TestCase):
             "https://alice:private-pass@example.invalid/path",
             "Cookie: sid=private-session; theme=dark",
             "session=private-session",
+            "session:\n\nprivate-session",
+            "api_key:\n    private-value",
+            "api_key:\n\n    private-value",
+            "api_key\n=\nprivate-value",
+            'headers={"api_key":\n"private-value"}',
+            "config.password=private-value",
+            "config.password:\n\nprivate-value",
+            "Help on function batch in module package.password:\n\nprivate-value",
+            "Help on function read in module package.password:\n\nbatch(private-value)",
+            "Help on function batch in module package.password:\n\nBATCH(private-value)",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_value",
             "tvly-abcdefghijklmnopqrstuvwxyz123456",
             "hf_abcdefghijklmnopqrstuvwxyz123456",

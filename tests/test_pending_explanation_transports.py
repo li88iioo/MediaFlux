@@ -17,13 +17,9 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.kernel.adapters import consume_events
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.provider_model import (
@@ -138,7 +134,7 @@ class NativeRuntime:
         self.session = AgentSession(
             model=self.model,
             catalog=self.catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(
                 catalog=self.catalog, state_store=self.store, effect_store=self.effects
             ),

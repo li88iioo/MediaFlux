@@ -10,9 +10,9 @@ import pytest
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
+from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import (
     OWNER,
     WaitScript,
@@ -32,14 +32,14 @@ def test_cold_cancel_blocks_late_terminal_failure(phase, terminal):
         clock[0] = 110
         script = WaitScript(True)
         store = SQLiteKernelStore(clock=lambda: clock[0])
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=store)
+        runtime = build_wait_runtime(model=script.adapter, store=store)
         runtime.session.continuation_binding = _capture_creation_binding()
         async def read(arguments, context):
             if terminal == "turn.failed":
                 raise ToolPipelineError("fixture READ failure", code="fixture_read_error")
             return {"ok": True, "summary": "fixture READ success"}
-        tool = runtime.session.catalog.get('web.search')
-        runtime.session.catalog._tools['web.search'] = replace(tool, read=read)
+        tool = runtime.session.catalog.get('fixture.lookup')
+        runtime.session.catalog._tools['fixture.lookup'] = replace(tool, read=read)
         entered, release = threading.Event(), threading.Event()
         append = store._append_event_sync
         delivered = []
@@ -66,7 +66,7 @@ def test_cold_cancel_blocks_late_terminal_failure(phase, terminal):
             worker = asyncio.create_task(runtime.session.resume_wait(candidate=candidate))
             try:
                 assert await asyncio.to_thread(entered.wait, 5), "failure journal entry timeout"
-                cold = build_agent_kernel_runtime(
+                cold = build_wait_runtime(
                     model=WaitScript(True).adapter,
                     store=SQLiteKernelStore(clock=lambda: clock[0]),
                 )

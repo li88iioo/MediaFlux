@@ -18,6 +18,46 @@ from tests.support import seed_rss_entry_state
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    def test_v37_and_unversioned_verification_jobs_migrate_targets_without_losing_receipts(self):
+        for version in (37, 0):
+            with self.subTest(version=version):
+                request_id, _ = db.create_download_request(f"verification-v{version}", "magnet", origin="agent")
+                with db.get_conn() as conn:
+                    conn.execute("DELETE FROM agent_download_verification_notification_outbox")
+                    conn.execute("DROP TABLE agent_download_verifications")
+                    conn.execute("CREATE TABLE agent_download_verifications ("
+                        "request_id INTEGER PRIMARY KEY,title TEXT NOT NULL,tmdb_id TEXT NOT NULL,"
+                        "season INTEGER NOT NULL,episode INTEGER NOT NULL,as_of TEXT NOT NULL,library_name TEXT NOT NULL DEFAULT '',"
+                        "owner TEXT NOT NULL DEFAULT '',chat_id TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',"
+                        "result TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,lease_generation INTEGER NOT NULL DEFAULT 0,"
+                        "next_check_at TEXT NOT NULL,last_checked_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+                        "FOREIGN KEY(request_id) REFERENCES download_requests(id) ON DELETE CASCADE)")
+                    conn.execute("INSERT INTO agent_download_verifications VALUES(?, 'The Show','123',2,3,'2026-08-03','Library',"
+                                 "'owner','100','retry_wait','missing',3,7,?,?,?,?)", (request_id, *(db.now(),) * 4))
+                    payload = json.dumps({"title": "The Show", "season": 2, "episode": 3,
+                                          "status": "attention", "result": "missing", "attempts": 3})
+                    conn.execute("INSERT INTO agent_download_verification_notification_outbox("
+                                 "request_id,owner,chat_id,payload_json,status,attempts,lease_generation,next_attempt_at,created_at,updated_at) "
+                                 "VALUES(?,'owner','100',?,'retry_wait',2,9,?,?,?)", (request_id, payload, *(db.now(),) * 3))
+                    conn.execute(f"PRAGMA user_version={version}")
+                db.init_db()
+                with db.get_conn() as conn:
+                    row = dict(conn.execute("SELECT * FROM agent_download_verifications").fetchone())
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+                    self.assertFalse({"title", "tmdb_id", "season", "episode", "as_of", "library_name"} & set(row))
+                    self.assertEqual(json.loads(row["targets_json"]), [{"title": "The Show", "tmdb_id": "123", "season": 2,
+                        "episode": 3, "as_of": "2026-08-03", "library_name": "Library", "result": "missing"}])
+                    self.assertEqual((row["status"], row["attempts"], row["lease_generation"], row["owner"]), ("retry_wait", 3, 7, "owner"))
+                    outbox = dict(conn.execute("SELECT * FROM agent_download_verification_notification_outbox").fetchone())
+                    self.assertEqual((outbox["status"], outbox["attempts"], outbox["lease_generation"]), ("retry_wait", 2, 9))
+                    self.assertEqual(json.loads(outbox["payload_json"])["targets"], [
+                        {"title": "The Show", "season": 2, "episode": 3, "result": "missing"},
+                    ])
+                db.init_db()
+                verification = db.get_agent_download_verification(request_id)
+                assert verification is not None
+                self.assertEqual(len(verification["targets"]), 1)
+
     def test_legacy_metadata_queue_gains_policy_column_on_cold_restart(self) -> None:
         import subprocess
         import sys

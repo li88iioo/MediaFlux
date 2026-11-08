@@ -4,6 +4,7 @@ import asyncio
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import httpx
 
@@ -15,13 +16,15 @@ from app.clients.http import (
     HttpSecurityError,
 )
 from app.indexers.errors import IndexerResultExpired, IndexerUnavailable
-from app.indexers.models import IndexerItem, IndexerSearchRequest
+from app.indexers.models import IndexerItem, IndexerMediaSearchRequest, IndexerSearchRequest
 from app.indexers.providers.base import IndexerAdapter
 from app.indexers.providers.btbtla import BTBtlaAdapter
 from app.indexers.providers.mikan import MikanAdapter
 from app.indexers.providers.nyaa import NyaaAdapter
 from app.indexers.providers.piratebay import PirateBayAdapter
 from app.indexers.registry import IndexerRegistry, build_default_registry
+from app.indexers.result_store import IndexerResultStore
+from app.indexers.service import IndexerService
 
 _INDEXER_FIXTURES = Path(__file__).with_name("fixtures") / "indexers"
 NYAA_HTML = (_INDEXER_FIXTURES / "nyaa-search.html").read_bytes()
@@ -85,6 +88,47 @@ async def _record_sleep(calls: list[float], delay: float) -> None:
 
 
 class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nyaa_native_pages_remain_complete_through_aggregation(self):
+        template = NYAA_HTML[NYAA_HTML.index(b"<tr>"):NYAA_HTML.index(b"</tr>") + len(b"</tr>")]
+
+        def page_body(numbers, *, has_more=False):
+            rows = [template.replace(b"/123", f"/{number}".encode())
+                    .replace(b"0123456789ABCDEF0123456789ABCDEF01234567", f"{number:040x}".encode())
+                    .replace(b"Frieren 01", f"Demo S01E01 release{number}".encode()) for number in numbers]
+            body = b'<table class="torrent-list"><tbody>' + b"".join(rows) + b"</tbody></table>"
+            return body + (b'<ul class="pagination"><li><a href="/?p=2">Next</a></li></ul>' if has_more else b"")
+
+        for has_more in (False, True):
+            with self.subTest(has_more=has_more):
+                first_body = page_body(range(1, 61), has_more=has_more)
+                http = FakeHttpClient(first_body)
+                http.responses = [first_body, first_body, page_body(range(61, 64))]
+                adapter = NyaaAdapter(site_id="nyaa", site_name="Nyaa", base_url="https://nyaa.si/", http=http, default_enabled=True)
+                service = IndexerService(registry=IndexerRegistry({"nyaa": adapter}), result_store=IndexerResultStore(), max_results_per_site=40)
+                try:
+                    with patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
+                        native = await adapter.search(IndexerSearchRequest.create("Demo"))
+                        first = await service.search_media(IndexerMediaSearchRequest.create(title="Demo", season=1, episode=1))
+                        cached = await service.search_media(IndexerMediaSearchRequest.create(title="Demo", season=1, episode=1))
+                        self.assertEqual(len(native.items), 60)
+                        self.assertEqual({row.title for row in first.items}, {row.title for row in native.items})
+                        self.assertEqual(len(cached.items), 60)
+                        self.assertTrue(cached.cached)
+                        self.assertEqual(first.site_truncated_counts, {"nyaa": 0})
+                        self.assertEqual(first.has_more, has_more)
+                        self.assertEqual(first.site_page_states["nyaa"].next_page, 2 if has_more else None)
+                        self.assertFalse(first.partial)
+                        self.assertTrue(first.complete)
+                        if has_more:
+                            second = await service.search_media(IndexerMediaSearchRequest.create(title="Demo", season=1, episode=1, page=2))
+                            self.assertEqual(len(second.items), 3)
+                            self.assertEqual(len({row.title for row in first.items + second.items}), 63)
+                            self.assertFalse(second.has_more)
+                            self.assertEqual(second.site_truncated_counts, {"nyaa": 0})
+                        self.assertEqual(len(http.calls), 3 if has_more else 2)
+                finally:
+                    await service.aclose()
+
     async def test_tpb_builds_magnet_and_filters_unrelated_hot_results(self):
         adapter = PirateBayAdapter(
             http=FakeHttpClient(TPB_JSON, content_type="application/json"),

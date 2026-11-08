@@ -16,10 +16,9 @@ from unittest import mock
 
 import pytest
 
-from app.agent.domains.guangya import fs_change_actions as guangya_fs_change_actions
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.models import ToolContext, ToolResult
-from app.modules import guangya_fs_change, guangya_workspace, organize_tasks
+from app.modules import guangya_fs_change, organize_tasks
 from app.modules.organize_tasks import OrganizeTaskManager
 from app.repositories import organize_operation_jobs as jobs
 from tests.support import isolated_test_database
@@ -35,10 +34,8 @@ def copy_queue(monkeypatch, tmp_path):
 
     for method in ("connect", "connect_ex", "sendto"):
         monkeypatch.setattr(socket.socket, method, deny_network)
-    monkeypatch.setattr(guangya_workspace, "_directory", lambda: tmp_path / "observations")
     monkeypatch.setattr(guangya_fs_change, "_directory", lambda: tmp_path / "changes")
-    for module in (guangya_workspace, guangya_fs_change):
-        monkeypatch.setattr(module, "get_web_secret", lambda: "copy-recovery-test-secret")
+    monkeypatch.setattr(guangya_fs_change, "get_web_secret", lambda: "copy-recovery-test-secret")
     monkeypatch.setattr(guangya_fs_change, "_COPY_FOREGROUND_ATTEMPTS", 1)
 
     client = FakeGatewayClient()
@@ -49,12 +46,12 @@ def copy_queue(monkeypatch, tmp_path):
     clock = [time.time()]
     # 本链路共享墙钟，不修改全局 time 或绕过原 expires_at/lease 检查。
     wall_clock = SimpleNamespace(time=lambda: clock[0])
-    for module in (jobs, guangya_fs_change, guangya_workspace):
+    for module in (jobs, guangya_fs_change):
         monkeypatch.setattr(module, "time", wall_clock)
     # manager 新增的 time.time() 期限 guard 也必须与队列共用受控墙钟。
     monkeypatch.setattr(organize_tasks, "time", wall_clock, raising=False)
     monkeypatch.setattr(
-        guangya_fs_change_actions,
+        guangya_fs_change,
         "execute_fs_change_plan",
         partial(guangya_fs_change.execute_fs_change_plan, client_factory=lambda: cast(GuangYaClient, client)),
     )
@@ -64,38 +61,28 @@ def copy_queue(monkeypatch, tmp_path):
 
 
 def _enqueue_plan(client, operation="copy"):
-    observation = guangya_workspace.create_directory_observation(
-        client, owner=_OWNER, session_id="session", path="/", recursive=True,
-    )
-    refs = {entry["file_id"]: entry["handle"] for entry in observation["entries"]}
     operations = (
         [
-            {"op": "copy", "object_ref": refs["trash"], "target_path": "/target"},
-            {"op": "move", "object_ref": refs["source"], "target_path": "/target"},
+            {"op": "copy", "file_id": "trash", "target_path": "/target"},
+            {"op": "move", "file_id": "source", "target_path": "/target"},
         ]
         if operation == "copy"
-        else [{"op": "rename", "object_ref": refs["rename"], "new_name": "renamed.mp4"}]
+        else [{"op": "rename", "file_id": "rename", "new_name": "renamed.mp4"}]
     )
     plan = guangya_fs_change.build_fs_change_plan(
-        client, owner=_OWNER, observation=observation,
+        client, owner=_OWNER,
         operations=operations, trigger_strm=False,
     )
-    guangya_fs_change.confirm_fs_change_plan(
-        plan["plan_id"], owner=_OWNER, expected_fingerprint=plan["fingerprint"],
-    )
-    row, replayed = jobs.enqueue_organize_operation_job(
-        job_kind="agent_guangya_fs_change", owner=_OWNER,
-        operation="光鸭文件变更", reference="copy 期限/恢复冻结计划",
-        payload={
-            "version": 1,
-            "plan_id": plan["plan_id"],
-            "plan_fingerprint": plan["fingerprint"],
-            "owner_digest": plan["owner_digest"],
-            "credential_generation": plan["credential_generation"],
-        },
-        dedupe_key=f"copy-deadline-recovery:{plan['plan_id']}",
-    )
-    assert not replayed
+    manager = OrganizeTaskManager()
+    manager._worker = cast(threading.Thread, object())
+    with mock.patch.object(organize_tasks, "get_organize_manager", return_value=manager), \
+            mock.patch.object(manager, "_ensure_operation_dispatcher"):
+        task = guangya_fs_change.submit_fs_change_plan(
+            plan["plan_id"], owner=_OWNER, expected_fingerprint=plan["fingerprint"],
+        )
+    row = jobs.get_organize_operation_job(task["task_id"])
+    assert row is not None
+    assert not task["replayed"]
     assert jobs.verify_organize_operation_payload(row)
     bound = guangya_fs_change._read(plan["plan_id"])
     assert bound["job_id"] == row["job_id"]
@@ -134,6 +121,7 @@ def _accepted_copy_pending(client):
     assert pending["payload_json"] == queued["payload_json"]
     client.copy.assert_called_once_with(["trash"], "target")
     client.move.assert_not_called()
+
     checkpoint = guangya_fs_change._read_fs_checkpoints(
         guangya_fs_change._read(plan["plan_id"]),
     )
@@ -152,7 +140,7 @@ def _terminal_receipt(manager, job_id):
         mock.patch.object(manager, "status", return_value={}),
     ):
         return asyncio.run(wait_for_effect_completion(
-            accepted, tool="guangya.fs.change.execute",
+            accepted, tool="cloud.change",
             context=ToolContext(owner=_OWNER), timeout_seconds=0,
         ))
 
@@ -243,6 +231,19 @@ def test_accepted_copy_stays_uncancellable_after_running_orphan_recovery(copy_qu
     ) == checkpoint
     client.copy.assert_called_once_with(["trash"], "target")
     client.move.assert_not_called()
+
+    manager = OrganizeTaskManager()
+    manager._worker = cast(threading.Thread, object())
+    with mock.patch.object(organize_tasks, "get_organize_manager", return_value=manager), \
+            mock.patch.object(manager, "_ensure_operation_dispatcher", side_effect=AssertionError("只复用原复制任务")):
+        repeated = guangya_fs_change.submit_fs_change_plan(
+            plan["plan_id"], owner=_OWNER, expected_fingerprint=plan["fingerprint"],
+        )
+    assert repeated["task_id"] == recovered["job_id"]
+    assert repeated["expires_at"] == recovered["expires_at"]
+    assert repeated["replayed"] and repeated["status"] == "pending"
+    assert guangya_fs_change._read_fs_checkpoints(guangya_fs_change._read(plan["plan_id"])) == checkpoint
+    client.copy.assert_called_once_with(["trash"], "target")
 
 
 def test_accepted_copy_handle_is_uncancellable_before_first_defer(copy_queue):

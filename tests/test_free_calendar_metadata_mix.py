@@ -42,9 +42,10 @@ def entry(**changes):
 
 
 def tmdb_row(**changes):
+    # TMDB 候选为合成控制数据；公开 suggest fixture 不补造产地。
     return {"id": 42, "name": "琅琊榜", "original_name": "Nirvana in Fire",
             "first_air_date": "2015-09-19", "genre_ids": [18], "poster_path": "/poster.jpg",
-            "vote_average": 8.5, "overview": "TMDB 简介", **changes}
+            "vote_average": 8.5, "overview": "TMDB 简介", "origin_country": ["CN"], **changes}
 
 
 def tmdb_payload(*rows):
@@ -81,6 +82,7 @@ class MixedMetadataTests(unittest.TestCase):
         for field in entry().to_dict():
             self.assertEqual(card[field], entry().to_dict()[field])
         self.assertEqual((card["rating"], card["rating_source"]), (8.5, "tmdb"))
+        self.assertEqual(card["origin_country"], ["CN"])
         self.assertFalse(any(key.startswith("_") for key in card))
         self.tmdb.get.assert_awaited_once()
         self.douban.suggest.assert_awaited_once()
@@ -102,9 +104,12 @@ class MixedMetadataTests(unittest.TestCase):
         first = self.mapper.enrich((entry(),))[0]
         self.assertEqual((first["tmdb_id"], first["douban_id"], first["poster_provider"]), ("", "25754848", "douban"))
         self.assertEqual((first["rating"], first["rating_source"]), (None, ""))
+        self.assertIsNone(first["origin_country"])
         self.assertNotIn("do-not-expose", json.dumps(first))
         self.tmdb.get.side_effect = None
-        self.assertEqual(self.mapper.enrich((entry(),))[0]["poster_provider"], "tmdb")
+        recovered = self.mapper.enrich((entry(),))[0]
+        self.assertEqual(recovered["poster_provider"], "tmdb")
+        self.assertEqual(recovered["origin_country"], ["CN"])
         self.assertEqual(self.douban.suggest.await_count, 1)
 
     def test_no_key_and_invalid_config_are_not_sticky_even_with_cached_douban_cover(self):
@@ -186,10 +191,12 @@ class MixedMetadataTests(unittest.TestCase):
 
     def test_non_contract_rating_and_tracking_url_are_not_exposed(self):
         self.tmdb.api_key = ""
-        self.douban.suggest.return_value = [douban_row(rating=9.9, url="https://movie.douban.com/subject/25754848/?suggest=tracking")]
+        self.douban.suggest.return_value = [douban_row(rating=9.9, origin_country=["CN"],
+            url="https://movie.douban.com/subject/25754848/?suggest=tracking")]
         card = self.mapper.enrich((entry(),))[0]
         self.assertEqual(card["douban_id"], "25754848")
         self.assertEqual((card["rating"], card["rating_source"]), (None, ""))
+        self.assertIsNone(card["origin_country"])
         self.assertNotIn("tracking", json.dumps(card))
 
     def test_stale_good_profile_survives_both_provider_failures_without_ttl_extension(self):
@@ -209,14 +216,15 @@ class MixedMetadataTests(unittest.TestCase):
         self.assertEqual(second["tmdb_poster_key"], first["tmdb_poster_key"])
         self.assertEqual(second["douban_poster_key"], first["douban_poster_key"])
 
-    def test_changed_work_id_cannot_inherit_old_poster(self):
+    def test_changed_work_id_cannot_inherit_old_poster_or_country(self):
         self.mapper.enrich((entry(),))
         self.now += timedelta(days=2)
-        self.tmdb.get.return_value = tmdb_payload(tmdb_row(id=43, poster_path=None))
+        self.tmdb.get.return_value = tmdb_payload(tmdb_row(id=43, poster_path=None, origin_country=None))
         self.douban.suggest.return_value = [douban_row(id="25754849", img="")]
         card = self.mapper.enrich((entry(),))[0]
         self.assertEqual((card["tmdb_id"], card["douban_id"]), ("43", "25754849"))
         self.assertEqual(card["poster_key"], "")
+        self.assertIsNone(card["origin_country"])
 
     def test_negative_cache_expires_and_v2_is_not_used(self):
         old_key = DiscoveryCache.make_key("calendar-tmdb", "profile-v2", "tv", 1, {
@@ -232,20 +240,31 @@ class MixedMetadataTests(unittest.TestCase):
         self.douban.suggest.return_value = fixture()
         self.assertEqual(self.mapper.enrich((entry(),))[0]["tmdb_id"], "42")
 
-    def test_cache_cannot_replace_schedule_fields(self):
+    def test_legacy_cache_keeps_unknown_country_and_cannot_replace_schedule_fields(self):
         self.mapper.enrich((entry(),))
         previous = self.cache.get(self.mapper.key(entry())).payload
         assert previous is not None
+        previous.pop("origin_country")
         previous.update(free_progress="伪造进度", events=[], year="1900", source_id="42", url="http://bad.invalid")
         self.cache.set_success(self.mapper.key(entry()), "calendar-tmdb", previous, ttl_seconds=10, stale_seconds=10)
         card = self.mapper.enrich((entry(),))[0]
         for key, value in entry().to_dict().items():
             self.assertEqual(card[key], value)
+        self.assertIsNone(card["origin_country"])
+        self.assertIsNone(self.mapper.enrich((entry(),))[0]["origin_country"])
+        self.tmdb.get.assert_awaited_once()
+        self.douban.suggest.assert_awaited_once()
+        self.now += timedelta(seconds=11)
+        self.assertEqual(self.mapper.enrich((entry(),))[0]["origin_country"], ["CN"])
+        self.assertEqual(self.tmdb.get.await_count, 2)
+        self.assertEqual(self.douban.suggest.await_count, 2)
 
     def test_same_programme_only_queries_each_provider_once_per_enrich(self):
         second = entry(events=(CalendarEvent("2026-09-10", "19:30", "第5集"),))
         cards = self.mapper.enrich((entry(), second))
         self.assertNotEqual(cards[0]["events"], cards[1]["events"])
+        self.assertTrue(all(card["origin_country"] == ["CN"] for card in cards))
+        self.assertEqual(self.mapper.enrich((entry(), second)), cards)
         self.tmdb.get.assert_awaited_once()
         self.douban.suggest.assert_awaited_once()
         params = self.tmdb.get.await_args.args[1]

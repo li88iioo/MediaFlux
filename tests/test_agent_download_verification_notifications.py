@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from starlette.requests import Request
 
-from app import database as db
+from app import database as db, notifier
 from app.modules import telegram_notification_center as center
 from app.modules.agent_download_verification_notifications import (
     dump_download_verification_payload,
@@ -41,6 +41,8 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
             "TG_AGENT_ALLOWED_USER_IDS": "200", "TG_NOTIFICATION_ENABLED": "1",
             "TG_NOTIFICATION_LEVEL": "standard", "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "1",
         }))
+        # 默认通知路由来自 transport 的已初始化配置；不继承其他用例留下的单例。
+        self.enterContext(patch.multiple(notifier, _initialized=True, _chat_id="100", _bot=None))
         for target in ("socket.socket.connect", "socket.socket.connect_ex", "socket.create_connection"):
             self.enterContext(patch(target, side_effect=AssertionError("R07 forbids network")))
         self.enterContext(patch.object(center, "_dispatch_stop", threading.Event()))
@@ -52,28 +54,24 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
             center, "edit_event_result", return_value=TelegramSendResult(True, message_id=73),
         ))
 
-    def _request(self, *, status="visible", result="visible", payload_title="The <Show>"):
+    def _request(self, *, status="visible", result="visible", payload_title="The <Show>",
+                 request_chat_id="100", origin="agent"):
         request_id, _ = db.create_download_request(
-            self.id(), "magnet", title="The <Show> S02E03", origin="agent", chat_id="100",
+            f"{self.id()}:{origin}", "magnet", title="The <Show> S02E03", origin=origin, chat_id=request_chat_id,
         )
         db.update_download_request(
             request_id, targets="qb", status="completed", qb_status="completed",
             local_import_status="completed", strm_status="completed",
         )
-        self.assertTrue(db.enqueue_agent_download_verification(
-            request_id, title="The <Show>", tmdb_id="123", season=2, episode=3,
-            as_of="2026-10-26", owner="tg:v1:100\x1f200", chat_id="100",
-        ))
+        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[{'title': 'The <Show>', 'tmdb_id': '123', 'season': 2, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f200', chat_id='100'), "queued")
         job = db.claim_due_agent_download_verification()
         assert job is not None
-        serialized = dump_download_verification_payload(
-            title=payload_title, season=2, episode=3, status=status, result=result, attempts=2,
-        )
+        serialized = dump_download_verification_payload(targets=[{'title': payload_title, 'season': 2, 'episode': 3, 'result': result}], status=status, result=result, attempts=2)
         payload = load_download_verification_payload(serialized)
         self.assertTrue(db.finish_agent_download_verification(
             request_id, status=payload["status"], result=payload["result"], attempts=payload["attempts"],
             next_check_at=db.now(), expected_lease_generation=job["lease_generation"], payload_json=serialized,
-        ))
+        targets=[{**target, "result": payload['result']} for target in job["targets"]]))
         return request_id
 
     def _event(self, request_id):
@@ -114,7 +112,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
         self.assertIn("无法得出可靠结论", rendered)
         self.assertNotIn("private backend error", rendered)
         payload = load_download_verification_payload(db.list_agent_download_verification_notifications()[0]["payload_json"])
-        self.assertEqual(payload["title"], "未命名剧集")
+        self.assertEqual(payload["targets"][0]["title"], "未命名剧集")
         self.assertEqual(payload["result"], "inconclusive")
 
     def test_sensitive_title_pattern_is_not_rendered_or_logged(self):
@@ -127,33 +125,37 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
 
         rendered = render_event(self._event(request_id))
         payload = db.list_agent_download_verification_notifications()[0]["payload_json"]
-        self.assertEqual(load_download_verification_payload(payload)["title"], "未命名剧集")
+        self.assertEqual(load_download_verification_payload(payload)["targets"][0]["title"], "未命名剧集")
         self.assertNotIn("private.invalid", payload)
         self.assertNotIn("SECRET", payload)
         self.assertNotIn("private.invalid", rendered)
         self.assertNotIn("SECRET", rendered)
 
     def test_persistent_payload_is_safe_and_strict(self):
-        serialized = dump_download_verification_payload(
-            title="https://private.invalid/file?token=SECRET",
-            season=2,
-            episode=3,
-            status="visible",
-            result="visible",
-            attempts=2,
-        )
+        serialized = dump_download_verification_payload(targets=[{'title': 'https://private.invalid/file?token=SECRET', 'season': 2, 'episode': 3, 'result': 'visible'}], status='visible', result='visible', attempts=2)
         self.assertNotIn("private.invalid", serialized)
         self.assertNotIn("SECRET", serialized)
         self.assertEqual(load_download_verification_payload(serialized), {
-            "title": "未命名剧集",
-            "season": 2,
-            "episode": 3,
+            "targets": [{"title": "未命名剧集", "season": 2, "episode": 3, "result": "visible"}],
             "status": "visible",
             "result": "visible",
             "attempts": 2,
         })
         with self.assertRaises(ValueError):
             load_download_verification_payload('{"title":"x","secret":"no"}')
+
+    def test_visible_library_with_partial_backend_still_notifies_overall_attention(self):
+        request_id = self._request()
+        db.update_download_request(request_id, targets="both", status="manual_review",
+                                   qb_status="completed", gy_status="manual_review")
+        self.assertTrue(notify_download_verification_terminal_result(
+            owner="tg:v1:100\x1f200", chat_id="100", request_id=request_id,
+        ).ok)
+        event = self._event(request_id)
+        self.assertEqual(event.state, "attention")
+        self.assertIn("已在媒体库中可见", render_event(event))
+        assert isinstance(event.title, str)
+        self.assertNotIn("下载与入库完成", event.title)
 
     def test_disabled_notification_never_calls_sender(self):
         request_id = self._request()
@@ -187,6 +189,59 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
         )
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM telegram_notification_outbox").fetchone()[0], 1)
+
+    def test_cross_chat_verification_does_not_publish_or_join_original_download_thread(self):
+        from app.modules.agent_download_verification_scheduler import DownloadLibraryVerificationScheduler
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        for origin, request_chat in (("indexer:nyaa", "999"), ("rss", "100")):
+            with self.subTest(origin=origin):
+                self.sender.reset_mock()
+                request_id = self._request(origin=origin, request_chat_id=request_chat)
+                if origin == "rss":
+                    db.update_download_request(request_id, notification_payload_json='{"chat_id":"999"}')
+                stored_row_2 = db.get_download_request(request_id)
+                assert stored_row_2 is not None
+                request = dict(stored_row_2)
+                job = db.get_agent_download_verification(request_id)
+
+                sent = notify_download_verification_terminal_result(
+                    owner="tg:v1:100\x1f200", chat_id="100", request_id=request_id,
+                )
+                self.assertFalse(sent.ok)
+                self.assertEqual(sent.error, "InvalidRoute")
+                self.sender.assert_not_called()
+                self.assertEqual(DownloadLibraryVerificationScheduler().dispatch_notification_once(), 1)
+                notification = next(item for item in db.list_agent_download_verification_notifications()
+                                    if item["request_id"] == request_id)
+                self.assertEqual(notification["status"], "discarded")
+                self.assertEqual(notification["last_error_type"], "InvalidRoute")
+                self.assertEqual(db.get_agent_download_verification(request_id), job)
+                stored_row_3 = db.get_download_request(request_id)
+                assert stored_row_3 is not None
+                self.assertEqual(dict(stored_row_3), request)
+
+                self.assertTrue(publish_download_lifecycle(request_id).delivered)
+                self.sender.assert_called_once()
+                self.assertEqual(self.sender.call_args.kwargs["chat_id"], "999")
+                self.assertNotIn("入库复核", dict(self.sender.call_args.args[0].fields))
+                self.assertIsNone(get_notification_thread_snapshot(
+                    f"download:{request_id}", topic=NotificationTopic.DOWNLOAD, chat_id="100",
+                ))
+                stored_row_4 = db.get_download_request(request_id)
+                assert stored_row_4 is not None
+                self.assertEqual(dict(stored_row_4), request)
+
+    def test_request_without_chat_keeps_existing_default_route(self):
+        request_id = self._request(request_chat_id="", origin="rss")
+        self.assertTrue(notify_download_verification_terminal_result(
+            owner="tg:v1:100\x1f200", chat_id="100", request_id=request_id,
+        ).ok)
+        self.assertEqual(self.sender.call_args.kwargs["chat_id"], "100")
+        self.assertIn("入库复核", dict(self.sender.call_args.args[0].fields))
+        stored_row_1 = db.get_download_request(request_id)
+        assert stored_row_1 is not None
+        self.assertEqual(stored_row_1["chat_id"], "")
 
     def test_revoked_route_never_calls_sender(self):
         request_id = self._request()

@@ -126,7 +126,9 @@ class CalendarCoreTests(unittest.TestCase):
         self.service.get_week()
         self.tick += 301
         self.assertFalse(self.service._needs_platform_posters(self.cache.get(self.service.key("tencent")).payload))
-        self.assertEqual(self.service.get_week()["items_count"], 1)
+        data = self.service.get_week()
+        self.assertEqual(data["items_count"], 1)
+        self.assertIsNone(data["days"][0]["items"][0]["origin_country"])
         self.assertEqual(self.source.calls, 1)
 
     def test_real_dated_schedule_does_not_require_a_free_label(self):
@@ -171,10 +173,13 @@ class CalendarCoreTests(unittest.TestCase):
         def enrich(entries):
             calls.append(True)
             return [{**item.to_dict(), "mapping_status": "pending" if len(calls) == 1 else "matched",
-                     "tmdb_id": "" if len(calls) == 1 else "42"} for item in entries]
+                     "tmdb_id": "" if len(calls) == 1 else "42",
+                     "origin_country": None if len(calls) == 1 else ["JP"]} for item in entries]
         self.service.metadata = SimpleNamespace(enrich=enrich)
         first = self.service.get_week()
-        self.assertTrue(first["refreshing"])
+        self.assertFalse(first["refreshing"])
+        self.assertTrue(first["metadata_pending"])
+        self.assertIsNone(first["days"][0]["items"][0]["origin_country"])
         fetched = first["sources"][0]["fetched_at"]
         self.now += timedelta(seconds=10)
         self.tick += 10
@@ -182,8 +187,10 @@ class CalendarCoreTests(unittest.TestCase):
         self.assertEqual(self.source.calls, 1)
         self.assertEqual(len(calls), 2)
         self.assertFalse(second["refreshing"])
+        self.assertFalse(second["metadata_pending"])
         self.assertEqual(second["sources"][0]["fetched_at"], fetched)
         self.assertEqual(second["days"][0]["items"][0]["tmdb_id"], "42")
+        self.assertEqual(second["days"][0]["items"][0]["origin_country"], ["JP"])
         self.now += timedelta(seconds=3591)
         self.assertEqual(self.cache.get(self.service.key("tencent")).status, "stale")
 
@@ -220,17 +227,21 @@ class CalendarCoreTests(unittest.TestCase):
             data = self.service.get_week()
         self.assertEqual(calls, [["one", "two", "three"], ["two", "three"], ["three"]])
         self.assertFalse(data["refreshing"])
+        self.assertFalse(data["metadata_pending"])
         self.assertEqual(data["items_count"], 3)
         self.assertEqual(self.source.calls, 1)
 
     def test_pending_metadata_is_bounded_even_if_enricher_never_finishes(self):
         self.service.metadata = SimpleNamespace(enrich=lambda entries: [{**item.to_dict(), "mapping_status": "pending"} for item in entries])
-        self.assertTrue(self.service.get_week()["refreshing"])
+        first = self.service.get_week()
+        self.assertFalse(first["refreshing"])
+        self.assertTrue(first["metadata_pending"])
         for _ in range(8):
             self.tick += 6
             self.now += timedelta(seconds=6)
             result = self.service.get_week()
         self.assertFalse(result["refreshing"])
+        self.assertFalse(result["metadata_pending"])
         self.assertEqual(self.source.calls, 1)
         get_result_2 = self.cache.get(self.service.key("tencent")).payload
         assert get_result_2 is not None
@@ -285,6 +296,24 @@ class CalendarCoreTests(unittest.TestCase):
         self.assertTrue(future.cancelled())
         with self.assertRaises(SourceUnavailable):
             self.service.get_week()
+
+    def test_published_facts_resume_queued_metadata_and_cancel_it_on_shutdown(self):
+        self.service.get_week()
+        key = self.service.key("tencent")
+        cached = self.cache.get(key).payload
+        assert cached is not None
+        payload = dict(cached)
+        payload.pop("metadata_rounds")  # 重启前仅发布了平台事实，尚未写首轮补全结果。
+        self.cache.set_success(key, "calendar:tencent", payload, ttl_seconds=3600, stale_seconds=86400)
+        self.tick += 6
+        future = Future()
+        self.service._submit = lambda fn: future
+        data = self.service.get_week()
+        self.assertFalse(data["refreshing"])
+        self.assertTrue(data["metadata_pending"])
+        self.assertEqual((data["items_count"], self.source.calls), (1, 1))
+        self.assertTrue(self.service.shutdown())
+        self.assertTrue(future.cancelled())
 
     def test_week_uses_shanghai_not_host_utc(self):
         self.assertEqual(calendar_dates(datetime(2026, 9, 6, 17, tzinfo=timezone.utc)), ("2026-09-07", "2026-09-07"))
@@ -379,6 +408,7 @@ class CalendarCoreTests(unittest.TestCase):
     def test_publish_raw_facts_retains_existing_poster_until_metadata_completes(self):
         self.cache.set_success(CalendarMetadata.key(entry()), "calendar-tmdb", {
             "tmdb_id": "42", "poster_key": "poster.jpg", "mapping_status": "matched",
+            "origin_country": ["JP"],
         }, ttl_seconds=3600, stale_seconds=86400)
         def enrich(entries):
             get_result_4 = self.cache.get(self.service.key("tencent")).payload
@@ -386,9 +416,12 @@ class CalendarCoreTests(unittest.TestCase):
             staged = get_result_4["entries"][0]
             self.assertEqual(staged["poster_key"], "poster.jpg")
             self.assertEqual(staged["tmdb_id"], "42")
+            self.assertEqual(staged["origin_country"], ["JP"])
             return [staged]
         self.service.metadata = SimpleNamespace(enrich=enrich)
-        self.assertEqual(self.service.get_week()["days"][0]["items"][0]["poster_key"], "poster.jpg")
+        card = self.service.get_week()["days"][0]["items"][0]
+        self.assertEqual(card["poster_key"], "poster.jpg")
+        self.assertEqual(card["origin_country"], ["JP"])
 
     def test_invalid_weekday_types_cannot_hide_behind_equal_integer_during_deduplication(self):
         for weekdays in ((1, True), (True, 1), (1, 1.0), (1.0, 1)):
@@ -574,9 +607,11 @@ class CalendarSourceWaitTests(unittest.TestCase):
         self.assertEqual((data["items_count"], data["sources"][0]["status"]), (1, "ok"))
         self.assertEqual(data["days"][2]["items"][0]["free_progress"], source.entries[0].free_progress)
         self.assertFalse(metadata_release.is_set())
-        assert service._pending['tencent'] is not None
-        self.assertFalse(service._pending["tencent"].done())
+        self.assertFalse(data["refreshing"])
+        self.assertTrue(data["metadata_pending"])
+        self.assertNotIn("tencent", service._pending)
         self.assertEqual(source.calls, 1)
+        self.assertFalse(service.shutdown(), "运行中的可选补全仍须纳入关闭回收")
 
     def test_concurrent_readers_and_web_refresh_share_one_real_source_fetch(self):
         source = GatedSource()
@@ -943,10 +978,26 @@ class CalendarMetadataTests(unittest.TestCase):
         )
 
     def test_unique_exact_title_year_and_category_can_enrich_without_changing_schedule(self):
-        card = self.mapper.enrich((entry(),))[0]
-        self.assertEqual(card["tmdb_id"], "42")
-        self.assertEqual(card["poster_key"], "poster.jpg")
-        self.assertEqual(card["free_weekdays"], (1, 3))
+        # 产地来自受控上游字段；中文标题、原始语言和动画类型都不能代替它。
+        original = self.rows[0]
+        for index, (fields, expected) in enumerate((
+            ({"origin_country": ["CN"]}, ["CN"]),
+            ({"origin_country": ["JP"]}, ["JP"]),
+            ({"origin_country": ["CN", "US"]}, ["CN", "US"]),
+            ({}, None), ({"origin_country": None}, None), ({"origin_country": []}, None),
+            ({"origin_country": "CN"}, None), ({"origin_country": ["CN", None]}, None),
+            ({"origin_country": ["cn"]}, None), ({"origin_country": ["中国"]}, None),
+        )):
+            with self.subTest(fields=fields):
+                self.rows = [{**original, "original_language": "zh", **fields}]
+                show = entry(source_id=f"country_{index}")
+                card = self.mapper.enrich((show,))[0]
+                self.assertEqual(card["tmdb_id"], "42")
+                self.assertEqual(card["poster_key"], "poster.jpg")
+                self.assertEqual(card["free_weekdays"], (1, 3))
+                self.assertEqual(card["origin_country"], expected)
+                self.assertEqual(self.mapper.enrich((show,))[0], card)
+                self.assertEqual(self.client.get.await_count, index + 1)
 
     def test_ambiguous_title_or_wrong_category_is_not_first_result_selected(self):
         self.rows = self.rows + [dict(self.rows[0], id=43)]

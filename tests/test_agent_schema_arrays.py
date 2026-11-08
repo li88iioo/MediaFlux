@@ -8,18 +8,9 @@ from types import MappingProxyType
 
 import pytest
 
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.domains.system.capability_actions import (
-    CAPABILITY_PARAMETERS,
-    capability_arguments,
-)
+from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
@@ -29,12 +20,12 @@ from tests.test_agent_tool_argument_ingress import Wire, encode, wire
 
 
 def array_schema():
-    specs = build_tool_specs()
+    specs = build_tool_catalog().visible()
     for spec in specs:
-        child = spec.parameters.get("properties", {}).get("subscription_ids", {})
-        if child.get("uniqueItems") and child.get("maxItems") == 32:
+        child = spec.input_schema.get("properties", {}).get("subscription_ids", {})
+        if child.get("uniqueItems"):
             return child
-    raise AssertionError("real RSS catalog contract missing")
+    raise AssertionError("real RSS native executor contract missing")
 
 
 async def execute(schema, arguments, trace):
@@ -60,13 +51,7 @@ async def execute(schema, arguments, trace):
         "lookup", arguments, context=context)
 
 
-@pytest.mark.parametrize("names", [[], ["library.status"] * 21])
-def test_real_capability_array_rejected_before_domain_validator(names):
-    trace = []
-    with pytest.raises(ToolPipelineError, match=r"arguments\.tool_names") as error:
-        asyncio.run(execute(CAPABILITY_PARAMETERS, {"tool_names": names}, trace))
-    assert error.value.code == "invalid_arguments"
-    assert trace == []
+
 
 
 def test_real_rss_unique_array_rejected_before_domain_validator():
@@ -129,29 +114,28 @@ def test_existing_item_error_order_and_fitting_capacity_are_unchanged():
     assert asyncio.run(execute(schema, {"values": values}, [])).arguments == {"values": values}
 
 
-@pytest.mark.parametrize("domain_only", [False, True])
-def test_native_invalid_array_direct_retry_keeps_valid_parameters(domain_only):
+def test_native_invalid_array_direct_retry_keeps_valid_parameters():
     async def run():
         executed = []
         tool = KernelToolSpec(name="lookup", domain="library", description="offline schema contract",
-                              input_schema=CAPABILITY_PARAMETERS, effect=ToolEffect.READ,
-                              validator=capability_arguments if domain_only else dict,
+                              input_schema={"type":"object","properties":{"subscription_ids":array_schema()},"additionalProperties":False}, effect=ToolEffect.READ,
+                              validator=dict,
                               read=lambda args, ctx: executed.append(args) or {"ok": True, "summary": "read"})
-        invalid = {"tool_names": ["library.status"], "query": "status"} if domain_only else {"tool_names": []}
-        valid = {"tool_names": ["library.status"]}
+        invalid = {"subscription_ids": [1, 1]}
+        valid = {"subscription_ids": [1]}
         final = {"choices": [{"message": {"content": "已核验"}, "finish_reason": "stop"}]}
         transport = Wire("chat_completions", [wire("chat_completions", "json", encode(invalid)),
                          wire("chat_completions", "json", encode(valid)), (encode(final).encode(), "application/json")])
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
         session = AgentSession(model=transport.adapter, catalog=catalog, state_store=state,
-                               retriever=CapabilityRetriever(minimum=1, maximum=1),
+
                                pipeline=ToolPipeline(catalog=catalog, state_store=state))
         events = [event async for event in session.run(AgentInput(message="schema contract", owner="owner", session_id="native"))]
         assert executed == [valid]
         feedback = [m for m in transport.requests[1]["messages"] if m["role"] == "tool"]
         error = json.loads(feedback[-1]["content"])
         assert error["code"] == "invalid_arguments"
-        assert ("只能提供其中一个" if domain_only else "arguments.tool_names") in error["error"]
+        assert "arguments.subscription_ids" in error["error"]
         assert events[-1].payload.get("status") == "success"
         transport.verify(3)
     asyncio.run(run())

@@ -637,8 +637,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         from app.indexers.providers.base import IndexerAdapter
         from app.indexers.registry import IndexerRegistry
         from app.indexers.result_store import IndexerResultStore
-        from app.indexers.service import IndexerService
-        from app.routes.indexers_api import _search_payload
+        from app.indexers.service import IndexerService, search_payload
 
         adapters = {
             site_id: SimpleNamespace(
@@ -656,7 +655,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
 
         async def search():
             try:
-                return _search_payload(service, await service.search("测试作品 123"))
+                return search_payload(service, await service.search("测试作品 123"))
             finally:
                 await service.aclose()
 

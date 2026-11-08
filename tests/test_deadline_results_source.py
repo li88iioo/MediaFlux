@@ -9,12 +9,8 @@ import httpx
 import pytest
 
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel import sandbox
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import DefaultProjector
@@ -23,10 +19,14 @@ from app.agent.kernel.provider_model import (
     ProviderSettings,
 )
 from app.agent.kernel.session import AgentSession, SessionLimits
+from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.state_types import AgentInput, CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.clients.http import FixedHostHttpClient
+from tests import test_agent_session_result as session_result_tests
 from tests.support import isolated_test_database
+
+native_workspace = session_result_tests.native_workspace
 
 
 def tool_reply(calls):
@@ -54,9 +54,10 @@ class Wire:
 
 def make_session(store, catalog, wire):
     pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
+    catalog.register(sandbox.run_code_tool(pipeline))
     model = OpenAICompatibleModelAdapter(ProviderSettings(api_url="https://api.example.com/v1",
         model="offline-model", protocol="chat_completions"), client_factory=wire.factory)
-    session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline,
+    session = AgentSession(model=model, catalog=catalog,  pipeline=pipeline,
         state_store=store, journal=store, system_prompt="遵守用户条件与写入确认。",
         limits=SessionLimits(context_window_tokens=16384, max_output_tokens=128))
     return session, pipeline
@@ -68,7 +69,7 @@ async def run(session, request):
     assert events[-1].payload["status"] == "success", events[-3:]
 
 
-def test_two_below_threshold_results_recover_dependency_tails_on_native_wire():
+def test_two_below_threshold_results_recover_dependency_tails_on_native_wire(native_workspace):
     async def exercise():
         handled = []
         sources = ["甲" * 11000 + "TAIL_ONE", "乙" * 11000 + "TAIL_TWO"]
@@ -91,7 +92,7 @@ def test_two_below_threshold_results_recover_dependency_tails_on_native_wire():
         messages = wire.payloads[1]["messages"]
         views = [json.loads(message["content"]) for message in messages if message["role"] == "tool"]
         assert len(views) == 2 and all(view["truncated"] for view in views)
-        assert all(view.get("result_handle") and view.get("read_tool") == "agent.read_result" for view in views), \
+        assert all(view.get("result_handle") and view.get("read_method") == "session.result" for view in views), \
             "late compaction discarded dependency tails without a readable source"
         caller = next(message for message in messages if message.get("tool_calls"))
         assert caller["reasoning_content"] == "native-private-exact"
@@ -102,8 +103,7 @@ def test_two_below_threshold_results_recover_dependency_tails_on_native_wire():
         for index, view in enumerate(views):
             omission = next(entry for entry in view["truncation"] if entry["path"] == "/data/dependency")
             assert omission["total"] == len(sources[index]) and omission["next_offset"] < 11000
-            reads.append((f"tail_{index}", "agent__read_result", {"handle": view["result_handle"],
-                "path": omission["path"], "offset": 10900, "limit": 200}))
+            reads.append((f"tail_{index}", "agent__run_code", {"code": f'from mf import session\nprint(session.result({view["result_handle"]!r}, path={omission["path"]!r})["data"][10900:])'}))
         reader_wire = Wire(reads)
         reader_session, reader = make_session(reopened, ToolCatalog([]), reader_wire)
         await run(reader_session, "recover")
@@ -111,15 +111,12 @@ def test_two_below_threshold_results_recover_dependency_tails_on_native_wire():
         assert len(tail_messages) == 2
         for index, message in enumerate(tail_messages):
             page = json.loads(message["content"])
-            assert page["result_handle"] == views[index]["result_handle"]
-            assert page["data"]["items"] == sources[index][10900:]
-            assert not page["data"]["has_more"]
+            assert page["data"]["stdout"].rstrip("\n") == sources[index][10900:]
         lease, _ = await reopened.begin_turn(owner="owner", session_id="source", request_id="deny")
         context = ToolCallContext(owner="owner", session_id="source", request_id=lease.request_id,
             turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
         with pytest.raises(ToolPipelineError) as error:
-            await reader.execute("agent.read_result", {"handle": views[0]["result_handle"], "path": "/data/dependency"},
-                context=replace(context, owner="other-owner"))
+            await SessionService(reader, replace(context, owner="other-owner")).result(views[0]["result_handle"], "/data/dependency")
         assert error.value.code == "reference_invalid"
         assert handled == [0, 1]
         assert all(client._client.is_closed for client in wire.clients + reader_wire.clients)

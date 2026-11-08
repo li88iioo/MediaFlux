@@ -5,6 +5,7 @@ import re
 import sqlite3
 import unicodedata
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -18,7 +19,7 @@ def add_rss_subscription(name: str, urls: str, exclude_keywords: str = "",
                          download_method: str = "", qb_save_path: str = "",
                          gy_target_dir: str = "", gy_target_dir_name: str = "",
                          *, media_tmdb_id: str = "", media_default_season: int = 1,
-                         skip_existing_episodes: int = 0) -> int:
+                         skip_existing_episodes: int = 0, connection: sqlite3.Connection | None = None) -> int:
     timestamp = db.now()
     normalized_tmdb_id = normalize_tmdb_id(media_tmdb_id) if media_tmdb_id else ""
     normalized_season = media_default_season
@@ -26,7 +27,7 @@ def add_rss_subscription(name: str, urls: str, exclude_keywords: str = "",
         raise ValueError("默认季号必须在 0 到 100 之间")
     if skip_existing_episodes and not normalized_tmdb_id:
         raise ValueError("启用媒体库去重前必须填写 TMDB ID")
-    with db.get_conn() as conn:
+    with nullcontext(connection) if connection is not None else db.get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO rss_items(name,enabled,refresh_cron,refresh_interval_minutes,urls,parser,"
             "exclude_keywords,action,download_method,qb_save_path,gy_target_dir,gy_target_dir_name,created_at,updated_at) "
@@ -56,9 +57,14 @@ def _rss_subscription_select() -> str:
     )
 
 
-def list_rss_subscriptions() -> list[sqlite3.Row]:
+def list_rss_subscriptions(*, limit: int | None = None, after_id: int | None = None) -> list[sqlite3.Row]:
     with db.get_conn() as conn:
-        return conn.execute(_rss_subscription_select() + " ORDER BY i.id ASC").fetchall()
+        query = _rss_subscription_select() + (" WHERE i.id>?" if after_id is not None else "") + " ORDER BY i.id ASC"
+        args = [after_id] if after_id is not None else []
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(limit)
+        return conn.execute(query, args).fetchall()
 
 
 def list_enabled_rss_subscriptions() -> list[sqlite3.Row]:
@@ -166,8 +172,10 @@ def _update_rss_subscription_in_connection(
             sets.append(f"{key}=?")
             vals.append(value)
     if sets:
-        sets.append("updated_at=?")
-        vals.extend([timestamp, sub_id])
+        if set(fields) - {"last_refreshed_at"}:
+            sets.append("updated_at=?")
+            vals.append(timestamp)
+        vals.append(sub_id)
         conn.execute(f"UPDATE rss_items SET {', '.join(sets)} WHERE id=?", vals)
 
     if binding_keys & fields.keys():
@@ -223,8 +231,8 @@ def update_rss_subscription(
         _update_rss_subscription_in_connection(conn, sub_id, fields, timestamp=timestamp)
 
 
-def delete_rss_subscription(sub_id: int) -> None:
-    with db.get_conn() as conn:
+def delete_rss_subscription(sub_id: int, *, connection: sqlite3.Connection | None = None) -> None:
+    with nullcontext(connection) if connection is not None else db.get_conn() as conn:
         conn.execute("DELETE FROM rss_entries WHERE rss_item_id=?", (sub_id,))
         conn.execute("DELETE FROM rss_items WHERE id=?", (sub_id,))
 
@@ -631,91 +639,53 @@ def get_rss_entry(entry_id: int) -> sqlite3.Row | None:
     return next(iter(get_rss_entries_by_ids((entry_id,)).values()), None)
 
 
-def get_pending_rss_qb_snapshot(
-    default_method: str = "qb",
-    limit: int = 21,
-) -> list[sqlite3.Row]:
-    """返回 Agent 确认绑定所需的 qB 待处理条目快照。
+def rss_pending_entry_snapshot(row) -> dict[str, Any]:
+    data = dict(row)
+    return {key: data.get(key) or "" for key in (
+        "title", "payload", "created_at", "download_method", "qb_save_path", "gy_target_dir",
+        "gy_target_dir_name", "download_request_key", "download_backend") } | {
+        key: int(data.get(key) or 0) for key in ("id", "rss_item_id", "download_request_id")}
 
-    该函数仅供服务端内部使用；调用方不得向客户端投影 title、payload 或路径。
-    """
-    safe_limit = max(1, min(100, (limit or 21)))
-    normalized_default = (default_method or "").strip().lower()
+
+def get_pending_rss_snapshot(default_method: str = "qb", limit: int | None = 21,
+    *, entry_ids: list[int] | None = None, subscription_id: int | None = None) -> list[sqlite3.Row]:
+    """只读选择各订阅目标的 pending 条目；明确范围，不静默截断。"""
+    conditions = ["rss_entries.status='pending'", "COALESCE(rss_entries.processed,0)=0",
+        "(rss_entries.download_request_key='' OR " + _rss_delivery_retry_sql("rss_entries") + ")",
+        "LOWER(COALESCE(NULLIF(TRIM(rss_entries.download_backend),''),NULLIF(TRIM(i.download_method),''),?)) IN ('qb','guangya')"]
+    params: list[Any] = [(default_method or "qb").strip().lower()]
+    if entry_ids is not None:
+        conditions.append("rss_entries.id IN (" + ",".join("?" for _ in entry_ids) + ")")
+        params.extend(entry_ids)
+    if subscription_id is not None:
+        conditions.append("rss_entries.rss_item_id=?")
+        params.append(subscription_id)
+    query = _RSS_RETRY_ENTRY_SELECT + "WHERE " + " AND ".join(conditions) + " ORDER BY rss_entries.id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
     with db.get_conn() as conn:
-        return conn.execute(
-            "SELECT e.id,e.rss_item_id,e.title,e.status,e.processed,e.created_at,e.payload,"
-            "COALESCE(i.download_method,'') AS download_method,"
-            "COALESCE(i.qb_save_path,'') AS qb_save_path "
-            "FROM rss_entries e JOIN rss_items i ON e.rss_item_id=i.id "
-            "WHERE e.status='pending' AND COALESCE(e.processed,0)=0 "
-            "AND LOWER(COALESCE(NULLIF(TRIM(i.download_method),''),?))='qb' "
-            "ORDER BY e.id DESC LIMIT ?",
-            (normalized_default, safe_limit),
-        ).fetchall()
+        return conn.execute(query, params).fetchall()
 
 
-def claim_pending_rss_qb_entries(
-    expected_rows: list[dict],
-    default_method: str = "qb",
-) -> list[sqlite3.Row]:
-    """全有或全无地复核并认领 Agent 已确认的 qB RSS 条目集合。"""
-    normalized_default = (default_method or "").strip().lower()
-    expected = []
-    seen: set[int] = set()
-    for raw in expected_rows:
-        entry_id = int(raw.get("id") or 0)
-        if entry_id <= 0 or entry_id in seen:
-            return []
-        seen.add(entry_id)
-        expected.append({
-            "id": entry_id,
-            "rss_item_id": int(raw.get("rss_item_id") or 0),
-            "title": str(raw.get("title") or ""),
-            "payload": str(raw.get("payload") or ""),
-            "created_at": str(raw.get("created_at") or ""),
-            "download_method": str(raw.get("download_method") or ""),
-            "qb_save_path": str(raw.get("qb_save_path") or ""),
-        })
-    if not expected or len(expected) > 20:
+def claim_pending_rss_entries(expected_rows: list[dict], default_method: str = "qb") -> list[sqlite3.Row]:
+    """全有或全无复核集合、目标与持久投递身份，再认领 pending 条目。"""
+    expected = [rss_pending_entry_snapshot(row) for row in expected_rows]
+    ids = [row["id"] for row in expected]
+    if not ids or len(set(ids)) != len(ids) or any(i <= 0 for i in ids):
         return []
-
-    ids = [item["id"] for item in expected]
     placeholders = ",".join("?" for _ in ids)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-            "SELECT e.id,e.rss_item_id,e.title,e.status,e.processed,e.created_at,e.payload,"
-            "COALESCE(i.download_method,'') AS download_method,"
-            "COALESCE(i.qb_save_path,'') AS qb_save_path "
-            "FROM rss_entries e JOIN rss_items i ON e.rss_item_id=i.id "
-            f"WHERE e.id IN ({placeholders}) ORDER BY e.id DESC",
-            ids,
-        ).fetchall()
-        eligible_rows = [
-            row for row in rows
-            if row["status"] == "pending"
-            and not bool(row["processed"])
-            and (str(row["download_method"] or "").strip().lower() or normalized_default) == "qb"
-        ]
-        current = [{
-            "id": int(row["id"]),
-            "rss_item_id": int(row["rss_item_id"]),
-            "title": str(row["title"] or ""),
-            "payload": str(row["payload"] or ""),
-            "created_at": str(row["created_at"] or ""),
-            "download_method": str(row["download_method"] or ""),
-            "qb_save_path": str(row["qb_save_path"] or ""),
-        } for row in eligible_rows]
-        if current != expected:
-            conn.rollback()
+        rows = conn.execute(_RSS_RETRY_ENTRY_SELECT + f"WHERE rss_entries.id IN ({placeholders}) "
+            "AND rss_entries.status='pending' AND COALESCE(rss_entries.processed,0)=0 "
+            "AND (rss_entries.download_request_key='' OR " + _rss_delivery_retry_sql("rss_entries") + ") "
+            "AND LOWER(COALESCE(NULLIF(TRIM(rss_entries.download_backend),''),NULLIF(TRIM(i.download_method),''),?)) IN ('qb','guangya') "
+            "ORDER BY rss_entries.id DESC", [*ids, default_method]).fetchall()
+        if [rss_pending_entry_snapshot(row) for row in rows] != expected:
             return []
-        submitted_at = db.now()
-        cur = conn.execute(
-            f"UPDATE rss_entries SET status='submitting', submitted_at=? "
-            f"WHERE id IN ({placeholders}) AND status='pending' AND COALESCE(processed,0)=0",
-            [submitted_at, *ids],
-        )
-        if (cur.rowcount or 0) != len(expected):
+        cur = conn.execute(f"UPDATE rss_entries SET status='submitting',submitted_at=? WHERE id IN ({placeholders}) AND status='pending' AND COALESCE(processed,0)=0", [db.now(), *ids])
+        if cur.rowcount != len(expected):
             conn.rollback()
             return []
         return rows
@@ -763,11 +733,13 @@ _RSS_RETRY_ENTRY_SELECT = (
     "SELECT rss_entries.id,rss_entries.rss_item_id,rss_entries.title,"
     "rss_entries.status,rss_entries.processed,rss_entries.created_at,rss_entries.payload,"
     "rss_entries.failure_code,rss_entries.failure_retryable,rss_entries.retry_count,"
-    "rss_entries.failed_at,COALESCE(i.download_method,'') AS download_method,"
+    "rss_entries.failed_at,rss_entries.download_request_id,rss_entries.download_request_key,rss_entries.download_backend,COALESCE(i.download_method,'') AS download_method,"
     "COALESCE(i.qb_save_path,'') AS qb_save_path,"
     "COALESCE(i.gy_target_dir,'') AS gy_target_dir,"
-    "COALESCE(i.gy_target_dir_name,'') AS gy_target_dir_name "
-    "FROM rss_entries JOIN rss_items i ON rss_entries.rss_item_id=i.id "
+    "COALESCE(i.gy_target_dir_name,'') AS gy_target_dir_name,"
+    + _rss_delivery_columns().replace("e.", "rss_entries.") +
+    " FROM rss_entries JOIN rss_items i ON rss_entries.rss_item_id=i.id "
+    + _RSS_REQUEST_JOIN.replace("e.", "rss_entries.")
 )
 
 
@@ -788,17 +760,21 @@ def rss_retry_entry_snapshot(row) -> dict[str, Any]:
         "qb_save_path": str(data.get("qb_save_path") or ""),
         "gy_target_dir": str(data.get("gy_target_dir") or ""),
         "gy_target_dir_name": str(data.get("gy_target_dir_name") or ""),
+        "download_request_id": int(data.get("download_request_id") or 0),
+        "download_request_key": str(data.get("download_request_key") or ""),
+        "download_backend": str(data.get("download_backend") or ""),
     }
 
 
 def _rss_retry_eligibility_sql(default_method: str) -> tuple[str, tuple[str, ...]]:
     """共享失败项安全条件；调用者传入 rss_entries 与 rss_items 的 i 联接。"""
-    method = "LOWER(COALESCE(NULLIF(TRIM(i.download_method),''),?))"
+    method = "LOWER(COALESCE(NULLIF(TRIM(rss_entries.download_backend),''),NULLIF(TRIM(i.download_method),''),?))"
     safe_codes = ",".join("?" for _ in _RSS_SAFE_RETRY_FAILURE_CODES)
     qb_codes = ",".join("?" for _ in _RSS_QB_RETRY_FAILURE_CODES)
     gy_codes = ",".join("?" for _ in _RSS_GUANGYA_RETRY_FAILURE_CODES)
     cooldown_codes = ",".join("?" for _ in _RSS_COOLDOWN_FAILURE_CODES)
     condition = (
+        "(rss_entries.download_request_key='' OR EXISTS (SELECT 1 FROM download_requests r WHERE r.id=rss_entries.download_request_id AND " + _rss_delivery_retry_sql("rss_entries") + ")) AND "
         "COALESCE(rss_entries.failure_retryable,0)=1 "
         f"AND COALESCE(rss_entries.retry_count,0)<{_RSS_MAX_RETRIES} "
         f"AND rss_entries.failure_code IN ({safe_codes}) "
@@ -819,12 +795,19 @@ def _rss_retry_eligibility_sql(default_method: str) -> tuple[str, tuple[str, ...
 
 def get_retryable_failed_rss_snapshot(
     default_method: str = "qb",
-    limit: int = 21,
+    limit: int | None = 21,
+    *, entry_ids: list[int] | None = None, subscription_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """返回按订阅当前下载方式筛选的安全 RSS 失败快照。"""
-    safe_limit = max(1, min(100, (limit or 21)))
     normalized_default = (default_method or "").strip().lower()
-    eligibility, parameters = _rss_retry_eligibility_sql(normalized_default)
+    eligibility, eligibility_parameters = _rss_retry_eligibility_sql(normalized_default)
+    parameters: list[Any] = list(eligibility_parameters)
+    if entry_ids is not None:
+        eligibility += " AND rss_entries.id IN (" + ",".join("?" for _ in entry_ids) + ")"
+        parameters.extend(entry_ids)
+    if subscription_id is not None:
+        eligibility += " AND rss_entries.rss_item_id=?"
+        parameters.append(subscription_id)
     with db.get_conn() as conn:
         query = (
             _RSS_RETRY_ENTRY_SELECT
@@ -832,9 +815,12 @@ def get_retryable_failed_rss_snapshot(
             + f"AND {eligibility} "
             + "ORDER BY COALESCE(NULLIF(rss_entries.failed_at,''),"
             + "NULLIF(rss_entries.submitted_at,''),rss_entries.created_at) DESC, "
-            + "rss_entries.id DESC LIMIT ?"
+            + "rss_entries.id DESC"
         )
-        return conn.execute(query, (*parameters, safe_limit)).fetchall()
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(limit)
+        return conn.execute(query, parameters).fetchall()
 
 
 def claim_retryable_failed_rss_entries(
@@ -845,7 +831,7 @@ def claim_retryable_failed_rss_entries(
     normalized_default = (default_method or "").strip().lower()
     expected = [rss_retry_entry_snapshot(raw) for raw in expected_rows]
     ids = [item["id"] for item in expected]
-    if not ids or len(ids) > 20 or any(entry_id <= 0 for entry_id in ids):
+    if not ids or any(entry_id <= 0 for entry_id in ids):
         return []
     if len(set(ids)) != len(ids):
         return []
@@ -1053,7 +1039,7 @@ def update_rss_entries_processed_snapshot(
             "failure_code": str(raw.get("failure_code") or ""),
             "failure_retryable": bool(raw.get("failure_retryable")),
         })
-    if not normalized or len(normalized) > 50:
+    if not normalized:
         return 0
     allowed_statuses = (
         {"pending", "failed", "skipped"} if processed else {"failed", "skipped", "downloaded"}
@@ -1115,6 +1101,7 @@ def get_rss_diagnostic_summary(
     stale_submitting_minutes: int = 15,
     pending_backlog_hours: int = 24,
     attention_limit: int = 20,
+    attention_offset: int = 0,
 ) -> dict:
     """返回 RSS Agent 所需的安全聚合；不读取或返回源 URL、标题、GUID、payload 或路径。"""
     snapshot = current_time or db.now()
@@ -1217,7 +1204,7 @@ def get_rss_diagnostic_summary(
             ORDER BY (failed_entries+stale_submitting+unknown_or_inconsistent) DESC,
                      invalid_last_refreshed_at DESC,pending_backlog DESC,
                      cron_not_active DESC,subscription_id ASC
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
         attention_rows = conn.execute(
             attention_sql,
@@ -1228,6 +1215,7 @@ def get_rss_diagnostic_summary(
                 snapshot,
                 stale_modifier,
                 limit + 1,
+                attention_offset,
             ),
         ).fetchall()
 
@@ -1304,6 +1292,7 @@ def _query_rss_subscription_safe_summaries(
     *,
     subscription_id: int | None,
     limit: int,
+    after_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """聚合 Agent 公开订阅；名称可展示，但不读取 URL、过滤词、正文或路径。"""
     stale_modifier = "-15 minutes"
@@ -1326,9 +1315,9 @@ def _query_rss_subscription_safe_summaries(
     )
     invalid_entry = f"COALESCE(({valid_entry}),0)=0"
     bounded_limit = max(1, min(100, (limit or 100)))
-    selected_where = "WHERE id=?" if subscription_id is not None else ""
+    selected_where = "WHERE id=?" if subscription_id is not None else "WHERE id>?" if after_id is not None else ""
     selected_params: list[object] = (
-        [subscription_id] if subscription_id is not None else []
+        [subscription_id] if subscription_id is not None else [after_id] if after_id is not None else []
     )
 
     with db.get_conn() as conn:
@@ -1470,6 +1459,7 @@ def list_rss_subscription_safe_summaries(
     current_time: str | None = None,
     *,
     limit: int = 100,
+    after_id: int | None = None,
 ) -> dict:
     """返回有界 RSS 订阅摘要；包含名称，不返回地址、过滤词、条目正文或路径。"""
     snapshot = current_time or db.now()
@@ -1478,8 +1468,10 @@ def list_rss_subscription_safe_summaries(
         snapshot,
         subscription_id=None,
         limit=bounded_limit,
+        after_id=after_id,
     )
-    total = int((rows[0]["subscription_total"] if rows else 0) or 0)
+    with db.get_conn() as conn:
+        total = int(conn.execute("SELECT COUNT(*) FROM rss_items").fetchone()[0])
     return {
         "total": total,
         "returned": len(rows),

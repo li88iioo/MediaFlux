@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.activity.actions import timeline_snapshot
+from app.repositories.activity import timeline_snapshot
 from app.modules.media_automation_rules import drain_automation_rules
 from app.modules.telegram_notification_center import NotificationPublishResult
 from app.repositories import activity
@@ -86,17 +86,21 @@ os._exit(17)
         self.assertEqual(done.returncode, 17, done.stderr)
 
     def _business(self):
-        result = timeline_snapshot(self.target)
+        identifier = self.target["id"]
+        assert identifier is not None
+        result = timeline_snapshot(self.target["kind"], identifier)
         return {
-            "status": result.status,
-            "terminal": result.data["terminal"],
-            "attention": result.data["needs_attention"],
+            "status": result["status"],
+            "terminal": result["data"]["terminal"],
+            "attention": result["data"]["needs_attention"],
             "members": next(
-                stage for stage in result.data["stages"] if stage["stage"] == "成员处理"
+                stage
+                for stage in result["data"]["stages"]
+                if stage["stage"] == "成员处理"
             ),
             "selected": [
                 (row["kind"], row["id"])
-                for row in activity.search(query="restart", limit=1)
+                for row in activity.search_page(query="restart", limit=2)["items"]
             ],
         }
 

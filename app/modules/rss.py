@@ -787,7 +787,7 @@ class RSSEngine:
 
     @staticmethod
     def _entry_value(entry, key: str, default=""):
-        """读取 dict/sqlite.Row 的可选字段；Agent 冻结快照只包含 qB 所需列。"""
+        """读取 dict/sqlite.Row 的可选字段。"""
         try:
             value = entry[key]
         except (IndexError, KeyError, TypeError):
@@ -881,7 +881,8 @@ class RSSEngine:
             if entry is None:
                 return {"error": "条目不存在", "ok": False}
         # 已绑定的失败恢复沿原目标与内容身份，不因订阅配置 / feed URL 变化改投。
-        method = str(self._entry_value(entry, "download_backend", "") or self._entry_method(entry))
+        method = str(self._entry_value(entry, "download_backend", "") or entry["download_method"]
+                     or (qb_runtime_config or {}).get("default_method") or self._entry_method(entry)).strip().lower()
         delivery = rss_entry_delivery(entry)
         if method not in {"qb", "guangya"}:
             method = "qb"
@@ -1142,7 +1143,7 @@ class RSSEngine:
         return self._download_entry(db.get_rss_entry(entry_id))
 
     def download_many(self, entry_ids: list[int], *, auto_guard: Callable[[], bool] | None = None) -> dict:
-        ids = list(dict.fromkeys(item for item in entry_ids))[:_RSS_DOWNLOAD_BATCH_SIZE]
+        ids = list(dict.fromkeys(entry_ids))
         entries_by_id = db.get_rss_entries_by_ids(ids)
         entries = [entries_by_id.get(entry_id) for entry_id in ids]
         succeeded: list[dict] = []
@@ -1248,11 +1249,11 @@ class RSSEngine:
         """按已选定的 pending/retry 原子认领规则执行确认快照。"""
         requested = len(expected_entries)
         needs_qb = any(
-            (str(row.get("download_method") or "").strip().lower()
+            (str(row.get("download_backend") or row.get("download_method") or "").strip().lower()
              or runtime_config.get("default_method", "qb")) == "qb"
             for row in expected_entries
         )
-        if not requested or requested > 20 or (needs_qb and not str(runtime_config.get("url") or "").strip()):
+        if not requested or (needs_qb and not str(runtime_config.get("url") or "").strip()):
             return {
                 "ok": False, "conflict": True, "requested": requested,
                 "claimed": 0, "submitted": 0, "failed": 0,

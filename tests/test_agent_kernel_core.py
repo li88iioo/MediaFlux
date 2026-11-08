@@ -1,6 +1,5 @@
 from __future__ import annotations
-from app.agent.kernel.effects import ConfirmationEffectPlanStore
-from app.agent.kernel.pipeline import EffectLifecycle
+from app.agent.kernel.effects import ConfirmationEffectPlanStore, EffectLifecycle
 from app.agent.kernel.model import ModelAdapter
 from app.agent.kernel.state_ports import SessionStateStore
 from typing import cast
@@ -15,12 +14,7 @@ from unittest.mock import AsyncMock
 
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import consume_events
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.conversation_context import (
     persisted_conversation,
     restore_messages,
@@ -30,7 +24,7 @@ from app.agent.kernel.conversation_state import (
     merge_effect_receipts,
     retain_conversation,
 )
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import (
     ModelEvent,
@@ -273,54 +267,6 @@ class InMemoryEffectStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(after.metadata["effect_waits"]), ["awaiting-delivery"])
 
 
-class CapabilityRetrieverTests(unittest.TestCase):
-    def test_workflow_neighbors_share_reserved_slots_without_expanding_window(self):
-        from dataclasses import replace
-
-        targets = [read_tool(name, domain="cloud", description="下游能力")
-                   for name in ("cloud.search", "cloud.run", "cloud.plan")]
-        sources = [replace(
-            read_tool(name, domain="cloud", description="整理目标", examples=("整理目标",)),
-            metadata={"workflow": workflow, "related_tools": (target,)},
-        ) for name, workflow, target in (
-            ("cloud.a_inspect", "scrape", "cloud.search"),
-            ("cloud.b_preview", "scrape", "cloud.run"),
-            ("cloud.c_inspect", "naming", "cloud.plan"),
-        )]
-        selection = CapabilityRetriever(minimum=3, maximum=5).retrieve(
-            "整理目标", ToolCatalog([*sources, *targets]),
-        )
-        self.assertEqual(len(selection.tools), 5)
-        self.assertIn("cloud.search", selection.names)
-        self.assertIn("cloud.plan", selection.names)
-        self.assertNotIn("cloud.run", selection.names)
-
-    def test_retrieves_six_to_twelve_atomic_tools_without_deciding_intent(self) -> None:
-        tools = [
-            read_tool(
-                "cloud.list_directory",
-                domain="cloud",
-                description="列出光鸭云盘目录中的文件夹与文件",
-                examples=("看看光鸭云盘根目录",),
-            ),
-            read_tool(
-                "cloud.inspect_directory",
-                domain="cloud",
-                description="检查光鸭目录内容和发布组文件",
-            ),
-        ]
-        tools.extend(
-            read_tool(f"library.tool_{index}", description=f"媒体库能力 {index}")
-            for index in range(14)
-        )
-        catalog = ToolCatalog(tools)
-        selection = CapabilityRetriever().retrieve(
-            "帮我看看光鸭云盘根目录有哪些文件夹", catalog
-        )
-        self.assertGreaterEqual(len(selection.tools), 6)
-        self.assertLessEqual(len(selection.tools), 12)
-        self.assertEqual(selection.tools[0].name, "cloud.list_directory")
-        self.assertIn("cloud.inspect_directory", selection.names)
 
 
 class AgentKernelCrossLoopTests(unittest.TestCase):
@@ -394,7 +340,7 @@ class AgentKernelCrossLoopTests(unittest.TestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -464,7 +410,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
         state, catalog = InMemorySessionStateStore(), ToolCatalog([read_tool("library.search")])
         session = AgentSession(model=Model(), catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
             stream_display=display_setting)
         for expected in (False, True):
@@ -493,7 +439,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                                [ModelEvent(ModelEventType.TEXT_DELTA, text="三个目录都整理好了。"),
                                 ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
         state, catalog = InMemorySessionStateStore(), ToolCatalog([tool])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=1, maximum=1),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         approval = await consume_events(session.run(AgentInput(message="整理这三个目录", owner="owner", session_id="session")))
         assert approval.approval is not None
@@ -541,18 +487,15 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                     rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="核对完成。"),
                                    ModelEvent(ModelEventType.FINISH, finish_reason="stop")])
                 model, state, catalog = ScriptedModel(rounds), InMemorySessionStateStore(), ToolCatalog([tool])
-                if effect is ToolEffect.WRITE:
-                    from tests.error30_model_inputs import ExplicitRepairModel
-                    model = ExplicitRepairModel(model, {"corrected"})
                 session = AgentSession(model=model, catalog=catalog,
-                    retriever=CapabilityRetriever(minimum=1, maximum=1),
+
                     pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
                 events = await collect(session.run(AgentInput(message="移动目录", owner="owner", session_id="session")))
                 error = next(m for m in model.requests[1].messages if m.role == "tool" and m.tool_call_id == "invalid")
                 payload = json.loads(error.content)
                 self.assertEqual(payload["code"], "invalid_arguments")
                 self.assertEqual(payload["expected_input_schema"], schema)
-                self.assertEqual(bool(payload.get("repair")), effect is ToolEffect.WRITE)
+                self.assertNotIn("repair", payload)
                 self.assertNotIn("do-not-echo-this", error.content)
                 public_events = json.dumps([e.to_dict() for e in events], ensure_ascii=False)
                 self.assertNotIn("expected_input_schema", public_events)
@@ -576,7 +519,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_confirmation_never_becomes_a_synthetic_user_query(self):
         model = ScriptedModel([])
         catalog, state = ToolCatalog([]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         view = await consume_events(session.confirm(owner="owner", session_id="session", plan_id=""))
         self.assertEqual(view.status, "failed")
@@ -698,7 +641,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="两步任务均已完成。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")])
         model = ScriptedModel(rounds)
         catalog = ToolCatalog([tool])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state, effect_store=effect_store), state_store=state)
         preview = await consume_events(session.run(AgentInput(message="先清洗再移动，完成后告诉我", owner="owner", session_id="session")))
         self.assertEqual(writes, [])
@@ -767,7 +710,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             [ModelEvent(ModelEventType.TEXT_DELTA, text="第一步完成，第二步未执行。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         preview = await consume_events(session.run(AgentInput(message="处理两步", owner="o", session_id="s")))
         before = await state.load(owner="o", session_id="s")
@@ -789,7 +732,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmed_internal_receipt_never_reaches_public_event_stream(self):
         tool = KernelToolSpec(
-            name="local_media.retry_task",
+            name="local.retry",
             domain="local_media",
             description="修正季集映射",
             input_schema={"type": "object", "properties": {}},
@@ -827,7 +770,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -897,7 +840,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             [ModelEvent(ModelEventType.TEXT_DELTA, text="请求 #276 已提交，已提交请求 #276。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         catalog, store = ToolCatalog([write, read]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="提交并检查后续任务", owner="o", session_id="s")))
         assert preview.approval is not None
@@ -948,7 +891,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=pipeline,
             state_store=state,
         )
@@ -979,7 +922,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         model = ScriptedModel([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("write", tool.name, {})),
                                 ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]])
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         preview = await consume_events(session.run(AgentInput(message="帮我移动目录", owner="owner", session_id="session")))
         assert preview.approval is not None
@@ -999,7 +942,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         model = ScriptedModel([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("write", tool.name, {})),
                                 ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]])
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         preview = await consume_events(session.run(AgentInput(message="帮我移动目录", owner="owner", session_id="session")))
         from unittest.mock import patch
@@ -1028,7 +971,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         state = BrokenStateStore()
         session = AgentSession(
             model=ScriptedModel([]), catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -1065,7 +1008,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             turn_admission=RejectingAdmission(),
@@ -1106,7 +1049,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=cast(ModelAdapter, FailingProviderModel()),
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -1169,7 +1112,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=pipeline,
             state_store=state,
         )
@@ -1252,7 +1195,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=2, maximum=2),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             limits=SessionLimits(max_tool_calls=2),
@@ -1269,10 +1212,10 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(observed, ["one", "two"])
-        for index, request in enumerate(model.requests):
-            self.assertIn(f"实际剩余工具调用 {session.limits.max_tool_calls - index} 次", request.system_prompt)
-            self.assertIn("剩余规划轮次", request.system_prompt)
-        self.assertEqual(tuple(model.requests[-1].tools), ())
+        for request in model.requests:
+            self.assertNotIn("实际剩余工具调用", request.system_prompt)
+            self.assertNotIn("剩余规划轮次", request.system_prompt)
+            self.assertTrue(request.tools)
         self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(events[-1].payload["status"], "success")
         self.assertEqual(events[-1].payload["finish_reason"], "stop")
@@ -1393,7 +1336,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=3, maximum=3),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             limits=SessionLimits(max_tool_calls=2),
@@ -1413,7 +1356,8 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepare_count, 0)
         self.assertEqual(events[-1].payload["status"], "partial")
         self.assertEqual(events[-1].payload["finish_reason"], "tool_budget_exceeded")
-        self.assertEqual(tuple(model.requests[-1].tools), ())
+        self.assertTrue(model.requests[-1].tools)
+        self.assertEqual(len(model.requests), 2)  # 超额批次后不额外请求强制汇总。
         failed = {
             event.payload["call_id"]: event
             for event in events
@@ -1477,7 +1421,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                     ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
                 ]])
                 session = AgentSession(
-                    model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=1, maximum=1),
+                    model=model, catalog=catalog,
                     pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
                     limits=SessionLimits(max_model_rounds=1, max_tool_calls=tool_limit),
                 )
@@ -1497,7 +1441,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 if executed:
                     self.assertIn("读取事实", answer)
                 else:
-                    self.assertIn("尚未取得可展示的查询结果", answer)
+                    self.assertIn("尚未形成可交付的答复", answer)
                 self.assertEqual(stored.conversation[-1]["content"], answer)
 
     async def test_context_window_drops_oldest_complete_turns_only(self) -> None:
@@ -1507,7 +1451,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             limits=SessionLimits(
@@ -1543,7 +1487,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=ScriptedModel([]),
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             limits=SessionLimits(
@@ -1586,11 +1530,11 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bounded, (messages[-1],))
 
     async def test_historical_tool_pairs_keep_roles_without_changing_current_calls(self):
-        prior_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("old", "media.user.inspect", {}),))
+        prior_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("old", "provider.query", {}),))
         prior_result = ModelMessage(role="tool", tool_call_id="old",
                                     content='{"ok":false,"error":"未核验"}\nopaque_refs=ref_example')
-        current_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("now", "media.user.inspect", {"profile_ref":"configured:jellyfin"}),))
-        current_result = ModelMessage(role="tool", tool_call_id="now", tool_name="media.user.inspect", content='{"ok":true}')
+        current_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("now", "provider.query", {"profile_ref":"configured:jellyfin"}),))
+        current_result = ModelMessage(role="tool", tool_call_id="now", tool_name="provider.query", content='{"ok":true}')
         messages = [ModelMessage(role="user", content="旧问题"), prior_call, prior_result,
                     ModelMessage(role="user", content="新问题"), current_call, current_result]
         bounded = bounded_model_messages(messages, history_end=3, tool_definitions=(),
@@ -1603,7 +1547,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         observation = historical_result.content
         self.assertIn("未核验", observation)
         self.assertIn("ref_example", observation)
-        self.assertEqual(historical_call.tool_calls[0].name, "media.user.inspect")
+        self.assertEqual(historical_call.tool_calls[0].name, "provider.query")
         self.assertEqual(prior_call.tool_calls[0].arguments, {})
         self.assertEqual(prior_result.role, "tool")
 
@@ -1642,7 +1586,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("precondition_failed", compact)
         self.assertNotIn("工具执行完成", compact)
 
-    async def test_final_model_round_is_synthesis_only_and_never_executes_calls(
+    async def test_explicit_last_round_keeps_tools_and_closes_executed_facts(
         self,
     ) -> None:
         calls = 0
@@ -1675,7 +1619,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             limits=SessionLimits(max_model_rounds=2),
@@ -1691,16 +1635,16 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(calls, 1)
+        self.assertEqual(calls, 2)
         self.assertTrue(model.requests[0].tools)
-        self.assertEqual(tuple(model.requests[1].tools), ())
+        self.assertTrue(model.requests[1].tools)
         self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
         self.assertEqual(events[-1].payload["status"], "partial")
         self.assertEqual(
             events[-1].payload["finish_reason"], "model_round_budget_exceeded"
         )
         failed = [event for event in events if event.type is AgentEventType.TOOL_FAILED]
-        self.assertEqual(failed[-1].payload["code"], "not_executed_final_round")
+        self.assertEqual(failed, [])
         stored = await state.load(owner="owner-1", session_id="session-1")
         self.assertIn("部分完成", stored.conversation[-1]["content"])
         assistant_calls = [
@@ -1723,7 +1667,8 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         late_result = next(
             item for item in stored.conversation if item.get("tool_call_id") == "late-call"
         )
-        self.assertIn("not_executed_final_round", late_result["content"])
+        self.assertNotIn("not_executed_final_round", late_result["content"])
+        self.assertIn("true", late_result["content"])
 
     async def test_reply_context_is_available_to_model_but_not_persisted_as_chat_text(
         self,
@@ -1743,7 +1688,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -1762,7 +1707,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         user = next(item for item in persisted.conversation if item["role"] == "user")
         self.assertEqual(user["content"], "它有多少集？")
 
-    async def test_unrecovered_tool_error_reaches_model_and_closes_as_failure(self) -> None:
+    async def test_unrecovered_tool_error_reaches_model_without_overwriting_answer(self) -> None:
         catalog = ToolCatalog([read_tool("library.status")])
         state = InMemorySessionStateStore()
         model = ScriptedModel(
@@ -1786,7 +1731,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=pipeline,
             state_store=state,
         )
@@ -1801,11 +1746,12 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         failed = [event for event in events if event.type is AgentEventType.TOOL_FAILED]
         self.assertEqual(failed[0].payload["code"], "tool_not_available")
-        self.assertEqual(events[-1].type, AgentEventType.TURN_FAILED)
-        self.assertEqual(events[-1].payload["code"], "tool_not_available")
+        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+        self.assertEqual(events[-1].payload["status"], "partial")
+        self.assertEqual(events[-1].payload["answer"], "当前没有可用的云盘读取能力。")
         self.assertIn("tool_not_available", model.requests[1].messages[-1].content)
 
-    async def test_write_only_freezes_plan_and_confirm_continues_after_deterministic_execution(
+    async def test_confirm_preserves_receipt_without_resetting_exhausted_planning_budget(
         self,
     ) -> None:
         calls = {"execute": 0, "verify": 0}
@@ -1875,7 +1821,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=pipeline,
             state_store=state,
             limits=SessionLimits(max_model_rounds=1),
@@ -1907,12 +1853,13 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(calls, {"execute": 1, "verify": 1})
-        self.assertEqual(len(model.requests), model_call_count + 1)
+        self.assertEqual(len(model.requests), model_call_count)
         self.assertIn(
             AgentEventType.EFFECT_COMPLETED,
             [event.type for event in confirmed_events],
         )
-        self.assertEqual(confirmed_events[-1].payload["status"], "success")
+        self.assertEqual(confirmed_events[-1].payload["status"], "partial")
+        self.assertEqual(confirmed_events[-1].payload["finish_reason"], "model_round_budget_exceeded")
         stored = await state.load(owner="owner-1", session_id="session-1")
         confirmed_result = next(row for row in stored.conversation if "可信系统结果" in row.get("content", ""))
         self.assertIn("可信系统结果", confirmed_result["content"])
@@ -1957,7 +1904,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             [ModelEvent(ModelEventType.TEXT_DELTA, text="hello"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         catalog = ToolCatalog([read_tool("library.status")]); store = InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
                                model_selector=select_channel_model)
         with patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value="chosen-model") as preference:
@@ -1976,7 +1923,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         ]])
         catalog = ToolCatalog([])
         store = InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         with patch("app.modules.telegram_model_preferences.get_telegram_model_preference",
                    side_effect=AssertionError("bare kernel must not read channel preferences")) as preference:
@@ -1996,7 +1943,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         model = ScriptedModel([])
         catalog = ToolCatalog([])
         store = InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
             model_selector=select_model)
         agent_input = AgentInput(message="你好", owner="o", session_id="selection-failed", channel="telegram")
@@ -2044,7 +1991,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
 
         catalog = ToolCatalog([tool])
         store = InMemorySessionStateStore()
-        session = AgentSession(model=initial, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=initial, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
             model_selector=select_model)
         preview = await consume_events(session.run(AgentInput(
@@ -2081,7 +2028,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("pause", tool.name, {})),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
         ]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         commit = store.commit
 
@@ -2121,7 +2068,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("move", tool.name, {})),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
         ]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="移动后继续处理其他文件", owner="o", session_id="s")))
         assert preview.approval is not None
@@ -2153,7 +2100,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("move", tool.name, {})),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
         ]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="移动后继续处理其他文件", owner="o", session_id="s")))
         original_unprotect = session.coordinator.unprotect
@@ -2204,7 +2151,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("fresh-plan", tool.name, {})),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
            [ModelEvent(ModelEventType.TEXT_DELTA, text="已核验完成。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="清空回收站", owner="o", session_id="s")))
         version[0] = 2
@@ -2255,7 +2202,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 ], [ModelEvent(ModelEventType.TEXT_DELTA, text="需核对真实目录状态，不能视为完成。"),
                     ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
                 session = AgentSession(
-                    model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                    model=model, catalog=catalog,
                     pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
                 )
                 preview = await consume_events(session.run(AgentInput(
@@ -2324,7 +2271,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -2364,7 +2311,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         rebuilt = AgentSession(
             model=rebuilt_model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -2424,7 +2371,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=2, maximum=2),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -2482,7 +2429,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             journal=CancellingJournal(),
@@ -2513,7 +2460,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
             limits=SessionLimits(
@@ -2640,6 +2587,8 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 "summary": "已暂停"
             },
         )
+        from app.agent.kernel import sandbox
+
         catalog = ToolCatalog([tool])
         state = InMemorySessionStateStore()
         model = ScriptedModel(
@@ -2653,7 +2602,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 [
                     ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                               tool_call=ModelToolCall("cancel", "agent.pending_plan", {"operation": "cancel"})),
+                               tool_call=ModelToolCall("cancel", "agent.run_code", {"code": "from mf import session\nprint(session.pending_plan(operation='cancel'))"})),
                     ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
                 ],
                 [
@@ -2665,10 +2614,11 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
+        catalog.register(sandbox.run_code_tool(session.pipeline))
         preview = await collect(
             session.run(
                 AgentInput(
@@ -2762,7 +2712,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -2898,7 +2848,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(
                 catalog=catalog,
                 state_store=state,
@@ -3010,7 +2960,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=2, maximum=2),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -3095,7 +3045,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state),
             state_store=state,
         )
@@ -3160,7 +3110,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=model,
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=pipeline,
             state_store=state,
         )
@@ -3205,18 +3155,18 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 True,
                 "success",
                 "候选已找到",
-                references=[ToolReference("resource_candidates", snapshot)],
+                references=[ToolReference("fixture_candidates", snapshot)],
             )
 
         def prepare(arguments, _context):
-            snapshot = arguments["resource_candidates"]
+            snapshot = arguments["fixture_candidates"]
             return PreparedEffect(
                 preview={"summary": "将提交资源"},
                 snapshot_fingerprint=snapshot["search_id"],
             )
 
         def execute(arguments, expected_snapshot, _context):
-            snapshot = arguments["resource_candidates"]
+            snapshot = arguments["fixture_candidates"]
             self.assertEqual(expected_snapshot, snapshot["search_id"])
             executed.append(snapshot["candidates"][0]["result_id"])
             return {"summary": "资源已提交"}
@@ -3239,9 +3189,9 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             description="提交资源候选",
             input_schema={
                 "type": "object",
-                "required": ["resource_candidates_ref"],
+                "required": ["fixture_candidates_ref"],
                 "properties": {
-                    "resource_candidates_ref": {"type": "string"},
+                    "fixture_candidates_ref": {"type": "string"},
                 },
                 "additionalProperties": False,
             },
@@ -3272,23 +3222,23 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         first = await pipeline.execute("resource.search", {}, context=context)
         first_ref = first.outcome.public_content["reference_arguments"][
-            "resource_candidates_ref"
+            "fixture_candidates_ref"
         ]
         preview = await pipeline.execute(
             "resource.submit",
-            {"resource_candidates_ref": first_ref},
+            {"fixture_candidates_ref": first_ref},
             context=context,
         )
         assert preview.effect_plan is not None
         self.assertEqual(
             preview.effect_plan.arguments,
-            {"resource_candidates_ref": first_ref},
+            {"fixture_candidates_ref": first_ref},
         )
 
         newer = await pipeline.execute("resource.search", {}, context=context)
         self.assertNotEqual(
             newer.outcome.public_content["reference_arguments"][
-                "resource_candidates_ref"
+                "fixture_candidates_ref"
             ],
             first_ref,
         )
@@ -3311,7 +3261,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolPipelineError) as raised:
             await pipeline.execute(
                 "resource.submit",
-                {"resource_candidates_ref": first_ref},
+                {"fixture_candidates_ref": first_ref},
                 context=foreign_context,
             )
         self.assertEqual(raised.exception.code, "reference_invalid")
@@ -3362,6 +3312,54 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("公开完整条目", outcome.model_content)
 
 
+class PromptCachePrefixTests(unittest.IsolatedAsyncioTestCase):
+    async def test_system_prompt_head_is_byte_stable_across_rounds_and_turns(self):
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+
+        from app.agent.kernel import model_rounds
+
+        answer = [ModelEvent(ModelEventType.TEXT_DELTA, text="完成"),
+                  ModelEvent(ModelEventType.FINISH, finish_reason="stop")]
+        model = ScriptedModel([
+            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
+                        tool_call=ModelToolCall("c1", "library.search", {})),
+             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
+            answer, answer,
+        ])
+        state, catalog = InMemorySessionStateStore(), ToolCatalog([read_tool("library.search")])
+        session = AgentSession(model=model, catalog=catalog,
+
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
+            limits=SessionLimits(max_model_rounds=3))
+        memory = {"requests": [], "observations": [], "legacy_note": "OLD-NOTE"}
+        before = datetime(2026, 11, 8, 23, 59, tzinfo=datetime.now().astimezone().tzinfo)
+        after = before + timedelta(minutes=2)
+        with patch("app.agent.kernel.turn.datetime") as clock:
+            clock.now.side_effect = [before, after]
+            await collect(session.run(AgentInput(message="查一下", owner="owner", session_id="s")))
+            with patch.object(model_rounds, "history_memory", return_value=memory):
+                await collect(session.run(AgentInput(message="再查", owner="owner", session_id="s")))
+            self.assertEqual(clock.now.call_count, 2)
+
+        self.assertEqual(len(model.requests), 3)
+        heads = {r.system_prompt[:r.stable_system_chars] for r in model.requests}
+        self.assertEqual(len(heads), 1)
+        head = heads.pop()
+        self.assertTrue(head.startswith(session.system_prompt))
+        # 历史记忆属于易变数据；预算倒计时已删除，不污染缓存前缀。
+        for request in model.requests:
+            self.assertNotIn("剩余额度", head)
+            self.assertNotIn("剩余额度", request.system_prompt)
+        self.assertNotIn("OLD-NOTE", head)
+        self.assertIn("OLD-NOTE", model.requests[2].system_prompt[model.requests[2].stable_system_chars:])
+        # 同一请求内冻结时间；跨午夜的新输入更新时间，但不破坏稳定提示前缀。
+        for request, timestamp in zip(model.requests, (before, before, after), strict=True):
+            iso = timestamp.isoformat(timespec="seconds")
+            self.assertNotIn(iso, head)
+            self.assertIn(iso, request.system_prompt[request.stable_system_chars:])
+
+
 class LatestWinsTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_turn_cancels_old_turn_and_blocks_late_commit(self) -> None:
         first_started = asyncio.Event()
@@ -3385,7 +3383,7 @@ class LatestWinsTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=ConcurrentModel(),
             catalog=catalog,
-            retriever=CapabilityRetriever(),
+
             pipeline=pipeline,
             state_store=state,
         )
@@ -3427,7 +3425,7 @@ class LatestWinsTests(unittest.IsolatedAsyncioTestCase):
         catalog = ToolCatalog([read_tool("library.first", handler=lambda *_: {"summary": "first-fact-5678"}),
                                read_tool("library.second", handler=wait_read)])
         state = InMemorySessionStateStore()
-        session = AgentSession(model=Model(), catalog=catalog, retriever=CapabilityRetriever(minimum=2, maximum=2),
+        session = AgentSession(model=Model(), catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         previous = asyncio.create_task(collect(session.run(AgentInput(owner="owner", session_id="overlap", message="检查两个"))))
         try:
@@ -3481,7 +3479,7 @@ class LatestWinsTests(unittest.IsolatedAsyncioTestCase):
         session = AgentSession(
             model=ReplacingModel(),
             catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=cast(SessionStateStore, state)),
             state_store=cast(SessionStateStore, state),
         )
@@ -3532,37 +3530,36 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
             return {"ok": True, "status": "empty", "summary": "本目录没有匹配候选"}
 
         catalog = ToolCatalog([
-            read_tool("guangya.directory_scrape.inspect", domain="guangya",
+            read_tool("fixture.directory.inspect", domain="guangya",
                       handler=lambda *_: {"ok": True, "summary": "已检查目录，视频尚未归档"}),
-            read_tool("guangya.directory_scrape.search", domain="guangya", handler=search),
-            read_tool("agent.capabilities", domain="agent"),
+            read_tool("fixture.directory.search", domain="guangya", handler=search),
         ])
-        sequence = ["agent.capabilities", "guangya.directory_scrape.inspect",
-                    "guangya.directory_scrape.search", "guangya.directory_scrape.search",
-                    "guangya.directory_scrape.inspect", "guangya.directory_scrape.search",
-                    "agent.capabilities"]
+        sequence = ["fixture.directory.inspect",
+                    "fixture.directory.search", "fixture.directory.search",
+                    "fixture.directory.inspect", "fixture.directory.search",
+                    ]
         if recovered:
-            sequence.append("guangya.directory_scrape.search")
+            sequence.append("fixture.directory.search")
         rounds = [self.tool_round(name, number) for number, name in enumerate(sequence)]
         rounds.append([
             ModelEvent(ModelEventType.TEXT_DELTA, text="仍未找到匹配候选。" if recovered else "已开始处理\n### 第1项：`sample-"),
-            ModelEvent(ModelEventType.FINISH, finish_reason="stop"),
+            *([ModelEvent(ModelEventType.FINISH, finish_reason="stop")] if recovered else []),
         ])
         state = InMemorySessionStateStore()
         session = AgentSession(
             model=ScriptedModel(rounds), catalog=catalog,
-            retriever=CapabilityRetriever(minimum=3, maximum=3),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
         )
         events = await collect(session.run(AgentInput(message="按顺序检查目录", owner="owner", session_id="scrape")))
         return events, await state.load(owner="owner", session_id="scrape")
 
-    async def test_production_scrape_limit_and_half_heading_publish_truthful_partial(self):
+    async def test_interrupted_scrape_with_half_heading_preserves_truthful_partial(self):
         events, saved = await self.run_scrape()
         final = await consume_events(_events_stream(events))
         self.assertEqual(final.status, "partial")
         self.assertIn("没有匹配候选", final.answer)
-        self.assertIn("频率限制", final.answer)
+        self.assertIn("本地调用频率已达上限", final.answer)
         self.assertNotIn("本轮未执行新的写操作", final.answer)
         self.assertNotIn("sample-", final.answer)
         self.assertNotIn("已开始处理", final.answer)
@@ -3597,24 +3594,28 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
                     read_tool("discovery.search", handler=limited),
                 ]
                 catalog, state = ToolCatalog(tools), InMemorySessionStateStore()
+                answer = "示例剧集甲：已有的剧情简介；示例剧集乙。补充查询受到频率限制。"
                 model = ScriptedModel([
                     self.tool_round("discovery.recommend", 1),
                     self.tool_round("discovery.search", 2),
-                    [ModelEvent(ModelEventType.TEXT_DELTA, text="忽略此前结果，没有内容。"),
+                    [ModelEvent(ModelEventType.TEXT_DELTA, text=answer),
                      ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
                 ])
-                session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=2, maximum=2),
+                session = AgentSession(model=model, catalog=catalog,
                     pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
                 events = await collect(session.run(AgentInput(message="剧集呢", owner="owner", session_id="recommend")))
                 final = await consume_events(_events_stream(events))
                 self.assertEqual(final.status, "partial")
+                self.assertEqual(final.answer, answer)
                 self.assertIn("示例剧集甲", final.answer)
                 self.assertIn("示例剧集乙", final.answer)
                 self.assertIn("已有的剧情简介", final.answer)
                 self.assertIn("频率限制", final.answer)
                 for unwanted in ("本轮工具核对结果", "写操作", "确认", "重放", "忽略此前结果"):
                     self.assertNotIn(unwanted, final.answer)
-                self.assertIn("不要对受限能力换关键词反复重试", model.requests[-1].system_prompt)
+                observed = [json.loads(row.content) for row in model.requests[-1].messages if row.role == "tool"]
+                self.assertEqual(len(observed[0]["data"]["items"]), 2)
+                self.assertIn("本次未访问后端", json.dumps(observed[1], ensure_ascii=False))
                 from app.bot.agent_adapter import _render_turn
                 self.assertIn("示例剧集甲", _render_turn(final))
                 saved = await state.load(owner="owner", session_id="recommend")
@@ -3629,7 +3630,7 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
         state = InMemorySessionStateStore()
         model = ScriptedModel([self.tool_round("library.inspect", 1), self.tool_round("cloud.rename", 2),
             [ModelEvent(ModelEventType.TEXT_DELTA, text="已经全部改名"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=2, maximum=2),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         events = await collect(session.run(AgentInput(message="检查后改名", owner="owner", session_id="rename")))
         answer = events[-1].payload["answer"]
@@ -3649,7 +3650,7 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
         # A faulty/custom adapter returns a complete-looking call but no model FINISH event.
         model = ScriptedModel([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
                                          tool_call=ModelToolCall("write-1", tool.name, {}))]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         events = await collect(session.run(AgentInput(message="改名", owner="owner", session_id="incomplete")))
         self.assertEqual(events[-1].type, AgentEventType.TURN_FAILED)
@@ -3675,7 +3676,7 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
                             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
                 model = ScriptedModel([lookup("first"), self.tool_round("library.health", "other"), lookup("retry"),
                     [ModelEvent(ModelEventType.TEXT_DELTA, text="对象A已核验完成"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
-                session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                session = AgentSession(model=model, catalog=catalog,
                     pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
                 result = await consume_events(session.run(AgentInput(message="核验A", owner="o", session_id="recovery")))
                 self.assertEqual(result.status, "success")
@@ -3686,14 +3687,15 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
         def broken(*_):
             raise ToolPipelineError("第一项尚未核验", code="provider_timeout")
         catalog, state = ToolCatalog([read_tool("library.first", handler=broken), read_tool("library.second")]), InMemorySessionStateStore()
+        answer = "第二项已核验，第一项仍待核验。"
         model = ScriptedModel([self.tool_round("library.first", "first"), self.tool_round("library.second", "second"),
-            [ModelEvent(ModelEventType.TEXT_DELTA, text="全部完成"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+            [ModelEvent(ModelEventType.TEXT_DELTA, text=answer), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         result = await consume_events(session.run(AgentInput(message="核验两项", owner="o", session_id="partial")))
         self.assertEqual(result.status, "partial")
-        self.assertIn("第一项尚未核验", result.answer)
-        self.assertNotIn("全部完成", result.answer)
+        self.assertEqual(result.answer, answer)
+        self.assertIn("第一项尚未核验", str(model.requests[-1].messages))
 
     async def test_unrelated_success_cannot_erase_a_limited_entry(self):
         for changed_context in (False, True):
@@ -3722,38 +3724,38 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
                 rounds.append([ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("other", tool.name, {} if changed_context else {"query": "B"})),
                                ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")])
                 rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="全部完成"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")])
-                session = AgentSession(model=ScriptedModel(rounds), catalog=catalog, retriever=CapabilityRetriever(minimum=2, maximum=2),
+                session = AgentSession(model=ScriptedModel(rounds), catalog=catalog,
                                        pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
                 events = await collect(session.run(AgentInput(message="检查两个条目", owner="owner", session_id="entries")))
                 self.assertEqual(events[-1].payload["status"], "partial")
-                self.assertIn("条目A搜索受限", events[-1].payload["answer"])
-                self.assertNotIn("全部完成", events[-1].payload["answer"])
+                self.assertEqual(events[-1].payload["answer"], "全部完成")
+                saved = await state.load(owner="owner", session_id="entries")
+                self.assertIn("条目A搜索受限", json.dumps([row for row in saved.conversation if row["role"] == "tool"], ensure_ascii=False))
 
-    async def test_unresolved_business_error_is_not_relabelled_as_budget_exhaustion(self):
+    async def test_read_business_failure_does_not_relabel_normal_model_completion(self):
         def inspect(_arguments, _context):
             raise ToolPipelineError("目录内没有支持的视频文件", code="precondition_failed")
 
         catalog = ToolCatalog([
             read_tool("cloud.list", domain="cloud", handler=lambda *_: {"ok": True, "summary": "根目录包含4个子目录"}),
             read_tool("cloud.inspect", domain="cloud", handler=inspect),
-            read_tool("agent.capabilities", domain="agent"),
         ])
         state = InMemorySessionStateStore()
         model = ScriptedModel([
             self.tool_round("cloud.list", 1), self.tool_round("cloud.inspect", 2),
-            self.tool_round("agent.capabilities", 3),
-            [ModelEvent(ModelEventType.TEXT_DELTA, text="已完成，因工具预算耗尽不能继续。"),
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="根目录包含4个子目录；目录内没有支持的视频文件。"),
              ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=3, maximum=3),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         events = await collect(session.run(AgentInput(message="检查每个目录", owner="owner", session_id="empty")))
         self.assertEqual(events[-1].payload["status"], "partial")
-        self.assertEqual(events[-1].payload["finish_reason"], "precondition_failed")
+        self.assertEqual(events[-1].payload["finish_reason"], "stop")
         self.assertIn("根目录包含4个子目录", events[-1].payload["answer"])
         self.assertIn("目录内没有支持的视频文件", events[-1].payload["answer"])
         self.assertNotIn("预算耗尽", events[-1].payload["answer"])
         self.assertNotIn("已完成，", events[-1].payload["answer"])
+        self.assertIn("precondition_failed", str(model.requests[-1].messages))
 
     async def test_valid_negative_read_results_are_not_execution_exceptions(self):
         for status in ("loading", "disabled", "not_missing", "not_found"):
@@ -3767,10 +3769,10 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
                     [ModelEvent(ModelEventType.TEXT_DELTA, text="当前状态已说明，不需要执行变更。"),
                      ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
                 ])
-                session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                session = AgentSession(model=model, catalog=catalog,
                                        pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
                 events = await collect(session.run(AgentInput(message="查看状态", owner="owner", session_id="negative")))
-                self.assertEqual(events[-1].payload["status"], "success")
+                self.assertEqual(events[-1].payload["status"], "partial")
                 self.assertEqual(events[-1].payload["answer"], "当前状态已说明，不需要执行变更。")
 
 
@@ -3780,7 +3782,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                             ModelEvent(ModelEventType.FINISH, finish_reason='stop')]])
         state = InMemorySessionStateStore()
         catalog = ToolCatalog([])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         result = await consume_events(session.run(AgentInput(owner='owner', session_id='empty-answer', message='检查状态')))
         self.assertEqual(result.status, 'failed')
@@ -3823,7 +3825,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     yield ModelEvent(ModelEventType.FINISH, finish_reason='stop')
 
         model = Model()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
                                limits=SessionLimits(max_model_rounds=max_rounds))
         events = await collect(session.run(AgentInput(owner='owner', session_id='recovery', message='清洗入库')))
@@ -3905,7 +3907,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         model = Model([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall('rename', tool.name, {})),
                         ModelEvent(ModelEventType.FINISH, finish_reason='tool_calls')]])
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         preview = await consume_events(session.run(AgentInput(message='改名', owner='owner', session_id='confirm-recovery')))
         self.assertEqual(writes, [])
@@ -3960,7 +3962,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         model = Model()
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         original = await consume_events(session.run(AgentInput(
             message='依次处理first和second', owner='owner', session_id='recovered-followup',
@@ -4019,7 +4021,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
              ModelEvent(ModelEventType.FINISH, finish_reason='stop')],
         ])
         catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         original = await consume_events(session.run(AgentInput(message='改名', owner='owner', session_id='explain-cut')))
         assert original.approval is not None
@@ -4065,7 +4067,7 @@ class ConfirmationPendingOwnershipTests(unittest.IsolatedAsyncioTestCase):
         state = SQLiteKernelStore() if persistent else InMemorySessionStateStore()
         tickets = (SQLiteConfirmationStore if persistent else ConfirmationStore)(clock=lambda: now[0])
         pipeline = ToolPipeline(catalog=catalog, state_store=state, effect_store=ConfirmationEffectPlanStore(tickets))
-        return AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=state), writes
+        return AgentSession(model=model, catalog=catalog,  pipeline=pipeline, state_store=state), writes
 
     async def preview(self, session, session_id):
         view = await consume_events(session.run(AgentInput(owner="owner", session_id=session_id, message="先改名再移动")))
@@ -4349,7 +4351,7 @@ class ConfirmedEffectReplayTests(unittest.IsolatedAsyncioTestCase):
         model = ScriptedModel([self.call(tool.name, {"step": 1}, "initial")] + tail)
         catalog = ToolCatalog([tool, read])
         state = InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         return session, model, prepares, writes, reads
 
@@ -4368,9 +4370,6 @@ class ConfirmedEffectReplayTests(unittest.IsolatedAsyncioTestCase):
                          [ModelEvent(ModelEventType.TEXT_DELTA, text="变更已完成。"),
                           ModelEvent(ModelEventType.FINISH, finish_reason="stop")]]
                 session, model, prepares, writes, reads = self.runtime(tail)
-                if repair:
-                    from tests.error30_model_inputs import ExplicitRepairModel
-                    session.model = ExplicitRepairModel(model, {"repeat"})
                 events = await self.confirm(session)
                 final = await consume_events(_events_stream(events))
                 self.assertEqual(final.status, "success")
@@ -4465,8 +4464,8 @@ class ConfirmedEffectReplayTests(unittest.IsolatedAsyncioTestCase):
             await pipeline.execute("cloud.change", {"step": 1}, context=continuation)
 
 
-class ArgumentRepairPreservationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repair_must_keep_optional_fields_but_can_remove_unknown_fields(self):
+class ArgumentRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_retry_validates_each_call_and_preserves_falsy_values(self):
         from dataclasses import replace
         from unittest.mock import AsyncMock
 
@@ -4494,26 +4493,25 @@ class ArgumentRepairPreservationTests(unittest.IsolatedAsyncioTestCase):
         for key in ("period", "enabled", "limit", "sites"):
             repaired = {**invalid, "period": 4320}
             repaired.pop(key)
-            with self.subTest(omitted=key), self.assertRaisesRegex(ToolPipelineError, "不能省略.*" + key):
-                await pipeline.execute(tool.model_name, repaired, context=context)
-        self.assertEqual(prepared, [])
-        self.assertFalse((await store.load(owner="owner", session_id="repair")).pending_effect_plan_id)
+            with self.subTest(omitted=key):
+                preview = await pipeline.execute(tool.model_name, repaired, context=context)
+                self.assertIsNotNone(preview.effect_plan)
+                self.assertEqual(preview.effect_plan.arguments, {"period": 10080, **repaired})
         # 无效None占位可移除；False、0、[]不能按falsy处理。
         with self.assertRaises(ToolPipelineError):
             await pipeline.execute(tool.name, {"id": "NULL", "period": None}, context=context)
         null_fixed = await pipeline.execute(tool.name, {"id": "NULL"}, context=context)
         assert null_fixed.effect_plan is not None
         self.assertEqual(null_fixed.effect_plan.arguments["period"], 10080)
-        # 不同对象正常使用默认值，不消费A的修复约束。
+        # 每个合法请求独立预检；省略可选值使用正常默认值。
         other = await pipeline.execute(tool.name, {"id": "B"}, context=context)
         assert other.effect_plan is not None
         self.assertEqual(other.effect_plan.arguments["period"], 10080)
-        with self.assertRaisesRegex(ToolPipelineError, "不能省略.*period"):
-            await pipeline.execute(tool.name, {"id": "A"}, context=context)
+        defaulted = await pipeline.execute(tool.name, {"id": "A"}, context=context)
+        self.assertIsNotNone(defaulted.effect_plan)
         fixed = await pipeline.execute(tool.name, {**invalid, "period": 4320}, context=context)
         assert fixed.effect_plan is not None
         self.assertEqual(fixed.effect_plan.arguments, {**invalid, "period": 4320})
-        self.assertFalse(any(entry.guard_key for entry in context.schema_replacements.values()))
         # 成功后不是永久锁定字段；新调用仍遵守原来的可选契约。
         fresh = await pipeline.execute(tool.name, {"id": "A"}, context=context)
         assert fresh.effect_plan is not None
@@ -4528,7 +4526,7 @@ class ArgumentRepairPreservationTests(unittest.IsolatedAsyncioTestCase):
         next_context = replace(context, lease=next_lease, turn_id=next_lease.turn_id)
         assert ((await pipeline.execute(tool.name, {"id": "A"}, context=next_context)).effect_plan) is not None
 
-    async def test_model_repair_cannot_freeze_a_defaulted_plan_before_correcting_the_field(self):
+    async def test_model_retry_previews_the_corrected_value_without_executing(self):
         prepared, writes = [], []
         schema = {"type": "object", "required": ["id"], "properties": {
             "id": {"type": "string"}, "period": {"type": "integer"}}, "additionalProperties": False}
@@ -4538,15 +4536,14 @@ class ArgumentRepairPreservationTests(unittest.IsolatedAsyncioTestCase):
             execute_confirmed=lambda a, *_: writes.append(dict(a)) or {"ok": True})
         call = ConfirmedEffectReplayTests.call
         model = ScriptedModel([call(tool.name, {"id": "A", "period": "4320"}, "wrong-type"),
-                               call(tool.model_name, {"id": "A"}, "drop-period"),
                                call(tool.name, {"id": "A", "period": 4320}, "corrected")])
         state, catalog = InMemorySessionStateStore(), ToolCatalog([tool])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         events = await collect(session.run(AgentInput(owner="owner", session_id="repair", message="建立A规则，每4320分钟检查")))
-        self.assertEqual(len([e for e in events if e.type == AgentEventType.TOOL_FAILED]), 2)
+        self.assertEqual(len([e for e in events if e.type == AgentEventType.TOOL_FAILED]), 1)
         self.assertEqual(len([e for e in events if e.type == AgentEventType.EFFECT_APPROVAL_REQUIRED]), 1)
         self.assertEqual(prepared, [{"id": "A", "period": 4320}])
         self.assertEqual(writes, [])
-        repair_message = next(m for m in model.requests[-1].messages if m.role == "tool" and m.tool_call_id == "drop-period")
-        self.assertIn("不要删除字段退回默认值", repair_message.content)
+        repair_message = next(m for m in model.requests[-1].messages if m.role == "tool" and m.tool_call_id == "wrong-type")
+        self.assertIn("expected_input_schema", repair_message.content)

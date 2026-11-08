@@ -11,7 +11,7 @@ from app.agent.errors import ToolPipelineError
 from app.agent.kernel.session_state import SessionState
 from app.agent.kernel.state_types import AgentInput
 
-from . import error_repair, telegram_reference
+from . import telegram_reference
 from .model import (
     ModelMessage,
     ModelToolCall,
@@ -19,61 +19,6 @@ from .model import (
 from .projection import _arguments_safe
 
 logger = logging.getLogger(__name__)
-
-def capability_retrieval_context(
-    state: SessionState,
-    *, current_turn: bool = False,
-) -> dict[str, Any]:
-    """提取有界跨轮线索供本地召回使用，不替模型裁决用户意图。"""
-    recent_users: list[str] = []
-    recent_tools: list[str] = []
-    seen_tools: set[str] = set()
-    tool_weights: dict[str, float] = {}
-    turns_back = 0
-    history = state.conversation
-    end = len(history)
-    if current_turn:
-        # 新输入已落盘，但它不是历史回合；不能提前衰减上一轮的线索。
-        end = next((i for i in range(len(history) - 1, -1, -1)
-                    if isinstance(history[i], Mapping) and history[i].get("role") == "user"), end)
-    for item in reversed(history[max(0, end - 24):end]):
-        if not isinstance(item, Mapping):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        if role == "user" and len(recent_users) < 3:
-            text = with_reply_context(
-                str(item.get("content") or "").strip(), item.get("reply_context"),
-            )
-            if text:
-                recent_users.append(text[:2_000])
-        if role == "user":
-            turns_back += 1
-            if turns_back >= 3:
-                break
-        tool_name = str(item.get("tool_name") or "").strip()
-        if tool_name and tool_name not in seen_tools and len(recent_tools) < 6:
-            recent_tools.append(tool_name)
-            seen_tools.add(tool_name)
-            tool_weights[tool_name] = 0.35 ** turns_back
-        calls = item.get("tool_calls")
-        if isinstance(calls, Sequence) and not isinstance(
-            calls, (str, bytes, bytearray)
-        ):
-            for call in reversed(calls):
-                if not isinstance(call, Mapping):
-                    continue
-                name = str(call.get("name") or "").strip()
-                if name and name not in seen_tools and len(recent_tools) < 6:
-                    recent_tools.append(name)
-                    seen_tools.add(name)
-                    tool_weights[name] = 0.35 ** turns_back
-    return {
-        "has_pending_effect": bool(state.pending_effect_plan_id),
-        "recent_user_messages": tuple(recent_users),
-        "recent_tool_names": tuple(recent_tools),
-        "recent_tool_weights": tool_weights,
-    }
-
 
 def contextual_message(agent_input: AgentInput) -> str:
     return with_reply_context(agent_input.message, agent_input.reply_context)
@@ -113,6 +58,8 @@ def persisted_conversation(
         preserved = {key: prior[key] for key in ("content", "public_content", "candidate_result_ref") if isinstance(prior.get(key), str)}
         if prior.get("history_before_truncated"):
             preserved["history_before_truncated"] = True
+        if isinstance(prior.get("activities"), list):
+            preserved["activities"] = prior["activities"]
         if isinstance(prior.get("reply_context"), Mapping):
             preserved["reply_context"] = telegram_reference.context_copy(prior["reply_context"])
         public_history.setdefault(key, []).append(preserved)
@@ -166,15 +113,16 @@ def tool_error_message(
     call: ModelToolCall, error: ToolPipelineError, *, input_schema: Mapping[str, Any] | None = None,
 ) -> ModelMessage:
     # 重述静态工具/已登记 operation 的真实契约，不回显调用参数，也不进入用户事件。
-    schema = error_repair.effective_schema(input_schema, error.argument_schemas) if input_schema is not None else None
-    repair = ({"expected_input_schema": dict(schema)}
-              if error.code == "invalid_arguments" and schema is not None else {})
-    if error.repair_ticket:
-        repair["repair"] = {"tool": "agent.repair", "ticket": error.repair_ticket,
-                            "semantics": "explicit replacement of this rejected invocation; valid arguments stay fixed"}
+    schema = input_schema
+    if schema is not None and error.argument_schemas:
+        properties = schema.get("properties", {})
+        schema = ({**schema, "properties": {**properties, **error.argument_schemas}}
+                  if error.argument_schemas.keys() <= properties.keys() else None)
+    feedback = ({"expected_input_schema": dict(schema)}
+                if error.code == "invalid_arguments" and schema is not None else {})
     content = json.dumps(
         {
-            **repair,
+            **feedback,
             "ok": False,
             "status": "error",
             "code": error.code,

@@ -2,25 +2,21 @@
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import cast
 import unittest
 from copy import deepcopy
 from unittest import mock
 
 import httpx
 
-from app.agent.domains.guangya import recycle_actions as recycle
-from app.agent.domains.guangya import share_actions as shares
-from app.agent.domains.guangya import workspace_actions as workspace
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext
+from app.modules import guangya_recycle as recycle
+from app.clients.guangya import GuangYaShareError
 from app.clients.guangya import (
     DirectoryEntryLimitError,
     GuangYaClient,
     IncompleteOfflineTaskListError,
     guangya_provider_task_state,
 )
-from app.modules.guangya_workspace import observation_page
 from tests.test_agent_guangya_sdk_capabilities import _RecycleClient, _ShareClient
 
 
@@ -510,25 +506,26 @@ class GuangYaReadContractTests(unittest.TestCase):
         raw.share_files_list.assert_called_once()
         raw._public_post.assert_not_called()
 
-    def test_share_preview_keeps_one_page_when_more_files_exist(self):
-        first = {"fileId": "f1", "fileName": "one"}
-        cases: tuple[dict[str, Any], ...] = (
-            {"list": [first], "total": 2, "cursor": "next"},
-            {"list": [{"fileId": f"f{i}", "fileName": str(i)} for i in range(200)]},
-        )
-        for payload in cases:
-            raw = mock.Mock()
-            raw.share_access_token.return_value = {"data": {"accessToken": "private-token"}}
-            raw.share_files_list.return_value = {"msg": "success", "data": payload}
-            with self.subTest(count=len(payload["list"])), mock.patch(
-                "app.clients.guangya._load_raw", return_value=raw,
-            ):
-                result = ReadClient(None).inspect_share("https://www.guangyapan.com/s/public_test")
-                self.assertEqual(result["count"], len(payload["list"]))
-                self.assertEqual(result["access_token"], "private-token")
-                self.assertTrue(result["has_more"])
-                raw.share_files_list.assert_called_once()
-                raw._public_post.assert_not_called()
+    def test_share_inspection_reads_all_pages_with_one_token(self):
+        raw = mock.Mock()
+        raw.share_access_token.return_value = {"data": {"accessToken": "private-token"}}
+        raw.share_files_list.return_value = {"msg": "success", "data": {
+            "list": [{"fileId": f"f{i}", "fileName": str(i)} for i in range(200)],
+            "total": 201, "cursor": "next",
+        }}
+        raw._public_post.return_value = {"msg": "success", "data": {
+            "list": [{"fileId": "f200", "fileName": "last"}], "total": 201,
+        }}
+        with mock.patch("app.clients.guangya._load_raw", return_value=raw):
+            result = ReadClient(None).inspect_share("https://www.guangyapan.com/s/public_test")
+            self.assertEqual(result["count"], 201)
+            self.assertEqual(result["files"][-1]["id"], "f200")
+            self.assertEqual(result["access_token"], "private-token")
+            self.assertFalse(result["has_more"])
+            raw.share_access_token.assert_called_once()
+            self.assertEqual(raw._public_post.call_args.args[1]["cursor"], "next")
+            with self.assertRaisesRegex(RuntimeError, "分页上限"):
+                ReadClient(None).inspect_share("https://www.guangyapan.com/s/public_test", max_pages=1)
 
     def test_share_preview_marks_a_successful_short_page_as_final(self):
         raw = mock.Mock()
@@ -585,48 +582,36 @@ class GuangYaAgentReadCompletionTests(unittest.TestCase):
         ):
             with (
                 self.subTest(payload=payload),
-                mock.patch.object(recycle, "GuangYaClient", return_value=client),
                 mock.patch.object(client, "task_status", return_value={"data": payload}),
             ):
-                result = recycle.query_guangya_task_status({"guangya_task": {"task_id": "task", "operation": "copy"}}, ToolContext())
-                self.assertEqual(result.status, expected)
-                self.assertEqual(result.ok, ok)
-                self.assertNotIn("private-error", json.dumps(result.to_dict()))
+                result = recycle.read_task(cast(GuangYaClient, client), "task")
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(result["status"] in {"running", "completed"}, ok)
+                self.assertNotIn("private-error", json.dumps(result))
                 if expected == "completed":
-                    self.assertEqual(result.data["progress"], 1.0)
+                    self.assertEqual(result["progress"], 1.0)
 
     def test_restore_and_clear_acceptance_survives_failed_verification(self):
         for operation in ("restore", "clear"):
-            client = _RecycleClient()
-            context = ToolContext(owner="owner", session_id="session")
+            client = cast(GuangYaClient, _RecycleClient())
             original = client.list_recycle
-
-            def read_after_write(*, client=client, original=original, **kwargs):
-                if not client.items:
+            def read_after_write(*, original=original, **kwargs):
+                rows = original(**kwargs)
+                if not rows:
                     raise RuntimeError("provider-private-error")
-                return original(**kwargs)
-
-            with mock.patch.object(recycle, "GuangYaClient", return_value=client):
-                if operation == "restore":
-                    listed = recycle.list_guangya_recycle({"page": 1, "page_size": 50}, context)
-                    args = {"guangya_recycle_items": listed.references[0].value, "indices": [1]}
-                    _preview, fingerprint = recycle.prepare_restore_guangya_recycle(args, context)
-                    execute = recycle.execute_restore_guangya_recycle
-                else:
-                    args = {}
-                    _preview, fingerprint = recycle.prepare_clear_guangya_recycle(args, context)
-                    execute = recycle.execute_clear_guangya_recycle
-                with mock.patch.object(client, "list_recycle", side_effect=read_after_write):
-                    result = execute(args, fingerprint, context)
-                self.assertEqual(result.status, "accepted")
-                self.assertTrue(result.data["verification_pending"])
-                self.assertFalse(result.data["verified"])
-                self.assertEqual(result.references[0].kind, "guangya_task")
-                self.assertNotIn("provider-private-error", json.dumps(result.to_dict()))
+                return rows
+            snapshot = recycle.prepare_restore(client, ["trash-1"]) if operation == "restore" else recycle.prepare_clear(client)
+            execute = recycle.restore_prepared if operation == "restore" else recycle.clear_prepared
+            with mock.patch.object(client, "list_recycle", side_effect=read_after_write):
+                result = execute(client, snapshot)
+            self.assertEqual(result["status"], "accepted")
+            self.assertTrue(result["verification_pending"])
+            self.assertFalse(result["verified"])
+            self.assertEqual(result["task_id"], operation + "-task")
+            self.assertNotIn("provider-private-error", json.dumps(result))
 
     def test_revoke_acceptance_survives_failed_verification(self):
         client = _ShareClient()
-        context = ToolContext(owner="owner", session_id="session")
         original = client.list_user_shares
 
         def read_after_write(**kwargs):
@@ -634,41 +619,20 @@ class GuangYaAgentReadCompletionTests(unittest.TestCase):
                 raise RuntimeError("private-error")
             return original(**kwargs)
 
-        with mock.patch.object(shares, "GuangYaClient", return_value=client):
-            listed = shares.list_guangya_user_shares({"page": 1, "page_size": 50}, context)
-            args = {"guangya_shares": listed.references[0].value, "indices": [1]}
-            _preview, fingerprint = shares.prepare_revoke_guangya_shares(args, context)
-            with mock.patch.object(client, "list_user_shares", side_effect=read_after_write):
-                result = shares.execute_revoke_guangya_shares(args, fingerprint, context)
-            self.assertEqual(result.status, "accepted")
-            self.assertTrue(result.data["verification_pending"])
-            self.assertFalse(result.data["verified"])
+        snapshot = client.prepare_user_share_revoke(["10001"])
+        with mock.patch.object(client, "list_user_shares", side_effect=read_after_write):
+            result = client.submit_prepared_user_share(snapshot, revoke=True)
+        self.assertEqual(result["status"], "accepted")
+        self.assertTrue(result["verification_pending"])
+        self.assertFalse(result["verified"])
 
     def test_share_without_identity_is_not_silently_dropped(self):
         client = _ShareClient()
         client.shares = [{"title": "nameless-id"}]
-        with (
-            mock.patch.object(shares, "GuangYaClient", return_value=client),
-            self.assertRaises(AgentToolError),
-        ):
-            shares.list_guangya_user_shares({"page": 1, "page_size": 50}, ToolContext())
+        with self.assertRaises(GuangYaShareError):
+            client.user_share_snapshot()
 
-    def test_model_keeps_type_size_extension_without_provider_identifiers(self):
-        page = observation_page({
-            "plan_id": "a" * 32, "scope_name": "scope",
-            "entries": [{"handle": "OBJ" + "B" * 24, "name": "episode.mkv",
-                         "relative_parent": "scope", "media_kind": "video", "size": 456,
-                         "extension": "mkv", "file_id": "private-provider-id"}],
-        })
-        workspace_actions = workspace.GuangyaWorkspaceActions()
-        with mock.patch.object(workspace_actions, "_read_observation_page", return_value=page):
-            result = workspace_actions.query_guangya_filesystem({}, ToolContext())
-        assert result.model_data is not None
-        entry = result.model_data["entries"][0]
-        self.assertEqual((entry["kind"], entry["size"], entry["extension"]), ("video", 456, "mkv"))
-        self.assertNotIn("file_id", entry)
-        self.assertNotIn("private-provider-id", json.dumps(result.model_data))
-        self.assertEqual(result.model_data["operation"], "list")
+
 
 
 if __name__ == "__main__":

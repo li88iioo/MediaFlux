@@ -3171,6 +3171,114 @@ def capture_strm_retry_runtime_config() -> tuple[dict, str]:
     return deepcopy(runtime), (error or "")
 
 
+def strm_failures(status: str = "all", action: str = "", source_id: str = "",
+                  limit: int = 200, offset: int = 0) -> dict:
+    """读取失败账本完整已保存事实；错误沿用入库脱敏边界，不访问媒体文件或云盘。"""
+    if status not in {"all", "open", "retrying", "resolved"}:
+        raise ValueError("status 必须是 all、open、retrying 或 resolved")
+    if action not in {"", "generate", "metadata"}:
+        raise ValueError("action 必须为空、generate 或 metadata")
+    if not isinstance(source_id, str):
+        raise ValueError("source_id 必须是字符串")
+    if type(limit) is not int or not 1 <= limit <= 1000 or type(offset) is not int or offset < 0:
+        raise ValueError("limit 必须是 1-1000 的整数，offset 必须是非负整数")
+    filters = {"status": status, "action": action, "source_id": source_id.strip()}
+    rows = [dict(row) for row in db.list_strm_failures(**filters, limit=limit, offset=offset)]
+    total = db.count_strm_failures(**filters)
+    failures = db.get_strm_failure_triage_summary()
+    state = "attention" if failures["open"] else "running" if failures["retrying"] else "healthy"
+    return {"ok": True, "status": state, "summary": f"读取 {len(rows)} 条 STRM 失败记录，共 {total} 条匹配",
+            "data": {"items": rows, "total": total, "returned": len(rows),
+                     "has_more": offset + len(rows) < total,
+                     "next_offset": offset + len(rows) if offset + len(rows) < total else None,
+                     "failures": failures, "summary_scope": "all", "filters": filters,
+                     "error_representation": "stored_redacted_text", "error_storage_limit": 500,
+                     "error_note": "error 为账本已保存的完整文本；入库时已脱敏并最多保留500字，不能还原上游原文。"}}
+
+
+class StrmFailureRetryStale(ValueError):
+    """所选失败项或运行配置在预检后发生变化。"""
+
+
+def normalize_strm_failure_ids(ids: list[int]) -> list[int]:
+    if not isinstance(ids, list) or any(type(item) is not int or item <= 0 for item in ids):
+        raise ValueError("ids 必须是失败账本真实 ID 的正整数数组")
+    return sorted(set(ids))
+
+
+def _capture_strm_failure_retry(ids: list[int]) -> dict:
+    from app.modules.web_secret import signed_context_fingerprint
+    from app.repositories.strm import strm_failure_selection
+
+    ids = normalize_strm_failure_ids(ids)
+    rows = strm_failure_selection(ids)
+    runtime, error = capture_strm_retry_runtime_config()
+    configuration = {key: get(key, "") for key in (
+        "GY_STRM_SOURCE_DIRS", "GY_STRM_BASE_URL", "STRM_ROOT", "STRM_VIDEO_EXTS",
+        "STRM_METADATA_ENABLED", "STRM_METADATA_EXTS", "STRM_SKIP_THRESHOLD_MB",
+        "STRM_NOTIFY_ENABLED", "GY_ORGANIZE_STRM_DETAIL_NOTIFY",
+    )}
+    return {"ids": ids, "rows": rows, "runtime": runtime, "error": error,
+            "fingerprint": signed_context_fingerprint(
+                {"ids": ids, "rows": rows, "runtime": runtime, "configuration": configuration, "error": error},
+                domain="strm-failure-retry")}
+
+
+def _strm_failure_retry_preview(state: dict) -> dict:
+    ids, rows = state["ids"], state["rows"]
+    if not ids:
+        return {"ok": True, "status": "no_changes", "summary": "没有选中 STRM 失败项，无需重试", "data": {}}
+    if len(rows) != len(ids) or any(row["status"] != "open" or row["action"] not in {"generate", "metadata"} for row in rows):
+        return {"ok": False, "status": "conflict", "summary": "所选失败项不存在或已不可重试",
+                "error": "请重新读取失败账本并选择 open 状态的真实 ID。", "data": {}}
+    if state["error"]:
+        return {"ok": False, "status": "not_configured", "summary": "STRM 重试配置当前不可用",
+                "error": "请检查 STRM 配置后重新预检。", "data": {}}
+    return {"ok": True, "status": "confirmation_required", "summary": f"确认后将重试 {len(ids)} 条 STRM 失败记录",
+            "data": {"ids": ids, "selected_count": len(ids), "count": len(ids),
+                     "by_action": {action: sum(row["action"] == action for row in rows) for action in ("generate", "metadata")},
+                     "effects": ["重新定位选定失败项的云端对象", "按冻结配置生成 STRM 或伴随元数据", "更新失败账本和现有刷新交接"]}}
+
+
+def prepare_strm_failure_retry(ids: list[int]) -> dict:
+    """冻结所选真实行、版本与运行配置；只读预检，不领取记录、不访问云盘。"""
+    from app import config
+
+    with config.runtime_config_read_guard():
+        state = _capture_strm_failure_retry(ids)
+        return {**_strm_failure_retry_preview(state), "fingerprint": state["fingerprint"]}
+
+
+def retry_selected_strm_failures(ids: list[int], *, expected_fingerprint: str,
+                                should_stop: Callable[[], bool] | None = None) -> dict:
+    """复验预检快照后进入唯一公共重试链；并发 claim 的实际计数保持原业务含义。"""
+    import secrets
+    from app import config
+
+    with config.runtime_config_read_guard():
+        state = _capture_strm_failure_retry(ids)
+        if not isinstance(expected_fingerprint, str) or not secrets.compare_digest(state["fingerprint"], expected_fingerprint):
+            raise StrmFailureRetryStale("STRM 失败项或运行配置已变化，请重新预检")
+        preview = _strm_failure_retry_preview(state)
+        if not preview["ok"] or preview["status"] == "no_changes":
+            return preview
+        if should_stop is not None and should_stop():
+            return {"ok": False, "status": "cancelled", "summary": "STRM 重试已取消，未执行业务操作",
+                    "data": _retry_result("agent", requested=len(state["ids"]))}
+        raw = retry_strm_failures(state["ids"], "agent", runtime_config=state["runtime"], should_stop=should_stop)
+    if not raw["ok"]:
+        busy = "正在运行" in str(raw.get("error") or "")
+        return {"ok": False, "status": "conflict" if busy else "not_configured", "summary": "STRM 重试未执行",
+                "error": "STRM 同步或重试任务正在运行。" if busy else "请检查 STRM 配置后重新预检。",
+                "data": {key: value for key, value in raw.items() if key != "error"}}
+    changed = raw["requested"] - raw["matched"]
+    conflict = raw["requested"] > 0 and raw["matched"] == 0
+    partial = changed or raw["failed"] or raw["deferred"] or raw["stopped"] or raw["scan_incomplete"]
+    return {"ok": not conflict, "status": "conflict" if conflict else "partial" if partial else "completed",
+            "summary": f"STRM 重试完成：已解决 {raw['resolved']} 条，失败 {raw['failed']} 条，保留待重试 {raw['deferred']} 条，状态已变化 {changed} 条",
+            "data": raw, "error": "失败项已被其他任务处理，本次未执行重试。" if conflict else ""}
+
+
 @dataclass(frozen=True)
 class _RetryLookupResult:
     located: dict[tuple[str, str], tuple[GuangYaFile, str, dict[str, str]]]
@@ -3456,12 +3564,18 @@ def _retry_strm_failures_locked(
     """选中/全部重试共用准备与分批执行；客户端和扫描成功前不领取失败项。"""
     normalized = list(dict.fromkeys(ids)) if ids is not None else None
     snapshot: list[tuple[int, str, str]] = []
+    from app.repositories.strm import strm_failure_selection
+
     before_id: int | None = None
     while True:
-        candidates = db.list_strm_failures(
-            status="open", ids=normalized, source_id=(source_id or "").strip(),
-            action=action or "", before_id=before_id, limit=1000,
-        )
+        # 明确选择与确认复验共用完整读取，超过一页也不能漏掉尾部 ID。
+        if normalized is not None:
+            candidates = strm_failure_selection(normalized, status="open")
+        else:
+            candidates = db.list_strm_failures(
+                status="open", source_id=(source_id or "").strip(),
+                action=action or "", before_id=before_id, limit=1000,
+            )
         if not candidates:
             break
         snapshot.extend(

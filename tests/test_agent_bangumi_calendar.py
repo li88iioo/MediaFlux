@@ -1,188 +1,69 @@
-"""Media Agent Bangumi 放送日历测试。"""
-
+"""Bangumi 日历与普通榜单共用原生单页 catalog。"""
 from __future__ import annotations
-from typing import Any
-from typing import cast
 
-import unittest
-from unittest.mock import Mock, patch
+from datetime import datetime
+from unittest.mock import patch
 
-from app.agent.domains.discovery.actions import bangumi_calendar, calendar_arguments
-from app.agent.errors import AgentToolError
-from app.discovery.models import (
-    DiscoveryPage,
-    MediaCard,
-    ProviderHealth,
-    ProviderRateLimited,
-)
+import pytest
 
-
-def _identity(arguments):
-    return dict(arguments)
+from app import sdk
+from app.discovery.cache import DiscoveryCache
+from app.discovery.models import ProviderUnavailable
+from app.discovery.providers.bangumi import BangumiProvider
+from app.discovery.registry import ProviderRegistry
+from app.discovery.service import DiscoveryService
+from tests.support import FakeHttpSession, FakeJsonResponse, isolated_test_database
 
 
-def _card(index: int = 1, **overrides) -> MediaCard:
-    values = {
-        "provider": "bangumi",
-        "external_id": str(3000 + index),
-        "media_type": "tv",
-        "title": f"放送动画 {index}",
-        "original_title": f"Calendar Anime {index}",
-        "year": "2026",
-        "overview": "安全简介\x00" * 80,
-        "poster_key": "https://image.example/poster?token=secret",
-        "backdrop_key": "https://image.example/backdrop?api_key=secret",
-        "rating": 8.2,
-        "rating_source": "bangumi",
-        "release_date": "2026-08-01",
-        "bangumi_id": str(3000 + index),
-        "weekday": 6,
-        "state": "watchlisted",
-    }
-    values.update(overrides)
-    return MediaCard(**values)
+@pytest.fixture
+def calendar(monkeypatch):
+    monkeypatch.setenv("DISCOVERY_ENABLED", "1")
+    http = FakeHttpSession([FakeJsonResponse([
+        {"weekday": {"id": day}, "items": [{"id": day * 100 + i, "name_cn": f"番剧-{day}-{i}",
+                                           "air_date": "2026-08-01"} for i in range(1, 25)]}
+        for day in range(1, 8)
+    ])])
+    provider = BangumiProvider(session=http, page_size=30)
+    with isolated_test_database():
+        service = DiscoveryService(registry=ProviderRegistry({"bangumi": provider}),
+                                   cache=DiscoveryCache(clock=lambda: datetime(2026, 9, 10)))
+        with patch("app.discovery.service.get_discovery_service", return_value=service):
+            try:
+                yield http, service
+            finally:
+                service.shutdown()
 
 
-class FakeDiscoveryService:
-    def __init__(self, page: DiscoveryPage):
-        self.page = page
-        self.calls: list[tuple[str, str, str, int, dict]] = []
+def test_catalog_default_is_one_full_source_page_and_weekday_is_not_anime_calendar(calendar):
+    http, _ = calendar
+    first = sdk.media.catalog("bangumi", "calendar", "tv")
+    assert len(first["items"]) > 20 and first["has_more"] is True
+    assert {item["provider"] for item in first["items"]} == {"bangumi"}
+    second = sdk.media.catalog("bangumi", "calendar", "tv", page=2)
+    assert set(item["external_id"] for item in first["items"]).isdisjoint(item["external_id"] for item in second["items"])
+    selected = sdk.media.catalog("bangumi", "calendar", "tv", filters={"weekday": "7"})
+    assert len(selected["items"]) == 24 and all(item["weekday"] == 7 for item in selected["items"])
+    assert not selected["has_more"]
+    assert len(http.calls) == 1  # weekday 与分页从同一次完整周历派生。
 
-    def list_items(self, provider, category, media_type, page, filters):
-        self.calls.append((provider, category, media_type, page, dict(filters)))
-        return self.page
+
+@pytest.mark.parametrize("arguments", [
+    {"page": False}, {"page": 101}, {"filters": {"weekday": "0"}}, {"filters": {"weekday": "8"}},
+    {"filters": {"url": "https://untrusted.invalid"}}, {"filters": {"weekday": True}},
+    {"limit": 2}, {"exclude_library": True}, {"region": "日本"},
+])
+def test_calendar_rejects_unsupported_constraints_without_query(calendar, arguments):
+    http, _ = calendar
+    with pytest.raises(ValueError):
+        sdk.media.catalog("bangumi", "calendar", "tv", **arguments)
+    assert http.calls == []
 
 
-class AgentBangumiCalendarTests(unittest.TestCase):
-    def test_arguments_default_and_fail_closed(self):
-        self.assertEqual(calendar_arguments({}), {"page": 1, "limit": 10})
-        self.assertEqual(
-            calendar_arguments({"weekday": 7, "page": 2, "limit": 8}),
-            {"weekday": 7, "page": 2, "limit": 8},
-        )
-        invalid = (
-            None,
-            {"weekday": None},
-            {"page": None},
-            {"limit": None},
-            {"weekday": True},
-            {"weekday": "6"},
-            {"weekday": 0},
-            {"weekday": 8},
-            {"page": False},
-            {"page": 101},
-            {"limit": 0},
-            {"limit": 21},
-            {"provider": "bangumi"},
-            {"category": "today"},
-            {"url": "https://example.invalid"},
-            {"token": "secret"},
-        )
-        for arguments in invalid:
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                calendar_arguments(cast(dict[str, Any], arguments))
-
-    def test_disabled_feature_does_not_create_service(self):
-        service = Mock()
-        with (
-            patch("app.agent.domains.discovery.actions.config.get_bool", return_value=False),
-            patch(
-                "app.agent.domains.discovery.actions.get_discovery_service",
-                return_value=service,
-            ) as getter,
-        ):
-            result = bangumi_calendar({"weekday": 6})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "disabled")
-        getter.assert_not_called()
-        service.list_items.assert_not_called()
-
-    def test_fixed_service_mapping_and_safe_public_payload(self):
-        page = DiscoveryPage(
-            items=(_card(1), _card(2, weekday=7)),
-            page=2,
-            has_more=True,
-            cached=True,
-            stale=True,
-            provider=ProviderHealth(name="bangumi", status="degraded", retry_after=12),
-        )
-        service = FakeDiscoveryService(page)
-        with (
-            patch("app.agent.domains.discovery.actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.discovery.actions.get_discovery_service",
-                return_value=service,
-            ),
-        ):
-            result = bangumi_calendar({"weekday": 6, "page": 2, "limit": 1})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "success")
-        self.assertEqual(
-            service.calls, [("bangumi", "calendar", "tv", 2, {"weekday": "6"})]
-        )
-        self.assertEqual(result.data["weekday"], 6)
-        self.assertEqual(result.data["total"], 2)
-        self.assertEqual(result.data["returned"], 1)
-        self.assertTrue(result.data["has_more"])
-        self.assertTrue(result.data["cached"])
-        self.assertTrue(result.data["stale"])
-        self.assertEqual(result.data["provider_status"], "degraded")
-        self.assertEqual(result.data["retry_after"], 12)
-        self.assertEqual(result.data["items"][0]["weekday"], 6)
-        serialized = repr(result.to_dict()).casefold()
-        for secret in (
-            "poster_key",
-            "backdrop_key",
-            "watchlisted",
-            "api_key",
-            "token=secret",
-            "\\x00",
-        ):
-            self.assertNotIn(secret, serialized)
-
-    def test_all_week_uses_empty_filters_and_empty_status(self):
-        service = FakeDiscoveryService(DiscoveryPage(items=(), page=1))
-        with (
-            patch("app.agent.domains.discovery.actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.discovery.actions.get_discovery_service",
-                return_value=service,
-            ),
-        ):
-            result = bangumi_calendar({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "empty")
-        self.assertEqual(service.calls, [("bangumi", "calendar", "tv", 1, {})])
-        self.assertIsNone(result.data["weekday"])
-
-    def test_provider_and_unexpected_errors_are_generic(self):
-
-        class FailingService:
-            def __init__(self, error):
-                self.error = error
-
-            def list_items(self, *_args, **_kwargs):
-                raise self.error
-
-        for error, expected_retry in (
-            (
-                ProviderRateLimited(
-                    "请求受限", retry_after=42, detail="Bearer should-not-leak"
-                ),
-                42,
-            ),
-            (RuntimeError("should-not-leak"), 0),
-        ):
-            with (
-                self.subTest(error=type(error).__name__),
-                patch("app.agent.domains.discovery.actions.config.get_bool", return_value=True),
-                patch(
-                    "app.agent.domains.discovery.actions.get_discovery_service",
-                    return_value=FailingService(error),
-                ),
-            ):
-                result = bangumi_calendar({"weekday": 6})
-            self.assertFalse(result.ok)
-            self.assertEqual(result.status, "unavailable")
-            self.assertEqual(result.data["retry_after"], expected_retry)
-            self.assertNotIn("should-not-leak", repr(result.to_dict()))
+def test_catalog_cached_empty_and_provider_failure_remain_distinct(calendar):
+    _, service = calendar
+    first = sdk.media.catalog("bangumi", "calendar", "tv", page=100)
+    assert first["items"] == [] and not first["has_more"] and not first["cached"]
+    cached = sdk.media.catalog("bangumi", "calendar", "tv", page=100)
+    assert cached["items"] == [] and cached["cached"]
+    with patch.object(service.registry.get("bangumi"), "list_items", side_effect=ProviderUnavailable("暂不可用")), pytest.raises(ProviderUnavailable):
+        sdk.media.catalog("bangumi", "calendar", "tv", page=99)

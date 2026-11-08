@@ -1,6 +1,7 @@
 """升级前缺精确运行身份的持久跟踪必须收束未知，禁止认领后继运行。"""
 
 from __future__ import annotations
+from dataclasses import asdict
 
 import json
 import unittest
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from app import database as db
 from app.agent import effect_completion as effects
 from app.agent.completion_observers import _CompletionTracker
-from app.agent.domains.library.patrol_status import build_persisted_patrol_projection
+from app.modules.library_patrol import build_persisted_patrol_projection
 from app.agent.kernel.completion_receipts import EffectCompletionScope
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.models import ToolResult
@@ -103,8 +104,8 @@ class CompletionUpgradeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private-old-task", json.dumps(final))
 
     async def test_valid_run_read_failure_remains_retryable_and_recovers_original_result(self):
-        patrol = build_persisted_patrol_projection(ToolResult(True, "up_to_date", "已核对",
-            data={"checked_series_count": 0, "findings": []}))
+        patrol = build_persisted_patrol_projection(asdict(ToolResult(True, "up_to_date", "已核对",
+            data={"checked_series_count": 0, "findings": []})))
         cases = (
             ("strm_run", "strm_sync", "success", {"stats": {"created": 1}}, "completed"),
             ("library_patrol", "agent_library_patrol", "up_to_date", patrol, "up_to_date"),

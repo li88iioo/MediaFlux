@@ -18,13 +18,14 @@ from fastapi.responses import Response
 
 from app import config
 from app import database as db
-from app.agent.async_bridge import run_awaitable_sync
+from app.concurrency import run_awaitable_sync
 from app.agent.model_catalog import fetch_ai_models
 from app.agent.rate_limit import agent_rate_limiter
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.clients.http import FixedHostHttpClient, HttpError
 from app.clients.openai_compatible import (
     PROTOCOLS,
+    REASONING_EFFORTS,
     SUPPORTED_PROTOCOLS_TEXT,
     extract_output_text,
     is_protocol_fallback_error,
@@ -1050,16 +1051,19 @@ async def _test_ai_provider(
     protocol: str,
     model: str,
     timeout_seconds: int,
+    reasoning_effort: str = "",
 ) -> dict[str, Any]:
     """验证结构化输出，并独立探测工具调用与流式输出能力。"""
     profiles_json = config.get("AGENT_LLM_GENERATION_PROFILES", "")
     parse_generation_profiles(profiles_json)
-    location = normalize_provider_location(base_url, https_only=True, public_only=True)
+    location = normalize_provider_location(base_url)
     protocols = protocol_attempts(protocol)
     client = FixedHostHttpClient(
         allowed_hosts={location.host},
+        configured_origin=location.base_url,
         timeout_seconds=timeout_seconds,
-        max_response_bytes=64 * 1024,
+        get_timeout_retries=0,
+        max_response_bytes=2 * 1024 * 1024 if reasoning_effort else 64 * 1024,
         max_redirects=0,
         user_agent="MediaFlux-AI-Model-Test/1.0",
         pin_resolved_address=True,
@@ -1096,7 +1100,9 @@ async def _test_ai_provider(
                 system_prompt=system_prompt,
                 history=history,
                 tools=native_tool_definitions(attempted_protocol, capabilities),
-                max_tokens=64,
+                # 与正式 Agent 一样为思考和工具调用保留额度，验证用户实际配置。
+                max_tokens=16_000 if reasoning_effort else 64,
+                reasoning_effort=reasoning_effort,
                 generation_profile=resolve_generation_profile(
                     profiles_json, location.base_url, model, attempted_protocol,
                 ),
@@ -1143,9 +1149,9 @@ async def _test_ai_provider(
                 received_text = received_text or bool(delta.strip())
             return received_text
 
-    async def _safe_capability_probe(probe) -> bool:
+    async def _safe_capability_probe(probe, *, timeout: float = probe_timeout) -> bool:
         try:
-            return bool(await asyncio.wait_for(probe, timeout=probe_timeout))
+            return bool(await asyncio.wait_for(probe, timeout=timeout))
         except (
             asyncio.TimeoutError,
             httpx.HTTPError,
@@ -1242,7 +1248,9 @@ async def _test_ai_provider(
                 )
 
             tool_calling = await _safe_capability_probe(
-                _probe_tool_calling(attempted_protocol)
+                _probe_tool_calling(attempted_protocol),
+                # 推理等待受整次测试的 deadline 约束，不能提前误判为不支持工具。
+                timeout=timeout_seconds if reasoning_effort else probe_timeout,
             )
             streaming = await _safe_capability_probe(
                 _probe_streaming(attempted_protocol)
@@ -1280,7 +1288,7 @@ async def _test_ai_provider(
 
 @router.post("/ai/models")
 def ai_models(request: Request, data: dict | None = Body(default=None)):
-    """读取用户配置 Provider 的模型列表；不允许跳转或访问内网。"""
+    """读取管理员配置 Provider 的模型列表；不允许跳转。"""
     require_api_login(request)
     data = data or {}
     unknown = sorted(set(data) - {"base_url", "api_key", "protocol"})
@@ -1317,7 +1325,7 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
     data = data or {}
     unknown = sorted(
-        set(data) - {"base_url", "api_key", "protocol", "model", "timeout_seconds"}
+        set(data) - {"base_url", "api_key", "protocol", "model", "timeout_seconds", "reasoning_effort"}
     )
     if unknown:
         return api_error("模型测试包含不支持的参数", 400)
@@ -1358,9 +1366,16 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
         if "timeout_seconds" in data
         else config.get_int("AGENT_LLM_TIMEOUT_SECONDS", 12)
     )
+    reasoning_effort = str(
+        data.get("reasoning_effort")
+        if "reasoning_effort" in data
+        else config.get("AGENT_LLM_REASONING_EFFORT", "")
+    ).strip().lower()
+    if reasoning_effort and reasoning_effort not in REASONING_EFFORTS:
+        return api_error("推理强度仅支持留空、low、medium 或 high", 400)
     try:
         timeout_seconds = _ai_model_test_timeout(timeout_raw)
-        normalize_provider_location(base_url, https_only=True, public_only=True)
+        normalize_provider_location(base_url)
         provider_headers("responses", api_key)
         result = run_awaitable_sync(
             _test_ai_provider(
@@ -1369,6 +1384,7 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
                 protocol=protocol,
                 model=model,
                 timeout_seconds=timeout_seconds,
+                reasoning_effort=reasoning_effort,
             )
         )
     except _AIProviderTestFailure as exc:

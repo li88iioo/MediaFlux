@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from app import database as db
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domains.resources import indexer_actions
+from app import config as indexer_config
 from app.agent.domains.resources.selection import current_candidate_view
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -25,12 +23,11 @@ from app.agent.transports import (
 )
 from app.indexers.models import ResolvedDownload
 from app.modules import download_dispatcher as dispatcher
-from tests.support import isolated_test_database
+from tests.support import isolated_test_database, isolated_indexer_results
 from tests.test_agent_ux_backend import (
     OWNER,
     SECRET,
     SESSION,
-    _resources,
     _runtime,
     _selection,
 )
@@ -50,27 +47,8 @@ class SearchModel:
                 ModelEventType.TOOL_CALL_COMPLETED,
                 tool_call=ModelToolCall(
                     "deep-search",
-                    "indexer.search_resources",
+                    "fixture.resource_read",
                     {"title": "Example"},
-                ),
-            )
-            yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
-        elif request.round_index == 1:
-            evidence = next(
-                message.content
-                for message in reversed(request.messages)
-                if message.role == "tool"
-            )
-            refs = json.loads(evidence)["reference_arguments"]
-            yield ModelEvent(
-                ModelEventType.TOOL_CALL_COMPLETED,
-                tool_call=ModelToolCall(
-                    "deep-present",
-                    "indexer.present_candidates",
-                    {
-                        "resource_candidates_ref": refs["resource_candidates_ref"],
-                        "positions": [1, 2],
-                    },
                 ),
             )
             yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
@@ -85,32 +63,21 @@ class SearchModel:
 def offline_chain():
     with (
         isolated_test_database(),
+        isolated_indexer_results() as service,
         patch("socket.socket.connect", side_effect=AssertionError("禁止实际网络连接")),
     ):
-        resources = {
-            item["result_id"]: SimpleNamespace(**item)
-            for item in _resources().data["items"]
-        }
-
         async def resolve(result_id, *, scope="manual"):
             digest = "a" if result_id.endswith("001") else "b"
             return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + digest * 40)
 
-        service = SimpleNamespace(
-            result_store=SimpleNamespace(get=resources.__getitem__),
-            get_result=lambda key, **_kw: resources[key],
-            resolve=resolve,
-            enabled_site_ids=("demo",),
-        )
+        service.resolve = resolve
+        service.enabled_site_ids = ("demo",)
         with (
-            patch.object(indexer_actions.config, "get_bool", return_value=True),
-            patch.object(indexer_actions, "get_indexer_service", return_value=service),
-            patch.object(
-                indexer_actions,
-                "download_target_readiness",
+            patch.object(indexer_config, "get_bool", return_value=True),
+            patch(
+                "app.indexers.downloads.download_target_readiness",
                 return_value={"qb": True, "guangya": True},
             ),
-            patch.object(indexer_actions, "run_indexer_awaitable_sync", asyncio.run),
             patch.object(
                 dispatcher,
                 "_submit_guangya",
@@ -127,7 +94,7 @@ def offline_chain():
 
 def runtime():
     store = SQLiteKernelStore(secret_provider=lambda: SECRET)
-    session, pipeline, _ = _runtime(store, model=SearchModel())
+    session, pipeline, _ = _runtime(store, model=SearchModel(), present_result=True)
     pipeline.effect_store = ConfirmationEffectPlanStore(SQLiteConfirmationStore())
     session.journal = store
     return session, store
@@ -185,11 +152,10 @@ def test_normal_web_and_telegram_share_search_facts_without_downloading(
             event["payload"] for event in events if event["type"] == "tool.completed"
         ]
         assert [payload["tool"] for payload in completed] == [
-            "indexer.search_resources",
-            "indexer.present_candidates",
+            "fixture.resource_read",
         ]
-        assert completed[0]["result"]["candidate_view"] is None
-        assert completed[1]["result"]["candidate_view"] == candidates
+        assert completed[0]["result"]["candidate_view"] == candidates
+        assert [item["result_id"] for item in candidates["items"]] == ["ux-resource-result-001", "ux-resource-result-002"]
         with db.get_conn() as conn:
             assert (
                 conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0]

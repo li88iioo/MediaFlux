@@ -7,11 +7,49 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 from dotenv import dotenv_values
 
 from app.runtime_paths import RuntimePaths
+
+
+class NativeWorkspaceDeploymentTests(unittest.TestCase):
+    def test_namespace_failure_explains_container_recreation_and_preserves_error(self):
+        from app.agent.kernel import sandbox
+
+        error = "bwrap: No permissions to create a new namespace"
+        probe = sandbox._workspace_probe.__wrapped__
+        for container in ("0", "1"):
+            with self.subTest(container=container), \
+                    patch.dict(os.environ, {"MEDIAFLUX_CONTAINER": container}), \
+                    patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"), \
+                    patch.object(sandbox, "_workspace_probe", probe), \
+                    patch.object(sandbox.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", error)):
+                reason = sandbox.workspace_unavailable_reason()
+                self.assertIn(error, reason)
+                self.assertFalse(sandbox.sandbox_supported())
+                if container == "1":
+                    self.assertIn("seccomp=unconfined", reason)
+                    self.assertIn("apparmor=unconfined", reason)
+                    self.assertIn("重新创建容器", reason)
+                else:
+                    self.assertNotIn("security_opt", reason)
+
+    def test_known_deployment_failures_are_reported_before_running_code(self):
+        from app.agent.kernel import sandbox
+
+        with patch.object(sandbox.shutil, "which", return_value=None):
+            self.assertIn("bubblewrap", sandbox.workspace_unavailable_reason())
+            self.assertFalse(sandbox.sandbox_supported())
+        with patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"):
+            with patch.object(sandbox, "_workspace_probe", return_value="namespace denied"):
+                self.assertEqual(sandbox.workspace_unavailable_reason(), "namespace denied")
+            for uid in (0, 10001):
+                with self.subTest(uid=uid), patch.object(sandbox.os, "geteuid", return_value=uid), \
+                        patch.object(sandbox, "_workspace_probe", return_value=""):
+                    self.assertTrue(sandbox.sandbox_supported())
 
 
 class DockerRuntimeContractTests(unittest.TestCase):
@@ -49,6 +87,20 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn('CMD ["uvicorn"', self.dockerfile)
         self.assertNotRegex(self.dockerfile, r"--workers(?:=|\s+)[2-9]")
         self.assertIn("# 后台调度器与 Telegram Bot 采用进程内单例", self.dockerfile)
+
+    def test_compose_allows_bubblewrap_inside_the_single_python_service(self) -> None:
+        for name, compose in (("production", self.compose), ("development", self.dev_compose)):
+            with self.subTest(compose=name):
+                self.assertEqual(set(compose["services"]), {"mediaflux"})
+                service = compose["services"]["mediaflux"]
+                self.assertCountEqual(
+                    service["security_opt"],
+                    ["seccomp=unconfined", "apparmor=unconfined"],
+                )
+                self.assertNotIn("privileged", service)
+                self.assertNotIn("cap_add", service)
+                self.assertNotIn("entrypoint", service)
+                self.assertNotIn("command", service)
 
     def test_build_identity_arguments_are_scoped_after_dependency_installation(self) -> None:
         self.assertIn("RUN npm install --global npm@12.2.1 --ignore-scripts", self.dockerfile)
@@ -206,9 +258,14 @@ class DockerRuntimeContractTests(unittest.TestCase):
     def test_image_entrypoint_defaults_to_nas_compatibility_and_supports_drop_privileges(
         self,
     ) -> None:
-        self.assertIn(
-            "apt-get install -y --no-install-recommends ffmpeg gosu", self.dockerfile
-        )
+        packages = re.search(r"apt-get install -y --no-install-recommends ([^\\\n]+)", self.dockerfile)
+        self.assertIsNotNone(packages)
+        self.assertTrue({"ffmpeg", "gosu", "bubblewrap", "libseccomp2"}.issubset(
+            packages.group(1).split() if packages else []
+        ))
+        self.assertIn("bwrap --version >/dev/null 2>&1", self.dockerfile)
+        self.assertNotIn("build_agent_root.py", self.dockerfile)
+        self.assertNotIn("/usr/local/lib/mediaflux-workspace", self.dockerfile)
         self.assertIn("MEDIAFLUX_FFPROBE=/usr/bin/ffprobe", self.dockerfile)
         self.assertIn("/usr/bin/ffprobe -version >/dev/null 2>&1", self.dockerfile)
         self.assertIn("COPY packaging/scripts/docker-entrypoint.sh", self.dockerfile)

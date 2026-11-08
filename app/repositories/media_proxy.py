@@ -648,10 +648,7 @@ def clear_media_proxy_playback_records(instance_id: int | None = None) -> int:
         return cursor.rowcount
 
 
-def get_media_proxy_playback_failure_summary(
-    *, hours: int = 24, instance_id: int | None = None
-) -> dict:
-    """聚合固定时间窗内已记录的反代请求，不返回媒体身份或错误正文。"""
+def _playback_failure_filter(hours: int, instance_id: int | None) -> tuple[str, list]:
     normalized_hours = hours
     if normalized_hours not in {1, 6, 24, 72}:
         raise ValueError("播放故障摘要仅支持 1、6、24 或 72 小时")
@@ -664,36 +661,39 @@ def get_media_proxy_playback_failure_summary(
         clauses.append("instance_id=?")
         params.append(instance_id)
     where = " AND ".join(clauses)
-    with _playback_read_snapshot() as conn:
-        totals = conn.execute(
-            "SELECT COUNT(*) AS total,"
-            "SUM(CASE WHEN status_code=0 OR status_code>=400 THEN 1 ELSE 0 END) AS failed,"
-            "SUM(CASE WHEN cache_hit=1 THEN 1 ELSE 0 END) AS cache_hits,"
-            "AVG(CASE WHEN total_latency_ms>=0 THEN total_latency_ms END) AS avg_latency "
-            f"FROM media_proxy_playback_records WHERE {where}",
-            params,
-        ).fetchone()
-        stages = conn.execute(
-            "SELECT CASE WHEN TRIM(failure_stage)='' THEN 'unknown' ELSE failure_stage END AS value,"
-            "COUNT(*) AS total FROM media_proxy_playback_records "
-            f"WHERE {where} AND (status_code=0 OR status_code>=400) "
-            "GROUP BY value ORDER BY total DESC,value LIMIT 8",
-            params,
-        ).fetchall()
-        routes = conn.execute(
-            "SELECT route_class AS value,COUNT(*) AS total "
-            f"FROM media_proxy_playback_records WHERE {where} "
-            "GROUP BY route_class ORDER BY total DESC,value LIMIT 8",
-            params,
-        ).fetchall()
-        last = conn.execute(
-            "SELECT MAX(created_at) AS last_seen FROM media_proxy_playback_records "
-            f"WHERE {where}", params,
-        ).fetchone()
+    return where, params
+
+
+def _playback_failure_summary(conn: sqlite3.Connection, where: str, params: list, hours: int) -> dict:
+    totals = conn.execute(
+        "SELECT COUNT(*) AS total,"
+        "SUM(CASE WHEN status_code=0 OR status_code>=400 THEN 1 ELSE 0 END) AS failed,"
+        "SUM(CASE WHEN cache_hit=1 THEN 1 ELSE 0 END) AS cache_hits,"
+        "AVG(CASE WHEN total_latency_ms>=0 THEN total_latency_ms END) AS avg_latency "
+        f"FROM media_proxy_playback_records WHERE {where}",
+        params,
+    ).fetchone()
+    stages = conn.execute(
+        "SELECT CASE WHEN TRIM(failure_stage)='' THEN 'unknown' ELSE failure_stage END AS value,"
+        "COUNT(*) AS total FROM media_proxy_playback_records "
+        f"WHERE {where} AND (status_code=0 OR status_code>=400) "
+        "GROUP BY value ORDER BY total DESC,value LIMIT 8",
+        params,
+    ).fetchall()
+    routes = conn.execute(
+        "SELECT route_class AS value,COUNT(*) AS total "
+        f"FROM media_proxy_playback_records WHERE {where} "
+        "GROUP BY route_class ORDER BY total DESC,value LIMIT 8",
+        params,
+    ).fetchall()
+    last = conn.execute(
+        "SELECT MAX(created_at) AS last_seen FROM media_proxy_playback_records "
+        f"WHERE {where}", params,
+    ).fetchone()
     total = int(totals["total"] or 0) if totals else 0
     failed = int(totals["failed"] or 0) if totals else 0
     return {
-        "window_hours": normalized_hours,
+        "window_hours": hours,
         "total_recorded": total,
         "failed": failed,
         "success": max(0, total - failed),
@@ -711,6 +711,37 @@ def get_media_proxy_playback_failure_summary(
         "last_seen_at": str(last["last_seen"] or "") if last else "",
         "coverage": "recorded_proxy_requests_only",
     }
+
+
+def get_media_proxy_playback_failure_summary(
+    *, hours: int = 24, instance_id: int | None = None
+) -> dict:
+    """聚合固定时间窗内已记录的反代请求，不返回媒体身份或错误正文。"""
+    where, params = _playback_failure_filter(hours, instance_id)
+    with _playback_read_snapshot() as conn:
+        return _playback_failure_summary(conn, where, params, hours)
+
+
+def media_proxy_failure_facts(*, hours: int = 24, instance_id: int | None = None,
+                              limit: int = 50, offset: int = 0) -> dict:
+    """同一 SQLite 快照返回原故障汇总与完整已保存失败记录，明细可继续分页。"""
+    if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or offset < 0:
+        raise ValueError("limit 必须在1-200之间，offset必须为非负整数")
+    where, params = _playback_failure_filter(hours, instance_id)
+    with _playback_read_snapshot() as conn:
+        summary = _playback_failure_summary(conn, where, params, hours)
+        rows = conn.execute(
+            "SELECT * FROM media_proxy_playback_records WHERE " + where
+            + " AND (status_code=0 OR status_code>=400) ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    items = [dict(row) for row in rows]
+    total = summary["failed"]
+    return {**summary, "items": items, "total": total, "returned": len(items),
+            "has_more": offset + len(items) < total,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+            "summary_group_limit": 8, "error_representation": "stored_redacted_text",
+            "error_note": "error保留账本中完整已保存文本；写入时已脱敏并最多保留1000字，不能还原上游原文。"}
 
 
 def _prune_playback_history(conn: sqlite3.Connection, *, retained_rows: int) -> None:

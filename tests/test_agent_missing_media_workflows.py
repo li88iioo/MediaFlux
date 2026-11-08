@@ -2,23 +2,23 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from unittest.mock import patch
 
 from app import database as db
 from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmissionStore,
-    enqueue_recent_download_library_verification,
     parse_recent_download_verification_context,
 )
 from app.agent.domains.library.missing_workflow_runtime import (
     MissingMediaWorkflowRuntime,
 )
-from app.agent.domains.library.missing_workflows import (
+from app.repositories.agent_download_verification import (
     SQLiteMissingMediaWorkflowRepository,
-    list_missing_workflows,
     workflow_followup_context,
     workflow_ref_from_context,
 )
-from app.agent.models import ToolContext, ToolResult
+from app.agent.models import ToolResult
 from tests.support import IsolatedDatabaseTestCase
 
 _VERIFICATION = {
@@ -30,31 +30,15 @@ _VERIFICATION = {
 }
 
 
-def _search_result(*, candidate: bool = True) -> ToolResult:
-    selected = {
-        "result_id": "resource-result-secret",
-        "title": "The.Show.S02E03.1080p",
-        "site_id": "nyaa",
-        "magnet": "magnet:?xt=urn:btih:must-not-persist",
-        "url": "https://secret.invalid/resource",
-        "path": "/private/must-not-persist",
-    } if candidate else None
-    return ToolResult(
-        True,
-        "success",
-        "searched",
-        data={
-            "verification": {
-                **_VERIFICATION,
-                "verified_missing": True,
-                "sources": [{"path": "/secret/library"}],
-            },
-            "search": {
-                "items": [{"private_url": "https://secret.invalid/item"}],
-                "recommendation": {"selected": selected, "alternatives": []},
-            },
-        },
-    )
+def _search_result(*, candidate: bool = True) -> dict:
+    return {"verification": {**_VERIFICATION, "verified_missing": True, "sources": [{"path":"/secret/library"}]},
+            "episodes": [{"episode": _VERIFICATION["episode"], "has_candidate": candidate}]}
+
+
+def query_workflows(repository, *, owner, limit=10):
+    from app.modules import missing_resources
+    with patch.object(missing_resources, "SQLiteMissingMediaWorkflowRepository", return_value=repository):
+        return missing_resources.missing_workflows(owner=owner, limit=limit)
 
 
 def _submission_result(request_id: int) -> ToolResult:
@@ -62,8 +46,8 @@ def _submission_result(request_id: int) -> ToolResult:
         True,
         "accepted",
         "submitted",
-        data={
-            "request_id": request_id,
+        data={"items": [{
+            "result_id": "resource-result-secret", "request_id": request_id,
             "target": "qb",
             "status": "submitted",
             "succeeded": ["qb"],
@@ -72,7 +56,7 @@ def _submission_result(request_id: int) -> ToolResult:
             "duplicate": False,
             "magnet": "magnet:?xt=urn:btih:must-not-persist",
             "path": "/private/must-not-persist",
-        },
+        }]},
     )
 
 
@@ -91,35 +75,18 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
     def test_kernel_runtime_closes_search_selection_submission_verification_chain(self):
         recent = RecentDownloadSubmissionStore()
 
-        def enqueue(result, context, _owner):
-            workflow_ref = workflow_ref_from_context(context)
-            request_id = int(result.data["request_id"])
-            return bool(
-                workflow_ref
-                and self.repository.attach_submission(
-                    workflow_ref=workflow_ref,
-                    request_id=request_id,
-                    verification_enqueued=True,
-                )
-            )
-
         runtime = MissingMediaWorkflowRuntime(
             repository=self.repository,
             recent_download_store=recent,
-            verification_enqueuer=enqueue,
         )
         self.assertTrue(
-            runtime.capture_search(
-                owner="session-a",
-                tool_name="library.search_missing_episode_resources",
-                result=_search_result(),
-            )
+            runtime.repository.capture_search(owner="session-a", **_search_result())
         )
         followups = runtime.stage_candidates(
             owner="session-a",
             candidates=[
                 {
-                    "verification": _VERIFICATION,
+                    "result_id": "resource-result-secret", "verification": _VERIFICATION,
                     "candidate_title": "The.Show.S02E03.1080p",
                     "target": "qb",
                 }
@@ -133,16 +100,17 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
 
         request_id, created = db.create_download_request(
             "kernel-runtime-closed-loop",
-            "magnet",
+            "magnet", verification_targets=[_VERIFICATION], verification_owner="session-a",
             title="The Show S02E03",
             origin="agent:session-a",
         )
         self.assertTrue(created)
+        db.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
         submission = _submission_result(request_id)
         submission.data["source_type"] = "resource_candidates"
         runtime.complete_submission(
             owner="session-a",
-            tool_name="ingest.submit",
+            tool_name="resources.download",
             result=submission,
             followups=followups,
         )
@@ -150,24 +118,54 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
         row = self.repository.list_for_owner(owner="session-a")[0]
         self.assertEqual(row["item_state"], "verification_pending")
         self.assertEqual(row["download_request_id"], request_id)
+        job = db.get_agent_download_verification(request_id)
+        assert job is not None
+        self.assertEqual(job["owner"], "session-a")
         captured = recent.get(owner="session-a")
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0].request_id, request_id)
         assert captured[0].verification is not None
         self.assertEqual(captured[0].verification.episode, 3)
 
+    def test_native_pack_joins_every_frozen_target_only_to_matching_owner_job(self):
+        for mode in ("all_targets", "missing_second", "foreign_owner"):
+            with self.subTest(mode=mode):
+                owner = "pack-" + mode
+                runtime = MissingMediaWorkflowRuntime(repository=self.repository)
+                proofs = [{**_VERIFICATION, "episode": episode} for episode in (3, 4)]
+                searched = _search_result()
+                searched["episodes"] = [{"episode": episode, "has_candidate": True} for episode in (3, 4)]
+                runtime.repository.capture_search(owner=owner, **searched)
+                followups = runtime.stage_candidates(owner=owner, candidates=[{
+                    "result_id": "resource-result-secret", "verification": proof,
+                    "candidate_title": "The.Show.S02.Pack", "target": "qb",
+                } for proof in proofs])
+                request_id, _ = db.create_download_request("native-pack-"+mode, "magnet", origin="agent",
+                    verification_targets=proofs[:1] if mode == "missing_second" else proofs,
+                    verification_owner="foreign" if mode == "foreign_owner" else owner)
+                db.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
+                result = _submission_result(request_id)
+                before = deepcopy(result.to_dict())
+                runtime.complete_submission(owner=owner, tool_name="resources.download", result=result, followups=followups)
+                rows = {row["episode"]: row for row in self.repository.list_for_owner(owner=owner)}
+                for episode in (3, 4):
+                    attached = mode == "all_targets" or (mode == "missing_second" and episode == 3)
+                    self.assertEqual(rows[episode]["item_state"], "verification_pending" if attached else "selection_required")
+                    if attached:
+                        self.assertEqual(rows[episode]["download_request_id"], request_id)
+                self.assertEqual(result.to_dict(), before)
+                request = db.get_download_request(request_id)
+                assert request is not None
+                self.assertEqual(request["status"], "submitted")
+
     def test_kernel_runtime_releases_cancelled_confirmation_for_reselection(self):
         runtime = MissingMediaWorkflowRuntime(repository=self.repository)
-        runtime.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_episode_resources",
-            result=_search_result(),
-        )
+        runtime.repository.capture_search(owner="session-a", **_search_result())
         followups = runtime.stage_candidates(
             owner="session-a",
             candidates=[
                 {
-                    "verification": _VERIFICATION,
+                    "result_id": "resource-result-secret", "verification": _VERIFICATION,
                     "candidate_title": "The.Show.S02E03.1080p",
                     "target": "qb",
                 }
@@ -184,12 +182,30 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
                 target="guangya",
             )) is not None
 
+    def test_registration_failure_preserves_accepted_receipt_and_recent_request(self):
+        recent = RecentDownloadSubmissionStore()
+        runtime = MissingMediaWorkflowRuntime(repository=self.repository, recent_download_store=recent)
+        runtime.repository.capture_search(owner="session-a", **_search_result())
+        followups = runtime.stage_candidates(owner="session-a", candidates=[{
+            "result_id": "resource-result-secret", "verification": _VERIFICATION, "candidate_title": "The.Show.S02E03", "target": "qb",
+        }])
+        request_id, _ = db.create_download_request("registration-error", "magnet", origin="agent")
+        db.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
+        result = _submission_result(request_id)
+        result.data["source_type"] = "resource_candidates"
+        original = deepcopy(result.to_dict())
+        with patch.object(db, "get_agent_download_verification", side_effect=RuntimeError("storage unavailable")):
+            runtime.complete_submission(owner="session-a", tool_name="resources.download", result=result, followups=followups)
+        self.assertEqual(result.to_dict(), original)
+        self.assertEqual(recent.get(owner="session-a")[0].request_id, request_id)
+        self.assertIsNone(db.get_agent_download_verification(request_id))
+        self.assertNotEqual(self.repository.list_for_owner(owner="session-a")[0]["item_state"], "verification_pending")
+        request = db.get_download_request(request_id)
+        assert request is not None
+        self.assertEqual(request["status"], "submitted")
+
     def test_search_projection_is_owner_scoped_and_persists_no_resource_secret(self):
-        workflow_id = self.repository.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_episode_resources",
-            result=_search_result(),
-        )
+        workflow_id = self.repository.capture_search(owner="session-a", **_search_result())
         self.assertTrue(workflow_id)
         self.assertEqual(len(self.repository.list_for_owner(owner="session-a")), 1)
         self.assertEqual(self.repository.list_for_owner(owner="session-b"), ())
@@ -218,11 +234,7 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
         self.assertIsNone(item["download_request_id"])
 
     def test_selection_submission_restart_and_visible_verification_form_closed_loop(self):
-        self.repository.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_episode_resources",
-            result=_search_result(),
-        )
+        self.repository.capture_search(owner="session-a", **_search_result())
         ref = self.repository.select_candidate(
             owner="session-a",
             verification=_VERIFICATION,
@@ -249,7 +261,7 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
 
         request_id, created = db.create_download_request(
             "workflow-closed-loop",
-            "magnet",
+            "magnet", verification_targets=[{**_VERIFICATION, "library_name": "动漫库"}], verification_owner="session-a",
             title="The Show S02E03",
             origin="agent:session-a",
         )
@@ -260,10 +272,13 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             status="downloading",
             qb_status="downloading",
         )
-        self.assertTrue(enqueue_recent_download_library_verification(
-            _submission_result(request_id),
-            context,
-        ))
+        submission = _submission_result(request_id)
+        submission.data["source_type"] = "resource_candidates"
+        assert context is not None
+        context["result_id"] = "resource-result-secret"
+        MissingMediaWorkflowRuntime(repository=self.repository).complete_submission(
+            owner="session-a", tool_name="resources.download", result=submission, followups=[context],
+        )
 
         restarted = SQLiteMissingMediaWorkflowRepository(
             secret_provider=lambda: "workflow-test-secret"
@@ -276,6 +291,7 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             request_id=request_id,
             status="visible",
             result="visible",
+            targets=[{**_VERIFICATION, "result": "visible"}],
         ))
         final_row = restarted.list_for_owner(owner="session-a")[0]
         self.assertEqual(final_row["state"], "visible")
@@ -284,14 +300,38 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             request_id=request_id,
             status="visible",
             result="visible",
+            targets=[{**_VERIFICATION, "result": "visible"}],
         ))
 
+    def test_pack_verification_projects_each_episode_including_late_attachment(self):
+        targets = [{**_VERIFICATION, "episode": episode} for episode in (3, 4)]
+        refs = []
+        for target in targets:
+            search = _search_result()
+            search["verification"].update(target)
+            search["episodes"] = [{"episode": target["episode"], "has_candidate": True}]
+            self.repository.capture_search(owner="session-a", **search)
+            ref = self.repository.select_candidate(owner="session-a", verification=target, candidate_title="The.Show.S02.Pack", target="qb")
+            assert ref is not None
+            refs.append({"workflow_id": ref.workflow_id, "item_id": ref.item_id, "revision": ref.revision})
+        request, _ = db.create_download_request("two-episode-pack", "magnet", origin="agent", verification_targets=targets, verification_owner="session-a")
+        self.assertTrue(self.repository.attach_submission(workflow_ref=refs[0], request_id=request, verification_enqueued=True))
+        job = db.claim_due_agent_download_verification()
+        assert job is not None
+        results = [{**target, "result": "visible" if target["episode"] == 3 else "missing"} for target in job["targets"]]
+        self.assertTrue(db.update_agent_download_verification(
+            request, status="attention", result="missing", attempts=3, next_check_at=db.now(),
+            expected_lease_generation=job["lease_generation"], targets=results,
+        ))
+        cold = SQLiteMissingMediaWorkflowRepository(secret_provider=lambda: "workflow-test-secret")
+        self.assertTrue(cold.finish_verification(request_id=request, status="attention", result="missing", targets=results))
+        self.assertTrue(cold.attach_submission(workflow_ref=refs[1], request_id=request, verification_enqueued=True))
+        states = {row["episode"]: row["item_state"] for row in cold.list_for_owner(owner="session-a")}
+        self.assertEqual(states, {3: "visible", 4: "attention"})
+        self.assertFalse(cold.finish_verification(request_id=request, status="attention", result="missing", targets=results))
+
     def test_cancel_or_expiry_releases_confirmation_for_reselection(self):
-        self.repository.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_episode_resources",
-            result=_search_result(),
-        )
+        self.repository.capture_search(owner="session-a", **_search_result())
         first = self.repository.select_candidate(
             owner="session-a",
             verification=_VERIFICATION,
@@ -336,16 +376,8 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
         assert (third) is not None
 
     def test_new_search_stales_previous_active_workflow_and_public_view_is_safe(self):
-        first_id = self.repository.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_episode_resources",
-            result=_search_result(),
-        )
-        second_id = self.repository.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_episode_resources",
-            result=_search_result(candidate=False),
-        )
+        first_id = self.repository.capture_search(owner="session-a", **_search_result())
+        second_id = self.repository.capture_search(owner="session-a", **_search_result(candidate=False))
         self.assertNotEqual(first_id, second_id)
         rows = self.repository.list_for_owner(owner="session-a")
         states = {str(row["workflow_id"]): str(row["state"]) for row in rows}
@@ -353,68 +385,27 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
         self.assertEqual(states[first_id], "stale")
         self.assertEqual(states[second_id], "search_ready")
 
-        public = list_missing_workflows(
-            {"limit": 10},
-            ToolContext(owner="session-a"),
-            repository=self.repository,
-        )
-        self.assertTrue(public.ok)
-        self.assertEqual(public.status, "attention")
-        self.assertEqual(public.data["total"], 2)
-        self.assertGreaterEqual(public.data["attention"], 1)
-        serialized = json.dumps(public.data, ensure_ascii=False)
+        public = query_workflows(self.repository, owner="session-a", limit=10)
+        self.assertTrue(public["ok"])
+        self.assertEqual(public["status"], "attention")
+        self.assertEqual(public["total"], 2)
+        serialized = json.dumps(public, ensure_ascii=False)
         for secret in (
-            first_id,
-            second_id,
-            "workflow_id",
-            "item_id",
-            "tmdb_id",
             "resource-result-secret",
             "magnet:",
             "secret.invalid",
             "/private/",
         ):
             self.assertNotIn(secret, serialized)
-        self.assertTrue(any("重新搜索" in suggestion for suggestion in public.suggestions))
+        self.assertEqual({w["workflow_id"] for w in public["workflows"]}, {first_id,second_id})
 
     def test_listing_limit_keeps_every_episode_of_selected_workflow(self):
-        result = ToolResult(
-            True,
-            "success",
-            "searched season",
-            data={
-                "verification": {
-                    "title": "Long Season",
-                    "tmdb_id": "98765",
-                    "season": 1,
-                    "as_of": "2026-08-03",
-                    "verified_missing": True,
-                },
-                "episodes": [
-                    {
-                        "episode": episode,
-                        "search": {
-                            "recommendation": {
-                                "selected": {"title": f"Long.Season.E{episode:02d}"},
-                                "alternatives": [],
-                            }
-                        },
-                    }
-                    for episode in range(1, 13)
-                ],
-            },
-        )
-        self.repository.capture_search(
-            owner="session-a",
-            tool_name="library.search_missing_season_resources",
-            result=result,
-        )
+        result = {"verification": {"title":"Long Season", "tmdb_id":"98765", "season":1,
+                                   "as_of":"2026-08-03", "verified_missing":True},
+                  "episodes": [{"episode": e, "has_candidate": True} for e in range(1,13)]}
+        self.repository.capture_search(owner="session-a", **result)
         rows = self.repository.list_for_owner(owner="session-a", limit=1)
         self.assertEqual(len(rows), 12)
-        public = list_missing_workflows(
-            {"limit": 1},
-            ToolContext(owner="session-a"),
-            repository=self.repository,
-        )
-        self.assertEqual(len(public.data["workflows"]), 1)
-        self.assertEqual(len(public.data["workflows"][0]["items"]), 12)
+        public = query_workflows(self.repository, owner="session-a", limit=1)
+        self.assertEqual(len(public["workflows"]), 1)
+        self.assertEqual(len(public["workflows"][0]["items"]), 12)

@@ -42,6 +42,8 @@ _CATEGORY_MEDIA: dict[str, dict[str, set[str]]] = {
     "bangumi": {"calendar": {"tv"}},
 }
 
+COLLECTION_CATEGORIES = {"tmdb": "discover", "douban": "recommend"}
+
 _TMDB_MOVIE_GENRES = {
     "28": "动作", "12": "冒险", "16": "动画", "35": "喜剧",
     "80": "犯罪", "99": "纪录片", "18": "剧情", "10751": "家庭",
@@ -115,22 +117,14 @@ def validate_request(provider: str, category: str, media_type: str) -> tuple[str
 def validate_filters(provider: str, category: str, media_type: str,
                      filters: dict[str, Any] | None) -> dict[str, str]:
     provider, category, media_type = validate_request(provider, category, media_type)
-    raw = filters or {}
+    raw = {} if filters is None else filters
     if not isinstance(raw, dict):
         raise ValueError("筛选参数必须是对象")
-    allowed: set[str] = set()
-    date_field = "primary_release_date" if media_type == "movie" else "first_air_date"
-    if provider == "tmdb" and category == "discover":
-        allowed = {
-            "with_genres", "with_original_language", "with_origin_country", "sort_by",
-            "primary_release_year", "first_air_date_year",
-        }
-        date_field = "release_date" if media_type == "movie" else "first_air_date"
-        allowed.update(f"{date_field}.{bound}" for bound in ("gte", "lte"))
-    elif provider == "douban" and category == "recommend":
-        allowed = {"sort", "tags"}
-    elif provider == "bangumi" and category == "calendar":
-        allowed = {"weekday"}
+    definition = (list_filter_definitions(provider, media_type)
+                  if (provider, category, media_type) in _FILTER_DEFAULTS else {})
+    allowed = {field["key"] for group in ("filters", "extra_filters")
+               for field in definition.get(group, [])}
+    date_field = "release_date" if media_type == "movie" else "first_air_date"
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(f"包含不支持的筛选项: {', '.join(sorted(unknown))}")
@@ -150,6 +144,12 @@ def validate_filters(provider: str, category: str, media_type: str,
                 date.fromisoformat(value)
         if lower and upper and lower > upper:
             raise ValueError("TMDB 日期范围顺序无效")
+        lower_score, upper_score = (float(result.get(f"vote_average.{bound}", default))
+                                    for bound, default in (("gte", "0"), ("lte", "10")))
+        if not 0 <= lower_score <= upper_score <= 10:
+            raise ValueError("TMDB 评分范围必须在 0 到 10 且下限不大于上限")
+        if "vote_count.gte" in result and not re.fullmatch(r"[0-9]+", result["vote_count.gte"]):
+            raise ValueError("TMDB 最低投票人数必须是非负整数")
     if "with_genres" in result:
         genres = _TMDB_MOVIE_GENRES if media_type == "movie" else _TMDB_TV_GENRES
         values = [value.strip() for value in result["with_genres"].split(",") if value.strip()]
@@ -159,10 +159,6 @@ def validate_filters(provider: str, category: str, media_type: str,
     for year_key in ("primary_release_year", "first_air_date_year"):
         if year_key in result and not re.fullmatch(r"(?:19|20)[0-9]{2}", result[year_key]):
             raise ValueError("TMDB 年份筛选无效")
-    if media_type == "movie" and "first_air_date_year" in result:
-        raise ValueError("TMDB 年份筛选与媒体类型不匹配")
-    if media_type == "tv" and "primary_release_year" in result:
-        raise ValueError("TMDB 年份筛选与媒体类型不匹配")
     if "with_origin_country" in result:
         result["with_origin_country"] = result["with_origin_country"].upper()
         if not re.fullmatch(r"[A-Z]{2}", result["with_origin_country"]):
@@ -203,67 +199,64 @@ def _plain_options(values: set[str]) -> list[dict[str, str]]:
     return [{"value": value, "label": value} for value in sorted(values)]
 
 
+def list_catalog_definitions() -> list[dict[str, Any]]:
+    """全部可查询栏目来自实际请求注册表；首页栏目只决定页面布局。"""
+    douban_enabled = config.get_bool("DISCOVERY_DOUBAN_ENABLED", True)
+    return [{"provider": provider, "category": category, "media_types": sorted(media_types),
+             "enabled": douban_enabled if provider == "douban" else True,
+             "supports_collection": COLLECTION_CATEGORIES.get(provider) == category}
+            for provider, categories in _CATEGORY_MEDIA.items()
+            for category, media_types in categories.items()]
+
+
 def list_filter_definitions(provider: str, media_type: str) -> dict[str, Any]:
     provider = (provider or "").strip().lower()
     media_type = (media_type or "").strip().lower()
+    extra_filters = []
     if provider == "tmdb" and media_type in {"movie", "tv"}:
+        category = COLLECTION_CATEGORIES[provider]
         genres = _TMDB_MOVIE_GENRES if media_type == "movie" else _TMDB_TV_GENRES
         sorts = _TMDB_MOVIE_SORTS if media_type == "movie" else _TMDB_TV_SORTS
-        return {
-            "filters": [
-                {
-                    "key": "with_genres",
-                    "label": "类型",
-                    "all_label": "全部类型",
-                    "options": _filter_options(genres),
-                },
-                {
-                    "key": "with_original_language",
-                    "label": "原始语言",
-                    "all_label": "全部语言",
-                    "options": _filter_options(_LANGUAGES),
-                },
-                {
-                    "key": "sort_by",
-                    "label": "排序",
-                    "all_label": "默认排序",
-                    "options": _filter_options(sorts),
-                },
-            ],
-            "defaults": dict(_FILTER_DEFAULTS[("tmdb", "discover", media_type)]),
-        }
-    if provider == "douban" and media_type in {"movie", "tv"}:
+        fields = [("with_genres", "类型", "全部类型", genres),
+                  ("with_original_language", "原始语言", "全部语言", _LANGUAGES),
+                  ("sort_by", "排序", "默认排序", sorts)]
+        date_field = "release_date" if media_type == "movie" else "first_air_date"
+        year_field = "primary_release_year" if media_type == "movie" else "first_air_date_year"
+        extra_filters = [
+            {"key": "vote_average.gte", "label": "最低评分", "format": "0–10", "example": "7"},
+            {"key": "vote_average.lte", "label": "最高评分", "format": "0–10", "example": "10"},
+            {"key": "vote_count.gte", "label": "最低投票人数", "format": "非负整数", "example": "100"},
+            {"key": "with_origin_country", "label": "产地", "format": "ISO 3166-1 alpha-2", "example": "CN"},
+            {"key": year_field, "label": "年份", "format": "YYYY (1900–2099)", "example": "2020"},
+            {"key": f"{date_field}.gte", "label": "起始日期", "format": "YYYY-MM-DD (1900–2099)", "example": "2016-01-01"},
+            {"key": f"{date_field}.lte", "label": "截止日期", "format": "YYYY-MM-DD (1900–2099)", "example": "2026-12-31"},
+        ]
+    elif provider == "douban" and media_type in {"movie", "tv"}:
+        category = COLLECTION_CATEGORIES[provider]
         tags = _DOUBAN_MOVIE_TAGS if media_type == "movie" else _DOUBAN_TV_TAGS
-        return {
-            "filters": [
-                {
-                    "key": "sort",
-                    "label": "排序方式",
-                    "all_label": "默认排序",
-                    "options": _filter_options(_DOUBAN_SORTS),
-                },
-                {
-                    "key": "tags",
-                    "label": "类型 / 地区",
-                    "all_label": "全部",
-                    "options": _plain_options(tags) if isinstance(tags, set) else _filter_options(tags),
-                },
-            ],
-            "defaults": dict(_FILTER_DEFAULTS[("douban", "recommend", media_type)]),
-        }
-    if provider == "bangumi" and media_type == "tv":
-        return {
-            "filters": [
-                {
-                    "key": "weekday",
-                    "label": "放送星期",
-                    "all_label": "全部星期",
-                    "options": _filter_options(_WEEKDAYS),
-                },
-            ],
-            "defaults": dict(_FILTER_DEFAULTS[("bangumi", "calendar", "tv")]),
-        }
-    raise ValueError("不支持的数据源或媒体类型")
+        fields = [("sort", "排序方式", "默认排序", _DOUBAN_SORTS),
+                  ("tags", "类型 / 地区", "全部", tags)]
+    elif provider == "bangumi" and media_type == "tv":
+        category = "calendar"
+        fields = [("weekday", "放送星期", "全部星期", _WEEKDAYS)]
+    else:
+        raise ValueError("不支持的数据源或媒体类型")
+    return {
+        "category": category,
+        "filters": [{"key": key, "label": label, "all_label": all_label,
+                     "options": _plain_options(values) if isinstance(values, set) else _filter_options(values)}
+                    for key, label, all_label, values in fields],
+        "extra_filters": extra_filters,
+        "defaults": dict(_FILTER_DEFAULTS[(provider, category, media_type)]),
+    }
+
+
+# HTTP 入口仅识别参数名，具体栏目和值仍由 validate_filters 校验。
+FILTER_QUERY_KEYS = frozenset(
+    field["key"] for provider, _category, media_type in _FILTER_DEFAULTS
+    for group in ("filters", "extra_filters")
+    for field in list_filter_definitions(provider, media_type)[group]
+)
 
 
 class ProviderRegistry:

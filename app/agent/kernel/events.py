@@ -16,6 +16,7 @@ class AgentEventType(StrEnum):
     CAPABILITIES_SELECTED = "capabilities.selected"
     MODEL_STARTED = "model.started"
     MODEL_DELTA = "model.delta"
+    MODEL_REASONING_SUMMARY_DELTA = "model.reasoning_summary.delta"
     MODEL_TOOL_CALL = "model.tool_call"
     TOOL_STARTED = "tool.started"
     TOOL_PROGRESS = "tool.progress"

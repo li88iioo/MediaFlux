@@ -3,10 +3,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 import json
 import unittest
+import unicodedata
 
 from app.agent.public_view import (
     format_partial_progress,
     format_public_result,
+    public_active_turn_events,
+    public_activities,
     public_conversation_messages,
     public_result_state,
     sanitize_confirmed_answer,
@@ -14,6 +17,95 @@ from app.agent.public_view import (
 
 
 class AgentKernelPublicViewTests(unittest.TestCase):
+    def test_activity_snapshot_preserves_business_facts_without_execution_payloads(self):
+        active = {"request_id": "request", "turn_id": "turn"}
+        activity = {"id": "read:1", "kind": "tool", "method": "watchlist.list",
+                    "label": "读取收藏片单", "status": "partial", "summary": "本次返回 14 项；还有后续页",
+                    "arguments": {"api_key": "private-secret"}, "stdout": "private script output"}
+        rows = [{**active, "type": "tool.progress", "payload": {"activity": activity}},
+                {**active, "turn_id": "foreign", "type": "tool.progress", "payload": {"activity": activity}}]
+        restored = public_active_turn_events(rows, active)
+        self.assertEqual(len(restored), 1)
+        visible = restored[0]["payload"]["activity"]
+        self.assertEqual(visible["summary"], "本次返回 14 项;还有后续页")
+        self.assertNotIn("arguments", visible)
+        self.assertNotIn("stdout", visible)
+        messages = public_conversation_messages([{"role": "assistant", "content": "已查到收藏。", "activities": [activity]}])
+        self.assertEqual(messages[0]["activities"], [visible])
+        self.assertNotIn("activities", public_conversation_messages([{"role": "assistant", "content": "旧回复"}])[0])
+        private = {**activity, "summary": "api_key=sk-private-secret-for-test"}
+        self.assertEqual(public_activities([private])[0]["summary"], "")
+        self.assertLessEqual(len(public_activities([{**activity, "id": str(i)} for i in range(100)])), 80)
+
+    def test_activity_snapshot_survives_next_turn_but_never_becomes_model_input(self):
+        from app.agent.kernel.conversation_context import persisted_conversation
+        from app.agent.kernel.model import ModelMessage
+
+        activity = {"id": "read:1", "kind": "tool", "method": "watchlist.list",
+                    "label": "读取收藏片单", "status": "success", "summary": "本次返回 14 项"}
+        original = [{"role": "user", "content": "收藏有哪些"},
+                    {"role": "assistant", "content": "14部", "activities": [activity]}]
+        restored = [ModelMessage.from_dict(row) for row in original]
+        restored.append(ModelMessage(role="user", content="继续"))
+        encoded = persisted_conversation(restored, current_user_index=2, original_message="继续", prior_conversation=original)
+        self.assertEqual(encoded[1]["activities"], [activity])
+        self.assertNotIn("activities", restored[1].to_dict())
+
+    def test_active_journal_without_start_never_publishes_stream_text(self):
+        active = {"request_id": "request", "turn_id": "turn"}
+        restored = public_active_turn_events([
+            {**active, "type": "model.delta", "payload": {"delta": "hidden-text"}},
+            {**active, "type": "tool.completed", "payload": {"tool": "agent.run_code", "call_id": "call",
+                "result": {"summary": "命令完成", "data": {"token": "secret"}}}},
+        ], active)
+        self.assertEqual(restored, [{**active, "type": "tool.completed", "payload": {
+            "call_id": "call", "label": "工作区代码执行", "result": {"summary": "命令完成"}}}])
+
+    def test_partial_reads_keep_entry_summary_when_analysis_only_reports_failure(self):
+        analysis = "另一个目录读取失败。"
+        text = format_partial_progress("后续查询未完成", [("光鸭目录列表", {
+            "ok": True,
+            "summary": "光鸭列表完成：共3个对象",
+            "data": {"entries": [{"name": name} for name in ("目录甲", "目录乙", "目录丙")]},
+        })], analysis_text=analysis)
+
+        self.assertIn(analysis, text)
+        self.assertEqual(text.count("共3个对象"), 1)
+        self.assertIn("已完成的查询：", text)
+
+    def test_partial_progress_keeps_business_receipts_without_workspace_status(self):
+        command = {"ok": True, "summary": "命令已退出（退出码 1）", "_tool_name": "agent.run_code"}
+        read = {"ok": True, "summary": "媒体库核对到3部影片"}
+        receipt = {"ok": True, "status": "completed", "summary": "已移动1个目录"}
+        for write_attempted, confirmed_result in ((False, None), (True, None), (False, receipt)):
+            with self.subTest(write_attempted=write_attempted, confirmed_result=confirmed_result):
+                text = format_partial_progress("回答中断", [("工作区", command), ("媒体库", read)],
+                                               write_attempted=write_attempted, confirmed_result=confirmed_result)
+                self.assertNotIn("退出码", text)
+                self.assertIn(read["summary"], text)
+                if confirmed_result is not None:
+                    self.assertIn(receipt["summary"], text)
+
+    def test_partial_reads_deduplicate_only_summaries_covered_by_analysis(self):
+        summary = "光鸭列表完成：共3个对象"
+        other_summary = "媒体库检查通过"
+        results = [("光鸭目录列表", {"ok": True, "summary": summary}),
+                   ("媒体库检查", {"ok": True, "summary": other_summary})] * 2
+        for all_covered in (False, True):
+            analysis = summary + "。\n" + (other_summary + "。\n" if all_covered else "") + "另一个目录读取失败。"
+            with self.subTest(all_covered=all_covered):
+                text = format_partial_progress("后续查询未完成", results, analysis_text=analysis)
+
+                self.assertIn(analysis, text)
+                self.assertEqual(text.count("共3个对象"), 1)
+                self.assertEqual(text.count(other_summary), 1)
+                if all_covered:
+                    self.assertNotIn("已完成的查询：", text)
+                else:
+                    self.assertIn("已完成的查询：", text)
+                    self.assertNotIn("共3个对象", text.partition("已完成的查询：")[2])
+                self.assertNotIn("本轮尚未形成可交付的答复", text)
+
     def test_partial_reads_keep_distinct_episode_positions_without_guessing(self):
         rows = [
             {"series_name": "测试剧", "name": "首集", "type": "Episode", "season_number": 1, "episode_number": 1},
@@ -738,34 +830,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class PublicToolArgumentErrorTests(unittest.TestCase):
-    def test_actual_validator_error_survives_kernel_and_public_projection(self):
-        from app.agent.domains.guangya.fs_change_actions import (
-            guangya_fs_change_arguments,
+
+
+def test_partial_status_line_copied_into_the_answer_appears_once():
+    """真实 8 轮约束任务中，模型模仿上一轮回答把状态行抄进正文，导致同一句出现两次。"""
+    status = "找到 9 项可查看资源，部分来源未完成"
+    status_line = f"部分完成：{status}"
+    quality_fact = "已将画质条件修改为2160p。"
+    for facts in (
+        [quality_fact],
+        [quality_fact, f"{status_line}；另一个来源有 2 项可查看资源。",
+         "部分完成：找到 4 项可查看资源，来源检查未完成"],
+    ):
+        text = format_partial_progress(
+            status, [], current_errors=[status],
+            analysis_text=status_line + "\n\n" + "\n".join(facts),
         )
-        from app.agent.errors import AgentToolError
-        from app.agent.kernel.ports.existing_actions import _safe_error
-        from app.agent.public_safety import sanitize_public_text
-        with self.assertRaises(AgentToolError) as caught:
-            guangya_fs_change_arguments({'operations': [{'op': 'rename', 'object_ref': 'OBJ' + 'A' * 24}]})
-        error = _safe_error(caught.exception, fallback_code='invalid_tool_call')
-        text = sanitize_public_text(str(error))
-        self.assertIn('缺少 新名称', text)
-        self.assertIn('对象引用', text)
-        self.assertNotIn('内部状态', text)
-        self.assertNotIn('OBJ' + 'A' * 24, text)
-        self.assertEqual(text, sanitize_public_text(text))
-
-    def test_schema_labels_do_not_disable_secret_and_internal_state_redaction(self):
-        from app.agent.public_safety import sanitize_public_text
-        text = sanitize_public_text('new_name object_ref target_path parent_path observation_ref session_snapshot')
-        for label in ('新名称', '对象引用', '目标目录', '父目录', '目录观察引用'):
-            self.assertIn(label, text)
-        self.assertNotIn('session_snapshot', text)
-        self.assertEqual(sanitize_public_text('new_name access_token=AbCd1234testCredential9876'), '')
-        self.assertEqual(sanitize_public_text('new_name /data/private/test.env'), '')
-
-    def test_known_no_missing_episode_status_is_not_private_state(self):
-        from app.agent.public_safety import sanitize_public_text
-        self.assertEqual(sanitize_public_text("not_missing"), "not_missing")
-        self.assertEqual(sanitize_public_text("private_snapshot"), "内部状态")
+        # 按可见整行统计，不能只统计保留中文逗号的那一份。
+        canonical_lines = [unicodedata.normalize("NFKC", line).strip() for line in text.splitlines()]
+        assert canonical_lines.count(unicodedata.normalize("NFKC", status_line)) == 1, text
+        for fact in facts:
+            assert unicodedata.normalize("NFKC", fact) in canonical_lines, text

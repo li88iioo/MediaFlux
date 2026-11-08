@@ -11,13 +11,8 @@ import json
 import pytest
 
 from app.agent.kernel.adapters import consume_events
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.provider_model import (
@@ -94,7 +89,8 @@ def native_reply(protocol, text="", *, call_name="", private=True, state_tag="")
                     "type": "reasoning",
                     "id": "rs_1" + state_tag,
                     "encrypted_content": REDACTED + state_tag,
-                    "summary": [{"type": "summary_text", "text": THINKING + state_tag}],
+                    "summary": [{"type": "summary_text", "text": "Checking the actual result." + state_tag}],
+                    "content": [{"type": "reasoning_text", "text": THINKING + state_tag}],
                 }
             ]
             if private
@@ -181,7 +177,7 @@ def test_confirmed_receipt_is_authoritative_after_sqlite_restore(protocol):
                         client_factory=cast(Callable[..., FixedHostHttpClient], lambda **_: wire),
                     ),
                     catalog=catalog,
-                    retriever=CapabilityRetriever(),
+
                     pipeline=ToolPipeline(catalog=catalog, state_store=fixture.store),
                     state_store=fixture.store,
                     journal=fixture.store,

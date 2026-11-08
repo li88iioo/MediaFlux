@@ -13,14 +13,14 @@ from app.agent.kernel.state_types import (
     StateUpdate,
     _ExecutionCapacity,
 )
-from app.agent.public_safety import public_tool_label, sanitize_public_text
+from app.agent.public_safety import public_tool_label
+from app.agent.public_view import public_result_state
+from app.agent.schema import normalize_read_arguments
 
-from . import error_repair
 from .capabilities import ToolEffect
 from .continuation import _ContinuationAction
 from .conversation_codec import pending_content
 from .conversation_context import persisted_conversation, restore_messages
-from .discovery import DISCOVERY_TOOL
 from .model import (
     ModelMessage,
 )
@@ -31,54 +31,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 未取得查询结果的服务错误；not_found/loading/disabled等业务观察不是执行异常。
-_READ_FAILURE_STATUSES = frozenset({
-    "unavailable", "timeout", "authentication", "invalid_response", "unreadable",
-    "budget_exhausted", "configuration_missing", "provider_error", "provider_timeout",
-    "http_error", "security_error", "response_too_large", "indexer_error",
-    "validation_error", "query_rejected", "challenge_required", "result_expired", "result_not_found",
-    "provider_unavailable", "upstream_timeout", "provider_auth_failed", "provider_not_configured",
-    "provider_user_required", "provider_version_unsupported",
-})
-
 def record_result(turn: AgentTurn,
     name: str, arguments: Mapping[str, Any], result: Mapping[str, Any],
-    *, error: ToolPipelineError | None = None, recovered_failures: tuple[str, ...] = (), rejected_call: str = "",
+    *, error: ToolPipelineError | None = None, rejected_call: str = "", progress: bool = True,
 ) -> None:
     tool = turn.session.catalog.get(name) if turn.session.catalog.has(name) else None
     if tool is not None:
         name = tool.name
-    if name == DISCOVERY_TOOL:
-        return
+        if tool.effect is ToolEffect.READ:
+            # 恢复身份与执行共用只读归一化；不改模型原始调用及其协议历史。
+            arguments = normalize_read_arguments(dict(arguments), tool.input_schema)
     # 显式参数重试按对象归并；无参工具依赖隐式上下文，切换后不能冒充同一对象恢复。
     if name != turn.last_business_tool:
         turn.context_revision += 1
     turn.last_business_tool = name
     attempt = (name, 0 if arguments else turn.context_revision,
                "unparsed:" + rejected_call if rejected_call else json.dumps(dict(arguments), ensure_ascii=False, sort_keys=True, default=str))
-    # 聚合 DTO 可同时提供部分结果和失败事实；保留已取得的结果，再登记未完成部分。
+    # 观察保留原 DTO；部分来源或失败不改造成回合异常。
     turn.has_tool_result = turn.has_tool_result or (error is None and result.get("ok") is not False)
-    status = result.get("status")
-    if error is None and isinstance(status, str) and (
-        status == "rate_limited" or (tool is not None and tool.effect is ToolEffect.READ
-            and (status == "partial" or (result.get("ok") is False and status in _READ_FAILURE_STATUSES)))
-    ):
-        error = ToolPipelineError(
-            sanitize_public_text(result.get("error") or result.get("summary") or "工具查询未取得结果"), code=status,
-        )
-    turn.progress_results.append((public_tool_label(name), {**result, "_recovery_tracked": error is not None}))
+    if error is None:
+        # 取得业务回执说明本次参数已被接纳；旧语法拒绝不掩盖真实执行结果。
+        # 已经开始执行的失败仍按对象保留，不因另一笔合法调用而消失。
+        for previous, outcome in list(turn.unresolved_results.items()):
+            if (previous[0] == name and outcome.get("status") == "invalid_arguments"
+                    and outcome.get("execution_started") is not True):
+                turn.unresolved_results.pop(previous)
+    incomplete = error is not None or result.get("status") == "rate_limited" or public_result_state(result) in {"failed", "warning", "pending"}
+    if progress and (error is None or error.code != "invalid_arguments" or error.execution_started is True):
+        turn.progress_results.append((public_tool_label(name), {
+            **result, "_tool_name": name, "_recovery_tracked": incomplete,
+        }))
     if error is not None:
-        turn.unresolved_errors[attempt] = error
+        turn.unresolved_results[attempt] = {**result, "status": error.code,
+                                          "error": str(error), "execution_started": error.execution_started}
+    elif incomplete:
+        turn.unresolved_results[attempt] = {**result,
+                                          "execution_started": (result.get("data") or {}).get("execution_started", True)}
     else:
-        if result.get("ok") is not False:
-            turn.unresolved_errors.pop(attempt, None)
-        read_completed = tool is not None and tool.effect is ToolEffect.READ and error_repair.completed_result(tool, result)
-        for previous, failure_error in list(turn.unresolved_errors.items()):
-            if ((failure_error.repair_ticket and failure_error.repair_ticket in recovered_failures)
-                    or (read_completed and previous[0] == name and failure_error.code == "invalid_arguments"
-                        and not failure_error.repair_ticket)):
-                # 只读形状错误保留在历史中，但成功重试后不再阻断回答；它不是对象核验/写授权。
-                turn.unresolved_errors.pop(previous)
+        turn.unresolved_results.pop(attempt, None)
 
 
 async def persist_conversation(turn: AgentTurn,
@@ -111,20 +101,32 @@ async def persist_conversation(turn: AgentTurn,
             reply_context=turn.agent_input.reply_context,
             prior_conversation=turn.state.conversation,
         )
+        if turn.activities and stored and not stored[-1].get("tool_calls") and (
+            stored[-1].get("role") == "assistant" or stored[-1].get("effect_plan_id")
+        ):
+            from app.agent.public_view import public_activities
+            stored[-1]["activities"] = public_activities(list(turn.activities.values()))
         # The store enforces retention after receipt merge in its transaction.
         start = turn.current_user_index if turn.current_user_index is not None else next(
             (i for i in range(len(stored) - 1, -1, -1) if stored[i].get("role") == "user"), len(stored),
         )
+        receipt_plan_id = ""
+        if turn.diagnosing_effect:
+            receipt_index = next((i for i in range(len(stored) - 1, -1, -1)
+                                  if stored[i].get("completion_receipt_id")), None)
+            if receipt_index is not None and all(
+                turn.session.catalog.has(call["name"])
+                and turn.session.catalog.get(call["name"]).effect is ToolEffect.READ
+                for row in stored[receipt_index + 1:] for call in row.get("tool_calls", ())
+            ):
+                receipt_plan_id = stored[receipt_index]["completion_receipt_id"]
         try:
             extra_updates = ()
             if wait_action is not None:
                 extra_updates = (wait_action,)
             elif task_patch is not None and task_patch.operation == "create" and turn.session.continuation_binding is not None:
                 extra_updates = (_ContinuationAction("", {
-                    "operation": "seed", "model_limit": turn.session.limits.max_model_rounds,
-                    "tool_limit": turn.session.limits.max_tool_calls,
-                    "model_spent": turn._budget_model_attempts - turn._budget_paid_models,
-                    "tool_spent": turn._budget_tool_attempts - turn._budget_paid_tools,
+                    "operation": "seed", "budget": turn.seed_budget(),
                 }, binding=turn.session.continuation_binding),)
             # 失败确认后的诊断仍属于同一执行组，不能在续接前撤掉已有的有界容量。
             # 下一用户回合仍按正常规则释放；保留此阶段并不会提高容量上限。
@@ -135,6 +137,7 @@ async def persist_conversation(turn: AgentTurn,
                         call.call_id not in completed for call in turn.active_calls
                     ),
                     current_start=start if any(row.get("tool_calls") or row.get("reply_context", {}).get("reference_handle") for row in stored[start:]) else None,
+                    receipt_plan_id=receipt_plan_id,
                 ),) + extra_updates,
                 conversation=stored,
                 **({"task_patch": task_patch} if task_patch is not None else {}),
@@ -144,8 +147,12 @@ async def persist_conversation(turn: AgentTurn,
                     turn._budget_task_id = turn.state.metadata["task"]["task_id"]
                     turn._budget_paid_models = turn._budget_model_attempts
                     turn._budget_paid_tools = turn._budget_tool_attempts
+                    turn._budget_paid_tokens = turn._budget_token_attempts
+                    turn.sync_budget_context()
                 elif task_patch.operation == "cancel":
                     turn._budget_task_id = ""
+                    turn._local_budget = turn.seed_budget()
+                    turn.sync_budget_context()
         except HistoryCapacityError as exc:
             raise ToolPipelineError(
                 "当前结果超过历史容量，已保留此前检查点；已开始的调用结果可能未知，请勿重放写操作。",
@@ -188,10 +195,12 @@ async def remember_result(turn: AgentTurn,
     safe_public_content = (public_content or "").strip()
     if safe_public_content:
         item["public_content"] = safe_public_content
-    updates: tuple[StateUpdate, ...] = ()
+    updates: tuple[StateUpdate, ...] = (
+        _ExecutionCapacity("", turn.state.execution_capacity, receipt_plan_id=receipt_plan_id or ""),
+    )
     if candidate_result:
         item["candidate_result_ref"] = candidate_result["ref"]
-        updates = (
+        updates += (
             StateUpdate("metadata.ux_candidate_result", dict(candidate_result)),
         )
     conversation.append(item)

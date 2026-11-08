@@ -53,6 +53,7 @@ class CalendarService:
         self.cooldown = max(30.0, float(cooldown))
         self._guard = threading.Condition(threading.RLock())
         self._pending: dict[str, Future | None] = {}
+        self._metadata_pending: dict[str, Future | None] = {}
         self._last_attempt: dict[str, float] = {}
         self._last_metadata_attempt: dict[str, float] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -108,11 +109,12 @@ class CalendarService:
         sources, unscheduled, updated, identities = [], [], [], set()
         metadata_pending = False
         for source, name in SOURCE_NAMES.items():
-            cached = self.cache.get(self.key(source))
             with self._guard:
+                cached = self.cache.get(self.key(source))
                 pending = source in self._pending
+                metadata_pending |= source in self._metadata_pending
             state = {"id": source, "name": name, "status": "unavailable", "message": "尚未获取到平台节目排期",
-                     "fetched_at": "", "sampled": 0, "ignored": 0}
+                     "fetched_at": "", "sampled": 0, "ignored": 0, "covered_dates": []}
             payload = cached.payload if cached.status in {"fresh", "stale"} else None
             if payload and payload.get("version") == 1 and payload.get("source") == source:
                 stale = cached.status == "stale" or bool(cached.last_error)
@@ -120,6 +122,7 @@ class CalendarService:
                 state.update(status="stale" if stale else payload.get("status", "partial"),
                              message=cached.last_error or str(payload.get("message", ""))[:400],
                              fetched_at=str(payload.get("fetched_at", "")),
+                             covered_dates=payload.get("covered_dates", []),
                              sampled=int(payload.get("sampled", 0)), ignored=int(payload.get("ignored", 0)))
                 if state["status"] not in {"ok", "partial", "stale"}:
                     state["status"] = "partial"
@@ -184,7 +187,8 @@ class CalendarService:
             refreshing = bool(self._pending)
         return {"timezone": "Asia/Shanghai", "today": today, "week_start": week_start,
                 "days": days, "unscheduled": unscheduled, "sources": sources,
-                "refreshing": refreshing or metadata_pending or any(s["status"] == "loading" for s in sources),
+                "refreshing": refreshing or any(s["status"] == "loading" for s in sources),
+                "metadata_pending": metadata_pending,
                 "updated_at": max(updated, default=""), "retry_after": 5,
                 "items_count": len({card["stable_id"] for day in days for card in day["items"]})}
 
@@ -222,7 +226,7 @@ class CalendarService:
         rows = payload.get("entries", [])
         return (isinstance(rounds, int) and 0 <= rounds < 8 and isinstance(rows, list)
                 and any(isinstance(row, dict) and row.get("category") == "animation"
-                        and row.get("mapping_status") == "pending" for row in rows))
+                        and ("metadata_rounds" not in payload or row.get("mapping_status") == "pending") for row in rows))
 
     def _schedule(self, source, *, metadata_only=False):
         with self._guard:
@@ -230,12 +234,13 @@ class CalendarService:
             attempts = self._last_metadata_attempt if metadata_only else self._last_attempt
             previous = attempts.get(source)
             cooldown = 5 if metadata_only else self.cooldown
-            if (self._closed or source in self._pending
+            if (self._closed or source in self._pending or source in self._metadata_pending
                     or (previous is not None and now - previous < cooldown)):
                 return False
             attempts[source] = now
             job = self._refresh_metadata if metadata_only else self._refresh
-            self._pending[source] = None
+            pending = self._metadata_pending if metadata_only else self._pending
+            pending[source] = None
             try:
                 if self._submit is None:
                     if self._executor is None:
@@ -244,22 +249,26 @@ class CalendarService:
                 else:
                     future = self._submit(lambda: job(source))
                 if future is None:
-                    self._pending.pop(source, None)
+                    self._finished(source, None)
                 else:
-                    self._pending[source] = future
-                    future.add_done_callback(lambda done, source=source: self._finished(source, done))
+                    pending[source] = future
+                    future.add_done_callback(lambda done: self._finished(source, done))
                 return True
             except Exception:
-                self._pending.pop(source, None)
+                pending.pop(source, None)
                 logger.warning("无法启动日历刷新 source=%s", source)
                 return False
 
     def _finished(self, source, future):
         with self._guard:
-            if self._pending.get(source) is future:
-                self._pending.pop(source, None)
+            metadata_only = source in self._metadata_pending
+            pending = self._metadata_pending if metadata_only else self._pending
+            if pending.get(source) is future:
+                pending.pop(source, None)
+                if not metadata_only:
+                    self._schedule(source, metadata_only=True)
             self._guard.notify_all()
-            release = self._closed and not self._pending
+            release = self._closed and not (self._pending or self._metadata_pending)
         if release:
             _release(self)
 
@@ -292,13 +301,15 @@ class CalendarService:
         # 首屏今日优先；同组保持平台原顺序，后续预算轮次继续未完成条目。
         return tuple(sorted(entries, key=lambda entry: not any(event.date == today for event in entry.events)))
 
-    def _refresh_metadata(self, source, *, initial=False):
+    def _refresh_metadata(self, source):
         """首轮与续批共用补全链路，平台事实始终按原抓取时间到期。"""
         cached = self.cache.get(self.key(source))
-        if (cached.status != "fresh" or cached.last_error or not cached.payload
-                or (not initial and not self._needs_metadata(cached.payload))):
+        if cached.status != "fresh" or cached.last_error or not cached.payload:
             return
         payload = dict(cached.payload)
+        initial = "metadata_rounds" not in payload
+        if not initial and not self._needs_metadata(payload):
+            return
         rounds = 0 if initial else payload.get("metadata_rounds", 0) + 1
         try:
             fetched_at = datetime.fromisoformat(payload["fetched_at"])
@@ -359,15 +370,14 @@ class CalendarService:
             payload = {"version": 1, "source": source,
                        "entries": [self._cached_card(entry) for entry in result.entries],
                        "fetched_at": fetched_at, "status": result.status, "message": result.message,
-                       "sampled": result.sampled, "ignored": result.ignored}
+                       "sampled": result.sampled, "ignored": result.ignored,
+                       "covered_dates": list(result.covered_dates)}
             with self._guard:
                 if self._closed:
                     return
                 # 先发布平台事实；可选的TMDB查询不能阻挡免费进度进入页面。
                 self.cache.set_success(self.key(source), "calendar:" + source, payload,
                                        ttl_seconds=3600, stale_seconds=2 * 86400)
-                self._guard.notify_all()
-            self._refresh_metadata(source, initial=True)
         except Exception as exc:
             message = str(exc)[:400] if isinstance(exc, SourceUnavailable) else "平台更新日历获取失败，请稍后重试"
             logger.warning("日历来源刷新失败 source=%s type=%s", source, type(exc).__name__)
@@ -377,21 +387,21 @@ class CalendarService:
                     self.cache.set_error(self.key(source), "calendar:" + source, message,
                                          ttl_seconds=int(self.cooldown), retry_after=int(self.cooldown),
                                          preserve_stale=self._has_entries(previous.payload))
-                    self._guard.notify_all()
 
     def shutdown(self):
         """回收业务任务；已取消请求的有界 OS DNS 可能仍待系统返回，但不能再发 HTTP/写缓存。"""
         with self._guard:
             self._closed = True
             self._guard.notify_all()
-            futures = tuple(f for f in self._pending.values() if f is not None)
+            futures = tuple(f for jobs in (self._pending, self._metadata_pending)
+                            for f in jobs.values() if f is not None)
             executor = self._executor
         for future in futures:
             future.cancel()
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
         with self._guard:
-            drained = not self._pending
+            drained = not (self._pending or self._metadata_pending)
         if drained:
             _release(self)
         return drained

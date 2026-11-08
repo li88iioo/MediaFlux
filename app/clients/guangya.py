@@ -26,8 +26,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from secrets import token_hex
 from time import monotonic, sleep, time
-from typing import Optional
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import Any, Optional
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -45,6 +45,74 @@ class DirectoryEntryLimitError(RuntimeError):
 
 class DirectorySnapshotChangedError(RuntimeError):
     """分页期间目录发生变化；必须丢弃本轮数据并重新证明完整性。"""
+
+
+def _first(raw: dict[str, Any], *keys: str) -> object:
+    payloads = [raw]
+    data = raw.get("data")
+    if isinstance(data, dict):
+        payloads.append(data)
+    for payload in payloads:
+        for key in keys:
+            value = payload.get(key)
+            if value not in (None, ""):
+                return value
+    return ""
+
+
+def _extract_created_share(raw: dict[str, Any]) -> dict[str, str]:
+    candidate_id = str(
+        _first(raw, "shareId", "shareID", "share_id", "id") or ""
+    ).strip()
+    share_id = candidate_id if re.fullmatch(r"[A-Za-z0-9_-]{8,256}", candidate_id) else ""
+    candidate_url = str(
+        _first(raw, "shareUrl", "shareURL", "share_url", "url", "link") or ""
+    ).strip()
+    # 顶层 ``code`` 常是 HTTP 业务成功码（0/200），不能误当成分享访问码。
+    data = raw.get("data")
+    candidate_code = str(
+        (data.get("code") if isinstance(data, dict) else "") or _first(
+            raw,
+            "shareCode",
+            "share_code",
+            "accessCode",
+            "access_code",
+            "extractCode",
+            "extract_code",
+            "pwd",
+        )
+        or ""
+    ).strip()
+    code = candidate_code if re.fullmatch(r"[A-Za-z0-9]{4,16}", candidate_code) else ""
+    share_url = ""
+    if candidate_url and len(candidate_url) <= 2048:
+        try:
+            parsed = urlsplit(candidate_url)
+            hostname = (parsed.hostname or "").casefold()
+            if (
+                parsed.scheme.casefold() == "https"
+                and not parsed.username
+                and not parsed.password
+                and (
+                    hostname == "guangyapan.com"
+                    or hostname.endswith(".guangyapan.com")
+                )
+                and parsed.path.startswith("/s/")
+            ):
+                share_url = urlunsplit(parsed)
+        except ValueError:
+            share_url = ""
+    if not share_url and share_id:
+        share_url = f"https://www.guangyapan.com/s/{share_id}#/share"
+    return {"share_id": share_id, "share_url": share_url, "access_code": code}
+
+
+class GuangYaShareError(ValueError):
+    """分享业务的可公开错误；不包含 Provider 原始响应或凭据。"""
+
+    def __init__(self, message: str, *, code: str = "precondition_failed"):
+        super().__init__(message)
+        self.code = code
 
 
 class IncompleteOfflineTaskListError(RuntimeError):
@@ -2419,13 +2487,12 @@ class GuangYaClient:
         return True
 
     # ===== 链接转存 =====
-    def inspect_share(self, share_url: str, page_size: int = 200) -> dict:
-        """解析分享链接并返回单页可选顶层文件，不执行转存；has_more 标记截断。"""
+    def inspect_share(self, share_url: str, page_size: int = 200, max_pages: int = 10) -> dict:
+        """完整解析分享顶层文件与内部转存令牌；分页未完成时拒绝返回快照。"""
         inspected, access_token = self._read_share_files(
             share_url,
             page_size=page_size,
-            max_pages=1,
-            require_complete=False,
+            max_pages=max_pages,
         )
         return {**inspected, "access_token": access_token}
 
@@ -2440,8 +2507,8 @@ class GuangYaClient:
         return inspected
 
     def _read_share_files(self, share_url: str, page_size: int,
-                          max_pages: int, *, require_complete: bool = True) -> tuple[dict, str]:
-        """默认要求完整列表；单页转存预览可有界截断，令牌仅供内部使用。"""
+                          max_pages: int) -> tuple[dict, str]:
+        """读取和转存检查共用完整分页；令牌仅供内部使用。"""
         share_id, code = self._parse_share(share_url)
         if not share_id:
             raise ValueError("无法识别光鸭分享 ID")
@@ -2485,8 +2552,7 @@ class GuangYaClient:
                 raise RuntimeError("光鸭分享文件游标未推进，列表不完整")
             cursor = next_cursor
         else:
-            if require_complete:
-                raise RuntimeError("光鸭分享文件达到安全分页上限，未返回不完整快照")
+            raise RuntimeError("光鸭分享文件达到安全分页上限，未返回不完整快照")
         return ({
             "share_id": share_id,
             "code_required": bool(code),
@@ -2612,10 +2678,10 @@ class GuangYaClient:
                 if not isinstance(item, dict):
                     continue
                 share_id = str(
-                    item.get("shareId")
+                    item.get("id")
+                    or item.get("shareId")
                     or item.get("shareID")
                     or item.get("share_id")
-                    or item.get("id")
                     or ""
                 ).strip()
                 identity = share_id or hashlib.sha256(
@@ -2674,6 +2740,148 @@ class GuangYaClient:
             envelope["data"] = {key: value for key, value in envelope["data"].items() if key != "code"}
         _validate_write_response(envelope, operation="share_create")
         return response if isinstance(response, dict) else {}
+
+    def user_share_snapshot(self) -> dict:
+        """完整读取自有分享；share_id 是撤销管理 ID，不是公开链接 ID。"""
+        if not self.logged_in:
+            raise GuangYaShareError("光鸭账号尚未连接")
+        generation = self.credential_generation
+        items = []
+        for raw in self.list_user_shares(max_items=2_000):
+            identity = str(_first(raw, "id") or "").strip()
+            if not identity:
+                raise GuangYaShareError("光鸭分享列表缺少管理标识，无法确认完整快照", code="unavailable")
+            items.append({
+                "share_id": identity,
+                "title": str(_first(raw, "title", "shareName", "name") or "").strip(),
+                "status": str(_first(raw, "status", "shareStatus", "state") or "").strip(),
+                "created_at": str(_first(raw, "createTime", "createdAt", "created_at", "shareTime") or ""),
+                "expires_at": str(_first(raw, "expireTime", "expiresAt", "expiredAt", "invalidTime") or ""),
+                "updated_at": str(_first(raw, "updateTime", "updatedAt", "updated_at") or ""),
+                "file_count": max(0, min(_to_int(_first(raw, "fileCount", "resCount", "count", "resourceCount")), 1_000_000)),
+            })
+        if len({item["share_id"] for item in items}) != len(items):
+            raise GuangYaShareError("光鸭分享管理标识重复，无法确认完整快照", code="unavailable")
+        self._require_share_generation(generation)
+        return {"credential_generation": generation, "items": items}
+
+    def _require_share_generation(self, expected: int) -> None:
+        if not self.logged_in or self.credential_generation != expected:
+            raise GuangYaShareError("光鸭登录凭据已变化，请重新读取后确认", code="confirmation_stale")
+
+    @staticmethod
+    def _share_ids(values: list[str], label: str) -> list[str]:
+        if (not isinstance(values, list) or not 1 <= len(values) <= 100
+                or any(not isinstance(value, str) or not value.strip() for value in values)):
+            raise GuangYaShareError(f"{label} 必须包含 1 到 100 个非空真实 ID")
+        return list(dict.fromkeys(value.strip() for value in values))
+
+    def prepare_user_share(self, file_ids: list[str], *, title: str = "", expires_days: int = 0,
+                           access_code: str = "", auto_access_code: bool = True,
+                           max_restore_count: int = 0, allow_download: bool = True) -> dict:
+        """冻结真实对象和分享策略，不创建链接或维护第二份确认计划。"""
+        ids = self._share_ids(file_ids, "file_ids")
+        if not isinstance(title, str) or len(title.strip()) > 180:
+            raise GuangYaShareError("分享标题必须是最多 180 字符的文本")
+        if type(expires_days) is not int or not 0 <= expires_days <= 3650:
+            raise GuangYaShareError("expires_days 必须在 0 到 3650 之间")
+        if isinstance(access_code, str):
+            access_code = access_code.strip()
+        if not isinstance(access_code, str) or access_code and not re.fullmatch(r"[A-Za-z0-9]{4,16}", access_code):
+            raise GuangYaShareError("access_code 必须是 4 到 16 位字母或数字")
+        if type(auto_access_code) is not bool or type(allow_download) is not bool:
+            raise GuangYaShareError("auto_access_code 和 allow_download 必须是布尔值")
+        if type(max_restore_count) is not int or not 0 <= max_restore_count <= 1_000_000:
+            raise GuangYaShareError("max_restore_count 必须在 0 到 1000000 之间")
+        if not self.logged_in:
+            raise GuangYaShareError("光鸭账号尚未连接")
+        generation = self.credential_generation
+        items = []
+        for identity in ids:
+            item = self.file_info(identity)
+            if item is None or item.file_id != identity:
+                raise GuangYaShareError("选择的分享对象不存在，请重新读取目录", code="confirmation_stale")
+            items.append({key: getattr(item, key) for key in (
+                "file_id", "parent_id", "name", "is_dir", "size", "etag", "updated_at")})
+        self._require_share_generation(generation)
+        title = title.strip() or str(items[0]["name"] or "MediaFlux 分享") + (f" 等 {len(items)} 项" if len(items) > 1 else "")
+        title = " ".join(redact_sensitive_text(title).split())[:180] or "MediaFlux 分享"
+        return {"credential_generation": generation, "items": items, "policy": {
+            "title": title, "expires_days": expires_days, "access_code": access_code,
+            "auto_access_code": auto_access_code and not bool(access_code),
+            "max_restore_count": max_restore_count, "allow_download": allow_download,
+        }}
+
+    def prepare_user_share_revoke(self, share_ids: list[str]) -> dict:
+        """按管理 ID 冻结选中分享，不按标题、序号或公开链接 ID 猜测。"""
+        ids = self._share_ids(share_ids, "share_ids")
+        snapshot = self.user_share_snapshot()
+        by_id = {item["share_id"]: item for item in snapshot["items"]}
+        if any(identity not in by_id for identity in ids):
+            raise GuangYaShareError("选择的分享已不在列表，请重新读取后确认", code="confirmation_stale")
+        return {**snapshot, "items": [by_id[identity] for identity in ids]}
+
+    def submit_prepared_user_share(self, snapshot: dict, *, revoke: bool = False,
+                                   cancel_check: Callable[[], None] | None = None) -> dict:
+        """复验冻结快照后写一次；受理、验证成功、写后未知分别返回。"""
+        self._require_share_generation(snapshot["credential_generation"])
+        expected = snapshot["items"]
+        if revoke:
+            current = self.prepare_user_share_revoke([item["share_id"] for item in expected])
+            matches = current["credential_generation"] == snapshot["credential_generation"] and all(
+                all(live[key] == item[key] for key in ("share_id", "title", "status", "updated_at"))
+                for live, item in zip(current["items"], expected)
+            )
+        else:
+            current = self.prepare_user_share([item["file_id"] for item in expected], **snapshot["policy"])
+            matches = current["credential_generation"] == snapshot["credential_generation"] and all(
+                all(live[key] == item[key] for key in ("file_id", "parent_id", "name", "is_dir", "size"))
+                and (not item["etag"] or live["etag"] in {"", item["etag"]})
+                for live, item in zip(current["items"], expected)
+            ) and current["policy"] == snapshot["policy"]
+        if not matches:
+            raise GuangYaShareError("光鸭分享对象或策略已变化，请重新预检", code="confirmation_stale")
+        if cancel_check is not None:
+            cancel_check()
+        self._require_share_generation(snapshot["credential_generation"])
+        receipt: dict[str, Any] = {"count": len(expected), "verified": False, "verification_pending": True}
+        if not revoke:
+            receipt.update({key: snapshot["policy"][key] for key in ("title", "expires_days", "allow_download")},
+                           share_url="", access_code="")
+        try:
+            if revoke:
+                self.delete_user_shares([item["share_id"] for item in expected])
+            else:
+                policy = snapshot["policy"]
+                raw = self.create_user_share([item["file_id"] for item in expected], title=policy["title"],
+                    validate_duration=policy["expires_days"], code=policy["access_code"],
+                    auto_fill_code=policy["auto_access_code"], max_restore_count=policy["max_restore_count"],
+                    allow_download=policy["allow_download"])
+                created = _extract_created_share(raw)
+                receipt.update(share_url=created["share_url"], access_code=created["access_code"],
+                               verified=bool(created["share_url"]))
+        except GuangYaWriteRejected:
+            raise
+        except Exception:
+            return {**receipt, "ok": False, "status": "outcome_unknown",
+                    "error": "光鸭分享操作结果未知，请先查询分享列表，勿重复提交"}
+        if revoke:
+            remaining = {item["share_id"] for item in expected}
+            for attempt in range(20):
+                try:
+                    current = self.user_share_snapshot()
+                    if current["credential_generation"] != snapshot["credential_generation"]:
+                        break
+                    remaining &= {item["share_id"] for item in current["items"]}
+                except Exception:
+                    break  # 撤销已受理，回读失败仍须保留原受理回执。
+                if not remaining:
+                    break
+                if attempt < 19:
+                    sleep(0.5)
+            receipt["verified"] = not remaining
+        receipt["verification_pending"] = not receipt["verified"]
+        return {**receipt, "ok": True, "status": "completed" if receipt["verified"] else "accepted"}
 
     def delete_user_shares(self, share_ids: list[str]) -> bool:
         ids = list(

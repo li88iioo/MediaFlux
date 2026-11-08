@@ -990,18 +990,19 @@ def classify_episode_position(
     target_s = _positive_int(target_season)
     target_e = _positive_int(target_episode)
 
-    if target_e is None:
+    if target_e is None or episode is None or episode_end is None:
         if target_s is not None and season == target_s:
             return EpisodePositionMatch(
                 "season", "source_season_matches_target", mapping
             )
-        return EpisodePositionMatch("unknown", "target_episode_missing", mapping)
-    if episode is None or episode_end is None:
-        if target_s is not None and season == target_s:
+        # 缺少集号不抹掉已知季号冲突；发布组分季对 TMDB 合并第一季仍需映射。
+        if season is not None and target_s is not None and not (target_s == 1 and season > 1):
             return EpisodePositionMatch(
-                "season", "source_season_matches_target", mapping
+                "conflict", "release_season_conflicts_with_target", mapping
             )
-        return EpisodePositionMatch("unknown", "source_episode_missing", mapping)
+        return EpisodePositionMatch(
+            "unknown", "target_episode_missing" if target_e is None else "source_episode_missing", mapping
+        )
 
     # 无季号的裸集号只有在目标为第一季同集时可直接证明；其它位置仍需映射证据。
     if season is None:

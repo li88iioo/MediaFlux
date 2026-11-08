@@ -114,6 +114,13 @@ class MediaCard:
     number_of_seasons: int | None = None
     number_of_episodes: int | None = None
     seasons: tuple[dict[str, Any], ...] | None = None
+    # 仅保留来源已返回的事实；语言不能替代产地，旧缓存缺字段仍为未知。
+    origin_country: tuple[str, ...] | None = None
+    original_language: str | None = None
+    genre_ids: tuple[int, ...] | None = None
+    # 来源评分人数与热度是不同指标；缺失（含旧缓存）不是 0。
+    vote_count: int | None = None
+    popularity: float | None = None
 
     def __post_init__(self) -> None:
         provider = (self.provider or "").strip().lower()
@@ -138,6 +145,9 @@ class MediaCard:
             object.__setattr__(self, "rating", float(self.rating))
         if self.seasons is not None:
             object.__setattr__(self, "seasons", tuple(dict(item) for item in self.seasons))
+        for name in ("origin_country", "genre_ids"):
+            if (value := getattr(self, name)) is not None:
+                object.__setattr__(self, name, tuple(value))
 
     @property
     def stable_id(self) -> str:
@@ -146,8 +156,9 @@ class MediaCard:
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["stable_id"] = self.stable_id
-        if self.seasons is not None:
-            result["seasons"] = list(result["seasons"])
+        for name in ("seasons", "origin_country", "genre_ids"):
+            if result[name] is not None:
+                result[name] = list(result[name])
         return result
 
     @classmethod

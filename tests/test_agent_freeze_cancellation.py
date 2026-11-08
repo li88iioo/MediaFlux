@@ -45,7 +45,7 @@ async def assert_peer_busy(peer):
         await peer.state_store.begin_turn(owner=OWNER, session_id=SESSION, request_id="blocked-peer")
     lifecycle = AgentSessionLifecycle(session=peer, store=peer.state_store,
         effect_store=peer.pipeline.effect_store,
-        clear_provider_state=lambda **_: None, clear_domain_state=lambda **_: None)
+        clear_legacy_plans=lambda **_: None)
     with pytest.raises(SessionBusyError):
         await lifecycle.reset(owner=OWNER, session_id=SESSION)
     queried = await collect(peer.run(AgentInput(owner=OWNER, session_id=SESSION,

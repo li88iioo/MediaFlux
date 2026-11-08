@@ -11,6 +11,17 @@ from tools import agent_doctor
 
 
 class AgentDoctorTests(IsolatedDatabaseTestCase):
+    def test_doctor_accepts_configured_local_http_provider(self) -> None:
+        with patch.dict(os.environ, {
+            "AGENT_LLM_ENABLED": "1",
+            "AGENT_LLM_API_URL": "http://127.0.0.1:8080/v1",
+            "AGENT_LLM_MODEL": "local-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }, clear=False):
+            check = agent_doctor._provider_check()
+        self.assertEqual(check.status, "ok")
+        self.assertIn("本次未联网", check.message)
+
     def test_offline_doctor_reports_ready_without_echoing_secrets(self) -> None:
         secret = "web-secret-" + ("x" * 32)
         provider_key = "provider-key-not-for-output"
@@ -24,7 +35,7 @@ class AgentDoctorTests(IsolatedDatabaseTestCase):
             "AGENT_LLM_API_KEY": provider_key,
             "AGENT_METRICS_SCRAPE_KEY": scrape_key,
             "WEB_SECRET_KEY": secret,
-        }, clear=False):
+        }, clear=False), patch.object(agent_doctor, "workspace_unavailable_reason", return_value=""):
             report = agent_doctor.run_agent_diagnostics()
 
         statuses = {check.key: check.status for check in report.checks}
@@ -34,13 +45,25 @@ class AgentDoctorTests(IsolatedDatabaseTestCase):
             "agent.database": "ok",
             "agent.web_secret": "ok",
             "agent.keys": "ok",
-            "agent.capabilities": "ok",
+            "agent.sdk": "ok",
+            "agent.workspace": "ok",
         })
         serialized = json.dumps(report.as_dict(), ensure_ascii=False)
         self.assertNotIn(secret, serialized)
         self.assertNotIn(provider_key, serialized)
         self.assertNotIn(scrape_key, serialized)
         self.assertIn("本次未联网", serialized)
+
+    def test_doctor_rejects_unavailable_workspace_even_when_sdk_is_available(self) -> None:
+        reason = "代码工作区需要容器 root 入口"
+        with patch.object(agent_doctor, "workspace_unavailable_reason", return_value=reason):
+            report = agent_doctor.run_agent_diagnostics()
+        self.assertEqual(report.check("agent.sdk").status, "ok")
+        check = report.check("agent.workspace")
+        self.assertEqual(check.status, "error")
+        self.assertEqual(check.message, reason)
+        self.assertIn("工作区运行条件", check.suggestion)
+        self.assertEqual(agent_doctor._exit_code(report), 1)
 
     def test_doctor_flags_invalid_provider_and_weak_scrape_key_safely(self) -> None:
         with patch.dict(os.environ, {

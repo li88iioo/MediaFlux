@@ -7,14 +7,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmissionStore,
-    enqueue_recent_download_library_verification,
 )
-from app.agent.domains.library.missing_workflows import (
+from app.repositories.agent_download_verification import (
     MissingMediaWorkflowRepository,
     SQLiteMissingMediaWorkflowRepository,
     verification_from_followup_context,
@@ -22,6 +21,7 @@ from app.agent.domains.library.missing_workflows import (
     workflow_ref_from_context,
 )
 from app.agent.models import ToolResult
+from app import database as db
 
 logger = logging.getLogger(__name__)
 
@@ -37,30 +37,9 @@ class MissingMediaWorkflowRuntime:
         *,
         repository: MissingMediaWorkflowRepository | None = None,
         recent_download_store: RecentDownloadSubmissionStore | None = None,
-        verification_enqueuer: Callable[[ToolResult, dict[str, Any] | None, str], bool]
-        | None = None,
     ) -> None:
         self.repository = repository or SQLiteMissingMediaWorkflowRepository()
         self.recent_download_store = recent_download_store or RecentDownloadSubmissionStore()
-        self.verification_enqueuer = (
-            verification_enqueuer or enqueue_recent_download_library_verification
-        )
-
-    def capture_search(
-        self, *, owner: str, tool_name: str, result: ToolResult
-    ) -> str | None:
-        """记录真实缺集搜索结果；失败不得改变只读工具结果。"""
-        try:
-            return self.repository.capture_search(
-                owner=owner,
-                tool_name=tool_name,
-                result=result,
-            )
-        except Exception as exc:  # noqa: BLE001 - 辅助状态不得遮蔽搜索结果
-            logger.warning(
-                "Agent 补库工作流记录搜索失败 type=%s", type(exc).__name__
-            )
-            return None
 
     def stage_candidates(
         self,
@@ -94,6 +73,7 @@ class MissingMediaWorkflowRuntime:
                 if context is None:
                     contexts.append(None)
                     continue
+                context["result_id"] = raw["result_id"]
                 contexts.append(context)
                 workflow = workflow_ref_from_context(context)
                 if workflow is not None:
@@ -123,66 +103,39 @@ class MissingMediaWorkflowRuntime:
         result: Any,
         followups: Any,
     ) -> None:
-        """下载写入成功后记录最近任务并建立缺集入库自动复核。"""
-        if tool_name != "ingest.submit" or not isinstance(result, ToolResult):
+        """消费原生逐项回执与已持久化复核目标，关联原 workflow；不再事后排队。"""
+        if tool_name not in {"resources.download", "downloads.submit", "cloud.transfer_share"} or not isinstance(result, ToolResult):
             return
-        contexts = self._followup_slots(followups)
+        contexts = list(self._iter_followups(followups))
         data = result.data if isinstance(result.data, dict) else {}
-        source_type = str(data.get("source_type") or "").strip().lower()
-        if source_type != "resource_candidates":
+        if tool_name != "resources.download":
             self._capture(owner=owner, result=result, verification_context=None)
             return
-
-        raw_items = data.get("items")
-        if isinstance(raw_items, list):
-            for index, raw in enumerate(raw_items):
-                if not isinstance(raw, dict):
-                    continue
-                context = contexts[index] if index < len(contexts) else None
-                item_result = self._batch_item_result(raw)
-                self._capture_and_enqueue(
-                    owner=owner,
-                    result=item_result,
-                    verification_context=context,
-                )
-            for context in contexts[len(raw_items) :]:
+        receipts = {item["result_id"]: item for item in data.get("items", [])
+                    if isinstance(item, dict) and item.get("result_id")}
+        for identity, raw in receipts.items():
+            matching = [item for item in contexts if item.get("result_id") == identity]
+            self._capture(owner=owner, result=self._batch_item_result(raw),
+                          verification_context=matching[0] if matching else None)
+        for context in contexts:
+            raw = receipts.get(context.get("result_id"), {})
+            attached = False
+            try:
+                request_id = raw.get("request_id")
+                job = db.get_agent_download_verification(request_id) if type(request_id) is int and request_id > 0 else None
+                proof = verification_from_followup_context(context)
+                workflow_ref = workflow_ref_from_context(context)
+                keys = ("tmdb_id", "season", "episode", "library_name")
+                if (job and job["owner"] == owner and proof and workflow_ref
+                        and any(all(target.get(key, "") == proof.get(key, "") for key in keys)
+                                for target in job["targets"])):
+                    self.repository.attach_submission(workflow_ref=workflow_ref,
+                        request_id=raw["request_id"], verification_enqueued=True)
+                    attached = True
+            except Exception as exc:  # 已受理下载与复核意图不受 workflow 镜像失败影响
+                logger.warning("Agent 下载复核关联失败 type=%s", type(exc).__name__)
+            if not attached:
                 self.release_followups(owner=owner, followups=(context,))
-            return
-
-        context = contexts[0] if contexts else None
-        self._capture_and_enqueue(
-            owner=owner,
-            result=result,
-            verification_context=context,
-        )
-        for extra in contexts[1:]:
-            self.release_followups(owner=owner, followups=(extra,))
-
-    def _capture_and_enqueue(
-        self,
-        *,
-        owner: str,
-        result: ToolResult,
-        verification_context: dict[str, Any] | None,
-    ) -> None:
-        self._capture(
-            owner=owner,
-            result=result,
-            verification_context=verification_context,
-        )
-        verification = verification_from_followup_context(verification_context)
-        if verification is None:
-            return
-        enqueued = False
-        try:
-            enqueued = (self.verification_enqueuer(result, verification_context, owner))
-        except Exception as exc:  # noqa: BLE001 - 下载已完成，不得改写执行终态
-            logger.warning(
-                "Agent 下载后媒体库自动复核排队失败 type=%s",
-                type(exc).__name__,
-            )
-        if not enqueued:
-            self.release_followups(owner=owner, followups=(verification_context,))
 
     def _capture(
         self,

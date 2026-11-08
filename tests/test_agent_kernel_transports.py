@@ -13,12 +13,7 @@ from unittest.mock import patch
 
 from starlette.requests import Request
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.events import AgentEvent, AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.model import (
@@ -81,7 +76,7 @@ def make_session() -> AgentSession:
     return AgentSession(
         model=ReadThenAnswerModel(),
         catalog=catalog,
-        retriever=CapabilityRetriever(minimum=1, maximum=1),
+
         pipeline=ToolPipeline(catalog=catalog, state_store=state),
         state_store=state,
     )
@@ -93,7 +88,7 @@ class AgentKernelTransportTests(unittest.IsolatedAsyncioTestCase):
             template = make_session()
             store = SQLiteKernelStore(secret_provider=lambda: "isolated-finish-secret")
             session = AgentSession(
-                model=template.model, catalog=template.catalog, retriever=template.retriever,
+                model=template.model, catalog=template.catalog,
                 pipeline=ToolPipeline(catalog=template.catalog, state_store=store),
                 state_store=store, journal=store,
             )
@@ -265,6 +260,8 @@ class WebDetachedTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(await anext(stream))["type"], "turn.started")
         await asyncio.wait_for(entered.wait(), 1)
         await stream.aclose()
+        await stream.aclose()
+        self.assertEqual(session.metrics.snapshot()["detached_deliveries"], 1)
         for _ in range(3):
             activity = await web.activity(owner="owner", session_id="session")
             assert activity is not None
@@ -283,6 +280,7 @@ class WebDetachedTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(row["role"] == "user" for row in state.conversation), 1)
         metrics = session.metrics.snapshot()
         self.assertEqual(metrics["statuses"], {"success": 1})
+        self.assertEqual(metrics["detached_deliveries"], 1)
         self.assertEqual(metrics["recent"][0]["model_calls"], 1)
         self.assertEqual(metrics["recent"][0]["request_id"], "request")
 

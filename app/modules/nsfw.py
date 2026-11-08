@@ -35,24 +35,30 @@ _NAMED_PROVIDER_RE = re.compile(
     r"(?i)(?<![A-Z0-9])(HEYZO|HEYDOUGA)[\s._-]*(\d{3,6})(?!\d)"
     + _CODE_SUFFIX
 )
+_DATE_PROVIDERS = r"1PONDO|CARIB(?:BEANCOM)?|PACOPACOMAMA|10MUSUME"
 _DATE_PROVIDER_RE = re.compile(
-    r"(?i)(?<![A-Z0-9])(1PONDO|CARIB(?:BEANCOM)?|PACOPACOMAMA|10MUSUME)"
+    rf"(?i)(?<![A-Z0-9])({_DATE_PROVIDERS})"
     r"[\s._-]*(\d{6,8})[\s._-]+(\d{2,4})(?!\d)"
     + _CODE_SUFFIX
 )
-# 数字前缀仍须跟至少两位字母，避免把纯年份、分辨率或单字母编码当作番号。
+_DATE_PROVIDER_SUFFIX_RE = re.compile(
+    r"(?i)(?<![A-Z0-9])(\d{6,8})[\s._-]+(\d{2,4})[\s._-]+"
+    rf"({_DATE_PROVIDERS})(?![A-Z0-9])"
+)
+# 支持数字厂牌及 T38 一类字母数字厂牌；后者须有分隔符，排除 S/E 季集前缀。
 _GENERIC_CODE_RE = re.compile(
-    r"(?i)(?<![A-Z0-9])((?:[0-9]{1,4})?[A-Z]{2,8}[A-Z0-9]{0,4})"
-    r"[\s._-]+(\d{3,7})(?!\d)"
+    r"(?i)(?<![A-Z0-9])((?:[0-9]{1,4})?[A-Z]{2,8}[A-Z0-9]{0,4}|"
+    r"(?![SE][0-9])[A-Z][0-9]{2,4}|[A-Z])"
+    r"[\s._-]+(\d{3,7}|\d{2}(?=C?(?![A-Z0-9])))(?!\d)"
     + _CODE_SUFFIX
 )
 _COMPACT_CODE_RE = re.compile(
     r"(?i)(?<![A-Z0-9])([A-Z]{2,7})(\d{3,5})" + _CODE_SUFFIX + r"(?![A-Z0-9])"
 )
 _CODE_PREFIX_BLOCKLIST = {
-    "AAC", "AC3", "AV1", "AVC", "BDMV", "CBR", "DDP", "DTS", "DV", "DVD",
+    "AAC", "AC3", "AV1", "AVC", "BDMV", "CBR", "CD", "DDP", "DISC", "DISK", "DTS", "DV", "DVD",
     "EP", "EPISODE", "FILM", "FLAC", "H264", "H265", "HDR", "HEVC", "MOVIE",
-    "MP3", "MP4", "MPEG", "REMUX", "SAMPLE", "SDR", "SEASON", "TRUEHD", "UHD",
+    "MP3", "MP4", "MPEG", "PART", "PT", "REMUX", "SAMPLE", "SDR", "SEASON", "TRACK", "TRUEHD", "UHD",
     "VBR", "VIDEO", "WEB", "WEBRIP", "X264", "X265",
 }
 _RELEASE_NOISE_RE = re.compile(
@@ -266,8 +272,8 @@ def clean_nsfw_release_text(value: str, strip_domains: str = "") -> str:
             rf"(?:[/\\][^\s\[\]【】()]*)?",
             " ", text,
         )
-    text = _RELEASE_NOISE_RE.sub(" ", text)
-    return re.sub(r"\s+", " ", text.replace("_", " ")).strip()
+    text = _RELEASE_NOISE_RE.sub(" ", text.replace("_", " "))
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def extract_nsfw_identifier(value: str, strip_domains: str = "") -> NsfwIdentifier | None:
@@ -279,11 +285,12 @@ def _extract_nsfw_identifier(text: str) -> NsfwIdentifier | None:
     match = _FC2_RE.search(text)
     if match:
         return NsfwIdentifier(f"FC2-PPV-{match.group(1)}", match.group(0), "fc2")
-    match = _DATE_PROVIDER_RE.search(text)
-    if match:
-        provider = match.group(1).upper()
-        code = f"{provider}-{match.group(2)}-{match.group(3)}"
-        return NsfwIdentifier(code, match.group(0), "date-provider")
+    # 厂牌可以在日期前或后；保留完整匹配片段供清洗和分段定位共用。
+    for regex, groups in ((_DATE_PROVIDER_RE, (1, 2, 3)), (_DATE_PROVIDER_SUFFIX_RE, (3, 1, 2))):
+        match = regex.search(text)
+        if match:
+            code = "-".join(match.group(index).upper() for index in groups)
+            return NsfwIdentifier(code, match.group(0), "date-provider")
     match = _NAMED_PROVIDER_RE.search(text)
     if match:
         return NsfwIdentifier(
@@ -297,8 +304,17 @@ def _extract_nsfw_identifier(text: str) -> NsfwIdentifier | None:
             number = match.group(2)
             if prefix.lstrip("0123456789") in _CODE_PREFIX_BLOCKLIST:
                 continue
-            # 纯字母片名后的年份仍保持保守；数字厂牌前缀的序号不能当年份丢弃。
-            if not prefix[0].isdigit() and len(number) == 4 and 1900 <= int(number) <= 2099:
+            # 单字母厂牌只接收长序号；S/E 季集标记不作为番号。
+            if len(prefix) == 1 and (prefix in {"S", "E"} or len(number) < 4):
+                continue
+            # 短番号和单字母厂牌须紧贴连字符，避免吞掉日期、剧集编号或片名后的年份。
+            if (len(number) == 2 or len(prefix) == 1) and not match.group(0).upper().startswith(f"{prefix}-{number}"):
+                continue
+            # 片名后的年份保持保守；数字开头厂牌或 T38-1999 这种明确写法除外。
+            if (
+                not prefix[0].isdigit() and len(number) == 4 and 1900 <= int(number) <= 2099
+                and not (prefix[1:].isdigit() and match.group(0).upper().startswith(f"{prefix}-{number}"))
+            ):
                 continue
             return NsfwIdentifier(f"{prefix}-{number}", match.group(0), source)
     return None

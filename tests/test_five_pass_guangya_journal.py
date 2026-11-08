@@ -1,4 +1,4 @@
-"""三种光鸭操作日志共用追加实现，历史 JSONL 字节协议保持不变。"""
+"""光鸭统一变更操作日志追加实现，历史 JSONL 字节协议保持不变。"""
 from __future__ import annotations
 
 import json
@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.modules import guangya_fs_change, guangya_rename, guangya_residual_cleanup
+from app.modules import guangya_fs_change
 
-_MODULES = (guangya_fs_change, guangya_rename, guangya_residual_cleanup)
+_MODULES = (guangya_fs_change,)
 
 
 class GuangYaJournalProtocolTests(unittest.TestCase):

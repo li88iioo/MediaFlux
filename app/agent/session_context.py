@@ -17,18 +17,10 @@ from app.modules.web_secret import get_web_secret
 logger = logging.getLogger(__name__)
 
 _CONTEXT_TYPES = frozenset({
-    "patrol",
     "download_submission",
-    "resource_candidates",
     "discovery_candidates",
     "read_operation",
-    "local_media_tasks",
-    "discovery_mapping",
     "directory_scrape",
-    "guangya_rename",
-    "guangya_cleanup",
-    "guangya_workspace",
-    "guangya_fs_change",
 })
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024

@@ -1,34 +1,33 @@
 """结构化偏好的确认、持久化、单次覆盖与真实推荐消费。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from contextlib import contextmanager
-from typing import Any
-from unittest.mock import Mock, patch
+from typing import cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app import database as db
-from app.agent.action_history import action_history_owner_digest
-from app.agent.domains.library.recommendation_actions import (
-    get_library_recommendations,
-    library_recommendation_arguments,
-)
-from app.agent.domains.subscriptions.consumption_actions import (
-    clear_preferences_confirmed,
-    get_preferences,
-    owner_media_preferences,
-    preferences_update_arguments,
-    prepare_clear_preferences,
-    prepare_set_preferences,
-    set_preferences_confirmed,
-)
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext, ToolResult
+from app.database import media_owner_digest
+
+from app.modules.media_preferences import owner_media_preferences
+from app.agent.errors import ToolPipelineError
+from app.agent.kernel.capabilities import ToolCatalog
+from app.agent.kernel.effects import EffectExecutor
+from app.agent.kernel.ports.sdk_effects import download_submit_tool
+from app.agent.kernel.state import InMemorySessionStateStore
+from tests.test_agent_kernel_existing_ports import context_for
+from app.agent.models import ToolContext
 from app.modules.episode_resource_ranking import rank_episode_search
 from app.modules.media_preferences import (
+    apply_media_preferences_change,
     effective_preferences,
+    prepare_media_preferences_change,
+    media_preferences_preview,
+    public_media_preferences,
     resource_preference_match,
     validate_preference_updates,
 )
@@ -75,9 +74,49 @@ def _context(owner="viewer"):
     return ToolContext(owner=owner, session_id="preferences-test")
 
 
+def test_shared_preference_change_is_read_only_until_apply_and_preserves_explicit_fields(preference_db):
+    owner = "viewer-key"
+    updates = {"preferred_resolution": "2160p", "memory_notes": [" 喜欢原声 ", "喜欢原声"]}
+    original = get_media_preferences(owner)
+    prepared = prepare_media_preferences_change(owner, updates)
+    assert json.loads(json.dumps(prepared, ensure_ascii=False)) == prepared
+    assert prepared["current"] == get_media_preferences(owner) == original
+    assert prepared["proposed"]["minimum_resolution"] == "any"
+    assert prepared["proposed"]["memory_notes"] == ["喜欢原声"]
+    with preference_db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM agent_media_preferences").fetchone()[0] == 0
+    assert apply_media_preferences_change(
+        owner, {"preferred_resolution": "1080p"}, expected_fingerprint=prepared["fingerprint"],
+    ) is None
+    assert get_media_preferences(owner) == original
+
+    written = apply_media_preferences_change(owner, updates, expected_fingerprint=prepared["fingerprint"])
+    assert written is not None and written["explicit"] and written["revision"] == 1
+    assert len(written["revision_token"]) == 32
+    assert not get_media_preferences(owner + " ")["explicit"]
+    assert apply_media_preferences_change(
+        owner + " ", updates, expected_fingerprint=prepare_media_preferences_change(owner, updates)["fingerprint"],
+    ) is None
+
+    prepared = prepare_media_preferences_change(owner, {"preferred_download_target": "qb"})
+    merged = apply_media_preferences_change(
+        owner, prepared["updates"], expected_fingerprint=prepared["fingerprint"],
+    )
+    assert merged is not None and merged["preferred_download_target"] == "qb"
+    assert merged["preferred_resolution"] == "2160p" and merged["minimum_resolution"] == "any"
+    assert merged["memory_notes"] == ["喜欢原声"]
+    assert get_media_preferences(owner) == merged
+    prepared = prepare_media_preferences_change(owner)
+    assert prepared["proposed"] == default_media_preferences()
+    cleared = apply_media_preferences_change(owner, expected_fingerprint=prepared["fingerprint"])
+    assert cleared == {**default_media_preferences(), "revision": 0, "explicit": False}
+    assert get_media_preferences(owner) == original
+    assert apply_media_preferences_change(owner, expected_fingerprint=prepared["fingerprint"]) is None
+
+
 def test_structured_preferences_freeze_then_persist_merge_and_owner_isolation(preference_db):
-    context = _context()
-    updates = preferences_update_arguments({
+    digest = media_owner_digest("viewer")
+    updates = validate_preference_updates({
         "preferred_resolution": "2160p", "minimum_resolution": "1080p",
         "preferred_hdr": "dolby_vision", "preferred_codecs": ["HEVC", "av1"],
         "preferred_subtitles": ["简中"], "preferred_audio_languages": ["国语"],
@@ -86,27 +125,29 @@ def test_structured_preferences_freeze_then_persist_merge_and_owner_isolation(pr
         "preferred_genres": ["喜剧|Comedy"], "excluded_genres": ["恐怖"],
         "min_rating": 7.5, "exclude_played": True,
     })
-    preview, fingerprint = prepare_set_preferences(updates, context)
-    assert preview.status == "confirmation_required"
-    assert not get_preferences({}, context).data["explicit"]
-    assert preview.data["proposed"]["preferred_release_groups"] == ["BlackTV"]
-    assert "首选分辨率：2160p" in preview.data["effects"]
-    assert "首选编码：hevc、av1" in preview.data["effects"]
-    assert "首选动态范围：杜比视界" in preview.data["effects"]
-    assert "排除已看内容：是" in preview.data["effects"]
+    prepared = prepare_media_preferences_change(digest, updates)
+    fingerprint = prepared["fingerprint"]
+    preview = media_preferences_preview(prepared)
+    assert not get_media_preferences(digest)["explicit"]
+    assert preview["proposed"]["preferred_release_groups"] == ["BlackTV"]
+    assert "首选分辨率：2160p" in preview["effects"]
+    assert "首选编码：hevc、av1" in preview["effects"]
+    assert "首选动态范围：杜比视界" in preview["effects"]
+    assert "排除已看内容：是" in preview["effects"]
     from app.agent.public_safety import sanitize_public_text
-    public_changes = sanitize_public_text("；".join(preview.data["effects"]), limit=2000)
+    public_changes = sanitize_public_text("；".join(preview["effects"]), limit=2000)
     assert "首选分辨率:2160p" in public_changes and "内部状态" not in public_changes
-    result = set_preferences_confirmed(updates, fingerprint, context)
-    assert result.ok and result.data["preferred_resolution"] == "2160p"
-    assert result.data["preferred_codecs"] == ["hevc", "av1"]
-    assert get_preferences({}, _context("other")).data["preferred_genres"] == []
-    digest = action_history_owner_digest("viewer")
+    written = apply_media_preferences_change(digest, updates, expected_fingerprint=fingerprint)
+    assert written is not None
+    result = public_media_preferences(written)
+    assert result["preferred_resolution"] == "2160p"
+    assert result["preferred_codecs"] == ["hevc", "av1"]
+    assert public_media_preferences(get_media_preferences(media_owner_digest("other")))["preferred_genres"] == []
     stored = get_media_preferences(digest)
     assert stored["revision"] == 1
     assert len(stored["revision_token"]) == 32
-    assert "revision_token" not in result.data
-    assert "revision_token" not in get_preferences({}, context).data
+    assert "revision_token" not in result
+    assert "revision_token" not in public_media_preferences(get_media_preferences(digest))
     assert stored["preferred_download_target"] == "guangya"
     with preference_db() as conn:
         saved = json.loads(conn.execute("SELECT profile_json FROM agent_media_preferences").fetchone()[0])
@@ -117,20 +158,11 @@ def test_structured_preferences_freeze_then_persist_merge_and_owner_isolation(pr
     assert changed["revision_token"] != stored["revision_token"]
     assert changed["preferred_genres"] == ["喜剧|Comedy"]
     assert set_media_preferences(digest, expected_revision=1, updates={"preferred_resolution": "720p"}) is None
-    with pytest.raises(AgentToolError, match="已变化"):
-        set_preferences_confirmed(updates, fingerprint, context)
-    clear_preview, clear_fingerprint = prepare_clear_preferences({}, context)
-    assert clear_preview.data["defaults"]["preferred_genres"] == []
-    assert clear_preferences_confirmed({}, clear_fingerprint, context).ok
-    assert get_preferences({}, context).data["preferred_resolution"] == "any"
-
-
-def test_preference_confirmation_detects_changed_args(preference_db):
-    _, fingerprint = prepare_set_preferences({"preferred_resolution": "2160p"}, _context())
-    with pytest.raises(AgentToolError) as error:
-        set_preferences_confirmed({"preferred_resolution": "720p"}, fingerprint, _context())
-    assert error.value.code == "confirmation_stale"
-    assert not get_preferences({}, _context()).data["explicit"]
+    assert apply_media_preferences_change(digest, updates, expected_fingerprint=fingerprint) is None
+    clear = prepare_media_preferences_change(digest)
+    assert media_preferences_preview(clear)["defaults"]["preferred_genres"] == []
+    assert apply_media_preferences_change(digest, expected_fingerprint=clear["fingerprint"]) is not None
+    assert get_media_preferences(digest)["preferred_resolution"] == "any"
 
 
 @pytest.mark.parametrize("updates", [
@@ -147,17 +179,13 @@ def test_preference_validation_is_bounded(updates):
     with pytest.raises(ValueError) as domain_error:
         validate_preference_updates(updates)
     assert type(domain_error.value) is ValueError
-    with pytest.raises(AgentToolError) as agent_error:
-        preferences_update_arguments(updates)
-    assert agent_error.value.code == "invalid_tool_call"
-    assert agent_error.value.safe_message == str(domain_error.value)
 
 
 def test_defaults_not_mutable_and_corrupt_storage_has_safe_defaults(preference_db):
     first = default_media_preferences()
     first["preferred_genres"].append("污染")
     assert default_media_preferences()["preferred_genres"] == []
-    digest = action_history_owner_digest("viewer")
+    digest = media_owner_digest("viewer")
     set_media_preferences(digest, expected_revision=0, updates={"preferred_genres": ["喜剧"]})
     with preference_db() as conn:
         conn.execute("UPDATE agent_media_preferences SET profile_json=?", ('{"preferred_genres": "bad"}',))
@@ -167,26 +195,33 @@ def test_defaults_not_mutable_and_corrupt_storage_has_safe_defaults(preference_d
     assert get_media_preferences(digest)["preferred_genres"] == []
 
 
-def test_local_recommendations_consume_saved_genre_rating_history_and_single_use_overrides(preference_db):
-    digest = action_history_owner_digest("viewer")
+def test_local_recommendations_consume_saved_genre_rating_history_and_single_use_overrides(preference_db, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from app import sdk
+    from app.clients.base import MediaRecommendationInventory
+    from app.modules import media_library
+
+    digest = media_owner_digest("viewer")
     set_media_preferences(digest, expected_revision=0, updates={
         "preferred_server": "jellyfin", "preferred_genres": ["喜剧|Comedy"],
         "excluded_genres": ["恐怖|Horror"], "min_rating": 8, "exclude_played": True,
     })
     profile = MediaServerProfile(source="configured:jellyfin", server_type="jellyfin", label="Jellyfin", url="http://example.local", credential="test", enabled=True, user_id="viewer")
-    gateway = Mock()
-    gateway.query.return_value = ToolResult(True, "completed", "推荐完成", data={"items": []})
-    with patch("app.agent.domains.subscriptions.consumption_actions.list_configured_profiles", return_value=[profile]), patch("app.agent.domains.library.recommendation_actions.get_provider_gateway", return_value=gateway):
-        normalized = library_recommendation_arguments({"media_type": "tv"})
-        assert "prefer" not in normalized
-        assert get_library_recommendations(normalized, _context()).ok
-        arguments = gateway.query.call_args.kwargs["arguments"]
-        assert arguments["prefer"] == ["喜剧|Comedy"]
-        assert arguments["exclude"] == ["恐怖|Horror"]
-        assert arguments["min_rating"] == 8
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.enrich_media_genres.return_value = []
+    client.list_recommendation_candidates.return_value = MediaRecommendationInventory()
+    monkeypatch.setattr(media_library, "list_configured_profiles", lambda: [profile])
+    monkeypatch.setattr(MediaServerProfile, "create_client", lambda _profile: client)
+    with sdk.call_owner("viewer"):
+        result = sdk.library.recommend(media_type="tv")
+        assert result["criteria"]["prefer"] == ["喜剧|Comedy"]
+        assert result["criteria"]["exclude"] == ["恐怖|Horror"]
+        assert result["criteria"]["min_rating"] == 8
         override = {"prefer": [], "exclude": [], "min_rating": 0, "exclude_played": False}
-        get_library_recommendations(library_recommendation_arguments(override), _context())
-        assert all(gateway.query.call_args.kwargs["arguments"][key] == value for key, value in override.items())
+        result = sdk.library.recommend(**override)
+        assert all(result["criteria"][key] == value for key, value in override.items())
     assert owner_media_preferences("viewer")["min_rating"] == 8
 
 
@@ -229,6 +264,20 @@ def test_resource_language_hdr_codec_and_group_markers_add_explainable_bonus():
     assert effective_preferences({"excluded_keywords": ["CAM"]}, {"excluded_keywords": []})["excluded_keywords"] == []
 
 
+@pytest.mark.parametrize(("suffix", "preference", "matched"), [
+    ("H264-ASDRGroup", "sdr", False), ("HDR", "hdr10", False),
+    ("H264", "sdr", False), ("SDR", "sdr", True), ("HLG", "sdr", False),
+    ("HDR10", "hdr10", True), ("杜比视界", "dolby_vision", True),
+])
+def test_resource_range_preferences_require_explicit_shared_evidence(suffix, preference, matched):
+    item = _resource("a", f"Show.S01E01.1080p.WEB-DL.{suffix}")
+    baseline = resource_preference_match(item, {"preferred_hdr": "any"})
+    result = resource_preference_match(item, {"preferred_hdr": preference})
+    assert result["score"] - baseline["score"] == (25 if matched else 0)
+    assert result["eligible"] and baseline["eligible"]  # 软偏好不成为硬门槛。
+    assert (f"偏好画面格式：{preference}" in result["reasons"]) is matched
+
+
 def test_old_preference_schema_can_be_read_without_runtime_schema_mutation(preference_db):
     with preference_db() as conn:
         conn.execute("DROP TABLE agent_media_preferences")
@@ -248,344 +297,192 @@ def test_old_preference_schema_can_be_read_without_runtime_schema_mutation(prefe
 
 
 @pytest.mark.parametrize("whole_season", [False, True])
-def test_missing_resource_domain_wrapper_consumes_owner_profile_before_reference_creation(
-    preference_db, whole_season,
-):
-    from app.agent.domains.library.tools import register_specs
+def test_native_missing_resources_consumes_saved_owner_profile(preference_db, whole_season):
+    from app import sdk
+    from app.modules.episode_audit import EpisodeAuditResult
+    from tests.test_agent_indexer_actions import FakeIndexerService
+    from tests.test_missing_resources import _search_result
 
-    digest = action_history_owner_digest("viewer")
-    set_media_preferences(digest, expected_revision=0, updates={
+    set_media_preferences(media_owner_digest("viewer"), expected_revision=0, updates={
         "preferred_resolution": "1080p", "excluded_keywords": ["CAM"],
     })
-    registry = Mock()
-    runtime = Mock()
-    register_specs(registry, missing_media_runtime=runtime)
-    specs = {call.args[0].name: call.args[0] for call in registry.register.call_args_list}
-    tool = specs["library.search_missing_season_resources" if whole_season
-                 else "library.search_missing_episode_resources"]
-    assert "preference_overrides" in tool.parameters["properties"]
-    assert "preference_overrides" not in specs["library.search"].parameters["properties"]
-    arguments = {"query": "Show", "season": 1, "as_of": "2026-08-01"}
-    if not whole_season:
-        arguments["episode"] = 1
-    audit = ToolResult(True, "updates_available", "确定缺集", data={
-        "title": "Show", "tmdb_id": "12345", "missing_count": 1,
-        "missing_sample": [{"season": 1, "episode": 1}],
-        "missing_sample_truncated": False, "target_missing": True,
+    audit = EpisodeAuditResult(True, "updates_available", "确定缺集", data={
+        "title":"Show", "tmdb_id":"12345", "as_of":"2026-08-01", "season":1,
+        "missing_count":1,"missing_sample":[{"season":1,"episode":1}],
+        "missing_sample_truncated":False,"target_missing":True,
     })
-    source_items = [
-        _resource("a", "Show.S01E01.2160p.WEB-DL.HEVC-GroupA"),
-        _resource("b", "Show.S01E01.1080p.WEB-DL.HEVC-GroupB"),
-        _resource("c", "Show.S01E01.1080p.CAM-GroupC"),
-    ]
-    searched = ToolResult(True, "success", "找到三项", data={"items": source_items})
-    service = Mock()
-    service.result_store.get.return_value = None
-    with patch("app.agent.domains.library.episode_resource_actions.audit_series_episodes", return_value=audit), \
-            patch("app.agent.domains.library.episode_resource_actions.search_resources", return_value=searched), \
-            patch("app.agent.domains.library.episode_resource_actions.get_indexer_service", return_value=service):
-        for owner, overrides, expected in (
-            ("viewer", None, "b" * 20),
-            ("other", None, "a" * 20),
-            ("viewer", {"preferred_resolution": "2160p"}, "a" * 20),
-        ):
-            requested: dict[str, Any] = dict(arguments)
-            if overrides is not None:
-                requested["preference_overrides"] = overrides
-            result = tool.context_handler(tool.validator(requested), _context(owner))
-            assert result.ok
-            search = (result.data["episodes"][0]["search"] if whole_season
-                      else result.data["search"])
-            assert search["recommendation"]["selected"]["result_id"] == expected
-            snapshot = next(ref.value for ref in result.references if ref.kind == "resource_candidates")
-            assert snapshot["candidates"][0]["result_id"] == expected
-            assert snapshot["candidates"][0]["position"] == 1
-            assert "position" not in search["items"][0]
-            assert search["items"][0]["quality"]["rank"] == 1
-            assert runtime.capture_search.call_args.kwargs["owner"] == owner
-            assert runtime.capture_search.call_args.kwargs["result"] is result
-            if owner == "viewer":
-                assert "c" * 20 not in [candidate["result_id"] for candidate in snapshot["candidates"]]
-    assert owner_media_preferences("viewer")["preferred_resolution"] == "1080p"
+    source_items=[_resource("a","Show.S01E01.2160p.WEB-DL.HEVC-GroupA"),
+                  _resource("b","Show.S01E01.1080p.WEB-DL.HEVC-GroupB"),
+                  _resource("c","Show.S01E01.1080p.CAM-GroupC")]
+    service=FakeIndexerService(private_results=False)
+    service.search_media=AsyncMock(return_value=_search_result(items=source_items))
+    with patch("app.modules.missing_resources.audit_series_episodes",return_value=audit), \
+         patch("app.modules.missing_resources.config.get_bool",return_value=True), \
+         patch("app.modules.missing_resources.get_indexer_service",return_value=service):
+        for owner,overrides,expected in [("viewer",None,"b"*20),("other",None,"a"*20),
+                ("viewer",{"preferred_resolution":"2160p"},"a"*20),
+                ("viewer",{"excluded_keywords":[],"preferred_resolution":"2160p","max_episode_size_gb":0},"a"*20)]:
+            item={"query":"Show","season":1,**({} if whole_season else {"episodes":[1]})}
+            with sdk.call_owner(owner):
+                result=sdk.resources.search_missing([item],as_of="2026-08-01",preference_overrides=overrides)
+            assert result["ok"] and result["result_ids"]==[expected]
+            search=result["groups"][0]["episodes"][0]["search"]
+            assert search["recommendation"]["selected"]["result_id"]==expected
+            assert len(result["items"]) == 3 and all("position" not in r for r in result["items"])
+            assert set(search["result_ids"]) == set(search["quality"]) == set(search["preference_match"])
+            assert set(search["result_ids"]) == {r["result_id"] for r in result["items"]}
+    assert owner_media_preferences("viewer")["preferred_resolution"]=="1080p"
     assert all("quality" not in item for item in source_items)
 
 
-@pytest.mark.parametrize("invalid", [
-    {"preferred_server": "jellyfin"}, {"max_episode_size_gb": -1},
-    {"preferred_genres": ["Comedy"]}, "2160p", None,
-])
-def test_missing_resource_override_validator_rejects_irrelevant_or_invalid_fields(invalid):
-    from app.agent.domains.library.episode_resource_actions import (
-        missing_episode_resource_arguments,
-        missing_season_resource_arguments,
-    )
-
-    for validator, extra in (
-        (missing_episode_resource_arguments, {"episode": 1}),
-        (missing_season_resource_arguments, {}),
-    ):
-        with pytest.raises(AgentToolError):
-            validator({"query": "Show", "season": 1,
-                       "preference_overrides": invalid, **extra})
+@pytest.mark.parametrize("invalid",[{"preferred_server":"jellyfin"},{"max_episode_size_gb":-1},{"preferred_genres":["Comedy"]},"2160p"])
+def test_native_missing_resource_rejects_invalid_quality_fields(invalid):
+    from app import sdk
+    with sdk.call_owner("viewer"),pytest.raises((TypeError,ValueError)):
+        sdk.resources.search_missing([{"query":"Show","season":1}],preference_overrides=invalid)
 
 
 @pytest.fixture
-def ingest_environment(preference_db):
-    from app.agent.domains.resources.candidate_context import (
-        RecentResourceCandidateStore,
-    )
-    from app.agent.domains.resources.ingest_actions import (
-        IngestActions,
-    )
-
-    actions = IngestActions(share_store=ShareTransferPreviewStore(ttl_seconds=900, max_entries=256), recent_resource_store=RecentResourceCandidateStore())
-    with patch("app.agent.domains.resources.ingest_actions.download_target_readiness",
-               side_effect=lambda target: {name: True for name in (["qb", "guangya"] if target == "both" else [target])}), \
-            patch("app.agent.domains.resources.ingest_actions.create_request", return_value={"id": 42, "created": True}) as create, \
-            patch("app.agent.domains.resources.ingest_actions.dispatch_request",
-                  side_effect=lambda number, target: {"ok": True, "status": "submitted", "succeeded": [target], "failed": []}) as dispatch, \
-            patch("app.agent.domains.resources.ingest_actions.db.get_download_request", return_value=None):
-        yield actions, create, dispatch
+def download_environment(preference_db):
+    with patch("app.indexers.downloads.download_target_readiness", side_effect=lambda target: {
+            name: True for name in (["qb", "guangya"] if target == "both" else [target])}), \
+            patch("app.indexers.downloads.create_request", return_value={"id": 42, "created": True}) as create, \
+            patch("app.indexers.downloads.dispatch_request",
+                  side_effect=lambda number, target: {"ok": True, "status": "submitted", "succeeded": [target], "failed": []}) as dispatch:
+        yield create, dispatch
 
 
-def _inspect_direct(actions, owner="viewer"):
-    return actions.inspect({"source_type": "direct_url", "input": "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Show.S01E01"}, _context(owner))
 
-
-def test_ingest_default_target_validator_and_share_protocol_stay_separate():
-    from app.agent.domains.resources.ingest_actions import ingest_submit_arguments
-
-    reference = "ref_1234567890abcdefghijkl"
-    assert ingest_submit_arguments({"source_type": "direct_url", "ingest_snapshot_ref": reference})["target"] == "preferred"
-    assert ingest_submit_arguments({"source_type": "resource_candidates", "positions": [1]})["target"] == "preferred"
-    assert ingest_submit_arguments({"source_type": "guangya_share", "target": "preferred", "ingest_snapshot_ref": reference})["target"] == "guangya"
-    for target in ("qb", "both"):
-        with pytest.raises(AgentToolError, match="只能转存"):
-            ingest_submit_arguments({"source_type": "guangya_share", "target": target, "ingest_snapshot_ref": reference})
+def test_native_resource_default_and_share_protocol_stay_separate():
+    from app.agent.schema import validate_json_schema
+    from app.agent.kernel.ports.sdk_effects import resource_download_tool, share_transfer_tool
+    resource = resource_download_tool()
+    share = share_transfer_tool()
+    assert resource.input_schema["properties"]["target"]["default"] == "preferred"
+    validate_json_schema({"result_ids": ["candidate-id"]}, resource.input_schema)
+    validate_json_schema({"url": "https://www.guangyapan.com/s/example", "file_ids": ["real-id"]}, share.input_schema)
+    for target in ("qb", "both", "preferred"):
+        with pytest.raises(ToolPipelineError):
+            validate_json_schema({"url": "https://www.guangyapan.com/s/example", "file_ids": ["real-id"], "target": target}, share.input_schema)
     for invalid in ("evil", "", 0, False, None):
-        with pytest.raises(AgentToolError):
-            ingest_submit_arguments({"source_type": "direct_url", "target": invalid, "ingest_snapshot_ref": reference})
+        with pytest.raises(ToolPipelineError):
+            validate_json_schema({"result_ids": ["candidate-id"], "target": invalid}, resource.input_schema)
 
 
-def test_ingest_resolves_defaults_per_owner_and_explicit_choice_without_writes(ingest_environment):
-    from app.agent.domains.resources.ingest_actions import ingest_submit_arguments
+def test_native_url_resolves_defaults_per_owner_and_explicit_choice_without_writes(download_environment):
+    from app.agent.domains.resources.selection import _target_options
 
-    actions, create, dispatch = ingest_environment
-    set_media_preferences(action_history_owner_digest("viewer"), expected_revision=0,
+    create, dispatch = download_environment
+    set_media_preferences(media_owner_digest("viewer"), expected_revision=0,
                           updates={"preferred_download_target": "qb"})
-    for owner, explicit, expected in (
-        ("viewer", None, "qb"), ("other", None, "guangya"),
-        ("viewer", "both", "both"), ("viewer", "guangya", "guangya"),
-    ):
-        inspected = _inspect_direct(actions, owner)
-        raw = {"source_type": "direct_url", "ingest_snapshot_ref": "ref_1234567890abcdefghijkl"}
-        if explicit is not None:
-            raw["target"] = explicit
-        arguments = ingest_submit_arguments(raw)
-        arguments["ingest_snapshot"] = inspected.references[0].value
-        preview, fingerprint = actions.prepare_submit(arguments, _context(owner))
-        assert preview.ok and preview.data["target"] == expected
-        assert preview.data["backends"] == ({"qb": True, "guangya": True} if expected == "both" else {expected: True})
-        assert fingerprint.startswith("ingest-target-v1:") is (explicit is None)
-        assert arguments["target"] == (explicit or "preferred")
+    async def check():
+        state = InMemorySessionStateStore()
+        effects = EffectExecutor(catalog=ToolCatalog([download_submit_tool()]), state_store=state)
+        for owner, explicit, expected in (
+            ("viewer", None, "qb"), ("other", None, "guangya"),
+            ("viewer", "both", "both"), ("viewer", "guangya", "guangya"),
+        ):
+            context = await context_for(state, owner=owner, session=f"defaults-{explicit}")
+            arguments = {"url": "magnet:?xt=urn:btih:" + "a" * 40}
+            if explicit is not None:
+                arguments["target"] = explicit
+            prepared = await effects.prepare("downloads.submit", arguments, context=context)
+            plan = prepared.effect_plan
+            assert plan is not None and plan.arguments["target"] == expected
+            assert plan.preview["data"]["target"] == expected
+            assert plan.preview["data"]["backends"] == ({"qb": True, "guangya": True} if expected == "both" else {expected: True})
+    asyncio.run(check())
+    for owner, target, source in (("viewer", "qb", "saved_preference"), ("other", "guangya", "product_default")):
+        options = _target_options(owner)
+        assert (options["target"], options["target_source"]) == (target, source)
     create.assert_not_called()
     dispatch.assert_not_called()
 
 
-def test_ingest_confirm_restores_frozen_target_after_preferences_change_and_service_restart(ingest_environment):
-    from app.agent.domains.resources.candidate_context import (
-        RecentResourceCandidateStore,
-    )
-    from app.agent.domains.resources.ingest_actions import (
-        IngestActions,
-        ingest_submit_arguments,
-    )
-
-    actions, create, dispatch = ingest_environment
-    owner = action_history_owner_digest("viewer")
-    set_media_preferences(owner, expected_revision=0, updates={"preferred_download_target": "qb"})
-    inspected = _inspect_direct(actions)
-    arguments = ingest_submit_arguments({"source_type": "direct_url", "ingest_snapshot_ref": "ref_1234567890abcdefghijkl"})
-    arguments["ingest_snapshot"] = inspected.references[0].value
-    preview, fingerprint = actions.prepare_submit(arguments, _context())
-    assert preview.data["target"] == "qb"
-    # 仅模拟领域进程对象重建；资源来自原 Kernel 持久 opaque ref。
-    restarted = IngestActions(share_store=ShareTransferPreviewStore(ttl_seconds=900, max_entries=256), recent_resource_store=RecentResourceCandidateStore())
-    set_media_preferences(owner, expected_revision=1, updates={"preferred_download_target": "guangya"})
-    with patch("app.agent.domains.resources.ingest_actions.explicit_preferred_download_target", side_effect=AssertionError("确认阶段不得重读偏好")):
-        result = restarted.execute_submit(arguments, fingerprint, _context())
-    assert result.ok and result.data["target"] == "qb"
-    dispatch.assert_called_once_with(42, "qb")
-    create.assert_called_once()
-
-
-def test_ingest_default_plan_rejects_tampered_target_or_missing_freeze(ingest_environment):
-    from app.agent.domains.resources.ingest_actions import ingest_submit_arguments
-
-    actions, create, dispatch = ingest_environment
-    inspected = _inspect_direct(actions)
-    arguments = ingest_submit_arguments({"source_type": "direct_url", "ingest_snapshot_ref": "ref_1234567890abcdefghijkl"})
-    arguments["ingest_snapshot"] = inspected.references[0].value
-    _preview, fingerprint = actions.prepare_submit(arguments, _context())
-    corrupted = [
-        fingerprint.replace(":guangya:", ":qb:"),
-        "ingest-target-v1:qb:broken", "ingest-target-v1:other:" + "a" * 64,
-        "a" * 64,
-    ]
-    for modified in corrupted:
-        with pytest.raises(AgentToolError) as error:
-            actions.execute_submit(arguments, modified, _context())
-        assert error.value.code == "confirmation_stale"
-    with pytest.raises(AgentToolError):
-        actions.execute_submit({**arguments, "target": "qb"}, fingerprint, _context())
-    create.assert_not_called()
-    dispatch.assert_not_called()
-
-
-def test_ingest_legacy_explicit_hash_plan_and_unavailable_default_do_not_regress(ingest_environment):
-    from app.agent.domains.resources.ingest_actions import ingest_submit_arguments
-
-    actions, create, dispatch = ingest_environment
-    inspected = _inspect_direct(actions)
-    explicit = ingest_submit_arguments({"source_type": "direct_url", "target": "qb", "ingest_snapshot_ref": "ref_1234567890abcdefghijkl"})
-    explicit["ingest_snapshot"] = inspected.references[0].value
-    _preview, old_hash = actions.prepare_submit(explicit, _context())
-    assert len(old_hash) == 64 and ":" not in old_hash
-    with patch("app.agent.domains.resources.ingest_actions.explicit_preferred_download_target", side_effect=AssertionError("显式目标不得读取偏好")):
-        assert actions.execute_submit(explicit, old_hash, _context()).ok
-    dispatch.assert_called_once_with(42, "qb")
-    create.reset_mock()
-    dispatch.reset_mock()
-    set_media_preferences(action_history_owner_digest("viewer"), expected_revision=0,
+def test_native_url_explicit_target_and_unavailable_default(download_environment):
+    create, dispatch = download_environment
+    set_media_preferences(media_owner_digest("viewer"), expected_revision=0,
                           updates={"preferred_download_target": "qb"})
-    default_arguments = ingest_submit_arguments({"source_type": "direct_url", "ingest_snapshot_ref": "ref_1234567890abcdefghijkl"})
-    default_arguments["ingest_snapshot"] = inspected.references[0].value
-    with patch("app.agent.domains.resources.ingest_actions.download_target_readiness", return_value={"qb": False}):
-        preview, fingerprint = actions.prepare_submit(default_arguments, _context())
-    assert not preview.ok and fingerprint == ""
+    async def check():
+        state = InMemorySessionStateStore()
+        effects = EffectExecutor(catalog=ToolCatalog([download_submit_tool()]), state_store=state)
+        context = await context_for(state, owner="viewer", session="explicit")
+        url = "magnet:?xt=urn:btih:" + "a" * 40
+        with patch("app.agent.kernel.ports.sdk_effects.resolve_download_target", side_effect=AssertionError("显式目标不得读取偏好")):
+            assert (await effects.prepare("downloads.submit", {"url": url, "target": "qb"}, context=context)).effect_plan
+        context = await context_for(state, owner="viewer", session="unavailable")
+        with patch("app.indexers.downloads.download_target_readiness", return_value={"qb": False}):
+            with pytest.raises(ToolPipelineError) as error:
+                await effects.prepare("downloads.submit", {"url": url}, context=context)
+        assert error.value.code == "precondition_failed"
+        assert await effects.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
+    asyncio.run(check())
     create.assert_not_called()
     dispatch.assert_not_called()
 
 
 @pytest.mark.parametrize("positions", [[1], [1, 2]])
-def test_ingest_default_resource_single_and_batch_freeze_target_without_ref_position_drift(
-    preference_db, positions,
-):
-    from app.agent.domains.resources.candidate_context import (
-        RecentResourceCandidateStore,
-        new_resource_search_id,
-        safe_resource_snapshot,
-    )
-    from app.agent.domains.resources.ingest_actions import (
-        IngestActions,
-        ingest_submit_arguments,
-    )
+def test_native_resource_single_and_batch_freeze_owner_default_target(preference_db, positions):
+    from types import SimpleNamespace
+    from app.agent.kernel.ports.sdk_effects import resource_download_tool
+    from app.indexers.models import IndexerItem
+    from app.indexers.result_store import IndexerResultStore
+    from tests.support import _prepare_batch
 
-    owner = action_history_owner_digest("viewer")
+    owner = media_owner_digest("viewer")
     set_media_preferences(owner, expected_revision=0, updates={"preferred_download_target": "qb"})
-    actions = IngestActions(share_store=ShareTransferPreviewStore(ttl_seconds=900, max_entries=256), recent_resource_store=RecentResourceCandidateStore())
-    snapshot = safe_resource_snapshot(ToolResult(True, "success", "搜索完成", data={"items": [
-        _resource("a", "Show.S01E01.2160p", site_id="nyaa", site_name="Nyaa"),
-        _resource("b", "Show.S01E02.2160p", site_id="nyaa", site_name="Nyaa"),
-    ]}), search_id=new_resource_search_id())
-    arguments = ingest_submit_arguments({"source_type": "resource_candidates", "positions": positions})
-    arguments["resource_candidates"] = snapshot
-    with patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource", side_effect=lambda args: (
-        ToolResult(True, "confirmation_required", "预检完成", data={"resource": {"title": args["result_id"]}}),
-        args["result_id"] + ":" + args["target"],
-    )), patch("app.agent.domains.resources.candidate_actions.submit_resource_confirmed", side_effect=lambda args, expected: ToolResult(
-        True, "accepted", "已提交", data={"result_id": args["result_id"], "request_id": 42, "target": args["target"]},
-    )) as submit, patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource_batch", side_effect=lambda args: (
-        ToolResult(True, "confirmation_required", "批量预检", data={"resources": [
-            {"title": result_id} for result_id in args["result_ids"]
-        ]}), ":".join(args["result_ids"]) + ":" + args["target"],
-    )), patch("app.agent.domains.resources.candidate_actions.submit_resource_batch_confirmed", side_effect=lambda args, expected: ToolResult(
-        True, "completed", "已批量提交", data={"items": [
-            {"result_id": result_id, "target": args["target"], "request_id": 42}
-            for result_id in args["result_ids"]
-        ]},
-    )) as submit_batch:
-        preview, frozen = actions.prepare_submit(arguments, _context())
-        assert preview.data["target"] == "qb"
-        assert arguments["search_id"] == snapshot["search_id"]
-        assert arguments["positions"] == positions
+    ids = ["a" * 20, "b" * 20][:len(positions)]
+    service = SimpleNamespace(result_store=IndexerResultStore())
+    for identity in ids:
+        service.result_store.restore(identity, IndexerItem(title=identity, site_id="nyaa", site_name="Nyaa",
+            magnet="magnet:?xt=urn:btih:"+"a"*40, download_state="ready", download_kinds=("magnet",)))
+    async def check():
+        state = InMemorySessionStateStore()
+        effects = EffectExecutor(catalog=ToolCatalog([resource_download_tool()]), state_store=state)
+        context = await context_for(state, owner="viewer", session="resources")
+        prepared = await effects.prepare("resources.download", {"result_ids": ids}, context=context)
+        plan = prepared.effect_plan
+        assert plan is not None and dict(plan.arguments) == {"result_ids": ids, "target": "qb"}
+        assert plan.preview["data"]["target"] == "qb"
+        prepare.assert_called_once_with(service, ids, "qb", scope="agent")
+        submit.assert_not_called()
         set_media_preferences(owner, expected_revision=1, updates={"preferred_download_target": "both"})
-        with patch("app.agent.domains.resources.ingest_actions.explicit_preferred_download_target", side_effect=AssertionError("不得重读偏好")):
-            result = actions.execute_submit(arguments, frozen, _context())
-        assert result.ok
-        if len(positions) == 1:
-            submit.assert_called_once_with({"result_id": "a" * 20, "target": "qb"}, "a" * 20 + ":qb")
-            submit_batch.assert_not_called()
-        else:
-            assert submit_batch.call_args.args[0] == {"result_ids": ["a" * 20, "b" * 20], "target": "qb"}
-            submit.assert_not_called()
+        with patch("app.agent.kernel.ports.sdk_effects.resolve_download_target", side_effect=AssertionError("不得重读偏好")):
+            result = await effects.execute_confirmed(plan.plan_id, context=context)
+        data = result.outcome.public_content["data"]
+        assert [item["result_id"] for item in data["items"]] == ids
+        assert all(item["target"] == "qb" for item in data["items"])
+    with patch("app.agent.kernel.ports.sdk_effects.get_indexer_service", return_value=service), \
+         patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=_prepare_batch) as prepare, \
+         patch("app.indexers.downloads.submit_indexer_download_batch", new=AsyncMock(return_value={
+            "ok": True, "status": "accepted", "summary": "已提交", "error": "", "target": "qb",
+            "items": [{"result_id": identity, "target": "qb", "request_id": 42, "status": "submitted"} for identity in ids],
+         })) as submit:
+        asyncio.run(check())
+        submit.assert_awaited_once_with(service, ids, "qb", expected_snapshot={"target": "qb", "resources": [
+            {"result_id": identity, "target": "qb"} for identity in ids]},
+            origin_namespace="agent", scope="agent", verification_targets=None, verification_owner="")
 
 
-def test_ingest_share_preview_stays_cloud_even_when_saved_target_is_qb(ingest_environment):
-    from app.agent.domains.resources.ingest_actions import ingest_submit_arguments
-
-    actions, create, dispatch = ingest_environment
-    set_media_preferences(action_history_owner_digest("viewer"), expected_revision=0,
+def test_native_share_uses_configured_cloud_directory_despite_saved_qb_preference(download_environment):
+    from app.modules import share_transfer
+    from tests.test_telegram_guangya_share import FakeShareClient, SHARE_URL, inspected_payload
+    create, dispatch = download_environment
+    set_media_preferences(media_owner_digest("viewer"), expected_revision=0,
                           updates={"preferred_download_target": "qb"})
-    with patch("app.agent.domains.resources.ingest_actions.inspect_share_for_transfer", return_value={
-        "preview_id": "private-preview", "share_id": "private-share",
-        "files": [{"id": "private-file", "name": "Show.mkv", "size": 1}],
-        "target_id": "private-directory", "target_name": "默认云盘目录", "expires_in": 900,
-    }) as inspect_share, patch("app.agent.domains.resources.ingest_actions.explicit_preferred_download_target", side_effect=AssertionError("分享不应读取qB偏好")):
-        inspected = actions.inspect({
-            "source_type": "guangya_share",
-            "input": "https://www.guangyapan.com/s/1938060615538466851_aecd7hu726g3whGl#/share",
-        }, _context())
-        arguments = ingest_submit_arguments({"source_type": "guangya_share", "target": "preferred", "ingest_snapshot_ref": "ref_1234567890abcdefghijkl"})
-        arguments["ingest_snapshot"] = inspected.references[0].value
-        preview, fingerprint = actions.prepare_submit(arguments, _context())
-    assert inspect_share.call_count == 2
-    assert preview.ok and preview.data["target"] == "guangya"
-    assert len(fingerprint) == 64
+    from app.clients.guangya import GuangYaClient
+    client = FakeShareClient(inspected_payload(2))
+    with patch.object(share_transfer, "get", side_effect=lambda key, default="": {
+        "GY_SHARE_TARGET_DIR": "share-dir", "GY_SHARE_TARGET_DIR_NAME": "分享目录"}.get(key, default)), \
+         patch("app.agent.kernel.ports.sdk_effects.resolve_download_target", side_effect=AssertionError("分享不应读取qB偏好")):
+        prepared = share_transfer.prepare_share_transfer(SHARE_URL, ["file-2"], "viewer", "agent", client=cast(GuangYaClient, client),
+                                                        store=ShareTransferPreviewStore())
+    assert prepared["snapshot"]["target_id"] == "share-dir"
+    assert [item["id"] for item in prepared["snapshot"]["files"]] == ["file-2"]
+    assert not client.restore_calls
     create.assert_not_called()
     dispatch.assert_not_called()
 
-
-def test_kernel_default_target_is_prepared_and_confirmed_without_preferences_tool_call():
-    from tests.agent_kernel_test_harness import KernelDomainTestHarness
-    from tests.support import isolated_test_database
-
-    with isolated_test_database("structured-default-target-kernel.sqlite"), \
-            patch("app.agent.domains.resources.ingest_actions.download_target_readiness", side_effect=lambda target: {target: True}), \
-            patch("app.agent.domains.resources.ingest_actions.create_request", return_value={"id": 42, "created": True}) as create, \
-            patch("app.agent.domains.resources.ingest_actions.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}) as dispatch, \
-            patch("app.agent.domains.resources.ingest_actions.db.get_download_request", return_value=None):
-        owner = "kernel-preference-viewer"
-        digest = action_history_owner_digest(owner)
-        set_media_preferences(digest, expected_revision=0, updates={"preferred_download_target": "qb"})
-        service = KernelDomainTestHarness()
-        inspected = service.invoke("ingest.inspect", {
-            "source_type": "direct_url", "input": "magnet:?xt=urn:btih:" + "a" * 40,
-        }, owner=owner)
-        reference = inspected["result"]["reference_arguments"]["ingest_snapshot_ref"]
-        prepared = service.prepare("ingest.submit", {
-            "source_type": "direct_url", "ingest_snapshot_ref": reference,
-        }, owner=owner)
-        assert prepared["mode"] == "confirmation_required"
-        assert prepared["result"]["data"]["target"] == "qb"
-        plan_id = prepared["action_plan"]["plan_id"]
-        plan = service._prepared[plan_id].result.effect_plan
-        assert plan is not None
-        assert plan.arguments["target"] == "preferred"
-        assert "ingest-target-v1:qb:" in plan.snapshot_fingerprint
-        create.assert_not_called()
-        dispatch.assert_not_called()
-        set_media_preferences(digest, expected_revision=1, updates={"preferred_download_target": "guangya"})
-        with pytest.raises(AgentToolError):
-            service.confirm(plan_id, owner="different-owner")
-        with patch("app.agent.domains.resources.ingest_actions.explicit_preferred_download_target", side_effect=AssertionError("确认不得查询偏好")):
-            confirmed = service.confirm(plan_id, owner=owner)
-        assert confirmed["result"]["ok"]
-        assert confirmed["result"]["data"]["target"] == "qb"
-        dispatch.assert_called_once_with(42, "qb")
-        with pytest.raises(AgentToolError):
-            service.confirm(plan_id, owner=owner)
-        dispatch.assert_called_once()
 
 
 def test_resource_preference_tags_support_underscore_delimiters_and_huge_sizes():
@@ -626,7 +523,7 @@ def _interleave_preference_writer_after_commit(monkeypatch, connection, *, diges
 def test_preference_repository_returns_its_own_committed_row_when_another_writer_wins_after_commit(
     preference_db, monkeypatch,
 ):
-    digest = action_history_owner_digest("viewer")
+    digest = media_owner_digest("viewer")
     set_media_preferences(digest, expected_revision=0, updates={"preferred_genres": ["A"]})
     state = _interleave_preference_writer_after_commit(
         monkeypatch, preference_db, digest=digest,
@@ -645,78 +542,24 @@ def test_preference_repository_returns_its_own_committed_row_when_another_writer
     assert current_c["preferred_genres"] == ["C"]
 
 
-def test_preference_effect_metadata_freezes_exact_own_revision_not_later_writer(
-    preference_db, monkeypatch,
-):
-    digest = action_history_owner_digest("viewer")
-    set_media_preferences(digest, expected_revision=0, updates={"preferred_genres": ["A"]})
-    arguments = {"preferred_download_target": "qb"}
-    _preview, fingerprint = prepare_set_preferences(arguments, _context())
-    _interleave_preference_writer_after_commit(
-        monkeypatch, preference_db, digest=digest,
-        after_sql="""UPDATE agent_media_preferences SET preferred_download_target='both',
-            revision=revision+1 WHERE owner_digest=?""",
-    )
-    result = set_preferences_confirmed(arguments, fingerprint, _context())
-    after = result.effect_metadata["compensation_after"]
-    assert result.ok and result.data["preferred_download_target"] == "qb"
-    assert after["preferred_download_target"] == "qb" and after["revision"] == 2
-    assert after["explicit"]
-    assert get_media_preferences(digest)["revision"] == 3
-    assert "owner_digest" not in after and "owner" not in after
-    assert digest not in repr(result.to_dict())
-    assert "compensation_after" not in result.to_dict()
-    assert "effect_metadata" not in result.to_model_dict()
-    result.data["preferred_genres"].append("UI-only mutation")
-    assert after["preferred_genres"] == ["A"]
-
-
-def test_clear_preferences_metadata_is_known_missing_state_even_if_new_record_is_created(
-    preference_db, monkeypatch,
-):
-    digest = action_history_owner_digest("viewer")
-    set_media_preferences(digest, expected_revision=0, updates={"preferred_genres": ["A"]})
-    _preview, fingerprint = prepare_clear_preferences({}, _context())
-    _interleave_preference_writer_after_commit(
-        monkeypatch, preference_db, digest=digest,
-        after_sql="""INSERT INTO agent_media_preferences(
-            owner_digest,preferred_server,preferred_download_target,profile_json,revision,created_at,updated_at
-        ) VALUES(?,'emby','qb','{"preferred_genres":["C"]}',1,'','')""",
-    )
-    result = clear_preferences_confirmed({}, fingerprint, _context())
-    assert result.ok
-    after = result.effect_metadata["compensation_after"]
-    assert after == {**default_media_preferences(), "revision": 0, "explicit": False}
-    current = get_media_preferences(digest)
-    assert current["explicit"] and current["preferred_genres"] == ["C"]
-    assert "effect_metadata" not in result.to_dict()
-
-
 def test_preference_nonce_prevents_aba_after_clear_and_same_value_reinsert(preference_db):
-    context = _context()
-    arguments = {"preferred_download_target": "qb"}
-    _, expected = prepare_set_preferences(arguments, context)
-    original = set_preferences_confirmed(arguments, expected, context)
-    original_after = original.effect_metadata["compensation_after"]
-    _, original_clear_expected = prepare_clear_preferences({}, context)
-    assert original_after["revision"] == 1 and original_after["revision_token"]
-
-    assert clear_preferences_confirmed({}, original_clear_expected, context).ok
-    absent = get_media_preferences(action_history_owner_digest(context.owner))
+    digest = media_owner_digest("viewer")
+    updates = {"preferred_download_target": "qb"}
+    original = set_media_preferences(digest, expected_revision=0, updates=updates)
+    assert original is not None
+    original_clear = prepare_media_preferences_change(digest)
+    assert original["revision"] == 1 and original["revision_token"]
+    assert apply_media_preferences_change(digest, expected_fingerprint=original_clear["fingerprint"]) is not None
+    absent = get_media_preferences(digest)
     assert absent["revision_token"] == "" and not absent["explicit"]
-    _, recreated_expected = prepare_set_preferences(arguments, context)
-    recreated = set_preferences_confirmed(arguments, recreated_expected, context)
-    recreated_after = recreated.effect_metadata["compensation_after"]
-    assert recreated_after["revision"] == original_after["revision"] == 1
-    assert recreated.data == original.data
-    assert recreated_after["revision_token"] != original_after["revision_token"]
-    assert recreated_after != original_after
-    _, current_clear_expected = prepare_clear_preferences({}, context)
-    assert current_clear_expected != original_clear_expected
-    with pytest.raises(AgentToolError) as error:
-        clear_preferences_confirmed({}, original_clear_expected, context)
-    assert error.value.code == "confirmation_stale"
-    assert get_media_preferences(action_history_owner_digest(context.owner)) == recreated_after
+    recreated = set_media_preferences(digest, expected_revision=0, updates=updates)
+    assert recreated is not None
+    assert recreated["revision"] == original["revision"] == 1
+    assert public_media_preferences(recreated) == public_media_preferences(original)
+    assert recreated["revision_token"] != original["revision_token"]
+    assert prepare_media_preferences_change(digest)["fingerprint"] != original_clear["fingerprint"]
+    assert apply_media_preferences_change(digest, expected_fingerprint=original_clear["fingerprint"]) is None
+    assert get_media_preferences(digest) == recreated
 
 
 def test_legacy_empty_preference_nonce_migrates_on_next_write(preference_db):
@@ -731,14 +574,25 @@ def test_legacy_empty_preference_nonce_migrates_on_next_write(preference_db):
     assert get_media_preferences("legacy") == updated
 
 
-def test_preference_nonce_cas_rejects_aba_between_snapshot_check_and_write(preference_db):
+def test_preference_nonce_cas_rejects_aba_between_snapshot_check_and_write(preference_db, monkeypatch):
     original = set_media_preferences("owner", expected_revision=0, updates={"preferred_download_target": "qb"})
     assert original is not None
-    assert clear_media_preferences(
-        "owner", expected_revision=original["revision"], expected_revision_token=original["revision_token"],
-    )
-    recreated = set_media_preferences("owner", expected_revision=0, updates={"preferred_download_target": "qb"})
-    assert recreated is not None
+    updates = {"preferred_download_target": "both"}
+    prepared = prepare_media_preferences_change("owner", updates)
+    recreated = None
+
+    def reinsert_before_write(owner_digest, **kwargs):
+        nonlocal recreated
+        assert clear_media_preferences(
+            owner_digest, expected_revision=original["revision"], expected_revision_token=original["revision_token"],
+        )
+        recreated = set_media_preferences(owner_digest, expected_revision=0, updates={"preferred_download_target": "qb"})
+        return set_media_preferences(owner_digest, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr("app.repositories.media_experience.set_media_preferences", reinsert_before_write)
+        assert apply_media_preferences_change("owner", updates, expected_fingerprint=prepared["fingerprint"]) is None
+    assert recreated is not None and recreated["revision_token"] != original["revision_token"]
     assert recreated["revision"] == original["revision"]
     assert not clear_media_preferences(
         "owner", expected_revision=original["revision"], expected_revision_token=original["revision_token"],

@@ -33,6 +33,7 @@ from app.bot.agent_adapter import (
 from app.modules import telegram_notification_center as notifications
 from tests import test_agent_effect_continuation as effect_cases
 from tests import test_agent_waiting_delivery as read_cases
+from tests.agent_task_native_helpers import task_function
 from tests.test_agent_read_wait_contract_repair import resumed
 from tests.test_agent_read_wait_entry_exclusions import tg_config
 from tests.test_agent_read_wait_lifecycle import WaitScript, isolated_database
@@ -80,10 +81,10 @@ class CompleteReadScript(WaitScript):
         fact = tasks[-1]["verified_facts"][0]
         return httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": [{
             "id": self.prefix + "-checkpoint", "type": "function",
-            "function": {"name": "agent__task", "arguments": json.dumps({
+            "function": task_function({
                 "operation": "checkpoint", "evidence_ids": [], "blockers": [],
                 "read_evidence": {"read": fact["evidence_id"]},
-            })},
+            }),
         }]}, "finish_reason": "tool_calls"}]})
 
 

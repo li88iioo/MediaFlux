@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from app.agent.kernel.capabilities import CapabilityRetriever, KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
@@ -36,7 +36,7 @@ def test_read_handoff_rejects_write_without_false_success_in_cold_history(protoc
         catalog = ToolCatalog([read, write])
         wire = Wire(protocol, [reply(protocol, name=write.model_name, arguments={}), reply(protocol, text=claim)])
         session = AgentSession(
-            model=wire.adapter, catalog=catalog, retriever=CapabilityRetriever(), state_store=store, journal=store,
+            model=wire.adapter, catalog=catalog,  state_store=store, journal=store,
             pipeline=ToolPipeline(catalog=catalog, state_store=store),
         )
         events = [event async for event in session.run(AgentInput(

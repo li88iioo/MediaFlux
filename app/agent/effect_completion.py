@@ -32,11 +32,12 @@ _EFFECT_WAITS_KEY = "effect_waits"
 
 def _effect_seed(result: Mapping[str, Any], tracker: observers._CompletionTracker | None, tool: str,
                  scope: receipts.EffectCompletionScope) -> dict[str, Any]:
+    batch = (scope.origin or {}).get("batch_plan")
     return {
         "owner": scope.lease.owner, "session_id": scope.lease.session_id,
         "request_id": scope.lease.request_id, "turn_id": scope.lease.turn_id,
         "plan_id": scope.plan_id, "channel": scope.channel,
-        "tool": "agent.batch" if (scope.origin or {}).get("batch_plan") else tool,
+        "tool": batch.get("tool", "agent.batch") if batch else tool,
         **({"tracker": {"kind": tracker.kind, "value": tracker.value}} if tracker else {}),
         "result": deepcopy(dict(result)),
         **({"origin": scope.origin} if scope.origin else {}),

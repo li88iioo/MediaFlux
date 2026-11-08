@@ -9,7 +9,7 @@ import pytest
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import consume_events
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.state_types import AgentInput
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime

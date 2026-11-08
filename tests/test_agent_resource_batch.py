@@ -21,7 +21,6 @@ from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.references import ReferenceError
 from app.agent.kernel.state_types import AgentInput, SelectionInvalidError
-from app.agent.models import ToolResult
 from app.agent.public_view import (
     format_public_result,
     public_conversation_messages,
@@ -46,18 +45,15 @@ def store(tmp_path):
     yield from inspect.unwrap(ux.store)(tmp_path)
 
 
-def _prepare_batch(args):
-    return ToolResult(True, "confirmation_required", "等待整批确认", data={
-        "count": len(args["result_ids"]), "target": args["target"],
-        "resources": [{"title": str(result_id)} for result_id in args["result_ids"]],
-    }), ":".join(args["result_ids"]) + args["target"]
+from tests.support import _prepare_batch
 
 
 def _batch_result():
-    return ToolResult(True, "partial", "批量处理结果", data={"target": "both", "items": [
-        {"status": "submitted", "request_id": 81, "succeeded": ["qb", "guangya"], "failed": []},
-        {"status": "manual_review", "request_id": 82, "succeeded": ["qb"], "failed": []},
-    ]})
+    return {"ok": True, "status": "partial", "summary": "批量处理结果", "error": "部分提交结果待核对", "target": "both",
+            "total": 2, "succeeded": 1, "failed": 0, "review_required": 1, "items": [
+        {"result_id": "ux-resource-result-001", "status": "submitted", "request_id": 81, "succeeded": ["qb", "guangya"], "failed": []},
+        {"result_id": "ux-resource-result-002", "status": "manual_review", "request_id": 82, "succeeded": ["qb"], "failed": []},
+    ]}
 
 
 @pytest.mark.parametrize("value", [
@@ -103,32 +99,33 @@ def test_both_intent_inputs_share_one_batch_plan_and_settle_after_confirm(store,
                 yield ModelEvent(ModelEventType.TEXT_DELTA, text="已提交明确接受的任务，其余结果未知，请核验。")
                 yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
                 return
-            yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("batch", "ingest.submit", self.intent))
+            yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("batch", "resources.download", self.intent))
             yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
 
     async def exercise():
         model = Model()
         session, pipeline, states = _runtime(store, model=model)
         view, _ = await _publish_candidates(pipeline, states)
-        model.intent = {"source_type": "resource_candidates", "resource_candidates_ref": view["ref"], "positions": [1, 2], "target": "both"}
+        model.intent = await ux._download_intent(store, view, [1, 2], "both")
         message = "把1和2下载到两个目标"
         user = AgentInput(owner=OWNER, session_id=SESSION, message=message) if natural else QueryEnvelope(
             owner=OWNER, session_id=SESSION, message=message, selection=_selection(view, [2, 1], "both"),
         ).to_agent_input()
-        with patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource_batch", side_effect=_prepare_batch) as prepare, \
-             patch("app.agent.domains.resources.candidate_actions.submit_resource_batch_confirmed", side_effect=lambda *a: _batch_result()) as execute:
+        with patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=_prepare_batch) as prepare, \
+             patch("app.indexers.downloads.submit_indexer_download_batch", side_effect=lambda *a, **kw: _batch_result()) as execute:
             events = await _events(session.run(user))
             approvals = [e for e in events if e.type is AgentEventType.EFFECT_APPROVAL_REQUIRED]
             assert len(approvals) == 1
             assert model.calls == int(natural)
             assert events[-1].payload["model_calls"] == int(natural)
             prepare.assert_called_once()
-            assert prepare.call_args.args[0]["result_ids"] == ["ux-resource-result-001", "ux-resource-result-002"]
-            assert prepare.call_args.args[0]["target"] == "both"
+            assert prepare.call_args.args[1] == ["ux-resource-result-001", "ux-resource-result-002"]
+            assert prepare.call_args.args[2] == "both"
             execute.assert_not_called()
             plan = approvals[0].payload["plan"]["plan_id"]
             result_events = await _events(session.confirm(owner=OWNER, session_id=SESSION, plan_id=plan))
             result = next(e.payload["result"] for e in result_events if e.type is AgentEventType.EFFECT_COMPLETED)
+            assert (result["data"]["total"], result["data"]["succeeded"], result["data"]["review_required"]) == (2, 1, 1)
             assert [(item["position"], item["status"]) for item in result["data"]["items"]] == [(1, "submitted"), (2, "manual_review")]
             assert result_events[-1].payload["status"] == "partial"
             text = format_public_result(result)
@@ -161,19 +158,36 @@ def test_recovered_candidates_attach_to_exact_search_not_latest_message(store):
     asyncio.run(exercise())
 
 
-def test_receiving_directory_change_invalidates_frozen_plan_without_any_download(store):
+@pytest.mark.parametrize("invalidation", ["directory_changed", "retired_single_snapshot"])
+def test_receiving_directory_change_invalidates_frozen_plan_without_any_download(store, invalidation):
+    from app.indexers.downloads import preview_indexer_download_batch
+    from app.modules.offline import OfflineRules
+    from dataclasses import replace
+    from tests.test_agent_indexer_actions import FakeDownloadService, _resource_item
+
     async def exercise():
         session, pipeline, states = _runtime(store)
         view, _ = await _publish_candidates(pipeline, states)
-        with patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource_batch", side_effect=_prepare_batch), \
-             patch("app.agent.domains.resources.candidate_actions.submit_resource_batch_confirmed") as execute, \
-             patch("app.agent.domains.resources.ingest_actions._receiving_folders", return_value=(["光鸭：接收A"], "a")) as folders:
-            events = await _events(session.run(QueryEnvelope(owner=OWNER, session_id=SESSION, message="预检", selection=_selection(view, [1, 2], "both")).to_agent_input()))
+        rules = replace(OfflineRules.from_config(), target_dir_id="a", target_dir_name="接收A", secondary_enabled=False)
+        def preview(*args, **kwargs):
+            result, snapshot = preview_indexer_download_batch(*args, **kwargs)
+            # 种入旧单项计划的真实形状；不会为旧票据重新预检或换一份执行快照。
+            return result, snapshot["resources"][0] if invalidation == "retired_single_snapshot" else snapshot
+        with patch("app.agent.kernel.ports.sdk_effects.get_indexer_service", return_value=FakeDownloadService(_resource_item())), \
+             patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=preview), \
+             patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}), \
+             patch("app.modules.missing_resources.config.get_bool", return_value=True), \
+             patch("app.modules.offline.OfflineRules.from_config", return_value=rules) as config, \
+             patch("app.indexers.downloads.submit_download_input") as execute:
+            positions = [1] if invalidation == "retired_single_snapshot" else [1, 2]
+            events = await _events(session.run(QueryEnvelope(owner=OWNER, session_id=SESSION, message="预检", selection=_selection(view, positions, "both")).to_agent_input()))
             approval = next(e for e in events if e.type is AgentEventType.EFFECT_APPROVAL_REQUIRED)
-            assert approval.payload["plan"]["preview"]["data"]["receiving_folders"] == ["光鸭：接收A"]
-            folders.return_value = (["光鸭：接收B"], "b")
+            assert "光鸭：接收A / 每任务隔离目录" in approval.payload["plan"]["preview"]["data"]["receiving_folders"]
+            if invalidation == "directory_changed":
+                config.return_value = replace(rules, target_dir_id="b", target_dir_name="接收B")
             events = await _events(session.confirm(owner=OWNER, session_id=SESSION, plan_id=approval.payload["plan"]["plan_id"]))
             assert any(e.type is AgentEventType.EFFECT_FAILED for e in events)
+            assert not (await states.load(owner=OWNER, session_id=SESSION)).pending_effect_plan_id
             execute.assert_not_called()
     asyncio.run(exercise())
 
@@ -236,8 +250,8 @@ def test_telegram_in_place_multiselect_previews_and_finishes_once(store, monkeyp
         for button in edit[3]["reply_markup"].buttons:
             assert len(button.callback_data.encode()) <= 64
             assert "http" not in button.callback_data
-    with patch("app.agent.domains.resources.candidate_actions.prepare_submit_resource_batch", side_effect=_prepare_batch), \
-         patch("app.agent.domains.resources.candidate_actions.submit_resource_batch_confirmed", side_effect=lambda *a: _batch_result()) as execute:
+    with patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=_prepare_batch), \
+         patch("app.indexers.downloads.submit_indexer_download_batch", side_effect=lambda *a, **kw: _batch_result()) as execute:
         click("p")
         assert draft["phase"] == "approval" and model.requests == []
         execute.assert_not_called()
@@ -346,7 +360,7 @@ def test_telegram_reply_binding_uses_signed_batch_and_rejects_replaced_search(st
 
 def test_candidate_result_history_metadata_survives_model_round_without_entering_model():
     from app.agent.kernel.model import ModelMessage
-    prior = [{"role": "assistant", "content": "可信结果", "tool_name": "ingest.submit", "public_content": "已提交", "candidate_result_ref": "ref_example"}]
+    prior = [{"role": "assistant", "content": "可信结果", "tool_name": "resources.download", "public_content": "已提交", "candidate_result_ref": "ref_example"}]
     messages = [ModelMessage.from_dict(prior[0]), ModelMessage(role="user", content="后续提问")]
     assert "candidate_result_ref" not in messages[0].to_dict()
     stored = persisted_conversation(messages, current_user_index=1, original_message="后续提问", prior_conversation=prior)
@@ -363,7 +377,7 @@ def test_telegram_real_kernel_keeps_empty_update_answer_without_a_zero_selection
             self.calls += 1
             if self.calls == 1:
                 yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                    "search-updates", "indexer.search_resources", {"title": "仙逆"},
+                    "search-updates", "fixture.resource_read", {"title": "仙逆"},
                 ))
                 yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
             else:

@@ -6027,13 +6027,14 @@ class MediaProxyManager:
         return True
 
     def request_restart(
-        self, instance_id: int
+        self, instance_id: int, *, expected_fingerprint: str | None = None
     ) -> ConcurrentFuture[dict[str, Any]] | None:
         """线程安全地请求重启；返回真实重启结果的 Future，未能排队时返回 None。"""
         loop = self._loop
         if self._stopping or loop is None or loop.is_closed() or not loop.is_running():
             return None
-        coroutine = self.restart_instance(instance_id)
+        coroutine = (self.restart_instance(instance_id) if expected_fingerprint is None else
+                     self.restart_instance(instance_id, expected_fingerprint=expected_fingerprint))
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         except RuntimeError:
@@ -6042,7 +6043,7 @@ class MediaProxyManager:
         future.add_done_callback(self._report_reconcile_failure)
         return future
 
-    async def restart_instance(self, instance_id: int) -> dict[str, Any]:
+    async def restart_instance(self, instance_id: int, *, expected_fingerprint: str | None = None) -> dict[str, Any]:
         """强制重建一个实例运行时，不改动实例配置。"""
         async with self._lock:
             if self._stopping:
@@ -6052,8 +6053,24 @@ class MediaProxyManager:
             )
             if row is None or not int(row["enabled"] or 0):
                 return {"restarted": False, "reason": "not_enabled"}
+            state = None
+            if expected_fingerprint is not None:
+                # 排队期间的配置变化不能使原确认重建另一份实例配置。
+                def confirmed_row():
+                    with database.get_conn() as conn:
+                        state = _proxy_change_state(conn, "restart", instance_id, None)
+                    return state if secrets.compare_digest(state["fingerprint"], expected_fingerprint) else None
+                try:
+                    state = await asyncio.to_thread(confirmed_row)
+                except PlaybackProxyError:
+                    state = None
+                if state is None:
+                    return {"restarted": False, "reason": "confirmation_stale"}
+                row = state["row"]
             try:
-                resolved = resolve_proxy_instance(row)
+                if state is not None and state["configuration_error"]:
+                    raise ValueError(state["configuration_error"])
+                resolved = state["effective"] if state is not None else resolve_proxy_instance(row)
             except ValueError as exc:
                 await asyncio.to_thread(
                     database.update_media_proxy_instance,
@@ -6246,7 +6263,7 @@ class MediaProxyManager:
             return {"started": started, "stopped": stopped, "failed": failed}
 
     async def _start_runtime(self, row) -> ProxyRuntime:
-        row = resolve_proxy_instance(row)
+        """启动入口已经解析的配置；reconcile/restart各自只解析一次。"""
         instance_id = int(row["id"])
         host = validate_listen_host(str(row["listen_host"]))
         port = int(row["listen_port"])
@@ -6410,3 +6427,203 @@ def get_media_proxy_manager() -> MediaProxyManager:
     if _manager is None:
         _manager = MediaProxyManager()
     return _manager
+
+
+class PlaybackProxyError(ValueError):
+    def __init__(self, message: str, *, code: str = "precondition_failed"):
+        super().__init__(message)
+        self.code = code
+
+
+_PROXY_RESTART_WAIT_SECONDS = 30.0
+_PROXY_CONFIG_FIELDS = (
+    "id", "name", "server_type", "config_source", "upstream_url", "api_key", "listen_host",
+    "listen_port", "local_root", "trust_forwarded_headers", "trusted_proxy_cidrs_json", "enabled", "created_at",
+)
+
+
+def _proxy_instance_id(instance_id: int) -> int:
+    if type(instance_id) is not int or instance_id <= 0:
+        raise ValueError("instance_id 必须是已保存实例的真实正整数ID")
+    return instance_id
+
+
+def _proxy_public(value: Any, credentials: tuple[str, ...] = ()) -> Any:
+    """保留完整业务值，只隐藏凭据；不做模型摘要或路径/错误截断。"""
+    from app.sensitive_data import is_sensitive_key, redact_sensitive_text
+
+    if isinstance(value, str):
+        for credential in credentials:
+            if credential:
+                value = value.replace(credential, "********")
+        return redact_sensitive_text(value)
+    if isinstance(value, dict):
+        return {key: "********" if is_sensitive_key(key) and isinstance(item, str) and item else _proxy_public(item, credentials)
+                for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_proxy_public(item, credentials) for item in value]
+    return value
+
+
+def _proxy_credentials(rows) -> tuple[str, ...]:
+    from app.modules.media_server_profiles import list_configured_profiles
+
+    return tuple(sorted({str(row["api_key"] or "") for row in rows}
+                        | {profile.credential for profile in list_configured_profiles()}, key=len, reverse=True))
+
+
+def playback_proxy_instances() -> dict:
+    """只读当前配置、有效上游和本进程运行事实，不启动监听或探测上游。"""
+    rows = database.list_media_proxy_instances()
+    known_credentials = _proxy_credentials(rows)
+    runtime_error = ""
+    try:
+        runtime = get_media_proxy_manager().status()
+    except Exception as exc:
+        runtime, runtime_error = {}, type(exc).__name__
+    instances = []
+    for row in rows:
+        item = dict(row)
+        effective, configuration_error = item, ""
+        try:
+            effective = resolve_proxy_instance(row)
+        except ValueError as exc:
+            configuration_error = str(exc)
+        credentials = (*known_credentials, str(effective.get("api_key") or ""))
+        item.update(instance_id=int(row["id"]), enabled=bool(row["enabled"]),
+                    effective_config=effective, configuration_error=configuration_error,
+                    runtime=runtime.get(int(row["id"])), runtime_scope="current_process",
+                    runtime_status=("unknown" if runtime_error else "disabled" if not row["enabled"] else
+                                    "running" if (runtime.get(int(row["id"])) or {}).get("running") else
+                                    str(row["status"] or "stopped")))
+        instances.append(_proxy_public(item, credentials))
+    return {"ok": not bool(runtime_error), "status": "partial" if runtime_error else "ready" if rows else "not_configured",
+            "summary": f"读取 {len(instances)} 个媒体反代实例",
+            "data": {"instances": instances, "instance_count": len(instances), "runtime_error": runtime_error,
+                     "runtime_scope": "current_process", "network_accessed": False}}
+
+
+def playback_proxy_failures(hours: int = 24, instance_id: int | None = None,
+                            limit: int = 50, offset: int = 0) -> dict:
+    from app.repositories.media_proxy import media_proxy_failure_facts
+
+    if type(hours) is not int:
+        raise ValueError("hours 必须是整数")
+    if instance_id is not None:
+        _proxy_instance_id(instance_id)
+    data = media_proxy_failure_facts(hours=hours, instance_id=instance_id, limit=limit, offset=offset)
+    data["instance_id"] = instance_id
+    return {"ok": True, "status": "attention" if data["failed"] else "empty" if not data["total_recorded"] else "completed",
+            "summary": f"最近 {hours} 小时已记录 {data['failed']} 次媒体反代失败",
+            "data": _proxy_public(data, _proxy_credentials(database.list_media_proxy_instances()))}
+
+
+def test_playback_proxy(instance_id: int) -> dict:
+    """沿固定上游探测入口执行一次无跳转健康检查；保留原始HTTP状态和耗时。"""
+    from app.concurrency import run_awaitable_sync
+
+    _proxy_instance_id(instance_id)
+    result: dict[str, int | bool | str] = {"instance_id": instance_id, "network_accessed": True, "status_code": 0, "latency_ms": 0}
+    error = ""
+    try:
+        probe = run_awaitable_sync(probe_media_proxy_instance(instance_id, timeout_seconds=8.0))
+        result.update(probe)
+        code = probe["status_code"]
+        state = ("reachable" if 200 <= code < 300 else "authentication_failed" if code in {401, 403} else
+                 "redirect_not_allowed" if 300 <= code < 400 else "upstream_error" if code >= 500 else "http_error")
+    except (httpx.TimeoutException, TimeoutError):
+        state = "timeout"
+    except LookupError:
+        state, result["network_accessed"] = "not_configured", False
+    except Exception as exc:
+        state, error = "connection_failed", type(exc).__name__
+    result.update(connection_status=state, error_type=error)
+    return {"ok": state == "reachable", "status": "ready" if state == "reachable" else state,
+            "summary": f"媒体反代实例 {instance_id}：{state}", "data": result}
+
+
+def _proxy_change_state(conn, operation: str, instance_id: int, enabled: bool | None) -> dict:
+    from app.modules.web_secret import signed_context_fingerprint
+
+    _proxy_instance_id(instance_id)
+    if operation not in {"set_enabled", "restart"} or (operation == "set_enabled" and type(enabled) is not bool):
+        raise ValueError("媒体反代操作或 enabled 参数无效")
+    row = conn.execute("SELECT * FROM media_proxy_instances WHERE id=?", (instance_id,)).fetchone()
+    if row is None:
+        raise PlaybackProxyError("指定的媒体反代实例不存在")
+    configuration = {key: row[key] for key in _PROXY_CONFIG_FIELDS}
+    try:
+        effective, error = resolve_proxy_instance(row), ""
+    except ValueError as exc:
+        effective, error = {}, str(exc)
+    payload = {"operation": operation, "enabled": enabled, "configuration": configuration,
+               "effective": {key: effective.get(key) for key in _PROXY_CONFIG_FIELDS}, "configuration_error": error}
+    return {"row": configuration, "effective": effective, "configuration_error": error,
+            "fingerprint": signed_context_fingerprint(payload, domain="playback-proxy-change")}
+
+
+def prepare_playback_proxy_change(operation: str, instance_id: int, enabled: bool | None = None) -> dict:
+    from app import config
+
+    with config.runtime_config_read_guard(), database.get_conn() as conn:
+        state = _proxy_change_state(conn, operation, instance_id, enabled)
+    current = bool(state["row"]["enabled"])
+    if (operation == "restart" and not current) or (operation == "set_enabled" and current == enabled):
+        raise PlaybackProxyError("实例未启用，不能重启" if operation == "restart" else "实例已经处于目标启停状态")
+    return {"ok": True, "status": "confirmation_required", "summary": f"确认后将调整媒体反代实例 {instance_id}",
+            "data": {"instance_id": instance_id, "operation": operation, "current_enabled": current,
+                     "requested_enabled": enabled if operation == "set_enabled" else current,
+                     "affected": 1, "count": 1,
+                     "effects": ["只操作该真实ID绑定的实例，按当前冻结配置启停或重建运行时", "可能中断正在通过该实例播放的会话"]},
+            "fingerprint": state["fingerprint"]}
+
+
+def apply_playback_proxy_change(operation: str, instance_id: int, enabled: bool | None = None, *,
+                                expected_fingerprint: str, cancelled: Callable[[], bool] | None = None,
+                                admission=None) -> dict:
+    """原子复验目标配置并复用原实例生命周期；释放准入/配置锁后等待原重启Future。"""
+    from contextlib import nullcontext
+    from app import config
+
+    with admission() if admission else nullcontext():
+        with config.runtime_config_read_guard():
+            with database.get_conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    state = _proxy_change_state(conn, operation, instance_id, enabled)
+                except PlaybackProxyError as exc:
+                    raise PlaybackProxyError("媒体反代实例已变化，请重新预检", code="confirmation_stale") from exc
+                if not isinstance(expected_fingerprint, str) or not secrets.compare_digest(state["fingerprint"], expected_fingerprint):
+                    raise PlaybackProxyError("媒体反代实例或有效配置已变化，请重新预检", code="confirmation_stale")
+                if cancelled and cancelled():
+                    return {"ok": False, "status": "cancelled", "summary": "操作已取消，未修改实例", "data": {"instance_id": instance_id}}
+                if operation == "set_enabled":
+                    if enabled is None:
+                        raise ValueError("enabled 必须是布尔值")
+                    conn.execute("UPDATE media_proxy_instances SET enabled=?,updated_at=? WHERE id=?", (int(enabled), database.now(), instance_id))
+            cleared = clear_signed_url_cache(instance_id)
+            manager = get_media_proxy_manager()
+            data = {"operation": operation, "instance_id": instance_id, "cache_entries_cleared": cleared}
+            if operation == "set_enabled":
+                try:
+                    refreshed = manager.request_reconcile()
+                except Exception:
+                    refreshed = False
+                return {"ok": True, "status": "completed", "summary": f"媒体反代实例 {instance_id} 启停配置已保存",
+                        "data": {**data, "enabled": enabled, "affected": 1, "runtime_refreshed": refreshed}}
+            future = manager.request_restart(instance_id, expected_fingerprint=expected_fingerprint)
+    data["accepted"] = future is not None
+    if future is None:
+        return {"ok": False, "status": "unavailable", "summary": "媒体反代运行时当前未启动", "data": data}
+    # Future由现有Manager拥有，超时/异常不取消、不重投，不引入另一套任务账本。
+    try:
+        outcome = future.result(timeout=_PROXY_RESTART_WAIT_SECONDS)
+    except Exception as exc:
+        outcome = None
+        data["error_type"] = type(exc).__name__
+    if not isinstance(outcome, dict) or not isinstance(outcome.get("restarted"), bool):
+        return {"ok": False, "status": "outcome_unknown", "summary": "重启结果尚未确认，请读取实例状态，勿重复提交",
+                "data": {**data, "outcome_unknown": True}}
+    restarted = outcome["restarted"]
+    return {"ok": restarted, "status": "completed" if restarted else "failed", "summary": "媒体反代重启已完成" if restarted else "媒体反代重启失败",
+            "data": {**data, "restarted": restarted, "reason": _proxy_public(str(outcome.get("reason") or ""))}}

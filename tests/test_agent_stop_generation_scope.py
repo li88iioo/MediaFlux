@@ -11,10 +11,11 @@ import pytest
 
 from app import database as db
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domains.library.patrol_progress import empty_patrol_projection
+from app.modules.library_patrol import empty_patrol_projection
 from app.agent.effect_completion import wait_for_effect_completion
-from app.agent.kernel.capabilities import CapabilityRetriever, KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
@@ -95,7 +96,7 @@ async def _native_stop_race(*, stopper: str, tracker_registered: bool, cutover: 
             catalog = ToolCatalog([tool])
             session = AgentSession(
                 model=ScriptedModel([call(name, {}), FINAL]), catalog=catalog,
-                retriever=CapabilityRetriever(), state_store=store,
+                 state_store=store,
                 pipeline=ToolPipeline(catalog=catalog, state_store=store,
                     effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore())),
             )

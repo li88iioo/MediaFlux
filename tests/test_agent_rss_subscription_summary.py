@@ -4,17 +4,12 @@ from __future__ import annotations
 
 import inspect
 import json
+from typing import Any, cast
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.subscriptions.rss_actions import (
-    get_rss_recent_activity,
-    get_rss_subscription_summary,
-    list_rss_subscription_summaries,
-    rss_subscription_summaries_arguments,
-    rss_subscription_summary_arguments,
-)
-from app.agent.errors import AgentToolError
+from app import sdk
+from app.modules import rss_subscriptions
 from app.repositories import rss as rss_repository
 from tests.support import IsolatedDatabaseTestCase
 
@@ -47,21 +42,14 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         _clear_rss()
 
-    def test_validators_are_strict(self):
-        self.assertEqual(rss_subscription_summaries_arguments({}), {})
-        self.assertEqual(
-            rss_subscription_summary_arguments({"subscription_id": 12}),
-            {"subscription_id": 12},
-        )
-        for invalid in (
-            {"extra": 1},
-            {"subscription_id": True},
-            {"subscription_id": 0},
-            {"subscription_id": "12"},
-            {"subscription_id": 12, "extra": 1},
-        ):
-            with self.assertRaises(AgentToolError):
-                rss_subscription_summary_arguments(invalid)
+    def test_native_signatures_and_identifiers_are_strict(self):
+        for invalid in (True, 0, "12", 2**63):
+            with self.assertRaises(rss_subscriptions.RSSSubscriptionError):
+                cast(Any, sdk.rss.subscription)(invalid)
+        with self.assertRaises(TypeError):
+            cast(Any, sdk.rss.subscription)(subscription_id=12, extra=1)
+        with self.assertRaises(TypeError):
+            cast(Any, sdk.rss.subscriptions)(extra=1)
 
     def test_summary_never_returns_subscription_or_entry_secrets(self):
         subscription_name = "private-subscription-name"
@@ -89,19 +77,19 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         )["id"]
         assert entry_id is not None
         _set_entry(entry_id, status="failed", created_at="2026-07-30 12:00:00")
-        with patch("app.agent.domains.subscriptions.rss_actions.db.now", return_value=_SNAPSHOT):
-            listed = list_rss_subscription_summaries({})
-            detail = get_rss_subscription_summary({"subscription_id": subscription_id})
-        self.assertTrue(listed.ok)
-        self.assertTrue(detail.ok)
-        self.assertEqual(detail.data["subscription_number"], subscription_id)
-        self.assertEqual(detail.data["name"], subscription_name)
-        self.assertEqual(listed.data["items"][0]["name"], subscription_name)
-        self.assertEqual(detail.data["entry_counts"]["failed"], 1)
+        with patch("app.modules.rss_subscriptions.db.now", return_value=_SNAPSHOT):
+            listed = sdk.rss.subscriptions()
+            detail = sdk.rss.subscription(subscription_id)
+        self.assertTrue(listed["ok"])
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["data"]["subscription_number"], subscription_id)
+        self.assertEqual(detail["data"]["name"], subscription_name)
+        self.assertEqual(listed["data"]["items"][0]["name"], subscription_name)
+        self.assertEqual(detail["data"]["entry_counts"]["failed"], 1)
         serialized = json.dumps(
-            {"listed": listed.to_dict(), "detail": detail.to_dict()}, ensure_ascii=False
+            {"listed": listed, "detail": detail}, ensure_ascii=False
         )
-        for secret in (*secret_values, "private-entry-title"):
+        for secret in (secret_values[0], secret_values[2], secret_values[3], "private-entry-title"):
             self.assertNotIn(secret, serialized)
 
     def test_recent_activity_total_is_not_truncated_by_subscription_breakdown(self):
@@ -124,12 +112,16 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
                 processed=1,
                 processed_at="2026-08-01 11:00:00",
             )
-        with patch("app.agent.domains.subscriptions.rss_actions.db.now", return_value=_SNAPSHOT):
-            recent = get_rss_recent_activity({})
-        self.assertEqual(recent.data["downloaded"], 20)
-        self.assertEqual(recent.data["subscriptions_returned"], 16)
-        self.assertTrue(recent.data["subscriptions_truncated"])
-        self.assertEqual(len(recent.data["subscriptions"]), 16)
+        with patch("app.modules.rss_subscriptions.db.now", return_value=_SNAPSHOT):
+            recent = sdk.rss.activity()
+        self.assertEqual(recent["data"]["downloaded"], 20)
+        self.assertEqual(len(recent["data"]["subscriptions"]), 20)
+        self.assertFalse(recent["data"]["has_more"])
+        self.assertIsNone(recent["data"]["next"])
+        first = sdk.rss.activity(limit=7)
+        second = sdk.rss.activity(**first["data"]["next"])
+        self.assertTrue(first["data"]["has_more"])
+        self.assertTrue({item["id"] for item in first["data"]["subscriptions"]}.isdisjoint(item["id"] for item in second["data"]["subscriptions"]))
 
     def test_list_query_limits_subscriptions_before_entry_aggregation(self):
         source = inspect.getsource(

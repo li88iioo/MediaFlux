@@ -19,6 +19,13 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
 
+    # 允许 MF 的 Python 子进程调用 Bubblewrap 创建隔离环境。
+    # 外层放开这两项策略；内层仍 --cap-drop ALL、--unshare-all 并加载 seccomp。
+    # 保留 Python 主进程入口，避免直接以 bwrap 为容器入口触发 AppArmor 重入限制。
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+
     # 传入 APP_ENV、WEB_HOST 和本地目录浏览范围等开发运行配置。
     env_file:
       - .env.development

@@ -10,7 +10,8 @@ import pytest
 from app.agent.confirmation import ConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import CancellationToken
@@ -109,24 +110,26 @@ def test_argument_risk_freezes_and_confirms_once(rig, target, default, resolved)
 
 
 @pytest.mark.parametrize("cloud", [False, True])
-def test_real_batch_keeps_sync_write_and_cloud_danger_cards(rig, cloud):
+def test_real_batch_keeps_sync_write_and_cloud_danger_cards(rig, cloud, monkeypatch):
     async def run():
         tools = [rig.tool("test.first"), rig.tool("test.second"),
                  rig.tool("test.cloud", effect=ToolEffect.DANGER)]
+        from tests.test_agent_batch_confirmation import register_sdk_fixture
+        register_sdk_fixture(monkeypatch, tools)
         pipeline, context = rig.pipeline(*tools), await rig.context()
         names = ["test.first", "test.cloud" if cloud else "test.second"]
-        arguments = {"steps": [{"tool": name, "arguments": {
+        arguments = {"steps": [{"method": name, "arguments": {
             "target": f" {name.upper()} ", "items": [name],
         }} for name in names]}
-        preview = await pipeline.execute("agent.batch", arguments, context=context)
+        preview = await pipeline.execute("session.batch", arguments, context=context)
         plan = preview.effect_plan
         expected = ToolEffect.DANGER if cloud else ToolEffect.WRITE
-        assert pipeline.catalog.get("agent.batch").effect is ToolEffect.WRITE
+        assert pipeline.catalog.get("session.batch").effect is ToolEffect.WRITE
         assert preview.tool.effect is plan.effect is expected
         assert plan.public_approval_dict()["confirmation"]["risk"] == expected.value
         assert [s["arguments"]["target"] for s in plan.arguments["steps"]] == names
         assert not rig.writes
-        arguments["steps"][1]["tool"] = "test.first"
+        arguments["steps"][1]["method"] = "test.first"
         result = await pipeline.execute_confirmed(plan.plan_id, context=context)
         assert result.outcome.public_content["ok"] is True, result.outcome.public_content
         assert rig.writes == [(n, {"target": n, "items": [n]}) for n in names]

@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
+from app.modules.media_subscriptions import MediaSubscriptionError, strict_subscription_id
+from app.repositories import media_experience as repository
+
+
 from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
@@ -166,3 +173,68 @@ def recover_media_subscription_notifications() -> int:
     except Exception as exc:
         logger.exception("媒体订阅通知恢复投递失败 type=%s", type(exc).__name__)
     return recovered
+
+
+_RULE_FIELDS = {"enabled", "notify_on_missing", "notify_on_satisfied", "notify_on_error"}
+
+
+def notification_arguments(arguments: dict[str, Any], *, reset: bool = False) -> dict[str, Any]:
+    if (not isinstance(arguments, dict) or "subscription_id" not in arguments
+            or set(arguments) - {"subscription_id", *_RULE_FIELDS}
+            or (reset and set(arguments) != {"subscription_id"}) or (not reset and len(arguments) < 2)):
+        raise MediaSubscriptionError("必须指定订阅编号和至少一个通知字段；重置仅接受订阅编号")
+    for key in _RULE_FIELDS & arguments.keys():
+        if not isinstance(arguments[key], bool):
+            raise MediaSubscriptionError(f"{key} 必须是布尔值")
+    return {**arguments, "subscription_id": strict_subscription_id(arguments["subscription_id"])}
+
+
+def notification_rule(subscription_id: int) -> dict[str, Any]:
+    rule = repository.get_notification_rule(strict_subscription_id(subscription_id))
+    if rule is None:
+        raise MediaSubscriptionError("媒体订阅不存在", code="precondition_failed")
+    return rule
+
+
+def prepare_rule_change(operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if operation not in {"set_notification", "reset_notification"}:
+        raise MediaSubscriptionError("通知规则操作无效")
+    args = notification_arguments(arguments, reset=operation == "reset_notification")
+    current = notification_rule(args["subscription_id"])
+    if operation == "reset_notification" and not current["explicit"]:
+        raise MediaSubscriptionError("该订阅当前使用默认通知规则", code="precondition_failed")
+    proposed = {key: args.get(key, current[key]) for key in _RULE_FIELDS} if operation == "set_notification" else None
+    return {"arguments": args, "snapshot": {"operation": operation, "arguments": args, "current": current},
+            "preview": {"ok": True, "status": "confirmation_required", "summary": "确认后修改全局媒体订阅通知规则",
+                        "data": {"subscription_number": args["subscription_id"], "title": current["title"], "current": current, "proposed": proposed,
+                                 "effects": ["只改变此订阅通知开关或恢复默认，不改巡检策略；通知仍沿既有通知中心及投递授权。"]}}}
+
+
+def apply_rule_change(operation: str, arguments: dict[str, Any], *, expected_snapshot: dict[str, Any],
+                      check_cancelled: Callable[[], None] = lambda: None) -> dict[str, Any]:
+    prepared = prepare_rule_change(operation, arguments)
+    if prepared["snapshot"] != expected_snapshot:
+        raise MediaSubscriptionError("通知规则或订阅已变化，请重新预检", code="confirmation_stale")
+    current = expected_snapshot["current"]
+    args = prepared["arguments"]
+    scope = {"expected_rule_revision": current["revision"], "expected_subscription_revision": current["subscription_revision"], "expected_rule": current,
+             "check_cancelled": check_cancelled}
+    check_cancelled()
+    if operation == "set_notification":
+        updated = repository.set_notification_rule(args["subscription_id"], **scope, updates={key: args[key] for key in args.keys() & _RULE_FIELDS})
+    else:
+        updated = repository.reset_notification_rule(args["subscription_id"], **scope)
+    if not updated:
+        raise MediaSubscriptionError("通知规则或订阅已变化，请重新预检", code="confirmation_stale")
+    if operation == "reset_notification":
+        # 返回本次事务的默认规则事实；不把后来另一写者的规则冒充重置回执。
+        updated = {**current, **repository._DEFAULT_RULE, "revision": 0, "explicit": False}
+    return {"ok": True, "status": "completed", "summary": "媒体订阅通知规则已更新" if operation == "set_notification" else "媒体订阅已恢复默认通知规则", "data": updated}
+
+
+def today_summary() -> dict[str, Any]:
+    from app.agent.public_safety import sanitize_public_text
+
+    summary = repository.today_content_summary()
+    summary["content_titles"] = [title for item in summary["content_titles"] if (title := sanitize_public_text(item, limit=120))][:8]
+    return summary

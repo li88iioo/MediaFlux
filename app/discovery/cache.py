@@ -120,8 +120,8 @@ class DiscoveryCache:
 
     def get_detail_metadata(
         self, identities: list[tuple[str, str, str]],
-    ) -> dict[tuple[str, str, str], dict[str, str]]:
-        """按 provider/type/id 批量取可复用的详情日期字段。"""
+    ) -> dict[tuple[str, str, str], dict[str, Any]]:
+        """按 provider/type/id 批量取可复用的详情日期及当前陈旧状态。"""
         normalized = list(dict.fromkeys(
             ((provider or "").strip().lower(),
              (media_type or "").strip().lower(),
@@ -142,7 +142,7 @@ class DiscoveryCache:
             logger.warning("读取探索详情缓存失败: %s", exc)
             return {}
 
-        result: dict[tuple[str, str, str], dict[str, str]] = {}
+        result: dict[tuple[str, str, str], dict[str, Any]] = {}
         for identity, key in keys.items():
             lookup = self._lookup(rows.get(key))
             payload = lookup.payload
@@ -151,8 +151,9 @@ class DiscoveryCache:
             if payload.get("identity") != list(identity):
                 continue
             result[identity] = {
-                field: str(payload.get(field) or "")
-                for field in ("year", "release_date")
+                "year": str(payload.get("year") or ""),
+                "release_date": str(payload.get("release_date") or ""),
+                "stale": lookup.status == "stale",
             }
         return result
 

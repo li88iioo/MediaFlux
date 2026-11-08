@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from app.agent.kernel.tool_calls import PreparedEffect
 import requests
 
 from app import database as db
@@ -23,7 +24,6 @@ from app.agent import effect_completion as effects
 from app.agent.errors import ToolRateLimitError
 from app.agent.kernel.bootstrap import _capture_creation_binding
 from app.agent.kernel.events import AgentEventType
-from app.agent.kernel.ports import existing_actions
 from app.agent.kernel.ports.mediaflux_policy import MediaFluxToolRateLimiter
 from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolContext
@@ -43,7 +43,7 @@ from tests.test_agent_effect_admission import (
 from tests.test_agent_failed_effect_followup import GOAL, READ, A, NativeCase
 from tests.test_agent_task_first_slice import NativeScript
 
-WRITE = "guangya.fs.change.execute"
+WRITE = "cloud.change"
 PRIVATE = "PRIVATE-REOBSERVATION-WAIT-ENTITY-2734"
 
 
@@ -139,8 +139,10 @@ def test_synchronous_failed_confirm_uses_effect_wait_with_or_without_task(native
     case.media.prepare = freeze
     case.build(["read_a", "finish"])
     if tracked_task:
-        # 模型经真实 capabilities + task handler 建立 READ budget；不手写 task/read_wait。
-        case.script.steps[:0] = ["core_task_discovery", "core_task"]
+        # 模型经原生session SDK建立任务与预算，不手写task/read_wait。
+        from app.agent.kernel.sandbox import run_code_tool
+        case.session.catalog.register(run_code_tool(case.session.pipeline))
+        case.script.steps[:0] = ["core_task"]
     case.session.continuation_binding = _capture_creation_binding()
     quota = ReadQuota(case.clock)
     case.session.pipeline.rate_limiter = quota
@@ -173,16 +175,22 @@ def test_synchronous_failed_confirm_uses_effect_wait_with_or_without_task(native
         record = deepcopy(row["continuation"])
         assert row["state"] == "terminal" and row["final_result"]["ok"] is False
         assert record["state"] == "pending" and record["kind"] == "effect"
-        assert record["budget"]["wait_segments"] == 1
+        assert (state.metadata["read_wait"]["budget"] if tracked_task else record["budget"])["wait_segments"] == 1
+        budget = state.metadata["read_wait"]["budget"] if tracked_task else record["budget"]
+        assert budget["model_spent"] == (3 if tracked_task else 2)
+        assert budget["token_spent"] > 0 and budget["active_since"] is None
+        if tracked_task:
+            assert record["budget_task_id"] == state.metadata["task"]["task_id"]
+            assert "budget" not in record  # 同一task只有一份可消费预算。
         assert await case.cold_store().due_continuations() == []
-        case.assert_io(prepares=["A"], executions=["A"], reads=0, requests=4 if tracked_task else 2)
+        case.assert_io(prepares=["A"], executions=["A"], reads=0, requests=3 if tracked_task else 2)
         case.assert_source(state, users)
         failed = [event for event in events if event.type is AgentEventType.EFFECT_FAILED]
         assert len(failed) == 1 and failed[0].payload["plan_id"] == plan_id
         assert failed[0].payload["result"]["ok"] is False
         assert not any(event.type is AgentEventType.EFFECT_COMPLETED for event in events)
         original_receipt = receipt(state, plan_id)
-        followup = case.script.requests[3 if tracked_task else 1]
+        followup = case.script.requests[2 if tracked_task else 1]
         assert any(row.get("role") == "user" and row.get("content") == (
             "运行时执行结果通知（不是用户新指令或新增写入授权）：\n" + original_receipt["content"]
         ) for row in followup["messages"])
@@ -248,21 +256,17 @@ def background_case(native_case):
     prepared = []
     inspect = case.media.inspect
 
-    def freeze(arguments, context):
+    async def freeze(arguments, context):
         # 只给真实领域预检附加本次私有来源，不伪造确认/受理/完成状态。
         assert context.reobservation_source is None
         assert real.prepare is not None
-        result = real.prepare(arguments, context)
+        result = await real.prepare(arguments, context)
+        assert isinstance(result, PreparedEffect)
         prepared.append(deepcopy(arguments))
         return replace(result, metadata={**result.metadata, "reobservation_source": deepcopy(source)})
 
     def read(arguments, context):
         observed.append(deepcopy(context.reobservation_source))
-        adapted = existing_actions._kernel_context(context)
-        assert adapted.reobservation_source == context.reobservation_source
-        if adapted.reobservation_source is not None:
-            adapted.reobservation_source["baseline"]["selected"].clear()
-            assert context.reobservation_source["baseline"]["selected"], "领域副本不能改写冻结来源"
         return inspect(arguments, context)
 
     case.media.inspect = read
@@ -285,10 +289,10 @@ def background_case(native_case):
 
     client = FailedWriteClient()
     with _offline_runtime(case.media.root, client) as stack, _paused_manager(), patch.object(
-        existing_actions, "wait_for_effect_completion",
+        effects, "wait_for_effect_completion",
         partial(effects.wait_for_effect_completion, timeout_seconds=0),
     ):
-        real = existing_actions.adapt_tool_spec(_spec("fs", actions=stack.domain_actions))
+        real = _spec("fs")
         case.change_arguments = _domain_arguments(
             "fs", client, ToolContext(owner=case.owner, session_id=case.sid), stack,
         )
@@ -444,8 +448,8 @@ def test_failed_effect_quota_cold_resume_preserves_private_source_and_original_r
         assert record["state"] == "terminal" and record["terminal_reason"] == "partial"
         assert record["budget"]["wait_segments"] == quota_segments
         assert record["budget"]["wait_seconds_spent"] == quota_segments * 10
-        assert record["budget"]["model_spent"] == 2
-        assert record["budget"]["tool_spent"] == quota_segments + 1
+        assert record["budget"]["model_spent"] == 3
+        assert record["budget"]["tool_spent"] == quota_segments + 2
         assert await case.cold_store().due_continuations() == []
         events = await case.cold_store().list_events(owner=case.owner, session_id=case.sid)
         terminal = [event for event in events if event["type"] == "turn.completed"]

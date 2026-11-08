@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.automation.rule_actions import list_digest_rules
+from app.modules.media_automation_rules import digests
 from app.agent.models import ToolContext
 from app.modules.media_automation_rules import drain_automation_rules
 from app.repositories import media_automation_rules as rules
@@ -56,7 +56,7 @@ class AutomationRulePayloadAuditTests(IsolatedDatabaseTestCase):
         for payload in payloads:
             row = self._save()
             self._corrupt(row, payload)
-        items = list_digest_rules({}, self.context).data["items"]
+        items = digests(owner=self.context.owner)["data"]["items"]
         self.assertEqual(len(items), len(payloads))
         for item in items:
             self.assertTrue(item.get("settings_error"))

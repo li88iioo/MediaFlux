@@ -9,12 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.conversation_codec import pending_content
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -97,7 +92,7 @@ def _session(store, read, model, *, journal=None):
     )])
     pipeline = ToolPipeline(catalog=catalog, state_store=store,
                             reference_store=store if isinstance(store, SQLiteKernelStore) else None)
-    return AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+    return AgentSession(model=model, catalog=catalog,
                         pipeline=pipeline, state_store=store, journal=journal)
 
 

@@ -11,8 +11,9 @@ import httpx
 import pytest
 
 from app import database as db
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.persistence import SQLiteKernelStore
+from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.provider_model import (
     OpenAICompatibleModelAdapter,
@@ -23,13 +24,17 @@ from app.agent.public_view import public_conversation_messages
 from app.agent.transports import QueryEnvelope, TelegramKernelTransport
 from app.bot import agent_adapter as adapter
 from app.clients.http import FixedHostHttpClient
+from app.agent.kernel import sandbox
+from tests import test_agent_session_result as session_result_tests
 from tests.test_agent_kernel_telegram_adapter import TELEBOT, FakeBot, Message
+
+native_workspace = session_result_tests.native_workspace
 
 TAIL = '批次Z17更正：仅检查，禁止删除，保留原文件。'
 LONG = '通知背景。' * 430 + TAIL
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, native_workspace):
     previous = db.DB_PATH, bool(getattr(db, '_configured_test_mode', False))
     db.configure_database(tmp_path / 'reference.db', test_mode=True)
     db.init_db()
@@ -53,7 +58,7 @@ class Wire:
         if handles and not self.reading:
             self.reading = True
             message: dict[str, Any] = {'content': None, 'tool_calls': [{'id': 'read-tail-' + str(len(self.requests)), 'type': 'function', 'function': {
-                'name': 'agent.read_result', 'arguments': json.dumps({'handle': handles[-1], 'path': '/text', 'offset': self.offset, 'limit': 1000})}}]}
+                'name': 'agent.run_code', 'arguments': json.dumps({'code': f'from mf import session\nimport json\nr = session.result({handles[-1]!r}, path="/text")\nassert len(r["data"]) >= {self.offset}\nr["data"] = r["data"][{self.offset}:]\nprint(json.dumps(r, ensure_ascii=False))'})}}]}
             finish = 'tool_calls'
         else:
             self.reading = False
@@ -75,15 +80,18 @@ class Wire:
 def runtime(store, wire):
     catalog = ToolCatalog([])
     pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
-    session = AgentSession(model=wire.adapter, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=store)
+    catalog.register(sandbox.run_code_tool(pipeline))
+    session = AgentSession(model=wire.adapter, catalog=catalog,  pipeline=pipeline, state_store=store)
     return NS(telegram=TelegramKernelTransport(session), state_store=store)
 
 def reader_content(payload, protocol):
     if protocol == 'responses':
-        return json.loads([m['output'] for m in payload['input'] if m.get('type') == 'function_call_output'][-1])
-    if protocol == 'anthropic_messages':
-        return json.loads([b['content'] for m in payload['messages'] if isinstance(m.get('content'), list) for b in m['content'] if b.get('type') == 'tool_result'][-1])
-    return json.loads([m['content'] for m in payload['messages'] if m['role'] == 'tool'][-1])
+        content = [m['output'] for m in payload['input'] if m.get('type') == 'function_call_output'][-1]
+    elif protocol == 'anthropic_messages':
+        content = [b['content'] for m in payload['messages'] if isinstance(m.get('content'), list) for b in m['content'] if b.get('type') == 'tool_result'][-1]
+    else:
+        content = [m['content'] for m in payload['messages'] if m['role'] == 'tool'][-1]
+    return json.loads(json.loads(content)['data']['stdout'])
 
 @pytest.mark.parametrize('protocol', ['chat_completions', 'responses', 'anthropic_messages'])
 @pytest.mark.parametrize('body', [LONG, '字' * (4096 - len(TAIL)) + TAIL, '\\"' * 2025 + TAIL, ' \n' + LONG + '\n '], ids=['2173', '4096-cjk', 'escaped', 'whitespace'])
@@ -107,18 +115,15 @@ def test_full_reference_vertical_cold_reader(store, protocol, body):
     assert row['reply_context']['text'] == body
     preview = json.dumps(wire.requests[0], ensure_ascii=False)
     assert TAIL not in preview
-    assert 'truncated' in preview and 'agent.read_result' in preview
+    assert 'truncated' in preview and 'session.result' in preview
     handle = row['reply_context']['reference_handle']
     assert handle in preview
     assert len(wire.requests) == 2
     content = reader_content(wire.requests[1], protocol)
     assert 'data' in content, content
-    assert content['data']['items'] == body[wire.offset:]
+    assert content['data'] == body[wire.offset:]
     assert content['untrusted_reference'] is True
-    from app.agent.model_context_budget import compact_tool_content
-    compacted = json.loads(compact_tool_content(json.dumps(content, ensure_ascii=False), maximum=600, tool_name='agent.read_result', trusted=True))
-    assert compacted['untrusted_reference'] is True
-    assert compacted['source'] == content['source']
+    assert content['source'] == row['reply_context']['source']
     assert TAIL not in str(public_conversation_messages(saved.conversation))
     pointer = asyncio.run(store.resolve(handle, owner=owner, session_id=sid, expected_kind='telegram_reference'))
     assert body not in str(pointer) and 'text' not in pointer
@@ -128,7 +133,7 @@ def test_full_reference_vertical_cold_reader(store, protocol, body):
         second = adapter._execute_query(FakeBot(), TELEBOT, source2, chat_id=str(source.chat.id), user_id='73', text=source2.text)
     assert second.status == 'success'
     assert len(wire.requests) == 4
-    assert reader_content(wire.requests[-1], protocol)['data']['items'] == body[wire.offset:]
+    assert reader_content(wire.requests[-1], protocol)['data'] == body[wire.offset:]
 
 
 def ingress(store, body=LONG, *, field='text', quote='', wire=None):
@@ -220,13 +225,13 @@ def test_reader_scope_lifecycle(store, mutation):
             pass
         context = ToolCallContext(owner=lease.owner, session_id=lease.session_id, request_id='reader', turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=progress)
         pipeline = ToolPipeline(catalog=ToolCatalog([]), state_store=store, reference_store=reader_store)
-        args = {'handle': handle, 'path': '/metadata' if mutation == 'path' else '/text', 'offset': 2000, 'limit': 1000}
+        args = {'handle': handle, 'path': '/metadata' if mutation == 'path' else '/text'}
         if mutation == 'next_generation':
-            result = await pipeline.execute('agent.read_result', args, context=context)
-            assert json.loads(result.outcome.model_content)['data']['items'] == LONG[2000:]
+            result = await SessionService(pipeline, context).result(**args)
+            assert result['data'] == LONG
         else:
             with pytest.raises(ToolPipelineError) as error:
-                await pipeline.execute('agent.read_result', args, context=context)
+                await SessionService(pipeline, context).result(**args)
             assert error.value.code == ('invalid_arguments' if mutation == 'path' else 'reference_invalid')
     asyncio.run(scenario())
 

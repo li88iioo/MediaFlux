@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from app.agent.models import ToolContext, ToolReference, ToolResult
+from app.agent.models import Evidence, ToolContext, ToolReference, ToolResult
 from app.agent.public_safety import sanitize_public_text
 
 _GY_OPERATION_REF_RE = re.compile(r"GY-(?:[0-9A-F]{4}-){7}[0-9A-F]{4}")
@@ -69,28 +68,6 @@ _TERMINAL_STATUSES = {
     ),
 }
 
-
-_STRM_STAT_FIELDS = frozenset(
-    {
-        "directories",
-        "scanned_files",
-        "generated",
-        "created",
-        "updated",
-        "skipped",
-        "failed",
-        "metadata_generated",
-        "metadata_queued",
-        "metadata_failed",
-        "metadata_cleaned",
-        "cleaned",
-        "empty_dirs_cleaned",
-        "read_retries",
-        "read_failures",
-        "scan_workers_peak",
-        "scan_workers_configured",
-    }
-)
 
 _LOCAL_MEDIA_OUTCOME_FIELDS = (
     "file_outcome", "video_count", "archived_video_count",
@@ -228,75 +205,11 @@ def _provider_summary(
     return "光鸭后台任务执行失败"
 
 
-def _row_value(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
-    try:
-        value = row[key]
-    except (KeyError, IndexError, TypeError):
-        return default
-    return default if value is None else value
-
-
-def _safe_strm_result(row: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
-    raw_status = str(_row_value(row, "status")).strip().casefold()
-    status = {
-        "success": "completed",
-        "completed": "completed",
-        "partial": "partial",
-        "failed": "failed",
-        "skipped": "failed",
-        "running": "running",
-    }.get(raw_status, "unknown")
-    try:
-        payload = json.loads(str(_row_value(row, "result", "{}") or "{}"))
-    except (TypeError, ValueError):
-        payload = {}
-    raw_stats = payload.get("stats") if isinstance(payload, dict) else None
-    stats = (
-        {
-            key: _bounded_int(value)
-            for key, value in raw_stats.items()
-            if key in _STRM_STAT_FIELDS
-        }
-        if isinstance(raw_stats, dict)
-        else {}
-    )
-    return status, stats
-
-
 def _strm_status(tracker: _CompletionTracker) -> ToolResult:
-    from app import database as db
-    from app.modules.scheduler import get_scheduler
+    from app.modules.scheduler import strm_status
 
-    run_id = _bounded_int(tracker.value.get("run_id"))
-    row = db.get_task_run(run_id)
-    if row is None or str(row["task_name"]) != "strm_sync":
-        return ToolResult(False, "unknown", "STRM 同步状态暂时无法确认")
-    runtime = get_scheduler().status() if str(row["status"]) == "running" else {}
-    status, stats = _safe_strm_result(dict(row))
-    summary = {
-        "running": "STRM 同步任务正在运行",
-        "completed": "STRM 同步已完成",
-        "partial": "STRM 同步部分完成",
-        "failed": "STRM 同步执行失败",
-        "unknown": "STRM 同步状态暂时无法确认",
-    }[status]
-    return ToolResult(
-        status in {"running", "completed"},
-        status,
-        summary,
-        data={
-            "task": {
-                "status": status,
-                "started_at": str(row["started_at"] or ""),
-                "finished_at": str(row["finished_at"] or ""),
-                "progress": dict(runtime.get("progress") or {})
-                if status == "running" and _bounded_int(runtime.get("current_run_id")) == run_id
-                else {},
-                "stats": stats,
-            }
-        },
-        error="STRM 同步未成功完成。" if status in {"partial", "failed"} else "",
-    )
+    result = strm_status(_bounded_int(tracker.value.get("run_id")))
+    return ToolResult(**result)
 
 
 def _local_media_scan_status(tracker: _CompletionTracker) -> ToolResult:
@@ -399,36 +312,12 @@ def _local_media_scan_status(tracker: _CompletionTracker) -> ToolResult:
 
 
 def _patrol_status(tracker: _CompletionTracker) -> ToolResult:
-    from app import config, database as db
-    from app.agent.domains.library.patrol_status import project_library_patrol_status
+    from app.modules.library_patrol import patrol_status
 
-    row = db.get_task_run(_bounded_int(tracker.value.get("run_id")))
-    if row is None or str(row["task_name"]) != "agent_library_patrol":
-        return ToolResult(False, "unknown", "全库巡检状态暂时无法确认")
-    status = str(row["status"])
-    if status in {"queued", "running"}:
-        return ToolResult(
-            True, status,
-            "全库缺集巡检正在运行" if status == "running" else "全库缺集巡检正在排队",
-            data={"task": {"status": status, "started_at": str(row["started_at"] or ""), "stats": {}}},
-        )
-    result = project_library_patrol_status({
-        "projection_json": row["result"], "status": "pending", "outcome": status,
-        "cycle_accumulator_json": "{}", "cycle_as_of": "",
-        "last_finished_at": row["finished_at"], "next_run_at": "",
-    }, enabled=config.get_bool("AGENT_LIBRARY_PATROL_ENABLED", False))
-    data = dict(result.data)
-    data["task"] = {
-        "status": result.status, "started_at": str(row["started_at"] or ""),
-        "finished_at": str(row["finished_at"] or ""),
-        "stats": {
-            "checked_series": _bounded_int(data.get("checked_series_count")),
-            "updates_available": _bounded_int(data.get("updates_available_count")),
-            "missing_episodes": _bounded_int(data.get("missing_episode_count")),
-        },
-    }
-    ok = result.status in {"updates_available", "up_to_date"}
-    return replace(result, ok=ok, error="" if ok else result.summary, data=data)
+    value = patrol_status(_bounded_int(tracker.value.get("run_id")))
+    return ToolResult(value["ok"], value["status"], value["summary"], data=value.get("data", {}),
+                      evidence=[Evidence(**item) for item in value.get("evidence", [])],
+                      suggestions=value.get("suggestions", []), error=value.get("error", ""))
 
 
 async def _poll(
@@ -447,23 +336,30 @@ async def _poll(
         )
         return snapshot, snapshot.status, {"status": snapshot.status}
     if tracker.kind == "guangya_operation":
-        from app.agent.domains.guangya.runtime import guangya_organize_status
+        from app.modules.organize_tasks import get_organize_operation_status
 
-        snapshot = await asyncio.to_thread(
-            guangya_organize_status,
-            {"operation_ref": tracker.value["operation_ref"]},
-            context=context,
-        )
+        snapshot = ToolResult(**(await asyncio.to_thread(
+            get_organize_operation_status, tracker.value["operation_ref"], owner=context.owner,
+        )))
         status, task = _snapshot_task(snapshot)
         return snapshot, status, task
     if tracker.kind == "guangya_task":
-        from app.agent.domains.guangya.recycle_actions import query_guangya_task_status
+        from app.clients.guangya import GuangYaClient, close_guangya_client
+        from app.modules.guangya_recycle import read_task
 
-        snapshot = await asyncio.to_thread(
-            query_guangya_task_status,
-            {"guangya_task": tracker.value},
-            context,
-        )
+        def read_provider_task():
+            client = GuangYaClient()
+            try:
+                return read_task(client, str(tracker.value["task_id"]))
+            finally:
+                close_guangya_client(client)
+
+        state = await asyncio.to_thread(read_provider_task)
+        status = state["status"]
+        snapshot = ToolResult(status in {"completed", "running"}, status, {
+            "completed": "光鸭任务已完成", "failed": "光鸭任务执行失败",
+            "running": "光鸭任务仍在处理中", "unknown": "光鸭任务状态暂时无法确认，不能判断为正在运行或已完成",
+        }[status], data={**state, "operation": str(tracker.value.get("operation") or "operation")})
         status = (snapshot.status or "").strip().casefold()
         return (
             snapshot,
@@ -471,21 +367,14 @@ async def _poll(
             dict(snapshot.data) if isinstance(snapshot.data, dict) else {},
         )
     if tracker.kind == "guangya_organize_task":
-        from app.agent.domains.guangya.runtime import guangya_organize_task_status
+        from app.modules.organize_results import observe_organize_task
 
-        snapshot = await asyncio.to_thread(
-            guangya_organize_task_status, tracker.value
-        )
+        snapshot = ToolResult(**(await asyncio.to_thread(observe_organize_task, tracker.value)))
         status, task = _snapshot_task(snapshot)
         return snapshot, status, task
     if tracker.kind == "local_media_task":
-        from app.agent.domains.local_media.task_queries import (
-            local_media_completion_status,
-        )
-
-        snapshot = await asyncio.to_thread(
-            local_media_completion_status, tracker.value, context
-        )
+        from app.modules.local_media_tasks import local_task_completion
+        snapshot = ToolResult(**(await asyncio.to_thread(local_task_completion, int(tracker.value.get("task_id") or 0))))
         status, task = _snapshot_task(snapshot)
         return snapshot, status, task
     if tracker.kind == "local_media_scan":
@@ -493,19 +382,14 @@ async def _poll(
         status, task = _snapshot_task(snapshot)
         return snapshot, status, task
     if tracker.kind == "agent_job":
-        from app.agent.domains.system.jobs_actions import get_agent_job_status
+        from app.modules.library_audit_jobs import audit_job
 
-        snapshot = await asyncio.to_thread(
-            get_agent_job_status,
-            {"job_id": str(tracker.value.get("job_id") or ""), "limit": 1},
-            context,
+        payload = await asyncio.to_thread(
+            audit_job, owner=context.owner,
+            job_id=str(tracker.value.get("job_id") or ""), limit=1,
         )
-        status = (snapshot.status or "").strip().casefold()
-        return (
-            snapshot,
-            status,
-            dict(snapshot.data) if isinstance(snapshot.data, dict) else {},
-        )
+        snapshot = ToolResult(**payload)
+        return snapshot, payload["status"], dict(payload["data"])
     if tracker.kind == "strm_run":
         snapshot = await asyncio.to_thread(_strm_status, tracker)
         return (

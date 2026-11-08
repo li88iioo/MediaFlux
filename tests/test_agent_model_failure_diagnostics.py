@@ -16,7 +16,7 @@ import pytest
 
 from app.agent.kernel import provider_model as pm
 from app.agent.kernel.adapters import TurnViewBuilder, iter_ndjson
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.events import TERMINAL_EVENT_TYPES, AgentEventType
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
@@ -135,7 +135,7 @@ def session_wire(actions, *, protocol='responses', deadline=60):
         ), client_factory=factory)
         catalog, store = ToolCatalog(), InMemorySessionStateStore()
         session = AgentSession(
-            model=adapter, catalog=catalog, retriever=CapabilityRetriever(),
+            model=adapter, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
         )
         builder = TurnViewBuilder()

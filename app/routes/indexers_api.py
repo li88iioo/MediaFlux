@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from typing import Any
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -32,11 +30,9 @@ from app.indexers.errors import (
     IndexerResultNotFound,
     IndexerValidationError,
 )
-from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
-from app.indexers.ranking import match_priority
-from app.indexers.release import parse_indexer_release_position
+from app.indexers.models import IndexerMediaSearchRequest
 from app.indexers.runtime import get_indexer_service
-from app.indexers.service import IndexerService
+from app.indexers.service import search_payload
 from app.modules.download_dispatcher import public_dispatch_summary
 from app.web import api_error, api_response, require_api_login
 
@@ -48,63 +44,6 @@ def _require_enabled() -> None:
 
 router = APIRouter(prefix="/api/indexers", dependencies=[Depends(_require_enabled)])
 _DOWNLOAD_TARGETS = {"qb", "guangya", "both"}
-_SITE_ERROR_CATALOG: dict[str, tuple[str, bool]] = {
-    "timeout": ("站点响应超时，请稍后重试", True),
-    "unavailable": ("站点暂不可用，请稍后重试", True),
-    "rate_limited": ("站点请求过于频繁，请稍后再试", True),
-    "invalid_response": ("站点返回异常数据，请稍后重试", True),
-    "query_rejected": ("关键词长度或字符不受该站点支持，请换用完整片名或别名", False),
-    "challenge_required": ("站点要求人机验证，本次未完成检索", False),
-    "response_too_large": ("站点响应异常，暂无法处理", False),
-    "security_error": ("站点连接未通过安全校验", False),
-    "coverage_limited": ("仅检索部分作品候选，未覆盖范围仍未知；可细化片名、年份或季集", False),
-}
-
-
-def _safe_site_error(error) -> tuple[str, str, bool]:
-    code = str(getattr(error, "code", "") or "unavailable")
-    message, retryable = _SITE_ERROR_CATALOG.get(
-        code, ("站点检索失败，请稍后重试", True)
-    )
-    return code, message, retryable
-
-
-def _public_provider_error(error) -> dict[str, str]:
-    code, message, _retryable = _safe_site_error(error)
-    return {"site_id": str(error.site_id), "code": code, "message": message}
-
-
-def _public_source_url(service, item) -> str | None:
-    value = str(getattr(item, "detail_url", "") or "").strip()
-    if not value or service is None:
-        return None
-    try:
-        parsed = urlsplit(value)
-        adapter = service.registry.get(item.site_id)
-        client = adapter.http_client_for_result(item)
-        allowed_hosts = {str(host).rstrip(".").lower() for host in getattr(client, "allowed_hosts", ())}
-    except (HttpError, KeyError, TypeError, ValueError):
-        return None
-    try:
-        host = (parsed.hostname or "").rstrip(".").lower()
-        port = parsed.port or 443
-    except ValueError:
-        return None
-    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
-        return None
-    if not host or host not in allowed_hosts or port != 443:
-        return None
-    return value
-
-
-def _public_search_item(item, service=None) -> dict[str, Any]:
-    payload = item.to_public_dict()
-    payload["source_url"] = _public_source_url(service, item)
-    payload["match_priority"] = match_priority(item)
-    # 稳定身份只供展示/勾选迁移；下载仍必须使用当前result_id并经过确认。
-    payload["resource_key"] = hashlib.sha256(repr(IndexerService._result_identity(item)).encode("utf-8")).hexdigest()
-    payload.update(parse_indexer_release_position(item.title))
-    return payload
 
 
 def _error_response(exc: HttpError):
@@ -132,102 +71,6 @@ def _site_payload(service, site_id: str) -> dict[str, Any]:
     }
 
 
-def _search_site_statuses(service, result) -> list[dict[str, Any]]:
-    raw_counts = getattr(result, "site_item_counts", None)
-    if isinstance(raw_counts, dict) and raw_counts:
-        counts = {str(site_id): max(0, int(count)) for site_id, count in raw_counts.items()}
-    else:
-        counts: dict[str, int] = {}
-        for item in result.items:
-            counts[item.site_id] = counts.get(item.site_id, 0) + 1
-    errors = {error.site_id: error for error in result.errors}
-    errors.update((error.site_id, error) for error in result.errors if error.code != "coverage_limited")
-    site_queries = getattr(result, "site_queries", {}) or {}
-    site_attempt_counts = getattr(result, "site_attempt_counts", {}) or {}
-    visible_counts = getattr(result, "site_visible_counts", {}) or {}
-    page_states = getattr(result, "site_page_states", {}) or {}
-    enabled_site_ids = getattr(service, "enabled_site_ids", None)
-    if enabled_site_ids is None:
-        enabled_site_ids = frozenset(service.registry.enabled_ids())
-    registered = set(service.registry.ids())
-    payload = []
-    for site_id in MANUAL_INDEXER_SITE_ORDER:
-        if site_id not in registered:
-            continue
-        adapter = service.registry.get(site_id)
-        code = None
-        retryable = False
-        sources = (getattr(result, "source_statuses", {}) or {}).get(site_id, ())
-        diagnostics = [{
-            "site_id": row.site_id, "site_name": row.site_name, "status": row.status,
-            "count": row.count, "cached": bool(result.cached or row.cached), "code": row.code or None,
-            "message": (
-                ("本轮未完整核验，暂保留缓存结果" if result.cached or row.cached else "部分结果未能取得，已保留成功结果")
-                if row.status == "partial" else
-                _SITE_ERROR_CATALOG.get(row.code, ("来源检索未完成", True))[0] if row.code else ""
-            ),
-        } for row in sources]
-        status = "disabled" if site_id not in enabled_site_ids else indexer_site_status(result, site_id, counts.get(site_id, 0))
-        message = ""
-        if status is None:
-            continue
-        if status == "searching":
-            message = "正在补充检索"
-        elif status == "partial":
-            if site_id in errors and errors[site_id].code == "coverage_limited":
-                code, message, retryable = _safe_site_error(errors[site_id])
-            else:
-                message, retryable = "本轮未找到匹配资源，部分来源未完成", True
-        elif status == "error":
-            if site_id in errors:
-                code, message, retryable = _safe_site_error(errors[site_id])
-            else:
-                code, message, retryable = "unavailable", "站点未返回有效状态", True
-        if result.site_truncated_counts.get(site_id, 0):
-            hint = "达到候选上限，可细化片名、年份或季集后重搜"
-            message = f"{message}；{hint}" if message else hint
-        page_state = page_states.get(site_id)
-        payload.append({
-            "site_id": site_id,
-            "site_name": INDEXER_SITE_LABELS.get(site_id, adapter.site_name),
-            "status": status,
-            "count": counts.get(site_id, 0),
-            "collected_count": result.site_collected_counts.get(site_id, counts.get(site_id, 0)),
-            "truncated_count": result.site_truncated_counts.get(site_id, 0),
-            "visible_count": max(0, int(visible_counts.get(site_id, counts.get(site_id, 0)) or 0)),
-            "message": message,
-            "code": code,
-            "retryable": retryable,
-            "diagnostics": diagnostics,
-            "query": str(site_queries.get(site_id) or ""),
-            "attempts": max(0, int(site_attempt_counts.get(site_id, 0) or 0)),
-            "pagination_supported": bool(
-                page_state.pagination_supported if page_state is not None else adapter.capabilities.pagination_supported
-            ),
-            "requested_page": int(page_state.requested_page if page_state is not None else result.page),
-            "has_more": page_state.has_more if page_state is not None else None,
-            "next_page": page_state.next_page if page_state is not None else None,
-        })
-    return payload
-
-
-def _search_payload(service, result) -> dict[str, Any]:
-    return {
-        "query": result.query,
-        "page": result.page,
-        "items": [_public_search_item(item, service) for item in result.items],
-        "sites_attempted": list(result.sites_attempted),
-        "sites_succeeded": list(result.sites_succeeded),
-        "errors": [_public_provider_error(error) for error in result.errors],
-        "site_statuses": _search_site_statuses(service, result),
-        "partial": result.partial,
-        "truncated": any(result.site_truncated_counts.values()),
-        "cached": result.cached,
-        "has_more": bool(getattr(result, "has_more", False)),
-        "complete": bool(getattr(result, "complete", True)),
-    }
-
-
 async def _stream_search(request: Request, service, run_search):
     """相同搜索管线的SSE表现形式：队列仅保留最新快照，断开即撤销本消费者。"""
     updates = asyncio.Queue(maxsize=1)
@@ -246,10 +89,10 @@ async def _stream_search(request: Request, service, run_search):
                 break
             if task in done:
                 result = task.result()
-                yield "event: complete\ndata: " + json.dumps(_search_payload(service, result), ensure_ascii=False) + "\n\n"
+                yield "event: complete\ndata: " + json.dumps(search_payload(service, result), ensure_ascii=False) + "\n\n"
                 break
             if update in done:
-                yield "event: progress\ndata: " + json.dumps(_search_payload(service, update.result()), ensure_ascii=False) + "\n\n"
+                yield "event: progress\ndata: " + json.dumps(search_payload(service, update.result()), ensure_ascii=False) + "\n\n"
                 update = asyncio.create_task(updates.get())
             elif not done:
                 yield ": keepalive\n\n"
@@ -353,7 +196,7 @@ async def search(
         )
     except HttpError as exc:
         return _error_response(exc)
-    return api_response(_search_payload(service, result))
+    return api_response(search_payload(service, result))
 
 
 @router.post("/search")
@@ -371,7 +214,7 @@ async def search_media(request: Request, payload: Any = Body(...)):
         )
     except HttpError as exc:
         return _error_response(exc)
-    return api_response(_search_payload(service, result))
+    return api_response(search_payload(service, result))
 
 
 def _validate_batch_payload(data: Any) -> tuple[list[str], str]:

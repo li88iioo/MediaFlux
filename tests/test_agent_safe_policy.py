@@ -5,16 +5,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from app import config
-from app.agent.domains.configuration.policy_actions import (
-    prepare_safe_policy_confirmation,
-    safe_policy_arguments,
-    safe_policy_summary_arguments,
-    summarize_safe_policies,
-)
-from app.agent.errors import AgentToolError
+from app.modules.policy_config import normalize_policy, policies, prepare_policy
 
 _POLICY_KEYS = {
     "TMDB_MATCH_MODE",
@@ -36,22 +31,23 @@ _POLICY_KEYS = {
 
 class SafePolicyUnitTests(unittest.TestCase):
     def test_arguments_are_strict_and_bounded(self):
-        self.assertEqual(safe_policy_summary_arguments({}), {})
+        with self.assertRaises(TypeError):
+            extra: dict[str, Any] = {"extra": True}
+            policies(**extra)
         self.assertEqual(
-            safe_policy_arguments({"policy": "tmdb_match_mode", "value": " STRICT "}),
+            normalize_policy(policy="tmdb_match_mode", value=" STRICT "),
             {"policy": "tmdb_match_mode", "value": "strict"},
         )
         self.assertEqual(
-            safe_policy_arguments({"policy": "web_search_max_results", "value": 10}),
+            normalize_policy(policy="web_search_max_results", value=10),
             {"policy": "web_search_max_results", "value": 10},
         )
         self.assertEqual(
-            safe_policy_arguments(
-                {"policy": "web_search_daily_credit_limit", "value": 100000}
+            normalize_policy(policy="web_search_daily_credit_limit", value=100000
             ),
             {"policy": "web_search_daily_credit_limit", "value": 100000},
         )
-        invalid = (
+        invalid: tuple[dict[str, Any], ...] = (
             {"extra": True},
             {},
             {"policy": "unknown", "value": "strict"},
@@ -70,11 +66,11 @@ class SafePolicyUnitTests(unittest.TestCase):
             {"policy": "tmdb_match_mode", "value": "strict", "key": "TMDB_API_KEY"},
         )
         for arguments in invalid:
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
+            with self.subTest(arguments=arguments), self.assertRaises((ValueError, TypeError)):
                 if arguments == {"extra": True}:
-                    safe_policy_summary_arguments(arguments)
+                    policies(**arguments)
                 else:
-                    safe_policy_arguments(arguments)
+                    normalize_policy(**arguments)
 
     def test_summary_and_preview_never_expose_unrelated_config(self):
         with tempfile.TemporaryDirectory() as root:
@@ -91,7 +87,7 @@ class SafePolicyUnitTests(unittest.TestCase):
                     "TAVILY_DAILY_CREDIT_LIMIT": "100",
                     "TAVILY_TIMEOUT_SECONDS": "10",
                     "DISCOVERY_CACHE_TTL_SECONDS": "21600",
-                    "DISCOVERY_STALE_TTL_SECONDS": "604800",
+                    "DISCOVERY_STALE_TTL_SECONDS": "604700",
                     "DOUBAN_CACHE_TTL_SECONDS": "21600",
                     "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": "5",
                     "TMDB_API_KEY": secret,
@@ -103,14 +99,14 @@ class SafePolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
             ):
-                summary = summarize_safe_policies({})
-                preview, context = prepare_safe_policy_confirmation(
-                    {"policy": "web_search_timeout_seconds", "value": 15}
+                summary = policies()
+                prepared = prepare_policy(policy="web_search_timeout_seconds", value=15
                 )
-        rendered = repr((summary.to_dict(), preview.to_dict(), context))
-        self.assertTrue(summary.ok)
-        self.assertEqual(summary.data["policy_count"], 13)
-        self.assertTrue(preview.ok)
+        preview, context = prepared["preview"], prepared["fingerprint"]
+        rendered = repr((summary, preview, context))
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["data"]["policy_count"], 13)
+        self.assertTrue(preview["ok"])
         self.assertRegex(context, "^[0-9a-f]{64}$")
         self.assertNotIn(secret, rendered)
         self.assertNotIn("TMDB_API_KEY", rendered)
@@ -123,7 +119,7 @@ class SafePolicyUnitTests(unittest.TestCase):
                 env_file,
                 {
                     "DISCOVERY_CACHE_TTL_SECONDS": "21600",
-                    "DISCOVERY_STALE_TTL_SECONDS": "604800",
+                    "DISCOVERY_STALE_TTL_SECONDS": "604700",
                 },
                 replace=False,
             )
@@ -132,17 +128,14 @@ class SafePolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
             ):
-                too_long, _ = prepare_safe_policy_confirmation(
-                    {"policy": "discovery_cache_ttl_seconds", "value": 604801}
+                too_long = prepare_policy(policy="discovery_cache_ttl_seconds", value=604800
                 )
-                too_short, _ = prepare_safe_policy_confirmation(
-                    {"policy": "discovery_stale_ttl_seconds", "value": 21599}
+                too_short = prepare_policy(policy="discovery_stale_ttl_seconds", value=21599
                 )
-                valid, _ = prepare_safe_policy_confirmation(
-                    {"policy": "discovery_stale_ttl_seconds", "value": 86400}
+                valid = prepare_policy(policy="discovery_stale_ttl_seconds", value=86400
                 )
-        self.assertFalse(too_long.ok)
-        self.assertEqual(too_long.status, "precondition_failed")
-        self.assertFalse(too_short.ok)
-        self.assertEqual(too_short.status, "precondition_failed")
-        self.assertTrue(valid.ok)
+        self.assertFalse(too_long["preview"]["ok"])
+        self.assertEqual(too_long["preview"]["status"], "precondition_failed")
+        self.assertFalse(too_short["preview"]["ok"])
+        self.assertEqual(too_short["preview"]["status"], "precondition_failed")
+        self.assertTrue(valid["preview"]["ok"])

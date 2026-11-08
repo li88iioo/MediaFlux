@@ -345,14 +345,9 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
                     conn.execute("DELETE FROM download_requests")
 
     def test_agent_confirmation_does_not_promise_a_successor_for_partial_retry(self):
-        from app.agent.domains.downloads.retry_actions import _preview
-
-        result = _preview({
-            "request_id": 1, "target": "guangya", "kind": "magnet",
-            "status": "submitted", "qb_status": "downloading", "gy_status": "failed",
-            "attention_stages": ["guangya"],
-        })
-        effects = "".join(result.data["effects"])
+        request_id = self.request()
+        result = dispatcher.prepare_download_retry(request_id, "guangya")
+        effects = "".join(result["effects"])
         self.assertIn("重试所选目标", effects)
         self.assertIn("保留未重试目标的任务", effects)
         self.assertIn("补投原请求或创建新的提交记录", effects)

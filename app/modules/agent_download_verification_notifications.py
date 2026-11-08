@@ -13,10 +13,15 @@ from app.agent.owner_routes import (
 from app.notifier import TelegramSendResult
 
 
-class DownloadVerificationPayload(TypedDict):
+class DownloadVerificationTarget(TypedDict):
     title: str
     season: int
     episode: int
+    result: str
+
+
+class DownloadVerificationPayload(TypedDict):
+    targets: list[DownloadVerificationTarget]
     status: str
     result: str
     attempts: int
@@ -47,52 +52,37 @@ def _safe_title(value: object) -> str:
 
 
 def dump_download_verification_payload(
-    *,
-    title: object,
-    season: int,
-    episode: int,
-    status: str,
-    result: str,
-    attempts: int,
+    *, targets: list[dict], status: str, result: str, attempts: int,
 ) -> str:
-    """生成可持久化的安全通知投影，不保存下载链接或凭据。"""
-    payload = {
-        "title": _safe_title(title),
-        "season": max(1, season),
-        "episode": max(1, episode),
-        "status": status if status in {"visible", "attention"} else "attention",
-        "result": result if result in _RESULT_LABELS else "inconclusive",
-        "attempts": max(0, min(attempts, 100)),
-    }
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    """投影全部已核对目标；不把缺失或未核对的目标写成成功通知。"""
+    projected = [{
+        "title": _safe_title(target.get("title")),
+        "season": max(1, int(target.get("season") or 1)),
+        "episode": max(1, int(target.get("episode") or 1)),
+        "result": target.get("result") if target.get("result") in _RESULT_LABELS else "inconclusive",
+    } for target in targets]
+    status = status if status in {"visible", "attention"} else "attention"
+    result = result if result in _RESULT_LABELS else "inconclusive"
+    if (status == "visible" or result == "visible") and (
+        not projected or any(target["result"] != "visible" for target in projected)
+    ):
+        status, result = "attention", "inconclusive"
+    return json.dumps({"targets": projected, "status": status, "result": result,
+                       "attempts": max(0, min(attempts, 100))}, ensure_ascii=False, separators=(",", ":"))
 
 
 def load_download_verification_payload(value: object) -> DownloadVerificationPayload:
-    """读取并再次收敛 outbox 载荷，拒绝畸形或扩展字段。"""
+    """只读取新格式 outbox；旧单目标载荷由 v38 一次迁完，不保留双读。"""
     try:
         payload = json.loads(str(value or ""))
     except (TypeError, ValueError) as exc:
         raise ValueError("通知载荷不是有效 JSON") from exc
-    if not isinstance(payload, dict) or set(payload) != {
-        "title", "season", "episode", "status", "result", "attempts"
-    }:
+    if (not isinstance(payload, dict) or set(payload) != {"targets", "status", "result", "attempts"}
+            or not isinstance(payload["targets"], list)
+            or any(not isinstance(target, dict) or set(target) != {"title", "season", "episode", "result"}
+                   for target in payload["targets"])):
         raise ValueError("通知载荷结构无效")
-    return {
-        "title": _safe_title(payload.get("title")),
-        "season": max(1, int(payload.get("season") or 1)),
-        "episode": max(1, int(payload.get("episode") or 1)),
-        "status": (
-            str(payload.get("status"))
-            if str(payload.get("status")) in {"visible", "attention"}
-            else "attention"
-        ),
-        "result": (
-            str(payload.get("result"))
-            if str(payload.get("result")) in _RESULT_LABELS
-            else "inconclusive"
-        ),
-        "attempts": max(0, min(int(payload.get("attempts") or 0), 100)),
-    }
+    return json.loads(dump_download_verification_payload(**payload))
 
 
 def notify_download_verification_terminal_result(
@@ -109,9 +99,9 @@ def notify_download_verification_terminal_result(
         return TelegramSendResult(False, error="AuthorizationRevoked", status_code=403)
     from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 
-    outcome = publish_download_lifecycle(request_id)
+    outcome = publish_download_lifecycle(request_id, expected_chat_id=target)
     return TelegramSendResult(
         ok=bool(outcome),
         error="" if outcome else (outcome.status or "DeliveryFailed"),
-        status_code=0 if outcome else 503,
+        status_code=0 if outcome else (403 if outcome.status == "InvalidRoute" else 503),
     )

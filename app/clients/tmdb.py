@@ -24,6 +24,7 @@ from app.discovery.providers.base import (
     response_json,
 )
 from app.logger import get_logger
+from app.modules.media_identity import normalize_tmdb_id
 
 logger = get_logger(__name__)
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._~/-]+$")
@@ -221,51 +222,34 @@ class TMDBClient:
         return [item for item in results if isinstance(item, dict)][:10]
 
     def search_people(
-        self,
-        query: str,
-        *,
-        limit: int = 10,
-        deadline_at: float | None = None,
-        retries: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """按人物名称搜索 TMDB，返回有界候选。"""
-        normalized_query = (query or "").strip()
-        if not normalized_query or len(normalized_query) > 120:
-            raise ValueError("人物名称必须为 1 到 120 个字符")
-        normalized_limit = max(1, min((limit or 10), 20))
-        payload = self.get(
-            "/search/person",
-            {"query": normalized_query, "page": 1},
-            deadline_at=deadline_at,
-            retries=retries,
-        )
-        results = payload.get("results", [])
-        if not isinstance(results, list):
-            raise ProviderInvalidResponse("TMDB 人物搜索响应结构无效")
-        return [item for item in results if isinstance(item, dict)][
-            :normalized_limit
-        ]
+        self, query: str, *, page: int = 1,
+        deadline_at: float | None = None, retries: int | None = None,
+    ) -> dict[str, Any]:
+        """按姓名读取完整TMDB候选页，保留源分页，不筛选或按热度选人。"""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("人物姓名不能为空")
+        if type(page) is not int or page < 1:
+            raise ValueError("page必须为正整数")
+        payload = self.get("/search/person", {"query": query.strip(), "page": page},
+                           deadline_at=deadline_at, retries=retries)
+        if (not isinstance(payload.get("results"), list)
+                or type(payload.get("page")) is not int or payload["page"] != page
+                or any(type(payload.get(key)) is not int or payload[key] < 0
+                       for key in ("total_pages", "total_results"))):
+            raise ProviderInvalidResponse("TMDB人物搜索响应缺少有效候选或分页事实")
+        return payload
 
     def person_movie_credits(
-        self,
-        person_id: str,
-        *,
-        deadline_at: float | None = None,
-        retries: int | None = None,
-    ) -> dict[str, list[dict[str, Any]]]:
-        """读取人物电影演职员表，不返回原始图片或外部 URL。"""
-        payload = self.get(
-            f"/person/{self._numeric_id(person_id)}/movie_credits",
-            deadline_at=deadline_at,
-            retries=retries,
-        )
-        result: dict[str, list[dict[str, Any]]] = {}
-        for key in ("cast", "crew"):
-            items = payload.get(key, [])
-            if not isinstance(items, list):
-                raise ProviderInvalidResponse("TMDB 人物作品响应结构无效")
-            result[key] = [item for item in items if isinstance(item, dict)]
-        return result
+        self, person_id: str, *, deadline_at: float | None = None, retries: int | None = None,
+    ) -> dict[str, list[Any]]:
+        """读取人物完整电影演职员表；缺表或明确响应身份错配不能当作空作品。"""
+        person_id = self._numeric_id(person_id)
+        payload = self.get(f"/person/{person_id}/movie_credits", deadline_at=deadline_at, retries=retries)
+        if payload.get("id") is not None and str(payload["id"]) != person_id:
+            raise ProviderInvalidResponse("TMDB人物作品响应身份不匹配")
+        if any(not isinstance(payload.get(key), list) for key in ("cast", "crew")):
+            raise ProviderInvalidResponse("TMDB人物作品响应缺少有效cast/crew列表")
+        return {key: payload[key] for key in ("cast", "crew")}
 
     def media_credits(
         self,
@@ -277,31 +261,33 @@ class TMDBClient:
         retries: int | None = None,
     ) -> dict[str, list[Any]]:
         """读取电影或剧集（可选单季）演职员；剧集使用完整季集聚合端点。"""
-        if media_type not in {"movie", "tv"}:
+        if not isinstance(media_type, str) or media_type not in {"movie", "tv"}:
             raise ValueError("media_type 仅支持 movie 或 tv")
-        path = f"/{media_type}/{self._numeric_id(tmdb_id)}"
+        tmdb_id = self._numeric_id(tmdb_id)
+        path = f"/{media_type}/{tmdb_id}"
         if season_number is not None:
             if (
                 media_type != "tv"
                 or isinstance(season_number, bool)
                 or not isinstance(season_number, int)
-                or not 0 <= season_number <= 100
+                or season_number < 0
             ):
-                raise ValueError("season_number 仅适用于剧集，必须在 0 到 100 之间")
+                raise ValueError("season_number 仅适用于剧集，必须为非负整数")
             path += f"/season/{season_number}"
         path += "/aggregate_credits" if media_type == "tv" else "/credits"
         payload = self.get(path, deadline_at=deadline_at, retries=retries)
-        # 缺字段不能静默变为空列表，否则 Agent 会误称 TMDB 尚未录入。
+        if season_number is None and payload.get("id") is not None and str(payload["id"]) != tmdb_id:
+            raise ProviderInvalidResponse("TMDB演职员响应作品身份不匹配")
+        if season_number is not None and "season_number" in payload and payload["season_number"] != season_number:
+            raise ProviderInvalidResponse("TMDB演职员响应季号不匹配")
+        # 缺字段不能静默变为空列表。
         if any(not isinstance(payload.get(key), list) for key in ("cast", "crew")):
             raise ProviderInvalidResponse("TMDB 演职员响应缺少有效 cast/crew 列表")
         return {key: payload[key] for key in ("cast", "crew")}
 
     @staticmethod
     def _numeric_id(value: object) -> str:
-        normalized = str(value or "").strip()
-        if not normalized.isascii() or not normalized.isdigit() or not 1 <= len(normalized) <= 10:
-            raise ValueError("TMDB ID 必须是 1 到 10 位数字")
-        return normalized
+        return normalize_tmdb_id(value)
 
     def close(self) -> bool:
         """关闭连接池；在途请求结束后可重试，不抢先拆除其 Session。"""

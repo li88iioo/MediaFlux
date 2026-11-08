@@ -5,20 +5,19 @@ import logging
 import math
 import threading
 import time
-import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Callable
 
 from app import database as db
 from app.agent.models import Evidence, ToolResult
-from app.agent.owner_routes import parse_telegram_owner_route
 from app.agent.session_context import AgentSessionContextRepository
+from app.modules.media_identity import normalize_episode_verification
 
 _ALLOWED_TARGETS = {"qb", "guangya", "both"}
-_ALLOWED_DISPATCH_STATUSES = {"submitted", "partial", "failed", "duplicate"}
-_ALLOWED_RESULT_STATUSES = {"accepted", "conflict", "unavailable"}
+_ALLOWED_DISPATCH_STATUSES = {"submitted", "partial", "failed", "duplicate", "manual_review"}
+_ALLOWED_RESULT_STATUSES = {"accepted", "partial", "conflict", "unavailable", "outcome_unknown"}
 _BACKEND_NAMES = {"qb", "guangya"}
 _TERMINAL_BACKEND_STATUSES = {"completed", "failed", "manual_review", "cancelled"}
 logger = logging.getLogger(__name__)
@@ -305,47 +304,10 @@ def _submission_from_payload(value: Any) -> RecentDownloadSubmission | None:
 
 
 def _safe_verification(value: Any) -> RecentDownloadVerification | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        return None
-    # 新版补库工作流会在确认票据中附带一个仅含随机工作流引用的 wrapper；
-    # 会话恢复和自动复核仍只消费最小 verification 投影，保持旧载荷兼容。
-    source = value.get("verification") if "verification" in value else value
-    required_keys = frozenset({"title", "tmdb_id", "season", "episode", "as_of"})
-    source_keys = frozenset(source) if isinstance(source, dict) else frozenset()
-    if not isinstance(source, dict) or source_keys not in {
-        required_keys,
-        required_keys | {"library_name"},
-    }:
-        return None
-    title = _safe_visible_text(source.get("title"), maximum=120)
-    tmdb_id = str(source.get("tmdb_id") or "").strip()
-    season = _bounded_positive_int(source.get("season"), maximum=100)
-    episode = _bounded_positive_int(source.get("episode"), maximum=1000)
-    as_of = str(source.get("as_of") or "").strip()
-    raw_library_name = source.get("library_name", "")
-    if not isinstance(raw_library_name, str):
-        return None
-    library_name = _safe_visible_text(raw_library_name, maximum=80) if raw_library_name else ""
-    if raw_library_name and not library_name:
-        return None
-    if not title or not tmdb_id.isascii() or not tmdb_id.isdigit() or not 1 <= len(tmdb_id) <= 10:
-        return None
-    try:
-        parsed_as_of = date.fromisoformat(as_of)
-    except ValueError:
-        return None
-    if parsed_as_of > date.today() or season is None or episode is None:
-        return None
-    return RecentDownloadVerification(
-        title=title,
-        tmdb_id=tmdb_id,
-        season=season,
-        episode=episode,
-        as_of=parsed_as_of.isoformat(),
-        library_name=library_name,
-    )
+    # 工作流票据保留随机引用；最近记录只消费公共最小目标投影。
+    source = value.get("verification", value) if isinstance(value, dict) else value
+    normalized = normalize_episode_verification(source)
+    return RecentDownloadVerification(**normalized) if normalized is not None else None
 
 
 def parse_recent_download_verification_context(
@@ -353,63 +315,6 @@ def parse_recent_download_verification_context(
 ) -> RecentDownloadVerification | None:
     """公开复用严格核验上下文解析器；失败时安全返回 ``None``。"""
     return _safe_verification(value)
-
-
-def enqueue_recent_download_library_verification(
-    result: ToolResult,
-    verification_context: dict[str, Any] | None,
-    owner: str = "",
-) -> bool:
-    """确认提交成功后创建持久化自动复核任务。"""
-    record = _safe_submission(
-        result,
-        captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-        verification_context=verification_context,
-    )
-    if (
-        record is None
-        or record.request_id is None
-        or record.verification is None
-        or not record.created
-        or record.duplicate
-        or not record.succeeded
-    ):
-        return False
-    verification = record.verification
-    owner_key = (owner or "")[:512]
-    telegram_route = parse_telegram_owner_route(owner_key)
-    enqueued = db.enqueue_agent_download_verification(
-        record.request_id,
-        title=verification.title,
-        tmdb_id=verification.tmdb_id,
-        season=verification.season,
-        episode=verification.episode,
-        as_of=verification.as_of,
-        library_name=verification.library_name,
-        owner=owner_key,
-        chat_id=telegram_route.chat_id if telegram_route is not None else "",
-    )
-    existing = enqueued or db.get_agent_download_verification(record.request_id) is not None
-    try:
-        from app.agent.domains.library.missing_workflows import (
-            SQLiteMissingMediaWorkflowRepository,
-            workflow_ref_from_context,
-        )
-
-        workflow_ref = workflow_ref_from_context(verification_context)
-        if workflow_ref is not None:
-            SQLiteMissingMediaWorkflowRepository().attach_submission(
-                workflow_ref=workflow_ref,
-                request_id=record.request_id,
-                verification_enqueued=existing,
-            )
-    except Exception as exc:
-        # 下载任务与自动复核已成功建立；补库进度投影失败不得反向改变执行结果。
-        logger.warning(
-            "Agent 补库工作流关联下载失败 type=%s",
-            type(exc).__name__,
-        )
-    return enqueued
 
 
 def _verification_payload(value: RecentDownloadVerification | None) -> dict[str, Any] | None:
@@ -423,25 +328,6 @@ def _verification_payload(value: RecentDownloadVerification | None) -> dict[str,
         "as_of": value.as_of,
         "library_name": value.library_name,
     }
-
-
-def _safe_visible_text(value: Any, *, maximum: int) -> str:
-    if not isinstance(value, str):
-        return ""
-    text = " ".join(unicodedata.normalize("NFKC", value).split())
-    if not text or any(unicodedata.category(char).startswith("C") for char in text):
-        return ""
-    return text[:maximum]
-
-
-def _bounded_positive_int(value: Any, *, maximum: int) -> int | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return parsed if 1 <= parsed <= maximum else None
 
 
 def _positive_int(value: Any) -> int | None:
@@ -615,9 +501,14 @@ def _automatic_verification_projection(request_id: int) -> dict[str, Any]:
     data: dict[str, Any] = {
         "status": status,
         "attempts": _bounded_nonnegative_int(row["attempts"], maximum=100) or 0,
-        "season": _bounded_nonnegative_int(row["season"], maximum=10_000) or 0,
-        "episode": _bounded_nonnegative_int(row["episode"], maximum=100_000) or 0,
-        "as_of": str(row["as_of"] or "")[:10],
+        "targets": [{
+            "tmdb_id": str(target["tmdb_id"])[:10],
+            "season": _bounded_nonnegative_int(target["season"], maximum=100) or 0,
+            "episode": _bounded_nonnegative_int(target["episode"], maximum=1000) or 0,
+            "as_of": str(target["as_of"] or "")[:10],
+            "library_name": str(target["library_name"] or "")[:80],
+            "result": target["result"] if target["result"] in {"", "visible", "missing", "inconclusive"} else "inconclusive",
+        } for target in row["targets"]],
     }
     if result in {"visible", "missing", "inconclusive"}:
         data["result"] = result
@@ -844,99 +735,50 @@ def build_recent_download_library_verification(
     missing_count = _bounded_nonnegative_int(audit_data.get("missing_count"), maximum=100_000)
     if missing_count is not None:
         data["missing_count"] = missing_count
-    exact_target_keys = {"target_aired", "target_local", "target_missing"}
-    has_exact_target = any(key in audit_data for key in exact_target_keys)
-    if audit.ok and audit.status in {"up_to_date", "updates_available"} and has_exact_target:
-        if audit_data.get("target_missing") is True:
-            data["verification"] = "missing"
-            return ToolResult(
-                True,
-                "updates_available",
-                f"{verification.title} S{verification.season:02d}E{verification.episode:02d} 仍未在媒体库中可见",
-                data=data,
-                evidence=list(audit.evidence),
-                suggestions=["下载完成不等于媒体服务器已扫描入库；可稍后再次核验或检查入库链路。"],
-            )
-        if (
-            audit_data.get("target_aired") is True
-            and audit_data.get("target_local") is True
-            and audit_data.get("target_missing") is False
-        ):
-            data["verification"] = "visible"
-            has_other_missing = audit.status == "updates_available"
-            summary = (
-                f"目标集 S{verification.season:02d}E{verification.episode:02d} 已在媒体库中可见，但同季仍有其他缺集"
-                if has_other_missing
-                else f"{verification.title} S{verification.season:02d}E{verification.episode:02d} 已在媒体库中可见"
-            )
-            return ToolResult(
-                True,
-                "up_to_date",
-                summary,
-                data=data,
-                evidence=list(audit.evidence),
-                suggestions=(
-                    ["可继续查看同季其他缺集。"]
-                    if has_other_missing
-                    else ["如媒体客户端尚未显示，可刷新客户端缓存后再查看。"]
-                ),
-            )
-        data["verification"] = "inconclusive"
-        return ToolResult(
-            False,
-            "inconclusive",
-            "媒体库审计暂时无法可靠判断目标集是否已入库",
-            data=data,
-            evidence=list(audit.evidence),
-            suggestions=list(audit.suggestions) or ["请稍后重试，或按明确片名与季集重新检查。"],
-            error=audit.error or "目标集尚未播出，或精确季集状态不完整。",
+    outcome = "inconclusive"
+    if audit.ok and audit.status in {"up_to_date", "updates_available"}:
+        facts = next((item for item in audit_data.get("episodes", []) if isinstance(item, dict)
+                      and item.get("season") == verification.season and item.get("episode") == verification.episode), {})
+        aired, local = facts.get("aired"), facts.get("local")
+        exact_target = (
+            any(key in audit_data for key in ("target_aired", "target_local", "target_missing"))
+            and audit_data.get("season", verification.season) == verification.season
+            and audit_data.get("target_episode", verification.episode) == verification.episode
         )
-    if audit.ok and audit.status == "up_to_date":
-        data["verification"] = "visible"
-        return ToolResult(
-            True,
-            "up_to_date",
-            f"{verification.title} S{verification.season:02d}E{verification.episode:02d} 已在媒体库中可见",
-            data=data,
-            evidence=list(audit.evidence),
-            suggestions=["如媒体客户端尚未显示，可刷新客户端缓存后再查看。"],
-        )
-    if audit.ok and audit.status == "updates_available":
-        target_missing = any(
-            isinstance(item, dict)
-            and item.get("season") == verification.season
+        if exact_target:
+            aired, local = audit_data.get("target_aired"), audit_data.get("target_local")
+        sample_missing = any(
+            isinstance(item, dict) and item.get("season") == verification.season
             and item.get("episode") == verification.episode
             for item in audit_data.get("missing_sample", [])
         )
-        if target_missing:
-            data["verification"] = "missing"
-            return ToolResult(
-                True,
-                "updates_available",
-                f"{verification.title} S{verification.season:02d}E{verification.episode:02d} 仍未在媒体库中可见",
-                data=data,
-                evidence=list(audit.evidence),
-                suggestions=["下载完成不等于媒体服务器已扫描入库；可稍后再次核验或检查入库链路。"],
-            )
-        if not bool(audit_data.get("missing_sample_truncated")):
-            data["verification"] = "visible"
-            return ToolResult(
-                True,
-                "up_to_date",
-                f"目标集 S{verification.season:02d}E{verification.episode:02d} 已在媒体库中可见，但同季仍有其他缺集",
-                data=data,
-                evidence=list(audit.evidence),
-                suggestions=["可继续查看同季其他缺集。"],
-            )
-    data["verification"] = "inconclusive"
+        if local is True:
+            outcome = "visible"
+        elif ((exact_target and audit_data.get("target_missing") is True)
+                or (aired is True and local is False) or sample_missing):
+            outcome = "missing"
+    data["verification"] = outcome
+    if outcome == "missing":
+        return ToolResult(
+            True, "updates_available",
+            f"{verification.title} S{verification.season:02d}E{verification.episode:02d} 仍未在媒体库中可见",
+            data=data, evidence=list(audit.evidence),
+            suggestions=["下载完成不等于媒体服务器已扫描入库；可稍后再次核验或检查入库链路。"],
+        )
+    if outcome == "visible":
+        has_other_missing = audit.status == "updates_available"
+        return ToolResult(
+            True, "up_to_date",
+            (f"目标集 S{verification.season:02d}E{verification.episode:02d} 已在媒体库中可见，但同季仍有其他缺集"
+             if has_other_missing else f"{verification.title} S{verification.season:02d}E{verification.episode:02d} 已在媒体库中可见"),
+            data=data, evidence=list(audit.evidence),
+            suggestions=(["可继续查看同季其他缺集。"] if has_other_missing else ["如媒体客户端尚未显示，可刷新客户端缓存后再查看。"]),
+        )
     return ToolResult(
-        False,
-        "inconclusive",
-        "媒体库审计暂时无法可靠判断目标集是否已入库",
-        data=data,
-        evidence=list(audit.evidence),
+        False, "inconclusive", "媒体库审计暂时无法可靠判断目标集是否已入库",
+        data=data, evidence=list(audit.evidence),
         suggestions=list(audit.suggestions) or ["请稍后重试，或按明确片名与季集重新检查。"],
-        error=audit.error or "审计结果不完整或缺集样本已截断。",
+        error=audit.error or "审计结果不完整或缺少目标集的本地存在证据。",
     )
 
 

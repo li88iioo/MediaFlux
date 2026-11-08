@@ -1,422 +1,157 @@
-"""三平台追漫日历Agent只读动作；真实结构回放/缓存与公共投影均隔离网络及生产DB。"""
+"""普通 SDK 完整周表契约；实际公共服务与假来源，复用原缓存生命周期。"""
 from __future__ import annotations
-from typing import cast
+
+from datetime import datetime, timedelta
+from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
-import copy
-import json
-import unittest
-from datetime import date, datetime, timedelta
-from pathlib import Path
-from unittest.mock import Mock, patch
+import pytest
 
-import tests  # noqa: F401 -- 必须先隔离环境/数据库，再导入应用。
-from app.agent.domains.discovery.calendar_actions import (
-    anime_calendar,
-    anime_calendar_arguments,
-)
-from app.agent.errors import AgentToolError
-from app.agent.kernel.projection import DefaultProjector
+from app import sdk
 from app.discovery.cache import DiscoveryCache
-from app.discovery.calendar.models import SOURCE_NAMES, SourceUnavailable
-from app.discovery.calendar.providers.youku import (
-    _dynamic_calendar_data,
-    _parse_calendar_data,
-)
+from app.discovery.calendar.models import CalendarEntry, CalendarEvent, SourceResult, SourceUnavailable
 from app.discovery.calendar.service import CalendarService
 from tests.support import isolated_test_database
-
-FIXTURES = Path(__file__).with_name("fixtures") / "calendar" / "youku"
-
-
-def snapshot(*, today="2026-09-10", start="2026-09-07", status="partial") -> dict[str, Any]:
-    monday = date.fromisoformat(start)
-    return {"timezone": "Asia/Shanghai", "today": today, "week_start": start,
-            "days": [{"date": (monday + timedelta(days=i)).isoformat(), "items": []} for i in range(7)],
-            "sources": [{"id": source, "name": name, "status": status,
-                         "fetched_at": "2026-09-10T04:24:05+08:00", "message": "真实公开来源，有限覆盖"}
-                        for source, name in SOURCE_NAMES.items()],
-            "refreshing": False}
+from tests.test_free_calendar_core import NoNetwork, RawMetadata
 
 
-def card(index=1, *, source="youku", day="2026-09-10", **changes) -> dict[str, Any]:
-    value = {"source": source, "source_id": f"show_{index}", "stable_id": f"{source}:show_{index}",
-             "title": f"测试动漫{index}", "category": "animation", "free_progress": "", "stale": False,
-             "events": [{"date": day, "weekday": date.fromisoformat(day).isoweekday(),
-                         "update_time": "10:00", "schedule": "10:00 VIP更新1话", "audience": "member"}],
-             "url": "https://v.youku.com/private?token=should-not-be-returned",
-             "platform_poster_key": "private-poster-key", "poster_urls": ["private-token"],
-             "tmdb_id": "1234", "watchlist": {"provider": "tmdb", "external_id": "1234"}}
-    value.update(changes)
-    return value
+class CalendarSource:
+    allowed_hosts = frozenset({"v.qq.com", "www.iqiyi.com", "v.youku.com"})
+
+    def __init__(self, source, entries):
+        self.source, self.entries, self.calls, self.failure = source, entries, 0, False
+
+    async def fetch(self, _http):
+        self.calls += 1
+        if self.failure:
+            raise SourceUnavailable("公开来源不可用")
+        return SourceResult(tuple(self.entries), "partial", "公开样本，非全站", sampled=len(self.entries))
 
 
-def model_rows(data):
-    fields = data.get("item_fields")
-    return [dict(zip(fields, row)) for row in data["items"]] if fields else data["items"]
+def calendar_service(now=datetime(2026, 9, 10, 12)):
+    monday = (now - timedelta(days=now.weekday())).date()
+    sources = {}
+    for name, url in (("tencent", "https://v.qq.com/x/cover/show.html"),
+                      ("iqiyi", "https://www.iqiyi.com/v_show.html"),
+                      ("youku", "https://v.youku.com/v_show/id_show.html")):
+        entries = [CalendarEntry(name, f"show_{index}", f"动画{index}", "animation", url, evidence="提供者明确排期", events=(
+            CalendarEvent((monday + timedelta(days=index % 7)).isoformat(), "10:00", "VIP更新", "member"),
+            CalendarEvent((monday + timedelta(days=index % 7)).isoformat(), "", "非会员更新，时间未知", "free"),
+        )) for index in range(18)]
+        sources[name] = CalendarSource(name, entries)
+    return CalendarService(providers=sources, cache=DiscoveryCache(clock=lambda: now),
+                           metadata=RawMetadata(), http_factory=NoNetwork, submit=lambda fn: fn(),
+                           clock=lambda: now), sources
 
 
-class AgentAnimeCalendarTests(unittest.TestCase):
-    def setUp(self):
-        self.data: dict[str, Any] = snapshot()
-        self.service = Mock(get_week=Mock(side_effect=lambda **kwargs: copy.deepcopy(self.data)))
-        self.getter = self.enterContext(patch("app.agent.domains.discovery.calendar_actions.get_calendar_service", return_value=self.service))
-        self.enabled = self.enterContext(patch("app.agent.domains.discovery.calendar_actions.config.get_bool", return_value=True))
-        self.network_attempts = []
-        def forbidden(*args, **kwargs):
-            self.network_attempts.append(True)
-            raise AssertionError("日历Agent回归不得发出真实网络")
-        for name in ("getaddrinfo", "create_connection", "socket.connect", "socket.connect_ex"):
-            self.enterContext(patch("socket." + name, side_effect=forbidden))
+@pytest.fixture
+def calendar(monkeypatch):
+    monkeypatch.setenv("DISCOVERY_ENABLED", "1")
+    with isolated_test_database():
+        service, sources = calendar_service()
+        with patch("app.discovery.calendar.service.get_calendar_service", return_value=service):
+            try:
+                yield service, sources
+            finally:
+                service.shutdown()
 
-    def tearDown(self):
-        self.assertEqual(self.network_attempts, [])
 
-    def test_defaults_and_strict_parameters_reject_unknown_privileged_fields(self):
-        self.assertEqual(anime_calendar_arguments({}), {"day": "today", "source": "all", "query": ""})
-        self.assertEqual(anime_calendar_arguments({"day": "monday", "source": "youku", "query": "  测试 ", "page": 2, "limit": 10})["query"], "测试")
-        for arguments in (None, [], {"source": None}, {"source": []}, {"source": "bangumi"}, {"source": "优酷"},
-                          {"day": True}, {"day": "2026-09-31"}, {"day": "2026-9-10"}, {"day": "next_week"},
-                          {"query": "x" * 81}, {"query": None}, {"query": "line\nbreak"},
-                          {"query": "https://evil.invalid/secret"}, {"query": "cookie=private-session"},
-                          {"query": "/home/private/file"}, {"page": 0}, {"page": True}, {"page": 101},
-                          {"limit": 21}, {"limit": "1"}, {"refresh": True}, {"force": True}, {"url": "secret"},
-                          {1: "wrong key"}, {"cookie": "private"}, {"auth": "private"}):
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                anime_calendar(cast(dict[str, Any], arguments))
-        self.getter.assert_not_called()
+def test_full_week_keeps_all_three_sources_and_member_free_unknown_time(calendar):
+    _, sources = calendar
+    result = sdk.media.calendar()
+    assert result["timezone"] == "Asia/Shanghai" and result["week_start"] == "2026-09-07"
+    assert len(result["days"]) == 7
+    rows = [row for day in result["days"] for row in day["items"]]
+    assert len(rows) == 54 and {row["source"] for row in rows} == set(sources)
+    assert all({event["audience"] for event in row["events"]} == {"member", "free"} for row in rows)
+    assert all(next(event for event in row["events"] if event["audience"] == "free")["update_time"] == "" for row in rows)
+    assert all(source.calls == 1 for source in sources.values())
+    assert all(row["fetched_at"] for row in result["sources"])
 
-    def test_disabled_feature_does_not_create_calendar_service(self):
-        self.enabled.return_value = False
-        result = anime_calendar({})
-        self.assertEqual((result.ok, result.status), (False, "disabled"))
-        self.getter.assert_not_called()
 
-    def test_today_source_keyword_filter_is_case_insensitive_readonly_and_allowlisted(self):
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card(1, title="DR. Stone"), card(2), card(3, source="iqiyi")]
-        result = anime_calendar({"source": "youku", "query": "dr. stone"})
-        self.assertEqual((result.ok, result.status, result.data["returned"]), (True, "partial", 1))
-        self.assertEqual(result.data["requested_dates"], ["2026-09-10"])
-        self.service.get_week.assert_called_once_with(wait_sources=("youku",), cancelled=None)
-        self.assertEqual([source["id"] for source in result.data["sources"]], ["youku"])
-        item = result.data["items"][0]
-        self.assertEqual((item["title"], item["audience"], item["free_progress"]), ("DR. Stone", "member", ""))
-        self.assertEqual(item["date"], "2026-09-10")
-        serialized = json.dumps(result.to_dict())
-        for forbidden in ("private", "token", "poster", "tmdb_id", "watchlist", "url=", "trackInfo", "https://"):
-            self.assertNotIn(forbidden, serialized)
-        self.assertTrue(result.evidence)
-        self.assertEqual(result.evidence[0].source, "anime_calendar")
+def test_actual_source_dates_survive_cache_and_legacy_cache_stays_unknown(calendar):
+    service, sources = calendar
+    dates = tuple(f"2026-09-{day:02d}" for day in range(7, 14))
+    source = sources["tencent"]
+    with patch.object(source, "fetch", AsyncMock(return_value=SourceResult(
+        tuple(source.entries), "partial", covered_dates=dates,
+    ))):
+        result = sdk.media.calendar()
+    state = next(row for row in result["sources"] if row["id"] == "tencent")
+    assert state["status"] == "partial" and state["covered_dates"] == list(dates)
+    cached = service.cache.get(service.key("tencent"))
+    assert cached.payload is not None
+    payload = dict(cached.payload)
+    assert payload.pop("covered_dates") == list(dates)
+    service.cache.set_success(service.key("tencent"), "calendar:tencent", payload,
+                              ttl_seconds=3600, stale_seconds=2 * 86400)
+    legacy = sdk.media.calendar()
+    assert next(row for row in legacy["sources"] if row["id"] == "tencent")["covered_dates"] == []
+    assert legacy["days"] == result["days"]
+    assert source.calls == 0  # 未将旧缓存无覆盖字段误当作需要重抓。
 
-    def test_shanghai_snapshot_not_host_clock_selects_today_tomorrow_and_weekdays(self):
-        for day, expected in (("today", "2026-09-10"), ("tomorrow", "2026-09-11"), ("monday", "2026-09-07"),
-                              ("sunday", "2026-09-13"), ("2026-09-09", "2026-09-09")):
-            with self.subTest(day=day):
-                self.assertEqual(anime_calendar({"day": day}).data["requested_dates"], [expected])
-        result = anime_calendar({"day": "week"})
-        self.assertEqual(result.data["requested_dates"], [f"2026-09-{day:02}" for day in range(7, 14)])
-        self.assertEqual((result.data["timezone"], result.data["week_end"]), ("Asia/Shanghai", "2026-09-13"))
 
-    def test_cross_year_week_is_preserved_and_tomorrow_out_of_week_is_not_rebased(self):
-        self.data = snapshot(today="2027-01-01", start="2026-12-28")
-        result = anime_calendar({"day": "week"})
-        self.assertEqual((result.data["requested_dates"][0], result.data["requested_dates"][-1]), ("2026-12-28", "2027-01-03"))
-        self.data["today"] = "2027-01-03"
-        result = anime_calendar({"day": "tomorrow"})
-        self.assertEqual((result.ok, result.status, result.data["items"]), (False, "unsupported_range", []))
-        self.assertEqual(result.data["requested_dates"], ["2027-01-04"])
-        for day in ("2026-12-21", "2027-01-04", "2030-01-01"):
-            self.assertEqual(anime_calendar({"day": day}).status, "unsupported_range")
+def test_failure_retains_last_known_facts_and_does_not_claim_refresh(calendar):
+    service, sources = calendar
+    first = sdk.media.calendar()
+    sources["youku"].failure = True
+    clock = service.monotonic()
+    service.monotonic = lambda: clock + 301
+    current = sdk.media.calendar(refresh=True)
+    previous = next(source for source in first["sources"] if source["id"] == "youku")
+    source = next(source for source in current["sources"] if source["id"] == "youku")
+    assert source["status"] == "stale" and source["fetched_at"] == previous["fetched_at"]
+    assert len([row for day in current["days"] for row in day["items"] if row["source"] == "youku"]) == 18
 
-    def test_explicit_events_keep_member_free_unknown_and_missing_time_independent(self):
-        base = card()
-        member = base["events"][0]
-        free = dict(member, update_time="", audience="free", schedule="非会员更新，时刻未注明")
-        unknown = dict(member, update_time="14:00", audience="unknown", schedule="14:00更新1话")
-        base.update(events=[member, free, unknown, member], free_progress="已核验免费至第3集")
-        assert self.data is not None
-        self.data["days"][3]["items"] = [base, copy.deepcopy(base)]
-        result = anime_calendar({})
-        self.assertEqual((result.data["total"], result.data["total_programmes"]), (3, 1))
-        by_audience = {row["audience"]: row for row in result.data["items"]}
-        self.assertEqual(by_audience["free"]["update_time"], "")
-        self.assertEqual(by_audience["member"]["update_time"], "10:00")
-        self.assertEqual(by_audience["unknown"]["update_time"], "14:00")
-        self.assertTrue(all(row["free_progress"] == "已核验免费至第3集" for row in by_audience.values()))
 
-    def test_schedule_result_has_no_unsolicited_playback_disclaimer(self):
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card()]
-        for status in ("ok", "partial"):
-            with self.subTest(status=status):
-                assert self.data is not None
-                self.data["sources"][2]["status"] = status
-                result = anime_calendar({"source": "youku"})
-                self.assertEqual(result.suggestions, [])
-                self.assertEqual(result.data["items"][0]["schedule"], "10:00 VIP更新1话")
-                self.assertEqual(result.data["items"][0]["audience"], "member")
-                self.assertEqual(result.data["items"][0]["free_progress"], "")
-                guidance = json.dumps([result.summary, result.data["scope_note"],
-                                       [e.description for e in result.evidence]], ensure_ascii=False)
-                for warning in ("免费进度", "免费观看", "访问资格", "播放资格"):
-                    self.assertNotIn(warning, guidance)
+def test_published_week_is_usable_while_optional_mapping_remains_pending(calendar):
+    service, sources = calendar
+    service.metadata = SimpleNamespace(enrich=lambda entries: [
+        {**entry.to_dict(), "mapping_status": "pending"} for entry in entries
+    ])
+    for _ in range(12):
+        result = sdk.media.calendar()
+        assert not result["refreshing"]
+        assert result["metadata_pending"]
+        assert len(result["days"]) == 7
+        assert sum(len(day["items"]) for day in result["days"]) == 54
+        assert all(source["status"] == "partial" for source in result["sources"])
+    assert all(source.calls == 1 for source in sources.values())
 
-    def test_page_limit_and_has_more_describe_events_not_full_site(self):
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card(i) for i in range(25, 0, -1)]
-        first = anime_calendar({"limit": 10})
-        second = anime_calendar({"limit": 10, "page": 2})
-        last = anime_calendar({"limit": 10, "page": 3})
-        beyond = anime_calendar({"limit": 10, "page": 4})
-        self.assertEqual((first.data["total"], first.data["total_programmes"], first.data["returned"]), (25, 25, 10))
-        self.assertTrue(first.data["has_more"])
-        self.assertFalse(last.data["has_more"])
-        self.assertEqual(last.data["returned"], 5)
-        self.assertEqual((beyond.ok, beyond.status), (True, "empty"))
-        self.assertIn("本页", beyond.summary)
-        self.assertTrue({row["stable_id"] for row in first.data["items"]}.isdisjoint({row["stable_id"] for row in second.data["items"]}))
-        old_order = [row["stable_id"] for row in first.data["items"]]
-        assert self.data is not None
-        self.data["days"][3]["items"].reverse()
-        self.assertEqual(old_order, [row["stable_id"] for row in anime_calendar({"limit": 10}).data["items"]])
 
-    def test_week_returns_all_53_events_across_seven_days_without_pagination(self):
-        for index in range(53):
-            assert self.data is not None
-            day = self.data["days"][index % 7]
-            day["items"].append(card(index, source="tencent", day=day["date"]))
-        result = anime_calendar({"day": "week", "source": "tencent"})
-        self.assertEqual((result.data["total"], result.data["returned"]), (53, 53))
-        self.assertFalse(result.data["has_more"])
-        self.assertEqual({row["date"] for row in result.data["items"]}, set(result.data["requested_dates"]))
-        projected = DefaultProjector().project(result)
-        self.assertFalse(projected.full_model_content, "普通周表应一次进入模型，不降成摘要")
-        self.assertEqual(model_rows(json.loads(projected.model_content)["data"]), result.data["items"])
-        explicit = anime_calendar({"day": "week", "source": "tencent", "page": 1})
-        self.assertEqual((explicit.data["returned"], explicit.data["limit"]), (20, 20))
-        self.assertTrue(explicit.data["has_more"])
-        self.assertTrue(any("不要让用户" in text for text in explicit.suggestions))
+def test_calendar_cross_year_uses_service_shanghai_week_not_host_clock(monkeypatch):
+    monkeypatch.setenv("DISCOVERY_ENABLED", "1")
+    with isolated_test_database():
+        service, _ = calendar_service(datetime(2026, 12, 31, 23))
+        try:
+            with patch("app.discovery.calendar.service.get_calendar_service", return_value=service):
+                result = sdk.media.calendar()
+            assert result["today"] == "2026-12-31"
+            assert result["days"][0]["date"] == "2026-12-28"
+            assert result["days"][-1]["date"] == "2027-01-03"
+            assert not any(day["date"] == "2027-01-04" for day in result["days"])
+        finally:
+            service.shutdown()
 
-    def test_revalidating_default_arguments_does_not_reintroduce_pagination(self):
-        normalized = anime_calendar_arguments({"day": "week"})
-        self.assertNotIn("page", normalized)
-        self.assertEqual(anime_calendar_arguments(normalized), normalized)
 
-    def test_loading_unavailable_empty_and_stale_are_distinguished_without_retry(self):
-        for status, expected, ok in (("loading", "loading", False), ("unavailable", "unavailable", False),
-                                      ("stale", "unavailable", False), ("partial", "empty", True), ("ok", "empty", True)):
-            with self.subTest(status=status):
-                self.service.get_week.reset_mock()
-                assert self.data is not None
-                self.data["sources"][2]["status"] = status
-                result = anime_calendar({"source": "youku"})
-                self.assertEqual((result.ok, result.status), (ok, expected))
-                self.service.get_week.assert_called_once_with(wait_sources=("youku",), cancelled=None)
-                self.assertIn("不代表", result.data["scope_note"])
-                if status == "loading":
-                    self.assertEqual(result.data["retry_after"], 5)
-        assert self.data is not None
-        self.data["sources"][2]["status"] = "stale"
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card()]
-        result = anime_calendar({"source": "youku"})
-        self.assertTrue(result.data["items"][0]["stale"])
-        self.assertEqual(result.status, "partial")
+def test_sdk_passes_host_cancel_and_refresh_without_model_cancel_argument(calendar):
+    service, _ = calendar
+    cancelled = lambda: False
+    with patch.object(service, "get_week", wraps=service.get_week) as get_week, sdk.call_owner("owner", cancelled=cancelled):
+        sdk.media.calendar(refresh=True)
+    get_week.assert_called_once_with(force=True, wait_sources=tuple(service.providers), cancelled=cancelled)
+    private: dict[str, Any] = {"cancelled": lambda: True}
+    invalid: dict[str, Any] = {"refresh": "true"}
+    with pytest.raises(TypeError):
+        sdk.media.calendar(**private)
+    with pytest.raises(ValueError):
+        sdk.media.calendar(**invalid)
 
-    def test_selected_healthy_source_is_not_failed_by_other_unavailable_sources(self):
-        assert self.data is not None
-        self.data["sources"][0]["status"] = "unavailable"
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card(1, source="tencent"), card(2, source="youku")]
-        result = anime_calendar({"source": "youku"})
-        self.assertEqual((result.status, result.data["total"]), ("partial", 1))
-        self.assertEqual(result.data["sources"][0]["id"], "youku")
-        self.assertEqual(anime_calendar({}) .data["total"], 1)
 
-    def test_source_failure_and_optional_metadata_refresh_do_not_erase_valid_facts(self):
-        self.data["refreshing"] = True
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card()]
-        assert self.data is not None
-        self.data["sources"][0]["status"] = "unavailable"
-        result = anime_calendar({})
-        self.assertTrue(result.ok)
-        self.assertTrue(result.data["refreshing"])
-        self.assertEqual(result.data["returned"], 1)
-        self.assertEqual(result.data["sources"][0]["status"], "unavailable")
-
-    def test_malformed_cross_date_non_anime_and_sensitive_fields_do_not_reach_agent(self):
-        good = card()
-        invalid = [card(2, category="tv"), card(3, source="unknown"), card(4, title="cookie=private"),
-                   card(5, source_id="/home/private"), card(6, day="2026-09-03"), card(7, events=None)]
-        for change in ({"audience": "VIP"}, {"update_time": "25:00"}, {"update_time": False}, {"date": "2026-09-11"}):
-            event = dict(good["events"][0], **change)
-            invalid.append(card(8, events=[event]))
-        assert self.data is not None
-        self.data["days"][3]["items"] = [good, *invalid]
-        assert self.data is not None
-        self.data["sources"][2].update(message="cookie=secret; https://evil.invalid/private", fetched_at="private")
-        result = anime_calendar({"source": "youku"})
-        self.assertEqual(result.data["total"], 1)
-        self.assertEqual(result.data["sources"][0]["fetched_at"], "")
-        self.assertNotIn("private", json.dumps(result.to_dict()))
-        self.assertNotIn("secret", json.dumps(result.to_dict()))
-
-    def test_bad_snapshot_or_exception_is_unavailable_without_raw_error_text(self):
-        base = snapshot()
-        variants = [None, [], {}, dict(base, timezone="UTC"), dict(base, today="2026-09-14"),
-                    dict(base, week_start="2026-09-08"), dict(base, days=base["days"][:6])]
-        wrong_day = copy.deepcopy(base)
-        wrong_day["days"][3]["date"] = "2026-09-03"
-        variants.append(wrong_day)
-        for value in variants:
-            with self.subTest(value=type(value).__name__):
-                self.data = cast(dict[str, Any], value)
-                result = anime_calendar({})
-                self.assertEqual((result.ok, result.status), (False, "unavailable"))
-        self.service.get_week.side_effect = SourceUnavailable("cookie=private; https://evil.invalid/secret")
-        result = anime_calendar({})
-        self.assertEqual(result.status, "unavailable")
-        self.assertNotIn("private", json.dumps(result.to_model_dict()))
-        self.assertNotIn("evil", json.dumps(result.to_model_dict()))
-
-    def test_verified_legacy_free_rule_has_dates_but_free_progress_alone_does_not(self):
-        known = card(1, events=[], free_progress="免费观看第3集", free_weekdays=(4,),
-                     free_schedule="非会员每周四更新", free_update_time="")
-        no_rule = card(2, events=[], free_progress="免费观看第3集")
-        wrong_day = card(3, events=[], free_weekdays=(3,), free_schedule="非会员每周三更新")
-        assert self.data is not None
-        self.data["days"][3]["items"] = [known, no_rule, wrong_day]
-        result = anime_calendar({})
-        self.assertEqual(result.data["total"], 1)
-        row = result.data["items"][0]
-        self.assertEqual((row["date"], row["update_time"], row["audience"]), ("2026-09-10", "", "free"))
-
-    def test_exact_calendar_link_survives_model_projection_without_loosening_private_paths(self):
-        result = anime_calendar({})
-        projected = DefaultProjector().project(result)
-        self.assertEqual(projected.public_content["data"]["calendar_url"], "/discovery/calendar")
-        self.assertEqual(json.loads(projected.model_content)["data"]["calendar_url"], "/discovery/calendar")
-        for target in ("/discovery/calendar?x=1", "/discovery/calendar#x", "/home/secret.txt", "//host/path",
-                       "https://example.com/discovery/calendar", "/discovery/calendar/", " /discovery/calendar", None,
-                       ["/discovery/calendar"], {"nested": "/discovery/calendar"}):
-            with self.subTest(target=target):
-                model = json.loads(DefaultProjector().project({"data": {"calendar_url": target}}).model_content)
-                self.assertEqual(model["data"]["calendar_url"], "[页面地址无效]")
-        model = json.loads(DefaultProjector().project({"data": {"path": "/discovery/calendar", "cookie": "never-public"}}).model_content)
-        self.assertIn("隐藏", model["data"]["path"])
-        self.assertNotIn("never-public", json.dumps(model))
-
-    def test_maximum_sized_page_keeps_facts_under_default_projector_context_limit(self):
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card(i, source_id="s" * 120 + str(i), title="题" * 200,
-            free_progress="免" * 120, events=[{"date": "2026-09-10", "update_time": "10:00",
-                "schedule": "排" * 400, "audience": "member"}]) for i in range(20)]
-        assert self.data is not None
-        for source in self.data["sources"]:
-            source["message"] = "范" * 300
-        result = anime_calendar({"query": "题" * 80})
-        projected = DefaultProjector().project(result)
-        model = json.loads(projected.full_model_content or projected.model_content)
-        self.assertFalse(model.get("truncated", False))
-        self.assertLess(len(projected.model_content), 24000)
-        self.assertEqual(len(model_rows(model["data"])), 20)
-
-    def test_json_escaping_compacts_text_only_and_never_drops_events_or_pagination(self):
-        for mode in ("schedule", "title", "all"):
-            with self.subTest(mode=mode):
-                title = '"' * 200 if mode in {"title", "all"} else "题" * 200
-                progress = '"' * 120 if mode == "all" else "免" * 120
-                schedule = '"更新"' * 80 if mode != "title" else "排" * 400
-                assert self.data is not None
-                self.data["days"][3]["items"] = [card(i, source="tencent", source_id="s" * 126 + f"{i:02}",
-                    title=title, free_progress=progress,
-                    events=[{"date": "2026-09-10", "update_time": "10:00", "schedule": schedule, "audience": "member"}])
-                    for i in range(21)]
-                assert self.data is not None
-                for source in self.data["sources"]:
-                    source["message"] = '"' * 300 if mode == "all" else "范" * 300
-                result = anime_calendar({"day": "week", "limit": 20})
-                public = copy.deepcopy(result.data)
-                projected = DefaultProjector().project(result)
-                model = json.loads(projected.full_model_content or projected.model_content)
-                self.assertFalse(model.get("truncated", False))
-                self.assertEqual(len(model_rows(model["data"])), 20)
-                self.assertEqual(model["data"]["calendar_url"], "/discovery/calendar")
-                self.assertTrue(model["data"]["has_more"])
-                self.assertEqual((model["data"]["page"], model["data"]["total"]), (1, 21))
-                self.assertLess(len(projected.model_content), 24_000)
-                self.assertEqual(result.data, public)
-                self.assertTrue(all("schedule" in row and "source_id" in row for row in result.data["items"]))
-                for original, row in zip(public["items"], model_rows(model["data"])):
-                    for key in ("stable_id", "source", "title", "date", "update_time", "audience", "free_progress", "stale"):
-                        self.assertEqual(row[key], original[key])
-                self.assertEqual([(s["id"], s["status"], s["fetched_at"]) for s in model["data"]["sources"]],
-                                 [(s["id"], s["status"], s["fetched_at"]) for s in public["sources"]])
-                self.assertEqual(model_rows(model["data"]), public["items"])
-                self.assertNotIn("model_omitted_fields", model["data"])
-
-    def test_last_permitted_page_marks_limit_without_recommending_invalid_next_page(self):
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card(i) for i in range(101)]
-        result = anime_calendar({"page": 100, "limit": 1})
-        self.assertEqual((result.data["total"], result.data["returned"]), (101, 1))
-        self.assertTrue(result.data["pagination_limited"])
-        self.assertFalse(result.data["has_more"])
-        self.assertIn("收窄", "".join(result.suggestions))
-        self.assertIn("第100页", "".join(result.suggestions))
-
-    def test_original_source_snapshot_is_not_mutated(self):
-        assert self.data is not None
-        self.data["days"][3]["items"] = [card()]
-        before = copy.deepcopy(self.data)
-        self.service.get_week.side_effect = lambda **kwargs: self.data
-        anime_calendar({"query": "测试"})
-        self.assertEqual(self.data, before)
-
-    def test_real_source_fixture_to_shared_service_cache_to_agent_replays_all_92_events(self):
-        self.enterContext(isolated_test_database())
-        now = datetime(2026, 9, 10, 12)
-        raw = json.loads((FIXTURES / "dynamic_week_20260910.json").read_text())
-        result = _parse_calendar_data(_dynamic_calendar_data(raw), now.date())
-        class Source:
-            source = "youku"
-            allowed_hosts = frozenset({"www.youku.com", "acs.youku.com"})
-            calls = 0
-            async def fetch(self, http):
-                self.calls += 1
-                return result
-        class NoNetwork:
-            def __init__(self, hosts):
-                self.hosts = hosts
-            async def aclose(self):
-                pass
-        class Metadata:
-            def enrich(self, entries):
-                return [entry.to_dict() for entry in entries]
-        source = Source()
-        service = CalendarService(providers={"youku": source}, cache=DiscoveryCache(clock=lambda: now),
-                                  metadata=Metadata(), clock=lambda: now, monotonic=lambda: 100.,
-                                  submit=lambda fn: fn(), http_factory=NoNetwork)
-        self.addCleanup(service.shutdown)
-        self.getter.return_value = service
-        rows = []
-        for page in range(1, 6):
-            response = anime_calendar({"day": "week", "source": "youku", "page": page})
-            self.assertEqual((response.status, response.data["total"], response.data["total_programmes"]), ("partial", 92, 47))
-            rows.extend(response.data["items"])
-        self.assertEqual(source.calls, 1)
-        self.assertEqual((len(rows), sum(bool(row["update_time"]) for row in rows)), (92, 91))
-        self.assertEqual({row["date"] for row in rows}, {f"2026-09-{day:02}" for day in range(7, 14)})
-        self.assertTrue(all(not row["free_progress"] for row in rows))
-        complete = anime_calendar({"day": "week", "source": "youku"})
-        self.assertEqual(complete.data["items"], rows)
-        self.assertFalse(complete.data["has_more"])
-        self.assertEqual(complete.data["returned"], 92)
-        projected = DefaultProjector().project(complete)
-        self.assertFalse(projected.full_model_content, "真实优酷92条排期应无损进入模型")
-        self.assertEqual(model_rows(json.loads(projected.model_content)["data"]), rows)
-        serialized = json.dumps(rows)
-        for forbidden in ("platform_poster_key", "trackInfo", "_m_h5_tk", "poster_urls", "watchlist", "tmdb_id"):
-            self.assertNotIn(forbidden, serialized)
+def test_calendar_cooperative_cancel_leaves_shared_collection_owned_by_service(calendar):
+    service, _ = calendar
+    service._submit = lambda _fn: Future()
+    with sdk.call_owner("owner", cancelled=lambda: True), pytest.raises(SourceUnavailable, match="停止"):
+        sdk.media.calendar()

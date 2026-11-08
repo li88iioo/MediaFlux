@@ -9,12 +9,14 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app import database as db
 from app.agent.completion_observers import _CompletionTracker, _patrol_status
-from app.agent.domains.guangya.runtime import guangya_organize_status
+from app.modules.organize_tasks import get_organize_operation_status
+from app.modules.organize_results import organize_status
 from app.agent.effect_completion import wait_for_effect_completion
-from app.agent.kernel.ports.existing_actions import adapt_tool_spec
+from app.agent.kernel.invocation import invoke
+from app.agent.kernel.ports.sdk_effects import cloud_change_tool, local_source_tools
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import CancellationToken
-from app.agent.models import RiskLevel, ToolContext, ToolReference, ToolResult, ToolSpec
+from app.agent.models import ToolContext, ToolReference, ToolResult
 from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES
 from app.modules.local_media_scan_runs import (
     finish_local_media_scan_report,
@@ -73,6 +75,26 @@ def _tracked_accepted(kind: str, **completion) -> ToolResult:
 
 
 class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
+    def test_overview_keeps_schedule_without_an_unscoped_task_lookup(self) -> None:
+        manager = Mock()
+        manager.status.return_value = {
+            "status": "running", "stats": {"total": 5, "moved": 2}, "stoppable": True,
+            "operation_queue": {"total": 3},
+            "schedule": {"enabled": True, "cron_valid": True, "next_run": "2026-11-05T12:00:00+08:00"},
+            "payload": {"path": "/private/overview"},
+        }
+        with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager):
+            result = ToolResult(**organize_status())
+        manager.task_result.assert_not_called()
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.data["task"]["stats"], {"total": 5, "moved": 2})
+        self.assertTrue(result.data["task"]["stoppable"])
+        self.assertEqual(result.data["queue"], {"pending_count": 3})
+        self.assertEqual(result.data["schedule"], {
+            "enabled": True, "configured": True, "cron_valid": True, "next_run": "2026-11-05T12:00:00+08:00",
+        })
+        self.assertNotIn("private", json.dumps(result.to_dict()))
+
     def test_status_binds_public_ref_to_owner_and_keeps_safe_stats(self) -> None:
         manager = Mock()
         manager.status.return_value = {
@@ -94,10 +116,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ):
-            result = guangya_organize_status(
-                {"operation_ref": _OPERATION_REF},
-                ToolContext(owner="webk:v1:owner-safe"),
-            )
+            result = ToolResult(**get_organize_operation_status(_OPERATION_REF, owner="webk:v1:owner-safe"))
 
         manager.task_result.assert_called_once_with(
             _OPERATION_REF, owner="webk:v1:owner-safe"
@@ -132,10 +151,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ):
-            result = guangya_organize_status(
-                {"operation_ref": _OPERATION_REF},
-                ToolContext(owner="webk:v1:owner-safe"),
-            )
+            result = ToolResult(**get_organize_operation_status(_OPERATION_REF, owner="webk:v1:owner-safe"))
 
         self.assertEqual(result.status, "queued")
         self.assertEqual(result.data["task"]["status"], "queued")
@@ -171,8 +187,8 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "app.agent.domains.guangya.runtime.guangya_organize_status",
-                side_effect=lambda *_args, **_kwargs: next(snapshots),
+                "app.modules.organize_tasks.get_organize_operation_status",
+                side_effect=lambda *_args, **_kwargs: (next(snapshots)).to_dict(),
             ) as status,
             patch(
                 "app.agent.effect_completion.asyncio.sleep",
@@ -181,7 +197,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await wait_for_effect_completion(
                 accepted,
-                tool="guangya.fs.change.execute",
+                tool="cloud.change",
                 context=ToolContext(owner="tg:v1:owner-safe"),
                 report_progress=report,
             )
@@ -210,7 +226,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             all(item["operation_ref"] == _OPERATION_REF for item in progress)
         )
         self.assertTrue(
-            all(item["tool"] == "guangya.fs.change.execute" for item in progress)
+            all(item["tool"] == "cloud.change" for item in progress)
         )
         self.assertNotIn("owner", progress[0])
 
@@ -226,7 +242,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                     "已提交",
                     data={"operation_ref": _OPERATION_REF},
                 ),
-                "app.agent.domains.guangya.runtime.guangya_organize_status",
+                "app.modules.organize_tasks.get_organize_operation_status",
             ),
             (
                 "private_task_id",
@@ -236,7 +252,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                     run_id=7,
                     operation="run",
                 ),
-                "app.agent.domains.guangya.runtime.guangya_organize_task_status",
+                "app.modules.organize_results.observe_organize_task",
             ),
         )
         expected_statuses = ["running", "queued", "running", "completed"]
@@ -244,7 +260,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         for label, accepted, status_target in cases:
             with self.subTest(tracker=label):
                 snapshots = iter(
-                    _snapshot(status, stats={"copied": 1})
+                    _snapshot(status, stats={"copied": 1}).to_dict()
                     for status in expected_statuses
                 )
                 progress: list[dict] = []
@@ -266,7 +282,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     result = await wait_for_effect_completion(
                         accepted,
-                        tool="guangya.fs.change.execute",
+                        tool="cloud.change",
                         context=ToolContext(owner="tg:v1:owner-safe"),
                         report_progress=report,
                         timeout_seconds=60,
@@ -290,16 +306,15 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_for_provider_task_until_recycle_clear_completes(self) -> None:
         snapshots = iter(
             (
-                ToolResult(
-                    True, "running", "光鸭任务仍在处理中", data={"progress": 0.5}
-                ),
-                ToolResult(True, "completed", "光鸭任务已完成", data={"progress": 1.0}),
+                {"status": "running", "progress": 0.5},
+                {"status": "completed", "progress": 1.0},
             )
         )
         progress = AsyncMock()
         with (
+            patch("app.clients.guangya.GuangYaClient"),
             patch(
-                "app.agent.domains.guangya.recycle_actions.query_guangya_task_status",
+                "app.modules.guangya_recycle.read_task",
                 side_effect=lambda *_args, **_kwargs: next(snapshots),
             ) as status,
             patch(
@@ -309,7 +324,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await wait_for_effect_completion(
                 _provider_accepted("recycle_clear", 247),
-                tool="guangya.recycle.clear",
+                tool="cloud.clear_recycle",
                 context=ToolContext(owner="tg:v1:owner-safe"),
                 report_progress=progress,
             )
@@ -331,14 +346,14 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-task", str(result.to_dict()))
 
     async def test_provider_failure_and_timeout_never_claim_completion(self) -> None:
-        failed = ToolResult(False, "failed", "光鸭任务执行失败", data={"progress": 0.4})
-        with patch(
-            "app.agent.domains.guangya.recycle_actions.query_guangya_task_status",
+        failed = {"status": "failed", "progress": 0.4}
+        with patch("app.clients.guangya.GuangYaClient"), patch(
+            "app.modules.guangya_recycle.read_task",
             return_value=failed,
         ):
             result = await wait_for_effect_completion(
                 _provider_accepted("recycle_restore", 2),
-                tool="guangya.recycle.restore",
+                tool="cloud.restore",
                 context=ToolContext(owner="owner"),
             )
         self.assertFalse(result.ok)
@@ -346,16 +361,14 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.summary, "光鸭回收站恢复任务执行失败")
         self.assertFalse(result.data["verification_pending"])
 
-        running = ToolResult(
-            True, "running", "光鸭任务仍在处理中", data={"progress": 0.2}
-        )
-        with patch(
-            "app.agent.domains.guangya.recycle_actions.query_guangya_task_status",
+        running = {"status": "running", "progress": 0.2}
+        with patch("app.clients.guangya.GuangYaClient"), patch(
+            "app.modules.guangya_recycle.read_task",
             return_value=running,
         ) as status:
             result = await wait_for_effect_completion(
                 _provider_accepted("recycle_clear", 3),
-                tool="guangya.recycle.clear",
+                tool="cloud.clear_recycle",
                 context=ToolContext(owner="owner"),
                 timeout_seconds=0,
             )
@@ -373,24 +386,24 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             (
                 "guangya_organize_task",
                 {"task_id": "private-organize-task", "run_id": 7, "operation": "run"},
-                "app.agent.domains.guangya.runtime.guangya_organize_task_status",
-                (_snapshot("queued"), _snapshot("completed")),
+                "app.modules.organize_results.observe_organize_task",
+                (_snapshot("queued").to_dict(), _snapshot("completed").to_dict()),
                 "completed",
             ),
             (
                 "local_media_task",
-                {"task_id": 91, "task_number": 4, "operation": "retry"},
-                "app.agent.domains.local_media.task_queries.local_media_completion_status",
-                (_snapshot("running"), _snapshot("completed")),
+                {"task_id": 91, "operation": "retry"},
+                "app.modules.local_media_tasks.local_task_completion",
+                (_snapshot("running").to_dict(), _snapshot("completed").to_dict()),
                 "completed",
             ),
             (
                 "agent_job",
                 {"job_id": "private-agent-job", "operation": "audit"},
-                "app.agent.domains.system.jobs_actions.get_agent_job_status",
+                "app.modules.library_audit_jobs.audit_job",
                 (
-                    ToolResult(True, "pending", "全库检查已排队"),
-                    ToolResult(True, "up_to_date", "全库检查已完成"),
+                    ToolResult(True, "pending", "全库检查已排队").to_dict(),
+                    ToolResult(True, "up_to_date", "全库检查已完成").to_dict(),
                 ),
                 "up_to_date",
             ),
@@ -455,8 +468,8 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                     task_id="private-organize-task",
                     operation="stop",
                 ),
-                "app.agent.domains.guangya.runtime.guangya_organize_task_status",
-                _snapshot("stopped"),
+                "app.modules.organize_results.observe_organize_task",
+                _snapshot("stopped").to_dict(),
                 "光鸭整理任务已停止",
                 "stopped",
             ),
@@ -464,8 +477,8 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                 _tracked_accepted(
                     "agent_job", job_id="private-agent-job", operation="cancel"
                 ),
-                "app.agent.domains.system.jobs_actions.get_agent_job_status",
-                ToolResult(True, "cancelled", "全库检查已取消"),
+                "app.modules.library_audit_jobs.audit_job",
+                ToolResult(True, "cancelled", "全库检查已取消").to_dict(),
                 "全库检查已取消",
                 "cancelled",
             ),
@@ -514,14 +527,14 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         snapshot = _snapshot("completed", stats={"renamed": 1, "strm_scope_unknown": 1})
         snapshot.suggestions.append("同步范围未能确认，本次未触发 STRM 联动。")
         with patch(
-            "app.agent.domains.guangya.runtime.guangya_organize_status",
-            return_value=snapshot,
+            "app.modules.organize_tasks.get_organize_operation_status",
+            return_value=(snapshot).to_dict(),
         ):
             result = await wait_for_effect_completion(
                 ToolResult(
                     True, "accepted", "已提交", data={"operation_ref": _OPERATION_REF}
                 ),
-                tool="guangya.fs.change.execute",
+                tool="cloud.change",
                 context=ToolContext(owner="owner"),
             )
         self.assertTrue(result.ok)
@@ -546,8 +559,8 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with (
                     patch(
-                        "app.agent.domains.guangya.runtime.guangya_organize_status",
-                        return_value=_snapshot(terminal),
+                        "app.modules.organize_tasks.get_organize_operation_status",
+                        return_value=(_snapshot(terminal)).to_dict(),
                     ) as status,
                     patch(
                         "app.agent.effect_completion.asyncio.sleep",
@@ -556,7 +569,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     result = await wait_for_effect_completion(
                         accepted,
-                        tool="guangya.rename.execute",
+                        tool="cloud.change",
                         context=ToolContext(owner="webk:v1:owner-safe"),
                         report_progress=AsyncMock(),
                     )
@@ -578,17 +591,17 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             data={"operation_ref": _OPERATION_REF, "total": 1},
         )
         with patch(
-            "app.agent.domains.guangya.runtime.guangya_organize_status",
-            return_value=ToolResult(
+            "app.modules.organize_tasks.get_organize_operation_status",
+            return_value=(ToolResult(
                 False,
                 "empty",
                 "没有找到这个光鸭操作编号",
                 data={"operation_ref": _OPERATION_REF, "found": False},
-            ),
+            )).to_dict(),
         ):
             unknown = await wait_for_effect_completion(
                 accepted,
-                tool="guangya.fs.change.execute",
+                tool="cloud.change",
                 context=ToolContext(owner="webk:v1:owner-safe"),
             )
 
@@ -600,7 +613,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             True, "accepted", "已提交", data={"accepted": True, "total": 1}
         )
         with patch(
-            "app.agent.domains.guangya.runtime.guangya_organize_status"
+            "app.modules.organize_tasks.get_organize_operation_status"
         ) as status:
             unchanged = await wait_for_effect_completion(
                 normal_write,
@@ -622,12 +635,12 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         with patch(
-            "app.agent.domains.guangya.runtime.guangya_organize_status",
-            return_value=_snapshot("running"),
+            "app.modules.organize_tasks.get_organize_operation_status",
+            return_value=(_snapshot("running")).to_dict(),
         ):
             result = await wait_for_effect_completion(
                 accepted,
-                tool="guangya.fs.change.execute",
+                tool="cloud.change",
                 context=ToolContext(owner="webk:v1:owner-safe"),
                 report_progress=AsyncMock(),
                 timeout_seconds=0,
@@ -652,29 +665,10 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             data={"operation_ref": _OPERATION_REF},
         )
 
-        def verifier(_arguments, value):
+        def verifier(_arguments, value, _context):
             verifier_threads.append(threading.get_ident())
             return value
 
-        spec = ToolSpec(
-            name="guangya.fs.change.execute",
-            description="测试同步写后验证",
-            risk=RiskLevel.DANGER,
-            parameters={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            validator=lambda value: dict(value),
-            requires_confirmation=True,
-            context_confirmation_preparer=lambda _args, _ctx: (
-                ToolResult(True, "ready", "预检"),
-                "fingerprint",
-            ),
-            context_confirmed_handler=lambda _args, _snapshot, _ctx: accepted,
-            post_write_verifier=verifier,
-        )
-        tool = adapt_tool_spec(spec)
         state = InMemorySessionStateStore()
         lease, _ = await state.begin_turn(
             owner="webk:v1:owner-safe", session_id="session", request_id="request"
@@ -691,17 +685,11 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             report_progress=AsyncMock(),
             wait_for_completion=True,
         )
-        with patch(
-            "app.agent.kernel.ports.existing_actions.wait_for_effect_completion",
-            new=AsyncMock(side_effect=lambda value, **_kwargs: value),
-        ) as wait:
-            assert tool.verify is not None
-            result = await tool.verify({}, accepted, context)
+        result = await invoke(verifier, {}, accepted, context, protection=context)
 
         self.assertIs(result, accepted)
         self.assertEqual(len(verifier_threads), 1)
         self.assertNotEqual(verifier_threads[0], main_thread)
-        wait.assert_awaited_once()
 
     async def test_cancel_drains_sync_verifier_before_verify_task_finishes(
         self,
@@ -711,31 +699,12 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         finished = threading.Event()
         accepted = ToolResult(True, "success", "已核验", data={"total": 1})
 
-        def verifier(_arguments, value):
+        def verifier(_arguments, value, _context):
             entered.set()
             release.wait(timeout=5)
             finished.set()
             return value
 
-        spec = ToolSpec(
-            name="config.cancel_drain",
-            description="测试取消时收稳同步核验",
-            risk=RiskLevel.WRITE,
-            parameters={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            validator=lambda value: dict(value),
-            requires_confirmation=True,
-            context_confirmation_preparer=lambda _args, _ctx: (
-                ToolResult(True, "ready", "预检"),
-                "fingerprint",
-            ),
-            context_confirmed_handler=lambda _args, _snapshot, _ctx: accepted,
-            post_write_verifier=verifier,
-        )
-        tool = adapt_tool_spec(spec)
         state = InMemorySessionStateStore()
         lease, _ = await state.begin_turn(
             owner="webk:v1:owner-safe", session_id="session", request_id="request"
@@ -754,8 +723,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         verify_done: list[bool] = []
 
         async def run_verify():
-            assert tool.verify is not None
-            await tool.verify({}, accepted, context)
+            await invoke(verifier, {}, accepted, context, protection=context)
             verify_done.append(True)
 
         task = asyncio.create_task(run_verify())
@@ -780,24 +748,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             "已提交",
             data={"operation_ref": _OPERATION_REF},
         )
-        spec = ToolSpec(
-            name="guangya.fs.change.execute",
-            description="测试 GY 后台写入",
-            risk=RiskLevel.DANGER,
-            parameters={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            validator=lambda value: dict(value),
-            requires_confirmation=True,
-            context_confirmation_preparer=lambda _args, _ctx: (
-                ToolResult(True, "ready", "预检"),
-                "fingerprint",
-            ),
-            context_confirmed_handler=lambda _args, _snapshot, _ctx: accepted,
-        )
-        tool = adapt_tool_spec(spec)
+        tool = cloud_change_tool()
         state = InMemorySessionStateStore()
         lease, _ = await state.begin_turn(
             owner="webk:v1:owner-safe", session_id="session", request_id="request"
@@ -818,7 +769,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             True, "completed", "已完成", data={"operation_ref": _OPERATION_REF}
         )
         with patch(
-            "app.agent.kernel.ports.existing_actions.wait_for_effect_completion",
+            "app.agent.effect_completion.wait_for_effect_completion",
             new=AsyncMock(return_value=terminal),
         ) as wait:
             assert tool.verify is not None
@@ -827,7 +778,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result, terminal)
         wait.assert_awaited_once()
         assert wait.await_args is not None
-        self.assertEqual(wait.await_args.kwargs["tool"], "guangya.fs.change.execute")
+        self.assertEqual(wait.await_args.kwargs["tool"], "cloud.change")
 
     async def test_non_streaming_kernel_verify_returns_submission_without_waiting(
         self,
@@ -838,24 +789,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             "已提交",
             data={"operation_ref": _OPERATION_REF},
         )
-        spec = ToolSpec(
-            name="guangya.fs.change.execute",
-            description="测试非流式调用不占用请求等待后台终态",
-            risk=RiskLevel.DANGER,
-            parameters={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            validator=lambda value: dict(value),
-            requires_confirmation=True,
-            context_confirmation_preparer=lambda _args, _ctx: (
-                ToolResult(True, "ready", "预检"),
-                "fingerprint",
-            ),
-            context_confirmed_handler=lambda _args, _snapshot, _ctx: accepted,
-        )
-        tool = adapt_tool_spec(spec)
+        tool = cloud_change_tool()
         state = InMemorySessionStateStore()
         lease, _ = await state.begin_turn(
             owner="service-owner", session_id="session", request_id="request"
@@ -872,7 +806,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             report_progress=AsyncMock(),
         )
         with patch(
-            "app.agent.kernel.ports.existing_actions.wait_for_effect_completion",
+            "app.agent.effect_completion.wait_for_effect_completion",
             new=AsyncMock(),
         ) as wait:
             assert tool.verify is not None
@@ -885,14 +819,53 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
+    def test_public_projection_preserves_all_task_states_and_outer_status(self):
+        from app.modules.organize_results import project_organize_status
+
+        for phase, outer, ok in (
+            ("idle", "idle", True), ("queued", "queued", True),
+            ("running", "running", True), ("stopping", "running", True),
+            ("completed", "completed", True), ("partial", "attention", False),
+            ("failed", "attention", False), ("manual_review", "attention", False),
+            ("stopped", "stopped", True), ("cancelled", "stopped", True),
+        ):
+            with self.subTest(phase=phase):
+                result = project_organize_status({"status": phase, "stoppable": True}, overview={})
+                self.assertEqual((result["status"], result["ok"]), (outer, ok))
+                task = result["data"]["task"]
+                self.assertEqual(task["status"], phase)
+                self.assertEqual(task["running"], phase in {"running", "stopping"})
+                self.assertEqual(task["stoppable"], task["running"])
+
+    def test_strm_rejection_keeps_completed_cloud_changes_but_marks_partial(self):
+        from app.modules.organize_results import project_organize_status
+
+        for handoff, expected_status in (
+            ({"ok": False, "error": "STRM 失败 token=private-secret"}, "partial"),
+            ({"ok": False, "skipped": True, "error": "STRM 失败 token=private-secret"}, "completed"),
+            ({"ok": True, "queued": True}, "completed"),
+        ):
+            with self.subTest(handoff=handoff):
+                result = project_organize_status({
+                    "status": "completed", "result": {
+                        "counters": {"moved": 2},
+                        "strm": handoff,
+                    },
+                }, overview={})
+                self.assertEqual(result["data"]["task"]["status"], expected_status)
+                self.assertEqual(result["data"]["task"]["stats"]["moved"], 2)
+                self.assertEqual(result["ok"], expected_status == "completed")
+                self.assertEqual(bool(result["error"]), expected_status == "partial")
+                self.assertNotIn("private-secret", json.dumps(result))
+
     def test_relocated_download_continuation_is_visible_without_claiming_completion(self):
-        from app.agent.domains.guangya.runtime import _project_guangya_status
+        from app.modules.organize_results import project_organize_status
         for location in ("stats", "result"):
             with self.subTest(location=location):
-                snapshot = _project_guangya_status(
+                snapshot = ToolResult(**project_organize_status(
                     {"status": "partial", location: {"resumed_download_ids": [31, 32, 31, True, -1, "private"],
                      "failed": 1}}, overview={},
-                )
+                ))
                 self.assertFalse(snapshot.ok)
                 self.assertEqual(snapshot.data["task"]["status"], "partial")
                 self.assertEqual(snapshot.data["task"]["resumed_download_count"], 2)
@@ -902,23 +875,23 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("resumed_download_ids", str(snapshot.to_dict()))
         for invalid in (None, "private", [], [True, 0, -1]):
             with self.subTest(invalid=invalid):
-                snapshot = _project_guangya_status(
+                snapshot = ToolResult(**project_organize_status(
                     {"status": "partial", "result": {"resumed_download_ids": invalid}}, overview={},
-                )
+                ))
                 self.assertNotIn("resumed_download_count", snapshot.data["task"])
                 self.assertIn("核对失败项", str(snapshot.suggestions))
 
     async def test_cleanup_verification_failure_reaches_terminal_receipt_without_private_error(self):
-        from app.agent.domains.guangya.runtime import _project_guangya_status
+        from app.modules.organize_results import project_organize_status
         from app.agent.public_view import format_public_result
-        snapshot = _project_guangya_status(
+        snapshot = ToolResult(**project_organize_status(
             {'status': 'partial', 'stats': {'total': 2, 'failed': 2, 'verification_failed': 2},
              'error': 'private /folder token=do-not-expose'},
             overview={}, operation_ref=_OPERATION_REF,
-        )
+        ))
         accepted = ToolResult(True, 'accepted', '清理已提交', data={'operation_ref': _OPERATION_REF})
-        with patch('app.agent.domains.guangya.runtime.guangya_organize_status', return_value=snapshot):
-            result = await wait_for_effect_completion(accepted, tool='guangya.organize.cleanup.execute', context=ToolContext(owner='owner'))
+        with patch('app.modules.organize_tasks.get_organize_operation_status', return_value=(snapshot).to_dict()):
+            result = await wait_for_effect_completion(accepted, tool='cloud.change', context=ToolContext(owner='owner'))
         self.assertFalse(result.ok)
         self.assertEqual(result.status, 'partial')
         assert result.error is not None
@@ -933,8 +906,8 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
                               data={'operation_ref': _OPERATION_REF, 'operation': 'filesystem_change'},
                               model_data={'operation': 'filesystem_change'})
         snapshot = _snapshot('completed', stats={'renamed': 6, 'moved': 0})
-        with patch('app.agent.domains.guangya.runtime.guangya_organize_status', return_value=snapshot):
-            result = await wait_for_effect_completion(accepted, tool='guangya.fs.change.execute', context=ToolContext(owner='owner'))
+        with patch('app.modules.organize_tasks.get_organize_operation_status', return_value=(snapshot).to_dict()):
+            result = await wait_for_effect_completion(accepted, tool='cloud.change', context=ToolContext(owner='owner'))
         self.assertTrue(result.ok)
         assert result.model_data is not None
         self.assertEqual(result.data['scope_note'], result.model_data['scope_note'])
@@ -944,31 +917,31 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('移动 6 项', text)
 
     def test_preflight_and_audit_failure_counts_have_distinct_explanations(self):
-        from app.agent.domains.guangya.runtime import _project_guangya_status
-        result = _project_guangya_status({'status': 'manual_review', 'stats': {'precondition_failed': 1, 'audit_failures': 2}}, overview={})
+        from app.modules.organize_results import project_organize_status
+        result = ToolResult(**project_organize_status({'status': 'manual_review', 'stats': {'precondition_failed': 1, 'audit_failures': 2}}, overview={}))
         assert result.error is not None
         self.assertIn('1 项写前核对未通过，后续动作未执行', result.error)
         assert result.error is not None
         self.assertIn('2 项执行审计未完整保存', result.error)
-        success = _project_guangya_status({'status': 'completed', 'stats': {}}, overview={})
+        success = ToolResult(**project_organize_status({'status': 'completed', 'stats': {}}, overview={}))
         self.assertEqual(success.error, '')
 
     def test_stale_recovered_plan_does_not_deny_prior_writes(self):
-        from app.agent.domains.guangya.runtime import _project_guangya_status
-        result = _project_guangya_status({"status": "failed", "error_code": "GuangYaFSChangeStale", "result": {
+        from app.modules.organize_results import project_organize_status
+        result = ToolResult(**project_organize_status({"status": "failed", "error_code": "GuangYaFSChangeStale", "result": {
             "stats": {"total": 2}, "operation_items": [
                 {"position": 1, "operation": "rename", "status": "unknown", "completed_actions": []},
                 {"position": 2, "operation": "rename", "status": "not_started", "completed_actions": []},
-            ]}}, overview={})
+            ]}}, overview={}))
         assert result.error is not None
         self.assertIn("已发生的变更以逐项回执为准", result.error)
         assert result.error is not None
         self.assertNotIn("本次变更未执行", result.error)
 
     def test_task_projection_passes_sanitized_operation_items_and_keeps_legacy_stats(self):
-        from app.agent.domains.guangya.runtime import _project_guangya_status
+        from app.modules.organize_results import project_organize_status
 
-        projected = _project_guangya_status(
+        projected = ToolResult(**project_organize_status(
             {
                 "status": "partial",
                 "result": {
@@ -989,7 +962,7 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
             overview={},
-        )
+        ))
         task = projected.data["task"]
         self.assertEqual(task["stats"], {"total": 2, "relocated": 1})
         self.assertEqual(
@@ -1006,10 +979,10 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-file-id", str(projected.to_dict()))
         self.assertNotIn("must-not-leak", str(projected.to_dict()))
 
-        legacy = _project_guangya_status(
+        legacy = ToolResult(**project_organize_status(
             {"status": "completed", "result": {"counters": {"moved": "3", "renamed": True, "failed": -1}}},
             overview={},
-        )
+        ))
         self.assertEqual(legacy.data["task"]["stats"], {"moved": 3, "renamed": 1, "failed": 0})
         self.assertNotIn("operation_items", legacy.data["task"])
 
@@ -1053,7 +1026,7 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
 
     async def _wait(self, accepted, **kwargs):
         return await wait_for_effect_completion(
-            accepted, tool="local_media.scan_sources", context=self.context, **kwargs
+            accepted, tool="local.scan_sources", context=self.context, **kwargs
         )
 
     async def test_real_batch_over_twenty_uses_frozen_members_and_live_file_facts(self):
@@ -1196,13 +1169,7 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
         from app.agent.kernel.tool_calls import ToolCallContext
 
         accepted = self._accepted([self._task()])
-        tool = adapt_tool_spec(ToolSpec(
-            name="local_media.scan_sources", description="本地扫描", risk=RiskLevel.WRITE,
-            parameters={"type": "object", "properties": {}}, validator=lambda value: value,
-            requires_confirmation=True,
-            context_confirmation_preparer=lambda _args, _ctx: (ToolResult(True, "ready", "预检"), "snapshot"),
-            context_confirmed_handler=lambda _args, _snapshot, _ctx: accepted,
-        ))
+        tool = next(tool for tool in local_source_tools() if tool.name == "local.scan_sources")
         state = InMemorySessionStateStore()
         lease, _ = await state.begin_turn(owner="scan-owner", session_id="scan-session", request_id="scan-request")
         context = ToolCallContext(
@@ -1262,7 +1229,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
         return count, reader
 
     def create_agent_job(self):
-        from app.agent.domains.library.patrol_progress import empty_patrol_projection
+        from app.modules.library_patrol import empty_patrol_projection
 
         row, created = db.create_agent_job(
             owner=self.scope_args["owner"], job_type="library_episode_audit",
@@ -1281,7 +1248,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
         )):
             return await wait_for_effect_completion(
                 _tracked_accepted("agent_job", job_id=job["job_id"], operation=operation),
-                tool="agent.cancel_job" if operation == "cancel" else "library.start_episode_audit",
+                tool="library.cancel_audit" if operation == "cancel" else "library.start_audit",
                 context=ToolContext(**self.scope_args), timeout_seconds=60,
                 scope=EffectCompletionScope(self.store, self.lease, self.plan_id),
             )
@@ -1359,17 +1326,13 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_agent_job_result["status"], "pending")
         self.assertEqual((await self.store.load(**self.scope_args)).metadata.get("effect_waits", {}), {})
         # 提交后跟踪登记失败不能靠重放制造第二份任务；重新确认复用原队列行。
-        from app.agent.domains.system.jobs_actions import (
-            prepare_start_episode_audit,
-            start_episode_audit_confirmed,
-        )
+        from app.modules.library_audit_jobs import prepare_start_audit, start_audit
         arguments = {"as_of": "2026-10-08", "max_series": 1}
-        context = ToolContext(**self.scope_args)
-        _, fingerprint = prepare_start_episode_audit(arguments, context)
-        with patch("app.agent.domains.system.jobs_actions.get_agent_jobs_scheduler"):
-            recovered = start_episode_audit_confirmed(arguments, fingerprint, context)
-        self.assertFalse(recovered.data["created"])
-        self.assertEqual(recovered.data["job_id"], job["job_id"])
+        _, snapshot = prepare_start_audit(owner=self.scope_args["owner"], **arguments)
+        with patch("app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler"):
+            recovered = start_audit(owner=self.scope_args["owner"], expected_snapshot=snapshot, **arguments)
+        self.assertFalse(recovered["data"]["created"])
+        self.assertEqual(recovered["data"]["job_id"], job["job_id"])
         self.assertEqual(len(db.list_agent_jobs(owner=self.scope_args["owner"])), 1)
 
     async def test_many_already_accepted_tasks_are_not_rejected_after_the_write(self):

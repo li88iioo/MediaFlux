@@ -122,6 +122,15 @@ class MediaProxySnapshotAuditTests(IsolatedDatabaseTestCase):
             repository.get_media_proxy_playback_failure_summary()["failed"], 2
         )
 
+    def test_native_failure_rows_and_summary_share_one_snapshot(self):
+        first = self._record(status=502, stage="signed_url")
+        with self._after_read("SELECT COUNT(*) AS total,", lambda: self._record(status=504, stage="timeout")):
+            facts = repository.media_proxy_failure_facts(instance_id=1)
+        self.assertEqual(facts["total"], facts["failed"])
+        self.assertEqual(facts["total"], 1)
+        self.assertEqual([row["id"] for row in facts["items"]], [first])
+        self.assertEqual(repository.media_proxy_failure_facts(instance_id=1)["total"], 2)
+
     def test_batch_session_metrics_keep_one_group_query_and_normal_pagination(self):
         for index in range(105):
             self._record(session=f"fixture-{index}")

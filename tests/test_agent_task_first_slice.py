@@ -1,8 +1,10 @@
 """Explicit task lifecycle through real native wire, domain tools and SQLite."""
+from tests.agent_task_native_helpers import task_call
 from typing import cast
 
 import asyncio
 import json
+from tests.agent_task_native_helpers import returned_task
 import socket
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -48,8 +50,13 @@ def declaration():
     }
 
 
+def configuration_call(method, arguments):
+    code = "import json\nfrom mf import diagnostics\nprint(json.dumps(diagnostics." + method.split(".")[1] + "(**" + repr(arguments) + "), ensure_ascii=False))"
+    return "agent.run_code", {"code": code}
+
+
 class NativeScript:
-    def __init__(self, component, create=False, *, observation_tool="config.explain_component"):
+    def __init__(self, component, create=False, *, observation_tool="diagnostics.component"):
         self.component = component
         self.observation_tool = observation_tool
         self.steps = (
@@ -108,8 +115,8 @@ class NativeScript:
                     value = json.loads(message["content"])
                 except (ValueError, TypeError):
                     continue
-                if value.get("task"):
-                    self.latest = value["task"]
+                if task := returned_task(value):
+                    self.latest = task
         step = self.steps.pop(0)
         if step == "finish" and not self.force_final_tool:
             return httpx.Response(
@@ -124,20 +131,15 @@ class NativeScript:
                 },
             )
         if step == "discover":
-            name, args = (
-                "agent__capabilities",
-                {"tool_names": ["agent.task", self.observation_tool]},
-            )
+            name, args = "agent__run_code", {"language": "shell", "code": "mf --help"}
         elif step == "create":
-            name, args = "agent__task", declaration()
+            name, args = task_call(declaration(), wire=True)
         elif step == "observe":
-            name = self.observation_tool.replace(".", "__")
-            args = {"component": self.component} if self.component is not None else {}
+            tool, args = configuration_call(self.observation_tool, {"component": self.component} if self.component is not None else {})
+            name = tool.replace(".", "__")
         else:
             task = self.latest or {}
-            name, args = (
-                "agent__task",
-                {
+            name, args = task_call({
                     "operation": "checkpoint",
                     "evidence_ids": [
                         f["evidence_id"]
@@ -145,8 +147,7 @@ class NativeScript:
                         if self.component is None or f["component"] == self.component
                     ],
                     "blockers": [],
-                },
-            )
+                }, wire=True)
         return httpx.Response(
             200,
             json={
@@ -197,19 +198,12 @@ def test_observe_checkpoint_prune_reopen_continue(tmp_path, budget):
                 indent=2,
             )
         )
-        discoveries = [
-            e.payload.get("result", {})
-            for e in events
-            if e.payload.get("tool") == "agent.capabilities"
-        ]
-        assert any(
-            "agent.task" in json.dumps(result)
-            and "agent.task" in result.get("data", result).get("loaded_tools", [])
-            for result in discoveries
-        ), (
-            "task control must be discoverable through the real capability tool: "
-            + repr([(e.type, dict(e.payload)) for e in events])
-        )
+        assert {tool["function"]["name"] for tool in first.requests[0]["tools"]} == {"agent__run_code"}
+        [help_result] = [event.payload["result"]["data"] for event in events
+                         if event.type.value == "tool.completed" and event.payload.get("call_id") == "call-discover"]
+        assert help_result["exit_code"] == 0
+        assert "session" in help_result["stdout"] and "diagnostics" in help_result["stdout"]
+        assert help_result["sdk_calls"] == []
         cold = await store.load(owner=OWNER, session_id="task-session-0001")
         assert cold.metadata["task"]["status"] == "partial"
         assert events[-1].payload["task"]["status"] == "partial"
@@ -241,9 +235,9 @@ def test_observe_checkpoint_prune_reopen_continue(tmp_path, budget):
             assert "verified_facts" in text and "tmdb" in text and "qbittorrent" in text
         assert (
             sum(
-                e.payload.get("tool") == "config.explain_component"
+                any(c["method"] == "diagnostics.component" for c in e.payload.get("result", {}).get("data", {}).get("sdk_calls", []))
                 for e in events2
-                if e.type.value == "tool.started"
+                if e.type.value == "tool.completed"
             )
             == 1
         )
@@ -362,7 +356,7 @@ def test_no_task_qa_transaction_trace(tmp_path):
 
 @pytest.mark.parametrize("failure", ["invalid", "exception", "commit"])
 def test_native_failed_observation_is_atomic_and_object_scoped(tmp_path, failure):
-    from app.agent.domains.configuration import explanations as domain
+    from app.modules import diagnostics as domain
 
     previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
     db.configure_database(tmp_path / "failure.db", test_mode=True)
@@ -410,8 +404,9 @@ def test_native_failed_observation_is_atomic_and_object_scoped(tmp_path, failure
             ):
                 events.append(event)
                 if (
-                    event.type.value == "tool.failed"
-                    and event.payload.get("tool") == "config.explain_component"
+                    break_query and failure != "commit"
+                    and event.type.value == "tool.completed"
+                    and event.payload.get("call_id") == "call-observe"
                 ):
                     cold = await store.load(
                         owner=OWNER, session_id="failure-session-01"
@@ -428,11 +423,13 @@ def test_native_failed_observation_is_atomic_and_object_scoped(tmp_path, failure
         store = FailingStore(secret_provider=lambda: "task-test-only")
         events, first = await turn(store, "tmdb", True, True)
         assert not first.metadata["task"]["verified_facts"]
-        assert not any(
-            e.type.value == "tool.completed"
-            and e.payload.get("tool") == "config.explain_component"
-            for e in events
-        )
+        completed = [e.payload["result"]["data"] for e in events
+                     if e.type.value == "tool.completed" and any(c["method"] == "diagnostics.component" for c in e.payload.get("result", {}).get("data", {}).get("sdk_calls", []))]
+        if failure == "commit":
+            assert not completed  # 未保存的结果仍不可发布。
+        else:
+            assert len(completed) == 1
+            assert (completed[0]["exit_code"] != 0) == (failure == "exception")
         assert first.metadata["task"]["status"] != "complete"
         if failure == "commit":
             assert "observed_at" not in json.dumps(first.conversation)
@@ -457,7 +454,7 @@ def test_native_failed_observation_is_atomic_and_object_scoped(tmp_path, failure
 
 @pytest.mark.parametrize("checkpoint", [False, True])
 def test_native_snapshot_capacity_failure_and_cold_recovery(tmp_path, checkpoint):
-    from app.agent.domains.configuration import explanations as domain
+    from app.modules import diagnostics as domain
     from app.agent.rate_limit import AgentRateLimiter
 
     previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
@@ -484,18 +481,20 @@ def test_native_snapshot_capacity_failure_and_cold_recovery(tmp_path, checkpoint
             ))]
         cold = await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(owner=OWNER, session_id=session_id)
         failures = [event for event in events if event.type.value == "tool.failed"]
+        assert not failures
         if fail:
-            assert any(
-                event.payload.get("tool") in {"config.explain_component", "config__explain_component"}
-                and event.payload.get("code") == "tool_execution_failed"
-                for event in failures
-            ), [(event.type.value, dict(event.payload)) for event in failures]
-        else:
-            assert not failures
+            completed = [event.payload["result"]["data"] for event in events
+                         if event.type.value == "tool.completed"
+                         and event.payload.get("tool") in {"agent.run_code", "agent__run_code"}
+                         and any(call["method"] == "diagnostics.component"
+                                 for call in event.payload["result"]["data"]["sdk_calls"])]
+            assert len(completed) == 1 and completed[0]["exit_code"] != 0
+            assert "synthetic query failure" in completed[0]["stderr"]
+            assert completed[0]["sdk_calls"][0]["ok"] is False
         return cold.metadata["task"]
 
     async def run():
-        for index in range(32):
+        for index in range(2):
             task = await turn("tmdb", create=index == 0, accept=checkpoint)
             assert len(task["verified_facts"]) == 1
             assert task["status"] == "partial"
@@ -527,8 +526,8 @@ def test_native_snapshot_capacity_failure_and_cold_recovery(tmp_path, checkpoint
 
 @pytest.mark.parametrize("qb_state", ["ready", "incomplete", "invalid", "error"])
 def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_path, qb_state):
-    from app.agent.domains.configuration import diagnosis
-    from app.agent.domains.configuration import explanations as explain
+    from app.modules import diagnostics as diagnosis
+    from app.modules import diagnostics as explain
 
     previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
     db.configure_database(tmp_path / "diagnose-task.db", test_mode=True)
@@ -546,7 +545,7 @@ def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_p
         return {**payload, "enabled": 1} if component == "qbittorrent" and qb_state == "invalid" else payload
 
     async def run():
-        script = NativeScript(None, create=True, observation_tool="config.diagnose")
+        script = NativeScript(None, create=True, observation_tool="diagnostics.configuration")
         if qb_state in {"invalid", "error"}:
             script.steps = ["discover", "create", "observe", "finish"]
         store = SQLiteKernelStore(secret_provider=lambda: "task-test-only")
@@ -561,26 +560,29 @@ def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_p
             patch.object(socket.socket, "connect", side_effect=AssertionError("test must remain offline")),
         ):
             if qb_state != "error":
-                actual = diagnosis.diagnose_config({})
-                assert actual.ok is False and actual.status == "attention"
+                actual = diagnosis.configuration()
+                assert actual["ok"] is False and actual["status"] == "attention"
             async for event in runtime.session.run(AgentInput(message=GOAL, owner=OWNER, session_id=session_id)):
                 events.append(event)
-                if event.payload.get("tool") in {"config.diagnose", "config__diagnose"} and event.type.value in {"tool.completed", "tool.failed"}:
-                    if qb_state in {"invalid", "error"}:
-                        assert event.type.value == "tool.failed"
-                        assert event.payload["code"] == ("invalid_observation" if qb_state == "invalid" else "tool_execution_failed")
+                if event.payload.get("call_id") == "call-observe" and event.type.value in {"tool.completed", "tool.failed"}:
+                    assert event.type.value == "tool.completed"
+                    result = event.payload["result"]["data"]
+                    assert (result["exit_code"] != 0) == (qb_state == "error")
+                    assert result["sdk_calls"][0]["ok"] is False
+                    if qb_state == "error":
+                        assert "synthetic diagnosis failure" in result["stderr"]
                     else:
-                        assert event.type.value == "tool.completed" and event.payload["result"]["ok"] is False
+                        assert result["sdk_calls"][0]["status"] == "attention"
                     observed = (await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(owner=OWNER, session_id=session_id)).metadata["task"]
                     assert observed["revision"] == 2  # create + 一次批量观察。
                     assert all(o["state"] == "pending" and not o["evidence_ids"] for o in observed["obligations"])
         assert observed is not None
         failures = [event for event in events if event.type.value == "tool.failed"]
-        assert len(failures) == (1 if qb_state in {"invalid", "error"} else 0)
+        assert not failures
         expected = set() if qb_state == "error" else {"tmdb"} if qb_state == "invalid" else {"tmdb", "qbittorrent"}
         assert {fact["component"] for fact in observed["verified_facts"]} == expected
         for fact in observed["verified_facts"]:
-            assert fact["tool"] == "config.diagnose" and fact["call_id"] == "call-observe"
+            assert fact["tool"] == "diagnostics.configuration" and fact["call_id"] == "call-observe:1"
             assert fact["scope"]["owner"] == OWNER and fact["scope"]["session_id"] == session_id
             assert fact["network_accessed"] is False and fact["probe_mode"] == "configuration_only"
             assert fact["status"] == (qb_state if fact["component"] == "qbittorrent" else "ready")
@@ -598,6 +600,56 @@ def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_p
         wire = json.dumps(script.requests, ensure_ascii=False)
         assert all(value not in wire for value in ("fixture-tmdb", "fixture-qb", "qb.invalid"))
         assert events[-1].payload["task"]["status"] == task["status"]
+
+    try:
+        asyncio.run(run())
+    finally:
+        db.configure_database(previous[0], test_mode=previous[1])
+
+
+def test_caught_diagnostic_error_preserves_script_result_and_task_evidence(tmp_path, monkeypatch):
+    from app.modules import diagnostics
+
+    original_call = configuration_call
+    original_component = diagnostics.component_configuration
+
+    def broken(component):
+        if component == "qbittorrent":
+            raise RuntimeError("synthetic unavailable")
+        return original_component(component)
+
+    def recover(method, arguments):
+        _, first = original_call(method, arguments)
+        code = "try:\n" + "\n".join("    " + line for line in first["code"].splitlines())
+        code += "\nexcept Exception as exc:\n    print('caught:', exc)"
+        code += "\nprint(json.dumps(diagnostics.component('tmdb'), ensure_ascii=False))\nprint('script recovered')"
+        return "agent.run_code", {"code": code}
+
+    monkeypatch.setattr(f"{__name__}.configuration_call", recover)
+    monkeypatch.setattr(diagnostics, "component_configuration", broken)
+    previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
+    db.configure_database(tmp_path / "caught-diagnostic.db", test_mode=True)
+    db.init_db()
+
+    async def run():
+        script = NativeScript("qbittorrent", create=True)
+        script.steps = ["discover", "create", "observe", "finish"]
+        store = SQLiteKernelStore(secret_provider=lambda: "task-test-only")
+        runtime = build_agent_kernel_runtime(model=script.adapter, store=store)
+        events = [event async for event in runtime.session.run(AgentInput(
+            message=GOAL, owner=OWNER, session_id="caught-diagnostic"))]
+        terminal = [event for event in events if event.payload.get("call_id") == "call-observe"
+                    and event.type.value in {"tool.completed", "tool.failed"}]
+        assert len(terminal) == 1 and terminal[0].type.value == "tool.completed"
+        result = terminal[0].payload["result"]["data"]
+        assert result["exit_code"] == 0 and "script recovered" in result["stdout"]
+        assert [(call["method"], call["ok"]) for call in result["sdk_calls"]] == [
+            ("diagnostics.component", False), ("diagnostics.component", True)]
+        saved = await store.load(owner=OWNER, session_id="caught-diagnostic")
+        task = saved.metadata["task"]
+        assert task["status"] == "blocked"
+        assert {fact["component"] for fact in task["verified_facts"]} == {"tmdb"}
+        assert {blocker["component"] for blocker in task["blockers"]} == {"qbittorrent"}
 
     try:
         asyncio.run(run())

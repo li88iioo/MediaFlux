@@ -1482,19 +1482,13 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         db.update_download_request(
             request_id, organize_status="completed", strm_status="completed",
         )
-        self.assertTrue(db.enqueue_agent_download_verification(
-            request_id, title="测试剧", tmdb_id="123", season=1, episode=3,
-            as_of="2026-10-26", owner="tg:v1:100\x1f456", chat_id="100",
-        ))
+        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[{'title': '测试剧', 'tmdb_id': '123', 'season': 1, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f456', chat_id='100'), "queued")
         job = db.claim_due_agent_download_verification()
         assert job is not None
         self.assertTrue(db.finish_agent_download_verification(
             request_id, status="visible", result="visible", attempts=1, next_check_at=db.now(),
             expected_lease_generation=job["lease_generation"],
-            payload_json=dump_download_verification_payload(
-                title="测试剧", season=1, episode=3, status="visible", result="visible", attempts=1,
-            ),
-        ))
+            payload_json=dump_download_verification_payload(targets=[{'title': '测试剧', 'season': 1, 'episode': 3, 'result': 'visible'}], status='visible', result='visible', attempts=1), targets=[{**target, "result": 'visible'} for target in job["targets"]]))
         second = publish_download_lifecycle(
             request_id, media_refresh="Jellyfin 已刷新",
         )
@@ -1552,15 +1546,13 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
         from app.agent.models import ToolResult
         from app.modules.agent_download_verification_scheduler import DownloadLibraryVerificationScheduler
 
-        self.assertTrue(db.enqueue_agent_download_verification(
-            request_id, title="测试剧", tmdb_id="123", season=1, episode=3,
-            as_of="2026-10-26", owner="tg:v1:100\x1f456", chat_id="100",
-        ))
+        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[{'title': '测试剧', 'tmdb_id': '123', 'season': 1, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f456', chat_id='100'), "queued")
         current = datetime.now() + timedelta(seconds=1)
         result = ToolResult(True, "up_to_date" if visible else "updates_available", "isolated audit", data={
             "missing_count": 0 if visible else 1,
             "missing_sample": [] if visible else [{"season": 1, "episode": 3}],
             "missing_sample_truncated": False,
+            "episodes": [{"season": 1, "episode": 3, "aired": True, "local": visible}],
         })
         scheduler = DownloadLibraryVerificationScheduler(
             audit_executor=lambda _arguments: (result, 1), max_attempts=1, clock=lambda: current,
@@ -1671,21 +1663,14 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
                 self.assertTrue(db.finish_agent_download_verification(
                     request_id, status=status, result=result, attempts=2, next_check_at=db.now(),
                     expected_lease_generation=job["lease_generation"],
-                    payload_json=dump_download_verification_payload(
-                        title="测试剧", season=1, episode=3, status=status, result=result, attempts=2,
-                    ),
-                ))
+                    payload_json=dump_download_verification_payload(targets=[{'title': '测试剧', 'season': 1, 'episode': 3, 'result': result}], status=status, result=result, attempts=2), targets=[{**target, "result": result} for target in job["targets"]]))
                 self.assertTrue(publish_download_lifecycle(request_id).delivered)
                 current = self._snapshot(request_id)
                 self.assertEqual(current.event.state, expected_state)
                 self.assertEqual(dict(current.event.fields)["入库复核"], label)
 
                 # 夹具重新排入旧代 outbox 载荷；真实消费仍须读取当前复核事实。
-                stale_payload = dump_download_verification_payload(
-                    title="测试剧", season=1, episode=3,
-                    status="attention" if status == "visible" else "visible",
-                    result="missing" if status == "visible" else "visible", attempts=1,
-                )
+                stale_payload = dump_download_verification_payload(targets=[{'title': '测试剧', 'season': 1, 'episode': 3, 'result': 'missing' if status == 'visible' else 'visible'}], status='attention' if status == 'visible' else 'visible', result='missing' if status == 'visible' else 'visible', attempts=1)
                 with db.get_conn() as conn:
                     conn.execute(
                         "UPDATE agent_download_verification_notification_outbox "

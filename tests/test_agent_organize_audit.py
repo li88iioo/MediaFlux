@@ -1,18 +1,10 @@
 """Media Agent 整理记录摘要的聚合、脱敏、路由与 API 契约。"""
 
 from __future__ import annotations
-from typing import Any
-from typing import cast
-
-import json
+import sqlite3
 from unittest.mock import patch
 
-from app import database as db
-from app.agent.domains.guangya.audit_actions import (
-    audit_organize_logs,
-    organize_audit_arguments,
-)
-from app.agent.errors import AgentToolError
+from app import database as db, sdk
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -94,29 +86,13 @@ class OrganizeAuditUnitTests(IsolatedDatabaseTestCase):
             )
         return task_id
 
-    def test_arguments_are_strict_and_normalized(self):
-        self.assertEqual(
-            organize_audit_arguments({}),
-            {"origin": "all", "status": "all", "limit": 10},
-        )
-        self.assertEqual(
-            organize_audit_arguments(
-                {"origin": " GUANGYA ", "status": " Failed ", "limit": 50}
-            ),
-            {"origin": "guangya", "status": "failed", "limit": 50},
-        )
-        for invalid in (
-            [],
-            {"unexpected": True},
-            {"origin": "remote"},
-            {"status": "deleted"},
-            {"limit": True},
-            {"limit": 0},
-            {"limit": 51},
-            {"limit": "10"},
-        ):
-            with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
-                organize_audit_arguments(cast(dict[str, Any], invalid))
+    def test_arguments_and_empty_page(self):
+        self.assertEqual(sdk.activity.organize_logs()["total"], 0)
+        for invalid in ({"unexpected": True}, {"origin": "remote"}, {"status": "bad"},
+                        {"limit": True}, {"limit": 0}, {"limit": "10"}, {"offset": -1},
+                        {"offset": True}, {"keyword": None}):
+            with self.subTest(invalid=invalid), self.assertRaises((ValueError, TypeError)):
+                sdk.METHODS["activity.organize_logs"](**invalid)
 
     def test_database_projection_maps_filters_and_owner_scope(self):
         self._guangya("success", title="云端电影", stamp="2026-08-10 09:00:00")
@@ -129,7 +105,7 @@ class OrganizeAuditUnitTests(IsolatedDatabaseTestCase):
         self._local("requires_manual", title="本地待确认", stamp="2026-08-10 16:00:00")
         self._local("planned", title="本地处理中", stamp="2026-08-10 17:00:00")
         self._local("failed", title="其他用户", owner="other")
-        summary = db.get_agent_organize_audit(owner="admin", limit=50)
+        summary = db.organize_history_page(owner="admin", limit=50)
         self.assertEqual(summary["total"], 9)
         self.assertEqual(summary["by_origin"], {"guangya": 5, "local": 4})
         self.assertEqual(
@@ -143,62 +119,46 @@ class OrganizeAuditUnitTests(IsolatedDatabaseTestCase):
                 "success": 2,
             },
         )
-        self.assertEqual(summary["records"][0]["title"], "本地处理中")
-        filtered = db.get_agent_organize_audit(
+        self.assertEqual(summary["items"][0]["title"], "本地处理中")
+        filtered = db.organize_history_page(
             owner="admin", origin="local", status="failed", limit=1
         )
         self.assertEqual(filtered["total"], 1)
         self.assertEqual(filtered["by_origin"], {"local": 1})
         self.assertEqual(filtered["by_status"], {"failed": 1})
-        self.assertFalse(filtered["truncated"])
+        self.assertFalse(filtered["has_more"])
 
-    def test_result_is_fixed_shape_and_redacts_sensitive_fields(self):
-        self._guangya(
-            "failed",
-            title="token=TOP-SECRET https://private.example /private/video.mkv",
-        )
-        result = audit_organize_logs({"origin": "all", "status": "all", "limit": 10})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "attention")
-        self.assertEqual(result.data["counts"]["by_status"]["failed"], 1)
-        self.assertEqual(result.data["records"][0]["title"], "未命名条目")
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-        for secret in (
-            "TOP-SECRET",
-            "/private",
-            "private.example",
-            "PRIVATE-FILE-ID",
-            "PRIVATE-EXTERNAL-ID",
-            "PRIVATE-TMDB-ID",
-            "token=",
-        ):
-            self.assertNotIn(secret, serialized)
-        serialized_data = json.dumps(result.data, ensure_ascii=False)
-        for forbidden_key in (
-            "id",
-            "raw_status",
-            "source_label",
-            "trigger",
-            "path",
-            "error",
-            "warning",
-            "tmdb_id",
-            "provider",
-            "external_id",
-            "version",
-        ):
-            self.assertNotIn(f'"{forbidden_key}"', serialized_data)
+    def test_complete_fields_and_redacted_credentials_keep_real_ids(self):
+        title = "真实长标题" * 40
+        log_id = self._guangya("failed", title=title)
+        result = sdk.activity.organize_logs(status="failed")
+        row = result["items"][0]
+        self.assertEqual((row["id"], row["kind"], row["status"]), (log_id, "organize", "failed"))
+        self.assertEqual(row["title"], title)
+        self.assertEqual(row["original_path"], "/private/original/SECRET.mkv")
+        self.assertEqual(row["provider"], "tmdb")
+        self.assertNotIn("PRIVATE-ERROR", row["error"])
+        self.assertIn("https://private.example/error", row["error"])
+        self.assertEqual(sdk.activity.timeline(row["kind"], row["id"])["status"], "attention")
 
-    def test_unavailable_result_is_stable_and_does_not_leak_exception(self):
-        with patch(
-            "app.agent.domains.guangya.audit_actions.db.get_agent_organize_audit",
-            side_effect=RuntimeError("PRIVATE SQL /private/db.sqlite"),
-        ):
-            result = audit_organize_logs(
-                {"origin": "all", "status": "all", "limit": 10}
-            )
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "unavailable")
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-        self.assertNotIn("PRIVATE SQL", serialized)
-        self.assertNotIn("/private", serialized)
+    def test_pages_keep_tail_total_and_match_web_deleted_status(self):
+        ids = [self._guangya("deleted", title=f"已回收{i}") for i in range(63)]
+        self._guangya("failed", title="不要混入")
+        first = sdk.activity.organize_logs(origin="guangya", status="deleted", limit=60)
+        last = sdk.activity.organize_logs(origin="guangya", status="deleted", offset=first["next_offset"])
+        self.assertEqual(first["total"], db.count_organize_timeline(origin="guangya", status="deleted"))
+        self.assertEqual(first["by_status"], {"deleted": 63})
+        self.assertEqual([first["returned"], last["returned"]], [60, 3])
+        self.assertEqual({row["id"] for row in first["items"]+last["items"]}, set(ids))
+        self.assertFalse(last["has_more"])
+        empty = sdk.activity.organize_logs(status="deleted", offset=100)
+        self.assertEqual((empty["total"], empty["items"], empty["next_offset"]), (63, [], None))
+        issue = sdk.activity.organize_logs(status="issues")
+        self.assertEqual(issue["by_status"], {"failed": 1})
+        self.assertEqual(sdk.activity.organize_logs(keyword="已回收62")["returned"], 1)
+
+    def test_database_failure_is_not_an_empty_success(self):
+        with patch("app.repositories.activity.db.organize_history_page",
+                   side_effect=sqlite3.OperationalError("PRIVATE SQL /private/db.sqlite")):
+            with self.assertRaisesRegex(RuntimeError, "^暂时无法读取整理记录$"):
+                sdk.activity.organize_logs()

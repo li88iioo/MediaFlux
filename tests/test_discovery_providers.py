@@ -15,6 +15,7 @@ from app import config as app_config
 from app.clients.douban_public import DoubanPublicClient, DoubanPublicPage
 from app.clients.tmdb import TMDBClient
 from app.discovery.models import (
+    DiscoveryPage,
     ProviderAuthenticationError,
     ProviderInvalidResponse,
     ProviderNotConfigured,
@@ -305,6 +306,8 @@ class TMDBProviderTests(unittest.TestCase):
                 "with_genres": "16,35",
                 "primary_release_year": "2026",
                 "vote_average.gte": "7.5",
+                "vote_average.lte": "9.5",
+                "vote_count.gte": "100",
                 "region": "CN",
                 "with_origin_country": "CN",
                 "language": "evil-language",
@@ -319,12 +322,83 @@ class TMDBProviderTests(unittest.TestCase):
         self.assertEqual(params["with_genres"], "16,35")
         self.assertEqual(params["primary_release_year"], "2026")
         self.assertEqual(params["vote_average.gte"], "7.5")
+        self.assertEqual(params["vote_average.lte"], "9.5")
+        self.assertEqual(params["vote_count.gte"], "100")
         self.assertEqual(params["region"], "CN")
         self.assertEqual(params["with_origin_country"], "CN")
         self.assertEqual(params["language"], "zh-CN")
         self.assertEqual(params["api_key"], "test-key")
         self.assertNotIn("unknown", params)
         self.assertTrue(page.has_more)
+
+    def test_rating_filters_validate_bounds_without_setting_defaults(self):
+        for media_type in ("movie", "tv"):
+            with self.subTest(media_type=media_type):
+                self.assertEqual(validate_filters("tmdb", "discover", media_type, {}),
+                                 {"sort_by": "popularity.desc"})
+                for filters in ({"vote_average.gte": "0", "vote_average.lte": "10", "vote_count.gte": "0"},
+                                {"vote_average.gte": "7.5", "vote_count.gte": "100"}):
+                    self.assertEqual(validate_filters("tmdb", "discover", media_type, filters),
+                                     {**filters, "sort_by": "popularity.desc"})
+                for filters in ({"vote_average.gte": "NaN"}, {"vote_average.lte": "inf"},
+                                {"vote_average.gte": "-1"}, {"vote_average.lte": "11"},
+                                {"vote_average.gte": "high"}, {"vote_average.gte": "9", "vote_average.lte": "8"},
+                                {"vote_count.gte": "-1"}, {"vote_count.gte": "1.5"}, {"vote_count.gte": True}):
+                    with self.subTest(filters=filters), self.assertRaises(ValueError):
+                        validate_filters("tmdb", "discover", media_type, filters)
+
+    def test_catalog_and_cached_cards_keep_source_country_language_and_genres(self):
+        provider, _ = self.make_provider({"results": [
+            tmdb_item(110181, "tv", origin_country=["CN"], original_language="zh", genre_ids=[10759, 16]),
+            tmdb_item(2, "tv", origin_country=["US", "CN"], original_language="en", genre_ids=[16]),
+            tmdb_item(3, "tv", original_language="zh"),
+        ], "total_pages": 1})
+        page = provider.list_items("discover", "tv", 1, {})
+        restored = DiscoveryPage.from_dict(json.loads(json.dumps(page.to_dict())))
+        self.assertEqual(restored, page)
+        cards = restored.to_dict()["items"]
+        self.assertEqual(cards[0]["origin_country"], ["CN"])
+        self.assertEqual(cards[0]["original_language"], "zh")
+        self.assertEqual(cards[0]["genre_ids"], [10759, 16])
+        self.assertEqual(cards[1]["origin_country"], ["US", "CN"])
+        self.assertEqual(cards[1]["original_language"], "en")
+        self.assertIsNone(cards[2]["origin_country"])
+        self.assertIsNone(cards[2]["genre_ids"])
+
+    def test_rating_evidence_survives_list_detail_and_old_cache(self):
+        for count, popularity, expected in (
+            (1, 0.25, (1, 0.25)), (0, 0, (0, 0.0)), (None, None, (None, None)),
+            (-1, -1, (None, None)), (True, True, (None, None)),
+            (1.5, float("nan"), (None, None)), ("bad", float("inf"), (None, None)),
+        ):
+            with self.subTest(count=count, popularity=popularity):
+                raw = tmdb_item(1, "tv", vote_average=10, vote_count=count, popularity=popularity)
+                provider, session = self.make_provider({"results": [raw], "total_pages": 1})
+                page = provider.list_items("discover", "tv", 1, {})
+                restored = DiscoveryPage.from_dict(json.loads(json.dumps(page.to_dict(), allow_nan=False)))
+                detail_provider, detail_session = self.make_provider(raw)
+                detail = detail_provider.get_detail("1", "tv").to_dict()
+                for card in (restored.to_dict()["items"][0], detail):
+                    self.assertEqual((card["vote_count"], card["popularity"]), expected)
+                    self.assertEqual(card["rating"], 10)
+                self.assertEqual((len(session.calls), len(detail_session.calls)), (1, 1))
+        old = page.to_dict()
+        for key in ("vote_count", "popularity"):
+            old["items"][0].pop(key)
+        restored = DiscoveryPage.from_dict(old).to_dict()["items"][0]
+        self.assertIsNone(restored["vote_count"])
+        self.assertIsNone(restored["popularity"])
+
+    def test_detail_preserves_explicit_empty_and_does_not_invent_missing_source_facts(self):
+        for fields, expected in (
+            ({"origin_country": [], "genres": []}, ([], None, [])),
+            ({"origin_country": ["CN"], "original_language": "zh", "genres": [{"id": 16, "name": "动画"}]}, (["CN"], "zh", [16])),
+            ({"origin_country": "CN", "original_language": 1, "genres": [{"name": "未知"}]}, (None, None, None)),
+        ):
+            with self.subTest(fields=fields):
+                provider, _ = self.make_provider(tmdb_item(4, "tv", **fields))
+                card = provider.get_detail("4", "tv").to_dict()
+                self.assertEqual(tuple(card[key] for key in ("origin_country", "original_language", "genre_ids")), expected)
 
     def test_page_100_never_reports_more_even_when_tmdb_has_more_pages(self):
         provider, _ = self.make_provider({"results": [], "total_pages": 500})

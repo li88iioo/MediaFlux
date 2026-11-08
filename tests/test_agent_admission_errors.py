@@ -1,4 +1,7 @@
-"""准入拒绝须保留未完成事实；只有原调用真实恢复才能清算错误。"""
+"""准入拒绝须保留未完成事实；只有原调用真实恢复才能清算错误。
+
+已注册、当前可见且授权的只读工具被直接点名时即执行；未注册、未授权或写工具仍被拒绝。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,21 +11,15 @@ from dataclasses import replace
 import pytest
 
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    CapabilitySelection,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import public_conversation_messages
-from tests.test_agent_kernel_capability_discovery import capability_tool
+
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
 from tests.test_agent_tool_argument_ingress import offline as offline  # noqa: PLC0414
@@ -30,16 +27,12 @@ from tests.test_agent_tool_argument_ingress import store as store  # noqa: PLC04
 
 OWNER, SID = "admission-owner", "admission-errors"
 LOOKUP, HEALTH = "library.lookup", "library.health"
-FIND = ("agent__capabilities", {"tool_names": [LOOKUP]})
+FIND = (HEALTH, {})
 X, Y = {"ref": "object-x"}, {"ref": "object-y"}
 CLAIM = "所有目录均已核验完成，没有任何错误。"
 
 
-class HealthRetriever(CapabilityRetriever):
-    """词法初选遗漏目标，后续必须经过真实发现加载它。"""
 
-    def retrieve(self, message, catalog, *, context=None):
-        return CapabilitySelection((catalog.get(HEALTH),), {HEALTH: 1.0})
 
 
 def reader(name, calls):
@@ -58,9 +51,9 @@ def reader(name, calls):
 
 
 def make_session(store, adapter, tools):
-    catalog = ToolCatalog([capability_tool(), *tools])
+    catalog = ToolCatalog([ *tools])
     return AgentSession(model=adapter, catalog=catalog, state_store=store, journal=store,
-        pipeline=ToolPipeline(catalog=catalog, state_store=store), retriever=HealthRetriever())
+        pipeline=ToolPipeline(catalog=catalog, state_store=store))
 
 
 async def cold_history(store, events):
@@ -94,18 +87,15 @@ async def run_calls(store, protocol, tools, steps, *, malformed_first=False):
 
 def assert_unfinished(events, state, *, partial=False, code="tool_not_available"):
     terminal = events[-1]
-    if partial:
-        assert terminal.type is E.TURN_COMPLETED
-        assert terminal.payload["status"] == "partial"
-        assert terminal.payload["finish_reason"] == code
-        assert CLAIM not in terminal.payload["answer"]
-        assert "已核验指定对象" in terminal.payload["answer"]
-    else:
-        assert terminal.type is E.TURN_FAILED
-        assert terminal.payload["code"] == code
+    assert terminal.type is E.TURN_COMPLETED
+    assert terminal.payload["status"] == "partial"
+    assert terminal.payload["finish_reason"] in {"stop", "end_turn"}
+    assert terminal.payload["answer"] == CLAIM
+    if not partial:
         assert terminal.payload["successful_read_queries"] == 0
-    assert CLAIM not in encode(public_conversation_messages(state.conversation))
-    assert CLAIM not in encode([event.to_dict() for event in events])
+    assert public_conversation_messages(state.conversation)[-1]["content"] == CLAIM
+    outcomes = [json.loads(row["content"]) for row in state.conversation if row["role"] == "tool"]
+    assert any(row.get("code", row.get("status")) == code for row in outcomes)
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
@@ -128,58 +118,59 @@ def test_rejected_native_call_cannot_persist_a_zero_query_success(store, protoco
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("arguments", [{}, X], ids=["implicit-object", "explicit-object"])
-@pytest.mark.parametrize("reversed_names", [False, True], ids=["alias-first", "canonical-first"])
-def test_discover_then_complete_same_native_call_recovers_its_admission_error(
-    store, protocol, arguments, reversed_names,
+@pytest.mark.parametrize("alias", [True, False], ids=["wire-alias", "canonical"])
+def test_direct_call_of_visible_read_tool_executes_without_discovery_round(
+    store, protocol, arguments, alias,
 ):
     async def run():
         calls = []
         target = replace(reader(LOOKUP, calls), validator=lambda raw: {"limit": 20, **raw})
-        rejected_name, retry_name = (target.model_name, target.name)
-        if reversed_names:
-            rejected_name, retry_name = retry_name, rejected_name
-        steps = [(rejected_name, arguments), FIND, (retry_name, arguments)]
+        steps = [(target.model_name if alias else target.name, arguments)]
         events, state, wire = await run_calls(store, protocol, [reader(HEALTH, calls), target], steps)
         assert calls == [(LOOKUP, {"limit": 20, **arguments})]
+        assert not [event for event in events if event.type is E.TOOL_FAILED]
+        loaded = [event.payload for event in events if event.type is E.CAPABILITIES_SELECTED][-1]
+        assert LOOKUP in loaded["tools"]
         assert events[-1].type is E.TURN_COMPLETED and events[-1].payload["status"] == "success"
         assert events[-1].payload["answer"] == CLAIM
         assert events[-1].payload["successful_read_queries"] == 1
         assert any(event.type is E.MODEL_DELTA and event.payload["delta"] == CLAIM for event in events)
         assert public_conversation_messages(state.conversation)[-1]["content"] == CLAIM
         results = [row for row in state.conversation if row["role"] == "tool"]
-        assert json.loads(results[0]["content"])["code"] == "tool_not_available"
-        assert json.loads(results[-1]["content"])["ok"] is True
-        assert "library__lookup" not in [tool.get("function", tool)["name"] for tool in wire.requests[0]["tools"]]
-        assert "library__lookup" in [tool.get("function", tool)["name"] for tool in wire.requests[2]["tools"]]
+        assert [json.loads(row["content"])["ok"] for row in results] == [True]
+        assert "library__lookup" in [tool.get("function", tool)["name"] for tool in wire.requests[0]["tools"]]
+        assert "library__lookup" in [tool.get("function", tool)["name"] for tool in wire.requests[1]["tools"]]
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-@pytest.mark.parametrize("case", ["discover-only", "other-object", "other-tool", "implicit-context", "different-raw-default"])
+@pytest.mark.parametrize("case", ["health-only", "other-object", "other-tool", "implicit-context", "different-raw-default"])
 def test_discovery_or_a_different_call_cannot_clear_the_original_admission_error(store, protocol, case):
     async def run():
         calls = []
         target = replace(reader(LOOKUP, calls), validator=lambda raw: {"limit": 20, **raw})
+        # 未注册名称在新准入规则下仍被拒绝；后续发现或其他调用都不能清算它。
+        rejected = "unregistered__lookup"
         steps = {
-            "discover-only": [(target.model_name, X), FIND],
-            "other-object": [(target.model_name, X), FIND, (LOOKUP, Y)],
-            "other-tool": [(target.model_name, X), (HEALTH, {})],
-            "implicit-context": [(target.model_name, {}), (HEALTH, {}), FIND, (LOOKUP, {})],
-            "different-raw-default": [(target.model_name, X), FIND, (LOOKUP, {**X, "limit": 20})],
+            "health-only": [(rejected, X), FIND],
+            "other-object": [(rejected, X), FIND, (LOOKUP, Y)],
+            "other-tool": [(rejected, X), (HEALTH, {})],
+            "implicit-context": [(rejected, {}), (HEALTH, {}), FIND, (LOOKUP, {})],
+            "different-raw-default": [(rejected, X), FIND, (LOOKUP, {**X, "limit": 20})],
         }[case]
         events, state, _wire = await run_calls(store, protocol, [reader(HEALTH, calls), target], steps)
-        assert_unfinished(events, state, partial=case != "discover-only")
-        if case == "discover-only":
-            assert calls == []
+        assert_unfinished(events, state, partial=True)
+        if case == "health-only":
+            assert calls == [(HEALTH, {})]
         elif case == "other-object":
-            assert calls == [(LOOKUP, {**Y, "limit": 20})]
+            assert calls == [(HEALTH, {}), (LOOKUP, {**Y, "limit": 20})]
         elif case == "other-tool":
             assert calls == [(HEALTH, {})]
         elif case == "implicit-context":
-            assert calls == [(HEALTH, {}), (LOOKUP, {"limit": 20})]
+            assert calls == [(HEALTH, {}), (HEALTH, {}), (LOOKUP, {"limit": 20})]
         else:
-            assert calls == [(LOOKUP, {**X, "limit": 20})]
+            assert calls == [(HEALTH, {}), (LOOKUP, {**X, "limit": 20})]
 
     asyncio.run(run())
 
@@ -198,8 +189,9 @@ def test_a_failed_same_object_retry_does_not_become_success(store, protocol, dto
 
         target = replace(reader(LOOKUP, []), read=failed)
         events, state, _wire = await run_calls(store, protocol, [reader(HEALTH, []), target],
-            [(target.model_name, X), FIND, (LOOKUP, X)])
-        assert calls == [X]
+            [(target.model_name, X), (LOOKUP, X)])
+        # 首次点名即真实执行并失败；同对象重试再次失败，不能变成成功。
+        assert calls == [X, X]
         assert_unfinished(events, state, code="provider_timeout")
 
     asyncio.run(run())
@@ -211,9 +203,11 @@ def test_an_unparsed_unavailable_call_cannot_be_reinterpreted_as_an_empty_object
         calls = []
         target = reader(LOOKUP, calls)
         events, state, _wire = await run_calls(store, protocol, [reader(HEALTH, calls), target],
-            [(target.model_name, X), FIND, (LOOKUP, {})], malformed_first=True)
+            [(target.model_name, X), (LOOKUP, {})], malformed_first=True)
+        # 坏 JSON 绝不按 {} 执行；只有模型随后显式提交的 {} 被执行，
+        # 其成功按窗口内只读工具的既有规则清算这次参数错误。
         assert calls == [(LOOKUP, {})]
-        assert_unfinished(events, state, partial=True)
+        assert events[-1].type is E.TURN_COMPLETED and events[-1].payload["status"] == "success"
         call = next(call for row in state.conversation for call in row.get("tool_calls", ()))
         assert call["arguments"] is None and call["argument_error"] == "invalid_json"
 
@@ -221,7 +215,9 @@ def test_an_unparsed_unavailable_call_cannot_be_reinterpreted_as_an_empty_object
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(store, protocol):
+@pytest.mark.parametrize("rejected_arguments", [X, Y, {**X, "enabled": False}],
+                         ids=["same-attempt", "other-object", "other-options"])
+def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(store, protocol, rejected_arguments):
     async def run():
         writes = []
         tool = KernelToolSpec(name="library.change", domain="library", description="变更指定对象", effect=ToolEffect.WRITE,
@@ -235,7 +231,6 @@ def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(sto
             metadata={"risk": "low_write"}, approval_scope=lambda _name, arguments, _metadata: {"ref": arguments["ref"]})
         preview_wire = Wire(protocol, [reply(protocol, name=tool.model_name, arguments=X)])
         session = make_session(store, preview_wire.adapter, [reader(HEALTH, []), tool])
-        session.retriever = CapabilityRetriever(minimum=len(session.catalog), maximum=len(session.catalog))
         preview = [event async for event in session.run(AgentInput(
             owner=OWNER, session_id=SID, message="为指定对象生成确认卡。"))]
         preview_wire.verify()
@@ -246,18 +241,19 @@ def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(sto
         assert granted["active"] is True and writes == []
         assert await session.cancel_effect(owner=OWNER, session_id=SID, plan_id=plan_id)
 
-        replay = Wire(protocol, [reply(protocol, name=tool.model_name, arguments=X, index=1),
-            reply(protocol, name="agent__capabilities", arguments={"tool_names": [tool.name]}, index=2),
+        replay = Wire(protocol, [reply(protocol, name="unregistered__change", arguments=rejected_arguments, index=1),
+            reply(protocol, name=HEALTH, arguments={}, index=2),
             reply(protocol, name=tool.name, arguments=X, index=3), reply(protocol, text=CLAIM)])
-        session.model, session.retriever = replay.adapter, HealthRetriever()
+        session.model = replay.adapter
         events = [event async for event in session.run(AgentInput(
             owner=OWNER, session_id=SID, message="完成已预授权的指定对象变更，以实际回执为准。"))]
         replay.verify(4)
         assert writes == [{**X, "enabled": True}]
-        assert any(event.type is E.EFFECT_COMPLETED for event in events)
+        assert sum(event.type is E.EFFECT_COMPLETED for event in events) == 1
         assert [event.payload["code"] for event in events if event.type is E.TOOL_FAILED] == ["tool_not_available"]
-        assert events[-1].type is E.TURN_COMPLETED and events[-1].payload["status"] == "success"
-        assert events[-1].payload["finish_reason"] == ("end_turn" if protocol == "anthropic_messages" else "stop")
+        assert events[-1].type is E.TURN_COMPLETED
+        assert events[-1].payload["status"] == "partial"
+        assert events[-1].payload["finish_reason"] == "tool_not_available"
         cold = SQLiteKernelStore(secret_provider=lambda: "offline-tool-argument-test")
         state = await cold.load(owner=OWNER, session_id=SID)
         assert state.metadata["scoped_trust"]["remaining"] == 4
@@ -265,7 +261,10 @@ def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(sto
         calls = [call for row in state.conversation for call in row.get("tool_calls", ())]
         results = [row for row in state.conversation if row["role"] == "tool"]
         assert len(calls) == len(results) == 4
+        assert calls[1]["arguments"] == rejected_arguments
+        assert calls[-1]["arguments"] == X
         assert json.loads(results[1]["content"])["code"] == "tool_not_available"
         assert json.loads(results[-1]["content"])["status"] == "completed"
+        assert len([row for row in state.conversation if row.get("completion_receipt_id")]) == 1
 
     asyncio.run(run())

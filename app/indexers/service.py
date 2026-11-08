@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import cast
+from typing import Any, cast
+from urllib.parse import urlsplit
 
 from app import config
 from app.clients.http import HttpError, HttpInvalidResponse, HttpSecurityError
 from app.logger import get_logger
+from app.modules.media_probe import release_dynamic_range_evidence
 
 from .config import (
     AGENT_ONLY_INDEXER_SITE_IDS,
+    INDEXER_SITE_LABELS,
+    MANUAL_INDEXER_SITE_ORDER,
     RETIRED_INDEXER_SITE_IDS,
     SENSITIVE_INDEXER_SITE_IDS,
 )
@@ -28,6 +33,7 @@ from .models import (
     IndexerSearchRequest,
     IndexerSitePageState,
     ResolvedDownload,
+    indexer_site_status,
 )
 from .providers.base import magnet_infohash, page_observer, report_page
 from .query_plan import build_site_queries, needs_bilingual_search
@@ -35,10 +41,12 @@ from .ranking import (
     annotate_clusters,
     candidate_sort_key,
     match_order,
+    match_priority,
     published_timestamp,
     rank_item,
 )
 from .registry import IndexerRegistry
+from .release import parse_indexer_release_position
 from .result_store import IndexerResultStore
 
 logger = get_logger(__name__)
@@ -76,7 +84,11 @@ class _CloseAttempt:
 
 
 class IndexerService:
-    """Concurrent, bounded aggregation over registered resource indexers."""
+    """并发聚合各 Provider 的公开页；最终结果完整保留本页已取得的候选。
+
+    max_results_per_site 仅限制中间进度快照。续页沿用 Provider 的 page，
+    不把展示限量变成业务截断；上游未覆盖量仍由站点计数和错误如实返回。
+    """
 
     def __init__(
         self,
@@ -173,7 +185,7 @@ class IndexerService:
             sort_mode=sort_mode,
         )
         scope = self._normalize_scope(scope)
-        selected = self._select_sites(site_ids, scope=scope)
+        selected = self.select_sites(site_ids, scope=scope)
         plans: dict[str, tuple[str, ...]] = {site_id: (request.query,) for site_id in selected}
         cache_key = (
             "query",
@@ -205,7 +217,7 @@ class IndexerService:
         if not isinstance(request, IndexerMediaSearchRequest):
             raise IndexerValidationError("invalid media search request")
         scope = self._normalize_scope(scope)
-        selected = self._select_sites(site_ids, scope=scope)
+        selected = self.select_sites(site_ids, scope=scope)
         plans = {site_id: build_site_queries(site_id, request) for site_id in selected}
         plan_identity = tuple((site_id, plans[site_id]) for site_id in selected)
         cache_key = (
@@ -249,6 +261,32 @@ class IndexerService:
             return cached
         loop = asyncio.get_running_loop()
         inflight_key = (loop, cache_key)
+
+        def cleanup(done_task: asyncio.Task[object]) -> None:
+            with self._runtime_condition:
+                if self._inflight.get(inflight_key) is done_task:
+                    self._inflight.pop(inflight_key, None)
+                    self._progress_last.pop(inflight_key, None)
+                active_loops = {active_key[0] for active_key in self._inflight}
+                if loop not in active_loops:
+                    self._loop_semaphores.pop(loop, None)
+                self._runtime_condition.notify_all()
+
+        # 最后一个等待者取消后，旧任务仍需完成清理；新查询不能复用它，
+        # 也不能提前移出在途台账，否则服务关闭会漏等仍在使用HTTP连接的任务。
+        while True:
+            with self._runtime_condition:
+                closing = self._inflight.get(inflight_key)
+            if closing is None or not closing.cancelling():
+                break
+            started = loop.time()
+            await asyncio.wait_for(asyncio.shield(asyncio.gather(closing, return_exceptions=True)),
+                                   timeout=timeout_seconds)
+            cleanup(closing)
+            if timeout_seconds is not None:
+                timeout_seconds -= loop.time() - started
+                if timeout_seconds <= 0:
+                    raise TimeoutError("caller search timeout")
         pinned: dict[tuple, IndexerItem] = {}
         def stable_view(result: AggregatedIndexerResult) -> AggregatedIndexerResult:
             view = result.clone()
@@ -285,19 +323,6 @@ class IndexerService:
                     )
                 )
                 self._inflight[inflight_key] = task
-
-                def cleanup(
-                    done_task: asyncio.Task[object],
-                    key=inflight_key,
-                ) -> None:
-                    with self._runtime_condition:
-                        if self._inflight.get(key) is done_task:
-                            self._inflight.pop(key, None)
-                            self._progress_last.pop(key, None)
-                        active_loops = {active_key[0] for active_key in self._inflight}
-                        if key[0] not in active_loops:
-                            self._loop_semaphores.pop(key[0], None)
-                        self._runtime_condition.notify_all()
 
                 task.add_done_callback(cleanup)
         try:
@@ -377,6 +402,23 @@ class IndexerService:
         progress = asyncio.Event()
         outcomes: dict[str, _ProviderOutcome] = {}
         published_items: dict[tuple, IndexerItem] = {}
+        cache_expires_at = None
+        if page > 1:
+            # 两类既有缓存键的第三项都是页码，其余部分绑定查询、站点及计划。
+            previous_key = (*cache_key[:2], page - 1, *cache_key[3:])
+            with self._cache_lock:
+                previous = self._cache.get(previous_key)
+                if (previous is not None and previous.expires_at > self._clock()
+                        and previous.result.complete and not previous.result.partial):
+                    for site_id, state in previous.result.site_page_states.items():
+                        if (state.has_more is False and site_id in previous.result.sites_succeeded
+                                and not previous.result.site_truncated_counts.get(site_id)):
+                            outcomes[site_id] = _ProviderOutcome(
+                                site_id, page=IndexerPage([], page, False, state.pagination_supported),
+                                query=previous.result.site_queries.get(site_id, ""),
+                            )
+                    if outcomes:
+                        cache_expires_at = previous.expires_at
 
         def observe(site_id: str, result_page: IndexerPage) -> None:
             if site_id not in selected:
@@ -403,7 +445,7 @@ class IndexerService:
         token = page_observer.set(observe)
         tasks = {site_id: asyncio.create_task(self._search_site_plan(
             site_id, plans[site_id], page, ranking_context=ranking_context, sort_mode=sort_mode,
-        )) for site_id in selected}
+        )) for site_id in selected if site_id not in outcomes}
         page_observer.reset(token)
         pending = set(tasks.values())
         deadline = loop.time() + self.total_timeout_seconds + self._maximum_timeout_overhead(selected)
@@ -449,7 +491,10 @@ class IndexerService:
             sort_mode=sort_mode, complete=True, published_items=published_items,
         )
         cache_ttl = self._cache_ttl_for(result)
-        if cache_ttl is not None:
+        if cache_ttl is not None and cache_expires_at is not None:
+            # 推导出的后续空页不能续长原始“已耗尽”证据的有效期。
+            cache_ttl = min(cache_ttl, (cache_expires_at - self._clock()).total_seconds())
+        if cache_ttl is not None and cache_ttl > 0:
             self._put_cached(cache_key, result, cache_ttl)
         return result.clone(cached=False)
 
@@ -554,10 +599,11 @@ class IndexerService:
                 next_page=page + 1 if page_has_more else None,
             )
             provider_items = [rank_item(item, media=ranking_context, fallback_query=display_query, now=self._clock()) for item in page_result.items]
-            provider_items = [entry[1] for entry in sorted(
-                enumerate(provider_items),
-                key=lambda entry: candidate_sort_key((site_index, entry[0], entry[1]), sort_mode),
-            )][: self.max_results_per_site]
+            if not complete:
+                provider_items = [entry[1] for entry in sorted(
+                    enumerate(provider_items),
+                    key=lambda entry: candidate_sort_key((site_index, entry[0], entry[1]), sort_mode),
+                )][: self.max_results_per_site]
             collected = max(len(page_result.items), page_result.total_items or 0)
             site_collected_counts[site_id] = collected
             site_truncated_counts[site_id] = max(0, collected - len(provider_items))
@@ -839,9 +885,10 @@ class IndexerService:
                 allowed.add("sukebei")
         return tuple(site_id for site_id in registered if site_id in allowed)
 
-    def _select_sites(
+    def select_sites(
         self, site_ids: Iterable[str] | None, *, scope: str = "manual"
     ) -> tuple[str, ...]:
+        """按既有调用范围选择并校验站点；不改变开关、授权或错误合同。"""
         allowed = set(self.site_ids_for_scope(scope))
         requested = (
             tuple(site_id for site_id in self.registry.ids() if site_id in allowed)
@@ -954,6 +1001,7 @@ class IndexerService:
         page_errors: dict[tuple[str, str], IndexerProviderError] = {}
         contributed_query = ""
         has_more = False
+        has_more_known = False
         pagination_supported = bool(
             getattr(
                 getattr(adapter, "capabilities", None), "pagination_supported", False
@@ -1013,6 +1061,7 @@ class IndexerService:
             reported_omissions = max(reported_omissions, (outcome.page.total_items or 0) - len(outcome.page.items))
             page_errors.update(((err.code, err.message), err) for err in outcome.page.errors)
             has_more = has_more or outcome.page.has_more
+            has_more_known = True
             pagination_supported = pagination_supported or outcome.page.pagination_supported
             if outcome.page.items:
                 contributed_query = query
@@ -1041,56 +1090,29 @@ class IndexerService:
                     pagination_supported=pagination_supported, complete=False,
                     errors=tuple(page_errors.values()),
                 ))
-        if merged_items:
-            ranked_items = [
-                rank_item(
-                    item,
-                    media=ranking_context,
-                    fallback_query=contributed_query or (queries[0] if queries else ""),
-                    now=self._clock(),
-                )
-                for item in merged_items
-            ]
-            ranked_entries = list(enumerate(ranked_items))
-            ranked_entries.sort(
-                key=lambda entry: candidate_sort_key(
-                    (0, entry[0], entry[1]),
-                    sort_mode,
-                )
-            )
-            ranked_items = [item for _provider_index, item in ranked_entries]
+        outcome = last_error or last_outcome
+        if outcome is None:
             return _ProviderOutcome(
                 site_id=site_id,
-                page=IndexerPage(
-                    items=ranked_items[: self.max_results_per_site],
-                    total_items=len(ranked_items) + reported_omissions,
-                    page=page,
-                    has_more=has_more,
-                    pagination_supported=pagination_supported,
-                    errors=tuple(page_errors.values()),
-                    source_statuses=last_outcome.page.source_statuses if last_outcome is not None and last_outcome.page is not None else (),
+                error=self._public_error(
+                    site_id, IndexerValidationError("site query plan is empty")
                 ),
-                query=contributed_query or (queries[0] if queries else ""),
-                attempts=attempts_made,
-                duration_ms=duration_ms,
-                error=last_error.error if last_error is not None else None,
             )
-        if last_error is not None:
-            last_error.attempts = attempts_made
-            last_error.duration_ms = duration_ms
-            return last_error
-        if last_outcome is not None:
-            if last_outcome.page is not None:
-                last_outcome.page.errors = tuple(page_errors.values())
-            last_outcome.attempts = attempts_made
-            last_outcome.duration_ms = duration_ms
-            return last_outcome
-        return _ProviderOutcome(
-            site_id=site_id,
-            error=self._public_error(
-                site_id, IndexerValidationError("site query plan is empty")
-            ),
-        )
+        # 空页同样具有分页事实；后续别名失败不能抹掉已经取得的页。
+        if has_more_known:
+            outcome.page = IndexerPage(
+                items=merged_items,
+                total_items=len(merged_items) + reported_omissions,
+                page=page,
+                has_more=has_more,
+                pagination_supported=pagination_supported,
+                errors=tuple(page_errors.values()),
+                source_statuses=last_outcome.page.source_statuses if last_outcome is not None and last_outcome.page is not None else (),
+            )
+            outcome.query = contributed_query or outcome.query
+        outcome.attempts = attempts_made
+        outcome.duration_ms = duration_ms
+        return outcome
 
     @staticmethod
     def _plan_item_keys(item: IndexerItem) -> tuple[tuple[str, str], ...]:
@@ -1375,3 +1397,165 @@ class IndexerService:
             self._cache.move_to_end(key)
             while len(self._cache) > self.max_cache_entries:
                 self._cache.popitem(last=False)
+
+
+_SITE_ERROR_CATALOG: dict[str, tuple[str, bool]] = {
+    "timeout": ("站点响应超时，请稍后重试", True),
+    "unavailable": ("站点暂不可用，请稍后重试", True),
+    "rate_limited": ("站点请求过于频繁，请稍后再试", True),
+    "invalid_response": ("站点返回异常数据，请稍后重试", True),
+    "query_rejected": ("关键词长度或字符不受该站点支持，请换用完整片名或别名", False),
+    "challenge_required": ("站点要求人机验证，本次未完成检索", False),
+    "response_too_large": ("站点响应异常，暂无法处理", False),
+    "security_error": ("站点连接未通过安全校验", False),
+    "coverage_limited": ("仅检索部分作品候选，未覆盖范围仍未知；可细化片名、年份或季集", False),
+}
+
+
+def _safe_site_error(error) -> tuple[str, str, bool]:
+    code = str(getattr(error, "code", "") or "unavailable")
+    message, retryable = _SITE_ERROR_CATALOG.get(
+        code, ("站点检索失败，请稍后重试", True)
+    )
+    return code, message, retryable
+
+
+def _public_provider_error(error) -> dict[str, str]:
+    code, message, _retryable = _safe_site_error(error)
+    return {"site_id": str(error.site_id), "code": code, "message": message}
+
+
+def _public_source_url(service, item) -> str | None:
+    value = str(getattr(item, "detail_url", "") or "").strip()
+    if not value or service is None:
+        return None
+    try:
+        parsed = urlsplit(value)
+        adapter = service.registry.get(item.site_id)
+        client = adapter.http_client_for_result(item)
+        allowed_hosts = {str(host).rstrip(".").lower() for host in getattr(client, "allowed_hosts", ())}
+    except (HttpError, KeyError, TypeError, ValueError):
+        return None
+    try:
+        host = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port or 443
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return None
+    if not host or host not in allowed_hosts or port != 443:
+        return None
+    return value
+
+
+def search_item(item, service=None) -> dict[str, Any]:
+    payload = item.to_public_dict()
+    payload["technical_evidence"] = release_dynamic_range_evidence(payload["title"])
+    payload["source_url"] = _public_source_url(service, item)
+    payload["match_priority"] = match_priority(item)
+    # 稳定身份只供展示/勾选迁移；下载仍必须使用当前result_id并经过确认。
+    payload["resource_key"] = hashlib.sha256(repr(IndexerService._result_identity(item)).encode("utf-8")).hexdigest()
+    payload.update(parse_indexer_release_position(item.title))
+    return payload
+
+
+def search_site_statuses(service, result) -> list[dict[str, Any]]:
+    raw_counts = getattr(result, "site_item_counts", None)
+    if isinstance(raw_counts, dict) and raw_counts:
+        counts = {str(site_id): max(0, int(count)) for site_id, count in raw_counts.items()}
+    else:
+        counts: dict[str, int] = {}
+        for item in result.items:
+            counts[item.site_id] = counts.get(item.site_id, 0) + 1
+    errors = {error.site_id: error for error in result.errors}
+    errors.update((error.site_id, error) for error in result.errors if error.code != "coverage_limited")
+    site_queries = getattr(result, "site_queries", {}) or {}
+    site_attempt_counts = getattr(result, "site_attempt_counts", {}) or {}
+    visible_counts = getattr(result, "site_visible_counts", {}) or {}
+    page_states = getattr(result, "site_page_states", {}) or {}
+    enabled_site_ids = getattr(service, "enabled_site_ids", None)
+    if enabled_site_ids is None:
+        enabled_site_ids = frozenset(service.registry.enabled_ids())
+    registered = set(service.registry.ids())
+    manual_sites = set(MANUAL_INDEXER_SITE_ORDER)
+    participating = dict.fromkeys((*result.sites_attempted, *result.sites_succeeded))
+    extra_sites = tuple(site_id for site_id in participating if site_id in registered and site_id not in manual_sites)
+    payload = []
+    for site_id in (*MANUAL_INDEXER_SITE_ORDER, *extra_sites):
+        if site_id not in registered:
+            continue
+        adapter = service.registry.get(site_id)
+        code = None
+        retryable = False
+        sources = (getattr(result, "source_statuses", {}) or {}).get(site_id, ())
+        diagnostics = [{
+            "site_id": row.site_id, "site_name": row.site_name, "status": row.status,
+            "count": row.count, "cached": bool(result.cached or row.cached), "code": row.code or None,
+            "message": (
+                ("本轮未完整核验，暂保留缓存结果" if result.cached or row.cached else "部分结果未能取得，已保留成功结果")
+                if row.status == "partial" else
+                _SITE_ERROR_CATALOG.get(row.code, ("来源检索未完成", True))[0] if row.code else ""
+            ),
+        } for row in sources]
+        status = ("disabled" if site_id in manual_sites and site_id not in enabled_site_ids
+                  else indexer_site_status(result, site_id, counts.get(site_id, 0)))
+        message = ""
+        if status is None:
+            continue
+        if status == "searching":
+            message = "正在补充检索"
+        elif status == "partial":
+            if site_id in errors and errors[site_id].code == "coverage_limited":
+                code, message, retryable = _safe_site_error(errors[site_id])
+            else:
+                message, retryable = "本轮未找到匹配资源，部分来源未完成", True
+        elif status == "error":
+            if site_id in errors:
+                code, message, retryable = _safe_site_error(errors[site_id])
+            else:
+                code, message, retryable = "unavailable", "站点未返回有效状态", True
+        if result.site_truncated_counts.get(site_id, 0):
+            hint = "达到候选上限，可细化片名、年份或季集后重搜"
+            message = f"{message}；{hint}" if message else hint
+        page_state = page_states.get(site_id)
+        payload.append({
+            "site_id": site_id,
+            "site_name": INDEXER_SITE_LABELS.get(site_id, adapter.site_name),
+            "status": status,
+            "count": counts.get(site_id, 0),
+            "collected_count": result.site_collected_counts.get(site_id, counts.get(site_id, 0)),
+            "truncated_count": result.site_truncated_counts.get(site_id, 0),
+            "visible_count": max(0, int(visible_counts.get(site_id, counts.get(site_id, 0)) or 0)),
+            "message": message,
+            "code": code,
+            "retryable": retryable,
+            "diagnostics": diagnostics,
+            "query": str(site_queries.get(site_id) or ""),
+            "attempts": max(0, int(site_attempt_counts.get(site_id, 0) or 0)),
+            "pagination_supported": bool(
+                page_state.pagination_supported if page_state is not None else adapter.capabilities.pagination_supported
+            ),
+            "requested_page": int(page_state.requested_page if page_state is not None else result.page),
+            "has_more": page_state.has_more if page_state is not None else None,
+            "next_page": page_state.next_page if page_state is not None else None,
+        })
+    return payload
+
+
+def search_payload(service, result) -> dict[str, Any]:
+    return {
+        "query": result.query,
+        "page": result.page,
+        "items": [search_item(item, service) for item in result.items],
+        "sites_attempted": list(result.sites_attempted),
+        "sites_succeeded": list(result.sites_succeeded),
+        "errors": [_public_provider_error(error) for error in result.errors],
+        "site_statuses": search_site_statuses(service, result),
+        "site_collected_counts": dict(result.site_collected_counts),
+        "site_truncated_counts": dict(result.site_truncated_counts),
+        "partial": result.partial,
+        "truncated": any(result.site_truncated_counts.values()),
+        "cached": result.cached,
+        "has_more": bool(getattr(result, "has_more", False)),
+        "complete": bool(getattr(result, "complete", True)),
+    }

@@ -174,15 +174,15 @@ class AgentPageTests(InitializedWebTestCase):
 
     def test_agent_frontend_consumes_bounded_public_event_stream(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        styles = STYLES.read_text(encoding="utf-8")
-
         self.assertIn("const MAX_TRANSCRIPT_ITEMS = 120", source)
         self.assertIn("function pruneTranscript()", source)
         self.assertIn("async function readEventStream(response, consume)", source)
         for event_type in (
             "turn.started",
             "capabilities.selected",
+            "model.started",
             "model.delta",
+            "model.reasoning_summary.delta",
             "model.tool_call",
             "tool.started",
             "tool.progress",
@@ -194,12 +194,8 @@ class AgentPageTests(InitializedWebTestCase):
             "turn.cancelled",
         ):
             self.assertIn(f"case '{event_type}'", source)
-        self.assertNotIn("step.arguments", source)
         self.assertNotIn("payload.arguments", source)
-        self.assertIn(".agent-stream-steps", styles)
-        self.assertIn(".agent-stream-step", styles)
-        self.assertIn(".agent-tool-trace", styles)
-        self.assertIn("function buildToolTrace(turn)", source)
+        # 展示过程仅消费公开活动/摘要；展开、限额与恢复由浏览器行为用例验证。
         for removed in (
             "RELEASE_FORMAT_TEACHING_HASH",
             "RELEASE_FORMAT_TEACHING_DRAFT",
@@ -279,7 +275,6 @@ class AgentPageTests(InitializedWebTestCase):
             "renderLibraryAudit",
         ):
             self.assertNotIn(legacy_renderer, source)
-        self.assertIn("const TOOL_LABELS", source)
         self.assertIn("applyEvent(turn, event)", source)
 
     def test_agent_frontend_uses_safe_interruptible_confirmation_flow(self):
@@ -400,20 +395,12 @@ class AgentPageTests(InitializedWebTestCase):
                 re.DOTALL,
             ),
         )
-        self.assertRegex(
-            source,
-            re.compile(
-                r"\.agent-streaming,\s*\n\.agent-cancelled\s*\{[^}]*"
-                r"min-height:\s*116px",
-                re.DOTALL,
-            ),
-        )
+        # 状态行及耗时的布局稳定性由 UX 浏览器用例实测。
         self.assertIn(".agent-confirmation-executing", source)
         self.assertRegex(
             source,
             re.compile(
-                r"\.agent-confirmation-executing-mark svg,\s*"
-                r"\.agent-stream-step\.is-pending svg\s*\{[^}]*"
+                r"\.agent-confirmation-executing-mark svg\s*\{[^}]*"
                 r"animation:\s*none\s*!important",
                 re.DOTALL,
             ),

@@ -12,12 +12,7 @@ import pytest
 
 from app import database as db
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import ToolOutcome
@@ -91,23 +86,24 @@ async def scenario(store, good, *, ending="answer", mixed=True):
     ) for name in sorted({name for name, _ in steps})])
     replies = [reply(name=catalog.get(name).model_name, arguments=args, index=index)
                for index, (name, args) in enumerate(steps)]
-    replies.append((b"not-json", "application/json") if ending == "model-fault" else reply(
-        text="" if ending in {"round-empty", "tool-empty"} else FINAL,
-    ))
     limits = None
     if ending == "round-empty":
-        limits = SessionLimits(max_model_rounds=len(steps) + 1)
+        limits = SessionLimits(max_model_rounds=len(steps))
     elif ending == "tool-empty":
         limits = SessionLimits(max_tool_calls=len(steps))
+        replies.append(reply(name=catalog.get(steps[0][0]).model_name,
+                             arguments=steps[0][1], index=len(steps)))
+    else:
+        replies.append((b"not-json", "application/json") if ending == "model-fault" else reply(text=FINAL))
     wire = Wire("chat_completions", replies)
     session = AgentSession(
-        model=wire.adapter, catalog=catalog, retriever=CapabilityRetriever(minimum=len(catalog), maximum=len(catalog)),
+        model=wire.adapter, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store, journal=store, limits=limits,
     )
     events = [event async for event in session.run(AgentInput(
         message="分别核验对象与作用域，不以另一对象成功冒充恢复。", owner="owner-a", session_id="invalid-progress",
     ))]
-    wire.verify(posts=len(steps) + 1)
+    wire.verify(posts=len(steps) + (ending != "round-empty"))
     assert not wire.replies
     # A's invalid request is rejected by the real schema, before the business boundary.
     assert calls == steps[1:]
@@ -119,15 +115,15 @@ async def scenario(store, good, *, ending="answer", mixed=True):
     journal = await fresh.list_events(owner="owner-a", session_id="invalid-progress")
     assert journal == [event.to_dict() for event in events]
     tool_rows = [row for row in saved.conversation if row["role"] == "tool"]
-    assert [row["tool_call_id"] for row in tool_rows] == [f"call-{i}" for i in range(len(steps))]
+    assert [row["tool_call_id"] for row in tool_rows] == [f"call-{i}" for i in range(len(steps) + (ending == "tool-empty"))]
     rejection = json.loads(tool_rows[0]["content"])
     assert rejection["code"] == "invalid_arguments"
     assert "repair" not in rejection
     assert "expected_input_schema" in rejection
     assert "类型无效" in rejection["error"]
-    assert json.loads(tool_rows[-1]["content"])["status"] == "success"
+    assert json.loads(tool_rows[len(steps) - 1]["content"])["status"] == "success"
     failed = [event for event in events if event.type.value == "tool.failed"]
-    assert len(failed) == (2 if mixed else 1)
+    assert len(failed) == (2 if mixed else 1) + (ending == "tool-empty")
     final = dict(events[-1].payload)
     answers = {
         "event": final["answer"],
@@ -144,13 +140,16 @@ async def scenario(store, good, *, ending="answer", mixed=True):
     {**X, "ref": "object-y", "limit": 1}, {**X, "scope": "scope-b", "limit": 1},
 ], ids=["different-ref", "different-scope-same-owner"])
 @pytest.mark.parametrize("ending,reason", [
-    ("answer", "provider_timeout"), ("model-fault", "model_provider_error"),
+    ("answer", "stop"), ("model-fault", "model_provider_error"),
     ("round-empty", "provider_timeout"), ("tool-empty", "provider_timeout"),
 ])
 def test_operational_failure_remains_disclosed_after_read_schema_correction(store, other, ending, reason):
     final, answers = asyncio.run(scenario(store, other, ending=ending))
     assert final["status"] == "partial"
     assert final["finish_reason"] == reason
+    if ending == "answer":
+        assert all(answer == FINAL for answer in answers.values())
+        return
     for projection, answer in answers.items():
         assert "已核验 " + other["ref"] + " " + other["scope"] in answer, projection
         assert "已核验 object-x scope-a" not in answer, projection
@@ -164,8 +163,5 @@ def test_operational_failure_remains_disclosed_after_read_schema_correction(stor
 def test_direct_read_correction_retains_wire_history_and_does_not_hide_operational_failures(store, mixed):
     final, answers = asyncio.run(scenario(store, {**X, "limit": 1}, mixed=mixed))
     assert final["status"] == ("partial" if mixed else "success")
-    if mixed:
-        assert final["finish_reason"] == "provider_timeout"
-        assert all("已核验 object-x scope-a" in answer for answer in answers.values())
-    else:
-        assert final["answer"] == FINAL
+    assert final["finish_reason"] == "stop"
+    assert all(answer == FINAL for answer in answers.values())

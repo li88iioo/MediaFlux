@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .conversation_codec import conversation_payload, conversation_rows, json_text
-from .conversation_state import _encode_history_memory, history_memory
+from .conversation_state import history_memory
 from .state_types import (
     PublicationLease,
     SelectionInvalidError,
@@ -113,7 +113,7 @@ class SessionState:
             session_id=session_id,
             generation=max(0, generation),
             conversation=conversation_rows(payload.get("conversation", [])),
-            summary=str(payload.get("summary") or "")[:8_000],
+            summary=str(payload.get("summary") or ""),
             recent_refs=[
                 str(item) for item in payload.get("recent_refs", ()) if str(item)
             ][-100:],
@@ -204,7 +204,7 @@ class SessionState:
                 if self.metadata.get("history_memory_version") == 1:
                     memory = history_memory(self)
                     memory["legacy_note"] = note
-                    self.summary = _encode_history_memory(memory)
+                    self.summary = json_text(memory)
                 else:
                     self.summary = note
             elif key == "pending_effect_plan_id":

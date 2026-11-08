@@ -1,6 +1,7 @@
 """统一 Telegram 主动通知仓储；schema 仅由 database.init_db 初始化和迁移。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timedelta
@@ -79,12 +80,10 @@ def upsert_notification(
             current_verification = conn.execute(
                 "SELECT * FROM agent_download_verifications WHERE request_id=?", (request["id"],),
             ).fetchone()
-            if verification is None:
-                if current_verification is not None:
-                    return None
-            elif current_verification is None or any(
-                current_verification[key] != value for key, value in verification.items()
-            ):
+            if current_verification is not None:
+                current_verification = dict(current_verification)
+                current_verification["targets"] = json.loads(current_verification.pop("targets_json"))
+            if current_verification != verification:
                 return None
         if row is None:
             conn.execute(

@@ -1,25 +1,19 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
 from unittest.mock import patch
 
-from app.agent.domain_catalog import build_tool_specs
+from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolEffect
-from app.agent.kernel.conversation_context import capability_retrieval_context
-from app.agent.kernel.discovery import CapabilityDiscovery
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import (
-    adapt_tool_spec,
-    catalog_from_tool_specs,
-)
-from app.agent.kernel.session_state import SessionState
+from app.agent.kernel.projection import DefaultProjector
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
-from app.clients.guangya import GuangYaFile
+from app.agent.models import ToolResult
 
 
 async def context_for(
@@ -45,54 +39,36 @@ async def context_for(
 
 
 class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
-    def test_ingest_inspect_schema_separates_candidate_refs_from_link_inputs(self):
+    def test_native_share_schema_requires_real_files_and_no_candidate_reference(self):
         from app.agent.schema import validate_json_schema
-        tool = catalog_from_tool_specs(build_tool_specs()).get("ingest.inspect")
-        reference = "ref_1234567890abcdefghijkl"
-        magnet = "magnet:?xt=urn:btih:" + "a" * 40
-        valid = [
-            {"source_type": "resource_candidates"},
-            {"source_type": "resource_candidates", "input": "", "positions": [3, 1, 3], "resource_candidates_ref": reference},
-            {"source_type": "resource_candidates", "positions": [50, 1] * 7},
-            {"input": magnet}, {"source_type": "direct_url", "input": magnet},
-        ]
-        for arguments in valid:
-            with self.subTest(arguments=arguments):
-                validate_json_schema(arguments, tool.input_schema)
-                tool.validator(arguments)
-        invalid = [
-            {}, {"source_type": "direct_url"},
-            {"source_type": "resource_candidates", "input": reference, "positions": [3, 1]},
-            {"source_type": "resource_candidates", "positions": []},
-            {"source_type": "resource_candidates", "positions": [True]},
-            {"source_type": "resource_candidates", "positions": [51]},
-            {"source_type": "auto", "input": magnet, "positions": [1]},
-            {"input": magnet, "resource_candidates_ref": reference},
-        ]
-        for arguments in invalid:
+        from app.agent.kernel.ports.sdk_effects import share_transfer_tool
+        tool = share_transfer_tool()
+        valid = {"url": "https://www.guangyapan.com/s/share", "file_ids": ["real-file-201"]}
+        validate_json_schema(valid, tool.input_schema)
+        for arguments in ({}, {"url": valid["url"]}, {**valid, "file_ids": []},
+                          {**valid, "file_ids": [True]}, {**valid, "target": "qb"},
+                          {**valid, "ingest_snapshot_ref": "ref_"+"x"*24}):
             with self.subTest(arguments=arguments), self.assertRaises(ToolPipelineError):
                 validate_json_schema(arguments, tool.input_schema)
 
-    async def test_noop_preparation_returns_without_freezing_or_execution_and_settles_repair(self):
+    async def test_direct_retry_noop_returns_without_freezing_or_execution(self):
         from unittest.mock import Mock
-        for effect in (RiskLevel.WRITE, RiskLevel.DANGER):
+        for effect in (ToolEffect.WRITE, ToolEffect.DANGER):
             with self.subTest(effect=effect):
                 execute = Mock(side_effect=AssertionError("no cloud write"))
-                spec = ToolSpec(name="config.noop", description="预检明确无需变更", risk=effect,
-                    parameters={"type": "object", "required": ["value"], "properties": {"value": {"type": "integer"}}},
-                    validator=dict, requires_confirmation=True,
-                    context_confirmation_preparer=lambda args, ctx: (ToolResult(True, "no_changes", "已符合目标，不执行任何写入"), ""),
-                    context_confirmed_handler=execute)
+                tool = KernelToolSpec(domain="fixture", name="config.noop", description="预检明确无需变更", effect=effect,
+                    input_schema={"type": "object", "required": ["value"], "properties": {"value": {"type": "integer"}}},
+                    validator=dict,
+                    prepare=lambda _args, _ctx: DefaultProjector().project(ToolResult(True, "no_changes", "已符合目标，不执行任何写入")),
+                    execute_confirmed=execute)
                 state = InMemorySessionStateStore()
-                pipeline = ToolPipeline(catalog=catalog_from_tool_specs([spec]), state_store=state)
+                pipeline = ToolPipeline(catalog=ToolCatalog([tool]), state_store=state)
                 context = await context_for(state)
-                with self.assertRaises(ToolPipelineError) as failed:
-                    await pipeline.execute(spec.name, {"value": "invalid"}, context=context)
+                with self.assertRaises(ToolPipelineError):
+                    await pipeline.execute(tool.name, {"value": "invalid"}, context=context)
                 with patch.object(pipeline.effect_store, "freeze", side_effect=AssertionError("must not issue an empty confirmation")):
-                    result = await pipeline.execute("agent.repair", {
-                        "ticket": failed.exception.repair_ticket, "arguments": {"value": 0}}, context=context)
+                    result = await pipeline.execute(tool.name, {"value": 0}, context=context)
                 self.assertIsNone(result.effect_plan)
-                self.assertTrue(result.recovered_failures)
                 self.assertEqual(result.outcome.public_content["status"], "no_changes")
                 self.assertFalse((await state.load(owner="owner", session_id="session")).pending_effect_plan_id)
                 execute.assert_not_called()
@@ -101,17 +77,17 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         for status in ("conflict", "outcome_unknown"):
             with self.subTest(status=status):
                 domain_result = ToolResult(False, status, "最终状态未确认", data={"receipt": "safe-receipt"}, error="请先核验而非重试")
-                spec = ToolSpec(name="config.test_write", description="测试配置写入", risk=RiskLevel.WRITE,
-                    parameters={"type": "object", "properties": {}, "additionalProperties": False},
-                    validator=lambda arguments: arguments, requires_confirmation=True,
-                    context_confirmation_preparer=lambda _args, _ctx: (ToolResult(True, "ready", "预检"), "fingerprint"),
-                    context_confirmed_handler=lambda _args, _snapshot, _ctx, result=domain_result: result,
-                    post_write_verifier=lambda _args, result: result)
-                catalog = catalog_from_tool_specs([spec])
+                tool = KernelToolSpec(domain="fixture", name="config.test_write", description="测试配置写入", effect=ToolEffect.WRITE,
+                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    validator=lambda arguments: arguments,
+                    prepare=lambda _args, _ctx: PreparedEffect(preview={"summary": "预检"}, snapshot_fingerprint="fingerprint"),
+                    execute_confirmed=lambda _args, _snapshot, _ctx, result=domain_result: result,
+                    verify=lambda _args, result, _ctx: result)
+                catalog = ToolCatalog([tool])
                 state = InMemorySessionStateStore()
                 pipeline = ToolPipeline(catalog=catalog, state_store=state)
                 context = await context_for(state)
-                preview = await pipeline.execute(spec.name, {}, context=context)
+                preview = await pipeline.execute(tool.name, {}, context=context)
                 assert preview.effect_plan is not None
                 outcome = await pipeline.execute_confirmed(preview.effect_plan.plan_id, context=context)
                 public = outcome.outcome.public_content
@@ -120,400 +96,86 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(public["data"]["receipt"], "safe-receipt")
                 self.assertEqual(public["error"], "请先核验而非重试")
 
-    async def test_all_existing_atomic_tools_can_be_declared_to_kernel(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        self.assertEqual(len(catalog), len(build_tool_specs()))
-        self.assertGreaterEqual(len(catalog), 153)
-        self.assertFalse(catalog.has("agent.cancel_pending_action"))
-        selection = CapabilityRetriever().retrieve(
-            "规整光鸭云盘动漫目录并按 TMDB 集数重命名",
-            catalog,
-        )
-        self.assertLessEqual(len(selection.tools), 12)
-        self.assertTrue(any(tool.domain == "cloud" for tool in selection.tools))
-        self.assertTrue(all("." not in tool.model_name for tool in selection.tools))
-        self.assertTrue(
-            all(
-                tool.model_definition()["name"] == tool.model_name
-                for tool in selection.tools
-            )
-        )
+    async def test_native_executor_catalog_contains_only_complete_effect_contracts(self):
+        catalog = build_tool_catalog()
+        self.assertTrue(catalog)
+        for tool in catalog.visible():
+            if tool.effect is ToolEffect.READ:
+                self.assertIsNotNone(tool.read)
+            else:
+                self.assertIsNotNone(tool.prepare)
+                self.assertIsNotNone(tool.execute_confirmed)
+            self.assertNotIn(".", tool.model_name)
+            self.assertEqual(tool.model_definition()["name"], tool.model_name)
 
-    async def test_web_search_and_read_are_neighboring_read_capabilities(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        search = catalog.get("web.search")
-        read = catalog.get("web.read")
 
-        self.assertEqual(search.effect, ToolEffect.READ)
-        self.assertEqual(read.effect, ToolEffect.READ)
-        self.assertIn("web.read", search.metadata["related_tools"])
-        self.assertIn("web.search", read.metadata["related_tools"])
-        selection = CapabilityRetriever().retrieve(
-            "搜索 2026 年新番并打开官方公告核对发布日期",
-            catalog,
-        )
-        self.assertIn("web.search", selection.names)
-        self.assertIn("web.read", selection.names)
+    async def test_resource_and_web_search_retire_without_legacy_fallback(self):
+        from app import sdk
+        catalog = build_tool_catalog()
+        for name in ("indexer.search_resources", "web.search", "web.read"):
+            self.assertFalse(catalog.has(name))
+        self.assertIn("resources.search", sdk.METHODS)
+        self.assertIn("resources.present", sdk.METHODS)
 
-    async def test_recent_nsfw_request_selects_web_and_sukebei_search_capabilities(
-        self,
-    ) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        search = catalog.get("indexer.search_resources")
-        selection = CapabilityRetriever().retrieve(
-            "最近有什么新出的步兵资源？",
-            catalog,
-        )
+    async def test_retired_inventory_reads_are_replaced_by_native_sdk(self):
+        from app import sdk
+        catalog = build_tool_catalog()
+        for name in ("library.count_series_episodes", "library.batch_presence"):
+            self.assertFalse(catalog.has(name))
+            with self.assertRaises(KeyError):
+                catalog.get(name)
+        self.assertIn("library.episodes", sdk.METHODS)
 
-        self.assertIn("web.search", selection.names)
-        self.assertIn("indexer.search_resources", selection.names)
-        properties = search.input_schema["properties"]
-        self.assertIn("sort_mode", properties)
-        self.assertIn("published_desc", properties["sort_mode"]["enum"])
-        self.assertIn('sites=["sukebei"]', search.description)
+    async def test_native_download_remains_an_internal_confirmed_effect(self):
+        from app import sdk
+        tool = build_tool_catalog().get("resources.download")
+        self.assertIn(tool.name, sdk.WRITE_METHODS)
+        self.assertIn(tool.effect, (ToolEffect.WRITE, ToolEffect.DANGER))
+        self.assertIsNotNone(tool.prepare)
+        self.assertIsNotNone(tool.execute_confirmed)
 
-    async def test_short_followup_reuses_recent_media_library_context(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = SessionState(
-            owner="owner",
-            session_id="session",
-            conversation=[
-                {
-                    "role": "user",
-                    "content": "黄泉使者 我的 Jellyfin 媒体库中有吗",
-                },
-                {"role": "assistant", "content": "已查询。"},
-            ],
-        )
-        selection = CapabilityRetriever().retrieve(
-            "绿灯军团呢",
-            catalog,
-            context=capability_retrieval_context(state),
-        )
 
-        self.assertIn("library.search", selection.names)
-        self.assertIn("provider.capabilities", selection.names)
-        self.assertIn("provider.query", selection.names)
+    async def test_local_playback_reads_are_native_sdk_capabilities(self) -> None:
+        from app import sdk
+        catalog = build_tool_catalog()
+        methods = {item["name"]: item for item in sdk.describe_methods()}
+        for name in ("library.history", "library.resume", "library.recommend"):
+            self.assertIn(name, methods)
+            self.assertNotIn(name, sdk.WRITE_METHODS)
+        for name in ("media.recommend_from_library", "media.recently_played", "media.continue_watching"):
+            self.assertFalse(catalog.has(name))
+            self.assertFalse(catalog.has(name.replace(".", "__")))
 
-    async def test_resource_version_followup_keeps_inspect_and_submit_tools(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = SessionState(
-            owner="owner",
-            session_id="session",
-            conversation=[
-                {
-                    "role": "user",
-                    "content": "搜索绿灯军团资源，有的话推送到云盘",
-                },
-                {
-                    "role": "assistant",
-                    "content": "找到候选。",
-                    "tool_calls": [
-                        {
-                            "call_id": "search-1",
-                            "name": "indexer.search_resources",
-                            "arguments": {},
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "content": "候选已保存",
-                    "tool_call_id": "search-1",
-                    "tool_name": "indexer.search_resources",
-                },
-                {"role": "assistant", "content": "请选择版本。"},
-            ],
-        )
-        selection = CapabilityRetriever().retrieve(
-            "推送4K版",
-            catalog,
-            context=capability_retrieval_context(state),
-        )
+    async def test_person_filmography_uses_native_sdk_without_retired_inventory_tool(self):
+        from app import sdk
+        catalog = build_tool_catalog()
+        self.assertFalse(catalog.has("discovery.person_filmography"))
+        self.assertFalse(catalog.has("library.batch_presence"))
+        self.assertTrue({"media.people", "media.filmography", "media.credits"} <= sdk.METHODS.keys())
 
-        self.assertIn("indexer.search_resources", selection.names)
-        self.assertIn("ingest.inspect", selection.names)
-        self.assertIn("ingest.submit", selection.names)
-
-    async def test_global_library_count_selects_provider_count_path(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        selection = CapabilityRetriever().retrieve(
-            "我媒体库中有多少资源", catalog
-        )
-
-        self.assertIn("provider.capabilities", selection.names)
-        self.assertIn("provider.query", selection.names)
-
-    async def test_named_library_count_selects_provider_reference_path(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        for message in ("有多少部动漫", "动漫媒体库里有多少部剧集"):
-            with self.subTest(message=message):
-                selection = CapabilityRetriever().retrieve(message, catalog)
-                self.assertIn("provider.capabilities", selection.names)
-                self.assertIn("provider.query", selection.names)
-
-    async def test_mood_recommendation_prioritizes_local_library_capability(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        selection = CapabilityRetriever().retrieve(
-            "今天心情很丧，想看点不用脑子、爆笑的无厘头日番",
-            catalog,
-        )
-
-        self.assertEqual(selection.names[0], "media.recommend_from_library")
-        self.assertIn("discovery.recommend", selection.names)
-        self.assertIn("media.recently_played", selection.names)
-
-    async def test_person_filmography_uses_one_batch_library_comparison(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        selection = CapabilityRetriever().retrieve(
-            "把诺兰导演的所有电影按上映年份排出来，标出我库里缺哪几部",
-            catalog,
-        )
-
-        self.assertIn("discovery.person_filmography", selection.names)
-        self.assertIn("library.batch_presence", selection.names)
-
-    async def test_guangya_sdk_p1_p3_capabilities_are_retrievable(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        cases = {
-            "我的光鸭还剩多少空间": {"guangya.account.status"},
-            "看看光鸭回收站并恢复第一个文件": {
-                "guangya.recycle.list",
-                "guangya.recycle.restore",
-            },
-            "清空光鸭回收站": {"guangya.recycle.clear"},
-            "列出我创建的光鸭分享": {"guangya.share.list"},
-            "把刚才选中的文件创建 7 天分享链接": {"guangya.share.create"},
-            "撤销刚才第一个分享": {"guangya.share.revoke"},
-            "把刚才这个文件复制到备份目录": {"guangya.fs.change.execute"},
-        }
-        for message, expected in cases.items():
-            with self.subTest(message=message):
-                selected = set(
-                    CapabilityRetriever().retrieve(message, catalog).names
-                )
-                self.assertTrue(expected <= selected, (message, selected))
-
-        self.assertFalse(catalog.has("guangya.upload"))
-        self.assertFalse(catalog.has("guangya.upload.status"))
-
-    async def test_guangya_directory_browse_and_correction_prioritize_fs_query(
-        self,
-    ) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = SessionState(
-            owner="owner",
-            session_id="session",
-            conversation=[
-                {
-                    "role": "user",
-                    "content": "先不整理，你可以上我云盘根目录/电视剧目录看下",
-                },
-                {
-                    "role": "assistant",
-                    "content": "尝试检查目录。",
-                    "tool_calls": [
-                        {
-                            "call_id": "scrape-1",
-                            "name": "guangya.directory_scrape.inspect",
-                            "arguments": {},
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "content": "目录刮削当前不可用",
-                    "tool_call_id": "scrape-1",
-                    "tool_name": "guangya.directory_scrape.inspect",
-                },
-                {"role": "user", "content": "是叫你看目录，没叫你刮削检查"},
-                {
-                    "role": "assistant",
-                    "content": "尝试检查目录。",
-                    "tool_calls": [
-                        {
-                            "call_id": "cleanup-1",
-                            "name": "guangya.organize.cleanup.preview",
-                            "arguments": {},
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "content": "扫描到 3 个目录",
-                    "tool_call_id": "cleanup-1",
-                    "tool_name": "guangya.organize.cleanup.preview",
-                },
-            ],
-        )
-        cases = (
-            (
-                "先不整理，你可以上我云盘根目录/电视剧目录看下",
-                None,
-            ),
-            (
-                "是叫你看目录，没叫你刮削检查",
-                capability_retrieval_context(state),
-            ),
-            (
-                "你看不到子目录名称吗",
-                capability_retrieval_context(state),
-            ),
-        )
-
-        for message, context in cases:
-            with self.subTest(message=message):
-                selection = CapabilityRetriever().retrieve(
-                    message,
-                    catalog,
-                    context=context,
-                )
-                self.assertEqual(selection.names[0], "guangya.fs.query")
-                if "没叫你刮削" in message:
-                    self.assertFalse(
-                        any(
-                            name.startswith("guangya.directory_scrape.")
-                            for name in selection.names
-                        )
-                    )
-
-    async def test_existing_read_action_executes_through_new_pipeline_only(
-        self,
-    ) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = InMemorySessionStateStore()
-        pipeline = ToolPipeline(catalog=catalog, state_store=state)
-        result = await pipeline.execute(
-            "agent.runtime_status",
-            {},
-            context=await context_for(state),
-        )
-        self.assertEqual(result.tool.effect, ToolEffect.READ)
-        self.assertTrue(result.outcome.public_content["ok"])
-        self.assertIn("agent_enabled", result.outcome.public_content["data"])
-
-    async def test_guangya_recycle_reference_and_confirmation_close_the_loop(
-        self,
-    ) -> None:
-        class RecycleClient:
-            logged_in = True
-            credential_generation = 7
-
-            def __init__(self) -> None:
-                self.items = [
-                    GuangYaFile(
-                        "private-file-id",
-                        "待恢复.mkv",
-                        False,
-                        size=123,
-                        parent_id="source",
-                    )
-                ]
-
-            def list_recycle(self, **_kwargs):
-                return list(self.items)
-
-            def restore_from_recycle(self, file_ids):
-                selected = {str(item) for item in file_ids}
-                self.items = [
-                    item for item in self.items if item.file_id not in selected
-                ]
-                return "private-task-id"
-
-            def task_status(self, _task_id):
-                return {"data": {"status": "completed", "progress": 100}}
-
-            def close(self):
-                return True
-
-        client = RecycleClient()
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = InMemorySessionStateStore()
-        pipeline = ToolPipeline(catalog=catalog, state_store=state)
-        context = await context_for(state, wait_for_completion=True)
-
-        with patch(
-            "app.agent.domains.guangya.recycle_actions.GuangYaClient",
-            return_value=client,
-        ):
-            listed = await pipeline.execute(
-                "guangya.recycle.list",
-                {"page": 1, "page_size": 50},
-                context=context,
-            )
-            reference = listed.outcome.public_content["reference_arguments"][
-                "guangya_recycle_items_ref"
-            ]
-            self.assertNotIn(
-                "private-file-id", str(listed.outcome.public_content)
-            )
-
-            preview = await pipeline.execute(
-                "guangya.recycle.restore",
-                {
-                    "guangya_recycle_items_ref": reference,
-                    "indices": [1],
-                },
-                context=context,
-            )
-            assert (preview.effect_plan) is not None
-            self.assertEqual(len(client.items), 1)
-
-            completed = await pipeline.execute_confirmed(
-                preview.effect_plan.plan_id,
-                context=context,
-            )
-
-        self.assertTrue(completed.outcome.public_content["data"]["verified"])
-        self.assertEqual(client.items, [])
-        self.assertNotIn(
-            "private-task-id", str(completed.outcome.public_content)
-        )
-
-    async def test_agent_capabilities_returns_compact_domain_summary(self) -> None:
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = InMemorySessionStateStore()
-        discovery = CapabilityDiscovery(catalog, context={})
-        result = await ToolPipeline(catalog=catalog, state_store=state).execute(
-            "agent.capabilities",
-            {},
-            context=replace(await context_for(state), capability_search=discovery.search),
-        )
-
-        public = result.outcome.public_content
-        # 全目录还可能包含当前上下文不可见的内核工具。
-        self.assertGreater(public["data"]["total_tools"], 0)
-        self.assertLessEqual(public["data"]["total_tools"], len(catalog))
-        self.assertEqual(public["data"]["total_tools"], sum(g["tool_count"] for g in public["data"]["groups"]))
-        self.assertEqual(public["data"]["total_tools"], public["data"]["discovery"]["visible_count"])
-        self.assertGreaterEqual(len(public["data"]["groups"]), 6)
-        self.assertNotIn("tools", public["data"])
-        self.assertNotIn("parameters", str(public))
-        self.assertLess(len(result.outcome.model_content), 8_000)
 
     async def test_domain_owned_opaque_refs_are_not_misresolved_as_kernel_refs(
         self,
     ) -> None:
         captured = {}
 
-        def handler(arguments):
+        def handler(arguments, _context):
             captured.update(arguments)
             return ToolResult(True, "success", "领域引用已接收")
 
-        spec = ToolSpec(
-            name="cloud.domain_ref_check",
-            description="验证领域自己的 observation_ref",
-            risk=RiskLevel.READ,
-            parameters={
+        tool = KernelToolSpec(domain="fixture",
+            name="fixture.domain_ref_check",
+            description="验证夹具自有字段透传",
+            effect=ToolEffect.READ,
+            input_schema={
                 "type": "object",
-                "required": ["observation_ref"],
-                "properties": {"observation_ref": {"type": "string"}},
+                "required": ["fixture_payload"],
+                "properties": {"fixture_payload": {"type": "string"}},
                 "additionalProperties": False,
             },
             validator=lambda value: dict(value),
-            handler=handler,
+            read=handler,
         )
-        tool = adapt_tool_spec(spec)
         from app.agent.kernel.capabilities import ToolCatalog
 
         catalog = ToolCatalog([tool])
@@ -521,32 +183,31 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         pipeline = ToolPipeline(catalog=catalog, state_store=state)
         await pipeline.execute(
             tool.name,
-            {"observation_ref": "GYOBS-v1-domain-owned"},
+            {"fixture_payload": "fixture-value"},
             context=await context_for(state),
         )
-        self.assertEqual(captured["observation_ref"], "GYOBS-v1-domain-owned")
+        self.assertEqual(captured["fixture_payload"], "fixture-value")
 
     async def test_unexpected_domain_exception_cannot_leak_paths_or_credentials(
         self,
     ) -> None:
-        def handler(_arguments):
+        def handler(_arguments, _context):
             raise RuntimeError(
                 "failed at /home/aio/private/media with token=sk-secretsecretsecret1234"
             )
 
-        spec = ToolSpec(
+        tool = KernelToolSpec(domain="fixture",
             name="cloud.failure_boundary",
             description="验证异常边界",
-            risk=RiskLevel.READ,
-            parameters={
+            effect=ToolEffect.READ,
+            input_schema={
                 "type": "object",
                 "properties": {},
                 "additionalProperties": False,
             },
             validator=lambda value: dict(value),
-            handler=handler,
+            read=handler,
         )
-        tool = adapt_tool_spec(spec)
         from app.agent.kernel.capabilities import ToolCatalog
 
         catalog = ToolCatalog([tool])
@@ -557,33 +218,30 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
             await pipeline.execute(tool.name, {}, context=await context_for(state))
 
         self.assertEqual(raised.exception.code, "tool_execution_failed")
-        self.assertEqual(str(raised.exception), "领域能力暂时不可用")
+        self.assertEqual(str(raised.exception), "工具执行失败")
         self.assertNotIn("/home/aio", str(raised.exception))
         self.assertNotIn("sk-secret", str(raised.exception))
 
     async def test_declared_safe_domain_error_is_preserved_after_sanitizing(
         self,
     ) -> None:
-        from app.agent.errors import AgentToolError
-
-        def handler(_arguments):
-            raise AgentToolError(
+        def handler(_arguments, _context):
+            raise ToolPipelineError(
                 "目标状态已变化,请重新检查", code="precondition_failed"
             )
 
-        spec = ToolSpec(
+        tool = KernelToolSpec(domain="fixture",
             name="cloud.safe_failure",
             description="验证安全领域错误",
-            risk=RiskLevel.READ,
-            parameters={
+            effect=ToolEffect.READ,
+            input_schema={
                 "type": "object",
                 "properties": {},
                 "additionalProperties": False,
             },
             validator=lambda value: dict(value),
-            handler=handler,
+            read=handler,
         )
-        tool = adapt_tool_spec(spec)
         from app.agent.kernel.capabilities import ToolCatalog
 
         catalog = ToolCatalog([tool])
@@ -596,43 +254,35 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "precondition_failed")
         self.assertEqual(str(raised.exception), "目标状态已变化,请重新检查")
 
-    async def test_existing_write_contract_becomes_frozen_effect(self) -> None:
+    async def test_native_write_contract_becomes_frozen_effect(self) -> None:
         calls = {"execute": 0}
 
         def validate(arguments):
             return {"name": str(arguments["name"])}
 
         def prepare(arguments, _context):
-            return ToolResult(
-                True, "preview", f"将更新 {arguments['name']}"
-            ), "fingerprint-v1"
-
-        # Keep the real legacy tuple contract explicit.
-        def legacy_prepare(arguments, _context):
-            result, fingerprint = prepare(arguments, _context)
-            return result, fingerprint
+            return PreparedEffect(preview={"summary": f"将更新 {arguments['name']}"},
+                                  snapshot_fingerprint="fingerprint-v1")
 
         def execute(arguments, expected, _context):
             self.assertEqual(expected, "fingerprint-v1")
             calls["execute"] += 1
             return ToolResult(True, "success", f"已更新 {arguments['name']}")
 
-        legacy = ToolSpec(
+        tool = KernelToolSpec(domain="fixture",
             name="config.example_update",
             description="更新示例配置",
-            risk=RiskLevel.WRITE,
-            parameters={
+            effect=ToolEffect.WRITE,
+            input_schema={
                 "type": "object",
                 "required": ["name"],
                 "properties": {"name": {"type": "string"}},
                 "additionalProperties": False,
             },
             validator=validate,
-            requires_confirmation=True,
-            context_confirmation_preparer=legacy_prepare,
-            context_confirmed_handler=execute,
+            prepare=prepare,
+            execute_confirmed=execute,
         )
-        tool = adapt_tool_spec(legacy)
         state = InMemorySessionStateStore()
         from app.agent.kernel.capabilities import ToolCatalog
 

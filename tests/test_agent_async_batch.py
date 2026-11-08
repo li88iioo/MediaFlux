@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from copy import deepcopy
 from dataclasses import replace
 from functools import partial
@@ -17,42 +18,41 @@ from app.agent import effect_completion as effects
 from app.agent import rate_limit as rates
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.feature_gate import initialize_runtime_fence
-from app.agent.kernel import batch_effects
+from app.agent.kernel import batch_effects, sandbox
 from app.agent.kernel.bootstrap import _capture_creation_binding
 from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
     KernelToolSpec,
     ToolCatalog,
     ToolEffect,
 )
 from app.agent.kernel.continuation import CLAIM_SECONDS
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.events import AgentEventType as Event
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports import existing_actions
+from app.agent.kernel.ports import sdk_effects
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput, CancellationToken
-from app.agent.kernel.tool_calls import ToolCallContext
-from app.agent.models import ToolContext, ToolResult
+from app.agent.kernel.tool_calls import PreparedEffect, ToolCallContext
+from app.agent.models import ToolResult
 from app.modules import organize_tasks
 from app.repositories import organize_operation_jobs as jobs
+from tests import test_agent_session_result as session_result_tests
 from tests.support import isolated_test_database
 from tests.test_agent_batch_confirmation import batch_quota as shared_batch_quota
-from tests.test_agent_batch_confirmation import capture
+from tests.test_agent_batch_confirmation import capture, register_sdk_fixture
 from tests.test_agent_effect_continuation import (
-    _domain_arguments,
     _offline_runtime,
     _OfflineClient,
     _paused_manager,
     _run_real_worker,
-    _spec,
 )
 from tests.test_agent_task_first_slice import NativeScript
 
 batch_quota = shared_batch_quota
+native_workspace = session_result_tests.native_workspace
 OWNER, SID = "async-batch-owner", "async-batch-session"
-FIRST, TAIL = "guangya.fs.change.execute", "test.preference"
+FIRST, TAIL = "cloud.change", "test.preference"
 GOAL = "组合变更：把 source 视频改名为 admitted.mp4，成功后保存偏好 4K，只确认一次。"
 
 
@@ -60,7 +60,7 @@ class BatchScript(NativeScript):
     def __init__(self, arguments=None, *, foreground=False):
         super().__init__("tmdb")
         self.arguments = arguments
-        self.steps = ["discover", "batch"] if arguments is not None else ["finish"]
+        self.steps = ["batch"] if arguments is not None else ["finish"]
         if foreground:
             self.steps.append("finish")
 
@@ -71,8 +71,7 @@ class BatchScript(NativeScript):
         if step == "finish":
             message = {"content": "请以本次组合的真实回执为准。"}
         else:
-            name, args = (("agent__capabilities", {"tool_names": ["agent.batch"]})
-                          if step == "discover" else ("agent__batch", self.arguments))
+            name, args = "agent__run_code", {"code": f"from mf import session\nsession.batch(**{self.arguments!r})"}
             message = {"tool_calls": [{"id": "async-" + step, "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args)}}]}
         return httpx.Response(200, json={"choices": [{"message": message,
@@ -82,18 +81,17 @@ class BatchScript(NativeScript):
 class AsyncBatchRig:
     def __init__(self, client, stack):
         self.client, self.stack = client, stack
+        self.monkeypatch = None
         self.store = SQLiteKernelStore()
         self.worker: organize_tasks.OrganizeTaskManager | None = None
         self.value, self.attempts, self.verified = "before", [], []
         self.rate_limiter, self.denied = None, set()
         self.tail_effect = ToolEffect.WRITE
         self.client.rename = Mock(wraps=self.client.rename)
-        spec = _spec("fs", actions=self.stack.domain_actions)
-        self.prepare = Mock(wraps=spec.context_confirmation_preparer)
-        tracked = existing_actions.adapt_tool_spec(replace(spec, batch_mode="tracked",
-            workflow="guangya_fs_change", workflow_stage=20, context_confirmation_preparer=self.prepare))
+        tracked = sdk_effects.cloud_change_tool()
+        self.prepare = Mock(wraps=tracked.prepare)
         self.submit = Mock(wraps=tracked.execute_confirmed)
-        self.tracked = replace(tracked, execute_confirmed=self.submit)
+        self.tracked = replace(tracked, prepare=self.prepare, execute_confirmed=self.submit)
 
     def tail(self):
         def snapshot(arguments):
@@ -131,25 +129,27 @@ class AsyncBatchRig:
     def session(self, script, store=None, *, extra=()):
         store = self.store if store is None else store
         catalog = ToolCatalog([self.tracked, self.tail(), *extra])
+        register_sdk_fixture(self.monkeypatch, [self.tail(), *extra])
         pipeline = ToolPipeline(catalog=catalog, state_store=store,
             rate_limiter=self.rate_limiter,
             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
-        session = AgentSession(model=script.adapter, catalog=catalog, retriever=CapabilityRetriever(maximum=10),
+        catalog.register(sandbox.run_code_tool(pipeline))
+        session = AgentSession(model=script.adapter, catalog=catalog, model_tools=("agent.run_code",),
                                pipeline=pipeline, state_store=store, journal=store)
         session.continuation_binding = _capture_creation_binding()
         return session
 
-    async def start(self, *, foreground=False, invalid="", third=None):
-        arguments = _domain_arguments("fs", self.client, ToolContext(owner=OWNER, session_id=SID), self.stack)
-        steps = [{"tool": FIRST, "arguments": arguments}, {"tool": TAIL, "arguments": {"quality": "4K"}}]
+    async def start(self, *, foreground=False, invalid="", third=None, operation="rename"):
+        arguments = {"operations": [{"op": operation, "file_id": "rename", **({"new_name": "admitted.mp4"} if operation == "rename" else {})}], "trigger_strm": False}
+        steps = [{"method": FIRST, "arguments": arguments}, {"method": TAIL, "arguments": {"quality": "4K"}}]
         extra = (third,) if third is not None else ()
         if third is not None:
-            steps.append({"tool": third.name, "arguments": {}})
+            steps.append({"method": third.name, "arguments": {}})
         if invalid == "trailing":
             steps.reverse()
         elif invalid == "multiple":
             extra = (replace(self.tracked, name="test.other_tracked", model_name=""),)
-            steps.insert(1, {"tool": extra[0].name, "arguments": arguments})
+            steps.insert(1, {"method": extra[0].name, "arguments": arguments})
         self.script = BatchScript({"steps": steps}, foreground=foreground or bool(invalid))
         self.source = self.session(self.script, extra=extra)
         goal = GOAL + ("另将影片加入收藏。" if third is not None else "")
@@ -158,7 +158,7 @@ class AsyncBatchRig:
             assert not self.script.steps
             return view, events
         assert view.approval is not None
-        assert view.status == "approval_required" and view.approval.tool_name == "agent.batch"
+        assert view.status == "approval_required" and view.approval.tool_name == "session.batch"
         self.plan = await self.source.pipeline.get_pending_plan(owner=OWNER, session_id=SID)
         assert self.plan is not None
         assert view.approval is not None
@@ -180,12 +180,13 @@ class AsyncBatchRig:
         assert get_organize_operation_job_result["status"] == "completed"
 
     async def confirm(self, *, foreground=False):
+        original_wait = effects.wait_for_effect_completion
         async def finish_before_wait(result, **options):
             self.complete_job()
             with patch.object(organize_tasks, "get_organize_manager", lambda: self.worker):
-                return await effects.wait_for_effect_completion(result, timeout_seconds=0, **options)
-        wait = finish_before_wait if foreground else partial(effects.wait_for_effect_completion, timeout_seconds=0)
-        with patch.object(existing_actions, "wait_for_effect_completion", wait):
+                return await original_wait(result, timeout_seconds=0, **options)
+        wait = finish_before_wait if foreground else partial(original_wait, timeout_seconds=0)
+        with patch.object(effects, "wait_for_effect_completion", wait):
             assert self.plan is not None
             return await capture(self.source.confirm(owner=OWNER, session_id=SID, plan_id=self.plan.plan_id, channel="web"))
 
@@ -229,11 +230,19 @@ class AsyncBatchRig:
 
 
 @pytest.fixture
-def rig(tmp_path):
+def rig(tmp_path, monkeypatch, native_workspace):
     client = _OfflineClient()
+    connect = socket.socket.connect
     with isolated_test_database(), _offline_runtime(tmp_path, client) as stack, _paused_manager():
         initialize_runtime_fence()
-        yield AsyncBatchRig(client, stack)
+        def local_connect(sock, address):
+            assert sock.family == socket.AF_UNIX, "离线工作区仅允许Unix IPC"
+            return connect(sock, address)
+        stack.enter_context(patch.object(socket.socket, "connect", local_connect))
+        stack.enter_context(patch.object(sdk_effects, "GuangYaClient", lambda: client))
+        rig = AsyncBatchRig(client, stack)
+        rig.monkeypatch = monkeypatch
+        yield rig
 
 
 @pytest.mark.parametrize("foreground", [False, True])
@@ -252,7 +261,7 @@ def test_tracked_and_tail_use_last_confirmed_permit_once_across_resume(rig, batc
             assert final.status == "success"
         else:
             assert final.status == "waiting"
-            assert [name for name, stage, _ in debits if stage] == ["agent.batch", FIRST]
+            assert [name for name, stage, _ in debits if stage] == ["session.batch", FIRST]
             rig.complete_job()
             assert await rig.poll() == 1
             candidate, = await rig.store.due_continuations()
@@ -263,7 +272,7 @@ def test_tracked_and_tail_use_last_confirmed_permit_once_across_resume(rig, batc
         assert row["batch_progress"]["done"] is True
         assert row["final_result"]["data"]["completed"] == 2
         confirmed = [(name, decision) for name, stage, decision in debits if stage == "confirmed"]
-        expected = ["agent.batch", FIRST, *([] if foreground else ["agent.batch"]), TAIL]
+        expected = ["session.batch", FIRST, *([] if foreground else ["session.batch"]), TAIL]
         assert [name for name, _ in confirmed] == expected
         assert all(d.allowed and d.remaining == 0 for name, d in confirmed if name in (FIRST, TAIL))
         before_replay = list(debits)
@@ -289,7 +298,7 @@ def test_tail_preflight_failure_never_submits_tracked_first_or_consumes_child_pe
         code = "confirmation_stale" if change == "snapshot" else "authorization_denied"
         assert any(e.type is Event.EFFECT_FAILED and e.payload.get("code") == code for e in events)
         assert not rig.submit.called and not rig.client.rename.called and not rig.job_rows() and not rig.attempts
-        assert [name for name, stage, _ in debits if stage] == ["agent.batch"]
+        assert [name for name, stage, _ in debits if stage] == ["session.batch"]
         before_replay = list(debits)
         replay, _ = await capture(rig.source.confirm(owner=OWNER, session_id=SID, plan_id=rig.plan.plan_id))
         assert replay.status == "failed" and debits == before_replay
@@ -297,8 +306,8 @@ def test_tail_preflight_failure_never_submits_tracked_first_or_consumes_child_pe
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("risk", [ToolEffect.WRITE, ToolEffect.DANGER])
-def test_pending_poll_cold_resume_preserves_frozen_parent_and_never_replays(rig, risk):
+@pytest.mark.parametrize("risk,legacy", [(ToolEffect.WRITE, False), (ToolEffect.DANGER, False), (ToolEffect.WRITE, True)])
+def test_pending_poll_cold_resume_preserves_frozen_parent_and_never_replays(rig, risk, legacy):
     async def run():
         rig.tail_effect = risk
         preview, events = await rig.start()
@@ -314,11 +323,18 @@ def test_pending_poll_cold_resume_preserves_frozen_parent_and_never_replays(rig,
         seed = json.loads(completion_receipts._completion_cipher().decrypt(wait["sealed"].encode()))
         scope = rig.submit.call_args.args[2].completion_scope
         assert scope.plan_id == seed["plan_id"] == rig.plan.plan_id
-        assert seed["tool"] == "agent.batch" and seed["origin"] == scope.origin
+        assert seed["tool"] == "session.batch" and seed["origin"] == scope.origin
         assert seed["origin"]["arguments"] == rig.plan.arguments
         assert seed["origin"]["batch_plan"]["snapshot"] == rig.plan.snapshot_fingerprint
         assert seed["origin"]["batch_plan"]["effect"] == risk.value
         assert "batch_progress" not in wait and await rig.store.due_continuations() == []
+        if legacy:
+            # 迁移前已签名续行：旧父标识，descriptor没有tool；原参数/任务/检查点不变。
+            seed["tool"] = "agent.batch"
+            del seed["origin"]["batch_plan"]["tool"]
+            sealed = completion_receipts._completion_cipher().encrypt(json.dumps(seed).encode()).decode()
+            await rig.store.update_effect_state(owner=OWNER, session_id=SID,
+                change=lambda state: state.metadata["effect_waits"][rig.plan.plan_id].update(sealed=sealed))
         users = [r for r in state.conversation if r["role"] == "user"]
         rig.complete_job()
         cold = SQLiteKernelStore()
@@ -469,7 +485,7 @@ def test_tracked_must_be_unique_and_first_before_any_child_prepares(rig, invalid
     async def run():
         view, events = await rig.start(invalid=invalid)
         assert view.approval is None
-        assert any(e.type is Event.TOOL_FAILED and e.payload.get("code") == "invalid_arguments" for e in events)
+        assert "invalid_arguments" in json.dumps([dict(e.payload) for e in events], ensure_ascii=False)
         assert not rig.prepare.called and not rig.submit.called and not rig.attempts and not rig.job_rows()
     asyncio.run(run())
 
@@ -636,4 +652,20 @@ def test_stop_while_unprotecting_batch_prevents_any_model_call(rig):
         assert not await session.resume_wait(candidate=candidate)
         assert await cold.due_continuations() == []
         await rig.assert_once()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation,risk", [("rename", ToolEffect.WRITE), ("trash", ToolEffect.DANGER)])
+def test_cloud_parameter_risk_reaches_parent_child_and_receipt(rig, operation, risk):
+    async def run():
+        preview, _ = await rig.start(operation=operation)
+        assert rig.plan.effect is risk and preview.approval.effect == risk.value
+        waiting, _ = await rig.confirm()
+        assert waiting.status == "waiting"
+        child = rig.submit.call_args.args[2].active_effect_plan
+        assert child.effect is risk
+        _, wait = await rig.row()
+        seed = json.loads(completion_receipts._completion_cipher().decrypt(wait["sealed"].encode()))
+        assert seed["origin"]["batch_plan"]["effect"] == risk.value
+        assert not rig.attempts and len(rig.job_rows()) == 1
     asyncio.run(run())

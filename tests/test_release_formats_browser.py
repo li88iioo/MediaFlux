@@ -125,9 +125,14 @@ class ReleaseFormatsBrowserTests(InitializedWebTestCase):
         from app.agent.kernel.bootstrap import build_agent_kernel_runtime
         from app.modules.recognition import formats
         from app.modules.scraper import _parse_release_core
-        from tests.test_agent_release_format_kernel import MESSAGE, TeachingModel
+        from tests.test_agent_release_format_kernel import TeachingModel
         from tests.test_release_formats import PARENT, TEMPLATE, filename
 
+        message = (
+            f"这些文件集号识别错了，教会你这个发布格式以后复用。父目录是{PARENT}。"
+            f"{filename(13)} 是星海航行第13集；{filename(14)} 是第14集。r2是修订版。"
+            f"另请批量核对{filename(15)}和unrelated.mkv。请先批量预览，再让我确认保存。"
+        )
         with self.real_app_page() as (page, _client, errors):
             model = TeachingModel()
             runtime = build_agent_kernel_runtime(model=model)
@@ -137,7 +142,7 @@ class ReleaseFormatsBrowserTests(InitializedWebTestCase):
                 self.assertEqual(page.locator("#agentPrompt").input_value(), "")
                 self.assertEqual(model.requests, [])
                 self.assertEqual(formats.list_rules(), [])
-                page.locator("#agentPrompt").fill(MESSAGE)
+                page.locator("#agentPrompt").fill(message)
                 page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
                 card = page.locator(".agent-confirmation-card")
                 card.wait_for()
@@ -152,5 +157,5 @@ class ReleaseFormatsBrowserTests(InitializedWebTestCase):
                 page.wait_for_function("() => document.querySelector('.agent-result-card')?.innerText.includes('已保存')")
                 self.assertEqual(len(formats.list_rules()), 1)
                 self.assertEqual(_parse_release_core(filename(15), PARENT).context.episode, 15)
-                self.assertEqual(len(model.requests), 3)
+                self.assertEqual(len(model.requests), 2)
                 self.assertEqual(errors, [])

@@ -1,59 +1,16 @@
-"""Media Agent 工作区标题搜索的安全、路由与 API 回归测试。"""
+"""公共工作区搜索的SQLite、分页、真实ID与来源失败回归。"""
 
 from __future__ import annotations
 
 import json
-import unittest
 from unittest.mock import patch
 
+import pytest
+
 from app import database as db
-from app.agent.domains.workspace.actions import (
-    search_workspace,
-    workspace_search_arguments,
-)
-from app.agent.errors import AgentToolError
 from app.clients.base import MediaItem
+from app.modules import workspace_search as service
 from tests.support import IsolatedDatabaseTestCase
-
-
-def _identity(arguments):
-    return dict(arguments)
-
-
-def _empty_records(*_args, **_kwargs):
-    return {"items": [], "truncated": False}
-
-
-class WorkspaceSearchArgumentTests(unittest.TestCase):
-    def test_arguments_normalize_sections_and_reject_unsafe_shapes(self):
-        self.assertEqual(
-            workspace_search_arguments(
-                {"query": "  沙丘２  ", "sections": ["downloads", "library"]}
-            ),
-            {"query": "沙丘2", "sections": ["library", "downloads"]},
-        )
-        self.assertEqual(
-            workspace_search_arguments({"query": "沙丘2"})["sections"],
-            ["library", "rss", "downloads", "organize", "local_media"],
-        )
-        invalid = (
-            {},
-            {"query": ""},
-            {"query": "x\ny"},
-            {"query": "x" * 121},
-            {"query": "x", "sections": []},
-            {"query": "x", "sections": "rss"},
-            {"query": "x", "sections": ["rss", "rss"]},
-            {"query": "x", "sections": ["unknown"]},
-            {"query": "x", "token": "secret"},
-            {"query": "Bearer PRIVATE-CREDENTIAL /private/data"},
-            {"query": "www.private.example/library"},
-            {"query": "ghp_abcdefghijklmnopqrstuvwxyz1234567890"},
-            {"query": "tmdb_id=12345678"},
-        )
-        for arguments in invalid:
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                workspace_search_arguments(arguments)
 
 
 class WorkspaceSearchDataTests(IsolatedDatabaseTestCase):
@@ -148,39 +105,37 @@ class WorkspaceSearchDataTests(IsolatedDatabaseTestCase):
                 ),
             )
 
-    def test_real_database_projection_and_media_server_projection_do_not_leak(self):
+    def test_public_sources_preserve_real_identifiers_without_private_payload(self):
         self._seed_sensitive_records()
         media_item = MediaItem(
-            id="PRIVATE-MEDIA-ID",
-            name="沙丘2",
-            type="Movie",
-            year="2024",
-            overview="token=PRIVATE-OVERVIEW",
-            web_url="https://private.example/media/PRIVATE-MEDIA-ID",
-            primary_image="PRIVATE-IMAGE",
+            id="media-real-id", name="沙丘2", type="Movie", year="2024"
         )
         with patch(
-            "app.agent.domains.workspace.actions.search_media_servers",
+            "app.services._search_sources",
             return_value=[
                 {
                     "server_type": "jellyfin",
-                    "server_name": "PRIVATE-SERVER-NAME",
+                    "server_name": "Cinema",
                     "items": [media_item],
+                    "total": 1,
+                    "has_more": False,
+                    "next_offset": None,
                 }
             ],
         ):
-            result = search_workspace(workspace_search_arguments({"query": "沙丘2"}))
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.data["returned"], 5)
-        self.assertTrue(result.data["network_accessed"])
-        self.assertTrue(result.data["database_accessed"])
-        self.assertFalse(result.data["filesystem_scanned"])
-        self.assertEqual(
-            [section["source"] for section in result.data["sections"]],
-            ["library", "rss", "downloads", "organize", "local_media"],
-        )
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+            result = service.search("沙丘２")
+        assert result["ok"] and result["status"] == "success"
+        data = result["data"]
+        assert data["returned"] == 5 and data["network_accessed"]
+        assert data["database_accessed"] and not data["filesystem_scanned"]
+        sections = {section["source"]: section for section in data["sections"]}
+        assert sections["library"]["items"][0]["id"] == "media-real-id"
+        assert sections["rss"]["items"][0]["id"] > 0
+        assert sections["downloads"]["items"][0]["record_type"] == "log"
+        assert sections["downloads"]["items"][0]["id"] > 0
+        assert sections["organize"]["items"][0]["file_id"] == "PRIVATE-FILE-ID"
+        assert sections["local_media"]["items"][0]["id"] > 0
+        text = json.dumps(result)
         for secret in (
             "PRIVATE-RSS",
             "PRIVATE-RULE",
@@ -189,141 +144,122 @@ class WorkspaceSearchDataTests(IsolatedDatabaseTestCase):
             "/private",
             "PRIVATE-TASK-ID",
             "PRIVATE-DOWNLOAD",
-            "PRIVATE-FILE-ID",
             "PRIVATE-ORGANIZE",
-            "PRIVATE-QB-HASH",
             "PRIVATE-OP-TOKEN",
-            "PRIVATE-TMDB-ID",
-            "PRIVATE-LOCAL",
-            "PRIVATE-MEDIA-ID",
-            "PRIVATE-OVERVIEW",
-            "PRIVATE-IMAGE",
-            "PRIVATE-SERVER-NAME",
-            "private.example",
+            "PRIVATE-LOCAL-ERROR",
         ):
-            self.assertNotIn(secret, serialized)
+            assert secret not in text
 
-    def test_like_wildcards_are_treated_as_literal_title_characters(self):
+    def test_sqlite_more_than_eight_rows_all_pages_ids_and_literal_wildcards(self):
         stamp = db.now()
         with db.get_conn() as conn:
-            rss_id = conn.execute(
+            subscription = conn.execute(
                 "INSERT INTO rss_items(name,urls,created_at,updated_at) VALUES(?,?,?,?)",
                 ("demo", "https://example.invalid/rss", stamp, stamp),
             ).lastrowid
-            conn.execute(
-                "INSERT INTO rss_entries(rss_item_id,title,status,created_at) VALUES(?,?,?,?)",
-                (rss_id, "100% 完成", "pending", stamp),
-            )
-            conn.execute(
-                "INSERT INTO rss_entries(rss_item_id,title,status,created_at) VALUES(?,?,?,?)",
-                (rss_id, "普通条目", "pending", stamp),
-            )
-        result = db.search_agent_workspace_rss("%", limit=8)
-        self.assertEqual([item["title"] for item in result["items"]], ["100% 完成"])
+            ids = [
+                conn.execute(
+                    "INSERT INTO rss_entries(rss_item_id,title,status,created_at) VALUES(?,?,?,?)",
+                    (subscription, f"Dune 100% {index}", "pending", stamp),
+                ).lastrowid
+                for index in range(23)
+            ]
+        read_ids, offset = [], 0
+        while True:
+            result = service.search("%", ["rss"], limit=7, offset=offset)
+            data = result["data"]
+            (section,) = data["sections"]
+            read_ids.extend(item["id"] for item in section["items"])
+            assert section["has_more"] == data["has_more"]
+            if not data["has_more"]:
+                assert data["next_offset"] is None
+                break
+            offset = data["next_offset"]
+        assert read_ids == list(reversed(ids)) and len(set(read_ids)) == 23
+        assert service.search("Dune", ["rss"])["data"]["returned"] == 20
+        assert db.search_workspace_rss("_")["items"] == []
 
-    def test_source_failure_is_isolated_and_error_detail_is_hidden(self):
-        with (
-            patch("app.agent.domains.workspace.actions.search_media_servers", return_value=[]),
-            patch(
-                "app.agent.domains.workspace.actions.db.search_agent_workspace_rss",
-                side_effect=RuntimeError("token=PRIVATE-SOURCE-ERROR"),
-            ),
-            patch(
-                "app.agent.domains.workspace.actions.db.search_agent_workspace_downloads",
-                side_effect=_empty_records,
-            ),
-            patch(
-                "app.agent.domains.workspace.actions.db.search_agent_workspace_organize",
-                side_effect=_empty_records,
-            ),
-            patch(
-                "app.agent.domains.workspace.actions.db.search_agent_workspace_local_media",
-                side_effect=_empty_records,
-            ),
+    def test_download_union_pagination_keeps_request_ids_distinct_from_log_ids(self):
+        stamp = db.now()
+        with db.get_conn() as conn:
+            request, _ = db.create_download_request(
+                "workspace-search", "magnet", title="Dune", origin="agent"
+            )
+            log = conn.execute(
+                "INSERT INTO download_log(source,title,status,request_id,created_at) VALUES(?,?,?,?,?)",
+                ("qb", "Dune", "submitted", request, stamp),
+            ).lastrowid
+        first = service.search("Dune", ["downloads"], limit=1)
+        second = service.search(
+            "Dune", ["downloads"], limit=1, offset=first["data"]["next_offset"]
+        )
+        rows = (
+            first["data"]["sections"][0]["items"]
+            + second["data"]["sections"][0]["items"]
+        )
+        assert {(row["record_type"], row["id"]) for row in rows} == {
+            ("log", log),
+            ("request", request),
+        }
+        assert all(row["request_id"] == request for row in rows)
+        assert not second["data"]["has_more"]
+
+    def test_failures_keep_other_sources_and_unknown_pagination(self):
+        self._seed_sensitive_records()
+        with patch.object(
+            db, "search_workspace_rss", side_effect=RuntimeError("token=PRIVATE-ERROR")
         ):
-            result = search_workspace(workspace_search_arguments({"query": "沙丘2"}))
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "partial")
-        rss = next(
+            result = service.search("沙丘2", ["rss", "downloads"])
+        assert result["ok"] and result["status"] == "partial"
+        assert result["data"]["returned"] == 1
+        assert result["data"]["has_more"] is None
+        assert result["data"]["unavailable_sources"] == ["rss"]
+        assert "PRIVATE-ERROR" not in json.dumps(result)
+        with patch.object(db, "search_workspace_rss", side_effect=RuntimeError):
+            result = service.search("沙丘2", ["rss"])
+        assert not result["ok"] and result["status"] == "unavailable"
+        assert result["data"]["has_more"] is None
 
-                section
-                for section in result.data["sections"]
-                if section["source"] == "rss"
+    def test_missing_or_null_items_are_not_empty(self):
+        for raw in ({}, {"items": None}):
+            with patch.object(db, "search_workspace_rss", return_value=raw):
+                result = service.search("沙丘", ["rss"])
+            assert result["status"] == "unavailable"
 
+    def test_media_partial_and_server_pagination_survive_with_no_flat_limit(self):
+        good = {
+            "server_type": "jellyfin",
+            "items": [
+                MediaItem(id=f"j-{i}", name="Dune", type="Movie") for i in range(2)
+            ],
+            "total": 3,
+            "has_more": True,
+            "next_offset": 2,
+        }
+        bad = {"server_type": "emby", "items": [], "error": "offline"}
+        with patch("app.services._search_sources", return_value=[good, bad]) as reader:
+            result = service.search("Dune", ["library"], limit=2)
+        reader.assert_called_once_with(
+            "Dune", 2, offset=0, search_by="title", media_type="all", count_only=False
         )
-        self.assertEqual(rss["status"], "unavailable")
-        self.assertNotIn(
-            "PRIVATE-SOURCE-ERROR", json.dumps(result.to_dict(), ensure_ascii=False)
-        )
+        assert result["status"] == "partial" and result["data"]["has_more"] is True
+        (section,) = result["data"]["sections"]
+        assert section["next_offset"] == 2 and len(section["sources"]) == 2
+        assert [row["id"] for row in section["items"]] == ["j-0", "j-1"]
+        good2 = {
+            **good,
+            "server_type": "emby",
+            "items": [MediaItem(id="e-1", name="Dune", type="Movie")],
+            "total": 1,
+            "has_more": False,
+            "next_offset": None,
+        }
+        with patch("app.services._search_sources", return_value=[good, good2]):
+            result = service.search("Dune", ["library"], limit=2)
+        assert result["data"]["returned"] == 3
 
-    def test_missing_or_null_items_remain_unavailable_instead_of_empty(self):
-        for raw, expected_status in (({}, "unavailable"), ({"items": None}, "unavailable"),
-                                     ({"items": []}, "empty")):
-            with self.subTest(raw=raw), patch(
-                "app.agent.domains.workspace.actions.db.search_agent_workspace_rss",
-                return_value=raw,
-            ):
-                result = search_workspace(
-                    workspace_search_arguments({"query": "沙丘", "sections": ["rss"]})
-                )
-            self.assertEqual(result.data["sections"][0]["status"], expected_status)
-            self.assertEqual(result.data["sections"][0]["items"], [])
-
-    def test_untrusted_titles_dates_years_and_hashes_are_redacted(self):
-        malicious = (
-            "沙丘 file://private/share",
-            "沙丘 smb://private/share",
-            "沙丘 ../private/file.mkv",
-            "沙丘 Bearer PRIVATE-CREDENTIAL",
-            "沙丘 token PRIVATE-CREDENTIAL",
-            "沙丘 0123456789abcdef0123456789abcdef01234567",
-            "沙丘 Downloads/Dune.mkv",
-            "沙丘 Downloads\\Dune.mkv",
-            "沙丘 www.private.example/library",
-            "沙丘 alice:PRIVATE-PASSWORD@private.example",
-            "沙丘 ghp_abcdefghijklmnopqrstuvwxyz1234567890",
-            "沙丘 tmdb_id=12345678",
-        )
-        for title in malicious:
-            with (
-                self.subTest(title=title),
-                patch(
-                    "app.agent.domains.workspace.actions.db.search_agent_workspace_rss",
-                    return_value={
-                        "items": [
-                            {
-                                "title": title,
-                                "status": "pending",
-                                "processed": 0,
-                                "pub_date": "https://private.example/token=PRIVATE-DATE",
-                                "created_at": "2026-08-01T12:00:00+08:00",
-                            }
-                        ],
-                        "truncated": False,
-                    },
-                ),
-            ):
-                result = search_workspace(
-                    workspace_search_arguments({"query": "沙丘", "sections": ["rss"]})
-                )
-            item = result.data["sections"][0]["items"][0]
-            self.assertEqual(item["title"], "RSS 条目")
-            self.assertEqual(item["published_at"], "")
-            serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-            self.assertNotIn("PRIVATE", serialized)
-        media_item = MediaItem(
-            id="safe-id", name="沙丘", type="Movie", year="2026token"
-        )
-        with patch(
-            "app.agent.domains.workspace.actions.search_media_servers",
-            return_value=[{"server_type": "jellyfin", "items": [media_item]}],
-        ):
-            result = search_workspace(
-                workspace_search_arguments({"query": "沙丘", "sections": ["library"]})
-            )
-        self.assertEqual(result.data["sections"][0]["items"][0]["year"], "")
-
-    def test_organize_real_statuses_and_legacy_names_remain_searchable(self):
+    def test_organize_legacy_names_and_all_business_statuses(self):
+        stamp = db.now()
         statuses = (
             "interrupted",
             "partial_failed",
@@ -334,48 +270,96 @@ class WorkspaceSearchDataTests(IsolatedDatabaseTestCase):
             "reverted",
             "revert_failed",
         )
-        for status in statuses:
-            with (
-                self.subTest(status=status),
-                patch(
-                    "app.agent.domains.workspace.actions.db.search_agent_workspace_organize",
-                    return_value={
-                        "items": [
-                            {
-                                "title": "沙丘2",
-                                "media_type": "movie",
-                                "year": "2024",
-                                "season": None,
-                                "episode": None,
-                                "status": status,
-                                "source": "organize",
-                                "created_at": "2026-08-01T12:00:00+08:00",
-                            }
-                        ],
-                        "truncated": False,
-                    },
-                ),
-            ):
-                result = search_workspace(
-                    workspace_search_arguments(
-                        {"query": "沙丘2", "sections": ["organize"]}
-                    )
-                )
-            self.assertEqual(result.data["sections"][0]["items"][0]["status"], status)
         with db.get_conn() as conn:
-            conn.execute(
-                "INSERT INTO organize_log(source,original_path,new_path,file_id,status,title,original_name,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    "guangya",
-                    "/private/legacy",
-                    "/private/new",
-                    "PRIVATE-ID",
-                    "success",
-                    "",
-                    "Dune.2021.1080p.mkv",
-                    db.now(),
-                ),
-            )
-        result = db.search_agent_workspace_organize("Dune", limit=8)
-        self.assertEqual(len(result["items"]), 1)
-        self.assertEqual(result["items"][0]["title"], "")
+            for status in statuses:
+                conn.execute(
+                    "INSERT INTO organize_log(source,original_path,new_path,file_id,status,title,original_name,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        "guangya",
+                        "/private/old",
+                        "/private/new",
+                        status,
+                        status,
+                        "",
+                        "Dune.2021.mkv",
+                        stamp,
+                    ),
+                )
+        result = service.search("Dune", ["organize"])
+        assert {row["status"] for row in result["data"]["sections"][0]["items"]} == set(
+            statuses
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"query": ""},
+        {"query": "x\ny"},
+        {"query": "x" * 121},
+        {"query": 1},
+        {"query": "Bearer PRIVATE-CREDENTIAL /private/data"},
+        {"query": "www.private.example/library"},
+        {"query": "ghp_abcdefghijklmnopqrstuvwxyz1234567890"},
+        {"query": "tmdb_id=12345678"},
+        {"query": "Dune", "sections": []},
+        {"query": "Dune", "sections": "rss"},
+        {"query": "Dune", "sections": ["rss", "RSS"]},
+        {"query": "Dune", "sections": ["unknown"]},
+        {"query": "Dune", "limit": True},
+        {"query": "Dune", "limit": 0},
+        {"query": "Dune", "limit": 51},
+        {"query": "Dune", "offset": -1},
+        {"query": "Dune", "offset": False},
+    ],
+)
+def test_search_rejects_invalid_arguments_before_read(arguments, monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "search_workspace_rss",
+        lambda *_a, **_k: pytest.fail("invalid request read DB"),
+    )
+    with pytest.raises(ValueError):
+        service.search(**arguments)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "沙丘 file://private/share",
+        "沙丘 smb://private/share",
+        "沙丘 ../private/file.mkv",
+        "沙丘 Bearer PRIVATE-CREDENTIAL",
+        "沙丘 token PRIVATE-CREDENTIAL",
+        "沙丘 0123456789abcdef0123456789abcdef01234567",
+        "沙丘 Downloads/Dune.mkv",
+        "沙丘 Downloads\\Dune.mkv",
+        "沙丘 www.private.example/library",
+        "沙丘 alice:PRIVATE-PASSWORD@private.example",
+        "沙丘 ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+        "沙丘 tmdb_id=12345678",
+    ],
+)
+def test_sensitive_record_text_is_redacted_but_identity_retained(title, monkeypatch):
+    monkeypatch.setattr(
+        db,
+        "search_workspace_rss",
+        lambda *_a, **_k: {
+            "items": [
+                {
+                    "id": 41,
+                    "rss_item_id": 9,
+                    "title": title,
+                    "status": "pending",
+                    "pub_date": "token=PRIVATE-DATE",
+                }
+            ],
+            "has_more": False,
+            "next_offset": None,
+        },
+    )
+    result = service.search("沙丘", ["rss"])
+    (item,) = result["data"]["sections"][0]["items"]
+    assert item["id"] == 41 and item["rss_item_id"] == 9
+    assert item["title"] == "RSS 条目" and item["published_at"] == ""
+    assert "PRIVATE" not in json.dumps(result)

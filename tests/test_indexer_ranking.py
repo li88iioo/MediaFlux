@@ -1,10 +1,64 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from app.indexers.models import IndexerItem, IndexerMediaSearchRequest
 from app.indexers.ranking import annotate_clusters, match_priority, rank_item
+
+
+class TechnicalFilterTests(unittest.TestCase):
+    def test_excluding_hdr_keeps_unknown_distinct_from_explicit_sdr(self):
+        from app.indexers.ranking import filter_technical_candidates
+
+        items = [{'title': f'Demo.1080p.{suffix}', 'result_id': f'resource-{number}', 'position': number}
+                 for number, suffix in enumerate(('H264', '[SDR]', 'HDR10', '[DV]', '[HLG]', '[SDR][HDR]'), 1)]
+        original = deepcopy(items)
+        selected, stats = filter_technical_candidates(items, {'exclude_hdr': True})
+        self.assertEqual(selected, items[:2])
+        self.assertEqual(stats, {'requested': {'exclude_hdr': True}, 'basis': 'release_title_only',
+                                'considered': 6, 'scope': 'input_candidate_titles',
+                                'unknown_excluded': 0, 'mismatched_excluded': 4, 'stream_verified': False})
+        selected, stats = filter_technical_candidates(items, {'exclude_hdr': True, 'dynamic_range': 'SDR'})
+        self.assertEqual(selected, items[1:2])
+        self.assertIs(selected[0], items[1])
+        self.assertEqual(stats['unknown_excluded'], 1)
+        self.assertEqual(filter_technical_candidates(items, {'exclude_hdr': False})[0], items)
+        self.assertEqual(items, original)
+
+    def test_technical_arguments_use_plain_value_error_and_keep_explicit_resets(self):
+        from app.indexers.ranking import technical_filter_arguments
+
+        for field, values in (
+            ('resolution', (['1080p'], '1080', None)),
+            ('dynamic_range', (True, 'guessed SDR')),
+            ('exclude_hdr', ('false', 'true', 0, 1, None, [])),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError) as caught:
+                    technical_filter_arguments({field: value})
+                self.assertIs(type(caught.exception), ValueError)
+                self.assertEqual(str(caught.exception), f'{field} 不在允许范围内')
+        self.assertEqual(technical_filter_arguments({}), {})
+        reset = {'resolution': '', 'dynamic_range': '', 'exclude_hdr': False}
+        self.assertEqual(technical_filter_arguments({'title': 'Demo', **reset}), reset)
+
+    def test_combined_hdr_evidence_uses_complete_release_title(self):
+        from app.indexers.ranking import filter_technical_candidates
+
+        for title, desired, matched in [
+            ('Demo.2160p.DoVi.HDR10', 'HDR10', True),
+            ('Demo.2160p.DoVi.HDR10', 'HDR', True),
+            ('Demo.2160p.HLG', 'HDR', True),
+            ('Demo.1080p.SDR.HDR10', 'SDR', False),
+            ('Demo.' + 'a' * 350 + '.1080p.SDR', 'SDR', True),
+            ('Demo.1080p.SDR.' + 'a' * 350 + '.HDR10', 'SDR', False),
+            ('Demo.' + 'a' * 350 + '.2160p.DoVi.HDR10', 'HDR10', True),
+        ]:
+            with self.subTest(title=title, desired=desired):
+                items, _ = filter_technical_candidates([{'title': title}], {'dynamic_range': desired})
+                self.assertEqual(bool(items), matched)
 
 
 class IndexerRankingTests(unittest.TestCase):
@@ -18,6 +72,53 @@ class IndexerRankingTests(unittest.TestCase):
             download_kinds=("torrent",),
             published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         )
+
+    def test_named_special_is_not_recommended_as_regular_or_numbered_special_episode(self):
+        from app.modules.episode_resource_ranking import rank_episode_search
+
+        title = "黑镜 第一季 / Black.Mirror.S02.Special.White.Christmas.1080p.WEBRip.DD2.0.x264-CasStudio[rartv]"
+        item = self._item(title)
+        for season in (2, 0):
+            with self.subTest(season=season):
+                media = IndexerMediaSearchRequest.create(title="黑镜", original_title="Black Mirror", media_type="tv", season=season, episode=1)
+                ranked = rank_item(item, media=media, fallback_query="黑镜")
+                self.assertNotIn("episode_exact", ranked.match_reasons)
+                result = rank_episode_search({"items": [item.to_public_dict()]}, season=season, episode=1, media=media)
+                self.assertNotEqual(result["items"][0]["quality"]["match"], "exact_episode")
+                self.assertIsNone(result["recommendation"]["selected"])
+                self.assertEqual(result["download_plan"]["result_ids"], [])
+
+    def test_subtitle_evidence_is_a_language_marker_not_size_or_word_fragment(self):
+        from app.modules.episode_resource_ranking import rank_episode_search
+
+        media = IndexerMediaSearchRequest.create(title="Demo", media_type="tv", season=1, episode=1)
+        for suffix, expected in (
+            ("[7.19GB]", []), ("[7.19 GB]", []), ("[7.19GiB]", []), ("Monarchs", []),
+            ("[GB]", ["含简体中文标记"]), ("[GB2312]", ["含简体中文标记"]),
+            ("[CHS]", ["含简体中文标记"]), ("[CHT]", ["含繁体中文标记"]),
+        ):
+            with self.subTest(suffix=suffix):
+                item = self._item(f"Demo.S01E01.1080p {suffix}")
+                result = rank_episode_search({"items": [item.to_public_dict()]}, season=1, episode=1, media=media)
+                reasons = result["items"][0]["quality"]["reasons"]
+                self.assertEqual([reason for reason in reasons if "中文标记" in reason], expected)
+
+    def test_other_season_pack_is_conflicting_in_both_ranking_stages(self):
+        from app.modules.episode_resource_ranking import rank_episode_search
+
+        for title in ("Demo.S06.COMPLETE.2160p.WEB-DL", "Demo.S04.2160p.WEB-DL"):
+            for episode in (None, 1):
+                with self.subTest(title=title, episode=episode):
+                    item = self._item(title)
+                    media = IndexerMediaSearchRequest.create(title="Demo", media_type="tv", season=2, episode=episode)
+                    ranked = rank_item(item, media=media, fallback_query=media.title)
+                    self.assertIn("episode_conflict", ranked.match_reasons)
+                    if episode is not None:
+                        result = rank_episode_search({"items": [item.to_public_dict()]}, season=2, episode=episode, media=media)
+                        self.assertEqual(result["items"][0]["quality"]["match"], "conflict")
+                        self.assertFalse(result["items"][0]["quality"]["eligible"])
+                        self.assertIsNone(result["recommendation"]["selected"])
+                        self.assertEqual(result["download_plan"]["result_ids"], [])
 
     def test_captioned_episode_is_ranked_before_truncating_search_results(self):
         from app.indexers.ranking import candidate_sort_key

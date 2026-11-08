@@ -14,12 +14,8 @@ from app.agent.confirmation import ConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.completion_receipts import EffectCompletionScope
-from app.agent.kernel.effects import (
-    ConfirmationEffectPlanStore,
-    EffectPlan,
-    PreparedEffect,
-)
-from app.agent.kernel.pipeline import EffectLifecycle, NoopEffectLifecycle, ToolPipeline
+from app.agent.kernel.effects import ConfirmationEffectPlanStore, EffectExecutor, EffectLifecycle, NoopEffectLifecycle
+from app.agent.kernel.tool_calls import EffectPlan, PreparedEffect
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
 from app.agent.kernel.state import InMemorySessionStateStore
 from tests.test_agent_kernel_safety import _context
@@ -92,7 +88,7 @@ def _fixture(lifecycle: EffectLifecycle | None = None, *, terminal="completed"):
         prepare=lambda arguments, context: prepared, execute_confirmed=execute,
     )
     state = InMemorySessionStateStore()
-    pipeline = ToolPipeline(
+    pipeline = EffectExecutor(
         catalog=ToolCatalog([tool]), state_store=state,
         effect_store=ConfirmationEffectPlanStore(ConfirmationStore()),
         effect_lifecycle=lifecycle,
@@ -121,6 +117,31 @@ def test_protocol_is_not_instantiable_and_default_pipeline_uses_named_noop():
     assert type(pipeline.effect_lifecycle) is NoopEffectLifecycle
     assert type(NoopEffectLifecycle()).__name__ == "NoopEffectLifecycle"
     assert EffectLifecycle is not NoopEffectLifecycle
+
+
+def test_direct_prepare_checks_schema_authority_and_never_runs_read_handler():
+    async def check():
+        executor, tool, _, _ = _fixture()
+        prepare = Mock(wraps=tool.prepare)
+        guarded = replace(tool, prepare=prepare, input_schema={"type": "object", "required": ["value"],
+            "properties": {"value": {"type": "string"}}, "additionalProperties": False})
+        read = Mock(side_effect=AssertionError("效果预检不执行读工具"))
+        executor.catalog = ToolCatalog([guarded, KernelToolSpec(name="fixture.read", domain="fixture",
+            description="只读", effect=ToolEffect.READ, input_schema={"type": "object"}, read=read)])
+        context = await _context(executor.state_store)
+        for name, args, ctx, code in (
+            (tool.name, {}, context, "invalid_arguments"),
+            (tool.name, {"value": "ok"}, replace(context, owner=""), "authorization_required"),
+            (tool.name, {"value": "ok"}, replace(context, diagnostic_only=True), "effect_diagnostic_only"),
+            ("fixture.read", {}, context, "confirmation_not_supported"),
+        ):
+            with pytest.raises(ToolPipelineError) as error:
+                await executor.prepare(name, args, context=ctx)
+            assert error.value.code == code
+        prepare.assert_not_called()
+        read.assert_not_called()
+        assert await executor.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
+    asyncio.run(check())
 
 
 def test_terminal_registration_is_an_explicit_async_keyword_only_hook():
@@ -176,7 +197,7 @@ def test_pipeline_awaits_injected_registration_and_preserves_failure_boundaries(
         lifecycle = RecordingLifecycle()
         pipeline, tool, _, _ = _fixture(lifecycle, terminal="failed")
         context = await _context(pipeline.state_store)
-        preview = await pipeline.execute(tool.name, {}, context=context)
+        preview = await pipeline.prepare(tool.name, {}, context=context)
         assert preview.effect_plan is not None
         error = fault("registration unavailable") if fault else None
         with patch.object(lifecycle, "register_terminal_failure", new=AsyncMock(
@@ -207,8 +228,6 @@ def test_noop_returns_identity_and_never_mutates_nested_payloads():
     async def check():
         pipeline, tool, prepared, value = _fixture()
         context = await _context(pipeline.state_store)
-        from app.agent.kernel.error_repair import SchemaReplacement
-        context.schema_replacements["fixture"] = SchemaReplacement((), tool.name, {("nested",): {"keep": [True]}})
         context = replace(context, selection_arguments={"nested": [{"d": [6]}]})
         arguments = {"nested": [{"e": [7]}]}
         plan = EffectPlan(
@@ -219,7 +238,7 @@ def test_noop_returns_identity_and_never_mutates_nested_payloads():
             confirmation_contract={"nested": [{"f": [8]}]}, public_result=value,
         )
         payloads = (arguments, prepared, plan, value, context.selection_arguments,
-                    context.schema_replacements, tool.input_schema, tool.metadata)
+                    tool.input_schema, tool.metadata)
         before = deepcopy(payloads)
         lifecycle = pipeline.effect_lifecycle
         assert lifecycle.prepared(tool=tool, arguments=arguments,
@@ -288,7 +307,7 @@ def test_injected_hooks_run_on_real_pipeline_paths(kind, terminal):
         with ExitStack() as stack:
             # Real MediaFlux hooks run; only domain services are isolated.
             stack.enter_context(patch(f"{module}.config.all_items", return_value={}))
-            stack.enter_context(patch(f"{module}.compensation_candidate", return_value=None))
+            stack.enter_context(patch(f"{module}.preference_compensation", return_value=None))
             audit_failed = stack.enter_context(patch(f"{module}.record_confirmation_error"))
             audit_interrupted = stack.enter_context(patch(f"{module}.record_confirmation_interrupted"))
             hooks = {name: stack.enter_context(patch.object(lifecycle, name, wraps=getattr(lifecycle, name)))
@@ -296,10 +315,10 @@ def test_injected_hooks_run_on_real_pipeline_paths(kind, terminal):
             if terminal == "prepare_failed":
                 stack.enter_context(patch.object(pipeline.effect_store, "freeze", side_effect=ValueError("freeze failed")))
                 with pytest.raises(ValueError, match="freeze failed"):
-                    await pipeline.execute("fixture.write", {}, context=context)
+                    await pipeline.prepare("fixture.write", {}, context=context)
                 plan = None
             else:
-                preview = await pipeline.execute("fixture.write", {}, context=context)
+                preview = await pipeline.prepare("fixture.write", {}, context=context)
                 plan = preview.effect_plan
                 assert plan is not None
                 if kind == "structural":

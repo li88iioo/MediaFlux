@@ -8,14 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from app import config
-from app.agent.domains.guangya.schedule_actions import (
-    get_guangya_connection_status,
-    guangya_organize_schedule_policy_arguments,
-    prepare_guangya_organize_schedule_policy_confirmation,
-    summarize_guangya_organize_schedule_policy,
-)
-from app.agent.errors import AgentToolError
+from app import config, sdk
+from app.modules.schedule_policy import normalize_changes, prepare_policy_change, summarize_policy
 from app.modules.organize_scheduler import OrganizeScheduler
 
 _GUANGYA_SCHEDULE_KEYS = {
@@ -28,7 +22,7 @@ _GUANGYA_SCHEDULE_KEYS = {
 class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
     def test_arguments_are_partial_bounded_and_strict(self):
         self.assertEqual(
-            guangya_organize_schedule_policy_arguments(
+            normalize_changes("organize",
                 {"enabled": True, "cron": "  30   2 * * * ", "notify_enabled": False}
             ),
             {"enabled": True, "cron": "30 2 * * *", "notify_enabled": False},
@@ -44,10 +38,10 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
             {"key": "GY_ORGANIZE_SCHEDULE_ENABLED"},
             {"token": "secret"},
         ):
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                guangya_organize_schedule_policy_arguments(arguments)
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                normalize_changes("organize", arguments)
 
-    def test_connection_status_is_bounded_and_never_leaks_credentials(self):
+    def test_connection_status_preserves_unknown_and_never_leaks_credentials(self):
         secret = "guangya-secret-must-not-leak"
         client = Mock()
         client.logged_in = True
@@ -55,13 +49,13 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
         client.token = secret
         client.phone = "13800000000"
         with patch(
-            "app.agent.domains.guangya.schedule_actions.GuangYaClient",
+            "app.modules.guangya_account.GuangYaClient",
             return_value=client,
         ):
-            result = get_guangya_connection_status({})
-        rendered = repr(result.to_dict())
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "ready")
+            result = sdk.cloud.connection()
+        rendered = repr(result)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ready")
         client.probe_connection.assert_called_once_with()
         client.validate.assert_not_called()
         self.assertNotIn(secret, rendered)
@@ -71,21 +65,32 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
         client.probe_connection.reset_mock()
         client.probe_connection.return_value = False
         with patch(
-            "app.agent.domains.guangya.schedule_actions.GuangYaClient",
+            "app.modules.guangya_account.GuangYaClient",
             return_value=client,
         ):
-            unavailable = get_guangya_connection_status({})
-        self.assertFalse(unavailable.ok)
-        self.assertEqual(unavailable.status, "attention")
+            unavailable = sdk.cloud.connection()
+        self.assertFalse(unavailable["ok"])
+        self.assertEqual(unavailable["status"], "attention")
+
+        client.probe_connection.side_effect = RuntimeError(f"private {secret}")
+        client.close.reset_mock()
+        with patch("app.modules.guangya_account.GuangYaClient", return_value=client):
+            interrupted = sdk.cloud.connection()
+        self.assertEqual(interrupted["status"], "unavailable")
+        self.assertTrue(interrupted["configured"])
+        self.assertIsNone(interrupted["reachable"])
+        client.close.assert_called_once_with()
 
         with patch(
-            "app.agent.domains.guangya.schedule_actions.GuangYaClient",
+            "app.modules.guangya_account.GuangYaClient",
             side_effect=RuntimeError(f"private {secret}"),
         ):
-            failed = get_guangya_connection_status({})
-        failed_rendered = repr(failed.to_dict())
-        self.assertFalse(failed.ok)
-        self.assertEqual(failed.status, "unavailable")
+            failed = sdk.cloud.connection()
+        failed_rendered = repr(failed)
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["status"], "unavailable")
+        self.assertIsNone(failed["configured"])
+        self.assertIsNone(failed["reachable"])
         self.assertNotIn(secret, failed_rendered)
         self.assertNotIn("RuntimeError", failed_rendered)
 
@@ -115,23 +120,23 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
                 patch(
-                    "app.agent.domains.guangya.schedule_actions.get_organize_scheduler",
+                    "app.modules.schedule_policy.get_organize_scheduler",
                     return_value=scheduler,
                 ),
             ):
-                summary = summarize_guangya_organize_schedule_policy({})
+                summary = summarize_policy("organize")
                 preview, context = (
-                    prepare_guangya_organize_schedule_policy_confirmation(
+                    prepare_policy_change("organize",
                         {"enabled": True}
                     )
                 )
-        rendered = repr((summary.to_dict(), preview.to_dict(), context))
+        rendered = repr((summary, preview, context))
         self.assertNotIn(secret, rendered)
         self.assertNotIn("GY_TOKEN", rendered)
         self.assertNotIn("private", rendered)
         self.assertNotIn(str(env_file), rendered)
         self.assertEqual(len(context), 64)
-        self.assertIn("不会立即", " ".join(preview.suggestions))
+        self.assertIn("不会立即", " ".join(preview["suggestions"]))
 
     def test_scheduler_reload_only_invalidates_schedule(self):
         manager = Mock()

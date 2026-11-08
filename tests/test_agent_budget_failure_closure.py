@@ -7,15 +7,14 @@ import json
 import pytest
 
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import CapabilityRetriever, KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import adapt_tool_spec
 from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state_types import AgentInput
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
+from app.agent.models import ToolResult
 from app.agent.public_view import public_conversation_messages
 from tests.test_agent_kernel_core import ScriptedModel, collect
 from tests.test_agent_read_failure_results import round_calls
@@ -34,8 +33,7 @@ def final_round(text=CLAIM):
 
 def session_for(store, catalog, model, limits):
     return AgentSession(model=model, catalog=catalog, state_store=store, journal=store,
-        pipeline=ToolPipeline(catalog=catalog, state_store=store), limits=limits,
-        retriever=CapabilityRetriever(minimum=len(catalog), maximum=len(catalog)))
+        pipeline=ToolPipeline(catalog=catalog, state_store=store), limits=limits)
 
 
 async def persisted_facts(events, *, call_ids):
@@ -54,7 +52,7 @@ async def persisted_facts(events, *, call_ids):
 async def read_budget(store, *, returned=False, prior=False, ending="oversized", recover=False):
     observed = []
 
-    def read(arguments):
+    def read(arguments, _context):
         query = arguments["query"]
         observed.append(query)
         if query == "broken" and observed.count("broken") == 1:
@@ -63,9 +61,9 @@ async def read_budget(store, *, returned=False, prior=False, ending="oversized",
             raise ToolPipelineError(ERROR, code="provider_timeout")
         return ToolResult(True, "success", "可信查询完成", data={"items": [{"title": "真实已有内容"}]})
 
-    tool = adapt_tool_spec(ToolSpec(name="fixture.lookup", description="核验目录", risk=RiskLevel.READ,
-        parameters={"type": "object", "properties": {"query": {"type": "string"}},
-                    "required": ["query"], "additionalProperties": False}, validator=dict, handler=read))
+    tool = KernelToolSpec(name="fixture.lookup", domain="fixture", description="核验目录", effect=ToolEffect.READ,
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"], "additionalProperties": False}, validator=dict, read=read)
     catalog = ToolCatalog([tool])
     queries = (["good"] if prior else []) + ["broken"] + (["broken"] if recover else [])
     calls = [ModelToolCall(f"read-{index}", tool.model_name, {"query": query})
@@ -75,14 +73,17 @@ async def read_budget(store, *, returned=False, prior=False, ending="oversized",
     if ending == "oversized":
         blocked = [ModelToolCall(f"blocked-{index}", tool.model_name, {"query": "must-not-run"})
                    for index in range(2)]
-        rounds.extend([round_calls(blocked), final_round()])
+        rounds.append(round_calls(blocked))
         limits = SessionLimits(max_tool_calls=len(calls) + 1)
     elif ending == "hard-limit":
         limits = SessionLimits(max_model_rounds=1)
     else:
         blocked = [ModelToolCall("blocked-final", tool.model_name, {"query": "must-not-run"})] if ending == "final-tools" else []
-        rounds.append(round_calls(blocked) if blocked else final_round(""))
-        limits = SessionLimits(max_model_rounds=len(rounds))
+        if blocked:
+            rounds.append(round_calls(blocked))
+            limits = SessionLimits(max_tool_calls=len(calls))
+        else:
+            limits = SessionLimits(max_model_rounds=len(rounds))
     model = ScriptedModel(rounds)
     events = await collect(session_for(store, catalog, model, limits).run(AgentInput(
         owner=OWNER, session_id=SESSION, message="逐一核验目录，只交付真实取得的结果")))
@@ -93,8 +94,7 @@ async def read_budget(store, *, returned=False, prior=False, ending="oversized",
     started = [event.payload["call_id"] for event in events if event.type.value == "tool.started"]
     assert started == [call.call_id for call in calls]
     for row in tools[-len(blocked):] if blocked else []:
-        assert json.loads(row["content"])["code"] == (
-            "not_executed_final_round" if ending == "final-tools" else "tool_budget_exceeded")
+        assert json.loads(row["content"])["code"] == "tool_budget_exceeded"
     if returned:
         assert json.loads(tools[len(calls) - 1 if not recover else len(calls) - 2]["content"]) == ToolResult(False, "unavailable", ERROR).to_dict()
     return events[-1], saved
@@ -131,8 +131,10 @@ def test_recovered_read_keeps_budget_partial_without_resurrecting_old_error(stor
     assert terminal.type.value == "turn.completed"
     assert terminal.payload["status"] == "partial"
     assert terminal.payload["finish_reason"] == "tool_budget_exceeded"
-    assert terminal.payload["answer"] == CLAIM
-    assert saved.conversation[-1]["content"] == CLAIM
+    assert CLAIM not in terminal.payload["answer"]  # 超额后不再调用模型重写答案。
+    assert "真实已有内容" in terminal.payload["answer"]
+    assert ERROR not in terminal.payload["answer"]
+    assert saved.conversation[-1]["content"] == terminal.payload["answer"]
 
 
 def test_confirmed_write_then_failed_read_budget_keeps_receipt_without_false_completion(store):
@@ -159,7 +161,6 @@ def test_confirmed_write_then_failed_read_budget_keeps_receipt_without_false_com
             round_calls([ModelToolCall("broken", lookup.model_name, {})]),
             round_calls([ModelToolCall("blocked-1", lookup.model_name, {}),
                          ModelToolCall("blocked-2", lookup.model_name, {})]),
-            final_round(),
         ])
         session = session_for(store, catalog, model, SessionLimits(max_tool_calls=2))
         preview = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION,
@@ -168,7 +169,7 @@ def test_confirmed_write_then_failed_read_budget_keeps_receipt_without_false_com
         plan_id = preview[-1].payload["plan_id"]
         events = await collect(session.confirm(owner=OWNER, session_id=SESSION, plan_id=plan_id))
         assert writes == ["write"] and reads == ["read"]
-        assert len(model.requests) == 4 and not model.rounds
+        assert len(model.requests) == 3 and not model.rounds
         saved, _ = await persisted_facts([*preview, *events],
             call_ids=["prepare", "broken", "blocked-1", "blocked-2"])
         final = dict(events[-1].payload)

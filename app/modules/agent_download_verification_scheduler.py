@@ -15,14 +15,16 @@ from app.agent.domains.downloads.recent_submissions import (
     build_recent_download_library_verification,
     build_recent_download_status,
 )
-from app.agent.domains.library.episode_audit import invalidate_episode_audit_cache
+from app.modules.episode_audit import (
+    audit_series_episodes, invalidate_episode_audit_cache,
+)
 from app.agent.feature_gate import (
     AgentRuntimeDisabled,
     agent_runtime_effect_admission,
     agent_runtime_generation_is_current,
     current_agent_runtime_generation,
 )
-from app.agent.models import ToolResult
+from app.agent.models import Evidence, ToolResult
 from app.agent.owner_routes import (
     parse_telegram_owner_route,
     telegram_owner_route_is_currently_authorized,
@@ -214,21 +216,6 @@ class DownloadLibraryVerificationScheduler:
         next_cleanup = self._format(self._next_cleanup_at)
         private_maintainers = (
             (
-                "Agent 光鸭私有计划",
-                "app.modules.guangya_rename",
-                "maintain_rename_plans",
-            ),
-            (
-                "Agent 光鸭残留清理私有计划",
-                "app.modules.guangya_residual_cleanup",
-                "maintain_cleanup_plans",
-            ),
-            (
-                "Agent 光鸭观察快照",
-                "app.modules.guangya_workspace",
-                "maintain_workspace_observations",
-            ),
-            (
                 "Agent 光鸭通用变更私有计划",
                 "app.modules.guangya_fs_change",
                 "maintain_fs_change_plans",
@@ -286,7 +273,7 @@ class DownloadLibraryVerificationScheduler:
         if total:
             logger.info("Agent 持久任务历史已清理 rows=%s", total)
 
-    def _process(self, job, *, current: str, runtime_generation: int) -> None:
+    def _process(self, job: dict, *, current: str, runtime_generation: int) -> None:
         request_id = int(job["request_id"])
         attempts = max(0, int(job["attempts"] or 0))
         result = str(job["result"] or "")
@@ -307,6 +294,14 @@ class DownloadLibraryVerificationScheduler:
             )
             return
 
+        if request["status"] in {"pending", "submitting"}:
+            # 原子登记的意图可能早于目标后端配置；等待原提交链，绝不代它重投。
+            db.update_agent_download_verification(
+                request_id, status="pending", result=result, attempts=attempts,
+                next_check_at=self._after(self.interval), last_checked_at=job["last_checked_at"],
+                expected_lease_generation=int(job["lease_generation"]),
+            )
+            return
         target = str(request["targets"] or "").strip()
         if target not in {"qb", "guangya", "both"}:
             self._finish(
@@ -336,7 +331,11 @@ class DownloadLibraryVerificationScheduler:
                 expected_lease_generation=int(job["lease_generation"]),
             )
             return
-        if phase != "completed":
+        # 库可见性与另一后端是否受理成功是两件事实；有真实完成分支即可
+        # 只读复核，保留 request 上的失败/未知，不能据此重投或改写整体状态。
+        if phase != "completed" and not any(
+            backend.get("status") == "completed" for backend in status_data.get("backends", [])
+        ):
             self._finish(
                 job,
                 status="attention",
@@ -360,17 +359,6 @@ class DownloadLibraryVerificationScheduler:
             )
             return
 
-        verification = record.verification
-        assert verification is not None
-        arguments = {
-            "query": verification.title,
-            "tmdb_id": verification.tmdb_id,
-            "season": verification.season,
-            "target_episode": verification.episode,
-            "as_of": verification.as_of,
-        }
-        if verification.library_name:
-            arguments["library_name"] = verification.library_name
         if not self._runtime_allows(runtime_generation):
             self._release_verification_job(job, current=current)
             return
@@ -388,31 +376,41 @@ class DownloadLibraryVerificationScheduler:
         )
         if not claimed:
             return
-        try:
-            with self._lease_heartbeat(
-                request_id,
-                int(job["lease_generation"]),
-            ):
-                invalidate_episode_audit_cache(arguments)
-                audit, _elapsed_ms = self._audit_executor(arguments)
-            projected = build_recent_download_library_verification(
-                record,
-                audit,
-                position=1,
-            )
-            projected_data = projected.data if isinstance(projected.data, dict) else {}
-            verification_result = str(
-                projected_data.get("verification") or "inconclusive"
-            )
-            if verification_result not in {"visible", "missing", "inconclusive"}:
-                verification_result = "inconclusive"
-        except Exception as exc:
-            logger.warning(
-                "Agent 下载后媒体库复核失败 request_id=%s type=%s",
-                request_id,
-                type(exc).__name__,
-            )
-            verification_result = "inconclusive"
+        targets = [{**item, "result": "inconclusive"} for item in job["targets"]]
+        groups: dict[tuple, list[dict]] = {}
+        for item in targets:
+            key = tuple(item[name] for name in ("tmdb_id", "season", "as_of", "library_name"))
+            groups.setdefault(key, []).append(item)
+        with self._lease_heartbeat(request_id, int(job["lease_generation"])):
+            for group in groups.values():
+                if not self._runtime_allows(runtime_generation):
+                    break
+                if not db.renew_agent_download_verification_lease(
+                    request_id, expected_lease_generation=int(job["lease_generation"]),
+                ):
+                    return  # 新目标已合并/租约已变化，旧批次不得继续核对或发布终态。
+                first = group[0]
+                arguments = {"query": first["title"] or first["tmdb_id"], "tmdb_id": first["tmdb_id"],
+                             "season": first["season"], "as_of": first["as_of"]}
+                if len(group) == 1:
+                    arguments["target_episode"] = first["episode"]
+                if first["library_name"]:
+                    arguments["library_name"] = first["library_name"]
+                try:
+                    invalidate_episode_audit_cache(arguments)
+                    audit, _elapsed_ms = self._audit_executor(arguments)
+                    for item in group:
+                        projected = build_recent_download_library_verification(
+                            self._record(job, target=target, verification=item), audit, position=1,
+                        )
+                        outcome = projected.data.get("verification", "inconclusive")
+                        item["result"] = outcome if outcome in {"visible", "missing", "inconclusive"} else "inconclusive"
+                except Exception as exc:
+                    logger.warning("Agent 下载后媒体库复核失败 request_id=%s type=%s", request_id, type(exc).__name__)
+        job = {**job, "targets": targets}
+        outcomes = {item["result"] for item in targets}
+        verification_result = ("visible" if outcomes == {"visible"} else
+                               "inconclusive" if not outcomes or "inconclusive" in outcomes else "missing")
 
         if not self._runtime_allows(runtime_generation):
             self._release_verification_job(
@@ -445,6 +443,7 @@ class DownloadLibraryVerificationScheduler:
             request_id,
             status="retry_wait",
             result=verification_result,
+            targets=targets,
             attempts=attempts,
             next_check_at=self._after(_RETRY_DELAYS[attempts - 1]),
             last_checked_at=current,
@@ -536,9 +535,7 @@ class DownloadLibraryVerificationScheduler:
     ) -> None:
         request_id = int(job["request_id"])
         payload_json = dump_download_verification_payload(
-            title=str(job["title"]),
-            season=int(job["season"]),
-            episode=int(job["episode"]),
+            targets=job["targets"],
             status=status,
             result=result,
             attempts=attempts,
@@ -552,11 +549,12 @@ class DownloadLibraryVerificationScheduler:
             last_checked_at=current if attempts else None,
             expected_lease_generation=int(job["lease_generation"]),
             payload_json=payload_json,
+            targets=job["targets"],
         )
         if not finished:
             return
         try:
-            from app.agent.domains.library.missing_workflows import (
+            from app.repositories.agent_download_verification import (
                 SQLiteMissingMediaWorkflowRepository,
             )
 
@@ -564,6 +562,7 @@ class DownloadLibraryVerificationScheduler:
                 request_id=request_id,
                 status=status,
                 result=result,
+                targets=job["targets"],
             )
         except Exception as exc:
             # 下载核验终态已原子落库；补库进度镜像失败不得破坏调度器语义。
@@ -771,15 +770,10 @@ class DownloadLibraryVerificationScheduler:
             and notifications_enabled()
         )
 
-    def _record(self, job, *, target: str) -> RecentDownloadSubmission:
-        verification = RecentDownloadVerification(
-            title=str(job["title"]),
-            tmdb_id=str(job["tmdb_id"]),
-            season=int(job["season"]),
-            episode=int(job["episode"]),
-            as_of=str(job["as_of"]),
-            library_name=str(job["library_name"] or ""),
-        )
+    def _record(self, job, *, target: str, verification: dict | None = None) -> RecentDownloadSubmission:
+        context = RecentDownloadVerification(**{
+            key: verification[key] for key in ("title", "tmdb_id", "season", "episode", "as_of", "library_name")
+        }) if verification is not None else None
         succeeded = ("qb", "guangya") if target == "both" else (target,)
         return RecentDownloadSubmission(
             request_id=int(job["request_id"]),
@@ -791,7 +785,7 @@ class DownloadLibraryVerificationScheduler:
             duplicate=False,
             result_status="accepted",
             captured_at=str(job["created_at"] or ""),
-            verification=verification,
+            verification=context,
         )
 
     @staticmethod
@@ -806,12 +800,16 @@ class DownloadLibraryVerificationScheduler:
 
     @staticmethod
     def _default_audit_executor(arguments: dict) -> tuple[ToolResult, int]:
-        from app.agent.domains.library.library_episode_audit import (
-            audit_library_episodes_batch,
-        )
-
         started = time.monotonic()
-        result = audit_library_episodes_batch(arguments)
+        audit = audit_series_episodes(arguments)
+        # 复核展示消费 ToolResult；审计事实与精确季集判断只来自公共 core。
+        result = ToolResult(
+            ok=audit.ok, status=audit.status, summary=audit.summary, data=audit.data,
+            suggestions=audit.suggestions, error=audit.error,
+            evidence=[Evidence(
+                "media_servers+tmdb", "按指定媒体库和季集核对本地库存与 TMDB 已播记录。", audit.checked_at,
+            )],
+        )
         return result, max(0, int((time.monotonic() - started) * 1000))
 
     def _loop(self) -> None:

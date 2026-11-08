@@ -36,10 +36,10 @@ def isolated_chain():
     yield from inspect.unwrap(chain.isolated_chain)()
 
 
-async def prepare(session, pipeline, store, *, owner=OWNER, session_id=SESSION):
+async def prepare(session, pipeline, store, *, owner=OWNER, session_id=SESSION, position=1):
     view, _ = await _publish_candidates(pipeline, store, owner=owner, session_id=session_id)
     events = await _events(session.run(QueryEnvelope(owner=owner, session_id=session_id,
-        message="确认一个资源", selection=_selection(view, [1])).to_agent_input()))
+        message="确认一个资源", selection=_selection(view, [position])).to_agent_input()))
     approval = next(e for e in events if e.type is AgentEventType.EFFECT_APPROVAL_REQUIRED)
     state = await store.load(owner=owner, session_id=session_id)
     return approval.payload["plan"]["plan_id"], PublicationLease(
@@ -48,8 +48,7 @@ async def prepare(session, pipeline, store, *, owner=OWNER, session_id=SESSION):
 
 def lifecycle_for(session, pipeline, store):
     return AgentSessionLifecycle(session=session, store=store, effect_store=pipeline.effect_store,
-                                 clear_provider_state=lambda **kw: {},
-                                 clear_domain_state=lambda **kw: {})
+                                 clear_legacy_plans=lambda **kw: {})
 
 
 async def confirmation(session, plan, *, owner=OWNER, session_id=SESSION):
@@ -188,7 +187,7 @@ def test_independent_owner_session_can_confirm_while_first_scope_is_writing(isol
         writer, pipeline, store = persistent_runtime()
         plan, _ = await prepare(writer, pipeline, store)
         other, other_pipeline, other_store = persistent_runtime()
-        plan2, _ = await prepare(other, other_pipeline, other_store, owner=other_owner, session_id=other_session)
+        plan2, _ = await prepare(other, other_pipeline, other_store, owner=other_owner, session_id=other_session, position=2)
         entered, release = threading.Event(), threading.Event()
 
         def remote_write(row, **kwargs):
@@ -201,19 +200,8 @@ def test_independent_owner_session_can_confirm_while_first_scope_is_writing(isol
         task = asyncio.create_task(confirmation(writer, plan))
         try:
             assert await asyncio.to_thread(entered.wait, 5)
-            # 第二个候选换成另一磁力，避免下载层正确的全局资源幂等影响 scope 验证。
-            with patch("app.agent.domains.resources.indexer_actions.get_indexer_service") as get_service:
-                # 恢复外层隔离 fixture 的 service，不改候选身份和冻结摘要。
-                from types import SimpleNamespace
-
-                from app.indexers.models import ResolvedDownload
-                from tests.test_agent_ux_backend import _resources
-                items = {item["result_id"]: SimpleNamespace(**item) for item in _resources().data["items"]}
-                async def resolve(_, *, scope="manual"):
-                    return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + "c" * 40)
-                get_service.return_value = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__), get_result=lambda key, **_kw: items[key],
-                                                           enabled_site_ids=("demo",), resolve=resolve)
-                assert_completed(await confirmation(other, plan2, owner=other_owner, session_id=other_session))
+            # 第二张卡预检时已选择另一资源；确认阶段不能改变冻结的磁力身份。
+            assert_completed(await confirmation(other, plan2, owner=other_owner, session_id=other_session))
             await lifecycle_for(other, other_pipeline, other_store).reset(owner=other_owner, session_id=other_session)
         finally:
             release.set()
@@ -225,15 +213,14 @@ def test_independent_owner_session_can_confirm_while_first_scope_is_writing(isol
 
 def _process_confirm(db_path, plan, pipe):
     """spawn worker 使用父进程的测试 DB；只替换远端，不初始化/恢复运行中的数据库。"""
-    from types import SimpleNamespace
 
-    from app.agent.domains.resources import indexer_actions
+    from app import config as indexer_config
+    from tests.support import isolated_indexer_results
     from app.indexers.models import ResolvedDownload
     from app.modules import download_dispatcher as dispatcher
-    from tests.test_agent_ux_backend import SECRET, _resources
+    from tests.test_agent_ux_backend import SECRET, _resources, _cache_candidates
 
     db.configure_database(db_path, test_mode=True)
-    items = {item["result_id"]: SimpleNamespace(**item) for item in _resources().data["items"]}
 
     async def resolve(_, *, scope="manual"):
         return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + "a" * 40)
@@ -243,18 +230,18 @@ def _process_confirm(db_path, plan, pipe):
         assert pipe.recv() == "finish"
         return {"ok": True, "task_id": "fake-gy"}
 
-    service = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__), get_result=lambda key, **_kw: items[key],
-                              enabled_site_ids=("demo",), resolve=resolve)
     try:
         with (
             patch("socket.socket.connect", side_effect=AssertionError("禁止外联")),
             patch("app.modules.web_secret.get_web_secret", return_value=SECRET),
-            patch.object(indexer_actions.config, "get_bool", return_value=True),
-            patch.object(indexer_actions, "get_indexer_service", return_value=service),
-            patch.object(indexer_actions, "download_target_readiness", return_value={"qb": True, "guangya": True}),
-            patch.object(indexer_actions, "run_indexer_awaitable_sync", asyncio.run),
+            patch.object(indexer_config, "get_bool", return_value=True),
+            isolated_indexer_results() as service,
+            patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}),
             patch.object(dispatcher, "_submit_guangya", side_effect=remote_write),
         ):
+            service.resolve = resolve
+            service.enabled_site_ids = ("demo",)
+            _cache_candidates(_resources().data["items"])
             session, _, _ = persistent_runtime()
             events = asyncio.run(confirmation(session, plan))
             pipe.send(("finished", any(e.type is AgentEventType.EFFECT_COMPLETED for e in events)))
@@ -475,7 +462,9 @@ def _cancelled_work_process(mode, pipe):
             session, pipeline, store = persistent_runtime()
             plan, _ = await prepare(session, pipeline, store)
             mocks[0].side_effect = cancelled_worker
-            events = await confirmation(session, plan)
+            # 保留原夹具的同步执行桥，让取消发生在可信worker，验证其收束及放锁。
+            with patch("app.agent.kernel.ports.sdk_effects.run_indexer_awaitable_sync", asyncio.run):
+                events = await confirmation(session, plan)
             assert any(e.type is AgentEventType.TURN_CANCELLED for e in events)
             assert not any(e.type is AgentEventType.EFFECT_COMPLETED for e in events)
             replay = await confirmation(session, plan)
@@ -554,7 +543,7 @@ def test_cancellation_during_confirmed_finalization_keeps_receipt_and_terminal_f
             return original(*args, **kwargs)
 
         def attach_reference(*, plan, value, elapsed_ms):
-            value.references.append(ToolReference("download_receipt", {"request_id": value.data["request_id"]}))
+            value.references.append(ToolReference("download_receipt", {"request_id": value.data["items"][0]["request_id"]}))
 
         with patch.object(store, method, side_effect=persistence), \
              patch.object(pipeline.effect_lifecycle, "completed", side_effect=attach_reference):

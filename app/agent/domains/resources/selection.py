@@ -3,65 +3,29 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import time
+import unicodedata
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from app.agent.domains.resources.candidate_context import (
+from app.modules.resource_candidates import (
     MAX_RESOURCE_CANDIDATES,
     validate_safe_resource_snapshot,
 )
-from app.agent.kernel.projection import DefaultProjector, _model_safe
 from app.agent.kernel.references import ReferenceError, ReferenceStore
 from app.agent.kernel.session_state import CandidateSelectionGuard, SessionState
 from app.agent.kernel.state_types import SelectionInvalidError
 from app.agent.kernel.ux_display import display_text
 from app.agent.public_safety import sanitize_resource_title
-from app.modules.media_probe import infer_dynamic_ranges, infer_media_profile
-from app.sensitive_data import is_sensitive_key, redact_sensitive_text
 
 CANDIDATE_VIEW_KEY = "ux_candidate_view"
 RESOURCE_KIND = "resource_candidates"
 SELECTION_KIND = "ux_resource_selection"
 _REF_RE = re.compile(r"^ref_[A-Za-z0-9_-]{16,160}$")
 _TAGS = {"resolution", "media", "video_codec", "effect", "audio"}
-
-
-
-_RESOURCE_PRIVATE_KEY_RE = re.compile(
-    r"^_|raw_?result|(?:download|torrent|detail)[_-]?(?:url|uri|link)|"
-    r"magnet|credential|password|passwd|secret|cookie|authorization|api[_-]?key|token",
-    re.IGNORECASE,
-)
-_RESOURCE_URL_RE = re.compile(r"(?i)\b(?:(?:https?|ftp|file|ed2k)\s*://|magnet:\?)[^\s<>]+")
-
-
-def resource_model_content(content: str, *, maximum: int) -> str:
-    """只净化已有模型 DTO 的私有枝叶，不用 UI 卡片覆盖业务结构或 model_data。"""
-    def clean(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {
-                key: clean(child) for key, child in value.items()
-                if key not in {"candidate_view", "selection"}
-                and not is_sensitive_key(key) and not _RESOURCE_PRIVATE_KEY_RE.search(key)
-            }
-        if isinstance(value, list):
-            return [clean(child) for child in value]
-        if isinstance(value, str):
-            return _model_safe(_RESOURCE_URL_RE.sub("[链接已隐藏]", redact_sensitive_text(value)))
-        return value
-
-    try:
-        value = clean(json.loads(content))
-    except (TypeError, ValueError):
-        return str(clean(content))[:maximum]
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    # 通常只会缩短已有投影；占位符增长时仍复用原 projector 的长度预算。
-    return encoded if len(encoded) <= maximum else DefaultProjector(max_model_chars=maximum).project(value).model_content
 
 
 def normalize_selection(value: Any) -> dict[str, Any]:
@@ -80,16 +44,14 @@ def normalize_selection(value: Any) -> dict[str, Any]:
 
 def _target_options(owner: str) -> dict[str, Any]:
     # 配置/登录状态来自领域现有契约；只用于展示，提交仍会再次预检。
-    from app.agent.domains.resources.indexer_actions import download_target_readiness
-    from app.agent.domains.subscriptions.consumption_actions import (
-        explicit_preferred_download_target,
-    )
+    from app.indexers.downloads import download_target_readiness
+    from app.modules.media_preferences import resolve_download_target
 
     ready = download_target_readiness("both")
-    preferred = explicit_preferred_download_target(owner)
+    target, target_source = resolve_download_target(owner)
     return {
-        "target": preferred or "guangya",
-        "target_source": "saved_preference" if preferred else "product_default",
+        "target": target,
+        "target_source": target_source,
         "targets": [
             {"value": name, "label": label, "available": available}
             for name, label, available in (
@@ -124,9 +86,12 @@ def _snapshot(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     # 绝不调用 restore_resource_candidate_reference：它会恢复 Provider 句柄。
-    return validate_safe_resource_snapshot({
+    snapshot = validate_safe_resource_snapshot({
         key: value.get(key) for key in ("search_id", "search_status", "candidates")
     })
+    if snapshot is not None and "_verification_targets" in value:
+        snapshot["_verification_targets"] = deepcopy(value["_verification_targets"])
+    return snapshot
 
 
 def _messages(value: Any, *, maximum: int) -> list[str]:
@@ -142,7 +107,7 @@ def candidate_item(value: Mapping[str, Any], position: int) -> dict[str, Any]:
     from app.modules.episode_mapping import extract_release_episode_range
 
     title = sanitize_resource_title(value.get("title")) or f"候选 {position}"
-    season, start, end = extract_release_episode_range(title)
+    season, start, end = extract_release_episode_range(unicodedata.normalize("NFKC", str(value.get("title") or "")))
     coverage = [season, start, end] if start and end and end - start < 1000 else None
     verification = value.get("_verification_context")
     verification = verification if isinstance(verification, dict) else {}
@@ -162,6 +127,7 @@ def candidate_item(value: Mapping[str, Any], position: int) -> dict[str, Any]:
         match = "conflict"
     return {
         "position": position,
+        "result_id": str(value.get("result_id") or ""),
         "title": title,
         "coverage": coverage,
         "media_title": media_title,
@@ -177,85 +143,6 @@ def candidate_item(value: Mapping[str, Any], position: int) -> dict[str, Any]:
         "reasons": _messages(quality.get("reasons"), maximum=6),
         "warnings": _messages(quality.get("warnings"), maximum=4),
     }
-
-
-def _display_sources(public: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    """仅从已有推荐 DTO 取解释，不能遍历 rawresult 或私有候选。"""
-    data = public.get("data")
-    if not isinstance(data, dict):
-        return {}
-    searches = [data]
-    if isinstance(data.get("search"), dict):
-        searches.append(data["search"])
-    episodes = data.get("episodes")
-    for episode in episodes[:3] if isinstance(episodes, list) else []:
-        if isinstance(episode, dict) and isinstance(episode.get("search"), dict):
-            searches.append(episode["search"])
-    result: dict[str, Mapping[str, Any]] = {}
-    for search in searches:
-        items = search.get("items")
-        candidates = list(items[:50]) if isinstance(items, list) else []
-        recommendation = search.get("recommendation")
-        if isinstance(recommendation, dict):
-            alternatives = recommendation.get("alternatives")
-            candidates += alternatives[:3] if isinstance(alternatives, list) else []
-            candidates.append(recommendation.get("selected"))
-        for item in candidates:
-            if isinstance(item, dict) and isinstance(item.get("result_id"), str):
-                result[item["result_id"]] = item
-    return result
-
-
-def resource_candidate_items(value: Any, public: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """模型研究与用户展示共用同一份安全编号；有搜索引用不等于应当挂卡。"""
-    snapshot = _snapshot(value)
-    if snapshot is None:
-        return []
-    sources = _display_sources(public)
-    return [candidate_item({**candidate, **sources.get(candidate["result_id"], {})}, candidate["position"])
-            for candidate in snapshot["candidates"]]
-
-
-def annotate_resource_candidates(payload: dict[str, Any], items: list[dict[str, Any]], *, selected_positions: list[int] | None = None) -> None:
-    """规格并入同编号、同标题的已有事实；仅无对应明细的展示结果需要附录。"""
-    numbers = {}
-    for item in items:
-        if ((item["match"] == "conflict" or item["requested_episode"] and item["match"] not in {"exact_episode", "episode_pack"})
-                and item["position"] not in (selected_positions or [])):
-            continue
-        candidate = {key: item[key] for key in ("position", "media_title", "requested_episode", "match", "title", "coverage") if item[key] is not None and item[key] != ""}
-        profile = infer_media_profile(item["title"])
-        candidate["technical_evidence"] = {
-            "basis": "release_title_only", "stream_verified": False,
-            "resolution": profile.resolution or None,
-            "dynamic_range": profile.dynamic_range or None,
-            "dynamic_ranges": list(infer_dynamic_ranges(item["title"])),
-            "video_codec": profile.video_codec or None,
-            "bit_depth": profile.bit_depth or None,
-            "source": profile.source or None,
-        }
-        numbers[item["position"]] = candidate
-
-    observed = set()
-
-    def annotate(value):
-        if isinstance(value, dict):
-            position = value.get("position")
-            candidate = numbers.get(position) if type(position) is int else None
-            if candidate and value.get("title") == candidate["title"]:
-                for key, fact in candidate.items():
-                    value.setdefault(key, fact)
-                observed.add(position)
-            for child in value.values():
-                annotate(child)
-        elif isinstance(value, list):
-            for child in value:
-                annotate(child)
-
-    annotate(payload)
-    remaining = [candidate for position, candidate in numbers.items() if position not in observed]
-    if remaining or not numbers:
-        payload["candidate_numbers"] = remaining
 
 
 def _candidate_summary(items: list[dict[str, Any]], *, explicit_selection: bool = False) -> dict[str, Any] | None:
@@ -295,6 +182,22 @@ async def issue_candidate_view(
         **await asyncio.to_thread(_target_options, owner),
     }
 
+
+def resource_download_arguments(snapshot: dict[str, Any], positions: list[int], target: str = "preferred") -> dict[str, Any]:
+    """把已绑定的卡片选择转换为原生资源ID及待服务端复核的目标。"""
+    candidates = {item["position"]: item for item in snapshot["candidates"]}
+    selected = [candidates[position] for position in positions]
+    arguments: dict[str, Any] = {"result_ids": [item["result_id"] for item in selected], "target": target}
+    goals = [deepcopy(goal) for goal in snapshot.get("_verification_targets", [])
+             if goal["result_id"] in arguments["result_ids"]]
+    for item in selected:
+        proof = item.get("_verification_context")
+        if isinstance(proof, dict) and not any(goal["result_id"] == item["result_id"] for goal in goals):
+            goals.append({"result_id": item["result_id"], "query": proof["title"],
+                          **{key: value for key, value in proof.items() if key != "title"}})
+    if goals:
+        arguments["verification_targets"] = goals
+    return arguments
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,10 +247,9 @@ async def validate_selection(
         ):
             raise SelectionInvalidError("已有这批资源的待确认计划，请先确认或取消后再改选。")
         guard.check(state)
-        return ValidatedSelection(guard, {
-            "source_type": RESOURCE_KIND, "resource_candidates_ref": guard.ref,
-            "positions": selection["positions"], "target": selection["target"],
-        })
+        return ValidatedSelection(guard, resource_download_arguments(
+            snapshot, selection["positions"], selection["target"],
+        ))
     except (ReferenceError, KeyError, TypeError, ValueError) as exc:
         raise SelectionInvalidError() from exc
 
@@ -364,7 +266,7 @@ async def current_candidate_view(
             "positions": [item["position"] for item in view["items"]], "target": "guangya",
         }, state=state, store=store, for_preview=False)
         public = {key: deepcopy(view[key]) for key in (
-            "ref", "selection_ref", "expires_at", "turn_id",
+            "ref", "selection_ref", "expires_at", "turn_id", "coverage_notice",
         ) if key in view}
         summary = _candidate_summary(
             [candidate_item(item, item["position"]) for item in view["items"]],

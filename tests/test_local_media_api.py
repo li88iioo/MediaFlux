@@ -207,7 +207,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
                 "server_path": "//NAS/Video/Movies",
             }],
         }
-        with patch("app.routes.local_media_api.get_local_media_scheduler") as scheduler:
+        with patch("app.modules.local_media_scheduler.get_local_media_scheduler") as scheduler:
             created = self.client.post("/api/local-media/sources", json=payload, headers=headers)
         self.assertEqual(created.status_code, 200, created.text)
         source_id = created.json()["id"]
@@ -533,7 +533,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             symlink = self.client.post("/api/local-media/sources", json=payload, headers=headers)
             self.assertEqual(symlink.status_code, 400, symlink.text)
         else:
-            with patch("app.routes.local_media_api._validate_source_paths", side_effect=ValueError("允许根目录不能是符号链接")):
+            with patch("app.modules.local_media_service._source_paths", side_effect=ValueError("允许根目录不能是符号链接")):
                 payload["name"] = "symlink"
                 payload["local_root"] = str(symlink_root)
                 payload["targets"] = [{"category": "movie", "path": str(self.movie_target)}]

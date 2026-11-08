@@ -7,15 +7,12 @@ import json
 from collections.abc import AsyncIterator
 from hashlib import sha256
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel import sandbox
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.conversation_codec import conversation_rows
 from app.agent.kernel.conversation_context import (
     persisted_conversation,
@@ -35,11 +32,16 @@ from app.agent.kernel.model import (
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession, SessionLimits
+from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.session_state import SessionState
 from app.agent.kernel.state import InMemorySessionStateStore
-from app.agent.kernel.state_types import AgentInput, HistoryCapacityError, StateUpdate
-from app.agent.kernel.task_state import classify_public_task, task_tool
+from app.agent.kernel.state_types import AgentInput, StateUpdate, _ExecutionCapacity
+from app.agent.kernel.task_state import classify_public_task, proposal
+from tests import test_agent_session_result as session_result_tests
+from tests.agent_task_native_helpers import task_call
 from tests.support import isolated_test_database
+
+native_workspace = session_result_tests.native_workspace
 
 OWNER = "legacy-context-owner"
 SESSION = "legacy-context-session"
@@ -183,20 +185,6 @@ def _call_round(name: str, arguments: dict, call_id: str) -> list[ModelEvent]:
     ]
 
 
-def _capabilities_tool() -> KernelToolSpec:
-    def search(arguments, context):
-        assert context.capability_search is not None
-        return context.capability_search(arguments)
-
-    return KernelToolSpec(
-        name="agent.capabilities",
-        domain="agent",
-        description="发现当前会话可用的受控能力。",
-        input_schema={"type": "object", "properties": {}, "additionalProperties": True},
-        effect=ToolEffect.READ,
-        read=search,
-        metadata={"kernel_utility": True},
-    )
 
 
 def _read_tool() -> KernelToolSpec:
@@ -211,14 +199,16 @@ def _read_tool() -> KernelToolSpec:
 
 
 def _session(
-    store, model: ScriptedModel, *, limits: SessionLimits | None = None
+    store, model: ScriptedModel, *, limits: SessionLimits | None = None, workspace: bool = True
 ) -> AgentSession:
-    catalog = ToolCatalog([_capabilities_tool(), _read_tool()])
+    catalog = ToolCatalog([_read_tool()])
     pipeline = ToolPipeline(catalog=catalog, state_store=store)
+    if workspace:
+        catalog.register(sandbox.run_code_tool(pipeline))
     return AgentSession(
         model=model,
         catalog=catalog,
-        retriever=CapabilityRetriever(minimum=1, maximum=3),
+
         pipeline=pipeline,
         state_store=store,
         limits=limits,
@@ -309,10 +299,8 @@ def test_legacy_summary_is_readable_but_is_not_a_trusted_user_source():
         user_source=CURRENT_USER_REQUEST,
         user_history=(),
     )
-    tool = task_tool()
-    assert tool.read is not None
     with pytest.raises(ValueError):
-        tool.read(_task_create_arguments(LEGACY_SUMMARY), context)
+        proposal(_task_create_arguments(LEGACY_SUMMARY), context)
 
 
 def test_state_update_cannot_forge_trusted_history_memory_version(commit_store):
@@ -350,9 +338,15 @@ def test_summary_update_preserves_verified_requests_and_only_replaces_legacy_not
     commit_store,
 ):
     async def exercise():
-        initial = await _commit_large_dialogue(commit_store)
+        original = EARLY_USER_REQUEST + "文" * 11_000 + "END_NO_WRITES"
+        initial = await _commit_large_dialogue(commit_store, early_user_request=original)
         assert initial.metadata.get("history_memory_version") == 1
-        assert EARLY_USER_REQUEST in historical_user_sources(initial)
+        assert len(initial.summary) > 8_000
+        assert original in historical_user_sources(initial)
+        restored = SessionState.from_payload(owner=OWNER, session_id=SESSION,
+            generation=initial.generation, payload=initial.to_payload())
+        assert restored.summary == initial.summary
+        assert history_memory(restored) == history_memory(initial.clone())
 
         lease, _ = await commit_store.begin_turn(
             owner=OWNER, session_id=SESSION, request_id="update-legacy-summary-note"
@@ -360,12 +354,14 @@ def test_summary_update_preserves_verified_requests_and_only_replaces_legacy_not
         await commit_store.commit(
             lease, updates=(StateUpdate("summary", LEGACY_SUMMARY),)
         )
-        cold = await commit_store.load(owner=OWNER, session_id=SESSION)
+        cold_store = _sqlite_store() if isinstance(commit_store, SQLiteKernelStore) else commit_store
+        cold = await cold_store.load(owner=OWNER, session_id=SESSION)
         memory = history_memory(cold)
 
         assert cold.metadata.get("history_memory_version") == 1
         assert memory["legacy_note"] == LEGACY_SUMMARY
-        assert EARLY_USER_REQUEST in historical_user_sources(cold)
+        assert original in historical_user_sources(cold)
+        assert memory["requests"] == history_memory(initial)["requests"]
         assert LEGACY_SUMMARY not in historical_user_sources(cold)
         assert ASSISTANT_FORGED_SOURCE not in historical_user_sources(cold)
         assert TOOL_FORGED_SOURCE not in historical_user_sources(cold)
@@ -410,12 +406,14 @@ def test_oversized_cropped_user_history_rejects_commit_without_mutating_checkpoi
             owner=OWNER, session_id=SESSION, request_id="oversized-history"
         )
 
-        with pytest.raises(HistoryCapacityError):
+        # 原 200k ASCII 可完整归入 summary；拒写边界应是整个状态的字节容量。
+        with pytest.raises(ValueError, match="持久化上限"):
             await store.commit(
                 lease,
                 conversation=[
-                    {"role": "user", "content": "OVERSIZED_USER_SOURCE_" + ("z" * 200_000)}
+                    {"role": "user", "content": "OVERSIZED_USER_SOURCE_" + ("z" * (256 * 1024))}
                 ],
+                updates=(_ExecutionCapacity("", False),),
             )
 
         after = await store.load(owner=OWNER, session_id=SESSION)
@@ -625,7 +623,7 @@ def test_legacy_plain_text_summary_is_only_untrusted_history_in_model_request():
             assert LEGACY_SUMMARY in prompt
             assert '"requests":[]' in prompt
             assert '"legacy_note"' in prompt
-            assert "legacy_note 不具备原始用户来源" in prompt
+            assert "legacy_note 不是用户原话" in prompt
             assert any(
                 message.role == "user" and CURRENT_USER_REQUEST in message.content
                 for message in model.requests[0].messages
@@ -642,9 +640,7 @@ def test_task_create_can_cite_exact_trusted_saved_user_request():
         current_task=None,
     )
 
-    tool = task_tool()
-    assert tool.read is not None
-    patch = tool.read(_task_create_arguments(EARLY_USER_REQUEST), context)
+    patch = proposal(_task_create_arguments(EARLY_USER_REQUEST), context)
 
     assert patch.operation == "create"
     assert patch.source == EARLY_USER_REQUEST
@@ -659,19 +655,16 @@ def test_task_revise_and_cancel_remain_limited_to_current_user_source():
         user_history=(EARLY_USER_REQUEST,),
         current_task=None,
     )
-    tool = task_tool()
-    assert tool.read is not None
 
     for arguments in (
         _task_revise_arguments(EARLY_USER_REQUEST),
         _task_cancel_arguments(EARLY_USER_REQUEST),
     ):
         with pytest.raises(ValueError):
-            tool.read(arguments, context)
+            proposal(arguments, context)
 
-    assert tool.read is not None
-    revised = tool.read(_task_revise_arguments(CURRENT_USER_REQUEST), context)
-    cancelled = tool.read(_task_cancel_arguments(CURRENT_USER_REQUEST), context)
+    revised = proposal(_task_revise_arguments(CURRENT_USER_REQUEST), context)
+    cancelled = proposal(_task_cancel_arguments(CURRENT_USER_REQUEST), context)
     assert revised.source == CURRENT_USER_REQUEST
     assert revised.source_kind == "current_user"
     assert cancelled.source == CURRENT_USER_REQUEST
@@ -685,12 +678,10 @@ def test_task_create_rejects_assistant_and_tool_text_as_historical_sources():
         user_history=(EARLY_USER_REQUEST,),
         current_task=None,
     )
-    tool = task_tool()
-    assert tool.read is not None
 
     for forged in (ASSISTANT_FORGED_SOURCE, TOOL_FORGED_SOURCE):
         with pytest.raises(ValueError):
-            tool.read(_task_create_arguments(forged), context)
+            proposal(_task_create_arguments(forged), context)
 
 
 def test_real_session_task_create_receives_only_trusted_cropped_user_history():
@@ -701,13 +692,7 @@ def test_real_session_task_create_receives_only_trusted_cropped_user_history():
             model = ScriptedModel(
                 [
                     _call_round(
-                        "agent__capabilities",
-                        {"tool_names": ["agent.task"]},
-                        "discover-task",
-                    ),
-                    _call_round(
-                        "agent__task",
-                        _task_create_arguments(EARLY_USER_REQUEST),
+                        *task_call(_task_create_arguments(EARLY_USER_REQUEST), wire=True),
                         "create-from-history",
                     ),
                     [
@@ -734,7 +719,7 @@ def test_real_session_task_create_receives_only_trusted_cropped_user_history():
             assert saved.metadata["task"]["source_quote"] == EARLY_USER_REQUEST
             assert saved.metadata["task"]["source_kind"] == "historical_user_quote"
             assert events[-1].payload["task"]["status"] == "partial"
-            assert session.catalog.get("agent.task").effect is ToolEffect.READ
+            assert not session.catalog.has("agent.task")
             assert all(tool.effect is ToolEffect.READ for tool in session.catalog.visible())
 
         _run(exercise())
@@ -774,7 +759,7 @@ def test_long_old_request_is_readable_without_freezing_unrelated_turn_or_repair(
         prompt = model.requests[0].system_prompt
         view = next(json.loads(line) for line in prompt.splitlines() if line.startswith('{"requests"'))
         assert view["truncated"] and view["truncation"]
-        assert "agent__read_result" in {tool["name"] for tool in model.requests[0].tools}
+        assert "agent__run_code" in {tool["name"] for tool in model.requests[0].tools}
         lease, _ = await store.begin_turn(owner=OWNER, session_id=SESSION, request_id="read-old")
 
         async def progress(_payload):
@@ -782,18 +767,214 @@ def test_long_old_request_is_readable_without_freezing_unrelated_turn_or_repair(
 
         context = ToolCallContext(owner=OWNER, session_id=SESSION, request_id="read-old", turn_id=lease.turn_id,
                                   lease=lease, cancellation=CancellationToken(), report_progress=progress)
-        arguments = {"handle": view["result_handle"], "path": "/requests/0/text", "offset": 10_900, "limit": 1000}
-        result = await session.pipeline.execute("agent.read_result", arguments, context=context)
-        page = json.loads(result.outcome.model_content)["data"]
-        assert page["items"] == long_request[10_900:]
-        assert "END_NO_WRITES" in page["items"]
-        assert page["total"] == len(long_request)
+        arguments = {"handle": view["result_handle"], "path": "/requests/0/text"}
+        result = await SessionService(session.pipeline, context).result(**arguments)
+        assert result["data"] == long_request
+        assert "END_NO_WRITES" in result["data"]
         from dataclasses import replace
-        other, _ = await store.begin_turn(owner="another-owner", session_id=SESSION, request_id="other")
-        with pytest.raises(ToolPipelineError) as error:
-            await session.pipeline.execute("agent.read_result", arguments,
-                context=replace(context, owner="another-owner", lease=other, turn_id=other.turn_id, request_id="other"))
-        assert error.value.code == "reference_invalid"
+        for owner, session_id in (("another-owner", SESSION), (OWNER, "another-session")):
+            other, _ = await store.begin_turn(owner=owner, session_id=session_id, request_id="other")
+            with pytest.raises(ToolPipelineError) as error:
+                await SessionService(session.pipeline, replace(context, owner=owner, session_id=session_id,
+                    lease=other, turn_id=other.turn_id, request_id="other")).result(**arguments)
+            assert error.value.code == "reference_invalid"
+
+    _run(exercise())
+
+
+def _history_view(request):
+    return next(json.loads(line) for line in request.system_prompt.splitlines()
+                if line.startswith('{"requests"'))
+
+
+@pytest.mark.parametrize("character,window,conservative,auxiliary,archived", [
+    ("x", 16_384, False, False, False),
+    ("文", 32_768, False, False, False),
+    ("x", 16_384, True, False, True),
+    ("x", 16_384, False, True, False),
+], ids=("ascii-fits", "larger-window-fits", "conservative-overflow", "omit-old-note-first"))
+def test_full_history_uses_model_token_capacity(character, window, conservative, auxiliary, archived, monkeypatch):
+    class Model(ScriptedModel):
+        def budget_for_model(self, model, context, output):
+            return context, output, conservative
+
+    async def exercise():
+        store = InMemorySessionStateStore()
+        original = "旧用户条件：" + character * 11_000 + "END_NO_WRITES"
+        await _commit_large_dialogue(store, early_user_request=original)
+        if auxiliary:
+            lease, _ = await store.begin_turn(owner=OWNER, session_id=SESSION, request_id="old-note")
+            await store.commit(lease, updates=(StateUpdate("summary", "旧" * 8_000),))
+        model = Model([[ModelEvent(ModelEventType.TEXT_DELTA, text="你好。"),
+                        ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        session = _session(store, model, limits=SessionLimits(context_window_tokens=window))
+        save = AsyncMock(wraps=session.pipeline.save_result)
+        monkeypatch.setattr(session.pipeline, "save_result", save)
+        events = [event async for event in session.run(AgentInput(
+            owner=OWNER, session_id=SESSION, message="新的普通问题：你好"))]
+        assert events[-1].payload["status"] == "success"
+        view = _history_view(model.requests[0])
+        if archived:
+            assert view["truncated"] and view["truncation"][0]["path"] == "/requests"
+            assert save.await_count > 0
+        else:
+            assert original in [row["text"] for row in view["requests"]]
+            assert "result_handle" not in view
+            save.assert_not_awaited()
+        if auxiliary:
+            assert view["auxiliary_history_omitted"] and view["legacy_note"] == ""
+        cold = await store.load(owner=OWNER, session_id=SESSION)
+        assert original in historical_user_sources(cold)
+        if auxiliary:
+            assert history_memory(cold)["legacy_note"] == "旧" * 8_000
+
+    _run(exercise())
+
+
+@pytest.mark.parametrize("expiry", ["valid", "expired", "missing-part"])
+def test_history_snapshot_cache_requires_readable_parts(expiry, monkeypatch):
+    from app.agent.kernel.references import InMemoryReferenceStore, ReferenceError
+
+    async def exercise():
+        now, missing = [0.0], [""]
+        refs = InMemoryReferenceStore(clock=lambda: now[0])
+        resolve = refs.resolve
+
+        async def resolve_available(handle, **scope):
+            if handle == missing[0]:
+                raise ReferenceError("snapshot part unavailable")
+            return await resolve(handle, **scope)
+
+        monkeypatch.setattr(refs, "resolve", resolve_available)
+
+        class Model(ScriptedModel):
+            async def stream(self, request, *, cancellation):
+                async for event in super().stream(request, cancellation=cancellation):
+                    yield event
+                if len(self.requests) == 1:
+                    if expiry == "expired":
+                        now[0] = 901.0
+                    elif expiry == "missing-part":
+                        manifest = await resolve(_history_view(request)["result_handle"],
+                            owner=OWNER, session_id=SESSION, expected_kind="tool_result")
+                        missing[0] = manifest["parts"][0]
+
+        store = InMemorySessionStateStore()
+        original = "旧任务" + "文" * 11_000 + "END_NO_WRITES"
+        lease, _ = await store.begin_turn(owner=OWNER, session_id=SESSION, request_id="seed")
+        await store.commit(lease, conversation=[{"role": "user", "content": original}])
+        model = Model([_call_round("library.inspect", {}, "read"),
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="仅检查配置。"),
+             ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        session = _session(store, model, limits=SessionLimits(context_window_tokens=16_384))
+        session.pipeline.reference_store = refs
+        events = [event async for event in session.run(AgentInput(
+            owner=OWNER, session_id=SESSION, message="检查当前配置"))]
+        assert events[-1].payload["status"] == "success"
+        handles = [_history_view(request)["result_handle"] for request in model.requests]
+        assert len(handles) == 2
+        assert (handles[0] == handles[1]) is (expiry == "valid")
+        manifest = await refs.resolve(handles[-1], owner=OWNER, session_id=SESSION, expected_kind="tool_result")
+        parts = [await refs.resolve(part, owner=OWNER, session_id=SESSION, expected_kind="tool_result_part")
+                 for part in manifest["parts"]]
+        assert json.loads("".join(parts))["requests"][0]["text"] == original
+        assert original in historical_user_sources(await store.load(owner=OWNER, session_id=SESSION))
+
+    _run(exercise())
+
+
+@pytest.mark.parametrize("boundary", ["snapshot", "reader-schema", "current-request"])
+def test_insufficient_archive_or_request_capacity_stops_before_model(boundary, monkeypatch):
+    from app.agent.kernel.references import InMemoryReferenceStore
+
+    async def exercise():
+        store = InMemorySessionStateStore()
+        original = "旧任务" + "文" * 11_000 + "END_NO_WRITES"
+        await _commit_large_dialogue(store, early_user_request=original)
+        model = ScriptedModel([])
+        session = _session(store, model, limits=SessionLimits(context_window_tokens=16_384))
+        if boundary == "snapshot":
+            refs = InMemoryReferenceStore(max_entries=32)
+            monkeypatch.setattr(refs, "max_ref_bytes", 1024, raising=False)
+            session.pipeline.reference_store = refs
+        elif boundary == "reader-schema":
+            from dataclasses import replace
+            reader = session.catalog.get("agent.run_code")
+            session.catalog._tools[reader.name] = replace(reader, input_schema={**reader.input_schema, "description": "s" * 100_000})
+        message = "问" * 11_900 if boundary == "current-request" else "新的普通问题：你好"
+        events = [event async for event in session.run(AgentInput(owner=OWNER, session_id=SESSION, message=message))]
+        assert events[-1].payload["code"] == "context_budget_exceeded"
+        assert model.requests == []
+        assert not any(event.type.value == "tool.started" for event in events)
+        assert original in historical_user_sources(await store.load(owner=OWNER, session_id=SESSION))
+
+    _run(exercise())
+
+
+def test_explicit_last_round_keeps_archived_original_context_readable(native_workspace):
+    import re
+
+    async def exercise():
+        store = InMemorySessionStateStore()
+        await _commit_large_dialogue(store, early_user_request="旧任务" + "文" * 11_000 + "END_NO_WRITES")
+
+        class Reader(ScriptedModel):
+            async def stream(self, request, *, cancellation):
+                if len(self.requests) == 1:
+                    match = re.search(r'"result_handle"\s*:\s*"(ref_[^"]+)"', request.system_prompt)
+                    assert match is not None
+                    handle = match.group(1)
+                    self.rounds.append(_call_round("agent.run_code", {
+                        "code": f'from mf import session\nv = session.result({handle!r}, path="/requests/0/text")["data"]\nassert v.endswith("END_NO_WRITES")\nprint(v[:32])',
+                    }, "archive"))
+                async for event in super().stream(request, cancellation=cancellation):
+                    yield event
+
+        model = Reader([_call_round("library.inspect", {}, "read")])
+        session = _session(store, model, limits=SessionLimits(context_window_tokens=16_384, max_model_rounds=2))
+        events = [event async for event in session.run(AgentInput(
+            owner=OWNER, session_id=SESSION, message="检查当前配置"))]
+        assert len(model.requests) == 2
+        assert any(tool["name"] == "agent__run_code" for tool in model.requests[-1].tools)
+        assert events[-1].payload["finish_reason"] == "model_round_budget_exceeded"
+        assert events[-1].payload["status"] == "partial"
+        saved = await store.load(owner=OWNER, session_id=SESSION)
+        archive = next(row for row in saved.conversation if row.get("tool_call_id") == "archive")
+        assert "旧任务" in archive["content"] and json.loads(archive["content"])["data"]["exit_code"] == 0
+
+    _run(exercise())
+
+
+def test_explanation_capacity_failure_keeps_plan_pending_and_tools_disabled(monkeypatch):
+    from app.agent.kernel.tool_calls import PreparedEffect
+
+    async def exercise():
+        store, writes = InMemorySessionStateStore(), []
+        await _commit_large_dialogue(store, early_user_request="旧任务" + "文" * 11_000 + "END_NO_WRITES")
+        tool = KernelToolSpec(name="library.change", domain="library", description="修改预览",
+            input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+            prepare=lambda *_: PreparedEffect(preview={"summary": "等待确认"}, snapshot_fingerprint="frozen"),
+            execute_confirmed=lambda *_: writes.append(True) or {"ok": True})
+        model = ScriptedModel([_call_round(tool.name, {}, "preview")])
+        session = _session(store, model, workspace=False)
+        session.catalog.register(tool)
+        initial = [event async for event in session.run(AgentInput(
+            owner=OWNER, session_id=SESSION, message="请准备修改预览"))]
+        assert initial[-1].payload["status"] == "approval_required"
+        before = await store.load(owner=OWNER, session_id=SESSION)
+        assert before.pending_effect_plan_id
+        model.requests.clear()
+        session.limits = SessionLimits(context_window_tokens=16_384)
+        save = AsyncMock(wraps=session.pipeline.save_result)
+        monkeypatch.setattr(session.pipeline, "save_result", save)
+        events = [event async for event in session.explain(owner=OWNER, session_id=SESSION,
+            plan_id=before.pending_effect_plan_id, message="只解释这张计划")]
+        assert events[-1].payload["code"] == "context_budget_exceeded"
+        assert model.requests == [] and writes == []
+        save.assert_not_awaited()
+        after = await store.load(owner=OWNER, session_id=SESSION)
+        assert after.pending_effect_plan_id == before.pending_effect_plan_id
+        assert after.metadata["pending_effect_binding"] == before.metadata["pending_effect_binding"]
 
     _run(exercise())
 

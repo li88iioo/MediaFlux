@@ -172,6 +172,25 @@ def test_global_context_defaults_and_clamp_unchanged(harness, raw, context, cap)
     assert output(wire.single_body()) == cap
 
 
+def test_saved_reasoning_effort_rebuilds_runtime_with_widened_output_budget(harness, config_api):
+    wire, _compression = harness
+    assert config_api.get('/api/config').json()['AGENT_LLM_REASONING_EFFORT'] == ''
+    before = bootstrap.get_agent_kernel_runtime()
+    assert before.session.limits.max_output_tokens == 6000
+    complete(turn(before.session))
+
+    reply = config_api.post('/api/config', json={'AGENT_LLM_REASONING_EFFORT': ' High '})
+    assert reply.status_code == 200, reply.text
+    assert config.get('AGENT_LLM_REASONING_EFFORT') == 'high'
+    after = bootstrap.get_agent_kernel_runtime()
+    assert after is not before and after.session.limits.max_output_tokens == 16000
+    complete(turn(after.session, session_id='after-effort'))
+
+    legacy, reasoning = (call['body'] for call in wire.requests)
+    assert (output(legacy), legacy['temperature'], 'reasoning_effort' in legacy) == (6000, 0, False)
+    assert (output(reasoning), reasoning['reasoning_effort'], 'temperature' in reasoning) == (16000, 'high', False)
+
+
 class InjectedModel:
     def __init__(self, truthy=True):
         self.truthy = truthy

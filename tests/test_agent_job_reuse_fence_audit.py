@@ -7,21 +7,28 @@ import socket
 import threading
 import unittest
 from contextlib import contextmanager
+from typing import TypedDict
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domains.library.patrol_progress import empty_patrol_projection
-from app.agent.domains.system.jobs_actions import (
-    prepare_start_episode_audit,
-    start_episode_audit_confirmed,
+from app.modules import library_audit_jobs as actions
+from app.modules.library_patrol import empty_patrol_projection
+from app.modules.library_audit_jobs import (
+    prepare_start_audit,
+    start_audit,
 )
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext, ToolResult
+from app.repositories.agent_jobs import AgentJobError
 from tests.support import isolated_test_database
 
 OWNER = "r7-temporary-owner"
-ARGUMENTS = {"as_of": "2026-01-01", "max_series": 2}
+
+
+class AuditArguments(TypedDict):
+    as_of: str
+    max_series: int
+
+
+ARGUMENTS: AuditArguments = {"as_of": "2026-01-01", "max_series": 2}
 
 
 class AgentJobReuseFenceAuditTests(unittest.TestCase):
@@ -37,7 +44,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             ),
             isolated_test_database(),
             patch(
-                "app.agent.domains.system.jobs_actions.get_agent_jobs_scheduler",
+                "app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler",
                 return_value=Mock(),
             ),
         ):
@@ -57,31 +64,18 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             running = db.claim_due_agent_job(job_type="library_episode_audit")
             assert running is not None
             self.assertEqual(running["job_id"], first_id)
-            context = ToolContext(owner=OWNER)
-            preview, fingerprint = prepare_start_episode_audit(ARGUMENTS, context)
-            self.assertTrue(preview.data["reused"])
-            self.assertIn("确认后不会创建新任务", " ".join(preview.data["effects"]))
-
-            # 模拟真实入口已经消费有效、owner 匹配的一次性确认票据。
-            store = SQLiteConfirmationStore()
-            ticket = store.issue(
-                owner=OWNER,
-                tool_name="library.start_episode_audit",
-                arguments=ARGUMENTS,
-                context_fingerprint=fingerprint,
-            )
-            claimed_ticket = store.claim_and_rotate_owner(
-                owner=OWNER, confirmation_id=ticket.confirmation_id
-            )
-            self.assertEqual(store.list_active_tickets(owner=OWNER), [])
+            context = OWNER
+            preview, fingerprint = prepare_start_audit(owner=context, **ARGUMENTS)
+            self.assertTrue(preview["data"]["reused"])
+            self.assertEqual(fingerprint["dedupe_active_id"], first_id)
 
             completion_uncommitted = threading.Event()
             allow_completion_commit = threading.Event()
             confirmation_checked = threading.Event()
-            outcomes: dict[str, bool | ToolResult] = {}
+            outcomes: dict[str, bool | dict] = {}
             failures = []
             real_get_conn = db.get_conn
-            real_create = db.create_agent_job
+            real_create = actions.jobs.create_agent_job
 
             @contextmanager
             def gated_connection():
@@ -94,7 +88,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
                             raise AssertionError("completion gate timed out")
 
             def observed_create(**kwargs):
-                # 此时正式 confirmed handler 已通过 _start_context 指纹复核；
+                # 公共service已通过同范围活动任务的预检快照复核；
                 # 随后的真实 BEGIN IMMEDIATE 必须等待旧 job 的成功事务提交。
                 confirmation_checked.set()
                 return real_create(**kwargs)
@@ -115,10 +109,8 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
 
             def confirm_reuse():
                 try:
-                    outcomes["confirmed"] = start_episode_audit_confirmed(
-                        claimed_ticket.arguments,
-                        claimed_ticket.context_fingerprint,
-                        context,
+                    outcomes["confirmed"] = start_audit(
+                        owner=context, expected_snapshot=fingerprint, **ARGUMENTS
                     )
                 except BaseException as exc:
                     failures.append(exc)
@@ -131,7 +123,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             )
             with (
                 patch.object(db, "get_conn", gated_connection),
-                patch.object(db, "create_agent_job", observed_create),
+                patch.object(actions.jobs, "create_agent_job", observed_create),
             ):
                 try:
                     completer.start()
@@ -148,59 +140,60 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             self.assertFalse(completer.is_alive() or confirmer.is_alive())
             self.assertTrue(outcomes["completed"])
             self.assertEqual(len(failures), 1)
-            assert isinstance(failures[0], AgentToolError)
+            assert isinstance(failures[0], AgentJobError)
             self.assertEqual(failures[0].code, "confirmation_stale")
             self.assertNotIn("confirmed", outcomes)
             get_agent_job_result = db.get_agent_job(owner=OWNER, job_id=first_id)
             assert get_agent_job_result is not None
-            self.assertEqual(
-                get_agent_job_result["status"], "succeeded"
-            )
+            self.assertEqual(get_agent_job_result["status"], "succeeded")
             self.assertEqual(len(db.list_agent_jobs(owner=OWNER)), 1)
-            self.assertEqual(store.list_active_tickets(owner=OWNER), [])
 
     def test_current_reuse_and_other_owner_keep_single_owner_scoped_job(self):
-        from app.agent.domains.system import jobs_actions as actions
+        from app.modules import agent_jobs_scheduler
 
         with (
             isolated_test_database(),
-            patch.object(actions, "get_agent_jobs_scheduler"),
+            patch.object(agent_jobs_scheduler, "get_agent_jobs_scheduler"),
         ):
-            args = dict(ARGUMENTS)
-            context = ToolContext(owner=OWNER)
-            _, fingerprint = prepare_start_episode_audit(args, context)
-            first = start_episode_audit_confirmed(args, fingerprint, context)
-            self.assertTrue(first.data["created"])
-            _, reuse_fingerprint = prepare_start_episode_audit(args, context)
-            reused = start_episode_audit_confirmed(args, reuse_fingerprint, context)
-            self.assertFalse(reused.data["created"])
-            self.assertEqual(reused.data["job_id"], first.data["job_id"])
-            other = ToolContext(owner="other-owner")
-            _, other_fingerprint = prepare_start_episode_audit(args, other)
-            second = start_episode_audit_confirmed(args, other_fingerprint, other)
-            self.assertTrue(second.data["created"])
-            self.assertNotEqual(second.data["job_id"], first.data["job_id"])
+            args = ARGUMENTS.copy()
+            context = OWNER
+            _, fingerprint = prepare_start_audit(owner=context, **args)
+            first = start_audit(owner=context, expected_snapshot=fingerprint, **args)
+            self.assertTrue(first["data"]["created"])
+            _, reuse_fingerprint = prepare_start_audit(owner=context, **args)
+            reused = start_audit(
+                owner=context, expected_snapshot=reuse_fingerprint, **args
+            )
+            self.assertFalse(reused["data"]["created"])
+            self.assertEqual(reused["data"]["job_id"], first["data"]["job_id"])
+            other = "other-owner"
+            _, other_fingerprint = prepare_start_audit(owner=other, **args)
+            second = start_audit(
+                owner=other, expected_snapshot=other_fingerprint, **args
+            )
+            self.assertTrue(second["data"]["created"])
+            self.assertNotEqual(second["data"]["job_id"], first["data"]["job_id"])
             self.assertEqual(len(db.list_agent_jobs(owner=OWNER)), 1)
 
     def test_cancelled_reuse_cannot_attach_to_new_active_replacement(self):
-        from app.agent.domains.system import jobs_actions as actions
+        from app.modules import agent_jobs_scheduler
 
         with (
             isolated_test_database(),
-            patch.object(actions, "get_agent_jobs_scheduler"),
+            patch.object(agent_jobs_scheduler, "get_agent_jobs_scheduler"),
         ):
-            args = dict(ARGUMENTS)
-            context = ToolContext(owner=OWNER)
-            _, fingerprint = prepare_start_episode_audit(args, context)
-            first = start_episode_audit_confirmed(args, fingerprint, context)
-            _, reuse_fingerprint = prepare_start_episode_audit(args, context)
-            real_create = db.create_agent_job
+            args = ARGUMENTS.copy()
+            context = OWNER
+            _, fingerprint = prepare_start_audit(owner=context, **args)
+            first = start_audit(owner=context, expected_snapshot=fingerprint, **args)
+            _, reuse_fingerprint = prepare_start_audit(owner=context, **args)
+            real_create = actions.jobs.create_agent_job
 
             def replace_before_transaction(**kwargs):
                 with db.get_conn() as conn:
                     conn.execute(
                         "UPDATE agent_jobs SET status='cancelled' WHERE job_id=?",
-                        (first.data["job_id"],),
+                        (first["data"]["job_id"],),
                     )
                 replacement_kwargs = {
                     key: value
@@ -209,13 +202,15 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
                 }
                 replacement, created = real_create(**replacement_kwargs)
                 self.assertTrue(created)
-                self.assertNotEqual(replacement["job_id"], first.data["job_id"])
+                self.assertNotEqual(replacement["job_id"], first["data"]["job_id"])
                 return real_create(**kwargs)
 
             with patch.object(
-                db, "create_agent_job", side_effect=replace_before_transaction
+                actions.jobs, "create_agent_job", side_effect=replace_before_transaction
             ):
-                with self.assertRaises(AgentToolError) as raised:
-                    start_episode_audit_confirmed(args, reuse_fingerprint, context)
+                with self.assertRaises(AgentJobError) as raised:
+                    start_audit(
+                        owner=context, expected_snapshot=reuse_fingerprint, **args
+                    )
             self.assertEqual(raised.exception.code, "confirmation_stale")
             self.assertEqual(len(db.list_agent_jobs(owner=OWNER)), 2)

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import URL
 from starlette.requests import Request
 
-from app import config
+from app import config, database as db
 from app.agent.feature_gate import is_agent_enabled
 from app.defaults import (
     DEFAULT_AGENT_STREAM_DISPLAY_ENABLED,
@@ -550,6 +550,17 @@ class AgentSettingsUiTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 _validate_agent_llm_updates({"AGENT_LLM_TIMEOUT_SECONDS": value})
 
+    def test_agent_llm_reasoning_effort_validation_normalizes_shared_levels(self):
+        for raw, expected in (("", ""), ("low", "low"), (" Medium ", "medium"), ("HIGH", "high"), (None, "")):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    _validate_agent_llm_updates({"AGENT_LLM_REASONING_EFFORT": raw}),
+                    {"AGENT_LLM_REASONING_EFFORT": expected},
+                )
+        for value in ("max", "xhigh", "minimal", "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _validate_agent_llm_updates({"AGENT_LLM_REASONING_EFFORT": value})
+
     def test_agent_feature_gate_hot_toggle_queues_runtime_without_bot_restart(self):
         request = self._request()
         request.app.state.background_services_enabled = True
@@ -799,6 +810,26 @@ class AgentSettingsUiTests(unittest.TestCase):
         configured_timeout.assert_not_called()
         self.assertEqual(runner.call_count, 1)
 
+    def test_model_test_rejects_unsupported_reasoning_effort_before_network(self):
+        from app.routes import tools_api
+
+        with patch.object(tools_api, "require_api_login", return_value=None), patch.object(
+            tools_api.agent_rate_limiter, "allow", return_value=True
+        ), patch.object(tools_api, "_test_ai_provider") as test_provider:
+            response = tools_api.ai_model_test(
+                self._request(),
+                {
+                    "base_url": "https://api.example.test/v1",
+                    "api_key": "draft-secret",
+                    "protocol": "responses",
+                    "model": "gpt-test",
+                    "reasoning_effort": "max",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        test_provider.assert_not_called()
+
     def test_model_test_uses_current_draft_without_saving_it(self):
         from app.routes import tools_api
 
@@ -828,6 +859,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                     "protocol": "auto",
                     "model": "claude-test",
                     "timeout_seconds": 120,
+                    "reasoning_effort": "High",
                 },
             )
 
@@ -847,6 +879,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             protocol="anthropic_messages",
             model="claude-test",
             timeout_seconds=120,
+            reasoning_effort="high",
         )
         self.assertEqual(runner.call_count, 1)
 
@@ -1140,6 +1173,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 _validate_web_access_updates({key: value})
         with (
+            initialized_web_runtime(),
             patch("app.routes.api.config.get", side_effect=lambda key, default="": _AGENT_SETTINGS_DEFAULTS.get(key, default)),
             patch("app.routes.api.config.has_external_override", return_value=False),
             patch("app.routes.api.config.set_and_save") as persist,
@@ -1147,7 +1181,11 @@ class AgentSettingsUiTests(unittest.TestCase):
             patch("app.agent.feature_gate.invalidate_agent_runtime_generation"),
             patch("app.agent.kernel.bootstrap.invalidate_agent_kernel_runtime"),
         ):
+            cache_key, cached = "a" * 64, {"fixture": "reader-cache"}
+            db.set_agent_web_search_cache(cache_key, cached, ttl_seconds=600)
+            self.assertEqual(db.get_agent_web_search_cache(cache_key), cached)
             result = save_config(self._request(), values)
+            self.assertIsNone(db.get_agent_web_search_cache(cache_key))
         self.assertEqual(result, {"success": True})
         persist.assert_called_once_with(values)
 

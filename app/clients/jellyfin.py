@@ -29,6 +29,7 @@ logger = get_logger(__name__)
 
 class JellyfinClient(MediaServerClient):
     display_name = "Jellyfin"
+    _REFRESH_SERVER = "jellyfin"
     _RECENT_EXTRA_FIELDS = "SeriesPrimaryImageTag,"
     _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
@@ -278,6 +279,7 @@ class JellyfinClient(MediaServerClient):
         )[:12]
         return MediaItem(
             id=item_id,
+            tmdb_id=self._provider_tmdb_id(item.get("ProviderIds")),
             name=item.get("Name", ""),
             type=item.get("Type", ""),
             year=str(item.get("ProductionYear", "") or ""),
@@ -517,27 +519,6 @@ class JellyfinClient(MediaServerClient):
             params={"Limit": 0, "MediaTypes": "Video", "EnableImages": "false"},
         )
         return int(data.get("TotalRecordCount", 0) or 0)
-
-    def refresh_library(self, library_id: str) -> bool:
-        """轻量刷新 Item/Folder/媒体库；自动流程不强制重抓全部元数据。"""
-        try:
-            resp = self._session.post(
-                f"{self.url}/Items/{library_id}/Refresh",
-                headers=self._headers(),
-                params={
-                    "metadataRefreshMode": "Default",
-                    "imageRefreshMode": "None",
-                    "replaceAllMetadata": "false",
-                    "replaceAllImages": "false",
-                    "regenerateTrickplay": "false",
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception as exc:
-            logger.error("Jellyfin 刷新目标失败 target=%s type=%s", library_id, type(exc).__name__)
-            return False
 
     @staticmethod
     def _normalize_path(path: str) -> str:

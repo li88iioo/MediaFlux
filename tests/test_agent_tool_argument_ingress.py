@@ -10,12 +10,7 @@ import httpx
 import pytest
 
 from app import database as db
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.model import ModelEventType, ModelRequest
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -350,7 +345,7 @@ def test_actual_session_pipeline_never_executes_nonobject(protocol, mode, value,
         }[protocol]
         transport = Wire(protocol, [wire(protocol, mode, incoming), (encode(final).encode(), "application/json")])
         session = AgentSession(model=transport.adapter, catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         seen = [e async for e in session.run(AgentInput(message="只读核验", owner="owner", session_id="ingress"))]
         saved = await SQLiteKernelStore(secret_provider=lambda: "offline-tool-argument-test").load(

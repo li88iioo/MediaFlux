@@ -9,7 +9,11 @@ import re
 from urllib.parse import unquote
 
 _ASSIGNMENT_RE = re.compile(
-    r'''(?ix)
+    r'''(?imx)
+    # 仅消费后接同名签名的pydoc标题；正文仍按原赋值规则扫描。
+    ^[\t ]*Help[ ]on[ ]function[ ](?P<help_name>[a-z_]\w*)[ ]in[ ]module[ ][a-z_]\w*(?:\.[a-z_]\w*)*:[\t ]*\r?$
+    (?=\n[\t ]*\r?\n[\t ]*(?-i:(?P=help_name))\()
+    |
     (?P<prefix>
         (?<![A-Za-z0-9_-])["']?
         (?P<label>[a-z][a-z0-9_-]{0,80})

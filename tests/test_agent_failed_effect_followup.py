@@ -8,6 +8,7 @@
 证据：.superpowers/tmp/agent-failed-effect-20261012/（不提交）。
 """
 from __future__ import annotations
+from tests.agent_task_native_helpers import task_call
 
 import asyncio
 import hashlib
@@ -23,20 +24,14 @@ import requests
 from app import config
 from app import database as db
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domain_catalog import build_tool_specs
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import TurnViewBuilder
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import adapt_tool_spec
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
 from app.agent.kernel.ports.mediaflux_policy import (
     MediaFluxAuthorizationPolicy,
@@ -91,13 +86,7 @@ class FailedEffectScript(NativeScript):
                 "retry_a": (WRITE, A),
                 "preview_b": (WRITE, B),
                 "read_a": (READ, A),
-                "core_discovery": (
-                    "agent.capabilities", {"tool_names": [WRITE, READ]},
-                ),
-                "core_task_discovery": (
-                    "agent.capabilities", {"tool_names": ["agent.task"]},
-                ),
-                "core_task": ("agent.task", {
+                "core_task": task_call({
                     "operation": "create", "source": GOAL,
                     "root_goal": GOAL, "constraints": ["不能自动执行 B"],
                     "obligations": [{
@@ -277,9 +266,7 @@ class NativeCase:
 
     def build(self, followup):
         self.script = FailedEffectScript(followup)
-        # 采用生产目录中的真实核心发现 handler，不能让 tool_not_available 假装核心成功。
-        capability = next(spec for spec in build_tool_specs() if spec.name == "agent.capabilities")
-        catalog = ToolCatalog([adapt_tool_spec(capability), *self.media.tools()])
+        catalog = ToolCatalog(self.media.tools())
         pipeline = ToolPipeline(
             catalog=catalog, state_store=self.store, reference_store=self.store,
             effect_store=ConfirmationEffectPlanStore(
@@ -290,7 +277,7 @@ class NativeCase:
         )
         self.session = AgentSession(
             model=self.script.adapter, catalog=catalog,
-            retriever=CapabilityRetriever(minimum=2, maximum=2), pipeline=pipeline,
+             pipeline=pipeline,
             state_store=self.store, journal=self.store, turn_admission=MediaFluxTurnAdmission(),
         )
 
@@ -497,10 +484,10 @@ def test_direct_write_before_diagnosis_is_rejected_before_prepare_or_replay(case
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("diagnostic", ["core_discovery", "failed_business_read"])
-def test_core_discovery_or_failed_business_read_does_not_unlock_new_write(case, diagnostic):
+@pytest.mark.parametrize("diagnostic", ["failed_business_read"])
+def test_failed_business_read_does_not_unlock_new_write(case, diagnostic):
     async def run():
-        step = "core_discovery" if diagnostic == "core_discovery" else "read_a"
+        step = "read_a"
         case.media.read_ok = diagnostic != "failed_business_read"
         case.build([step, "preview_b", "finish"])
         plan_id, source_users = await case.preview()
@@ -508,7 +495,7 @@ def test_core_discovery_or_failed_business_read_does_not_unlock_new_write(case, 
         case.assert_io(prepares=["A"], executions=["A"], reads=int(step == "read_a"), requests=4)
         assert "先用只读业务工具核对真实状态" in case.script.model_requests[2]["system_prompt"]
         case.assert_source(saved, source_users)
-        diagnostic_tool = "agent.capabilities" if step == "core_discovery" else READ
+        diagnostic_tool = READ
         observed = [e for e in events if e.type is AgentEventType.TOOL_COMPLETED and e.payload.get("tool") == diagnostic_tool]
         assert len(observed) == 1
         assert observed[0].payload["result"].get("ok") is case.media.read_ok
@@ -522,15 +509,16 @@ def test_core_discovery_or_failed_business_read_does_not_unlock_new_write(case, 
 
 def test_successful_real_core_task_does_not_unlock_new_write(case):
     async def run():
-        case.build(["core_task_discovery", "core_task", "preview_b", "finish"])
+        case.build(["core_task", "preview_b", "finish"])
         plan_id, source_users = await case.preview()
+        from app.agent.kernel.sandbox import run_code_tool
+        assert case.session is not None
+        case.session.catalog.register(run_code_tool(case.session.pipeline))
         events, saved = await case.confirm(plan_id)
-        case.assert_io(prepares=["A"], executions=["A"], reads=0, requests=5)
+        case.assert_io(prepares=["A"], executions=["A"], reads=0, requests=4)
         assert not case.script.steps
         case.assert_source(saved, source_users)
-        discovered = [e for e in events if e.type is AgentEventType.TOOL_COMPLETED and e.payload.get("tool") == "agent.capabilities"]
-        assert len(discovered) == 1 and discovered[0].payload["result"]["ok"] is True
-        completed = [e for e in events if e.type is AgentEventType.TOOL_COMPLETED and e.payload.get("tool") == "agent.task"]
+        completed = [e for e in events if e.type is AgentEventType.TOOL_COMPLETED and e.payload.get("tool") == "agent.run_code"]
         assert len(completed) == 1 and completed[0].payload["result"]["ok"] is True
         # 真正创建并持久化任务：不把 schema 拒绝/工具未加载冒充成功核心 READ。
         assert saved.metadata["task"]["root_goal"] == GOAL

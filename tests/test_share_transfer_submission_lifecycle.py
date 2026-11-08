@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import unittest
-from typing import cast
 from unittest.mock import Mock, patch
 
 from app import database as db
@@ -13,11 +12,19 @@ from tests.support import isolated_test_database
 from tests.test_telegram_guangya_share import FakeShareClient
 
 
+class LifecycleShareClient(FakeShareClient, Mock):
+    """保留共享替身行为，以真实客户端 spec 约束测试 Mock。"""
+
+    def __init__(self):
+        Mock.__init__(self, spec=GuangYaClient)
+        FakeShareClient.__init__(self)
+
+
 class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
         self.store = ShareTransferPreviewStore()
-        self.client = FakeShareClient()
+        self.client = LifecycleShareClient()
         self.preview = self.store.create(self.client.inspected, "chat", "user")
         self.enterContext(
             patch("app.modules.share_transfer.get", return_value="archive")
@@ -36,7 +43,7 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
             "chat",
             user_id="user",
             store=self.store,
-            client=cast(GuangYaClient, self.client) if injected else None,
+            client=self.client if injected else None,
         )
 
     @staticmethod
@@ -45,6 +52,61 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
             return conn.execute(
                 "SELECT * FROM download_requests WHERE kind='guangya_share'"
             ).fetchone()
+
+    def test_native_prepare_is_read_only_and_cold_confirmation_uses_frozen_files(self):
+        from app.modules.share_transfer import prepare_share_transfer, submit_prepared_share_transfer
+        from tests.test_telegram_guangya_share import SHARE_URL, SECRET_TOKEN, SIGNED_URL, inspected_payload
+        import json
+
+        self.client.inspected = inspected_payload(201)
+        prepared = prepare_share_transfer(SHARE_URL, ["file-201", "file-1", "file-201"],
+                                         "chat", "user", client=self.client, store=self.store)
+        self.assertEqual(self.client.restore_calls, [])
+        self.assertIsNone(self.request())
+        self.assertNotIn(SECRET_TOKEN, json.dumps(prepared))
+        self.assertNotIn(SIGNED_URL, json.dumps(prepared))
+        self.assertEqual([f["id"] for f in prepared["snapshot"]["files"]], ["file-1", "file-201"])
+        result = submit_prepared_share_transfer(prepared["snapshot"], "chat", user_id="user",
+                                               client=self.client, store=ShareTransferPreviewStore())
+        self.assertTrue(result["success"])
+        self.assertEqual(self.client.restore_calls[0][1], ["file-1", "file-201"])
+        self.assertEqual(result["request"]["request_number"], result["request_id"])
+        self.assertEqual(self.client.inspect_calls, [SHARE_URL, SHARE_URL])
+
+    def test_native_confirmation_rejects_foreign_owner_and_file_or_target_drift(self):
+        from app.modules.share_transfer import prepare_share_transfer, submit_prepared_share_transfer
+        from tests.test_telegram_guangya_share import SHARE_URL
+        from copy import deepcopy
+
+        prepared = prepare_share_transfer(SHARE_URL, ["file-1"], "chat", "user",
+                                         client=self.client, store=self.store)["snapshot"]
+        original = deepcopy(self.client.inspected)
+        for change in ("owner", "file", "target"):
+            with self.subTest(change=change):
+                self.client.inspected = deepcopy(original)
+                if change == "file":
+                    self.client.inspected["files"][0]["size"] += 1
+                with patch("app.modules.share_transfer.get", return_value="changed" if change == "target" else "archive"):
+                    with self.assertRaises(ValueError):
+                        submit_prepared_share_transfer(prepared, "other" if change == "owner" else "chat", user_id="user",
+                                                       client=self.client, store=ShareTransferPreviewStore())
+                self.assertEqual(self.client.restore_calls, [])
+                self.assertIsNone(self.request())
+
+    def test_native_unknown_receipt_is_not_replayed_by_new_previews(self):
+        from app.modules.share_transfer import prepare_share_transfer, submit_prepared_share_transfer
+        from tests.test_telegram_guangya_share import SHARE_URL
+
+        self.client.restore_share = Mock(return_value={"success": False, "retry_safe": False})
+        first = prepare_share_transfer(SHARE_URL, ["file-1"], "chat", "user", client=self.client, store=self.store)
+        one = submit_prepared_share_transfer(first["snapshot"], "chat", user_id="user", client=self.client, store=self.store)
+        two = submit_prepared_share_transfer(first["snapshot"], "chat", user_id="user", client=self.client, store=ShareTransferPreviewStore())
+        self.assertEqual((one["status"], two["status"]), ("manual_review", "manual_review"))
+        self.assertFalse(two["success"])
+        self.assertFalse(two["accepted"])
+        self.assertTrue(two["duplicate"])
+        self.assertEqual(one["request_id"], two["request_id"])
+        self.client.restore_share.assert_called_once()
 
     def test_request_is_durably_claimed_before_first_provider_write(self):
         observed = []
@@ -331,7 +393,7 @@ raise AssertionError("provider window not reached")
                     title="late",
                 )
             )
-            client = FakeShareClient()
+            client = LifecycleShareClient()
             store = ShareTransferPreviewStore()
             preview = store.create(client.inspected, "chat", "user")
             result = create_share_request(
@@ -341,7 +403,7 @@ raise AssertionError("provider window not reached")
                 "chat",
                 user_id="user",
                 store=store,
-                client=cast(GuangYaClient, client),
+                client=client,
             )
             self.assertFalse(result["success"])
             self.assertEqual(result["status"], "manual_review")

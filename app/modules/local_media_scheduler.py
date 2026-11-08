@@ -326,6 +326,8 @@ class LocalMediaScheduler:
         capture_results: bool = False,
         source_ids: set[int] | frozenset[int] | None = None,
         candidate_query: str = "",
+        expected_sources: dict[int, dict] | None = None,
+        cancelled=None,
     ) -> dict[str, Any]:
         """显式扫描全部本地来源，把已存在媒体作为手动任务加入队列。
 
@@ -339,9 +341,20 @@ class LocalMediaScheduler:
         selected_source_ids = (
             {item for item in source_ids} if source_ids is not None else None
         )
+        seen_source_ids: set[int] = set()
         for source in db.list_local_media_sources(owner=self.owner):
             if selected_source_ids is not None and source.id not in selected_source_ids:
                 continue
+            seen_source_ids.add(source.id)
+            if expected_sources is not None:
+                from app.repositories.local_media import local_media_source_snapshot
+                with db.get_conn() as conn:
+                    current = local_media_source_snapshot(conn, source.id, owner=self.owner)
+                if current != expected_sources.get(source.id) or (cancelled is not None and cancelled()):
+                    error_codes.add("source_changed")
+                    source_results.append({"id": source.id, "name": source.name, "candidates": 0, "queued": 0,
+                                           "skipped": True, "reason": "", "error": "来源配置已变化或扫描已取消"})
+                    continue
             source_error = _source_path_error(source)
             if source_error:
                 error_codes.add("source_unavailable")
@@ -395,6 +408,8 @@ class LocalMediaScheduler:
                         owner=self.owner,
                         trigger="scan",
                         operation_token=f"{prefix}{uuid.uuid4().hex}",
+                        **({"expected_source_snapshot": expected_sources[source.id], "cancelled": cancelled}
+                           if expected_sources is not None else {}),
                     )
                     source_task_ids.append(task_id)
                 except Exception as exc:
@@ -414,6 +429,11 @@ class LocalMediaScheduler:
                 "reason": "",
                 "error": error,
             })
+        if expected_sources is not None:
+            for missing_id in expected_sources.keys() - seen_source_ids:
+                error_codes.add("source_changed")
+                source_results.append({"id": missing_id, "name": "", "candidates": 0, "queued": 0,
+                                       "skipped": True, "reason": "", "error": "来源已不存在，请重新预检"})
         unique_task_ids = list(dict.fromkeys(task_ids))
         failed_sources = sum(bool(item["error"]) for item in source_results)
         useful_sources = sum(

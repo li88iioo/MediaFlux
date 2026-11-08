@@ -4,7 +4,7 @@ import json
 import threading
 from unittest.mock import patch
 
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -59,7 +59,7 @@ def test_parallel_reads_queue_real_reference_transactions_without_false_busy():
             [ModelEvent(ModelEventType.TEXT_DELTA, text="两项查询均已核对。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=store)
+        session = AgentSession(model=model, catalog=catalog,  pipeline=pipeline, state_store=store)
 
         async def collect():
             return [event async for event in session.run(AgentInput(owner="owner", session_id="publication", message="查询两项媒体信息"))]
@@ -92,7 +92,7 @@ def test_confirmed_receipt_releases_guard_before_parallel_followup_reads():
     """真实确认与SQLite保护域；写handler仅记录调用，不操作实际媒体。"""
     async def scenario():
         from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
-        from app.agent.kernel.effects import PreparedEffect
+        from app.agent.kernel.tool_calls import PreparedEffect
         store = SQLiteKernelStore(secret_provider=lambda: "confirmed-followup-isolated-key")
         executed, observed_tasks = [], []
         both_reads = asyncio.Event()
@@ -128,7 +128,7 @@ def test_confirmed_receipt_releases_guard_before_parallel_followup_reads():
                for q in ("first", "second")], ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
             [ModelEvent(ModelEventType.TEXT_DELTA, text="已完成后续只读核验。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=store, reference_store=store), state_store=store)
         first = [event async for event in session.run(AgentInput(owner="owner", session_id="confirmed", message="准备受控变更，确认后核验两项"))]
         assert first[-1].payload["status"] == "approval_required"

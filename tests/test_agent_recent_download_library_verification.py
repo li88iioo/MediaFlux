@@ -65,7 +65,7 @@ class RecentDownloadLibraryVerificationProjectionTests(unittest.TestCase):
         self.assertEqual(result.status, "precondition_failed")
         self.assertEqual(result.data, {})
 
-    def test_up_to_date_marks_target_visible(self):
+    def test_up_to_date_with_episode_facts_marks_target_visible(self):
         evidence = Evidence("Jellyfin", "已检查剧集库存", "2026-08-03T12:00:00+08:00")
         result = build_recent_download_library_verification(
             _record(),
@@ -73,7 +73,9 @@ class RecentDownloadLibraryVerificationProjectionTests(unittest.TestCase):
                 True,
                 "up_to_date",
                 "audit",
-                data={"missing_count": 0, "private_path": "/secret"},
+                data={"missing_count": 0, "private_path": "/secret", "episodes": [
+                    {"season": 2, "episode": 3, "aired": True, "local": True},
+                ]},
                 evidence=[evidence],
             ),
             position=1,
@@ -84,6 +86,35 @@ class RecentDownloadLibraryVerificationProjectionTests(unittest.TestCase):
         self.assertEqual(result.data["missing_count"], 0)
         self.assertNotIn("private_path", result.data)
         self.assertEqual(result.evidence, [evidence])
+
+    def test_group_summary_or_unknown_target_cannot_prove_local_visibility(self):
+        cases = [
+            ("up_to_date", {}),
+            ("updates_available", {"missing_sample": [{"season": 2, "episode": 4}], "missing_sample_truncated": False}),
+            ("up_to_date", {"episodes": [{"season": 2, "episode": 3, "aired": None, "local": False}]}),
+            ("up_to_date", {"episodes": [{"season": 2, "episode": 3, "aired": False, "local": False}]}),
+            ("up_to_date", {"episodes": [{"season": 2, "episode": 4, "aired": True, "local": True}]}),
+        ]
+        for status, facts in cases:
+            with self.subTest(status=status, facts=facts):
+                result = build_recent_download_library_verification(
+                    _record(), ToolResult(True, status, "audit", data={"missing_count": 0, **facts}), position=1,
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.data["verification"], "inconclusive")
+
+    def test_local_episode_is_visible_when_air_date_becomes_unknown_or_future(self):
+        for aired in (None, False):
+            for facts in (
+                {"episodes": [{"season": 2, "episode": 3, "aired": aired, "local": True}]},
+                {"target_aired": aired, "target_local": True, "target_missing": False},
+            ):
+                with self.subTest(facts=facts):
+                    result = build_recent_download_library_verification(
+                        _record(), ToolResult(True, "up_to_date", "audit", data=facts), position=1,
+                    )
+                    self.assertTrue(result.ok)
+                    self.assertEqual(result.data["verification"], "visible")
 
     def test_up_to_date_with_exact_target_requires_local_visibility(self):
         inconclusive = build_recent_download_library_verification(
@@ -150,6 +181,7 @@ class RecentDownloadLibraryVerificationProjectionTests(unittest.TestCase):
                     "missing_count": 1,
                     "missing_sample": [{"season": 2, "episode": 4}],
                     "missing_sample_truncated": False,
+                    "episodes": [{"season": 2, "episode": 3, "aired": True, "local": True}],
                 },
             ),
             position=1,

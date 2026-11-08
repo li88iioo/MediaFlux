@@ -27,15 +27,12 @@ from app.clients.guangya import (
 from app.config import PATHS
 from app.modules.guangya_journal import append_guangya_journal
 from app.modules.guangya_workspace import (
+    GuangYaWorkspaceError,
     GuangYaWorkspaceStale,
-    capture_observation_source,
-    create_directory_observation,
-    discard_observation,
-    observation_entry_map,
-    observation_ref,
+    file_location,
+    list_files,
+    locate_file_in_roots,
     resolve_workspace_path,
-    valid_object_handle,
-    workspace_session_scope,
 )
 from app.modules.organize_delete_audit import (
     DeleteCandidate,
@@ -46,7 +43,9 @@ from app.modules.strm import cloud_change_sources, trigger_cloud_changes
 from app.modules.web_secret import get_web_secret
 from app.private_files import protect_private_file
 from app.repositories.organize_operation_jobs import (
+    get_organize_operation_job,
     organize_operation_owner_digest,
+    organize_operation_queue_position,
     sanitize_organize_operation_result,
 )
 
@@ -176,6 +175,7 @@ def _fingerprint(payload: dict[str, Any]) -> str:
         "plan_id": payload.get("plan_id"),
         "owner_digest": payload.get("owner_digest"),
         "credential_generation": payload.get("credential_generation"),
+        # 仅校验升级前已经签名的业务job；新计划不再生产/读取观察句柄。
         "observation_ref": payload.get("observation_ref"),
         "trigger_strm": payload.get("trigger_strm"),
         "operations": payload.get("operations"),
@@ -377,6 +377,118 @@ def confirm_fs_change_plan(
         payload["updated_at"] = _now_iso()
         _atomic_write(payload)
         return payload
+
+
+def _fs_change_task(plan: dict[str, Any]) -> dict[str, Any] | None:
+    job_id = str(plan.get("job_id") or "")
+    row = get_organize_operation_job(job_id) if _SAFE_JOB_ID.fullmatch(job_id) else None
+    if row is None:
+        return None
+    status = str(row["status"] or "")
+    position = organize_operation_queue_position(job_id) if status == "pending" else 0
+    if status == "pending" and position == 0:
+        # 队列位置读取会收束已过期任务；回执必须采用收束后的真实状态。
+        row = get_organize_operation_job(job_id)
+        if row is None:
+            return None
+        status = str(row["status"] or "")
+    return {
+        "ok": True,
+        "task_id": job_id,
+        "status": status,
+        "expires_at": float(row["expires_at"]),
+        "cancel_requested": bool(row["cancel_requested"]),
+        "queued": status == "pending",
+        "queue_position": position,
+        "replayed": True,
+    }
+
+
+def submit_fs_change_plan(
+    plan_id: str,
+    *,
+    owner: str,
+    expected_fingerprint: str,
+    on_admitted: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    """确认既有冻结计划并提交原持久队列；重试复用同一任务及执行检查点。"""
+    if not isinstance(expected_fingerprint, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_fingerprint
+    ):
+        raise GuangYaFSChangeError("光鸭变更计划指纹无效")
+    plan = load_fs_change_plan(
+        plan_id, owner=owner, expected_fingerprint=expected_fingerprint
+    )
+    existing = _fs_change_task(plan)
+    if plan.get("job_id") and existing is None:
+        raise GuangYaFSChangeStale(
+            "光鸭变更已绑定任务但记录不可用，请先核验原任务，不能重复提交"
+        )
+    if existing is not None and existing["status"] in _TERMINAL_PLAN_STATUSES:
+        return existing
+    if str(plan.get("status") or "") in {"previewed", "confirmed"}:
+        try:
+            plan = confirm_fs_change_plan(
+                plan_id, owner=owner, expected_fingerprint=expected_fingerprint
+            )
+        except GuangYaFSChangeStale:
+            # 并发提交可能已把同一冻结计划绑定入队；只复用既有任务。
+            plan = load_fs_change_plan(
+                plan_id, owner=owner, expected_fingerprint=expected_fingerprint
+            )
+            existing = _fs_change_task(plan)
+            if existing is None:
+                raise
+            if existing["status"] in _TERMINAL_PLAN_STATUSES:
+                return existing
+    elif str(plan.get("status") or "") not in {"queued", "running"}:
+        raise GuangYaFSChangeStale("光鸭变更计划已执行或不再可排队")
+    if existing is not None and time.time() >= existing["expires_at"]:
+        raise GuangYaFSChangeStale(
+            "光鸭原任务期限已到，请先核验原任务结果，不能重复提交"
+        )
+    from app.modules.organize_tasks import get_organize_manager
+
+    task = get_organize_manager().start_durable_operation(
+        "光鸭文件变更",
+        "已确认通用文件变更冻结计划",
+        job_kind="agent_guangya_fs_change",
+        owner=owner,
+        payload={
+            "version": 1,
+            "plan_id": plan_id,
+            "plan_fingerprint": expected_fingerprint,
+            "owner_digest": plan["owner_digest"],
+            "credential_generation": int(plan["credential_generation"]),
+        },
+        dedupe_key=f"agent-guangya-fs-change:{plan_id}:{expected_fingerprint}",
+        **(
+            {"ttl_seconds": 6 * 60 * 60}
+            if plan.get("batch_summary")
+            and plan["stats"]["total"] > MAX_FS_CHANGE_OBJECT_OPERATIONS
+            else {}
+        ),
+        on_admitted=on_admitted,
+    )
+    try:
+        persisted = load_fs_change_plan(
+            plan_id, owner=owner, expected_fingerprint=expected_fingerprint
+        )
+        receipt = _fs_change_task(persisted)
+    except Exception as exc:
+        raise GuangYaFSChangeError(
+            "光鸭操作队列状态当前不可用，请稍后查询任务状态"
+        ) from exc
+    if receipt is not None and (
+        task.get("ok") or receipt["status"] in {"pending", "running"}
+    ):
+        return {
+            **receipt,
+            "replayed": bool(task.get("replayed")) if task.get("ok") else True,
+        }
+    if task.get("ok"):
+        return task
+    raise GuangYaFSChangeError("光鸭操作未能可靠入队，请重新生成预览后重试")
 
 
 def bind_fs_change_plan_job(
@@ -746,81 +858,93 @@ def _name_conflict(
     )
 
 
-def _validate_observation(
-    client: GuangYaClient, owner: str, observation: dict[str, Any]
-) -> None:
-    if not isinstance(observation, dict):
-        raise GuangYaFSChangeError("光鸭观察快照格式无效")
-    if not hmac.compare_digest(
-        str(observation.get("owner_digest") or ""), _owner_digest(owner)
-    ):
-        raise GuangYaFSChangeError("光鸭观察快照不属于当前会话")
-    if float(observation.get("expires_at_epoch") or 0) <= time.time():
-        raise GuangYaWorkspaceStale("光鸭目录观察已过期，请重新读取")
-    raw_generation = observation.get("credential_generation")
-    expected_generation = int(raw_generation) if raw_generation is not None else -1
-    if expected_generation != client.credential_generation:
-        raise GuangYaWorkspaceStale("光鸭登录凭据已变化，请重新读取目录")
+
+
+def _source_key(operation: dict[str, Any]) -> str:
+    file_id = operation.get("file_id")
+    if not isinstance(file_id, str) or not file_id.strip() or file_id.strip() == "0":
+        raise GuangYaFSChangeError("必须使用真实file_id，不能变更账号根目录")
+    return file_id.strip()
+
+
+def _read_fs_change_sources(
+    client: GuangYaClient, operations: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """凭真实身份读取源对象，复用公共寻址核对父链，不创建观察引用或会话状态。"""
+    if not client.logged_in:
+        raise GuangYaFSChangeError("光鸭账号尚未连接")
+    fields = {
+        "rename": {"op", "file_id", "new_name"},
+        "move": {"op", "file_id", "target_path"},
+        "relocate": {"op", "file_id", "target_path", "new_name"},
+        "copy": {"op", "file_id", "target_path"},
+        "trash": {"op", "file_id"},
+        "create_directory": {"op", "parent_path", "name"},
+    }
+    for raw in operations:
+        if not isinstance(raw, dict):
+            raise GuangYaFSChangeError("光鸭变更操作格式无效")
+        op = str(raw.get("op") or "").strip().casefold()
+        expected = fields.get(op)
+        if expected is None:
+            raise GuangYaFSChangeError("真实身份变更操作不支持该 op")
+        allowed = expected | ({"new_name"} if op == "copy" else set())
+        allowed |= {"parent_id"} if op == "create_directory" else {"target_id"} if op in {"move", "copy", "relocate"} else set()
+        for key in {"parent_id", "target_id"}.intersection(raw):
+            if not isinstance(raw[key], str) or not raw[key].strip():
+                raise GuangYaFSChangeError(key + "必须是真实目录ID")
+        if op != "create_directory":
+            allowed |= {"expected", "expected_tree", "require_empty"}
+        if set(raw) - allowed or expected - set(raw):
+            raise GuangYaFSChangeError(
+                "真实身份变更操作字段无效；请使用 file_id 与对应操作参数"
+            )
+        if "expected" in raw and not isinstance(raw["expected"], dict):
+            raise GuangYaFSChangeError("expected必须为读取时的对象快照")
+        if "require_empty" in raw and (op != "trash" or type(raw["require_empty"]) is not bool):
+            raise GuangYaFSChangeError("require_empty仅用于目录回收且必须是布尔值")
+        if "expected_tree" in raw and (not isinstance(raw["expected_tree"], list) or not raw["expected_tree"]):
+            raise GuangYaFSChangeError("expected_tree必须包含完整目录清单")
+    cache: dict[str, GuangYaFile | None] = {}
+    entries = {}
+    for raw in operations:
+        if str(raw["op"]).strip().casefold() == "create_directory":
+            continue
+        file_id = _source_key(raw)
+        if file_id in entries:
+            continue
+        current = client.file_info(file_id)
+        cache[file_id] = current
+        if current is None or current.file_id != file_id:
+            raise GuangYaFSChangeStale("光鸭源对象不存在或身份已变化")
+        entry = locate_file_in_roots(
+            client,
+            {"file_id": file_id, "is_dir": current.is_dir},
+            [{"file_id": "0", "path": "/", "is_dir": True}],
+            cache=cache,
+            check_cancelled=lambda: None,
+        )
+        if entry is None:
+            raise GuangYaFSChangeStale(
+                "无法按真实身份完整核对光鸭源对象路径，请重新核对目录"
+            )
+        entries[file_id] = entry
+    return entries
 
 
 def _compile_operations(
     operations: list[dict[str, Any]], entries: dict[str, dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    expanded: list[dict[str, Any]] = []
-    for raw in operations:
-        if str(raw.get("op") or "").strip().casefold() != "batch_relocate":
-            expanded.append(raw)
-            continue
-        title = str(raw.get("title") or "").strip()
-        naming = str(raw.get("naming") or "absolute").strip().casefold()
-        season = int(raw.get("season", 1))
-        padding = int(raw.get("episode_padding", 2))
-        target_path = _normalize_path(raw.get("target_path"))
-        if naming not in {"season_episode", "absolute"}:
-            raise GuangYaFSChangeError("批量规整命名方式无效")
-        if not 0 <= season <= 999 or not 2 <= padding <= 4:
-            raise GuangYaFSChangeError("批量规整编号参数无效")
-        items = raw.get("items")
-        if not isinstance(items, list) or not items:
-            raise GuangYaFSChangeError("批量规整缺少对象与集号")
-        for item in items:
-            if not isinstance(item, dict):
-                raise GuangYaFSChangeError("批量规整条目格式无效")
-            handle = str(item.get("object_ref") or "").strip().upper()
-            if not valid_object_handle(handle) or handle not in entries:
-                raise GuangYaFSChangeError("批量规整包含当前观察外的对象")
-            episode = item.get("episode")
-            if type(episode) is not int or not 1 <= episode <= 9999:
-                raise GuangYaFSChangeError("批量规整集号无效")
-            observed = entries[handle]
-            if bool(observed.get("is_dir")):
-                raise GuangYaFSChangeError("批量规整只支持文件")
-            source_name = str(observed.get("name") or "")
-            suffix = Path(source_name).suffix
-            if not suffix:
-                extension = str(observed.get("extension") or "").strip().lstrip(".")
-                suffix = f".{extension}" if extension else ""
-            number = str(episode).zfill(padding)
-            marker = (
-                f"S{season:02d}E{number}"
-                if naming == "season_episode"
-                else f"E{number}"
-            )
-            expanded.append(
-                {
-                    "op": "relocate",
-                    "object_ref": handle,
-                    "target_path": target_path,
-                    "new_name": _validate_name(f"{title} - {marker}{suffix}"),
-                }
-            )
+    expanded = operations
     # 未来路径描述的是同一个已观察目录，不是要创建的同名替代目录。
     # 在唯一冻结链路中归一为当前路径；执行阶段仍只使用核验后的目录 ID。
     destinations: dict[str, str] = {}
     for raw in expanded:
         op = str(raw.get("op") or "").strip().casefold()
-        observed = entries.get(str(raw.get("object_ref") or "").strip().upper(), {})
-        if not observed.get("is_dir") or op not in {"move", "relocate", "rename"}:
+        if op not in {"move", "relocate", "rename"}:
+            continue
+        observed = entries.get(_source_key(raw), {})
+        if not observed.get("is_dir"):
             continue
         parent = str(observed.get("parent_path") or "/")
         source = _full_path(parent, str(observed["name"]))
@@ -899,10 +1023,17 @@ def _operation_label(item: dict[str, Any]) -> str:
     if op == "rename":
         return f"{label}：{name} → {item['new_name']}"
     if op in {"move", "relocate", "copy"}:
-        target = Path(str(item["target_path"])).name or "根目录"
         suffix = f" / {item['new_name']}" if item.get("new_name") else ""
-        return f"{label}：{name} → {target}{suffix}"
+        return f"{label}：{name} → {_short_path(str(item['target_path']))}{suffix}"
+    if op == "create_directory" and item.get("parent_path"):
+        return f"{label}：{_short_path(_full_path(str(item['parent_path']), name))}"
     return f"{label}：{name}"
+
+
+def _short_path(path: str) -> str:
+    # 卡片只显示末两级：同名“Season 01”必须能看出建在哪个父目录下。
+    parts = [part for part in path.strip("/").split("/") if part]
+    return " › ".join(parts[-2:]) or "账号根目录"
 
 
 def _batch_filter_label(value: dict[str, Any]) -> str:
@@ -925,7 +1056,7 @@ def _batch_matches(entry: dict[str, Any], rule: dict[str, Any]) -> bool:
         ("size_lt_bytes" not in rule or size < rule["size_lt_bytes"])
         and ("size_gte_bytes" not in rule or size >= rule["size_gte_bytes"])
         and (not rule.get("kinds") or entry["media_kind"] in rule["kinds"])
-        and (not rule.get("extensions") or entry["extension"].casefold() in rule["extensions"])
+        and (not rule.get("extensions") or str(entry.get("extension") or Path(str(entry.get("name") or "").replace("。", ".").replace("．", ".")).suffix.lstrip(".")).casefold() in rule["extensions"])
         and (not rule.get("name_contains") or any(word in entry["name"].casefold() for word in rule["name_contains"]))
     )
 
@@ -951,127 +1082,171 @@ def _batch_unique_name(name: str, parent_path: str, used: set[str], siblings: se
         number += 1
 
 
-def _batch_prepare(
-    client: GuangYaClient, *, owner: str, session_id: str,
-    observation: dict[str, Any], rule: dict[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    """把完整目录中的明确规则编译为普通操作；不写云盘，也不另起执行链。"""
-    if not session_id or observation.get("session_scope") != workspace_session_scope(owner, session_id):
-        raise GuangYaFSChangeError("批量规则需要当前已登录会话的目录观察")
-    scope = observation_entry_map(observation).get(rule["scope_ref"])
-    if not scope or not scope.get("is_dir") or scope.get("file_id") in {"", "0"}:
-        raise GuangYaFSChangeError("scope_ref 必须是已读取的非账号根目录")
-    if "trash_filter" in rule and not rule["trash_filter"]:
-        raise GuangYaFSChangeError("回收文件必须提供明确筛选条件")
-    root_path = _full_path(scope["parent_path"], scope["name"])
-    root = {"file_id": scope["file_id"], "parent_id": scope["parent_id"], "is_dir": True, "path": root_path}
-    fresh = create_directory_observation(
-        client, owner=owner, session_id=session_id, path=root_path, recursive=True,
-        max_items=MAX_FS_CHANGE_BATCH_OPERATIONS, expected_roots=[root],
-    )
-    try:
-        entries = fresh["entries"]
-        by_id = {entry["file_id"]: entry for entry in entries}
-        directories = {entry["file_id"]: entry for entry in entries if entry["is_dir"]}
-        directories[root["file_id"]] = fresh["roots"][0]
-        # scanner 的深度上限不记为 truncated；目录数量必须证明每个子目录都已读取。
-        if (fresh["truncated"] or fresh["scanned_dirs"] != len(directories)
-                or fresh["scanned_items"] != len(entries) or len(by_id) != len(entries)
-                or root["file_id"] in by_id):
-            raise GuangYaFSChangeError("目录扫描不完整、超过范围上限或清单发生变化；请拆分子目录重新读取")
-        paths = {file_id: _full_path(entry["parent_path"], entry["name"])
-                 for file_id, entry in directories.items()}
-        children: dict[str, list[dict[str, Any]]] = {file_id: [] for file_id in directories}
-        for entry in entries:
-            if paths.get(entry["parent_id"]) != entry["parent_path"]:
-                raise GuangYaFSChangeError("目录扫描父子关系发生变化，请重新读取")
-            children[entry["parent_id"]].append(entry)
-        target_path = rule.get("target_path", "")
-        observed_directories = {paths[file_id]: entry for file_id, entry in directories.items()}
-        target_id = _resolve_directory(client, target_path, observed_directories)[0] if target_path else ""
-        used = {item.name.casefold() for item in client.list_dir(target_id)} if target_id else set()
-        operations: list[dict[str, Any]] = []
-        vacated: set[str] = set()
-        trash_count = move_count = renamed_count = unchanged_count = file_count = cleanup_count = 0
-        for entry in sorted(entries, key=lambda item: (item["parent_path"].casefold(), item["name"].casefold(), item["file_id"])):
-            if entry["is_dir"]:
-                continue
-            file_count += 1
-            file_id, name = entry["file_id"], entry["name"]
-            if rule.get("trash_filter") and _batch_matches(entry, rule["trash_filter"]):
-                operations.append({"op": "trash", "object_ref": entry["handle"]})
-                vacated.add(file_id)
-                trash_count += 1
-            elif target_id and entry["parent_id"] != target_id and _batch_matches(entry, rule.get("move_filter", {})):
-                if name.casefold() in used and rule.get("conflict") == "error":
-                    raise GuangYaFSChangeError("目标目录或批内已有同名对象")
-                siblings = {item["name"].casefold() for item in children[entry["parent_id"]]}
-                new_name = _batch_unique_name(name, entry["parent_path"], used, siblings)
-                operation = {"op": "move", "object_ref": entry["handle"], "target_path": target_path}
-                if new_name != name:
-                    operation.update(op="relocate", new_name=new_name)
-                    renamed_count += 1
-                operations.append(operation)
-                vacated.add(file_id)
-                move_count += 1
-            else:
-                unchanged_count += 1
-        if rule.get("cleanup_empty_dirs"):
-            protected = {root["file_id"]}
-            current = target_id
-            while current in by_id and current not in protected:
-                protected.add(current)
-                current = by_id[current]["parent_id"]
-            # 只清理冻结清单中已安排移出/回收全部子项的目录；目标与范围根始终保留。
-            for file_id in sorted(directories, key=lambda item: (-paths[item].count("/"), item)):
-                if file_id not in protected and all(child["file_id"] in vacated for child in children[file_id]):
-                    operations.append({"op": "trash", "object_ref": directories[file_id]["handle"]})
-                    vacated.add(file_id)
-                    cleanup_count += 1
-        summary = (
-            f"范围：{' › '.join(root_path.strip('/').split('/'))}；"
-            f"回收规则：{_batch_filter_label(rule['trash_filter']) if rule.get('trash_filter') else '无'}；"
-            f"移动规则：{_batch_filter_label(rule.get('move_filter', {})) if target_path else '无'}；"
-            f"目标：{' › '.join(target_path.strip('/').split('/')) or '账号根目录' if target_path else '无'}；"
-            f"扫描 {file_count} 个文件、{len(directories)} 个目录；"
-            f"回收文件 {trash_count}、移动 {move_count}、重名保留两份 {renamed_count}、"
-            f"清理空子目录 {cleanup_count}、其余保留 {unchanged_count}。"
-        )
-        return operations, fresh, summary
-    finally:
-        discard_observation(fresh["plan_id"])
+def _file_filter_arguments(value: object, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) - {
+        "size_lt_bytes", "size_gte_bytes", "kinds", "extensions", "name_contains",
+    }:
+        raise GuangYaFSChangeError(f"{field} 文件筛选条件无效")
+    result: dict[str, Any] = {}
+    for key, raw in value.items():
+        if key in {"size_lt_bytes", "size_gte_bytes"}:
+            if type(raw) is not int or not 0 <= raw <= 2**53 - 1:
+                raise GuangYaFSChangeError(f"{field}.{key} 必须是非负整数字节数")
+            result[key] = raw
+            continue
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 16:
+            raise GuangYaFSChangeError(f"{field}.{key} 必须包含 1 到 16 项")
+        if any(not isinstance(item, str) or not 1 <= len(item.strip()) <= 160 for item in raw):
+            raise GuangYaFSChangeError(f"{field}.{key} 必须是非空字符串列表")
+        values = list(dict.fromkeys(item.strip().casefold() for item in raw))
+        if key == "kinds" and set(values) - {"video", "subtitle", "image", "metadata", "other"}:
+            raise GuangYaFSChangeError("批量规则只筛选文件，kinds 不支持目录")
+        if key == "extensions" and any(not re.fullmatch(r"[a-z0-9]{1,16}", item) for item in values):
+            raise GuangYaFSChangeError("extensions 必须是无点的扩展名，如 mp4、srt、torrent")
+        result[key] = values
+    if "size_lt_bytes" in result and result.get("size_gte_bytes", -1) >= result["size_lt_bytes"]:
+        raise GuangYaFSChangeError("大小筛选下限必须小于上限")
+    return result
 
+def _batch_files_arguments(raw: dict[str, Any]) -> dict[str, Any]:
+    if set(raw) - {
+        "op", "file_id", "trash_filter", "target_path", "move_filter", "cleanup_empty_dirs", "conflict",
+    }:
+        raise GuangYaFSChangeError("batch_files 包含不支持的参数")
+    file_id = _source_key(raw)
+    cleanup = raw.get("cleanup_empty_dirs", False)
+    if type(cleanup) is not bool:
+        raise GuangYaFSChangeError("cleanup_empty_dirs 必须是布尔值")
+    conflict = raw.get("conflict", "keep_both")
+    if conflict not in ("keep_both", "error"):
+        raise GuangYaFSChangeError("conflict 仅支持 keep_both 或 error，不允许覆盖")
+    result: dict[str, Any] = {
+        "op": "batch_files", "file_id": file_id,
+        "cleanup_empty_dirs": cleanup, "conflict": conflict,
+    }
+    if "trash_filter" in raw:
+        result["trash_filter"] = _file_filter_arguments(raw["trash_filter"], field="trash_filter")
+        if not result["trash_filter"]:
+            raise GuangYaFSChangeError("回收文件必须提供明确筛选条件，不能使用空 trash_filter")
+    if "target_path" in raw:
+        if not isinstance(raw["target_path"], str):
+            raise GuangYaFSChangeError("target_path 必须是目录路径字符串")
+        result["target_path"] = _normalize_path(raw["target_path"])
+        result["move_filter"] = _file_filter_arguments(raw.get("move_filter", {}), field="move_filter")
+    elif "move_filter" in raw:
+        raise GuangYaFSChangeError("move_filter 必须配合 target_path 使用")
+    if not cleanup and "trash_filter" not in result and "target_path" not in result:
+        raise GuangYaFSChangeError("batch_files 至少指定回收条件、移动目标或空目录清理")
+    return result
+
+def _batch_prepare(client: GuangYaClient, rule: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str]:
+    """原批量规则按真实目录ID完整展开；沿用唯一fs-change计划，不保存观察。"""
+    scope = file_location(client, rule["file_id"])
+    if not scope["is_dir"]:
+        raise GuangYaFSChangeError("batch_files必须指定真实的非根目录ID")
+    root_path = scope["path"]
+    root = scope
+    try:
+        fresh = list_files(client, scope["file_id"], recursive=True, max_items=MAX_FS_CHANGE_BATCH_OPERATIONS, max_depth=12)
+    except GuangYaWorkspaceError as exc:
+        raise GuangYaFSChangeError("目录扫描不完整；请拆分子目录后重新读取") from exc
+    if fresh["scanned_dirs"] > 500:
+        raise GuangYaFSChangeError("目录扫描不完整：目录数量超过批量规则预算")
+    entries = fresh["items"]
+    by_id = {entry["file_id"]: entry for entry in entries}
+    directories = {entry["file_id"]: entry for entry in entries if entry["is_dir"]}
+    directories[root["file_id"]] = fresh["root"]
+    # scanner 的深度上限不记为 truncated；目录数量必须证明每个子目录都已读取。
+    if (not fresh["scan_complete"] or fresh["scanned_dirs"] != len(directories)
+            or fresh["scanned_items"] != len(entries) or len(by_id) != len(entries)
+            or root["file_id"] in by_id):
+        raise GuangYaFSChangeError("目录扫描不完整、超过范围上限或清单发生变化；请拆分子目录重新读取")
+    paths = {file_id: _full_path(entry["parent_path"], entry["name"])
+             for file_id, entry in directories.items()}
+    children: dict[str, list[dict[str, Any]]] = {file_id: [] for file_id in directories}
+    for entry in entries:
+        if paths.get(entry["parent_id"]) != entry["parent_path"]:
+            raise GuangYaFSChangeError("目录扫描父子关系发生变化，请重新读取")
+        children[entry["parent_id"]].append(entry)
+    target_path = rule.get("target_path", "")
+    observed_directories = {paths[file_id]: entry for file_id, entry in directories.items()}
+    target_id = _resolve_directory(client, target_path, observed_directories)[0] if target_path else ""
+    used = {item.name.casefold() for item in client.list_dir(target_id)} if target_id else set()
+    operations: list[dict[str, Any]] = []
+    vacated: set[str] = set()
+    trash_count = move_count = renamed_count = unchanged_count = file_count = cleanup_count = 0
+    for entry in sorted(entries, key=lambda item: (item["parent_path"].casefold(), item["name"].casefold(), item["file_id"])):
+        if entry["is_dir"]:
+            continue
+        file_count += 1
+        file_id, name = entry["file_id"], entry["name"]
+        if rule.get("trash_filter") and _batch_matches(entry, rule["trash_filter"]):
+            operations.append({"op": "trash", "file_id": entry["file_id"]})
+            vacated.add(file_id)
+            trash_count += 1
+        elif target_id and entry["parent_id"] != target_id and _batch_matches(entry, rule.get("move_filter", {})):
+            if name.casefold() in used and rule.get("conflict") == "error":
+                raise GuangYaFSChangeError("目标目录或批内已有同名对象")
+            siblings = {item["name"].casefold() for item in children[entry["parent_id"]]}
+            new_name = _batch_unique_name(name, entry["parent_path"], used, siblings)
+            operation = {"op": "move", "file_id": entry["file_id"], "target_path": target_path}
+            if new_name != name:
+                operation.update(op="relocate", new_name=new_name)
+                renamed_count += 1
+            operations.append(operation)
+            vacated.add(file_id)
+            move_count += 1
+        else:
+            unchanged_count += 1
+    if rule.get("cleanup_empty_dirs"):
+        protected = {root["file_id"]}
+        current = target_id
+        while current in by_id and current not in protected:
+            protected.add(current)
+            current = by_id[current]["parent_id"]
+        # 只清理冻结清单中已安排移出/回收全部子项的目录；目标与范围根始终保留。
+        for file_id in sorted(directories, key=lambda item: (-paths[item].count("/"), item)):
+            if file_id not in protected and all(child["file_id"] in vacated for child in children[file_id]):
+                operations.append({"op": "trash", "file_id": file_id})
+                vacated.add(file_id)
+                cleanup_count += 1
+    summary = (
+        f"范围：{' › '.join(root_path.strip('/').split('/'))}；"
+        f"回收规则：{_batch_filter_label(rule['trash_filter']) if rule.get('trash_filter') else '无'}；"
+        f"移动规则：{_batch_filter_label(rule.get('move_filter', {})) if target_path else '无'}；"
+        f"目标：{' › '.join(target_path.strip('/').split('/')) or '账号根目录' if target_path else '无'}；"
+        f"扫描 {file_count} 个文件、{len(directories)} 个目录；"
+        f"回收文件 {trash_count}、移动 {move_count}、重名保留两份 {renamed_count}、"
+        f"清理空子目录 {cleanup_count}、其余保留 {unchanged_count}。"
+    )
+    return operations, {entry["file_id"]: entry for entry in entries}, summary
 
 def build_fs_change_plan(
     client: GuangYaClient,
     *,
     owner: str,
-    session_id: str = "",
-    observation: dict[str, Any],
     operations: list[dict[str, Any]],
     trigger_strm: bool = True,
 ) -> dict[str, Any]:
-    _validate_observation(client, owner, observation)
-    if not isinstance(operations, list) or not operations:
-        raise GuangYaFSChangeError(
-            f"光鸭变更计划必须包含 1 到 {MAX_FS_CHANGE_OPERATIONS} 项操作"
-        )
-    entries = observation_entry_map(observation)
-    batch_rule: dict[str, Any] | None = None
+    """按真实ID冻结完整操作；原任务执行与检查点不变。"""
+    _owner_digest(owner)
+    if not client.logged_in:
+        raise GuangYaFSChangeError("光鸭账号尚未连接")
+    if type(trigger_strm) is not bool:
+        raise GuangYaFSChangeError("trigger_strm必须是布尔值")
+    if not isinstance(operations, list) or not operations or any(not isinstance(item, dict) for item in operations):
+        raise GuangYaFSChangeError("必须提交完整的operations对象数组")
+    batch_rule = None
     batch_summary = ""
-    original_observation = observation
-    if any(str(raw.get("op") or "").strip().casefold() == "batch_files" for raw in operations if isinstance(raw, dict)):
-        if len(operations) != 1 or not isinstance(operations[0], dict):
-            raise GuangYaFSChangeError("batch_files 必须独占一个计划")
-        batch_rule = dict(operations[0])
-        operations, observation, batch_summary = _batch_prepare(
-            client,
-            owner=owner,
-            session_id=session_id,
-            observation=observation,
-            rule=batch_rule,
-        )
-        entries = observation_entry_map(observation)
+    if any(str(raw.get("op") or "").strip().casefold() == "batch_files" for raw in operations):
+        if len(operations) != 1:
+            raise GuangYaFSChangeError("batch_files必须独占一个计划")
+        batch_rule = _batch_files_arguments(operations[0])
+        operations, entries, batch_summary = _batch_prepare(client, batch_rule)
+    else:
+        if len(operations) > MAX_FS_CHANGE_OPERATIONS:
+            raise GuangYaFSChangeError("光鸭变更操作数量超过冻结计划上限")
+        entries = _read_fs_change_sources(client, operations)
     operations = _compile_operations(operations, entries)
     observed_directories = {_full_path(str(item.get("parent_path") or "/"), str(item["name"])): item
                             for item in entries.values() if item.get("is_dir")}
@@ -1138,6 +1313,8 @@ def build_fs_change_plan(
                 ("", None) if pending_parent is not None
                 else resolve_directory(parent_path)
             )
+            if "parent_id" in raw and (pending_parent is not None or raw["parent_id"] != parent_id):
+                raise GuangYaFSChangeStale("已读取的父目录身份已变化，不能以同名目录替代")
             if pending_parent is None and _name_conflict(_list_map(client, parent_id, cache), name):
                 raise GuangYaFSChangeError("新建目录名称已被占用")
             created_path = _full_path(parent_path, name)
@@ -1155,8 +1332,8 @@ def build_fs_change_plan(
             frozen.append(created)
             continue
 
-        handle = str(raw.get("object_ref") or "").strip().upper()
-        if not valid_object_handle(handle) or handle not in entries:
+        handle = _source_key(raw)
+        if handle not in entries:
             raise GuangYaFSChangeError("计划包含当前观察中不存在的对象引用")
         observed = entries[handle]
         parent_id = str(observed.get("parent_id") or "0")
@@ -1169,23 +1346,42 @@ def build_fs_change_plan(
             raise GuangYaWorkspaceStale("光鸭对象已变化，请重新读取后再生成计划")
         base: dict[str, Any] = {
             "op": op,
-            "object_ref": handle,
             "source": _snapshot(current),
             "source_parent_path": str(observed.get("parent_path") or "/"),
             "source_path": _full_path(
                 str(observed.get("parent_path") or "/"), current.name
             ),
         }
+        if "expected" in raw:
+            expected = raw["expected"]
+            if expected.get("path") and expected["path"] != base["source_path"]:
+                raise GuangYaFSChangeStale("源对象所在路径已变化，请重新读取完整目录")
+            if not _snapshot_matches(current, expected):
+                raise GuangYaFSChangeStale("对象已不符合读取时的名称、版本或父目录，请重新预览")
+        if raw.get("require_empty"):
+            if (not current.is_dir or not (current.etag or current.updated_at)
+                    or not callable(getattr(client, "delete_empty_directory", None))
+                    or getattr(client, "supports_guarded_empty_directory_delete", None) is False):
+                raise GuangYaFSChangeError("真空目录回收要求可验证版本及原子空目录保护")
+            base["require_empty"] = True
+        if "expected_tree" in raw:
+            if not current.is_dir:
+                raise GuangYaFSChangeError("完整目录守卫只能用于目录")
+            base["expected_tree"] = raw["expected_tree"]
+            if not _guard_tree_matches(client, _snapshot(current), raw["expected_tree"]):
+                raise GuangYaFSChangeStale("目录内容已不符合预览，未冻结任何写操作")
         if batch_rule is not None and op == "trash" and current.is_dir:
             base["require_empty"] = True
+        if raw.get("require_empty") and client.list_dir(current.file_id):
+            raise GuangYaFSChangeStale("目录已不为空，不能作为真空目录回收")
         if op in {"rename", "relocate"} or op == "copy" and "new_name" in raw:
             new_name = _validate_name(raw.get("new_name"))
             if op == "rename" and new_name == current.name:
                 unchanged += 1
                 continue
             if not current.is_dir:
-                old_suffix = Path(current.name).suffix.casefold()
-                new_suffix = Path(new_name).suffix.casefold()
+                old_suffix = Path(current.name.replace("。", ".").replace("．", ".")).suffix.casefold()
+                new_suffix = Path(new_name.replace("。", ".").replace("．", ".")).suffix.casefold()
                 if old_suffix != new_suffix:
                     raise GuangYaFSChangeError("文件改名不能改变扩展名")
             if op != "copy" and _name_conflict(cache[parent_id], new_name, exclude_id=current.file_id):
@@ -1199,6 +1395,8 @@ def build_fs_change_plan(
             pending_target = pending_targets.get(target_path)
             if pending_target is None:
                 target_id, target_snapshot = resolve_directory(target_path)
+                if "target_id" in raw and raw["target_id"] != target_id:
+                    raise GuangYaFSChangeStale("已读取的目标目录身份已变化，不能以同名目录替代")
                 if target_id == parent_id:
                     if op == "copy":
                         raise GuangYaFSChangeError("复制目标与当前目录相同")
@@ -1208,6 +1406,8 @@ def build_fs_change_plan(
                     # 已在目标目录的 relocate 只需改名，不能再次提交原地移动。
                     base["op"] = "rename"
             else:
+                if "target_id" in raw:
+                    raise GuangYaFSChangeStale("所选目标目录已不再是原来的真实对象")
                 target_id, target_snapshot = "", None
             source_path = str(base["source_path"])
             if current.is_dir and (
@@ -1341,11 +1541,6 @@ def build_fs_change_plan(
         "plan_id": uuid.uuid4().hex,
         "owner_digest": _owner_digest(owner),
         "credential_generation": client.credential_generation,
-        "observation_ref": observation_ref(str((original_observation if batch_rule else observation).get("plan_id") or "")),
-        "observation_source": (
-            capture_observation_source(original_observation, [batch_rule["scope_ref"]]) if batch_rule
-            else capture_observation_source(observation, [item["object_ref"] for item in frozen if item.get("object_ref")])
-        ),
         "created_at": _now_iso(),
         "created_at_epoch": current,
         "expires_at_epoch": current + _PLAN_TTL_SECONDS,
@@ -1398,6 +1593,31 @@ def _copy_tree_snapshot(client, root_id, cancel_check=None):
     content = [(path, row["is_dir"], 0 if row["is_dir"] else row["size"],
                 "" if row["is_dir"] else row["etag"]) for path, row in rows]
     return {"identity": digest(rows), "content": digest(content), "items": len(rows)}
+
+
+def _guard_tree_matches(client: GuangYaClient, root: dict, expected: list, cancel_check=None) -> bool:
+    """比较完整子树身份，不能只凭目录外壳决定残留隔离。"""
+    if len(expected) > _MAX_COPY_ITEMS or any(not isinstance(item, dict) for item in expected):
+        raise GuangYaFSChangeError("目录守卫清单无效或超出完整核验预算")
+    rows, queue, seen = [root], [root["file_id"]], {root["file_id"]}
+    directories = 0
+    while queue:
+        identifier = queue.pop()
+        directories += 1
+        if directories > _MAX_COPY_DIRS:
+            raise GuangYaFSChangeError("目录守卫超过完整核验预算")
+        if cancel_check is not None:
+            cancel_check()
+        for item in client.list_dir(identifier):
+            if item.file_id in seen or item.parent_id != identifier:
+                raise GuangYaFSChangeStale("目录清单父子关系或身份发生变化")
+            seen.add(item.file_id)
+            rows.append(_snapshot(item))
+            if len(rows) > _MAX_COPY_ITEMS:
+                raise GuangYaFSChangeError("目录守卫超过完整核验预算")
+            if item.is_dir:
+                queue.append(item.file_id)
+    return sorted(rows, key=lambda item: item["file_id"]) == sorted(expected, key=lambda item: item.get("file_id", ""))
 
 
 def _find_current(client: GuangYaClient, snapshot: dict[str, Any]) -> GuangYaFile | None:
@@ -1463,6 +1683,31 @@ def _stage_identity_matches(item, snapshot, created_targets):
             and snapshot.get("is_dir") == source.get("is_dir"))
 
 
+def _frozen_path_matches(client, snapshot, path, cache, cancel_check):
+    """沿真实 ID 的有界父链核对冻结路径；不遍历子树或持久化第二套快照。"""
+    file_id = str(snapshot.get("file_id") or "")
+    if file_id == "0" and snapshot.get("is_dir"):
+        return path == "/"
+    if file_id not in cache:
+        cache[file_id] = _find_current(client, snapshot)
+    entry = locate_file_in_roots(
+        client, snapshot, [{"file_id": "0", "path": "/", "is_dir": True}],
+        cache=cache, check_cancelled=cancel_check or (lambda: None),
+    )
+    if entry is None:
+        return False
+    current_path = _full_path(entry["parent_path"], entry["name"])
+    if current_path == path:
+        return True
+    # 原路径解析允许唯一大小写别名；不能将共存的 D/d 当成同一个目录。
+    if current_path.casefold() == path.casefold():
+        try:
+            return resolve_workspace_path(client, path).file_id == file_id
+        except GuangYaWorkspaceError:
+            pass
+    return False
+
+
 def _preflight_operation(
     client: GuangYaClient,
     item: dict[str, Any],
@@ -1472,8 +1717,10 @@ def _preflight_operation(
     completed_objects: set[str] | None = None,
     source_snapshot: dict[str, Any] | None = None,
     cancel_check: Callable[[], None] | None = None,
+    path_cache: dict[str, GuangYaFile | None] | None = None,
 ) -> None:
     op = str(item.get("op") or "")
+    path_cache = path_cache if path_cache is not None else {}
     # 新建目录没有预先存在的快照：沿本次已核验创建链检查名称和位置，
     # 防止外部搬走父目录后，后续操作仍按旧 ID 写入错误的归档路径。
     dependency = str(item.get("parent_create_path" if op == "create_directory" else "target_create_path") or "")
@@ -1486,9 +1733,10 @@ def _preflight_operation(
         parent_id = _directory_id(item, created_targets, role="parent", allow_pending=allow_pending_target)
         if not parent_id:
             return
-        if not item.get("parent_create_path") and not _verify_directory_snapshot(
-            client, parent_id, item.get("parent_snapshot")
-        ):
+        if (not item.get("parent_create_path") and not _verify_directory_snapshot(
+                client, parent_id, item.get("parent_snapshot"))
+                or not _frozen_path_matches(client, {"file_id": parent_id, "is_dir": True},
+                                            item["parent_path"], path_cache, cancel_check)):
             raise GuangYaFSChangeStale("新建目录的父目录已变化，请重新预览")
         siblings = {row.file_id: row for row in client.list_dir(parent_id)}
         if _name_conflict(siblings, str(item.get("name") or "")):
@@ -1510,6 +1758,13 @@ def _preflight_operation(
     if not source_matches:
         raise GuangYaFSChangeStale("光鸭对象已变化，请重新预览")
     assert isinstance(source, dict)
+    if "expected_tree" in item and not _guard_tree_matches(client, source, item["expected_tree"], cancel_check):
+        raise GuangYaFSChangeStale("残留目录内容已变化，保留原目录并停止后续写入")
+    parent_path = item["source_parent_path"]
+    if source_snapshot is not None and source["parent_id"] != item["source"]["parent_id"]:
+        parent_path = item["target_path"]  # 已核验的移动/复制半步沿原目标路径继续。
+    if not _frozen_path_matches(client, source, _full_path(parent_path, source["name"]), path_cache, cancel_check):
+        raise GuangYaFSChangeStale("光鸭对象父路径已变化，请重新预览")
     if op == "copy" and source_snapshot is not None:
         if _verified_copy(client, item, created_targets, "", cancel_check,
                           name=source_snapshot["name"], copied_id=source_snapshot["file_id"]) is None:
@@ -1541,9 +1796,10 @@ def _preflight_operation(
         )
         if not target_id:
             return
-        if not item.get("target_create_path") and not _verify_directory_snapshot(
-            client, target_id, item.get("target_snapshot")
-        ):
+        if (not item.get("target_create_path") and not _verify_directory_snapshot(
+                client, target_id, item.get("target_snapshot"))
+                or not _frozen_path_matches(client, {"file_id": target_id, "is_dir": True},
+                                            item["target_path"], path_cache, cancel_check)):
             raise GuangYaFSChangeStale("目标目录已变化，请重新预览")
         siblings = {row.file_id: row for row in client.list_dir(target_id)}
         target_name = str(item.get("new_name") or source.get("name") or "")
@@ -1756,11 +2012,12 @@ def _apply_fs_operation(
     try:
         for action in actions[len(outcome["completed_actions"]):]:
             stage_source = stage_sources.get(str(outcome["position"]))
+            if stage_source is not None:
+                _preflight_operation(client, item, created_targets=created_targets,
+                                     source_snapshot=stage_source, cancel_check=cancel_check)
             if item["op"] == "copy" and action == "rename":
                 if stage_source is None:
                     raise GuangYaFSChangeStale("副本身份尚未核验，不能执行改名")
-                _preflight_operation(client, item, created_targets=created_targets,
-                                     source_snapshot=stage_source, cancel_check=cancel_check)
                 source = stage_source
             if cancel_check is not None:
                 cancel_check()
@@ -1831,11 +2088,13 @@ def _apply_fs_operation(
 
 def _preflight_fs_change_plan(client, operations, outcomes, cancel_check):
     """首次执行需整单通过写前核对；中断恢复则按已记录的阶段逐项核对。"""
+    path_cache = {}  # 整单只读核对共享父链；每项实际写前另用新缓存。
     for item, outcome in zip(operations, outcomes):
         if cancel_check is not None:
             cancel_check()
         try:
-            _preflight_operation(client, item, allow_pending_target=True, cancel_check=cancel_check)
+            _preflight_operation(client, item, allow_pending_target=True,
+                                 cancel_check=cancel_check, path_cache=path_cache)
         except GuangYaFSChangeStale:
             outcome.update(status="blocked", reason="precondition_failed")
             raise

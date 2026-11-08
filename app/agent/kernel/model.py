@@ -81,6 +81,7 @@ class ModelToolCall:
 
 class ModelEventType(StrEnum):
     TEXT_DELTA = "text_delta"
+    REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
     TOOL_CALL_DELTA = "tool_call_delta"
     TOOL_CALL_COMPLETED = "tool_call_completed"
     USAGE = "usage"
@@ -96,6 +97,7 @@ class ModelEvent:
     finish_reason: str = ""
     raw: Any = None
     provider_state: ProviderState | None = field(default=None, repr=False)
+    summary_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +177,8 @@ class ModelRequest:
     round_index: int = 0
     model: str = ""  # 由受控会话偏好选择，不改变 Provider URL、凭据或协议。
     allow_parallel_tool_calls: bool = False  # 仅接受服务端窗口授予的显式许可。
+    # system_prompt 开头跨回合不变的字符数；Provider 据此放置提示缓存断点。
+    stable_system_chars: int = 0
 
 
 class ModelAdapter(Protocol):

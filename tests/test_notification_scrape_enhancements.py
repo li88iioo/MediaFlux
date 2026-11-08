@@ -728,9 +728,43 @@ class ScrapePreviewApiTests(unittest.TestCase):
         self.assertEqual(tags["source"], "iTunes")
         self.assertEqual(tags["media"], "WEB-DL")
         self.assertEqual(tags["video_codec"], "H.265")
-        self.assertIn("Atmos", tags["audio"])
+        self.assertEqual(tags["audio"], "DDP 5.1 · Atmos")
         self.assertIn("HDR10+", tags["effect"])
         self.assertEqual(tags["release_group"], "DreamHD")
+
+    def test_resource_audio_preserves_explicit_codec_and_channels(self):
+        cases = (
+            ("DD2.0", "DD 2.0"), ("DD2 0", "DD 2.0"), ("DD5.1", "DD 5.1"),
+            ("AC3 2.0", "DD 2.0"), ("AC-3.5.1", "DD 5.1"),
+            ("DDP2.0", "DDP 2.0"), ("DDP 2 0", "DDP 2.0"), ("DDP.2.0", "DDP 2.0"),
+            ("DDP5 1", "DDP 5.1"), ("DDP.5.1", "DDP 5.1"), ("DDP7.1.Atmos", "DDP 7.1 · Atmos"),
+            ("DDP51", "DDP 5.1"), ("EAC371", "DDP 7.1"),
+            ("EAC3 5.1", "DDP 5.1"), ("E-AC-3 2.0", "DDP 2.0"),
+            ("AAC2.0", "AAC 2.0"), ("AAC2 0", "AAC 2.0"),
+            ("AAC5.1", "AAC 5.1"), ("AAC- 2.0", "AAC 2.0"),
+            ("DDP5.1.EAC3.5.1", "DDP 5.1"),
+            ("TrueHD.Atmos.DDP2.0.AAC5.1", "DDP 2.0 · Atmos · TrueHD · AAC 5.1"),
+        )
+        for token, expected in cases:
+            with self.subTest(audio_token=token):
+                tags = TMDBScraper.parse_resource_tags(f"Show.2026.1080p.WEB-DL.{token}.H264-GROUP.mkv")
+                self.assertEqual(tags["audio"], expected)
+                self.assertEqual(tags["effect"], "")
+                self.assertEqual((tags["resolution"], tags["media"], tags["video_codec"]), ("1080p", "WEB-DL", "H.264"))
+
+    def test_resource_audio_does_not_infer_channels_from_unrelated_numbers(self):
+        cases = (
+            ("DDP.H264.2026", "DDP"), ("DDP.v2.0", "DDP"), ("AAC.v5.1", "AAC"),
+            ("AAC 2.0.1", "AAC"), ("DDP 5.10", "DDP"), ("AC3.2026", "DD"),
+            ("AAC 264", "AAC"), ("AAC", "AAC"), ("DDP", "DDP"),
+            ("MyDDP5.1", ""), ("DDP5.1beta", ""), ("Version2.0.2026", ""),
+            ("DDP51suffix", ""), ("EAC371beta", ""), ("DDP20", ""), ("AAC51", ""),
+        )
+        for token, expected in cases:
+            with self.subTest(audio_token=token):
+                tags = TMDBScraper.parse_resource_tags(f"Show.1080p.WEB-DL.{token}.H264.mkv")
+                self.assertEqual(tags["audio"], expected)
+                self.assertEqual(tags["effect"], "")
 
     def test_resource_tags_do_not_misclassify_web_dl_suffix_as_release_group(self):
         tags = TMDBScraper.parse_resource_tags(
@@ -747,7 +781,7 @@ class ScrapePreviewApiTests(unittest.TestCase):
             tools_api, "TMDBScraper", return_value=_PreviewScraper()
         ):
             response = tools_api.scrape_preview(Mock(), {
-                "filename": "The.Furious.2026.2160p.WEB-DL.H.265-DreamHD.mkv"
+                "filename": "The.Furious.2026.2160p.WEB-DL.DDP2.0.H.265-DreamHD.mkv"
             })
 
         payload = json.loads(bytes(response.body))
@@ -759,6 +793,7 @@ class ScrapePreviewApiTests(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["overview"], "候选简介")
         self.assertIn("resource_tags", payload["parsed"])
         self.assertEqual(payload["parsed"]["resource_tags"]["resolution"], "2160p")
+        self.assertEqual(payload["parsed"]["resource_tags"]["audio"], "DDP 2.0")
 
 
 class ScrapePreviewTemplateTests(unittest.TestCase):

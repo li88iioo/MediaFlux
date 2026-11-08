@@ -1,4 +1,4 @@
-"""真实本地收藏库、领域 action、SQLite 票据和原 Session 的限定预授权。"""
+"""真实本地收藏库、native port、SQLite 票据和原 Session 的限定预授权。"""
 
 from typing import Any
 import asyncio
@@ -10,14 +10,13 @@ import pytest
 
 from app import database as db
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domain_catalog import build_tool_specs
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog, ToolEffect
+from app.agent.kernel.capabilities import ToolCatalog, ToolEffect
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.events import AgentEventType as Event
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports import adapt_tool_spec
+from app.agent.kernel.ports.sdk_effects import watchlist_tools
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import (
     AgentInput,
@@ -31,7 +30,7 @@ from tests.test_agent_kernel_core import ScriptedModel, collect
 from tests.test_agent_task_cas import task_store as isolated_store
 
 task_store = isolated_store
-OWNER, SESSION, TOOL = "scoped-trust-owner", "scoped-trust-session", "discovery.add_watchlist"
+OWNER, SESSION, TOOL = "scoped-trust-owner", "scoped-trust-session", "watchlist.add"
 SCOPE = {"provider": "tmdb", "media_type": "tv"}
 FINAL = [ModelEvent(ModelEventType.TEXT_DELTA, text="以收藏回执为准。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]
 
@@ -50,7 +49,7 @@ class TrustRig:
         self.now = 2_000_000_000.0
         self.store, self.attempts = store, []
         self.fail = False
-        tool = adapt_tool_spec(next(spec for spec in build_tool_specs() if spec.name == TOOL))
+        tool = next(spec for spec in watchlist_tools() if spec.name == TOOL)
         original = tool.execute_confirmed
         def execute(args, snapshot, context):
             self.attempts.append(dict(args))
@@ -80,16 +79,17 @@ class TrustRig:
 
     def session(self, rounds):
         return AgentSession(model=ScriptedModel(rounds), catalog=self.pipeline.catalog,
-            retriever=CapabilityRetriever(), pipeline=self.pipeline, state_store=self.store)
+             pipeline=self.pipeline, state_store=self.store)
 
 
 @pytest.fixture
 def rig(task_store, monkeypatch):
     monkeypatch.setattr("app.modules.web_secret.get_web_secret", lambda: "scoped-trust-test-only")
-    monkeypatch.setattr("app.agent.domains.discovery.watchlist_actions.config.get_bool", lambda *_args, **_kwargs: True)
-    service = SimpleNamespace(get_detail=lambda provider, media_type, external_id: MediaCard(
-        provider=provider, external_id=external_id, media_type=media_type, title=f"测试收藏 {external_id}", year="2026"))
-    monkeypatch.setattr("app.agent.domains.discovery.watchlist_actions.get_discovery_service", lambda: service)
+    monkeypatch.setattr("app.agent.kernel.ports.sdk_effects.config.get_bool", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("app.discovery.service.DiscoveryService.get_detail",
+        lambda self, provider, media_type, external_id: MediaCard(
+            provider=provider, external_id=external_id, media_type=media_type,
+            title=f"测试收藏 {external_id}", year="2026"))
     return TrustRig(task_store)
 
 

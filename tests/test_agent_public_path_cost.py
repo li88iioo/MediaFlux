@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import itertools
-import json
 import random
 import re
 from time import process_time
@@ -12,32 +10,12 @@ from time import process_time
 import pytest
 
 from app.agent import public_safety as safety
-from app.agent.domains.resources.candidate_context import (
-    new_resource_search_id,
-    safe_resource_snapshot,
-)
-from app.agent.domains.resources.presentation import (
-    MediaFluxProjector,
-    ResourceSelection,
-)
 from app.agent.domains.resources.selection import candidate_item
-from app.agent.kernel.adapters import TurnViewBuilder, iter_ndjson
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.events import AgentEvent, AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.session import AgentSession
-from app.agent.kernel.state_types import AgentInput
-from app.agent.models import ToolReference, ToolResult
-from app.agent.public_view import candidate_result_lines, public_conversation_messages
+from app.agent.public_view import candidate_result_lines
+from tests.test_resource_presentation_native import native as native
 from tests.test_agent_public_text_decoding import offline as offline
 from tests.test_agent_public_text_decoding import store as store
-from tests.test_agent_tool_argument_ingress import Wire, encode
 
 # Frozen short-input characterization oracle, never used for long cost cases.
 LEGACY_RELATIVE = re.compile(
@@ -145,89 +123,37 @@ def test_whole_title_and_consumers_have_bounded_cpu(kind):
     assert process_time() - start < 1.0
 
 
-def test_default_pipeline_long_title_cost_and_reopened_consumers(store, monkeypatch):
+def test_native_rpc_long_title_cost_and_reopened_consumers(native, monkeypatch):
+    from app.indexers.models import AggregatedIndexerResult, IndexerItem
+    from app.agent.domains.resources.selection import current_candidate_view
+    from tests.test_resource_presentation_native import context_for, display, read
     async def exercise():
         samples = []
         original_sanitize = safety.sanitize_public_text
-
         def observed(text, **kwargs):
             start = process_time()
             result = original_sanitize(text, **kwargs)
             samples.append((len(text), process_time() - start))
             return result
-
-        monkeypatch.setattr(safety, "sanitize_public_text", observed)
-        value = ToolResult(True, "success", "找到一个资源", data={"items": [{
-            "result_id": "cost-resource-result-001", "title": "~" * 40000,
-            "site_id": "demo", "site_name": "演示站点", "size_text": "2 GB",
-            "download_state": "ready", "download_kinds": ["magnet"],
-        }]})
-        snapshot = safe_resource_snapshot(value, search_id=new_resource_search_id())
-        assert len(snapshot["candidates"]) == 1
-        value.references.append(ToolReference("resource_candidates", snapshot))
-        original = copy.deepcopy(value)
-        calls = []
-
-        def read(arguments, context):
-            assert context.owner == "cost-owner"
-            calls.append(dict(arguments))
-            return value
-
-        tool = KernelToolSpec(
-            name="indexer.search_resources", domain="indexer", description="只读资源搜索", effect=ToolEffect.READ,
-            input_schema={"type": "object", "properties": {"title": {"type": "string"}},
-                          "required": ["title"], "additionalProperties": False}, read=read,
-        )
-        # Match catalog_from_tool_specs: resource classification belongs to the
-        # production domain bindings, while the generic Kernel stays neutral.
-        catalog = ToolCatalog(
-            [tool], projector=MediaFluxProjector(), selection=ResourceSelection()
-        )
-        responses = [{"choices": [{"message": {"tool_calls": [{"type": "function", "id": "call-0",
-            "function": {"name": tool.model_name, "arguments": encode({"title": "测试作品"})}}]},
-            "finish_reason": "tool_calls"}]},
-            {"choices": [{"message": {"content": "已找到资源，等待选择。"}, "finish_reason": "stop"}]}]
-        wire = Wire("chat_completions", [(encode(item).encode(), "application/json") for item in responses])
-        pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
-        assert pipeline.projector.max_model_chars == 24000
-        session = AgentSession(model=wire.adapter, catalog=catalog, pipeline=pipeline,
-            retriever=CapabilityRetriever(minimum=1, maximum=1), state_store=store, journal=store)
+        monkeypatch.setattr(safety, 'sanitize_public_text', observed)
+        long_title = '~' * 40000
+        item = IndexerItem('nyaa', 'Nyaa', long_title, download_state='ready', download_kinds=('magnet',), magnet='magnet:?xt=urn:btih:'+'a'*40)
+        identity = native.service.result_store.put(item)
+        async def search(request, **kwargs):
+            from dataclasses import replace
+            return AggregatedIndexerResult(query=request.title, page=1, items=[replace(item, result_id=identity)], sites_attempted=('nyaa',), sites_succeeded=('nyaa',))
+        monkeypatch.setattr(native.service, 'search_media', search)
+        pipeline = native.pipeline()
+        context = await context_for(native.store)
         start = process_time()
-        events = [event async for event in session.run(AgentInput(
-            message="搜索测试作品", owner="cost-owner", session_id="cost-session",
-        ))]
-        session_cpu = process_time() - start
-        assert value == original and calls == [{"title": "测试作品"}]
-        wire.verify(posts=2)
-        assert not wire.replies
-        fresh = SQLiteKernelStore(secret_provider=lambda: "offline-public-decoding")
-        journal = await fresh.list_events(owner="cost-owner", session_id="cost-session")
-        saved = await fresh.load(owner="cost-owner", session_id="cost-session")
-        assert journal == [event.to_dict() for event in events]
-        assert events[-1].type is AgentEventType.TURN_COMPLETED
-        assert events[-1].payload["status"] == "success"
-        assert saved.conversation[-1]["content"] == events[-1].payload["answer"]
-        assert public_conversation_messages(saved.conversation)[-1]["content"] == events[-1].payload["answer"]
-        completed = [event["payload"]["result"] for event in journal if event["type"] == "tool.completed"]
-        # Resource references intentionally compact the public DTO; the raw
-        # returned ToolResult above must remain unchanged, not replace this DTO.
-        assert len(completed) == 1
-        assert completed[0]["ok"] is True and completed[0]["status"] == "success"
-        assert completed[0]["summary"] == value.summary
-        assert [ref["kind"] for ref in completed[0]["refs"]] == ["resource_candidates"]
-        builder = TurnViewBuilder()
-        restored = [AgentEvent(type=AgentEventType(event["type"]), sequence=event["sequence"], request_id=event["request_id"], session_id=event["session_id"], turn_id=event["turn_id"], occurred_at=event["occurred_at"], event_id=event["event_id"], payload=event["payload"]) for event in journal]
-        for event in restored:
-            builder.apply(event)
-
-        async def stream():
-            for event in restored:
-                yield event
-
-        assert [json.loads(line) async for line in iter_ndjson(stream())] == journal
-        assert builder.build().to_dict()["status"] == "success"
+        result = await read(pipeline, context)
+        response, view = await display(pipeline, context, [identity])
+        assert result['items'][0]['title'] == long_title and item.title == long_title
+        assert 'error' not in response and view
+        cold = SQLiteKernelStore(secret_provider=lambda: 'native-resource-presentation-secret')
+        restored = await current_candidate_view(state=await cold.load(owner=context.owner, session_id=context.session_id), store=cold)
+        assert restored and restored['ref'] == view['ref'] and restored['items'] == view['items']
         full_scans = [cpu for length, cpu in samples if length == 40000]
-        assert full_scans, "default pipeline must reach the complete title, not a shortened fixture"
-        assert max(full_scans) < 1.0, samples
-        assert session_cpu < 1.0, session_cpu
+        assert full_scans and max(full_scans) < 1.0, samples
+        assert process_time() - start < 1.0
     asyncio.run(exercise())

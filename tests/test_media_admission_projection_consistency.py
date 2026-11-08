@@ -19,7 +19,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
 
     def test_postprocessing_attention_is_consistent_and_retains_admission_until_recovered(self):
         from app.routes.downloads_api import _attention_stages
-        from app.agent.domains.downloads.actions import download_request_public_summary
+        from app.repositories.download_requests import download_request_public_summary
         from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
 
         cases = (

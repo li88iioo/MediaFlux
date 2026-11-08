@@ -1,7 +1,7 @@
 """光鸭媒体名称卫生扫描。
 
 当前实现重点处理带站点污染的高置信媒体标识及其唯一关联伴随文件，
-并生成显式名称映射。真正写入仍由 ``guangya_rename`` 的 owner-bound
+并生成显式名称映射。真正写入统一由 ``guangya_fs_change`` 的 owner-bound
 冻结计划、确认门和持久队列负责。
 """
 from __future__ import annotations
@@ -15,8 +15,8 @@ from typing import Any
 from app import config
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.modules.guangya_rename import (
-    GuangYaRenamePlanError,
-    build_explicit_rename_plan,
+    GuangYaNamingError,
+    preview_explicit_names,
 )
 from app.modules.nsfw import NsfwRecognizer, extract_nsfw_identifier, normalize_code
 from app.modules.organize import (
@@ -53,14 +53,6 @@ class _DirectoryNode:
     files: list[GuangYaFile] = field(default_factory=list)
 
 
-def _normalize_path(value: object) -> str:
-    path = str(value or "").strip().replace("\\", "/")
-    if not path.startswith("/") or len(path) > 2048:
-        raise GuangYaRenamePlanError("光鸭路径必须是绝对路径")
-    parts = [part for part in path.split("/") if part]
-    if not parts or any(part in {".", ".."} for part in parts):
-        raise GuangYaRenamePlanError("媒体名称清理不能使用光鸭根目录")
-    return "/" + "/".join(parts)
 
 
 def _cached_list_dir(
@@ -74,32 +66,6 @@ def _cached_list_dir(
     return cache[key]
 
 
-def _resolve_path(
-    client: GuangYaClient,
-    path: str,
-    cache: dict[str, list[GuangYaFile]],
-) -> tuple[GuangYaFile, str]:
-    current: GuangYaFile | None = None
-    parent_id = "0"
-    parent_path = "/"
-    components = path.strip("/").split("/")
-    for index, component in enumerate(components):
-        items = _cached_list_dir(client, cache, parent_id)
-        exact = [item for item in items if item.name == component]
-        matches = exact or [
-            item for item in items if item.name.casefold() == component.casefold()
-        ]
-        if len(matches) != 1:
-            raise GuangYaRenamePlanError(
-                f"路径不存在或名称不唯一：/{'/'.join(components[:index + 1])}"
-            )
-        current = matches[0]
-        if index < len(components) - 1 and not current.is_dir:
-            raise GuangYaRenamePlanError("光鸭路径的中间组件不是目录")
-        parent_path = "/" + "/".join(components[:index]) if index else "/"
-        parent_id = current.file_id
-    assert current is not None
-    return current, parent_path
 
 
 def _configured_exts(key: str, defaults: tuple[str, ...]) -> set[str]:
@@ -151,7 +117,7 @@ def _safe_stem(value: object, fallback: str) -> str:
     if len(text) > _MAX_CANONICAL_STEM:
         text = text[:_MAX_CANONICAL_STEM].rstrip(" .-_")
     if not text:
-        raise GuangYaRenamePlanError("无法生成安全的媒体名称")
+        raise GuangYaNamingError("无法生成安全的媒体名称")
     return text
 
 
@@ -217,21 +183,24 @@ def _companion_suffix(item: GuangYaFile) -> str:
     return ""
 
 
-def build_media_hygiene_plan(
+def preview_media_hygiene(
     client: GuangYaClient,
     *,
-    owner: str,
-    path: str,
+    file_id: str,
     recursive: bool = True,
     limit: int = 1_000,
     enrich_metadata: bool = True,
 ) -> dict[str, Any]:
-    """扫描光鸭目录并冻结媒体名称卫生计划。
+    """按真实目录ID扫描媒体名称并编译操作，不执行或保存状态。
 
     当前策略聚焦带站点污染的高置信媒体标识，同时保留后续扩展到其他
     媒体类型和清理策略的通用能力边界。
     """
-    target_path = _normalize_path(path)
+    from app.modules.guangya_workspace import file_location
+    location = file_location(client, file_id)
+    target_path = location["path"]
+    if type(recursive) is not bool or type(enrich_metadata) is not bool or type(limit) is not int or not 1 <= limit <= 10_000:
+        raise GuangYaNamingError("递归、元数据或名称读取预算无效")
     safe_limit = max(1, min(limit, 10_000))
     strip_domains = (config.get("GY_ORGANIZE_NSFW_STRIP_DOMAINS", "") or "")
     video_exts = _configured_exts("GY_ORGANIZE_VIDEO_EXTS", DEFAULT_ORGANIZE_VIDEO_EXTS)
@@ -242,9 +211,10 @@ def build_media_hygiene_plan(
     try:
 
         cache: dict[str, list[GuangYaFile]] = {}
-        target, parent_path = _resolve_path(client, target_path, cache)
+        target = GuangYaFile(**{key: location[key] for key in GuangYaFile.__dataclass_fields__})
+        parent_path = location["parent_path"]
         if not target.is_dir:
-            raise GuangYaRenamePlanError("媒体名称清理目前只支持精确目录路径")
+            raise GuangYaNamingError("媒体名称清理目前只支持精确目录路径")
 
         nodes: dict[str, _DirectoryNode] = {
             target.file_id: _DirectoryNode(target, target_path, parent_path)
@@ -257,12 +227,12 @@ def build_media_hygiene_plan(
             node = nodes[directory_id]
             scanned_dirs += 1
             if scanned_dirs > _MAX_SCANNED_DIRS:
-                raise GuangYaRenamePlanError("媒体名称清理目录数量超过安全上限")
+                raise GuangYaNamingError("媒体名称清理目录数量超过安全上限")
             items = _cached_list_dir(client, cache, directory_id)
             for child in items:
                 scanned_items += 1
                 if scanned_items > _MAX_SCANNED_ITEMS:
-                    raise GuangYaRenamePlanError("媒体名称清理项目数量超过安全上限")
+                    raise GuangYaNamingError("媒体名称清理项目数量超过安全上限")
                 if child.is_dir:
                     if recursive:
                         child_path = node.path.rstrip("/") + "/" + child.name
@@ -372,12 +342,11 @@ def build_media_hygiene_plan(
             directory_renames += 1
 
         if len(changes) > safe_limit:
-            raise GuangYaRenamePlanError(
+            raise GuangYaNamingError(
                 f"媒体名称清理匹配超过本次上限 {safe_limit} 个，请缩小目录或提高 limit"
             )
-        return build_explicit_rename_plan(
+        return preview_explicit_names(
             client,
-            owner=owner,
             target=target_path,
             changes=changes,
             cache=cache,

@@ -117,6 +117,21 @@ class FreeCalendarAPITests(_BaseClientTests):
         self.assertEqual(self.client.post("/api/discovery/calendar/refresh", json={"url": "https://evil.invalid"}, headers=headers).status_code, 400)
         self.assertEqual(self.client.get("/api/discovery/calendar?source=evil").status_code, 400)
 
+    def test_web_keeps_polling_until_platform_and_optional_metadata_are_finished(self):
+        headers = self.authenticate()
+        for refreshing, metadata_pending in ((False, True), (True, False), (True, True), (False, False)):
+            with self.subTest(refreshing=refreshing, metadata_pending=metadata_pending):
+                data = copy.deepcopy(SNAPSHOT)
+                data.update(refreshing=refreshing, metadata_pending=metadata_pending)
+                self.service.get_week.side_effect = lambda **kw: copy.deepcopy(data)
+                for response in (self.client.get("/api/discovery/calendar"),
+                                 self.client.post("/api/discovery/calendar/refresh", json={}, headers=headers)):
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["refreshing"], refreshing or metadata_pending)
+                    self.assertEqual(response.json()["metadata_pending"], metadata_pending)
+                    self.assertEqual(response.json()["items_count"], 1)
+                self.assertEqual(data["refreshing"], refreshing)
+
     def test_calendar_respects_discovery_feature_gate(self):
         self.authenticate()
         from app import config

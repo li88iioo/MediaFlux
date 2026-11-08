@@ -8,7 +8,6 @@ from dataclasses import replace
 
 import pytest
 
-from app.agent.kernel.ports.existing_actions import _kernel_context
 from app.agent.kernel.state_types import AgentInput
 from tests.test_agent_failed_effect_followup import case as case
 
@@ -31,11 +30,6 @@ def test_confirmed_observation_source_is_private_scoped_and_not_a_new_user_defau
 
         def inspect(arguments, context):
             observed.append(deepcopy(context.reobservation_source))
-            adapted = _kernel_context(context)
-            assert adapted.reobservation_source == context.reobservation_source
-            if adapted.reobservation_source:
-                adapted.reobservation_source["baseline"]["selected"].clear()
-                assert context.reobservation_source == source, "领域上下文副本不能改写冻结来源"
             return original_inspect(arguments, context)
 
         case.media.prepare, case.media.inspect = prepare, inspect

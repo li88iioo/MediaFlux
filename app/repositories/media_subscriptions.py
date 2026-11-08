@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Iterable, TypedDict
@@ -49,6 +50,8 @@ def _next_check(interval_minutes: int, *, base: str | None = None) -> str:
 
 class MediaSubscriptionError(ValueError):
     """可安全返回给 Web 的订阅业务错误。"""
+
+    execution_started = False
 
     def __init__(
         self, message: str, *, status_code: int = 400, code: str = "invalid",
@@ -184,6 +187,7 @@ def upsert_media_subscription(
     sites: Iterable[str] | None = None,
     check_interval_minutes: int = 4320,
     expected_snapshot: dict[str, Any] | None = None,
+    check_cancelled: Callable[[], None] = lambda: None,
 ) -> tuple[int, bool]:
     """原子创建或恢复；冻结快照冲突返回 (0, False)，不改变关联工作。"""
     stamp = now()
@@ -201,6 +205,7 @@ def upsert_media_subscription(
             ).fetchone()
             if mapping is None:
                 return 0, False
+        check_cancelled()
         if not snapshot["exists"]:
             cur = conn.execute(
                 "INSERT INTO media_subscriptions("
@@ -442,8 +447,18 @@ def get_media_subscription_stats() -> dict[str, int]:
     }
 
 
+
+def media_subscription_config_snapshot(conn, identifier: int) -> dict[str, Any]:
+    row = conn.execute("SELECT id,title,media_type,monitor_mode,seasons_json,include_specials,action,download_target,sites_json,check_interval_minutes "
+                       "FROM media_subscriptions WHERE id=? AND deleted_at IS NULL", (identifier,)).fetchone()
+    if row is None:
+        raise MediaSubscriptionError("未找到指定的媒体追更订阅", code="precondition_failed")
+    return {"configuration": dict(row), "work": media_subscription_mutation_snapshot(conn, identifier)}
+
+
 def update_media_subscription_config(
     subscription_id: int, *, connection: sqlite3.Connection | None = None,
+    expected_snapshot: dict[str, Any] | None = None, check_cancelled: Callable[[], None] = lambda: None,
     invalidate_related: bool = True, reason: str = "订阅配置已变更",
     run_summary: str = "订阅配置已变更，旧检查已取消", **fields: Any,
 ) -> dict[str, int] | None:
@@ -461,6 +476,9 @@ def update_media_subscription_config(
     with nullcontext(connection) if connection is not None else get_conn() as conn:
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
+        if expected_snapshot is not None and media_subscription_config_snapshot(conn, subscription_id) != expected_snapshot:
+            raise MediaSubscriptionError("追更配置或关联工作已变化，请重新预检", code="conflict")
+        check_cancelled()
         row = conn.execute(
             "SELECT * FROM media_subscriptions WHERE id=? AND deleted_at IS NULL",
             (subscription_id,),
@@ -535,11 +553,16 @@ def media_subscription_mutation_snapshot(conn: Any, subscription_id: int) -> dic
         "available_candidates": int(row["available_candidates"]),
         "claimed_admissions": int(row["claimed_admissions"]),
         "running_checks": int(row["running_checks"]),
+        "active_admissions": [dict(item) for item in conn.execute(
+            "SELECT id,subscription_revision,status,updated_at FROM media_download_admissions "
+            "WHERE subscription_id=? AND status IN ('claimed','dispatching') ORDER BY id", (subscription_id,)
+        ).fetchall()],
     }
 
 
 def delete_media_subscription(
-    subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None
+    subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None,
+    check_cancelled: Callable[[], None] = lambda: None,
 ) -> bool:
     """软删除订阅，保留已经发生的下载审计和运行记录。"""
     stamp = now()
@@ -549,6 +572,7 @@ def delete_media_subscription(
             media_subscription_mutation_snapshot(conn, subscription_id) != expected_snapshot
         ):
             return False
+        check_cancelled()
         cur = conn.execute(
             "UPDATE media_subscriptions SET enabled=0,status='paused',deleted_at=?,revision=revision+1,"
             "updated_at=? WHERE id=? AND deleted_at IS NULL",

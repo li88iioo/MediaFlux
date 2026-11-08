@@ -7,8 +7,8 @@ from dataclasses import dataclass
 _INVALID_NAME = re.compile(r'[\\/:*?"<>|]')
 _TOKEN = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]*)\}|\{([A-Za-z][A-Za-z0-9_]*)\}")
 
-MOVIE_DEFAULT = "${showTitle}.${showYear}${mediaInfoDotSuffix}.${ext}"
-TV_DEFAULT = "${showTitle}.${showYear}.${seasonEpisode}${mediaInfoSuffix}.${ext}"
+MOVIE_DEFAULT = "${showTitle}${yearDotSuffix}${mediaInfoDotSuffix}.${ext}"
+TV_DEFAULT = "${showTitle}${yearDotSuffix}.${seasonEpisode}${mediaInfoSuffix}.${ext}"
 MOVIE_DIR_DEFAULT = "${showTitle}${yearSuffix} ${identityTag}"
 SHOW_DIR_DEFAULT = "${showTitle}${yearSuffix} ${identityTag}"
 NSFW_DIR_DEFAULT = "${showTitle}${yearSuffix}"
@@ -17,6 +17,7 @@ _ALIASES = {
     "showTitle": "title",
     "showYear": "year",
     "yearSuffix": "year_suffix",
+    "yearDotSuffix": "year_dot_suffix",
     "showTmdb": "tmdb_id",
     "tmdbTag": "tmdb_tag",
     "identityId": "identity_id",
@@ -32,7 +33,7 @@ _ALIASES = {
     "originalStem": "original_stem",
 }
 _ALLOWED = {
-    "title", "year", "year_suffix", "tmdb_id", "tmdb_tag", "identity_id", "identity_tag",
+    "title", "year", "year_suffix", "year_dot_suffix", "tmdb_id", "tmdb_tag", "identity_id", "identity_tag",
     "season", "episode", "season_episode",
     "media_info", "media_info_suffix", "media_info_dot_suffix", "ext", "original_name", "original_stem",
 }
@@ -59,6 +60,10 @@ class NamingContext:
     @property
     def year_suffix(self) -> str:
         return f" ({self.year})" if self.year else ""
+
+    @property
+    def year_dot_suffix(self) -> str:
+        return f".{self.year}" if self.year else ""
 
     def values(self) -> dict[str, str]:
         return {name: str(getattr(self, name) or "") for name in _ALLOWED}

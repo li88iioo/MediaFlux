@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -15,6 +16,10 @@ re_constants = importlib.import_module("re._constants")
 re_parser = importlib.import_module("re._parser")
 
 logger = get_logger(__name__)
+
+
+class RuleConflict(ValueError):
+    """确认的识别规则业务行已变化，未执行写入。"""
 
 MAX_RULES = 200
 MAX_PATTERN_LENGTH = 500
@@ -447,10 +452,21 @@ def get_rule(rule_id: int) -> dict | None:
     return _serialize(row) if row is not None else None
 
 
-def update_rule(rule_id: int, data: dict) -> dict:
+def update_rule(rule_id: int, data: dict, *, expected_snapshot: dict | None = None,
+                check_write: Callable[[sqlite3.Connection], None] | None = None) -> dict:
     identifier = _integer(rule_id, "规则 ID", minimum=1, maximum=2_147_483_647)
-    rule = _normalize(data)
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM tmdb_regex_rules WHERE id=?", (identifier,)).fetchone()
+        current = _serialize(row) if row is not None else {}
+        if expected_snapshot is not None and {k: v for k, v in current.items() if k != "updated_at"} != expected_snapshot:
+            raise RuleConflict("识别规则已变化，请重新预检")
+        state_only = expected_snapshot is not None and set(data) == {"disabled"}
+        if state_only and type(data["disabled"]) is not bool:
+            raise ValueError("disabled 必须是布尔值")
+        rule = {**current, **data} if state_only else _normalize(data)
+        if check_write:
+            check_write(conn)
         cursor = conn.execute(
             "UPDATE tmdb_regex_rules SET name=?,pattern=?,match_target=?,tmdb_id=?,"
             "media_type=?,season_override=?,priority=?,disabled=?,updated_at=? WHERE id=?",

@@ -4,9 +4,12 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+from collections import Counter
 from datetime import date
 from typing import Any
 
+from app.indexers.models import IndexerMediaSearchRequest
+from app.indexers.ranking import match_media_title
 from app.indexers.release import parse_indexer_release_position
 from app.modules.episode_mapping import (
     classify_episode_position,
@@ -16,9 +19,9 @@ from app.modules.media_preferences import (
     effective_preferences,
     resource_preference_match,
 )
+from app.modules.media_probe import release_dynamic_range_evidence
 from app.modules.scraper import TMDBScraper
 
-_MAX_ITEMS = 50
 _MAX_REASON_LENGTH = 80
 
 
@@ -211,7 +214,7 @@ def _tag_score(title: str) -> tuple[int, dict[str, str], list[str]]:
     if "DoVi" in effects:
         score += 8
         reasons.append("Dolby Vision")
-    elif effects:
+    elif "HDR" in effects:
         score += 5
         reasons.append(effects)
 
@@ -228,10 +231,12 @@ def _tag_score(title: str) -> tuple[int, dict[str, str], list[str]]:
     elif codec == "AV1":
         score += 4
 
-    if re.search(r"简(?:体|中)|chs|gb(?:2312|k)?|中字|简繁|繁简", title, re.IGNORECASE):
+    # 文件体积不是语言标记，拉丁缩写也必须是独立标签。
+    subtitle_title = re.sub(r"\d+(?:\.\d+)?\s*[KMGTPE]i?B\b", "", title, flags=re.IGNORECASE)
+    if re.search(r"简(?:体|中)|中字|简繁|繁简|(?<![A-Za-z0-9])(?:chs|gb(?:2312|k)?)(?![A-Za-z0-9])", subtitle_title, re.IGNORECASE):
         score += 8
         reasons.append("含简体中文标记")
-    elif re.search(r"繁(?:體|体|中)|cht|big5", title, re.IGNORECASE):
+    elif re.search(r"繁(?:體|体|中)|(?<![A-Za-z0-9])(?:cht|big5)(?![A-Za-z0-9])", subtitle_title, re.IGNORECASE):
         score += 4
         reasons.append("含繁体中文标记")
 
@@ -301,18 +306,31 @@ def _ranked_item(
     season: int,
     episode: int,
     mapping_context: dict[str, Any] | None = None,
+    media: IndexerMediaSearchRequest | None = None,
 ) -> dict[str, Any]:
     public = dict(item)
-    title = _safe_text(public.get("title"), 300)
+    # 重排已有结果时重新计算偏好，不能沿用上一次条件的标签。
+    public.pop("preference_match", None)
+    title = " ".join(str(public.get("title") or "").split())
+    public["technical_evidence"] = release_dynamic_range_evidence(title)
     match, match_score, match_reasons, match_warnings = _episode_match(
         title, season=season, episode=episode, mapping_context=mapping_context
     )
+    identity_reasons = public.get("match_reasons")
+    if media is not None:
+        _, kind = match_media_title(title, media=media, fallback_query=media.title)
+        identity_reasons = [kind]
+    identity_matches = identity_reasons is None or bool(
+        {"title_exact", "title_contains"}.intersection(identity_reasons)
+    )
+    if not identity_matches:
+        match_warnings.insert(0, "作品名称未匹配目标，不能仅凭相同集号或高画质推荐")
     availability_score, downloadable, availability_reasons, availability_warnings = (
         _availability_score(public)
     )
     tag_score, tags, tag_reasons = _tag_score(title)
     activity_score, activity_reasons, activity_warnings = _activity_score(public)
-    eligible = downloadable and match != "conflict"
+    eligible = downloadable and identity_matches and match != "conflict"
     score = match_score + availability_score + tag_score + activity_score
     if match == "exact_episode" and eligible:
         confidence = "high"
@@ -375,6 +393,7 @@ def _candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "reasons": list(quality.get("reasons") or [])[:6],
         "warnings": list(quality.get("warnings") or [])[:4],
         "tags": dict(quality.get("tags") or {}),
+        "technical_evidence": dict(item["technical_evidence"]),
     }
 
 
@@ -392,6 +411,7 @@ def rank_episode_search(
     preferences: dict[str, Any] | None = None,
     preference_overrides: dict[str, Any] | None = None,
     mapping_context: dict[str, Any] | None = None,
+    media: IndexerMediaSearchRequest | None = None,
 ) -> dict[str, Any]:
     """返回带排序解释和只读下载建议的搜索数据副本。"""
     ranked_data = dict(search_data)
@@ -402,8 +422,9 @@ def rank_episode_search(
             season=season,
             episode=episode,
             mapping_context=mapping_context,
+            media=media,
         )
-        for item in raw_items[:_MAX_ITEMS]
+        for item in raw_items
         if isinstance(item, dict)
     ] if isinstance(raw_items, list) else []
     if preferences or preference_overrides:
@@ -430,6 +451,7 @@ def rank_episode_search(
 
     eligible = [item for item in items if item["quality"]["eligible"]]
     matching = matched_episode_items(ranked_data)
+    matched_counts = Counter(item["quality"]["match"] for item in matching)
     selected = matching[0] if matching else None
     if selected is None:
         status = "review_required" if eligible else "no_downloadable_candidate" if items else "empty"
@@ -441,10 +463,18 @@ def rank_episode_search(
         status = "review_required"
         reason = "合集标题范围包含目标集；尚未核验文件清单，不等于目标文件已验证。"
 
-    selected_summary = _candidate_summary(selected) if selected else None
+    selected_summary = (
+        {**_candidate_summary(selected), "source_url": selected.get("source_url")}
+        if selected else None
+    )
     ranked_data["recommendation"] = {
         "status": status,
+        "target": {"season": season, "episode": episode},
+        "basis": "release_title_only",
+        "stream_verified": False,
         "candidate_count": len(eligible),
+        "matched_count": len(matching),
+        "matched_counts": {kind: matched_counts[kind] for kind in ("exact_episode", "episode_pack")},
         "selected": selected_summary,
         "alternatives": [_candidate_summary(item) for item in matching[1:4]],
         "reason": reason,
@@ -453,8 +483,7 @@ def rank_episode_search(
         "mode": "read_only",
         "auto_submit": False,
         "requires_confirmation": True,
-        "prepare_tool": "ingest.submit",
+        "result_ids": [selected_summary["result_id"]] if selected_summary else [],
         "supported_targets": ["qb", "guangya", "both"],
-        "note": "当前仅生成建议；提交前将按当前会话候选序号重新校验资源和下载目标。",
     }
     return ranked_data

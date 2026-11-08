@@ -168,19 +168,14 @@ def test_verification_retry_is_reread_after_notification_conflict(transport, ter
     db.update_download_request(
         request_id, status="completed", qb_status="completed", local_import_status="completed", strm_status="completed",
     )
-    assert db.enqueue_agent_download_verification(
-        request_id, title="Race Film", tmdb_id="123", season=1, episode=1,
-        as_of="2026-10-26", owner="tg:v1:100\x1f200", chat_id="100",
-    )
+    assert db.enqueue_agent_download_verification(request_id, targets=[{'title': 'Race Film', 'tmdb_id': '123', 'season': 1, 'episode': 1, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f200', chat_id='100') == "queued"
     job = db.claim_due_agent_download_verification()
     assert job is not None
     assert db.finish_agent_download_verification(
         request_id, status=terminal_status, result=terminal_result, attempts=1, next_check_at=db.now(),
         expected_lease_generation=job["lease_generation"],
-        payload_json=dump_download_verification_payload(
-            title="Race Film", season=1, episode=1, status=terminal_status, result=terminal_result, attempts=1,
-        ),
-    )
+        payload_json=dump_download_verification_payload(targets=[{'title': 'Race Film', 'season': 1, 'episode': 1, 'result': terminal_result}], status=terminal_status, result=terminal_result, attempts=1),
+    targets=[{**target, "result": terminal_result} for target in job["targets"]])
     assert lifecycle.publish_download_lifecycle(request_id).delivered
     assert _snapshot(request_id).event.state == ("completed" if terminal_status == "visible" else "attention")
 

@@ -11,7 +11,7 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Optional
@@ -97,6 +97,41 @@ def normalize_explicit_media_user_id(value: Any) -> str:
     return normalized
 
 
+def media_refresh_parameters(
+    mode: str,
+    replace_images: bool,
+    regenerate_trickplay: bool,
+    *,
+    server: str = "jellyfin",
+) -> dict[str, str]:
+    """校验刷新选项并生成请求参数，供领域预检与客户端刷新复用。"""
+    if mode not in ("scan", "missing", "replace"):
+        raise ValueError("刷新 mode 必须为 scan、missing 或 replace")
+    if not isinstance(replace_images, bool) or not isinstance(regenerate_trickplay, bool):
+        raise ValueError("replace_images 和 regenerate_trickplay 必须为 bool")
+    if server not in ("jellyfin", "emby"):
+        raise ValueError("刷新 server 必须为 jellyfin 或 emby")
+    if server == "emby" and regenerate_trickplay:
+        raise ValueError("Emby 不支持 regenerate_trickplay=True")
+    if mode == "scan" and (replace_images or regenerate_trickplay):
+        raise ValueError("scan 模式不支持 replace_images 或 regenerate_trickplay")
+
+    params = {
+        "metadataRefreshMode": "Default" if mode == "scan" else "FullRefresh",
+        "imageRefreshMode": "None" if mode == "scan" else "FullRefresh",
+        "replaceAllMetadata": "true" if mode == "replace" else "false",
+        "replaceAllImages": "true" if replace_images else "false",
+        "regenerateTrickplay": "true" if regenerate_trickplay else "false",
+    }
+    if server == "emby":
+        del params["regenerateTrickplay"]
+        return {
+            "Recursive": "true",
+            **{key[0].upper() + key[1:]: value for key, value in params.items()},
+        }
+    return params
+
+
 def normalize_playback_progress(value: Any) -> float:
     """将 MediaBrowser 播放百分比归一化为有限的 0..100 数值。"""
     if isinstance(value, bool):
@@ -139,6 +174,7 @@ class MediaItem:
     last_played: str = ""
     progress: float = 0.0
     genres: tuple[str, ...] = ()
+    tmdb_id: str = ""
 
     @property
     def display_name(self) -> str:
@@ -185,7 +221,7 @@ class MediaSearchResult:
             "search_by": self.search_by,
             "media_type": self.media_type,
             "included_item_types": self.included_item_types,
-            "match_basis": "actor_metadata" if self.search_by == "actor" else "title_search",
+            "match_basis": {"actor": "actor_metadata", "tmdb": "provider_id"}.get(self.search_by, "title_search"),
             "person_match": self.person_match,
             "total_source": self.total_source,
             "count_scope": "server_records",
@@ -329,6 +365,7 @@ class MediaServerClient:
     """媒体服务器客户端基类。"""
 
     display_name = "MediaServer"
+    _REFRESH_SERVER = ""
     _RECENT_EXTRA_FIELDS = ""
     _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
 
@@ -412,13 +449,13 @@ class MediaServerClient:
         return folders
 
     # ---- 看板数据（统一返回）----
-    def get_media_counts(self) -> dict[str, int]:
-        """读取最小媒体计数；供 Agent 等只需要统计的调用复用。"""
+    def get_media_counts(self) -> Mapping[str, int | None]:
+        """读取最小媒体计数；未提供的分类计数保持未知。"""
         return {
             "total_items": max(0, (self._total_items() or 0)),
-            "movie_count": 0,
-            "series_count": 0,
-            "episode_count": 0,
+            "movie_count": None,
+            "series_count": None,
+            "episode_count": None,
         }
 
     def get_library_media_counts(self, library_id: str) -> dict[str, int]:
@@ -586,10 +623,11 @@ class MediaServerClient:
         search_by: str = "title",
         media_type: str = "all",
         count_only: bool = False,
+        cancelled: Callable[[], bool] | None = None,
     ) -> MediaSearchResult:
-        """统一原生搜索：标题或精确演员身份，分页与统计共用同一过滤条件。"""
-        if search_by not in ("title", "actor"):
-            raise ValueError("search_by 必须是 title 或 actor")
+        """统一标题、演员与明确TMDB身份查询，分页和计数共用同一过滤范围。"""
+        if search_by not in ("title", "actor", "tmdb"):
+            raise ValueError("search_by 必须是 title、actor 或 tmdb")
         item_types = {"movie": "Movie", "series": "Series", "episode": "Episode"}
         if media_type not in ("all", *item_types):
             raise ValueError("media_type 无效")
@@ -602,6 +640,22 @@ class MediaServerClient:
             offset=offset, limit=normalized_limit, count_only=count_only,
             search_by=search_by, media_type=media_type,
         )
+        if search_by == "tmdb":
+            if media_type not in {"movie", "series"}:
+                raise ValueError("TMDB 身份查询必须指定 movie 或 series")
+            rows, truncated = self._tmdb_identity_items(
+                query, "movie" if media_type == "movie" else "tv", "", MediaIdentityBatch(cancelled=cancelled),
+            )
+            if not truncated:
+                result.total = len(rows)
+                result.total_source = "identity_inventory"
+            end = offset + normalized_limit
+            result.has_more = True if end < len(rows) else None if truncated else False
+            if not count_only:
+                result.items = [self._media_item(item) for item in rows[offset:end]]
+                if end < len(rows):
+                    result.next_offset = end
+            return result
         user_id = self._user_id()
         params: dict[str, Any] = {
             "Recursive": "true",
@@ -611,7 +665,7 @@ class MediaServerClient:
             "IncludeItemTypes": ",".join(kind.title() for kind in result.included_item_types),
             "Fields": (
                 "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,ParentIndexNumber,"
-                f"ImageTags,{self._RECENT_EXTRA_FIELDS}ProductionYear,RunTimeTicks,Genres,UserData"
+                f"ImageTags,{self._RECENT_EXTRA_FIELDS}ProductionYear,RunTimeTicks,Genres,UserData,ProviderIds"
             ),
             "SortBy": "SortName",
             "SortOrder": "Ascending",
@@ -728,6 +782,8 @@ class MediaServerClient:
                 },
                 timeout=self._remaining_timeout(deadline_at),
             )
+            if isinstance(data, dict) and "Items" not in data:
+                raise ValueError("媒体服务器分页响应缺少 Items")
             items, total = self._items_payload(data)
             reported_total = max(reported_total, total or 0)
             for item in items:
@@ -737,7 +793,7 @@ class MediaServerClient:
                         raise ValueError("媒体服务器分页包含重复条目，无法确认清单完整")
                     seen_ids.add(item_id)
             rows.extend(items[:limit])
-            raw_items = data if isinstance(data, list) else data.get("Items", [])
+            raw_items = data if isinstance(data, list) else data["Items"]
             if len(items) != len(raw_items) or len(items) > limit:
                 break  # 丢弃了无效条目或超额页，不能据此证明库存缺失。
             if len(items) < limit or (total is not None and len(rows) >= reported_total):
@@ -881,6 +937,7 @@ class MediaServerClient:
         max_items: int = 5_000,
         page_size: int = 200,
         deadline_at: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> MediaIdentityInventory:
         """分页枚举电影或剧集的标题、年份与 TMDB 身份，不加载媒体内容。"""
         normalized_type = (media_type or "").strip().casefold()
@@ -894,7 +951,7 @@ class MediaServerClient:
         user_id = self._user_id(deadline_at=deadline_at)
 
         items, total, truncated = self._inventory_items(
-            user_id, cap=cap, page_size=page, deadline_at=deadline_at,
+            user_id, cap=cap, page_size=page, deadline_at=deadline_at, cancelled=cancelled,
             params={
                 "IncludeItemTypes": include_item_type,
                 "Fields": "ProviderIds,ProductionYear",
@@ -931,6 +988,7 @@ class MediaServerClient:
         max_items: int = 5_000,
         page_size: int = 200,
         deadline_at: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> MediaRecommendationInventory:
         """分页读取可推荐的电影/剧集元数据与用户观看状态。"""
         selected_user = normalize_explicit_media_user_id(user_id)
@@ -969,7 +1027,7 @@ class MediaServerClient:
             return tuple(dict.fromkeys(names))[:12]
 
         items, total, truncated = self._inventory_items(
-            selected_user, cap=cap, page_size=page, deadline_at=deadline_at,
+            selected_user, cap=cap, page_size=page, deadline_at=deadline_at, cancelled=cancelled,
             params={
                 "IncludeItemTypes": include_types,
                 "Fields": (
@@ -981,6 +1039,8 @@ class MediaServerClient:
                 "EnableUserData": "true",
             },
         )
+        if cancelled and cancelled():
+            raise InterruptedError("媒体推荐查询已停止")
         for item in items:
             item_id = str(item.get("Id") or "").strip()
             name = str(item.get("Name") or "").strip()
@@ -1155,8 +1215,33 @@ class MediaServerClient:
         raise NotImplementedError
 
     # ---- 局部刷新（STRM 入库后通知）----
-    def refresh_library(self, library_id: str) -> bool:
-        raise NotImplementedError
+    def refresh_library(
+        self,
+        library_id: str,
+        *,
+        mode: str = "scan",
+        replace_images: bool = False,
+        regenerate_trickplay: bool = False,
+    ) -> bool:
+        """刷新 Item/Folder/媒体库；默认轻量扫描，非法选项在发请求前拒绝。"""
+        params = media_refresh_parameters(
+            mode, replace_images, regenerate_trickplay, server=self._REFRESH_SERVER,
+        )
+        try:
+            resp = self._session.post(
+                f"{self.url}/Items/{library_id}/Refresh",
+                headers=self._headers(),
+                params=params,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.error(
+                "%s 刷新目标失败 target=%s type=%s",
+                self.display_name, library_id, type(exc).__name__,
+            )
+            return False
 
     def refresh_all(self) -> bool:
         raise NotImplementedError

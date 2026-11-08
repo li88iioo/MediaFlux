@@ -62,10 +62,10 @@ def session_summary(state: SessionState, *, updated_at: float) -> dict[str, Any]
 
 
 def next_actions_view(result: Any) -> dict[str, Any]:
-    data = result.data if isinstance(getattr(result, "data", None), Mapping) else {}
+    data = result.get("data", {}) if isinstance(result, Mapping) else {}
     status = data.get("snapshot_status")
     allowed = {"attention", "active", "waiting", "empty", "partial", "success", "unavailable"}
-    if not getattr(result, "ok", False) or status not in allowed:
+    if not isinstance(result, Mapping) or not result.get("ok") or status not in allowed:
         return {"actions": [], "snapshot_status": "unavailable"}
     actions: list[dict[str, str]] = []
     raw_actions = data.get("actions")

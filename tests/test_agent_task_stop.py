@@ -18,7 +18,7 @@ from app.agent.effect_completion import (
 )
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import _capture_creation_binding
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.completion_receipts import (
     EffectCompletionScope,
     _completion_cipher,
@@ -608,7 +608,7 @@ class SQLiteAgentTaskStopTests(unittest.IsolatedAsyncioTestCase):
     def _runtime(self, store: SQLiteKernelStore) -> Any:
         catalog = ToolCatalog([])
         session = AgentSession(
-            model=self.model, catalog=catalog, retriever=CapabilityRetriever(),
+            model=self.model, catalog=catalog, model_tools=(),
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
         )
         session.continuation_binding = self.binding

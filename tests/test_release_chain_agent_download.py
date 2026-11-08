@@ -9,7 +9,8 @@ import tests  # noqa: F401 - 先隔离运行目录，禁止读取真实配置/�
 from app import database as db
 from app.agent.confirmation import ConfirmationStore
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.state import InMemorySessionStateStore

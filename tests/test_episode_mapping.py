@@ -1268,6 +1268,23 @@ class DirectoryScrapeEpisodeMappingTests(unittest.TestCase):
         self.assertEqual(exact.relation, "exact")
         self.assertEqual(unknown.relation, "unknown")
 
+    def test_missing_episode_keeps_known_season_conflicts_and_mapping_uncertainty(self):
+        for source_s, source_e, target_s, target_e, relation in (
+            (6, None, 2, 1, "conflict"),
+            (4, 1, 2, None, "conflict"),
+            (2, None, 2, 1, "season"),
+            (2, 1, 2, None, "season"),
+            (3, None, 1, 95, "unknown"),
+            (None, None, 2, 1, "unknown"),
+            (4, 1, None, None, "unknown"),
+        ):
+            with self.subTest(position=(source_s, source_e), target=(target_s, target_e)):
+                match = classify_episode_position(
+                    source_season=source_s, source_episode=source_e,
+                    target_season=target_s, target_episode=target_e,
+                )
+                self.assertEqual(match.relation, relation)
+
     def test_unified_release_mapping_maps_publisher_season_to_merged_tmdb_season(self):
         episodes = []
         for number in range(1, 96):

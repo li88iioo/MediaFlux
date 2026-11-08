@@ -8,17 +8,13 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import config, database as db
-from app.agent.action_history import list_action_history, record_confirmed_result
-from app.agent.domains.local_media.scan_actions import (
-    prepare_scan_local_media_sources,
-    scan_local_media_sources_confirmed,
-)
-from app.agent.domains.local_media.task_actions import LocalMediaTaskActions
-from app.agent.domains.local_media.task_arguments import local_media_task_summaries_arguments
+from app.agent.action_history import read_actions, record_confirmed_result
+from app.modules.local_media_service import prepare_local_source_scan, scan_local_sources
+from app.modules.local_media_tasks import local_tasks
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime, invalidate_agent_kernel_runtime
-from app.agent.kernel.pipeline import InMemoryRateLimiter
-from app.agent.models import RiskLevel, ToolContext
+from app.agent.kernel.effects import InMemoryRateLimiter
+from app.agent.models import RiskLevel, ToolContext, ToolResult
 from app.bot import handlers
 from app.modules.local_media_scan_runs import (
     finish_local_media_scan_report,
@@ -42,6 +38,13 @@ def source(root: Path, target: Path, *, name: str = "本地来源") -> int:
     return source_id
 
 
+def scan_receipt(expected: str) -> ToolResult:
+    result = ToolResult(**scan_local_sources(expected_fingerprint=expected))
+    if result.data.get("queued_count"):
+        result.effect_metadata["completion"] = {"kind": "local_media_scan", "scan_ref": result.data["scan_ref"]}
+    return result
+
+
 @pytest.mark.parametrize("remove_directory", [False, True])
 def test_real_confirmation_distinguishes_empty_source_from_disappeared_mount(tmp_path, remove_directory):
     async def scenario():
@@ -57,12 +60,12 @@ def test_real_confirmation_distinguishes_empty_source_from_disappeared_mount(tmp
             scheduler = LocalMediaScheduler(service=Mock())
             try:
                 context = await context_for(runtime.store, owner=OWNER, session="scan-facts")
-                preview = await runtime.session.pipeline.execute("local_media.scan_sources", {}, context=context)
+                preview = await runtime.session.pipeline.execute("local.scan_sources", {}, context=context)
                 assert preview.effect_plan is not None
                 if remove_directory:
                     root.rmdir()
                 with (
-                    patch("app.agent.domains.local_media.scan_actions.get_local_media_scheduler", return_value=scheduler),
+                    patch("app.modules.local_media_scheduler.get_local_media_scheduler", return_value=scheduler),
                     patch.object(scheduler, "start") as start,
                     patch("socket.socket.connect", side_effect=AssertionError("network forbidden")),
                 ):
@@ -80,7 +83,8 @@ def test_real_confirmation_distinguishes_empty_source_from_disappeared_mount(tmp
                 row = db.get_task_run(saved["id"])
                 assert row is not None
                 assert row["status"] == ("failed" if remove_directory else "success")
-                assert str(root) not in repr(result)
+                if remove_directory:
+                    assert result["data"]["sources"][0]["error"] == "目录不存在或不可访问"
                 if remove_directory:
                     assert "没有发现" not in repr(result["suggestions"])
                     assert saved["summary"]["scan_errors"][0]["code"] == "source_unavailable"
@@ -100,12 +104,12 @@ def test_partial_scan_keeps_failure_through_report_query_and_finished_tasks(tmp_
         source(root, target)
         source(tmp_path / "missing-mount", target, name="失联来源")
         scheduler = LocalMediaScheduler(service=Mock())
-        _, expected = prepare_scan_local_media_sources({})
+        expected = prepare_local_source_scan()["fingerprint"]
         with (
-            patch("app.agent.domains.local_media.scan_actions.get_local_media_scheduler", return_value=scheduler),
+            patch("app.modules.local_media_scheduler.get_local_media_scheduler", return_value=scheduler),
             patch.object(scheduler, "start") as start,
         ):
-            accepted = scan_local_media_sources_confirmed({}, expected)
+            accepted = scan_receipt(expected)
         start.assert_called_once()
         assert accepted.ok and accepted.status == "accepted"
         assert accepted.data["scan_status"] == "partial"
@@ -123,20 +127,17 @@ def test_partial_scan_keeps_failure_through_report_query_and_finished_tasks(tmp_
         saved = resolve_local_media_scan(scan_ref)["summary"]
         assert local_media_scan_summary(saved) == original_scan_summary
         result = asyncio.run(wait_for_effect_completion(
-            accepted, tool="local_media.scan_sources", context=ToolContext(owner="scan-owner"),
+            accepted, tool="local.scan_sources", context=ToolContext(owner="scan-owner"),
         ))
         assert result.status == "partial" and not result.ok
         assert result.data["stats"]["completed"] == 1
         assert result.data["stats"]["failed_sources"] == 1
         assert result.data["failed_sources"] == 1
-        assert "/missing-mount" not in repr(result.to_dict())
-        query = LocalMediaTaskActions().list_local_media_task_summaries(
-            local_media_task_summaries_arguments({"scan_ref": scan_ref}),
-            ToolContext(owner="scan-owner", session_id="scan-session"),
-        )
-        assert query.status == "attention"
-        assert query.data["scan_status"] == "partial"
-        assert query.data["failed_sources"] == 1
+        assert result.data["scan_errors"][0]["code"] == "source_unavailable"
+        query = local_tasks(scan_ref=scan_ref)
+        assert query["status"] == "attention"
+        assert query["scan_status"] == "partial"
+        assert query["failed_sources"] == 1
 
 
 @pytest.mark.parametrize("all_fail", [False, True])
@@ -198,19 +199,17 @@ def test_failed_empty_scan_remains_visible_in_queries_notifications_and_history(
         saved = resolve_local_media_scan(report["scan_ref"])
         assert saved["summary"]["scan_status"] == "failed"
         context = ToolContext(owner="scan-owner", session_id="scan-session")
-        query = LocalMediaTaskActions().list_local_media_task_summaries(
-            local_media_task_summaries_arguments({"scan_ref": report["scan_ref"]}), context,
-        )
-        assert query.status == "attention" and query.data["tasks"] == []
-        assert query.data["scan_errors"][0]["code"] == "source_unavailable"
-        _, expected = prepare_scan_local_media_sources({})
-        with patch("app.agent.domains.local_media.scan_actions.get_local_media_scheduler", return_value=scheduler):
-            failed = scan_local_media_sources_confirmed({}, expected)
+        query = local_tasks(scan_ref=report["scan_ref"])
+        assert query["status"] == "attention" and query["items"] == []
+        assert query["scan_errors"][0]["code"] == "source_unavailable"
+        expected = prepare_local_source_scan()["fingerprint"]
+        with patch("app.modules.local_media_scheduler.get_local_media_scheduler", return_value=scheduler):
+            failed = scan_receipt(expected)
         record_confirmed_result(
-            owner=context.owner, tool_name="local_media.scan_sources", risk=RiskLevel.WRITE,
+            owner=context.owner, tool_name="local.scan_sources", risk=RiskLevel.WRITE,
             result=failed, elapsed_ms=1,
         )
-        history = list_action_history({"limit": 10, "outcome": "all"}, context)
-        details = history.data["items"][0]["details"]
+        history = read_actions(owner=context.owner, **{"limit": 10, "outcome": "all"})
+        details = history["items"][0]["details"]
         assert details["scan_status"] == "failed" and details["failed_sources"] == 1
-        assert "private" not in repr(history.data)
+        assert "private" not in repr(history)

@@ -11,12 +11,11 @@ import pytest
 from app import database as db
 from app.agent import effect_completion as effects
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports import existing_actions
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.session_guard import continuation_execution_guard
 from app.agent.kernel.state_types import AgentInput, SessionBusyError
@@ -46,7 +45,7 @@ def native_call(protocol, rig, label, *, index=0):
 def native_session(rig, wire, *, cold=False, journal=None):
     current = SQLiteKernelStore(secret_provider=lambda: "offline-tool-argument-test") if cold else rig.store
     return AgentSession(model=wire.adapter, catalog=rig.pipeline.catalog,
-        retriever=CapabilityRetriever(), state_store=current, journal=journal,
+         state_store=current, journal=journal,
         pipeline=ToolPipeline(catalog=rig.pipeline.catalog, state_store=current,
             effect_store=rig.pipeline.effect_store))
 
@@ -272,7 +271,7 @@ def test_native_resume_next_card_can_be_confirmed_before_previous_continuation_f
                 receiver = _session(SQLiteKernelStore(), FollowScript(resume=True), client, reads, stack=stack) if cold else source
                 if cold:
                     receiver.pipeline.effect_store = ConfirmationEffectPlanStore(SQLiteConfirmationStore())
-                with patch.object(existing_actions, "wait_for_effect_completion",
+                with patch.object(effects, "wait_for_effect_completion",
                         partial(effects.wait_for_effect_completion, timeout_seconds=0)):
                     accepted = await collect(receiver.confirm(owner=OWNER, session_id=SID, plan_id=plan_id, channel="web"))
                 assert accepted[-1].type is E.TURN_COMPLETED and accepted[-1].payload["status"] == "waiting"

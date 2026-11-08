@@ -23,13 +23,11 @@ class AgentToolError(ValueError):
 
 
 class ToolPipelineError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "tool_failed", task_patch: TaskPatch | None = None, invalid_fields: tuple[str, ...] = (),
+    def __init__(self, message: str, *, code: str = "tool_failed", task_patch: TaskPatch | None = None,
                  argument_schemas: Mapping[str, Mapping[str, Any]] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.task_patch = task_patch
-        self.repair_ticket = ""
-        self.invalid_fields = invalid_fields
         self.argument_schemas = argument_schemas
         self.execution_started: bool | None = None
         self.plan_invalidated = False
@@ -76,10 +74,3 @@ class ConfirmationClaimError(ToolPipelineError):
 
     def __init__(self) -> None:
         super().__init__("确认计划无效、已过期或已被使用", code="confirmation_invalid")
-
-class _SchemaCollisionError(ToolPipelineError):
-    """A root-level, schema-proven collision between exactly two keys."""
-
-    def __init__(self, message: str, keys: frozenset[str]) -> None:
-        super().__init__(message, code="invalid_arguments")
-        self.keys = keys

@@ -1,58 +1,17 @@
-"""光鸭受控重命名计划、私有清单与确定性执行。
-
-LLM 只负责选择公开变换；本模块负责解析精确路径、冻结远端快照、排除
-重名冲突、持久化可回滚清单，并在确认后的整理互斥队列中逐项写入和复核。
-"""
-
+"""光鸭名称转换与冲突检查；只生成真实ID操作，由公共cloud.change唯一执行。"""
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
-import os
 import re
-import tempfile
-import time
-import uuid
 from collections import Counter, deque
-from collections.abc import Generator, Callable
-from contextlib import contextmanager
-from datetime import datetime
-from pathlib import Path
 from typing import Any
+from app.clients.guangya import GuangYaClient, GuangYaFile
 
-from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaWriteRejected
-from app.config import PATHS
-from app.modules.guangya_journal import append_guangya_journal
-from app.modules.process_lock import CrossProcessLock
-from app.modules.strm import cloud_change_sources, trigger_cloud_changes
-from app.modules.web_secret import get_web_secret
-from app.private_files import protect_private_file
-from app.repositories.organize_operation_jobs import organize_operation_owner_digest
-
-_PLAN_VERSION = 1
-CANONICAL_RENAME_PLAN_MODES = frozenset(
-    {
-        "remove_bitrate",
-        "replace_text",
-        "media_hygiene",
-    }
-)
-_PLAN_TTL_SECONDS = 15 * 60
-_CONFIRMED_TTL_SECONDS = 60 * 60
-_MAX_TARGETS = 4
+_MAX_TARGETS = 32
 _MAX_RENAMES = 10_000
 _MAX_SCANNED_ITEMS = 100_000
 _MAX_SCANNED_DIRS = 5_000
 _MAX_NAME_LENGTH = 255
-_MAX_PLAN_FILE_BYTES = 16 * 1024 * 1024
-_TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
-_MANUAL_REVIEW_RETENTION_SECONDS = 30 * 24 * 60 * 60
-_MAX_TERMINAL_PLANS = 128
-_MAX_ACTIVE_PLANS = 64
-_MAX_PLAN_STORAGE_BYTES = 512 * 1024 * 1024
-_SAFE_PLAN_ID = re.compile(r"^[0-9a-f]{32}$")
-_TERMINAL_PLAN_STATUSES = frozenset({"completed", "partial", "failed", "cancelled", "manual_review"})
+CANONICAL_RENAME_MODES = frozenset({"remove_bitrate", "replace_text", "media_hygiene"})
 _COMPACT_BITRATE_RE = re.compile(
     r"\.(?!(?:26[0-9])\.)(?:\d+(?:\.\d+)?)\s*Mbps(?=\.|$)",
     re.IGNORECASE,
@@ -67,311 +26,30 @@ _SPACED_BITRATE_RE = re.compile(
 )
 
 
-class GuangYaRenamePlanError(RuntimeError):
-    """可安全投影给 Agent 的重命名预检错误。"""
-
-
-class GuangYaRenamePlanStale(GuangYaRenamePlanError):
-    """计划快照、凭据或确认上下文已失效。"""
-
-
-def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def _plan_directory() -> Path:
-    return Path(PATHS.data_dir) / "agent-guangya-rename"
-
-
-@contextmanager
-def _plan_state_lock() -> Generator[None, None, None]:
-    """确认、执行状态与预览淘汰共用文件锁，防止读后状态变化造成误删。"""
-    lock = CrossProcessLock("guangya-rename-state", directory=_plan_directory())
-    if not lock.acquire():
-        raise GuangYaRenamePlanError("重命名计划正在被其他进程更新")
-    try:
-        yield
-    finally:
-        lock.release()
-
-
-def _ensure_private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        if path.is_symlink() or not path.is_dir():
-            raise GuangYaRenamePlanError("重命名计划目录不可用")
-        if os.name == "posix":
-            path.chmod(0o700)
-    except OSError as exc:
-        raise GuangYaRenamePlanError("重命名计划目录不可用") from exc
-
-
-def _plan_path(plan_id: str) -> Path:
-    if not _SAFE_PLAN_ID.fullmatch(plan_id or ""):
-        raise GuangYaRenamePlanError("重命名计划编号无效")
-    return _plan_directory() / f"{plan_id}.json"
-
-
-def _journal_path(plan_id: str) -> Path:
-    if not _SAFE_PLAN_ID.fullmatch(plan_id or ""):
-        raise GuangYaRenamePlanError("重命名计划编号无效")
-    return _plan_directory() / f"{plan_id}.jsonl"
-
-
-def _canonical_payload(payload: dict[str, Any]) -> bytes:
-    safe = {key: value for key, value in payload.items() if key != "auth"}
-    return json.dumps(
-        safe,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _plan_auth(payload: dict[str, Any]) -> str:
-    secret = (get_web_secret() or "").encode("utf-8")
-    if not secret:
-        raise GuangYaRenamePlanError("重命名计划签名密钥不可用")
-    return hmac.new(
-        secret,
-        b"mediaflux-guangya-rename-plan:v1\0" + _canonical_payload(payload),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _atomic_write_plan(path: Path, payload: dict[str, Any]) -> None:
-    _ensure_private_directory(path.parent)
-    stored = dict(payload)
-    stored["auth"] = _plan_auth(stored)
-    encoded = (json.dumps(stored, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    if len(encoded) > _MAX_PLAN_FILE_BYTES:
-        raise GuangYaRenamePlanError("重命名计划过大，请缩小路径范围或降低 limit")
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{path.stem}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    replaced = False
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        replaced = True
-        if not protect_private_file(path):
-            raise GuangYaRenamePlanError("重命名计划文件权限不安全")
-    except BaseException:
-        try:
-            os.unlink(path if replaced else temporary)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _append_journal(plan_id: str, event: dict[str, Any]) -> None:
-    path = _journal_path(plan_id)
-    _ensure_private_directory(path.parent)
-    append_guangya_journal(path, {"at": _now_iso(), **event})
-
-
-def _read_plan(plan_id: str) -> dict[str, Any]:
-    path = _plan_path(plan_id)
-    try:
-        if path.is_symlink() or not path.is_file():
-            raise GuangYaRenamePlanError("重命名计划不存在或已过期")
-        raw = path.read_text(encoding="utf-8")
-        if len(raw.encode("utf-8")) > _MAX_PLAN_FILE_BYTES:
-            raise GuangYaRenamePlanError("重命名计划文件异常")
-        payload = json.loads(raw)
-    except FileNotFoundError as exc:
-        raise GuangYaRenamePlanError("重命名计划不存在或已过期") from exc
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise GuangYaRenamePlanError("重命名计划文件损坏") from exc
-    if (
-        not isinstance(payload, dict)
-        or int(payload.get("version") or 0) != _PLAN_VERSION
-    ):
-        raise GuangYaRenamePlanError("重命名计划版本无效")
-    actual = str(payload.get("auth") or "")
-    expected = _plan_auth(payload)
-    if not actual or not hmac.compare_digest(actual, expected):
-        raise GuangYaRenamePlanError("重命名计划完整性校验失败")
-    return payload
-
-
-def _owner_digest(owner: str) -> str:
-    owner_key = (owner or "").strip()
-    if not owner_key:
-        raise GuangYaRenamePlanError("重命名计划缺少会话身份")
-    return organize_operation_owner_digest(owner_key)
-
-
-def load_rename_plan(
-    plan_id: str,
-    *,
-    owner: str | None = None,
-    expected_fingerprint: str = "",
-    require_confirmed: bool = False,
-) -> dict[str, Any]:
-    payload = _read_plan(plan_id)
-    mode = str(payload.get("mode") or "").strip().casefold()
-    if mode not in CANONICAL_RENAME_PLAN_MODES:
-        raise GuangYaRenamePlanStale("重命名计划来自已停用的旧链路，请重新预览")
-    if owner is not None and not hmac.compare_digest(
-        str(payload.get("owner_digest") or ""),
-        _owner_digest(owner),
-    ):
-        raise GuangYaRenamePlanError("重命名计划不属于当前会话")
-    fingerprint = str(payload.get("fingerprint") or "")
-    if expected_fingerprint and not hmac.compare_digest(
-        fingerprint,
-        (expected_fingerprint or ""),
-    ):
-        raise GuangYaRenamePlanStale("重命名计划已变化，请重新预览")
-    now_epoch = time.time()
-    if require_confirmed:
-        confirmed_at = float(payload.get("confirmed_at_epoch") or 0)
-        execute_until = float(payload.get("execute_until_epoch") or 0)
-        if confirmed_at <= 0 or execute_until <= now_epoch:
-            raise GuangYaRenamePlanStale("重命名确认已过期，请重新预览")
-    elif float(payload.get("expires_at_epoch") or 0) <= now_epoch:
-        raise GuangYaRenamePlanStale("重命名预览已过期，请重新生成")
-    return payload
-
-
-def confirm_rename_plan(
-    plan_id: str,
-    *,
-    owner: str,
-    expected_fingerprint: str,
-) -> dict[str, Any]:
-    with _plan_state_lock():
-        payload = load_rename_plan(
-            plan_id,
-            owner=owner,
-            expected_fingerprint=expected_fingerprint,
-        )
-        if str(payload.get("status") or "") not in {"preview", "confirmed"}:
-            raise GuangYaRenamePlanStale("重命名计划已进入执行阶段，请重新预览")
-        current = time.time()
-        payload["confirmed_at"] = _now_iso()
-        payload["confirmed_at_epoch"] = current
-        payload["execute_until_epoch"] = current + _CONFIRMED_TTL_SECONDS
-        payload["status"] = "confirmed"
-        _atomic_write_plan(_plan_path(plan_id), payload)
-        return payload
-
-
-def update_rename_plan_execution(
-    plan_id: str,
-    *,
-    status: str,
-    execution: dict[str, Any],
-) -> None:
-    with _plan_state_lock():
-        payload = _read_plan(plan_id)
-        payload["status"] = (status or "unknown")[:40]
-        payload["execution"] = dict(execution)
-        payload["updated_at"] = _now_iso()
-        _atomic_write_plan(_plan_path(plan_id), payload)
-
-
-def finalize_rename_plan_job(
-    plan_id: str,
-    *,
-    owner_digest: str,
-    expected_fingerprint: str,
-    queue_status: str,
-    error_code: str = "",
-) -> dict[str, Any]:
-    """把可信队列终态投影到旧 rename plan，且不覆盖已知终态。"""
-    safe_status = (queue_status or "").strip().casefold()
-    if safe_status not in _TERMINAL_PLAN_STATUSES:
-        raise GuangYaRenamePlanError("重命名任务终态无效")
-    with _plan_state_lock():
-        payload = _read_plan(plan_id)
-        if not hmac.compare_digest(
-            str(payload.get("owner_digest") or ""), (owner_digest or "")
-        ):
-            raise GuangYaRenamePlanError("重命名任务会话不匹配")
-        if not hmac.compare_digest(
-            str(payload.get("fingerprint") or ""), (expected_fingerprint or "")
-        ):
-            raise GuangYaRenamePlanStale("重命名计划已变化，请重新预览")
-        current_status = str(payload.get("status") or "").strip().casefold()
-        if current_status in _TERMINAL_PLAN_STATUSES:
-            return payload
-        if current_status not in {"confirmed", "running"}:
-            raise GuangYaRenamePlanStale("重命名计划状态已变化")
-        plan_status = (
-            "manual_review"
-            if current_status == "running" or safe_status == "manual_review"
-            else safe_status
-        )
-        execution = dict(payload.get("execution")) if isinstance(payload.get("execution"), dict) else {}
-        execution.update(
-            {
-                "queue_status": safe_status,
-                "queue_error_code": (error_code or "")[:80],
-                "finished_at": str(execution.get("finished_at") or _now_iso()),
-            }
-        )
-        payload["status"] = plan_status
-        payload["execution"] = execution
-        payload["updated_at"] = _now_iso()
-        _atomic_write_plan(_plan_path(plan_id), payload)
-        return payload
-
-
-def _discard_rename_plan_unlocked(plan_id: str) -> bool:
-    removed = False
-    for path in (_plan_path(plan_id), _journal_path(plan_id)):
-        try:
-            if path.is_file() and not path.is_symlink():
-                path.unlink()
-                removed = True
-        except OSError:
-            continue
-    return removed
-
-
-def discard_rename_plan(plan_id: str, *, preview_only: bool = False) -> bool:
-    """预览替换只能原子淘汰preview；已确认任务的执行凭据必须保留。"""
-    try:
-        with _plan_state_lock():
-            if preview_only:
-                payload = _read_plan(plan_id)
-                if str(payload.get("status") or "") != "preview":
-                    return False
-            return _discard_rename_plan_unlocked(plan_id)
-    except (OSError, GuangYaRenamePlanError):
-        return False
+class GuangYaNamingError(ValueError):
+    """名称编译或目录范围无效；尚未提交写操作。"""
 
 
 def _normalize_path(value: object) -> str:
     path = str(value or "").strip().replace("\\", "/")
     if not path.startswith("/") or len(path) > 2048:
-        raise GuangYaRenamePlanError("光鸭路径必须是绝对路径")
+        raise GuangYaNamingError("光鸭路径必须是绝对路径")
     parts = [part for part in path.split("/") if part]
     if not parts or any(part in {".", ".."} for part in parts):
-        raise GuangYaRenamePlanError("不能重命名光鸭根目录")
+        raise GuangYaNamingError("不能重命名光鸭根目录")
     if any(len(part) > _MAX_NAME_LENGTH for part in parts):
-        raise GuangYaRenamePlanError("光鸭路径组件过长")
+        raise GuangYaNamingError("光鸭路径组件过长")
     return "/" + "/".join(parts)
-
 
 def _validate_name(value: object) -> str:
     name = str(value or "")
     if not name or name != name.strip() or len(name) > _MAX_NAME_LENGTH:
-        raise GuangYaRenamePlanError("目标名称为空、过长或包含首尾空格")
+        raise GuangYaNamingError("目标名称为空、过长或包含首尾空格")
     if name in {".", ".."} or any(char in name for char in ("/", "\\", "\0")):
-        raise GuangYaRenamePlanError("目标名称包含不允许的字符")
+        raise GuangYaNamingError("目标名称包含不允许的字符")
     if any(ord(char) < 32 for char in name):
-        raise GuangYaRenamePlanError("目标名称包含控制字符")
+        raise GuangYaNamingError("目标名称包含控制字符")
     return name
-
 
 def remove_legacy_bitrate(name: str) -> str:
     """删除紧凑或旧式空格 Mbps 字段，不误伤 H.264/H.265。"""
@@ -382,16 +60,13 @@ def remove_legacy_bitrate(name: str) -> str:
     updated = _COMPACT_BITRATE_RE.sub("", updated)
     return updated
 
-
 def _extension(name: str) -> str:
     match = re.search(r"[.。．]([A-Za-z0-9]{1,10})$", (name or ""))
     return match.group(1).casefold() if match else ""
 
-
 def _item_extension(item: GuangYaFile) -> str:
     declared = (item.extension or "").strip().lstrip(".").casefold()
     return declared or _extension(item.name)
-
 
 def _transformed_name(
     item: GuangYaFile,
@@ -407,11 +82,10 @@ def _transformed_name(
             return item.name
         candidate = _validate_name(item.name.replace(find_text, replace_text))
     else:
-        raise GuangYaRenamePlanError("不支持的重命名方式")
+        raise GuangYaNamingError("不支持的重命名方式")
     if not item.is_dir and _extension(candidate) != _item_extension(item):
-        raise GuangYaRenamePlanError("批量重命名不允许修改文件扩展名")
+        raise GuangYaNamingError("批量重命名不允许修改文件扩展名")
     return candidate
-
 
 def _cached_list_dir(
     client: GuangYaClient,
@@ -422,34 +96,6 @@ def _cached_list_dir(
     if key not in cache:
         cache[key] = client.list_dir(key)
     return cache[key]
-
-
-def _resolve_path(
-    client: GuangYaClient,
-    path: str,
-    cache: dict[str, list[GuangYaFile]],
-) -> tuple[GuangYaFile, str]:
-    normalized = _normalize_path(path)
-    current: GuangYaFile | None = None
-    parent_id = "0"
-    parent_path = ""
-    for index, component in enumerate(normalized.strip("/").split("/")):
-        items = _cached_list_dir(client, cache, parent_id)
-        exact = [item for item in items if item.name == component]
-        matches = exact or [
-            item for item in items if item.name.casefold() == component.casefold()
-        ]
-        if len(matches) != 1:
-            raise GuangYaRenamePlanError(
-                f"路径不存在或名称不唯一：/{'/'.join(normalized.strip('/').split('/')[: index + 1])}"
-            )
-        current = matches[0]
-        if index < len(normalized.strip("/").split("/")) - 1 and not current.is_dir:
-            raise GuangYaRenamePlanError("光鸭路径的中间组件不是目录")
-        parent_path = "/" + "/".join(normalized.strip("/").split("/")[:index])
-        parent_id = current.file_id
-    assert current is not None
-    return current, parent_path or "/"
 
 
 def _entry(item: GuangYaFile, *, parent_path: str, new_name: str) -> dict[str, Any]:
@@ -474,136 +120,12 @@ def _entry(item: GuangYaFile, *, parent_path: str, new_name: str) -> dict[str, A
         "size": max(0, (item.size or 0)),
         "etag": (item.etag or ""),
         "extension": (item.extension or _extension(item.name)).casefold(),
+        "updated_at": max(0, item.updated_at or 0),
     }
-
-
-def _fingerprint(payload: dict[str, Any]) -> str:
-    selected = {
-        "version": _PLAN_VERSION,
-        "owner_digest": payload["owner_digest"],
-        "credential_generation": payload["credential_generation"],
-        "mode": payload["mode"],
-        "recursive": payload["recursive"],
-        "targets": payload["targets"],
-        "entries": payload["entries"],
-        "transform": payload.get("transform") or {},
-    }
-    return hashlib.sha256(
-        json.dumps(
-            selected,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-
-
-def maintain_rename_plans() -> dict[str, int]:
-    """主动清理过期/超额计划；快照检查与删除必须和确认串行。"""
-    directory = _plan_directory()
-    if not directory.exists() or directory.is_symlink():
-        return {"removed": 0, "remaining": 0, "active": 0, "bytes": 0}
-    with _plan_state_lock():
-        return _maintain_rename_plans_unlocked()
-
-
-def _maintain_rename_plans_unlocked() -> dict[str, int]:
-    """调用方已持有计划状态锁，禁止在内部重复取得非重入文件锁。"""
-    directory = _plan_directory()
-    if not directory.exists() or directory.is_symlink():
-        return {"removed": 0, "remaining": 0, "active": 0, "bytes": 0}
-    current = time.time()
-    removed = 0
-    terminal: list[tuple[float, str, int]] = []
-    total_bytes = 0
-    active = 0
-    plan_ids: set[str] = set()
-    for path in directory.glob("*.json"):
-        try:
-            if not path.is_file() or path.is_symlink():
-                continue
-            plan_ids.add(path.stem)
-            plan_size = max(0, path.stat().st_size)
-            journal = _journal_path(path.stem)
-            journal_size = (
-                max(0, journal.stat().st_size)
-                if journal.is_file() and not journal.is_symlink()
-                else 0
-            )
-            stored_size = plan_size + journal_size
-            try:
-                payload = _read_plan(path.stem)
-            except GuangYaRenamePlanError:
-                payload = {}
-            status = str(payload.get("status") or "").strip().casefold()
-            mode = str(payload.get("mode") or "").strip().casefold()
-            updated_epoch = max(
-                float(payload.get("created_at_epoch") or 0),
-                float(path.stat().st_mtime or 0),
-            )
-            remove = mode not in CANONICAL_RENAME_PLAN_MODES
-            if not remove and status == "preview":
-                remove = float(payload.get("expires_at_epoch") or 0) <= current
-            elif status == "confirmed":
-                remove = float(payload.get("execute_until_epoch") or 0) <= current
-            elif status == "manual_review":
-                remove = updated_epoch <= current - _MANUAL_REVIEW_RETENTION_SECONDS
-                if not remove:
-                    terminal.append((updated_epoch, path.stem, stored_size))
-            elif status in {"completed", "partial", "failed", "cancelled"}:
-                remove = updated_epoch <= current - _TERMINAL_RETENTION_SECONDS
-                if not remove:
-                    terminal.append((updated_epoch, path.stem, stored_size))
-            elif not status and updated_epoch <= current - _TERMINAL_RETENTION_SECONDS:
-                remove = True
-            if remove:
-                _discard_rename_plan_unlocked(path.stem)
-                plan_ids.discard(path.stem)
-                removed += 1
-            else:
-                total_bytes += stored_size
-                if status in {"preview", "confirmed", "running"}:
-                    active += 1
-        except OSError:
-            continue
-
-    for journal in directory.glob("*.jsonl"):
-        try:
-            if (
-                journal.is_file()
-                and not journal.is_symlink()
-                and journal.stem not in plan_ids
-            ):
-                journal.unlink()
-                removed += 1
-        except OSError:
-            continue
-
-    terminal.sort(key=lambda item: (item[0], item[1]))
-    while terminal and (
-        len(terminal) > _MAX_TERMINAL_PLANS or total_bytes > _MAX_PLAN_STORAGE_BYTES
-    ):
-        _updated, plan_id, stored_size = terminal.pop(0)
-        _discard_rename_plan_unlocked(plan_id)
-        total_bytes = max(0, total_bytes - stored_size)
-        removed += 1
-    remaining = sum(
-        1
-        for path in directory.glob("*.json")
-        if path.is_file() and not path.is_symlink()
-    )
-    return {
-        "removed": removed,
-        "remaining": remaining,
-        "active": active,
-        "bytes": total_bytes,
-    }
-
 
 def _finalize_rename_plan(
     client: GuangYaClient,
     *,
-    owner: str,
     mode: str,
     recursive: bool,
     targets: list[str],
@@ -662,8 +184,6 @@ def _finalize_rename_plan(
     extension_counts = Counter(
         entry["extension"] or "directory" for entry in safe_entries
     )
-    plan_id = uuid.uuid4().hex
-    current = time.time()
     stats = {
         "scanned_items": max(0, scanned_items),
         "scanned_dirs": max(0, scanned_dirs),
@@ -674,62 +194,20 @@ def _finalize_rename_plan(
     }
     for key, value in (extra_stats or {}).items():
         stats[key] = max(0, (value or 0))
-    safe_mode = (mode or "").strip().casefold()
-    if safe_mode not in CANONICAL_RENAME_PLAN_MODES:
-        raise GuangYaRenamePlanError("重命名计划类型无效")
-    payload: dict[str, Any] = {
-        "version": _PLAN_VERSION,
-        "plan_id": plan_id,
-        "owner_digest": _owner_digest(owner),
-        "created_at": _now_iso(),
-        "created_at_epoch": current,
-        "expires_at_epoch": current + _PLAN_TTL_SECONDS,
-        "status": "preview",
-        "credential_generation": client.credential_generation,
-        "mode": safe_mode,
-        "recursive": recursive,
-        "targets": list(targets),
-        "limit": max(1, min(limit, _MAX_RENAMES)),
-        "summary": summary,
-        "stats": stats,
-        "extension_counts": dict(sorted(extension_counts.items())),
-        "entries": sorted(
-            safe_entries,
-            key=lambda entry: (entry["old_path"].casefold(), entry["file_id"]),
-        ),
-        "conflicts": sorted(
-            conflicts,
-            key=lambda entry: (entry["old_path"].casefold(), entry["file_id"]),
-        ),
-        "samples": [
-            {"before": item["old_name"], "after": item["new_name"]}
-            for item in sorted(
-                safe_entries, key=lambda entry: entry["old_path"].casefold()
-            )[:5]
-        ],
-        "transform": dict(transform or {}),
-        "rollback": {
-            "available": bool(safe_entries),
-            "basis": "file_id,parent_id,old_name,new_name,size,etag",
-        },
-    }
-    payload["fingerprint"] = _fingerprint(payload)
-    with _plan_state_lock():
-        _atomic_write_plan(_plan_path(plan_id), payload)
-        capacity = _maintain_rename_plans_unlocked()
-        if (
-            (capacity.get("active") or 0) > _MAX_ACTIVE_PLANS
-            or (capacity.get("bytes") or 0) > _MAX_PLAN_STORAGE_BYTES
-        ):
-            _discard_rename_plan_unlocked(plan_id)
-            raise GuangYaRenamePlanError("私有重命名计划空间已满，请稍后重试")
-    return payload
+    entries = sorted(safe_entries, key=lambda entry: (entry["old_path"].casefold(), entry["file_id"]))
+    return {"status": "ready" if entries else "no_changes", "mode": mode, "targets": list(targets),
+            "recursive": recursive, "summary": summary, "stats": stats, "extension_counts": dict(sorted(extension_counts.items())),
+            "entries": entries, "conflicts": sorted(conflicts, key=lambda entry: (entry["old_path"].casefold(), entry["file_id"])),
+            "transform": dict(transform or {}),
+            "operations": [{"op": "rename", "file_id": item["file_id"], "new_name": item["new_name"],
+                            "expected": {"file_id": item["file_id"], "parent_id": item["parent_id"], "name": item["old_name"],
+                                         "is_dir": item["is_dir"], "size": item["size"], "etag": item["etag"], "updated_at": item["updated_at"]}}
+                           for item in entries]}
 
 
-def build_explicit_rename_plan(
+def preview_explicit_names(
     client: GuangYaClient,
     *,
-    owner: str,
     target: str,
     changes: list[tuple[GuangYaFile, str, str]],
     cache: dict[str, list[GuangYaFile]],
@@ -745,10 +223,10 @@ def build_explicit_rename_plan(
     normalized_target = _normalize_path(target)
     safe_mode = (mode or "").strip().casefold()
     if safe_mode != "media_hygiene":
-        raise GuangYaRenamePlanError("显式重命名计划类型无效")
+        raise GuangYaNamingError("显式重命名计划类型无效")
     safe_limit = max(1, min(limit, _MAX_RENAMES))
     if len(changes) > safe_limit:
-        raise GuangYaRenamePlanError(
+        raise GuangYaNamingError(
             f"匹配文件超过本次上限 {safe_limit} 个，请缩小范围或提高 limit"
         )
     raw_entries: list[dict[str, Any]] = []
@@ -756,17 +234,16 @@ def build_explicit_rename_plan(
     for item, parent_path, proposed_name in changes:
         file_id = (item.file_id or "").strip()
         if not file_id or file_id in seen_ids:
-            raise GuangYaRenamePlanError("显式重命名计划包含重复或无效对象")
+            raise GuangYaNamingError("显式重命名计划包含重复或无效对象")
         candidate = _validate_name(proposed_name)
         if not item.is_dir and _extension(candidate) != _item_extension(item):
-            raise GuangYaRenamePlanError("媒体名称清理不允许修改文件扩展名")
+            raise GuangYaNamingError("媒体名称清理不允许修改文件扩展名")
         if candidate == item.name:
             continue
         seen_ids.add(file_id)
         raw_entries.append(_entry(item, parent_path=parent_path, new_name=candidate))
     return _finalize_rename_plan(
         client,
-        owner=owner,
         mode=safe_mode,
         recursive=True,
         targets=[normalized_target],
@@ -780,31 +257,35 @@ def build_explicit_rename_plan(
         extra_stats=extra_stats,
     )
 
-
-def build_rename_plan(
+def preview_rename(
     client: GuangYaClient,
     *,
-    owner: str,
-    targets: list[str],
+    file_ids: list[str],
     mode: str,
     recursive: bool = False,
-    limit: int = 100,
+    limit: int = 10_000,
     find_text: str = "",
     replace_text: str = "",
 ) -> dict[str, Any]:
-    """扫描并冻结一个不含目标冲突的重命名计划。"""
-    normalized_targets = list(dict.fromkeys(_normalize_path(item) for item in targets))
-    if not normalized_targets or len(normalized_targets) > _MAX_TARGETS:
-        raise GuangYaRenamePlanError(f"一次只能指定 1 到 {_MAX_TARGETS} 个光鸭路径")
+    """按真实ID完整扫描并编译安全名称操作；不保存计划或执行写入。"""
+    from app.modules.guangya_workspace import file_location
+    if not isinstance(file_ids, list) or not file_ids or any(not isinstance(item, str) or not item or item == "0" for item in file_ids):
+        raise GuangYaNamingError("必须指定真实的非根文件或目录ID数组")
+    locations = [file_location(client, item) for item in dict.fromkeys(file_ids)]
+    if len(locations) > _MAX_TARGETS:
+        raise GuangYaNamingError(f"一次只能指定1到{_MAX_TARGETS}个范围")
+    if type(recursive) is not bool or type(limit) is not int or not 1 <= limit <= _MAX_RENAMES:
+        raise GuangYaNamingError("recursive或完整名称读取预算无效")
+    normalized_targets = [item["path"] for item in locations]
     safe_mode = (mode or "").strip().casefold()
     if safe_mode not in {"remove_bitrate", "replace_text"}:
-        raise GuangYaRenamePlanError("重命名方式无效")
+        raise GuangYaNamingError("重命名方式无效")
     safe_limit = max(1, min(limit, _MAX_RENAMES))
     if safe_mode == "replace_text":
         if not find_text or len(find_text) > 120 or len(replace_text) > 120:
-            raise GuangYaRenamePlanError("文本替换参数无效")
+            raise GuangYaNamingError("文本替换参数无效")
         if find_text == replace_text:
-            raise GuangYaRenamePlanError("替换前后文本相同")
+            raise GuangYaNamingError("替换前后文本相同")
 
     cache: dict[str, list[GuangYaFile]] = {}
     candidates: dict[str, dict[str, Any]] = {}
@@ -828,12 +309,13 @@ def build_rename_plan(
             _entry(item, parent_path=parent_path, new_name=candidate),
         )
         if len(candidates) > safe_limit:
-            raise GuangYaRenamePlanError(
+            raise GuangYaNamingError(
                 f"匹配文件超过本次上限 {safe_limit} 个，请缩小范围或提高 limit"
             )
 
-    for target in normalized_targets:
-        item, parent_path = _resolve_path(client, target, cache)
+    for location in locations:
+        target, parent_path = location["path"], location["parent_path"]
+        item = GuangYaFile(**{key: location[key] for key in GuangYaFile.__dataclass_fields__})
         if not item.is_dir:
             consider(item, parent_path)
             continue
@@ -846,12 +328,12 @@ def build_rename_plan(
             seen_dirs.add(directory_id)
             scanned_dirs += 1
             if scanned_dirs > _MAX_SCANNED_DIRS:
-                raise GuangYaRenamePlanError("递归目录数量超过安全上限")
+                raise GuangYaNamingError("递归目录数量超过安全上限")
             items = _cached_list_dir(client, cache, directory_id)
             for child in items:
                 scanned_items += 1
                 if scanned_items > _MAX_SCANNED_ITEMS:
-                    raise GuangYaRenamePlanError("扫描项目数量超过安全上限")
+                    raise GuangYaNamingError("扫描项目数量超过安全上限")
                 if child.is_dir:
                     if recursive:
                         queue.append(
@@ -865,7 +347,6 @@ def build_rename_plan(
 
     return _finalize_rename_plan(
         client,
-        owner=owner,
         mode=safe_mode,
         recursive=recursive,
         targets=normalized_targets,
@@ -880,240 +361,3 @@ def build_rename_plan(
             "replace_text": replace_text if safe_mode == "replace_text" else "",
         },
     )
-
-
-def _snapshot_matches(
-    item: GuangYaFile | None, entry: dict[str, Any], *, new: bool
-) -> bool:
-    expected_name = entry["new_name"] if new else entry["old_name"]
-    return bool(
-        item is not None
-        and item.file_id == str(entry["file_id"])
-        and item.name == expected_name
-        and item.is_dir == bool(entry["is_dir"])
-        and max(0, (item.size or 0)) == max(0, int(entry["size"] or 0))
-        and (item.etag or "") == str(entry.get("etag") or "")
-    )
-
-
-def execute_rename_plan(
-    payload: dict[str, Any],
-    *,
-    cancel_check: Callable[[], None] | None = None,
-    client_factory: Callable[[], GuangYaClient] = GuangYaClient,
-) -> dict[str, Any]:
-    """执行持久任务载荷；返回只含聚合计数的整理结果。"""
-    if not isinstance(payload, dict) or int(payload.get("version") or 0) != 1:
-        raise GuangYaRenamePlanError("重命名任务参数无效")
-    plan_id = str(payload.get("plan_id") or "")
-    expected_fingerprint = str(payload.get("plan_fingerprint") or "")
-    plan = load_rename_plan(
-        plan_id,
-        expected_fingerprint=expected_fingerprint,
-        require_confirmed=True,
-    )
-    if not hmac.compare_digest(
-        str(plan.get("owner_digest") or ""),
-        str(payload.get("owner_digest") or ""),
-    ):
-        raise GuangYaRenamePlanError("重命名任务会话不匹配")
-    raw_generation = payload.get("credential_generation")
-    expected_generation = int(raw_generation) if raw_generation is not None else -1
-    client = client_factory()
-    renamed = 0
-    failed = 0
-    provider_rejected = 0
-    verification_failed = 0
-    journal_started = False
-    started_at = _now_iso()
-    try:
-        if (
-            not client.logged_in
-            or client.credential_generation != expected_generation
-        ):
-            raise GuangYaRenamePlanStale("光鸭登录凭据已变化，请重新预览")
-        entries = list(plan.get("entries") or [])
-        if not entries:
-            raise GuangYaRenamePlanError("重命名计划没有可执行对象")
-        sync_enabled = str(plan.get("mode") or "") == "media_hygiene"
-        strm_sources = cloud_change_sources(client) if sync_enabled else None
-        changed: list[dict[str, Any]] = []
-        parent_snapshots: dict[str, dict[str, GuangYaFile]] = {}
-        for entry in entries:
-            if cancel_check is not None:
-                cancel_check()
-            parent_id = str(entry["parent_id"])
-            if parent_id not in parent_snapshots:
-                parent_snapshots[parent_id] = {
-                    item.file_id: item for item in client.list_dir(parent_id)
-                }
-            current = parent_snapshots[parent_id].get(str(entry["file_id"]))
-            if not _snapshot_matches(current, entry, new=False):
-                raise GuangYaRenamePlanStale("文件名称或内容已变化，请重新预览")
-            conflicts = [
-                item
-                for item in parent_snapshots[parent_id].values()
-                if item.name.casefold() == str(entry["new_name"]).casefold()
-                and item.file_id != str(entry["file_id"])
-            ]
-            if conflicts:
-                raise GuangYaRenamePlanStale("目标名称已被占用，请重新预览")
-
-        update_rename_plan_execution(
-            plan_id,
-            status="running",
-            execution={
-                "started_at": started_at,
-                "total": len(entries),
-                "renamed": 0,
-                "failed": 0,
-                "journal": _journal_path(plan_id).name,
-            },
-        )
-        _append_journal(
-            plan_id,
-            {"action": "preflight", "status": "completed", "total": len(entries)},
-        )
-        journal_started = True
-
-        precondition_failed = 0
-        for index, entry in enumerate(entries, start=1):
-            if cancel_check is not None:
-                cancel_check()
-            error_type = ""
-            provider_code = ""
-            # 大批量任务可能执行较久；每一项写入前再次核对源对象，避免
-            # 预检之后发生的内容或名称变化被后续重命名覆盖。
-            current_before = None
-            try:
-                current_before = client.file_info(str(entry["file_id"]))
-            except Exception:
-                current_before = None
-            if not _snapshot_matches(current_before, entry, new=False):
-                try:
-                    current_before = {
-                        item.file_id: item
-                        for item in client.list_dir(str(entry["parent_id"]))
-                    }.get(str(entry["file_id"]))
-                except Exception:
-                    current_before = None
-            if not _snapshot_matches(current_before, entry, new=False):
-                failed += 1
-                precondition_failed += 1
-                _append_journal(
-                    plan_id,
-                    {
-                        "action": "rename",
-                        "index": index,
-                        "file_id": str(entry["file_id"]),
-                        "parent_id": str(entry["parent_id"]),
-                        "old_name": str(entry["old_name"]),
-                        "new_name": str(entry["new_name"]),
-                        "status": "failed",
-                        "error_type": "PreWriteSnapshotChanged",
-                        "provider_code": "",
-                    },
-                )
-                continue
-            try:
-                client.rename(str(entry["file_id"]), str(entry["new_name"]))
-            except GuangYaWriteRejected as exc:
-                error_type = type(exc).__name__
-                provider_code = exc.code
-                provider_rejected += 1
-            except Exception as exc:
-                error_type = type(exc).__name__
-            # HTTP/SDK 结果不是成功凭据；始终按 file_id 重新读取真实名称。
-            current = None
-            try:
-                current = client.file_info(str(entry["file_id"]))
-            except Exception:
-                current = None
-            if not _snapshot_matches(current, entry, new=True):
-                try:
-                    current = {
-                        item.file_id: item
-                        for item in client.list_dir(str(entry["parent_id"]))
-                    }.get(str(entry["file_id"]))
-                except Exception:
-                    current = None
-            applied = _snapshot_matches(current, entry, new=True)
-            if applied:
-                renamed += 1
-                changed.append({"op": "rename", "source": entry,
-                                "source_path": entry["old_path"],
-                                "source_parent_path": str(Path(entry["old_path"]).parent),
-                                "new_name": entry["new_name"]})
-            else:
-                failed += 1
-                if not error_type:
-                    verification_failed += 1
-                    error_type = "PostWriteVerificationFailed"
-            _append_journal(
-                plan_id,
-                {
-                    "action": "rename",
-                    "index": index,
-                    "file_id": str(entry["file_id"]),
-                    "parent_id": str(entry["parent_id"]),
-                    "old_name": str(entry["old_name"]),
-                    "new_name": str(entry["new_name"]),
-                    "status": "completed" if applied else "failed",
-                    "error_type": error_type,
-                    "provider_code": provider_code,
-                },
-            )
-            time.sleep(0.12)
-
-        status = "completed" if failed == 0 else "partial"
-        execution = {
-            "started_at": started_at,
-            "finished_at": _now_iso(),
-            "total": len(entries),
-            "renamed": renamed,
-            "failed": failed,
-            "provider_rejected": provider_rejected,
-            "precondition_failed": precondition_failed,
-            "verification_failed": verification_failed,
-            "journal": _journal_path(plan_id).name,
-        }
-        update_rename_plan_execution(plan_id, status=status, execution=execution)
-        _append_journal(plan_id, {"action": "final", "status": status, **execution})
-        strm_stats = trigger_cloud_changes(changed, sources=strm_sources) if sync_enabled and changed else {}
-        return {
-            "partial": failed > 0 or bool(strm_stats.get("strm_trigger_failed")),
-            "stats": {"total": len(entries), "renamed": renamed,
-                      "rename_failed": failed, "failed": failed, **strm_stats},
-        }
-    except BaseException as exc:
-        if journal_started:
-            _append_journal(
-                plan_id,
-                {
-                    "action": "fatal",
-                    "status": "failed",
-                    "error_type": type(exc).__name__,
-                },
-            )
-        try:
-            update_rename_plan_execution(
-                plan_id,
-                status="failed",
-                execution={
-                    "started_at": started_at,
-                    "finished_at": _now_iso(),
-                    "renamed": renamed,
-                    "failed": failed,
-                    "error_type": type(exc).__name__,
-                    "journal": _journal_path(plan_id).name if journal_started else "",
-                },
-            )
-        except Exception:
-            pass
-        raise
-    finally:
-        client.close()
-        try:
-            maintain_rename_plans()
-        except Exception:
-            pass

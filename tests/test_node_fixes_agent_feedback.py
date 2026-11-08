@@ -15,7 +15,6 @@ from app.agent.kernel.adapters import TurnView, consume_events
 from app.agent.kernel.events import AgentEventType, EventFactory
 from app.agent.kernel.model import ModelEvent, ModelEventType
 from app.agent.kernel.state_types import AgentInput
-from app.agent.models import ToolResult
 from app.agent.public_view import format_public_result
 from app.bot.agent_adapter import _render_turn
 from tests import test_agent_kernel_browser as browser_tests
@@ -45,10 +44,12 @@ class AgentFailureProjectionTests(unittest.IsolatedAsyncioTestCase):
                 yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
         model = ReceiptModel()
         session, _, _ = _runtime(model)
-        with patch('app.agent.domains.resources.candidate_actions.prepare_submit_resource', return_value=(
-            ToolResult(True, 'confirmation_required', '确认下载'), 'snapshot')), patch(
-            'app.agent.domains.resources.candidate_actions.submit_resource_confirmed', return_value=ToolResult(
-                False, 'manual_review', FAILURE['summary'], data=FAILURE['data'], error=WARNING)) as execute:
+        from tests.support import _prepare_batch
+        with patch('app.indexers.downloads.preview_indexer_download_batch', side_effect=_prepare_batch), patch(
+            'app.indexers.downloads.submit_indexer_download_batch', return_value={
+                'ok': False, 'status': 'manual_review', 'summary': FAILURE['summary'], 'error': WARNING,
+                **FAILURE['data'], 'items': [{'result_id': 'green-lantern-4k-001', 'status': 'manual_review', 'target': 'guangya', 'error': WARNING}],
+            }) as execute:
             first = await _collect(session.run(AgentInput(message='搜索资源并推送到云盘',
                 owner='fixture-owner', session_id=SESSION_ID)))
             plan = next(e.payload['plan'] for e in first if e.type is AgentEventType.EFFECT_APPROVAL_REQUIRED)

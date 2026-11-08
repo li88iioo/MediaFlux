@@ -36,12 +36,50 @@ def _item(
 
 
 class ResourceRecommendationTests(unittest.TestCase):
+    def test_episode_quality_does_not_override_indexer_media_identity(self):
+        from app.indexers.models import IndexerItem, IndexerMediaSearchRequest
+        from app.indexers.ranking import rank_item
+
+        request = IndexerMediaSearchRequest.create(
+            title="目标剧", original_title="Target Show", media_type="tv", season=1, episode=2,
+        )
+        items = [
+            IndexerItem("nyaa", "Nyaa", "Target Show S01E02 720p", result_id="right-show-000001",
+                        download_state="ready", download_kinds=("magnet",), seeders=1),
+            IndexerItem("nyaa", "Nyaa", "其他作品 S01E02 2160p", result_id="wrong-show-000001",
+                        download_state="ready", download_kinds=("magnet",), seeders=1000),
+        ]
+        public = [rank_item(item, media=request, fallback_query=request.title).to_public_dict() for item in items]
+        ranked = rank_episode_search({"items": public}, season=1, episode=2)
+        self.assertEqual(ranked["recommendation"]["selected"]["result_id"], "right-show-000001")
+        self.assertEqual(ranked["recommendation"]["candidate_count"], 1)
+        self.assertFalse(ranked["items"][1]["quality"]["eligible"])
+
+    def test_checksum_cannot_make_a_different_episode_recommended(self):
+        item = _item("episode-12-with-checksum", "Show S04E12 [E5DA5D0E]")
+        for episode, expected in ((5, None), (12, item["result_id"])):
+            with self.subTest(episode=episode):
+                result = rank_episode_search({"items": [item]}, season=4, episode=episode)
+                selected = result["recommendation"]["selected"] or {}
+                self.assertEqual(selected.get("result_id"), expected)
+
+    def test_ranking_checks_every_supplied_candidate_before_selecting(self):
+        items = [_item(f"wrong-result-{index:04d}", "示例剧 S02E02 2160p") for index in range(50)]
+        items.append(_item("exact-result-last", "示例剧 S02E03 1080p"))
+        ranked = rank_episode_search({"items": items}, season=2, episode=3)
+        self.assertEqual(len(ranked["items"]), len(items))
+        self.assertEqual(ranked["recommendation"]["selected"]["result_id"], "exact-result-last")
+        self.assertEqual(ranked["download_plan"]["result_ids"], ["exact-result-last"])
+        self.assertNotIn("prepare_tool", ranked["download_plan"])
+        self.assertNotIn("候选序号", str(ranked["download_plan"]))
+        self.assertEqual(ranked["recommendation"]["candidate_count"], 1)
+        self.assertNotIn("quality", items[-1])
+
     def test_subscriptions_and_agent_use_one_business_ranking(self):
-        from app.agent.domains.library import episode_resource_actions
-        from app.modules import media_subscriptions
+        from app.modules import media_subscriptions, missing_resources
 
         self.assertIs(media_subscriptions.rank_episode_search, rank_episode_search)
-        self.assertIs(episode_resource_actions.rank_episode_search, rank_episode_search)
+        self.assertIs(missing_resources.rank_episode_search, rank_episode_search)
         self.assertEqual(rank_episode_search.__module__, "app.modules.episode_resource_ranking")
         root = Path(__file__).resolve().parents[1]
         self.assertFalse((root / "app/agent/domains/resources/recommendation.py").exists())
@@ -69,10 +107,14 @@ class ResourceRecommendationTests(unittest.TestCase):
 
             sys.meta_path.insert(0, NoAgentDomainImports())
             with patch("socket.socket.connect", side_effect=AssertionError("禁止真实外联")):
+                from app.indexers.ranking import filter_technical_candidates, technical_filter_arguments
                 from app.modules.episode_resource_ranking import rank_episode_search
                 from app.modules.media_preferences import effective_preferences
                 assert rank_episode_search({"items": []}, season=1, episode=1)["items"] == []
                 assert effective_preferences({"minimum_resolution": "bad"})["minimum_resolution"] == "any"
+                arguments = technical_filter_arguments({"resolution": "1080p", "dynamic_range": "SDR"})
+                items = [{"title": "Demo 1080p"}, {"title": "Demo 1080p SDR"}]
+                assert filter_technical_candidates(items, arguments)[0] == items[1:]
             assert not any(name == prefix or name.startswith(prefix + ".")
                            for name in sys.modules for prefix in blocked)
         ''')
@@ -172,6 +214,27 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertIn("站点未提供做种数", unknown_warnings)
         self.assertIn("当前做种数为 0", zero_warnings)
 
+    def test_matching_summary_counts_singles_and_packs_beyond_top_alternatives(self):
+        source = {"items": [
+            *[_item(f"single-candidate-{n}", "Show S01E01 1080p") for n in range(5)],
+            *[_item(f"range-candidate-{n}", "Show S01E01-E03 1080p") for n in range(3)],
+            _item("unavailable-single", "Show S01E01 1080p", state="unavailable"),
+            _item("unknown-candidate", "Show 1080p"),
+            _item("season-candidate", "Show S01 Complete 1080p"),
+            _item("conflict-candidate", "Show S01E02 1080p"),
+            _item("excluded-single", "Show S01E01 480p"),
+            _item("excluded-range", "Show S01E01-E03 480p"),
+        ]}
+        original = copy.deepcopy(source)
+        ranked = rank_episode_search(source, season=1, episode=1,
+                                     preferences={"minimum_resolution": "1080p"})
+        summary = ranked["recommendation"]
+        self.assertEqual(source, original)
+        self.assertEqual(summary["matched_counts"], {"exact_episode": 5, "episode_pack": 3})
+        self.assertEqual(summary["matched_count"], sum(summary["matched_counts"].values()))
+        self.assertTrue(all(item["match"] == "exact_episode"
+                            for item in [summary["selected"], *summary["alternatives"]]))
+
     def test_order_is_stable_when_input_order_changes(self):
         first = _item("beta-result-id-0001", "Beta S02E03 1080p WEB-DL", site_id="mikan")
         second = _item("alpha-result-id-001", "Alpha S02E03 1080p WEB-DL", site_id="nyaa")
@@ -197,6 +260,30 @@ class ResourceRecommendationTests(unittest.TestCase):
         later = rank_episode_search(source, season=2, episode=7, mapping_context={"detail": {"name": "理想禁区"}, "season_detail": {}})
         self.assertNotEqual(later["recommendation"]["status"], "recommended")
 
+    def test_known_title_range_still_requires_airing_and_file_evidence(self):
+        source = {"items": [_item("bare-range-result-001", "光阴之外46-47.2160p")]}
+        context = {
+            "as_of": "2026-11-08",
+            "detail": {"name": "光阴之外"},
+            "season_detail": {"season_number": 1, "episodes": [
+                {"episode_number": 46, "air_date": "2026-10-25"},
+                {"episode_number": 47, "air_date": "2026-11-01"},
+            ]},
+        }
+        unknown = rank_episode_search(source, season=1, episode=47)
+        self.assertEqual(unknown["recommendation"]["status"], "review_required")
+        proved = rank_episode_search(source, season=1, episode=47, mapping_context=context)
+        quality = proved["items"][0]["quality"]
+        self.assertEqual(quality["match"], "episode_pack")
+        self.assertTrue(quality["eligible"])
+        self.assertIn("未核验实际文件清单", " ".join(quality["warnings"]))
+        later = rank_episode_search(source, season=2, episode=47, mapping_context=context)
+        self.assertEqual(later["items"][0]["quality"]["match"], "unknown")
+        self.assertEqual(later["recommendation"]["status"], "review_required")
+        context["as_of"] = "2026-10-26"
+        future = rank_episode_search(source, season=1, episode=47, mapping_context=context)
+        self.assertFalse(future["items"][0]["quality"]["eligible"])
+
     def test_season_pack_requires_review_and_never_auto_submits(self):
         source = {"items": [
             _item("season-pack-id-0001", "示例剧 S02 Complete 1080p BluRay", state="resolvable", seeders=10)
@@ -207,6 +294,9 @@ class ResourceRecommendationTests(unittest.TestCase):
 
         self.assertEqual(source, original)
         self.assertEqual(ranked["recommendation"]["status"], "review_required")
+        self.assertEqual(ranked["recommendation"]["matched_count"], 0)
+        self.assertEqual(ranked["recommendation"]["basis"], "release_title_only")
+        self.assertFalse(ranked["recommendation"]["stream_verified"])
         self.assertIsNone(ranked["recommendation"]["selected"])
         self.assertEqual(ranked["recommendation"]["alternatives"], [])
         self.assertTrue(ranked["items"][0]["quality"]["eligible"], "仍允许用户明确选择合集，但不冒充已匹配推荐")
@@ -214,8 +304,30 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(ranked["download_plan"]["mode"], "read_only")
         self.assertFalse(ranked["download_plan"]["auto_submit"])
         self.assertTrue(ranked["download_plan"]["requires_confirmation"])
-        self.assertEqual(ranked["download_plan"]["prepare_tool"], "ingest.submit")
+        self.assertEqual(ranked["download_plan"]["result_ids"], [])
         self.assertNotIn("candidate_position", ranked["download_plan"])
+
+    def test_reranking_replaces_target_and_preference_evidence_without_mutating_search(self):
+        search = {"request": {"season": 1, "episode": 1}, "items": [
+            _item("first-episode-resource", "Show S01E01 2160p"),
+            _item("second-episode-resource", "Show S01E02 1080p"),
+            _item("unknown-episode-resource", "Show WEB-DL 1080p"),
+        ]}
+        original = copy.deepcopy(search)
+        first = rank_episode_search(search, season=1, episode=1,
+                                    preferences={"preferred_resolution": "2160p"})
+        before = copy.deepcopy(first)
+        second = rank_episode_search(first, season=1, episode=2)
+        self.assertEqual(first, before)
+        self.assertEqual(search, original)
+        self.assertTrue(any("preference_match" in item for item in first["items"]))
+        self.assertTrue(all("preference_match" not in item for item in second["items"]))
+        self.assertEqual(second["request"], original["request"])
+        self.assertEqual(second["recommendation"]["target"], {"season": 1, "episode": 2})
+        self.assertEqual(second["recommendation"]["candidate_count"], 2)
+        self.assertEqual(second["recommendation"]["matched_count"], 1)
+        self.assertEqual(second["recommendation"]["matched_counts"], {"exact_episode": 1, "episode_pack": 0})
+        self.assertEqual(second["recommendation"]["selected"]["result_id"], "second-episode-resource")
 
     def test_exact_episode_marker_wins_over_ambiguous_complete_tag(self):
         ranked = rank_episode_search({"items": [
@@ -375,6 +487,9 @@ class ResourceRecommendationTests(unittest.TestCase):
         ))
         self.assertEqual(empty["recommendation"]["status"], "empty")
         self.assertEqual(empty["recommendation"]["candidate_count"], 0)
+        for ranked in (unavailable, invalid_handle, empty):
+            self.assertEqual(ranked["download_plan"]["result_ids"], [])
+            self.assertEqual(ranked["recommendation"]["matched_counts"], {"exact_episode": 0, "episode_pack": 0})
 
     def test_quality_explanation_is_bounded_and_uses_verified_release_tags(self):
         ranked = rank_episode_search({"items": [

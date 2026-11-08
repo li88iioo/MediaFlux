@@ -1,26 +1,25 @@
 """Media Agent 功能状态摘要的投影、路由、安全与 API 契约。"""
 
 from __future__ import annotations
-from typing import Any
-from typing import cast
 
 import json
 from unittest.mock import patch
 
-from app.agent.domains.configuration.feature_actions import (
-    feature_summary_arguments,
-    summarize_feature_states,
-)
-from app.agent.errors import AgentToolError
-from tests.support import IsolatedDatabaseTestCase
+from app import sdk
+from app.modules.feature_config import features
+from tests.support import initialized_web_runtime
+import unittest
 
 
-class FeatureSummaryUnitTests(IsolatedDatabaseTestCase):
+class FeatureSummaryUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(initialized_web_runtime())
+
     def test_arguments_are_strictly_empty(self):
-        self.assertEqual(feature_summary_arguments({}), {})
-        for arguments in (None, {"feature": "discovery"}, {"debug": True}):
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                feature_summary_arguments(cast(dict[str, Any], arguments))
+        self.assertEqual(sdk.prepare_sdk_method("settings.features", {}, owner="feature-read"), {})
+        for arguments in ({"feature": "discovery"}, {"debug": True}):
+            with self.subTest(arguments=arguments), self.assertRaises(TypeError):
+                sdk.prepare_sdk_method("settings.features", arguments, owner="feature-read")
 
     def test_summary_projects_dependency_state_without_values(self):
         values = {
@@ -41,22 +40,22 @@ class FeatureSummaryUnitTests(IsolatedDatabaseTestCase):
             return default
 
         with (
-            patch("app.agent.domains.configuration.feature_actions.config.get_bool", side_effect=get_bool),
-            patch("app.agent.domains.configuration.feature_actions.config.get", side_effect=get_value),
+            patch("app.modules.feature_config.config.get_bool", side_effect=get_bool),
+            patch("app.modules.feature_config.config.get", side_effect=get_value),
             patch(
-                "app.agent.domains.configuration.feature_actions.config.has_external_override",
+                "app.modules.feature_config.config.has_external_override",
                 side_effect=lambda key: key == "DISCOVERY_DOUBAN_ENABLED",
             ),
         ):
-            result = summarize_feature_states({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "attention")
-        self.assertEqual(result.data["feature_count"], 11)
-        self.assertEqual(result.data["enabled_count"], 7)
-        self.assertEqual(result.data["available_count"], 4)
-        self.assertEqual(result.data["disabled_count"], 4)
-        self.assertEqual(result.data["attention_count"], 3)
-        by_feature = {item["feature"]: item for item in result.data["features"]}
+            result = features()
+        self.assertEqual({row["feature"] for row in result["features"]}, {"discovery", "douban", "resource_results", "indexer_search", "web_search", "web_read", "offline_magnet", "offline_ed2k", "offline_http", "strm_metadata", "download_verification_notify"})
+        self.assertEqual(result["status"], "attention")
+        self.assertEqual(result["feature_count"], 11)
+        self.assertEqual(result["enabled_count"], 7)
+        self.assertEqual(result["available_count"], 4)
+        self.assertEqual(result["disabled_count"], 4)
+        self.assertEqual(result["attention_count"], 3)
+        by_feature = {item["feature"]: item for item in result["features"]}
         self.assertEqual(by_feature["discovery"]["availability"], "disabled")
         self.assertEqual(by_feature["discovery"]["reason_codes"], ["feature_disabled"])
         self.assertEqual(by_feature["douban"]["availability"], "blocked")
@@ -71,7 +70,7 @@ class FeatureSummaryUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(
             by_feature["web_search"]["reason_codes"], ["provider_not_configured"]
         )
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+        serialized = json.dumps(result, ensure_ascii=False)
         for forbidden in (
             secret,
             "DISCOVERY_ENABLED",
@@ -95,27 +94,27 @@ class FeatureSummaryUnitTests(IsolatedDatabaseTestCase):
         }
         with (
             patch(
-                "app.agent.domains.configuration.feature_actions.config.get_bool",
+                "app.modules.feature_config.config.get_bool",
                 side_effect=lambda key, default=False: enabled.get(key, default),
             ),
-            patch("app.agent.domains.configuration.feature_actions.config.get", return_value=""),
+            patch("app.modules.feature_config.config.get", return_value=""),
             patch(
-                "app.agent.domains.configuration.feature_actions.config.has_external_override",
+                "app.modules.feature_config.config.has_external_override",
                 return_value=False,
             ),
         ):
-            result = summarize_feature_states({})
-        self.assertEqual(result.status, "ready")
-        self.assertEqual(result.data["available_count"], 8)
+            result = features()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["available_count"], 8)
         with (
-            patch("app.agent.domains.configuration.feature_actions.config.get_bool", return_value=False),
-            patch("app.agent.domains.configuration.feature_actions.config.get", return_value=""),
+            patch("app.modules.feature_config.config.get_bool", return_value=False),
+            patch("app.modules.feature_config.config.get", return_value=""),
             patch(
-                "app.agent.domains.configuration.feature_actions.config.has_external_override",
+                "app.modules.feature_config.config.has_external_override",
                 return_value=False,
             ),
         ):
-            disabled = summarize_feature_states({})
-        self.assertEqual(disabled.status, "disabled")
-        self.assertEqual(disabled.data["available_count"], 0)
-        self.assertEqual(disabled.data["disabled_count"], 11)
+            disabled = features()
+        self.assertEqual(disabled["status"], "disabled")
+        self.assertEqual(disabled["available_count"], 0)
+        self.assertEqual(disabled["disabled_count"], 11)

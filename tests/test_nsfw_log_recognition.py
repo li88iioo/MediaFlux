@@ -336,27 +336,46 @@ def test_unidentified_and_ordinary_logs_keep_source_rules(log_case, provider, so
         tmdb.assert_called_once()
 
 
-def test_execution_uses_same_effective_rules_and_persists_nsfw(log_case):
+@pytest.mark.parametrize('filename,number', [
+    ('SODAH-003.mp4', 'SODAH-003'),
+    ('4k688.com@T38-073.mp4', 'T38-073'),
+    ('hhd800.com@SPSE-91.mp4', 'SPSE-91'),
+    ('hhd800.com@C-2962.mp4', 'C-2962'),
+    ('091926-001-carib.mp4', 'CARIB-091926-001'),
+])
+def test_execution_uses_same_effective_rules_and_persists_nsfw(log_case, filename, number):
     service, _ = log_case
-    log_id = make_log()
+    log_id = make_log() if number == 'SODAH-003' else make_log(
+        '', 'adult-source', name=filename, status='skipped',
+    )
     remote = {
-        'video': GuangYaFile('video', 'SODAH-003.mp4', False, 100, 'etag', 'existing'),
+        'video': GuangYaFile('video', filename, False, 100, 'etag', 'existing'),
         'category': GuangYaFile('category', 'NSFW', True, parent_id='archive'),
-        'media': GuangYaFile('media', 'SODAH-003', True, parent_id='category'),
+        'media': GuangYaFile('media', number, True, parent_id='category'),
     }
     service.client.file_info.side_effect = remote.get
     service.client.list_dir.side_effect = lambda parent: [item for item in remote.values() if item.parent_id == parent]
     service.client.move.side_effect = lambda ids, parent: setattr(remote[ids[0]], 'parent_id', parent)
     service.client.rename.side_effect = lambda file_id, name: setattr(remote[file_id], 'name', name)
-    preview = service.preview_reorganize(log_id, '', 'movie', provider='clean_title', external_id='SODAH-003')
+    recognizer = MagicMock()
+    recognizer.candidates.return_value = []
+    with patch.object(service.organizer, '_nsfw_recognizer_lease', return_value=nullcontext(recognizer)):
+        candidates = service.search_candidates(log_id, filename)
+    assert len(candidates) == 1
+    assert (candidates[0]['provider'], candidates[0]['external_id']) == ('clean_title', number)
+    preview = service.preview_reorganize(log_id, '', 'movie', provider='clean_title', external_id=number)
+    assert preview['target_path'] == 'NSFW/' + number
+    service.client.move.assert_not_called()
+    service.client.rename.assert_not_called()
     with patch.object(service, '_notify_reorganize_result', return_value=[]):
         result = service._execute_reorganize(log_id, 'nsfw-log-reorganize', preview['version'], preview)
     assert result['success'] is True
     assert remote['video'].parent_id == 'media'
+    assert remote['video'].name == preview['file_name']
     get_organize_log_result = db.get_organize_log(log_id)
     assert get_organize_log_result is not None
     saved = dict(get_organize_log_result)
-    assert (saved['provider'], saved['external_id']) == ('clean_title', 'SODAH-003')
+    assert (saved['status'], saved['provider'], saved['external_id']) == ('success', 'clean_title', number)
     assert service.detail(log_id)['recognition']['nsfw_only'] is True
 
 

@@ -16,7 +16,6 @@ from app.modules.local_media_candidates import (
     candidate_payload,
     discover_local_media_directory_candidates,
 )
-from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
 from app.repositories.local_media import can_clear_local_media_task
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_media_recognition_summary import (
@@ -33,11 +32,8 @@ from app.modules.local_path_mapping import (
     LEGACY_SOURCE_PATH_ERROR,
     PathMappingError,
     assert_within,
-    is_windows_or_unc_path,
-    validate_source_target_roots,
 )
 from app.modules.local_storage import LocalStorageError
-from app.modules.media_server_path_mapping import MediaServerPathMapping
 from app.modules.media_server_profiles import list_configured_profiles
 from app.web import api_error, require_api_login
 
@@ -97,21 +93,6 @@ def _optional_integer(
     if not minimum <= number <= maximum:
         raise ValueError(f"{label}必须是 {minimum}-{maximum} 的整数")
     return number
-
-
-def _source_payload(source, targets) -> dict:
-    return {
-        "id": source.id, "name": source.name, "qb_profile": source.qb_profile,
-        "qb_path_prefix": source.qb_path_prefix, "local_root": source.local_root,
-        "enabled": source.enabled,
-        "media_type": source.media_type, "mode": source.mode,
-        "targets": [
-            {"id": item.id, "category": item.category, "path": item.path,
-             "provider": item.provider, "library_id": item.library_id,
-             "library_name": item.library_name, "server_path": item.server_path}
-            for item in targets
-        ],
-    }
 
 
 def _candidate_payloads(source, candidates, *, organize_ready: bool, error: str, allow_nested: bool = False):
@@ -230,76 +211,6 @@ def _safe_error(exc: Exception) -> JSONResponse:
     return api_error("本地媒体请求失败", 500)
 
 
-def _validated_targets(payload: dict) -> list[dict[str, str]] | None:
-    if "targets" not in payload or payload.get("targets") is None:
-        return None
-    targets = payload["targets"]
-    if not isinstance(targets, list) or len(targets) > len(LOCAL_MEDIA_CATEGORIES):
-        raise ValueError("targets 必须是分类目标数组")
-    normalized: list[dict[str, str]] = []
-    submitted: set[str] = set()
-    for item in targets:
-        if not isinstance(item, dict):
-            raise ValueError("目标配置格式错误")
-        category = _text(item, "category", required=True, max_length=32).lower()
-        if category not in LOCAL_MEDIA_CATEGORIES or category in submitted:
-            raise ValueError("目标分类无效或重复")
-        submitted.add(category)
-        path = _text(item, "path", required=True)
-        provider = _text(item, "provider", max_length=32).lower()
-        library_id = _text(item, "library_id", max_length=256)
-        library_name = _text(item, "library_name", max_length=128)
-        server_path = _text(item, "server_path", max_length=2048)
-        if provider not in {"", "jellyfin", "emby"}:
-            raise ValueError("目标媒体服务器类型无效")
-        if provider and not library_name:
-            raise ValueError("媒体服务器和媒体库名称必须同时选择")
-        if not provider and (library_id or library_name or server_path):
-            raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
-        if server_path:
-            server_path = MediaServerPathMapping(path, server_path).server_prefix
-        normalized.append({
-            "category": category,
-            "path": path,
-            "provider": provider,
-            "library_id": library_id,
-            "library_name": library_name,
-            "server_path": server_path,
-        })
-    return normalized
-
-
-def _validated_container_directory(value: str, label: str) -> Path:
-    raw = (value or "").strip()
-    if is_windows_or_unc_path(raw):
-        raise ValueError(
-            f"{label}必须填写 Docker 容器内路径；请先把宿主机或 NAS 目录挂载到容器，"
-            "再填写例如 /media/downloads 的路径"
-        )
-    directory = Path(raw).expanduser()
-    try:
-        if not directory.is_absolute() or not directory.exists() or not directory.is_dir():
-            raise ValueError(f"{label}必须是容器内已存在的绝对目录: {raw}")
-        return assert_within(directory, directory)
-    except OSError as exc:
-        raise ValueError(f"{label}无法访问，请检查 Docker 卷挂载与容器目录权限") from exc
-
-
-def _validate_source_paths(
-    local_root: str,
-    targets: list[dict[str, str]],
-) -> tuple[str, list[dict[str, str]]]:
-    source = _validated_container_directory(local_root, "来源目录")
-    target_paths: list[Path] = []
-    normalized_targets: list[dict[str, str]] = []
-    for item in targets:
-        target = _validated_container_directory(item["path"], "媒体库目标")
-        target_paths.append(target)
-        normalized_targets.append({**item, "path": str(target)})
-    validate_source_target_roots(source, target_paths)
-    return str(source), normalized_targets
-
-
 @router.get("/directories")
 def list_directories(
     request: Request,
@@ -363,37 +274,16 @@ def list_media_server_libraries(provider: str, request: Request):
 @router.get("/sources")
 def list_sources(request: Request):
     require_api_login(request)
-    targets_by_source: dict[int, list] = {}
-    for target in db.list_local_library_targets(owner=_OWNER):
-        targets_by_source.setdefault(target.source_id, []).append(target)
-    return {"sources": [
-        _source_payload(source, targets_by_source.get(source.id, []))
-        for source in db.list_local_media_sources(owner=_OWNER)
-    ]}
+    from app.modules.local_media_service import local_sources
+    return {"sources": local_sources()}
 
 
 @router.post("/sources")
 def create_source(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
-    payload = data or {}
+    from app.modules.local_media_service import save_local_source_config
     try:
-        targets = _validated_targets(payload) or []
-        local_root = _text(payload, "local_root", required=True)
-        local_root, targets = _validate_source_paths(local_root, targets)
-        source_id = db.save_local_media_source_bundle(
-            name=_text(payload, "name", required=True, max_length=128),
-            qb_profile=_text(payload, "qb_profile", max_length=64) or "configured:qb",
-            qb_path_prefix=_text(payload, "qb_path_prefix"),
-            local_root=local_root,
-            enabled=_boolean(payload, "enabled", True),
-            owner=_OWNER, media_type=_text(payload, "media_type", max_length=16) or "auto",
-            mode=_text(payload, "mode", max_length=16) or "move", targets=targets,
-        )
-        get_local_media_scheduler().reload()
-        return _source_payload(
-            db.get_local_media_source(source_id, owner=_OWNER),
-            db.list_local_library_targets(source_id, owner=_OWNER),
-        )
+        return save_local_source_config(data or {})["source"]
     except Exception as exc:
         return _safe_error(exc)
 
@@ -401,40 +291,11 @@ def create_source(request: Request, data: dict | None = Body(default=None)):
 @router.put("/sources/{source_id}")
 def update_source(source_id: int, request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
-    payload = data or {}
+    from app.modules.local_media_service import save_local_source_config
+    if db.get_local_media_source(source_id, owner=_OWNER) is None:
+        return api_error("本地媒体来源不存在", 404)
     try:
-        source = db.get_local_media_source(source_id, owner=_OWNER)
-        if source is None:
-            return api_error("本地媒体来源不存在", 404)
-        targets = _validated_targets(payload)
-        existing_targets = [
-            {"category": item.category, "path": item.path, "provider": item.provider,
-             "library_id": item.library_id, "library_name": item.library_name,
-             "server_path": item.server_path}
-            for item in db.list_local_library_targets(source_id, owner=_OWNER)
-        ]
-        effective_targets = targets if targets is not None else existing_targets
-        local_root = _text(payload, "local_root", required=True) if "local_root" in payload else source.local_root
-        local_root, effective_targets = _validate_source_paths(local_root, effective_targets)
-        db.save_local_media_source_bundle(
-            source_id=source_id, owner=_OWNER,
-            name=_text(payload, "name", required=True, max_length=128) if "name" in payload else source.name,
-            qb_profile=_text(payload, "qb_profile", max_length=64) if "qb_profile" in payload else source.qb_profile,
-            qb_path_prefix=_text(payload, "qb_path_prefix") if "qb_path_prefix" in payload else source.qb_path_prefix,
-            local_root=local_root,
-            # 旧 schema 列保留兼容，但废弃凭据必须在编辑时清空。
-            smb_user="",
-            smb_pass="",
-            enabled=_boolean(payload, "enabled", source.enabled) if "enabled" in payload else source.enabled,
-            media_type=_text(payload, "media_type", max_length=16) if "media_type" in payload else source.media_type,
-            mode=_text(payload, "mode", max_length=16) if "mode" in payload else source.mode,
-            targets=effective_targets,
-        )
-        get_local_media_scheduler().reload()
-        return _source_payload(
-            db.get_local_media_source(source_id, owner=_OWNER),
-            db.list_local_library_targets(source_id, owner=_OWNER),
-        )
+        return save_local_source_config(data or {}, source_id)["source"]
     except Exception as exc:
         return _safe_error(exc)
 
@@ -442,11 +303,11 @@ def update_source(source_id: int, request: Request, data: dict | None = Body(def
 @router.delete("/sources/{source_id}")
 def delete_source(source_id: int, request: Request):
     require_api_login(request)
+    from app.modules.local_media_service import delete_local_source_config
     try:
-        if not db.delete_local_media_source(source_id, owner=_OWNER):
+        if db.get_local_media_source(source_id, owner=_OWNER) is None:
             return api_error("本地媒体来源不存在", 404)
-        get_local_media_scheduler().reload()
-        return {"deleted": True}
+        return {"deleted": delete_local_source_config(source_id)["deleted"]}
     except Exception as exc:
         return _safe_error(exc)
 

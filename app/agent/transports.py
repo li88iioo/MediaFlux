@@ -45,6 +45,7 @@ class QueryEnvelope:
     selection: Mapping[str, Any] | None = None
     delivery_route: Mapping[str, Any] = field(default_factory=dict)
     initial_read_tool: str = ""
+    initial_read_arguments: Mapping[str, Any] = field(default_factory=dict)
 
     def to_agent_input(self) -> AgentInput:
         owner = _owner(self.owner)
@@ -66,6 +67,7 @@ class QueryEnvelope:
                 reply_context=dict(self.reply_context),
                 metadata=metadata,
                 initial_read_tool=self.initial_read_tool,
+                initial_read_arguments=dict(self.initial_read_arguments),
                 delivery_route=normalize_delivery_route(
                     self.delivery_route, channel=channel, owner=owner,
                 ),

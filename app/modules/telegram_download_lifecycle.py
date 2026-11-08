@@ -29,7 +29,7 @@ from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
 )
-from app.notifier import NotificationEvent, safe_int
+from app.notifier import NotificationEvent, notification_target_chat_id, safe_int
 from app.repositories.download_requests import download_postprocess_issues
 from app.repositories.download_requests import (
     download_display_title,
@@ -379,6 +379,7 @@ def publish_download_lifecycle(
     stats: Mapping[str, Any] | None = None,
     media_refresh: str = "",
     deliver_now: bool = True,
+    expected_chat_id: str | None = None,
 ) -> NotificationPublishResult:
     thread_key = f"download:{request_id}"
     result = NotificationPublishResult(False, status="invalid")
@@ -386,14 +387,17 @@ def publish_download_lifecycle(
         row = db.get_download_request(request_id)
         if row is None:
             return NotificationPublishResult(False, status="missing_request")
-        chat_id = _chat_id(row)
+        chat_id = notification_target_chat_id(_chat_id(row))
+        if expected_chat_id is not None and chat_id != expected_chat_id:
+            return NotificationPublishResult(False, status="InvalidRoute")
         snapshot = get_notification_thread_snapshot(
             thread_key, topic=NotificationTopic.DOWNLOAD, chat_id=chat_id,
         )
         verification_status = ""
         verification_result = ""
         verification = db.get_agent_download_verification(request_id)
-        if verification is not None:
+        if verification is not None and verification["chat_id"] == chat_id:
+            # 复用旧请求的复核不能进入另一会话的下载消息；原请求路由不变。
             # 旧通知载荷、STRM 回调和 tracker 重试都不能覆盖当前复核代际。
             verification_status = _status(verification["status"])
             verification_result = (

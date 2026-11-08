@@ -131,14 +131,23 @@ docker compose up -d
 
 需要 bridge 端口映射、固定非 root UID/GID 或迁移备份时，请参阅 [部署指南](docs/部署指南.md)。开发环境在源码仓库中使用独立的 `docker-compose.dev.yml` 与 `.env.development`。
 
+单个 MediaFlux 容器同时承载服务与 Agent 工作区。保留 Compose 中的 `security_opt`，让 MF 的 Python 子进程启动 Bubblewrap；内层工作区继续使用独立 namespace、清空 capabilities 并加载 seccomp。容器入口保持 `python mediaflux.py start`，具体运行条件见[部署指南](docs/部署指南.md#5-权限说明)。
+
 ---
 
 ### 方式二：Python 源码直接运行
 
+Agent 源码运行适用于允许非特权 user namespace 的 Linux，依赖系统 `bubblewrap` 与 `libseccomp2`，与 Docker 共用同一隔离执行器。日常开发直接使用 `python mediaflux.py start`；可用 `python tools/agent_doctor.py --json` 实际检查 Bubblewrap、seccomp 与当前身份的 namespace 创建能力。
+
+Ubuntu 源码环境若提示缺少 Bubblewrap 的 AppArmor profile，可先安装系统 `bubblewrap` 包，使用发行版随包提供的策略。执行器按需只读挂载现有解释器、标准库、共享库和常用命令。
+
 1. **环境准备与依赖安装**（要求 Python 3.13+）：
    ```bash
+   # Debian / Ubuntu 系统依赖
+   sudo apt-get update
+   sudo apt-get install -y bubblewrap libseccomp2
    python3 -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 

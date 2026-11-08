@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.clients.guangya import GuangYaFile
-from app.modules.naming import build_context, render_template
+from app.modules.naming import MOVIE_DEFAULT, TV_DEFAULT, build_context, render_media_template, render_template
 from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules.scraper import MatchResult
 from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin, release_parse_result
@@ -117,6 +117,45 @@ class MovieFolderNamingTests(unittest.TestCase):
         )
         self.assertEqual(render_template("${tmdbTag}", context), "{tmdb-1}")
 
+        for year, media_info, movie_name, tv_name in (
+            ("2025", "1080p.H.265.AAC.2.0",
+             "T38-073.2025.1080p.H.265.AAC.2.0.mp4",
+             "T38-073.2025.S01E03-1080p.H.265.AAC.2.0.mp4"),
+            ("2025", "", "T38-073.2025.mp4", "T38-073.2025.S01E03.mp4"),
+            ("", "1080p.H.265.AAC.2.0",
+             "T38-073.1080p.H.265.AAC.2.0.mp4",
+             "T38-073.S01E03-1080p.H.265.AAC.2.0.mp4"),
+            ("", "", "T38-073.mp4", "T38-073.S01E03.mp4"),
+        ):
+            with self.subTest(year=year, media_info=media_info):
+                context = build_context(
+                    title="T38-073", year=year, media_info=media_info,
+                    season=1, episode=3, ext="mp4",
+                )
+                self.assertEqual(render_media_template(MOVIE_DEFAULT, context), movie_name)
+                self.assertEqual(render_media_template(TV_DEFAULT, context), tv_name)
+
+    def test_optional_year_suffix_preserves_title_and_custom_template_dots(self):
+        for year, default_name in (("", "A..B.mp4"), ("2025", "A..B.2025.mp4")):
+            with self.subTest(year=year):
+                context = build_context(title="A..B", year=year, ext="mp4")
+                self.assertEqual(render_media_template(MOVIE_DEFAULT, context), default_name)
+                for token in ("${yearDotSuffix}", "{year_dot_suffix}"):
+                    with self.subTest(token=token):
+                        self.assertEqual(
+                            render_media_template("${showTitle}" + token + ".${ext}", context),
+                            default_name,
+                        )
+                self.assertEqual(
+                    render_media_template("${showTitle}..${ext}", context), "A..B..mp4",
+                )
+                self.assertEqual(
+                    render_media_template(
+                        "${showTitle}.${showYear}${mediaInfoDotSuffix}.${ext}", context,
+                    ),
+                    "A..B..mp4" if not year else "A..B.2025.mp4",
+                )
+
     def test_filename_media_info_fallback_keeps_explicit_high_bit_depth(self):
         self.assertEqual(
             Organizer._extract_media_info(
@@ -139,7 +178,7 @@ class MovieFolderNamingTests(unittest.TestCase):
         rules = OrganizeRules(
             rename_enabled=True,
             movie_dir_template="${showTitle} (${showYear}) ${tmdbTag}",
-            movie_template="${showTitle}.${showYear}${mediaInfoDotSuffix}.${ext}",
+            movie_template=MOVIE_DEFAULT,
             media_info_enabled=True,
             naming_scope="guangya",
             region_split=False,
@@ -199,7 +238,7 @@ class MovieFolderNamingTests(unittest.TestCase):
             rename_enabled=True,
             media_info_enabled=True,
             movie_dir_template="${showTitle} (${showYear}) ${tmdbTag}",
-            movie_template="${showTitle}.${showYear}${mediaInfoDotSuffix}.${ext}",
+            movie_template=MOVIE_DEFAULT,
             naming_scope="guangya",
             region_split=False,
             year_split=False,
@@ -317,6 +356,25 @@ class MediaProbeTests(unittest.TestCase):
         self.assertEqual(profile.bit_depth, "10-bit")
         self.assertEqual(profile.video_codec, "H.265")
         self.assertEqual(profile.render(), "Remux.2160p.DoVi.H.265.10-bit")
+
+    def test_filename_dynamic_range_uses_tag_boundaries(self):
+        from app.modules.media_probe import infer_dynamic_ranges, infer_media_profile
+
+        cases = {
+            "Movie.[HDR].mkv": ("HDR",),
+            "Movie.(HLG).mkv": ("HLG",),
+            "Movie［SDR］.mkv": ("SDR",),
+            "Movie.[DV][HDR10+].mkv": ("DoVi", "HDR10+"),
+            "Movie.Dolby-Vision.HDR10Plus.mkv": ("DoVi", "HDR10+"),
+            "Movie.DoVi.HDR10.mkv": ("DoVi", "HDR10"),
+            "Movie[SDR][HDR].mkv": ("HDR", "SDR"),
+            "Movie.SDRip.DVDRip.HDRip.mkv": (),
+            "Adoville.hdr100.sdrama.mkv": (),
+        }
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(infer_dynamic_ranges(filename), expected)
+                self.assertEqual(infer_media_profile(filename).dynamic_range, expected[0] if expected else "")
 
     def test_ffprobe_payload_detects_explicit_dolby_vision_and_atmos(self):
         from app.modules.media_probe import parse_ffprobe_payload

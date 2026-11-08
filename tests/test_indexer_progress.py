@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
+import textwrap
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
@@ -20,7 +24,7 @@ from app.indexers.models import (
 from app.indexers.providers.base import DirectResultAdapter, report_page
 from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
-from app.indexers.service import IndexerService
+from app.indexers.service import IndexerService, search_payload
 from app.routes import indexers_api
 from tests import test_indexer_api
 
@@ -65,6 +69,55 @@ def service_for(source):
 
 
 class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
+    def test_search_payload_runs_without_web_or_agent_runtime(self):
+        script = textwrap.dedent('''
+            import json
+            import sys
+            import tests
+            from types import SimpleNamespace
+            from unittest.mock import patch
+
+            blocked = ("app.routes", "fastapi", "app.agent.domains", "app.agent.kernel")
+            with patch.dict(sys.modules, dict.fromkeys(blocked)), patch(
+                "socket.socket.connect", side_effect=AssertionError("禁止真实外联"),
+            ):
+                from app.indexers.models import (
+                    AggregatedIndexerResult, IndexerCapabilities, IndexerItem,
+                    IndexerProviderError, IndexerSitePageState,
+                )
+                from app.indexers.registry import IndexerRegistry
+                from app.indexers.service import search_payload
+
+                adapter = SimpleNamespace(site_id="nyaa", site_name="Nyaa", default_enabled=True,
+                                          capabilities=IndexerCapabilities(True))
+                service = SimpleNamespace(registry=IndexerRegistry({"nyaa": adapter}))
+                result = AggregatedIndexerResult(
+                    query="SDK", page=2,
+                    items=[IndexerItem(site_id="nyaa", site_name="Nyaa", title="SDK S01E02")],
+                    sites_attempted=("nyaa",), sites_succeeded=("nyaa",),
+                    errors=[IndexerProviderError("nyaa", "timeout", "private-sdk-diagnostic")],
+                    site_page_states={"nyaa": IndexerSitePageState(True, 2, True, 3)},
+                    partial=True, complete=False, has_more=True,
+                )
+                print(json.dumps(search_payload(service, result)))
+                assert not any(module is not None and (name == prefix or name.startswith(prefix + "."))
+                               for name, module in sys.modules.items() for prefix in blocked)
+        ''')
+        completed = subprocess.run(
+            [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertTrue(payload["partial"])
+        self.assertFalse(payload["complete"])
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(payload["site_statuses"][0]["next_page"], 3)
+        self.assertEqual(payload["items"][0]["episode"], 2)
+        self.assertEqual(len(payload["items"][0]["resource_key"]), 64)
+        self.assertEqual(payload["errors"][0]["message"], "站点响应超时，请稍后重试")
+        self.assertNotIn("private-sdk-diagnostic", completed.stdout)
+
     async def test_finished_but_limited_search_is_partial_not_down_or_still_running(self):
         from app.modules.telegram_resource_search import _search_snapshot
         for found in (True, False):
@@ -79,7 +132,7 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(result.partial)
                     self.assertEqual(result.sites_succeeded, ("btbtla",))
                     self.assertEqual([error.code for error in result.errors], ["coverage_limited"])
-                    web = indexers_api._search_payload(service, result)
+                    web = search_payload(service, result)
                     telegram = _search_snapshot(service, result)
                     for status in (web["site_statuses"][0], telegram["sites"][0]):
                         self.assertEqual(status["status"], "partial")
@@ -89,7 +142,7 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(web["errors"][0]["code"], "coverage_limited")
                     # 范围提醒不能覆盖同站真实故障，无论两类信息的到达顺序。
                     result.errors.insert(0, IndexerProviderError("btbtla", "timeout", "fixture timeout"))
-                    web = indexers_api._search_payload(service, result)
+                    web = search_payload(service, result)
                     telegram = _search_snapshot(service, result)
                     self.assertEqual(web["site_statuses"][0]["code"], "timeout")
                     self.assertEqual(telegram["sites"][0]["message"], "响应超时")
@@ -204,7 +257,7 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_success_is_not_a_combined_outage(self):
         service = service_for(ProgressiveSource(failure=True))
         result = await service.search("Demo")
-        payload = indexers_api._search_payload(service, result)
+        payload = search_payload(service, result)
         self.assertTrue(payload["partial"])
         status = payload["site_statuses"][0]
         self.assertEqual(status["status"], "success")
@@ -224,7 +277,7 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
         result.site_item_counts = {"btbtla": 0}
         result.sites_succeeded = ()
         result.source_statuses["btbtla"] = (IndexerSourceStatus("aipan", "爱盼", "searching"),)
-        payload = indexers_api._search_payload(SimpleNamespace(registry=registry), result)
+        payload = search_payload(SimpleNamespace(registry=registry), result)
         active = [row for row in payload["site_statuses"] if row["status"] != "disabled"]
         self.assertEqual([row["site_id"] for row in active], ["btbtla"])
         self.assertEqual(active[0]["status"], "searching")
@@ -235,7 +288,7 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
         from app.modules.telegram_resource_search import _search_snapshot
         service = service_for(ProgressiveSource(failure=True))
         result = await service.search("Demo")
-        web = indexers_api._search_payload(service, result)
+        web = search_payload(service, result)
         telegram = _search_snapshot(service, result)
         self.assertEqual(web["site_statuses"][0]["status"], "success")
         self.assertEqual(telegram["sites"][0]["status"], "success")
@@ -260,7 +313,7 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
         rows = result.source_statuses["btbtla"]
         self.assertEqual(rows[1].status, "error")
         self.assertEqual(rows[1].code, "timeout")
-        self.assertEqual(indexers_api._search_payload(service, result)["site_statuses"][0]["status"], "success")
+        self.assertEqual(search_payload(service, result)["site_statuses"][0]["status"], "success")
         await service.aclose()
 
     async def test_empty_partial_and_total_failure_are_distinct(self):
@@ -272,9 +325,9 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
         result.source_statuses["btbtla"] = (
             IndexerSourceStatus("a", "Source A", "empty"), IndexerSourceStatus("b", "Source B", "error", code="timeout"),
         )
-        self.assertEqual(indexers_api._search_payload(service, result)["site_statuses"][0]["status"], "partial")
+        self.assertEqual(search_payload(service, result)["site_statuses"][0]["status"], "partial")
         result.source_statuses["btbtla"] = tuple(IndexerSourceStatus(row.site_id, row.site_name, "error", code="timeout") for row in result.source_statuses["btbtla"])
-        self.assertEqual(indexers_api._search_payload(service, result)["site_statuses"][0]["status"], "error")
+        self.assertEqual(search_payload(service, result)["site_statuses"][0]["status"], "error")
         await service.aclose()
 
     async def test_stream_generator_emits_progress_before_real_completion(self):

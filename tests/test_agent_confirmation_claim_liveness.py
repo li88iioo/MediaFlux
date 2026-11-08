@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
-from app.agent.kernel.capabilities import CapabilityRetriever, KernelToolSpec, ToolEffect
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.model import ModelEvent, ModelEventType as M, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
@@ -49,7 +49,6 @@ def test_pending_effect_wait_cannot_claim_a_live_direct_confirmation_tail(tmp_pa
 
             current = _session(store, FollowScript(resume=True), client, reads, stack=stack)
             current.catalog.register(tool)
-            current.retriever = CapabilityRetriever(minimum=3, maximum=3)
             current.model = HeldSynthesis()
             preview = await collect(current.run(AgentInput(owner=OWNER, session_id=SID, message="保存独立文件")))
             assert preview[-1].payload["status"] == "approval_required"

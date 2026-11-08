@@ -1,21 +1,17 @@
-"""官网 assets 容量契约、真实请求边界与 Agent 最小公开投影。"""
+"""官网 assets 容量契约、真实请求边界与共用账号查询。"""
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 import httpx
 
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.domains.guangya import account_actions as actions
-from app.agent.errors import AgentToolError
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolEffect
-from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
-from app.agent.kernel.state import InMemorySessionStateStore
-from app.agent.kernel.state_types import CancellationToken
-from app.agent.kernel.tool_calls import ToolCallContext
+from app.modules import guangya_account as account
 from app.clients.guangya import GuangYaClient
 
 PROFILE = {"sub": "private-account", "name": "Alice", "phone_number": "13800138000"}
@@ -78,21 +74,21 @@ class AccountClient(GuangYaClient):
 
 
 def read_status(client):
-    with mock.patch.object(actions, "GuangYaClient", return_value=client):
-        return actions.get_guangya_account_status({})
+    with mock.patch.object(account, "GuangYaClient", return_value=client):
+        return account.account_status()
 
 
 class GuangYaAccountCapacityTests(unittest.TestCase):
     def test_actual_assets_schema_is_read_from_separate_endpoint(self):
         client = AccountClient()
         result = read_status(client)
-        storage = result.data["storage"]
+        storage = result["storage"]
         self.assertEqual(storage["total_bytes"], 500 * 1024**4)
         self.assertEqual(storage["used_bytes"], 40 * 1024**4)
         self.assertEqual(storage["available_bytes"], 460 * 1024**4)
         self.assertEqual(storage["utilization"], 0.08)
         self.assertTrue(storage["reported"])
-        self.assertEqual(result.status, "ok")
+        self.assertEqual(result["status"], "ok")
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.calls[0][0], "https://api.guangyapan.com/assets/v1/get_assets")
         for _url, method, kwargs in client.calls:
@@ -116,7 +112,7 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
                 result = read_status(AccountClient(assets={"code": 0, "data": {
                     "totalSpaceSize": total, "usedSpaceSize": used,
                 }}))
-                storage = result.data["storage"]
+                storage = result["storage"]
                 self.assertEqual(storage["total_bytes"], expected_total)
                 self.assertEqual(storage["used_bytes"], expected_used)
                 self.assertEqual(storage["available_bytes"], max(0, expected_total - expected_used))
@@ -128,21 +124,21 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
         for value in (True, False, -1, "-1", "not-a-size", "2TB", "1.2", 1.2, 10**400, "9" * 400, 1 << 63, float("inf"), float("nan"), [], {}):
             with self.subTest(value=value):
                 # 直接测试解析器，JSON 不允许 NaN/Infinity。
-                self.assertIsNone(actions._bytes([{"totalSpaceSize": value}], "totalSpaceSize"))
+                self.assertIsNone(account._bytes([{"totalSpaceSize": value}], "totalSpaceSize"))
         result = read_status(AccountClient(assets={"code": 0, "data": {
             "totalSpaceSize": -1, "usedSpaceSize": True,
             "totalDirectLinkTraffic": 500, "freeShareGuestTraffic": 250,
         }}))
-        self.assertFalse(result.data["storage"]["reported"])
-        self.assertEqual(result.data["storage"]["status"], "not_reported")
-        self.assertEqual(result.status, "partial")
+        self.assertFalse(result["storage"]["reported"])
+        self.assertEqual(result["storage"]["status"], "not_reported")
+        self.assertEqual(result["status"], "partial")
 
     def test_capacity_does_not_mix_account_profile_or_traffic_counters(self):
         client = AccountClient(
             profile={"data": {"nickname": "Alice", "totalSpace": 999, "usedSpace": 111}},
             assets={"code": 0, "data": {"totalDirectLinkTraffic": 500, "freeShareGuestTraffic": 250}},
         )
-        self.assertFalse(read_status(client).data["storage"]["reported"])
+        self.assertFalse(read_status(client)["storage"]["reported"])
 
     def test_known_legacy_capacity_names_and_incomplete_values(self):
         for data, expected in (
@@ -153,7 +149,7 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
             ({"totalSpace": 1000, "freeSpace": 1200}, (1000, None, 1200, "partial")),
         ):
             with self.subTest(data=data):
-                storage = read_status(AccountClient(assets={"code": 0, "data": data})).data["storage"]
+                storage = read_status(AccountClient(assets={"code": 0, "data": data}))["storage"]
                 self.assertEqual(tuple(storage[key] for key in ("total_bytes", "used_bytes", "available_bytes", "status")), expected)
 
     def test_profile_failure_cannot_discard_valid_capacity(self):
@@ -164,10 +160,10 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
         ):
             with self.subTest(profile=type(profile).__name__):
                 result = read_status(AccountClient(profile=profile))
-                self.assertTrue(result.data["connected"])
-                self.assertFalse(result.data["profile_available"])
-                self.assertTrue(result.data["storage"]["reported"])
-                self.assertNotIn("private-", json.dumps(result.to_dict()))
+                self.assertTrue(result["connected"])
+                self.assertFalse(result["profile_available"])
+                self.assertTrue(result["storage"]["reported"])
+                self.assertNotIn("private-", json.dumps(result))
 
     def test_assets_failure_is_not_described_as_provider_omitting_fields(self):
         for assets in (
@@ -187,20 +183,20 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
             with self.subTest(assets=type(assets).__name__):
                 client = AccountClient(assets=assets)
                 result = read_status(client)
-                self.assertEqual(result.status, "partial")
-                self.assertEqual(result.data["storage"]["status"], "unavailable")
-                self.assertFalse(result.data["storage"]["reported"])
-                self.assertIn("读取失败", result.summary)
-                self.assertNotIn("服务端本次未返回", result.summary)
-                self.assertNotIn("private-", json.dumps(result.to_dict()))
+                self.assertEqual(result["status"], "partial")
+                self.assertEqual(result["storage"]["status"], "unavailable")
+                self.assertFalse(result["storage"]["reported"])
+                self.assertIn("读取失败", result["summary"])
+                self.assertNotIn("服务端本次未返回", result["summary"])
+                self.assertNotIn("private-", json.dumps(result))
                 self.assertTrue(client.closed)
 
     def test_no_remote_success_never_claims_connected(self):
         for profile in ({"error": "invalid_token"}, {"data": {}}, {"success": 0, "data": {}}, {"name": ""}):
             client = AccountClient(assets={"code": 401}, profile=profile)
-            with self.subTest(profile=profile), self.assertRaises(AgentToolError) as caught:
+            with self.subTest(profile=profile), self.assertRaises(RuntimeError) as caught:
                 read_status(client)
-            self.assertEqual(caught.exception.code, "unavailable")
+            self.assertIn("无法确认", str(caught.exception))
             self.assertTrue(client.closed)
 
     def test_http_errors_use_existing_bounded_retry_and_no_raw_message(self):
@@ -217,54 +213,75 @@ class GuangYaAccountCapacityTests(unittest.TestCase):
                 self.assertEqual(len(client.calls), 1 if status == 403 else 2)
                 self.assertEqual(refresh.call_count, int(status == 401))
 
-    def test_identity_is_masked_and_never_in_model_projection(self):
+    def test_identity_is_masked_without_provider_secrets(self):
         result = read_status(AccountClient())
-        self.assertEqual(result.data["masked_phone"], "138****8000")
-        public = json.dumps(result.to_dict())
-        model = json.dumps(result.to_model_dict())
+        self.assertEqual(result["masked_phone"], "138****8000")
+        public = json.dumps(result)
         for sensitive in ("private-account", "13800138000", "totalDirectLinkTraffic", "vipStatus"):
             self.assertNotIn(sensitive, public)
-            self.assertNotIn(sensitive, model)
-        self.assertNotIn("Alice", model)
+        self.assertEqual(result["display_name"], "Alice")
 
     def test_disconnected_and_close_failure(self):
+        with (
+            mock.patch.object(account, "GuangYaClient", side_effect=RuntimeError("private-token")),
+            self.assertRaisesRegex(RuntimeError, "^光鸭账号状态当前不可用$"),
+        ):
+            account.account_status()
         client = AccountClient()
         with (
             mock.patch.object(AccountClient, "logged_in", new=False),
-            self.assertRaises(AgentToolError) as caught,
+            self.assertRaises(RuntimeError) as caught,
         ):
             read_status(client)
-        self.assertEqual(caught.exception.code, "precondition_failed")
+        self.assertIn("尚未连接", str(caught.exception))
         self.assertEqual(client.calls, [])
         self.assertTrue(client.closed)
         with mock.patch.object(client, "close", side_effect=RuntimeError("close-failed")):
-            self.assertTrue(read_status(client).data["storage"]["reported"])
+            self.assertTrue(read_status(client)["storage"]["reported"])
 
+    def test_workspace_account_read_preserves_partial_results_and_errors(self):
+        from app.agent.kernel.capabilities import ToolCatalog
+        from app.agent.kernel.effects import EffectExecutor
+        from app.agent.kernel.sandbox import _SDKRequests
+        from app.agent.kernel.state import InMemorySessionStateStore
+        from app.agent.kernel.state_types import CancellationToken
+        from app.agent.kernel.tool_calls import ToolCallContext
 
-class GuangYaAccountKernelTests(unittest.IsolatedAsyncioTestCase):
-    async def test_user_capacity_query_reaches_same_read_port_and_projected_result(self):
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        selection = CapabilityRetriever().retrieve("云盘空间概览", catalog)
-        self.assertIn("guangya.account.status", selection.names)
-        self.assertLessEqual(len(selection.tools), 12)
-        state = InMemorySessionStateStore()
-        pipeline = ToolPipeline(catalog=catalog, state_store=state)
-        lease, _ = await state.begin_turn(owner="test-owner", session_id="test-session", request_id="test")
+        async def dispatch(root):
+            state = InMemorySessionStateStore()
+            lease, _ = await state.begin_turn(owner="account-reader", session_id="account-read", request_id="account-read")
+            context = ToolCallContext(owner="account-reader", session_id="account-read", request_id=lease.request_id,
+                                      turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(),
+                                      report_progress=mock.AsyncMock(), channel="api")
+            rpc = _SDKRequests(context, root, EffectExecutor(catalog=ToolCatalog(), state_store=state))
+            rpc.uid = os.getuid()
+            try:
+                name = "0" * 32 + ".json"
+                (root / "run/mf-requests" / name).write_text(json.dumps({"method": "cloud.account", "arguments": {}}))
+                await rpc.dispatch(name)
+                return json.loads((root / "run/mf-responses" / name).read_text())
+            finally:
+                await rpc.close()
 
-        async def progress(_payload):
-            pass
-
-        context = ToolCallContext(
-            owner="test-owner", session_id="test-session", request_id="test",
-            turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=progress,
-        )
-        with mock.patch.object(actions, "GuangYaClient", return_value=AccountClient()):
-            result = await pipeline.execute("guangya.account.status", {}, context=context)
-        self.assertEqual(result.tool.effect, ToolEffect.READ)
-        self.assertTrue(result.outcome.public_content["data"]["storage"]["reported"])
-        self.assertTrue(json.loads(result.outcome.model_content)["data"]["storage"]["reported"])
-        self.assertNotIn("private-account", json.dumps(result.outcome.public_content))
-        self.assertIsNone(result.outcome.effect_plan)
+        for assets, profile, expected in (
+            (ASSETS, PROFILE, "ok"), ({"code": 401}, PROFILE, "partial"),
+            ({"code": 401}, {"error": "private-token"}, "error"),
+        ):
+            client = AccountClient(assets=assets, profile=profile)
+            with self.subTest(status=expected), TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "run").mkdir()
+                with mock.patch.object(account, "GuangYaClient", return_value=client):
+                    reply = asyncio.run(dispatch(root))
+                if expected == "error":
+                    self.assertNotIn("result", reply)
+                    self.assertEqual(reply["error"]["code"], "RuntimeError")
+                    self.assertNotIn("private-token", json.dumps(reply))
+                else:
+                    self.assertEqual(reply["result"]["status"], expected)
+                    self.assertEqual(reply["result"]["masked_phone"], "138****8000")
+                self.assertNotIn("private-account", json.dumps(reply))
+                self.assertTrue(client.closed)
 
 
 if __name__ == "__main__":

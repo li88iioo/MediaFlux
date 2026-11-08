@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -20,11 +21,12 @@ from app.modules.web_secret import get_web_secret
 
 from .conversation_codec import conversation_rows, state_json_value
 from .conversation_state import commit_conversation
-from .events import AgentEvent, AgentEventType
+from .events import TERMINAL_EVENT_TYPES, AgentEvent, AgentEventType
 from .references import OpaqueReference, ReferenceError
 from .session_guard import (
     continuation_execution_guard,
     guarded_state_call,
+    run_state_worker,
     session_io,
     session_scope_guard,
 )
@@ -67,6 +69,7 @@ _DUE_EFFECT_WAITS_SQL = (
     f"WHERE {_EFFECT_NEXT_POLL_AT_SQL} <= ? "
     f"ORDER BY {_EFFECT_NEXT_POLL_AT_SQL} LIMIT ?"
 )
+
 
 
 class SQLiteKernelStore:
@@ -131,22 +134,24 @@ class SQLiteKernelStore:
         from .state_types import _CancelledReadInline
         if not isinstance(receipts, tuple) or not receipts or type(receipts[0]) is not _CancelledReadInline:
             return False
-        lease = receipts[0].lease
-        return await guarded_state_call(
-            lease.owner, lease.session_id, self._settle_cancelled_reads_sync, receipts,
-            kind="commit", complete_on_cancel=True,
+        return await run_state_worker(
+            self._settle_cancelled_reads_sync, (receipts,), complete_on_cancel=True,
+            scope=(receipts[0].lease.owner, receipts[0].lease.session_id),
         )
 
     def _settle_cancelled_reads_sync(self, receipts) -> bool:
         from .state import _settle_cancelled_reads
         lease = receipts[0].lease
-        with session_scope_guard(lease.owner, lease.session_id, kind="commit"), db.get_conn() as conn:
+        with db.get_conn() as conn:
+            if not cancelled_publication_matches(self._load_row(conn, lease.owner, lease.session_id), lease):
+                return False
             conn.execute("BEGIN IMMEDIATE")
             state = self._load_row(conn, lease.owner, lease.session_id)
             updated = _settle_cancelled_reads(state, receipts, self.max_state_bytes)
             if updated is None:
                 return False
-            self._write_state(conn, updated)
+            with session_scope_guard(lease.owner, lease.session_id, kind="commit"), conn:
+                self._write_state(conn, updated)
             return True
 
     async def is_current(self, lease: PublicationLease) -> bool:
@@ -161,13 +166,10 @@ class SQLiteKernelStore:
         task_patch: TaskPatch | None = None,
     ) -> SessionState:
         try:
-            return await guarded_state_call(
-                lease.owner, lease.session_id, self._commit_sync,
-                lease,
-                conversation,
-                tuple(updates),
-                *([task_patch] if task_patch is not None else []),
-                kind="commit",
+            return await run_state_worker(
+                self._commit_sync,
+                (lease, conversation, tuple(updates), *([task_patch] if task_patch is not None else [])),
+                scope=(lease.owner, lease.session_id),
             )
         except SessionBusyError as exc:
             if candidate_metadata_only(conversation, updates):
@@ -268,7 +270,7 @@ class SQLiteKernelStore:
                                 "message": "任务续行已中断，已保存的查询结果保留；不会自动重放。",
                             })
                         self._write_state(conn, state)
-                        self._write_event(conn, event, row["owner_digest"], row["session_digest"])
+                        self._write_event(conn, event, row["owner_digest"], row["session_digest"], state)
                 except SessionBusyError:
                     continue
 
@@ -369,12 +371,18 @@ class SQLiteKernelStore:
         owner: str,
         session_id: str,
         limit: int = 200,
+        request_id: str = "",
+        turn_id: str = "",
     ) -> list[dict[str, Any]]:
+        if bool(request_id) != bool(turn_id):
+            raise ValueError("event turn scope requires request_id and turn_id")
         return await session_io(
             self._list_events_sync,
             owner,
             session_id,
             limit,
+            request_id,
+            turn_id,
         )
 
     async def list_sessions(
@@ -412,7 +420,7 @@ class SQLiteKernelStore:
         ).hexdigest()
 
     def _scope(self, owner: str, session_id: str) -> tuple[str, str]:
-        owner_digest = self._digest(owner, domain=b"owner:v1")
+        owner_digest = db.native_agent_owner_digest(owner, secret=self._secret())
         session_digest = self._digest(
             f"{owner_digest}\x1f{session_id}", domain=b"session:v1"
         )
@@ -670,21 +678,31 @@ class SQLiteKernelStore:
         return lease, state.clone()
 
     def _is_current_sync(self, lease: PublicationLease) -> bool:
-        if lease.continuation_id:
-            from app.agent.feature_gate import RuntimeFenceError
+        from app.agent.feature_gate import RuntimeFenceError
 
-            from .continuation import check_claim
-            with db.get_conn() as conn:
-                conn.execute("BEGIN")
-                state = self._load_row(conn, lease.owner, lease.session_id)
-                try:
-                    check_claim(state, lease, self._clock(), conn, publication=True)
-                except (StalePublicationError, RuntimeFenceError):
-                    return False
-                return publication_matches(lease, generation=state.generation,
-                                           confirmed=state.metadata.get("confirmed_publication"))
-        owner_digest, session_digest = self._scope(lease.owner, lease.session_id)
         with db.get_conn() as conn:
+            conn.execute("BEGIN")
+            try:
+                self.require_current_in_transaction(lease, conn)
+            except (StalePublicationError, RuntimeFenceError):
+                return False
+            return True
+
+    def require_current_in_transaction(
+        self, lease: PublicationLease, conn: sqlite3.Connection,
+    ) -> None:
+        """复用调用方事务校验发布权；不另开连接、不提交，也不创建默认会话。"""
+        if not conn.in_transaction:
+            raise ValueError("publication check requires an active SQLite transaction")
+        if lease.continuation_id:
+            from .continuation import check_claim
+
+            state = self._load_row(conn, lease.owner, lease.session_id)
+            check_claim(state, lease, self._clock(), conn, publication=True)
+            current = publication_matches(lease, generation=state.generation,
+                                          confirmed=state.metadata.get("confirmed_publication"))
+        else:
+            owner_digest, session_digest = self._scope(lease.owner, lease.session_id)
             row = conn.execute(
                 "SELECT generation, "
                 "json_extract(CASE WHEN json_valid(state_json) THEN state_json ELSE '{}' END, "
@@ -694,10 +712,12 @@ class SQLiteKernelStore:
                 "FROM agent_kernel_sessions WHERE owner_digest=? AND session_digest=?",
                 (owner_digest, session_digest),
             ).fetchone()
-        return (row is not None and publication_matches(
-            lease, generation=int(row["generation"]),
-            confirmed={"generation": row["confirmed_generation"], "turn_id": row["confirmed_turn"]},
-        ))
+            current = row is not None and publication_matches(
+                lease, generation=int(row["generation"]),
+                confirmed={"generation": row["confirmed_generation"], "turn_id": row["confirmed_turn"]},
+            )
+        if not current:
+            raise StalePublicationError("turn no longer owns publication authority")
 
     def _commit_sync(
         self,
@@ -706,21 +726,27 @@ class SQLiteKernelStore:
         updates: Sequence[StateUpdate],
         task_patch: TaskPatch | None = None,
     ) -> SessionState:
-        with session_scope_guard(lease.owner, lease.session_id, kind="commit"), db.get_conn() as conn:
+        with db.get_conn() as conn:
+            # 只读快拒绝避免旧lease等待确认回执的写锁；它不授予后续提交权。
+            if not publication_commit_matches(lease, self._load_row(conn, lease.owner, lease.session_id), conversation, updates):
+                raise StalePublicationError("turn no longer owns publication authority")
             conn.execute("BEGIN IMMEDIATE")
             state = self._load_row(conn, lease.owner, lease.session_id)
             if not publication_commit_matches(lease, state, conversation, updates):
                 raise StalePublicationError("turn no longer owns publication authority")
-            from .continuation import apply_actions, check_claim, task_changed
-            check_claim(state, lease, self._clock(), conn)
-            if task_patch is not None:
-                state.metadata["task"] = reduce_task(state.metadata.get("task"), task_patch, owner=state.owner, session_id=state.session_id)
-                task_changed(state)
-            if conversation is not None:
-                commit_conversation(state, conversation, updates)
-            apply_actions(state, lease, updates, self._clock(), conn)
-            state.apply(updates)
-            self._write_state(conn, state)
+            # 写事务把发布权复验与保存串成同一CAS；旧lease在争用会话锁前退出。
+            # 确认执行仍持原会话锁，普通提交不得阻塞等待正在执行的外部写。
+            with session_scope_guard(lease.owner, lease.session_id, kind="commit"), conn:
+                from .continuation import apply_actions, check_claim, task_changed
+                check_claim(state, lease, self._clock(), conn)
+                if task_patch is not None:
+                    state.metadata["task"] = reduce_task(state.metadata.get("task"), task_patch, owner=state.owner, session_id=state.session_id)
+                    task_changed(state)
+                if conversation is not None:
+                    commit_conversation(state, conversation, updates)
+                apply_actions(state, lease, updates, self._clock(), conn)
+                state.apply(updates)
+                self._write_state(conn, state)
         return state.clone()
 
     def _update_effect_state_sync(
@@ -841,7 +867,7 @@ class SQLiteKernelStore:
             return session_summary(state, updated_at=float(row["updated_at"]))
 
     def _list_sessions_sync(self, owner: str, limit: int) -> list[dict[str, Any]]:
-        owner_digest = self._digest(owner, domain=b"owner:v1")
+        owner_digest = db.native_agent_owner_digest(owner, secret=self._secret())
         maximum = max(1, min(limit, 100))
         result: list[dict[str, Any]] = []
         with db.get_conn() as conn:
@@ -1042,9 +1068,15 @@ class SQLiteKernelStore:
                         raise StalePublicationError("event publication revoked")
                     from .continuation import check_claim
                     check_claim(state, lease, self._clock(), conn, publication=True)
-            self._write_event(conn, event, owner_digest, session_digest)
+            else:
+                try:
+                    state = self._load_existing_row(conn, owner, event.session_id)
+                except ValueError:
+                    # 无lease的失败审计仍可落盘；损坏state不能授予活跃轮保留。
+                    state = None
+            self._write_event(conn, event, owner_digest, session_digest, state)
 
-    def _write_event(self, conn, event, owner_digest, session_digest):
+    def _write_event(self, conn, event, owner_digest, session_digest, state):
         encoded, signature = self._encode(
             event.to_dict(),
             domain=f"event:v1:{event.event_id}:{owner_digest}:{session_digest}".encode(),
@@ -1068,45 +1100,51 @@ class SQLiteKernelStore:
                 now,
             ),
         )
+        active = (state.metadata.get("active_publication") or {}) if state is not None else {}
+        protected = ((active["turn_id"], active["request_id"])
+                     if state is not None and active.get("generation") == state.generation and active.get("status") == "running"
+                     and active.get("turn_id") and active.get("request_id") else None)
+        if event.type in TERMINAL_EVENT_TYPES and protected == (event.turn_id, event.request_id):
+            protected = None
+        history_scope = "owner_digest=? AND session_digest=?"
+        history_args = (owner_digest, session_digest)
+        if protected:
+            history_scope += " AND NOT (turn_id=? AND request_id=?)"
+            history_args += protected
         conn.execute(
             "DELETE FROM agent_kernel_events WHERE rowid IN ("
             "SELECT rowid FROM agent_kernel_events "
-            "WHERE owner_digest=? AND session_digest=? "
+            f"WHERE {history_scope} "
             "ORDER BY created_at DESC,rowid DESC LIMIT -1 OFFSET ?)",
-            (
-                owner_digest,
-                session_digest,
-                self.max_events_per_session,
-            ),
+            (*history_args, self.max_events_per_session),
         )
         conn.execute(
-            "DELETE FROM agent_kernel_events WHERE owner_digest=? "
-            "AND session_digest=? AND created_at<?",
-            (
-                owner_digest,
-                session_digest,
-                now - self.event_retention_seconds,
-            ),
+            f"DELETE FROM agent_kernel_events WHERE {history_scope} AND created_at<?",
+            (*history_args, now - self.event_retention_seconds),
         )
         if self._should_prune_all_events():
-            conn.execute(
-                "DELETE FROM agent_kernel_events WHERE created_at<?",
-                (now - self.event_retention_seconds,),
-            )
+            expired_scope = "created_at<?"
+            expired_args = (now - self.event_retention_seconds,)
+            if protected:
+                expired_scope += " AND NOT (owner_digest=? AND session_digest=? AND turn_id=? AND request_id=?)"
+                expired_args += (owner_digest, session_digest, *protected)
+            conn.execute(f"DELETE FROM agent_kernel_events WHERE {expired_scope}", expired_args)
 
     def _list_events_sync(
-        self, owner: str, session_id: str, limit: int
+        self, owner: str, session_id: str, limit: int, request_id: str = "", turn_id: str = "",
     ) -> list[dict[str, Any]]:
         owner_digest, session_digest = self._scope(owner, session_id)
         bounded = max(1, min(limit, 500))
         with db.get_conn() as conn:
-            rows = conn.execute(
-                "SELECT event_id,event_json,event_hmac FROM agent_kernel_events WHERE owner_digest=? AND session_digest=? "
-                "ORDER BY created_at DESC,rowid DESC LIMIT ?",
-                (owner_digest, session_digest, bounded),
-            ).fetchall()
+            query = "SELECT event_id,event_json,event_hmac FROM agent_kernel_events WHERE owner_digest=? AND session_digest=? "
+            if turn_id:
+                rows = conn.execute(query + "AND request_id=? AND turn_id=? ORDER BY sequence",
+                                    (owner_digest, session_digest, request_id, turn_id)).fetchall()
+            else:
+                rows = list(reversed(conn.execute(query + "ORDER BY created_at DESC,rowid DESC LIMIT ?",
+                                                 (owner_digest, session_digest, bounded)).fetchall()))
         result: list[dict[str, Any]] = []
-        for row in reversed(rows):
+        for row in rows:
             try:
                 value = self._decode(
                     row["event_json"],
@@ -1115,6 +1153,8 @@ class SQLiteKernelStore:
                     expected_type=dict,
                 )
             except ValueError:
+                continue
+            if turn_id and (value.get("request_id"), value.get("turn_id")) != (request_id, turn_id):
                 continue
             result.append(value)
         return result

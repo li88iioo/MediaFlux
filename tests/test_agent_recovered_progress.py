@@ -1,4 +1,4 @@
-"""Current unfinished queries, not recovered audit history, own partial answers."""
+"""对象恢复控制部分状态与中断兜底；正常答案由模型依据原始观察生成。"""
 from __future__ import annotations
 
 import asyncio
@@ -10,13 +10,8 @@ import pytest
 
 from app import database as db
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession, SessionLimits
@@ -110,26 +105,25 @@ async def run_scenario(store, steps, *, protocol="chat_completions", ending="ans
     if ending == "model-fault":
         replies.append((b"not-json", "application/json"))
     elif ending == "round-empty":
-        limits = SessionLimits(max_model_rounds=len(steps) + 1)
-        replies.append(reply(protocol, text=""))
+        limits = SessionLimits(max_model_rounds=len(steps))
     elif ending == "tool-empty":
         limits = SessionLimits(max_tool_calls=len(steps))
-        replies.append(reply(protocol, text=""))
+        replies.append(reply(protocol, name=catalog.get(A).model_name, arguments=X, index=len(steps)))
     elif ending == "round-blocked":
-        limits = SessionLimits(max_model_rounds=len(steps) + 1)
+        limits = SessionLimits(max_tool_calls=len(steps))
         replies.append(reply(protocol, name=catalog.get(A).model_name, arguments=X, index=len(steps)))
     else:
         replies.append(reply(protocol))
     wire = Wire(protocol, replies)
     session = AgentSession(
         model=wire.adapter, catalog=catalog,
-        retriever=CapabilityRetriever(minimum=len(catalog), maximum=len(catalog)),
+
         pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store, limits=limits,
     )
     events = [event async for event in session.run(AgentInput(
         message="分别核验所有对象，只报告有证据完成项。", owner="owner-a", session_id="recovery",
     ))]
-    wire.verify(posts=len(steps) + 1)
+    wire.verify(posts=len(steps) + (ending != "round-empty"))
     assert not wire.replies
     assert calls == steps
     fresh = SQLiteKernelStore(secret_provider=lambda: "offline-recovered-progress")
@@ -138,11 +132,11 @@ async def run_scenario(store, steps, *, protocol="chat_completions", ending="ans
     assert saved.conversation[-1]["content"] == final["answer"]
     # Recovery is not permission to delete original tool messages or events.
     tools = [row for row in saved.conversation if row["role"] == "tool"]
-    expected_tool_count = len(steps) + (ending == "round-blocked")
+    expected_tool_count = len(steps) + (ending in {"round-blocked", "tool-empty"})
     assert len(tools) == expected_tool_count
     assert [row["tool_call_id"] for row in tools] == [f"call-{i}" for i in range(expected_tool_count)]
     failures = [e for e in events if e.type.value == "tool.failed"]
-    assert len(failures) == sum(isinstance(step[2], str) for step in steps) + (ending == "round-blocked")
+    assert len(failures) == sum(isinstance(step[2], str) for step in steps) + (ending in {"round-blocked", "tool-empty"})
     return final, saved, wire, events
 
 
@@ -155,12 +149,12 @@ def test_recovered_request_not_unfinished_in_public_or_reopened_sqlite(store, pr
     steps = [(A, X, "rate_limited"), (C, Z, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, saved, wire, _ = asyncio.run(run_scenario(store, steps, protocol=protocol))
     assert final["status"] == "partial"
-    assert final["finish_reason"] == "provider_timeout"
+    assert final["finish_reason"] == ("end_turn" if protocol == "anthropic_messages" else "stop")
     assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
-    assert "可信已得内容" in final["answer"]
-    assert "未完成的查询不能据此判断没有内容" in final["answer"]
     for answer in (final["answer"], saved.conversation[-1]["content"]):
-        assert unfinished(answer) == "未完成的查询：未恢复对象:object-z"
+        assert answer == FINAL
+    assert "未恢复对象:object-z" in encode(wire.requests[-1])
+    assert "可信已得内容" in encode(wire.requests[-1])
 
 
 @pytest.mark.parametrize("case", [
@@ -187,18 +181,14 @@ def test_existing_identity_recovery_controls(store, case):
     final, _, wire, _ = asyncio.run(run_scenario(store, steps))
     recovered = case in {"single", "all", "repeated", "reordered", "empty-same"}
     assert final["status"] == ("success" if recovered else "partial")
-    if recovered:
-        assert final["answer"] == FINAL
-        assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
-    else:
-        assert final["finish_reason"] == "rate_limited"
-        assert "已有工具返回真实频率限制" in encode(wire.requests[-1])
-        assert unfinished(final["answer"]) == "未完成的查询：未恢复对象:" + ("媒体库搜索" if case == "empty-switched" else "object-x")
+    assert final["answer"] == FINAL
+    assert final["finish_reason"] == "stop"
+    assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
 
 
 @pytest.mark.parametrize("ending,reason", [
     ("model-fault", "model_provider_error"), ("round-empty", "model_round_budget_exceeded"),
-    ("tool-empty", "tool_budget_exceeded"), ("round-blocked", "model_round_budget_exceeded"),
+    ("tool-empty", "tool_budget_exceeded"), ("round-blocked", "tool_budget_exceeded"),
 ])
 @pytest.mark.parametrize("unresolved", [False, True])
 def test_fallback_entries_prioritize_current_errors_over_budget_status(store, ending, reason, unresolved):
@@ -223,7 +213,8 @@ def test_repeated_failure_uses_latest_message_and_ledger_order(store, recover_be
         steps.append((A, X, None))
     steps.append((A, X, "provider_timeout"))
     final, _, wire, _ = asyncio.run(run_scenario(
-        store, steps, summaries={0: "第一版错误", 1: "仍缺少另一项", len(steps) - 1: "第二版错误"},
+        store, steps, ending="round-empty",
+        summaries={0: "第一版错误", 1: "仍缺少另一项", len(steps) - 1: "第二版错误"},
     ))
     assert final["status"] == "partial"
     assert final["finish_reason"] == "provider_timeout"
@@ -237,7 +228,7 @@ def test_repeated_failure_uses_latest_message_and_ledger_order(store, recover_be
 @pytest.mark.parametrize("other", [{**X, "ref": "object-y"}, {**X, "scope": "owner-b"}])
 def test_identical_summaries_do_not_infer_recovery_for_another_identity(store, other):
     steps = [(A, X, "rate_limited"), (A, other, "provider_timeout"), (B, {}, None), (A, X, None)]
-    final, _, wire, _ = asyncio.run(run_scenario(store, steps, summaries={0: "对象检查未完成", 1: "对象检查未完成"}))
+    final, _, wire, _ = asyncio.run(run_scenario(store, steps, ending="round-empty", summaries={0: "对象检查未完成", 1: "对象检查未完成"}))
     assert final["status"] == "partial"
     assert final["finish_reason"] == "provider_timeout"
     assert unfinished(final["answer"]) == "未完成的查询：对象检查未完成"
@@ -248,7 +239,7 @@ def test_identical_summaries_do_not_infer_recovery_for_another_identity(store, o
 def test_returned_rate_limit_is_covered_by_existing_ledger(store, ok):
     steps = [(A, X, {"ok": ok, "status": "rate_limited", "summary": "旧限制"}),
              (C, Z, "provider_timeout"), (B, {}, None), (A, X, None)]
-    final, _, _, _ = asyncio.run(run_scenario(store, steps))
+    final, _, _, _ = asyncio.run(run_scenario(store, steps, ending="round-empty"))
     assert final["status"] == "partial"
     assert final["finish_reason"] == "provider_timeout"
     assert unfinished(final["answer"]) == "未完成的查询：未恢复对象:object-z"
@@ -257,8 +248,7 @@ def test_returned_rate_limit_is_covered_by_existing_ledger(store, ok):
 
 @pytest.mark.parametrize("status", ["failed", "error", "not_found"])
 def test_failed_public_results_without_ledger_entry_remain_visible(store, status):
-    # These public outcomes do not enter the current error ledger. This slice must
-    # not silently hide them or change their existing control-plane semantics.
+    # 真实中断仍展示尚未恢复的公开失败，不丢失原始 DTO。
     steps = [(A, X, "rate_limited"), (C, Z, {"ok": False, "status": status, "summary": "历史公开失败"}),
              (B, {}, None), (A, X, None)]
     final, _, _, _ = asyncio.run(run_scenario(store, steps, ending="model-fault"))
@@ -275,7 +265,7 @@ def test_current_error_redaction_and_parameter_identity_never_escape_to_answers(
     private_args = {"ref": "object-z", "scope": "PRIVATEIDENTITY", "absolute_path": "/srv/private/identity"}
     steps = [(A, X, "rate_limited"), (C, private_args, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, saved, _, events = asyncio.run(run_scenario(
-        store, steps, summaries={1: error_text},
+        store, steps, ending="round-empty", summaries={1: error_text},
     ))
     assert final["status"] == "partial"
     assert final["finish_reason"] == "provider_timeout"
@@ -292,7 +282,8 @@ def test_projection_leaves_native_tool_state_intact_and_private(store, protocol)
     steps = [(A, X, "rate_limited"), (C, Z, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, saved, wire, events = asyncio.run(run_scenario(store, steps, protocol=protocol, private=True))
     assert final["status"] == "partial"
-    assert unfinished(final["answer"]) == "未完成的查询：未恢复对象:object-z"
+    assert final["answer"] == FINAL
+    assert "未恢复对象:object-z" in encode(wire.requests[-1])
     states = [row["provider_state"] for row in saved.conversation if row.get("provider_state")]
     assert len(states) == len(steps)
     for index, state in enumerate(states):
@@ -361,7 +352,7 @@ def test_confirmed_history_is_not_filtered_or_replayed(store, receipt_status, en
             ),
         ])
         session = AgentSession(model=wire.adapter, catalog=catalog,
-            retriever=CapabilityRetriever(minimum=2, maximum=2),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
             limits=SessionLimits(max_model_rounds=3) if ending == "round-empty" else None)
         preview = [e async for e in session.run(AgentInput(message="提交后继续核验", owner="owner-a", session_id="confirmed"))]
@@ -383,5 +374,5 @@ def test_confirmed_history_is_not_filtered_or_replayed(store, receipt_status, en
         duplicate = [e async for e in session.confirm(owner="owner-a", session_id="confirmed", plan_id=plan_id)]
         assert duplicate[-1].payload["code"] == "confirmation_invalid"
         assert executed == ["write"]
-        wire.verify(posts=4)
+        wire.verify(posts=3 if ending == "round-empty" else 4)
     asyncio.run(run())

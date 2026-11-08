@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import atexit
 import inspect
+import re
 import threading
-from collections.abc import Awaitable
+import time
+import unicodedata
+from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, TypeVar
@@ -14,8 +17,9 @@ from app import config
 from app.logger import get_logger
 
 from .config import (
-    DEFAULT_INDEXER_SITE_IDS,
-    normalize_persisted_indexer_site_ids,
+    INDEXER_SITE_LABELS,
+    SENSITIVE_INDEXER_SITE_IDS,
+    current_indexer_site_ids,
 )
 from .registry import build_default_registry
 from .result_store import IndexerResultStore
@@ -34,6 +38,67 @@ _standalone_lock = threading.Lock()
 _standalone_loop: asyncio.AbstractEventLoop | None = None
 _standalone_thread: threading.Thread | None = None
 _STANDALONE_STARTUP_TIMEOUT_SECONDS = 5.0
+
+
+def source_readiness(*, scope: str = "manual") -> dict[str, Any]:
+    """只读本地注册与当前入口的站点权限；不进行站点连通性探测。"""
+    scope = IndexerService._normalize_scope(scope)
+    data: dict[str, Any] = {
+        "probe_mode": "local", "scope": scope,
+        "network_accessed": False, "filesystem_accessed": False,
+        "indexer_enabled": None,
+        "counts": {"registered": 0, "enabled": 0, "searchable": 0, "downloadable": 0, "attention": 0},
+        "transport": {"mode": "direct", "outbound_proxy_applied": False},
+        "sites": [], "configuration": None,
+    }
+    try:
+        from .config import site_configuration
+        data["configuration"] = site_configuration()
+        data["indexer_enabled"] = config.get_bool("INDEXER_SEARCH_ENABLED")
+        if not data["indexer_enabled"]:
+            return {"ok": True, "status": "disabled", **data}
+        service = get_indexer_service()
+        registered = tuple(service.registry.ids())
+        enabled = set(service.site_ids_for_scope(scope))
+    except Exception as exc:
+        logger.warning("索引器本地就绪状态读取失败 type=%s", type(exc).__name__)
+        return {"ok": False, "status": "unavailable", **data, "error": "索引器就绪诊断当前不可用。"}
+
+    counts = data["counts"]
+    for raw_id in registered:
+        site_id = (raw_id or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", site_id):
+            counts["attention"] += 1
+            continue
+        site_enabled = site_id in enabled
+        try:
+            adapter = service.registry.get(site_id)
+            kinds = sorted({kind.strip().lower() for kind in adapter.capabilities.download_kinds
+                            if kind.strip().lower() in {"magnet", "torrent"}})
+            pagination = adapter.capabilities.pagination_supported
+            label = unicodedata.normalize("NFKC", (INDEXER_SITE_LABELS.get(site_id, adapter.site_name) or "")).strip()
+            if not label or len(label) > 80 or any(unicodedata.category(char).startswith("C") for char in label):
+                label = site_id
+            searchable = site_enabled
+            downloadable = site_enabled and bool(kinds)
+            reason = "site_disabled" if not site_enabled else "ready" if kinds else "search_only"
+        except Exception:
+            kinds, pagination, label = [], False, site_id
+            searchable = downloadable = False
+            reason = "registry_unavailable"
+            counts["attention"] += 1
+        counts["registered"] += 1
+        counts["enabled"] += int(site_enabled)
+        counts["searchable"] += int(searchable)
+        counts["downloadable"] += int(downloadable)
+        data["sites"].append({
+            "site_id": site_id, "site_name": label, "enabled": site_enabled,
+            "search_available": searchable, "download_available": downloadable,
+            "download_kinds": kinds, "pagination_supported": pagination,
+            "sensitive": site_id in SENSITIVE_INDEXER_SITE_IDS, "reason": reason,
+        })
+    status = "no_enabled_sites" if not counts["enabled"] else "attention" if counts["attention"] else "ready"
+    return {"ok": True, "status": status, **data}
 
 
 def _close_awaitable(awaitable: Awaitable[Any]) -> None:
@@ -293,6 +358,7 @@ def run_indexer_awaitable_sync(
     awaitable: Awaitable[_T],
     *,
     timeout_seconds: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> _T:
     """从同步请求线程在索引器所属事件循环执行 awaitable。
 
@@ -304,6 +370,9 @@ def run_indexer_awaitable_sync(
     if timeout_seconds is not None and timeout_seconds <= 0:
         _close_awaitable(awaitable)
         raise TimeoutError("索引器调用超时")
+    if cancelled is not None and cancelled():
+        _close_awaitable(awaitable)
+        raise InterruptedError("索引器调用已取消")
 
     try:
         current_loop = asyncio.get_running_loop()
@@ -331,11 +400,24 @@ def run_indexer_awaitable_sync(
             _close_awaitable(awaitable)
             raise RuntimeError("同步索引器桥接不能阻塞其所属事件循环")
         future = _submit_to_runtime_loop(awaitable, owner_loop)
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         try:
-            return future.result(timeout=timeout_seconds)
-        except FutureTimeoutError:
+            while True:
+                # 已完成的结果仍可由批量调用保留；取消仅中止当前等待者。
+                if not future.done() and cancelled is not None and cancelled():
+                    raise InterruptedError("索引器调用已取消")
+                remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+                wait = min(0.1, remaining) if remaining is not None else 0.1
+                try:
+                    return future.result(timeout=wait if cancelled is not None else remaining)
+                except FutureTimeoutError:
+                    if future.done():
+                        return future.result()
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("索引器调用超时") from None
+        except BaseException:
             future.cancel()
-            raise TimeoutError("索引器调用超时") from None
+            raise
 
     _close_awaitable(awaitable)
     raise RuntimeError("同步索引器桥接不能在活动事件循环线程中运行")
@@ -420,17 +502,8 @@ def build_indexer_service() -> IndexerService:
         btbtla_page_size=max_results_per_site,
         btbtla_cache_ttl_seconds=cache_ttl_seconds,
     )
-    raw_sites = (config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS)) or "")
-    known_sites = {
-        site_id.strip().lower()
-        for site_id in raw_sites.split(",")
-        if site_id.strip().lower() in registry.ids()
-    }
-    configured = normalize_persisted_indexer_site_ids(tuple(known_sites))
-    sukebei_authorized = (
-        "sukebei" in configured
-        or config.get_bool("INDEXER_SUKEBEI_ENABLED", False)
-    )
+    configured = current_indexer_site_ids()
+    sukebei_authorized = "sukebei" in configured
     enabled = [site_id for site_id in configured if site_id in registry.ids()]
     if sukebei_authorized and "sukebei" in registry.ids():
         enabled.append("sukebei")
@@ -473,6 +546,23 @@ async def shutdown_indexer_service() -> None:
     with _lock:
         if _service is service:
             _service = None
+
+
+def refresh_indexer_configuration(*, timeout: float = 5.0) -> dict[str, bool]:
+    """配置保存后释放Web/TG旧服务；失败保留旧实例，调用方明确提示重启。"""
+    status = {"web": True, "telegram": True}
+    try:
+        run_indexer_awaitable_sync(shutdown_indexer_service(), timeout_seconds=timeout)
+    except Exception as exc:
+        status["web"] = False
+        logger.warning("Web索引器配置热更新失败 type=%s", type(exc).__name__)
+    try:
+        from app.modules.telegram_resource_search import shutdown_telegram_indexer_worker
+        status["telegram"] = shutdown_telegram_indexer_worker(timeout=timeout)
+    except Exception as exc:
+        status["telegram"] = False
+        logger.warning("Telegram索引器配置热更新失败 type=%s", type(exc).__name__)
+    return status
 
 
 atexit.register(_stop_standalone_runtime)

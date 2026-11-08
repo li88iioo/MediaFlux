@@ -9,25 +9,28 @@ import asyncio
 import json
 import logging
 import threading
+from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from time import monotonic
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 from app import config
 from app import database as db
 from app.clients.tmdb import TMDBClient, close_tmdb_client
-from app.discovery.models import ProviderError, ProviderNotConfigured
-from app.indexers.config import tmdb_detail_is_animation
+from app.discovery.models import MediaCard, ProviderError, ProviderNotConfigured
+from app.discovery.service import get_discovery_service
+from app.indexers.config import normalize_indexer_site_ids, tmdb_detail_is_animation
 from app.indexers.downloads import download_indexer_result_public
 from app.indexers.models import AggregatedIndexerResult, IndexerMediaSearchRequest
-from app.indexers.runtime import get_indexer_service, run_indexer_awaitable
+from app.indexers.runtime import get_indexer_service, run_indexer_awaitable, run_indexer_awaitable_sync
 from app.logger import get_logger
 from app.modules.episode_resource_ranking import rank_episode_search
 from app.modules.media_identity import build_media_key
 from app.repositories.media_subscriptions import (
     MediaSubscriptionError,
+    media_subscription_config_snapshot,
     list_media_subscriptions_by_identity,
     normalize_subscription_interval,
     normalize_subscription_seasons,
@@ -398,8 +401,181 @@ def _resolve_search_sites(
     return list(routed) or None
 
 
+
+
+def strict_subscription_id(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 2_147_483_647:
+        raise MediaSubscriptionError("subscription_id 必须是正整数")
+    return value
+
+
+def subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"provider", "external_id", "media_type", "season", "check_interval_minutes", "action", "download_target", "sites", "enabled"}
+    if not isinstance(arguments, dict) or set(arguments) - allowed or not {"provider", "external_id", "media_type"} <= arguments.keys():
+        raise MediaSubscriptionError("创建订阅需要精确来源、媒体 ID 和媒体类型")
+    values = {"season": None, "check_interval_minutes": 4320, "action": "confirm", "download_target": "guangya", "sites": [], "enabled": True, **arguments}
+    for key, choices in (("provider", _ALLOWED_PROVIDERS), ("media_type", _ALLOWED_MEDIA_TYPES)):
+        values[key] = _choice(values[key], choices, "")
+    identity = values["external_id"]
+    if not isinstance(identity, str) or not identity.strip() or len(identity) > 180 or any(c.isspace() for c in identity.strip()):
+        raise MediaSubscriptionError("外部媒体 ID 无效")
+    values["external_id"] = identity.strip()
+    season = values["season"]
+    if season is not None and (isinstance(season, bool) or not isinstance(season, int) or not 1 <= season <= 100 or values["media_type"] != "tv"):
+        raise MediaSubscriptionError("season 只支持剧集的 1 到 100 整数季度")
+    interval = values["check_interval_minutes"]
+    if interval is None:
+        interval = 4320
+    if isinstance(interval, bool) or not isinstance(interval, int):
+        raise MediaSubscriptionError("check_interval_minutes 必须是整数")
+    values["check_interval_minutes"] = normalize_subscription_interval(interval)
+    for key, choices in (("action", _ALLOWED_ACTIONS), ("download_target", _ALLOWED_TARGETS)):
+        values[key] = _choice(values[key], choices, "")
+    if not isinstance(values["enabled"], bool):
+        raise MediaSubscriptionError("enabled 必须是布尔值")
+    values["sites"] = list(normalize_indexer_site_ids(values["sites"] if values["sites"] is not None else []))
+    return values
+
+
+def subscription_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"subscription_id", "enabled", "monitor_mode", "seasons", "include_specials", "action", "download_target", "check_interval_minutes"}
+    if not isinstance(arguments, dict) or set(arguments) - allowed or "subscription_id" not in arguments or len(arguments) < 2:
+        raise MediaSubscriptionError("必须指定订阅编号和至少一个修改字段")
+    values = {**arguments, "subscription_id": strict_subscription_id(arguments["subscription_id"])}
+    for key in ("enabled", "include_specials"):
+        if key in values and not isinstance(values[key], bool):
+            raise MediaSubscriptionError(f"{key} 必须是布尔值")
+    for key, choices in (("monitor_mode", _ALLOWED_MONITOR_MODES), ("action", _ALLOWED_ACTIONS), ("download_target", _ALLOWED_TARGETS)):
+        if key in values:
+            values[key] = _choice(values[key], choices, "")
+    if "seasons" in values:
+        seasons = values["seasons"]
+        if not isinstance(seasons, list) or len(seasons) > 20 or any(isinstance(s, bool) or not isinstance(s, int) or not 1 <= s <= 100 for s in seasons):
+            raise MediaSubscriptionError("seasons 必须是最多 20 项的 1 到 100 整数季度数组")
+        values["seasons"] = normalize_subscription_seasons(seasons)
+    if "check_interval_minutes" in values:
+        interval = values["check_interval_minutes"]
+        if isinstance(interval, bool) or not isinstance(interval, int):
+            raise MediaSubscriptionError("check_interval_minutes 必须是整数")
+        values["check_interval_minutes"] = normalize_subscription_interval(interval)
+    return values
+
+
+def _resolved_subscription_identity(provider: str, external_id: str, media_type: str) -> str:
+    if provider == "tmdb":
+        return _numeric_tmdb_id(external_id)
+    mapping = db.get_media_external_id(provider, external_id, media_type)
+    if mapping is None or not bool(mapping["confirmed"]):
+        raise MediaSubscriptionError("该来源尚未确认 TMDB 映射，请先确认媒体身份", code="precondition_failed")
+    return _numeric_tmdb_id(mapping["tmdb_id"])
+
+
+
+
+def _reload_subscription_scheduler() -> bool:
+    try:
+        from app.modules.media_subscription_scheduler import get_media_subscription_scheduler
+        get_media_subscription_scheduler().reload()
+        return True
+    except Exception as exc:  # noqa: BLE001 -- 配置已持久化，唤醒失败不能抹掉真实结果。
+        logger.warning("媒体订阅配置已保存但调度刷新失败 type=%s", type(exc).__name__)
+        return False
+
+
 class MediaSubscriptionService:
     """按 TMDB 身份巡检媒体库，并在安全边界内生成/提交候选资源。"""
+
+    def prepare_change(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if operation == "create":
+            args = subscription_create_arguments(arguments)
+            identity = (args["provider"], args["external_id"], args["media_type"])
+            tmdb_id = _resolved_subscription_identity(*identity)
+            with db.get_conn() as conn:
+                state = db.media_subscription_identity_snapshot(conn, tmdb_id, args["media_type"])
+            if state.get("exists") and not state.get("deleted_at"):
+                raise MediaSubscriptionError("该媒体已经在追更订阅中", code="precondition_failed")
+            try:
+                card = get_discovery_service().get_detail(args["provider"], args["media_type"], args["external_id"])
+            except ProviderError as exc:
+                raise MediaSubscriptionError(exc.safe_message or "暂时无法核对该影视条目", code="precondition_failed") from exc
+            except Exception as exc:  # noqa: BLE001 -- 数据源故障不作为参数错误或暴露内部详情。
+                logger.warning("媒体订阅创建预检失败 type=%s", type(exc).__name__)
+                raise MediaSubscriptionError("暂时无法核对该影视条目", code="confirmation_unavailable") from exc
+            if not isinstance(card, MediaCard) or (card.provider, card.external_id, card.media_type) != identity:
+                raise MediaSubscriptionError("影视数据源返回的条目标识不一致", code="precondition_failed")
+            snapshot = {"operation": operation, "arguments": args, "tmdb_id": tmdb_id, "identity": state}
+            data = {**args, "title": card.title, "year": card.year, "affected": 1,
+                    "effects": ["创建或恢复本地追更订阅，不会立即搜索或下载。",
+                        "自动模式会持续自动提交符合既有严格匹配规则的资源，后续每次下载不再弹 Agent 确认。" if args["action"] == "auto" else "候选按提醒或人工确认策略处理。",
+                        "整理、STRM和媒体库刷新只沿用已有联动配置；不支持固定星期或独立4K/字幕硬过滤。"]}
+            summary = f"确认后为《{card.title}》创建媒体追更订阅"
+        else:
+            args = subscription_update_arguments(arguments) if operation == "update" else {"subscription_id": strict_subscription_id(arguments["subscription_id"])}
+            if operation not in {"update", "delete"} or (operation == "delete" and set(arguments) != {"subscription_id"}):
+                raise MediaSubscriptionError("订阅操作或参数无效")
+            with db.get_conn() as conn:
+                conn.execute("BEGIN")
+                state = media_subscription_config_snapshot(conn, args["subscription_id"])
+            current = state["configuration"]
+            changes = {key: value for key, value in args.items() if key != "subscription_id"}
+            if operation == "update":
+                effective = {**current, **changes}
+                if changes.keys() - {"enabled"}:
+                    validate_subscription_scope(current["media_type"], effective["monitor_mode"],
+                        changes.get("seasons", _loads(current["seasons_json"], [])), bool(effective["include_specials"]))
+                if changes.keys() == {"enabled"} and changes["enabled"] == state["work"]["enabled"]:
+                    raise MediaSubscriptionError("该媒体追更订阅已处于请求的启停状态", code="precondition_failed")
+            dispatching = sum(item["status"] == "dispatching" for item in state["work"]["active_admissions"])
+            effects = (["软删除订阅并停止后续检查；已提交下载和媒体文件不会删除。"] if operation == "delete" else
+                       ["保存后按新配置调度，不会立即检查或下载。", "暂停或修改策略会使未提交候选、准入和运行中检查失效；恢复启用保留在途工作。"])
+            if operation == "update" and changes.get("action", current["action"]) == "auto":
+                effects.append("后续匹配资源会无需再次人工确认，自动提交到确认卡所示下载目标。")
+            effects.append(f"预检有 {dispatching} 项已进入提交阶段，不能由此撤回。")
+            data = {"subscription_number": args["subscription_id"], "title": current["title"], "requested": changes,
+                    "in_flight_dispatches_at_preflight": dispatching,
+                    "pending_admissions_at_preflight": state["work"]["claimed_admissions"], "effects": effects,
+                    "effective": {key: changes.get(key, _loads(current["seasons_json"], []) if key == "seasons" else state["work"]["enabled"] if key == "enabled" else current[key])
+                                  for key in ("enabled", "monitor_mode", "seasons", "include_specials", "action", "download_target", "check_interval_minutes")}}
+            snapshot = {"operation": operation, "arguments": args, "state": state}
+            summary = f"确认后{'删除' if operation == 'delete' else '更新'}《{current['title']}》的媒体追更订阅"
+        return {"arguments": args, "snapshot": snapshot,
+                "preview": {"ok": True, "status": "confirmation_required", "summary": summary, "data": data}}
+
+    def apply_change(self, operation: str, arguments: dict[str, Any], *, expected_snapshot: dict[str, Any],
+                     check_cancelled: Callable[[], None] = lambda: None) -> dict[str, Any]:
+        args = (subscription_create_arguments(arguments) if operation == "create" else subscription_update_arguments(arguments)
+                if operation == "update" else {"subscription_id": strict_subscription_id(arguments["subscription_id"])})
+        if expected_snapshot.get("operation") != operation or expected_snapshot.get("arguments") != args:
+            raise MediaSubscriptionError("订阅确认范围无效", code="confirmation_invalid")
+        check_cancelled()
+        if operation == "create":
+            tmdb_id = _resolved_subscription_identity(args["provider"], args["external_id"], args["media_type"])
+            if tmdb_id != expected_snapshot["tmdb_id"]:
+                raise MediaSubscriptionError("媒体身份映射已变化，请重新预检", code="conflict")
+            payload = {key: value for key, value in args.items() if key != "season"}
+            payload.update(tmdb_id=tmdb_id, monitor_mode="selected" if args["season"] is not None else "missing",
+                           seasons=[args["season"]] if args["season"] is not None else [], include_specials=False)
+            result = run_indexer_awaitable_sync(self.create_subscription(payload, identity_confirmed=args["provider"] != "tmdb",
+                expected_snapshot=expected_snapshot["identity"], check_cancelled=check_cancelled), timeout_seconds=35.0)
+            row = result["subscription"]
+            data = {**row, "subscription_number": row["id"], "created": result["created"], "operation": "create" if result["created"] else "restore", "season": args["season"], "affected": 1}
+        elif operation == "delete":
+            with db.get_conn() as conn:
+                if media_subscription_config_snapshot(conn, args["subscription_id"]) != expected_snapshot["state"]:
+                    raise MediaSubscriptionError("订阅或关联工作已变化，请重新预检", code="conflict")
+            check_cancelled()
+            if not self.delete_subscription(args["subscription_id"], expected_snapshot=expected_snapshot["state"]["work"], check_cancelled=check_cancelled):
+                raise MediaSubscriptionError("订阅或关联工作已变化，请重新预检", code="conflict")
+            work = expected_snapshot["state"]["work"]
+            data = {"subscription_number": args["subscription_id"], "operation": "delete", "affected": 1,
+                    "expired_candidates": work["available_candidates"], "cancelled_admissions": work["claimed_admissions"], "cancelled_runs": work["running_checks"]}
+        else:
+            changes = {key: value for key, value in args.items() if key != "subscription_id"}
+            data = self.update_subscription(args["subscription_id"], changes, expected_snapshot=expected_snapshot["state"], check_cancelled=check_cancelled)
+        data["runtime_refreshed"] = _reload_subscription_scheduler()
+        return {"ok": True, "status": "completed", "summary": "媒体追更订阅已保存" if operation != "delete" else "媒体追更订阅已删除", "data": data}
+
+
 
     async def create_subscription(
         self,
@@ -407,6 +583,7 @@ class MediaSubscriptionService:
         *,
         identity_confirmed: bool = False,
         expected_snapshot: dict[str, Any] | None = None,
+        check_cancelled: Callable[[], None] = lambda: None,
     ) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise MediaSubscriptionError("订阅参数必须是 JSON 对象")
@@ -438,6 +615,7 @@ class MediaSubscriptionService:
         except ProviderError as exc:
             raise MediaSubscriptionError(exc.safe_message, status_code=exc.status_code, code=exc.code) from exc
         metadata = _metadata_from_detail(detail, media_type)
+        check_cancelled()
         subscription_id, created = db.upsert_media_subscription(
             provider=provider,
             external_id=external_id,
@@ -456,12 +634,17 @@ class MediaSubscriptionService:
             sites=sites,
             check_interval_minutes=interval,
             expected_snapshot=expected_snapshot,
+            check_cancelled=check_cancelled,
         )
         if not subscription_id:
             raise MediaSubscriptionError(
                 "媒体追更订阅状态已变化，请重新预检", status_code=409, code="conflict"
             )
-        return {"created": created, "subscription": self.get_subscription(subscription_id)}
+        try:
+            return {"created": created, "subscription": self.get_subscription(subscription_id)}
+        except MediaSubscriptionError as exc:
+            exc.execution_started = True
+            raise
 
     def get_subscription(self, subscription_id: int) -> dict[str, Any]:
         row = db.get_media_subscription(subscription_id)
@@ -507,6 +690,54 @@ class MediaSubscriptionService:
         )
         return [_public_candidate(row) for row in rows]
 
+    def check_updates(self, *, subscription_id: int | None = None, limit: int = 8,
+                      before_updated_at: str | None = None, before_id: int | None = None) -> dict[str, Any]:
+        """分页只读核对已播/库存；暂停项不计入已核对覆盖，失败保留其它项，不创建后台检查或下载。"""
+        if subscription_id is not None:
+            rows = [self.get_subscription(strict_subscription_id(subscription_id))]
+            page = {"total": 1, "has_more": False, "next": None}
+        else:
+            if (before_updated_at is None) != (before_id is None):
+                raise MediaSubscriptionError("订阅续页必须同时提供时间和编号")
+            page = self.list_subscriptions(limit=limit, before=(before_updated_at, before_id) if before_updated_at is not None and before_id is not None else None)
+            rows = page["items"]
+            if page["next"] is not None:
+                page["next"] = {key: page["next"][key] for key in ("before_updated_at", "before_id", "limit")}
+
+        async def preview():
+            semaphore = asyncio.Semaphore(3)
+
+            async def one(row):
+                async with semaphore:
+                    try:
+                        return await asyncio.wait_for(self.preview_subscription_updates(row["id"], max_search_episodes=1, limit_per_media=3), timeout=25.0)
+                    except Exception as exc:  # noqa: BLE001 -- 单项失败保留同页已取得的其它事实。
+                        return {"subscription_number": row["id"], "title": row["title"], "status": "timeout" if isinstance(exc, TimeoutError) else "unavailable",
+                                "summary": str(exc) if isinstance(exc, MediaSubscriptionError) else "实时核对暂时不可用",
+                                "inventory_complete": False, "resource_search": self._empty_preview_search("not_run")}
+            return list(await asyncio.gather(*(one(row) for row in rows)))
+
+        items = run_indexer_awaitable_sync(preview(), timeout_seconds=max(35.0, 25.0 * (len(rows) // 3 + 1) + 5))
+        uncertain = sum(item["status"] not in {"missing", "satisfied", "paused"} for item in items)
+        updates = sum(item["status"] == "missing" for item in items)
+        current = sum(item["status"] == "satisfied" for item in items)
+        paused = sum(item["status"] == "paused" for item in items)
+        partial = sum(item["resource_search"]["status"] == "partial" for item in items)
+        ok = not uncertain or bool(updates or current or paused)
+        if not items:
+            status = "empty" if page["total"] else "not_configured"
+            summary = "本页无媒体追更订阅" if page["total"] else "尚未创建媒体追更订阅"
+        elif paused == len(items):
+            status, summary = "inconclusive", "本页媒体追更订阅均已暂停，未核对媒体库或资源站，无法判断是否有更新"
+        else:
+            status = "unavailable" if not ok else "partial" if uncertain or partial or paused else "updates_available" if updates else "up_to_date"
+            summary = (f"本页 {paused} 项媒体追更订阅已暂停，未核对其库存；其余订阅检查结果见明细"
+                       if paused else "已只读核对本页媒体追更订阅")
+        return {"ok": ok, "status": status, "summary": summary,
+                "total": page["total"], "returned": len(items), "has_more": page["has_more"], "next": page["next"], "items": items,
+                "updates_available_count": updates, "up_to_date_count": current, "paused_count": paused,
+                "inconclusive_count": uncertain, "partial_search_count": partial, "read_only": True}
+
     async def preview_subscription_updates(
         self,
         subscription_id: int,
@@ -514,7 +745,7 @@ class MediaSubscriptionService:
         max_search_episodes: int = 1,
         limit_per_media: int = _PREVIEW_MAX_CANDIDATES_PER_MEDIA,
     ) -> dict[str, Any]:
-        """实时核对单条订阅，但不持久化候选、不改调度、也不提交下载。"""
+        """只读核对单条订阅；暂停项为历史快照，last_checked_at 为原巡检时间，checked_at 为回执时间。"""
         max_search_episodes = max(
             0,
             min(max_search_episodes, _PREVIEW_MAX_SEARCH_EPISODES),
@@ -536,15 +767,16 @@ class MediaSubscriptionService:
                 "media_type": str(row["media_type"] or ""),
                 "enabled": False,
                 "status": "paused",
-                "summary": "订阅已暂停，本次未访问媒体库或资源站",
+                "summary": "订阅已暂停，本次未访问媒体库或资源站；计数与缺失仅为历史快照",
                 "expected_count": max(0, int(row["expected_count"] or 0)),
                 "local_count": max(0, int(row["local_count"] or 0)),
                 "missing_count": max(0, int(row["missing_count"] or 0)),
-                "missing": list(missing)[:12] if isinstance(missing, list) else [],
+                "missing": list(missing) if isinstance(missing, list) else [],
                 "inventory_complete": False,
                 "sources": [],
                 "resource_search": self._empty_preview_search("not_run"),
                 "delivery": self._preview_delivery(row, missing_count=0, resources=[]),
+                "last_checked_at": str(row["last_checked_at"] or ""),
                 "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
 
@@ -571,7 +803,8 @@ class MediaSubscriptionService:
             }
         return result
 
-    def update_subscription(self, subscription_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    def update_subscription(self, subscription_id: int, data: dict[str, Any], *, expected_snapshot: dict[str, Any] | None = None,
+                            check_cancelled: Callable[[], None] = lambda: None) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise MediaSubscriptionError("订阅参数必须是 JSON 对象")
         allowed = {
@@ -598,15 +831,29 @@ class MediaSubscriptionService:
             fields["sites_json"] = _dumps(_normalize_sites(data["sites"]))
         if "check_interval_minutes" in data:
             fields["check_interval_minutes"] = normalize_subscription_interval(data["check_interval_minutes"])
-        if db.update_media_subscription_config(subscription_id, **fields) is None:
+        resume_only = expected_snapshot is not None and data.keys() == {"enabled"} and bool(data["enabled"])
+        changed = db.update_media_subscription_config(subscription_id, invalidate_related=not resume_only,
+            expected_snapshot=expected_snapshot, check_cancelled=check_cancelled, **fields)
+        if changed is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
-        return self.get_subscription(subscription_id)
+        try:
+            result = self.get_subscription(subscription_id)
+        except MediaSubscriptionError as exc:
+            exc.execution_started = True
+            raise
+        if expected_snapshot is not None:
+            result = {**result, **changed, "subscription_number": subscription_id,
+                      "operation": "enable" if resume_only else "disable" if data.keys() == {"enabled"} else "update",
+                      "updated_fields": sorted(data), "effective_action": result["action"],
+                      "in_flight_dispatches": sum(item["status"] == "dispatching" for item in expected_snapshot["work"]["active_admissions"])}
+        return result
 
     def delete_subscription(
-        self, subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None
+        self, subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None,
+        check_cancelled: Callable[[], None] = lambda: None,
     ) -> bool:
         return db.delete_media_subscription(
-            subscription_id, expected_snapshot=expected_snapshot
+            subscription_id, expected_snapshot=expected_snapshot, check_cancelled=check_cancelled
         )
 
     async def check_subscription(
@@ -1035,7 +1282,7 @@ class MediaSubscriptionService:
             "expected_count": len(expected),
             "local_count": local_count,
             "missing_count": len(missing),
-            "missing": missing[:12],
+            "missing": missing,
             "missing_truncated": len(missing) > 12,
             "inflight_count": len(active_keys),
             "future_count": future_count,

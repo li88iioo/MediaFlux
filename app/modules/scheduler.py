@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import json
+import secrets
 import logging
+import math
 import threading
 from copy import deepcopy
 from datetime import datetime
@@ -19,7 +21,7 @@ from typing import Any, Callable, Iterable, Optional, TypedDict
 
 from croniter import croniter
 
-from app import database as db
+from app import config, database as db
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, log_throttled
 from app.modules.media_refresh import plan_refresh_targets
@@ -2701,3 +2703,214 @@ _scheduler = STRMScheduler()
 
 def get_scheduler() -> STRMScheduler:
     return _scheduler
+
+
+_STRM_CONFIRMATION_KEYS = (
+    "GY_STRM_SOURCE_DIRS", "GY_STRM_BASE_URL", "STRM_ROOT", "STRM_VIDEO_EXTS",
+    "STRM_METADATA_ENABLED", "STRM_METADATA_EXTS", "STRM_SKIP_THRESHOLD_MB",
+    "STRM_NOTIFY_ENABLED", "GY_ORGANIZE_STRM_DETAIL_NOTIFY",
+)
+_STRM_STAT_FIELDS = frozenset({
+    "total", "directories", "scanned_files", "generated", "created", "updated", "skipped", "failed",
+    "metadata_generated", "metadata_queued", "metadata_skipped", "metadata_failed", "metadata_cleaned", "cleaned",
+    "empty_dirs_cleaned", "read_retries", "read_failures", "scan_workers_peak", "scan_workers_configured",
+})
+
+
+def _strm_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _public_strm_sources(sources: list[dict]) -> list[dict[str, str]]:
+    return [{"id": str(item.get("id") or ""), "name": str(item.get("name") or "")}
+            for item in sources]
+
+
+def _capture_strm_run(source_ids: list[str] | None) -> dict:
+    from app.modules.web_secret import signed_context_fingerprint
+
+    if source_ids is not None and (not isinstance(source_ids, list)
+            or any(not isinstance(item, str) or not item.strip() or item != item.strip() for item in source_ids)):
+        raise ValueError("source_ids必须是已配置STRM来源ID的字符串数组")
+    selected = list(dict.fromkeys(source_ids or []))
+    sources, source_error = configured_strm_source_plans()
+    by_id = {source["id"]: source for source in sources}
+    selection_error = bool(selected and (source_error or any(identity not in by_id for identity in selected)))
+    chosen = [by_id[identity] for identity in selected if identity in by_id] if selected else sources
+    scheduler = get_scheduler()
+    validation_error = scheduler.validate_config(auto_only=False) or ""
+    running = scheduler.status().get("running") is True
+    payload: dict[str, Any] = {key: config.get(key, "") for key in _STRM_CONFIRMATION_KEYS}
+    payload.update(selected_source_ids=selected, selection_error=selection_error,
+                   validation_error=validation_error, running=running)
+    return {"scheduler": scheduler, "selected": selected, "sources": chosen,
+            "selection_error": selection_error, "validation_error": validation_error, "running": running,
+            "fingerprint": signed_context_fingerprint(payload, domain="strm-run")}
+
+
+def _strm_run_preview(state: dict) -> dict:
+    if state["selection_error"] or state["validation_error"]:
+        return {"ok": False, "status": "not_configured", "summary": "STRM当前无法启动",
+                "error": "STRM来源选择或运行配置无效，请重新检查后再预检。", "data": {}}
+    if state["running"]:
+        return {"ok": False, "status": "conflict", "summary": "STRM同步任务已在运行",
+                "error": "当前任务未重复提交。", "data": {}}
+    sources = _public_strm_sources(state["sources"])
+    return {"ok": True, "status": "confirmation_required", "summary": "确认后将启动一次STRM同步",
+            "data": {"trigger": "manual", "scoped": bool(state["selected"]), "source_count": len(sources),
+                     "sources": sources, "effects": ["扫描本次选定的已配置STRM来源",
+                         "按现有规则创建、更新或清理STRM与伴随元数据", "根据现有配置执行通知和媒体库刷新"]}}
+
+
+def prepare_strm_run(source_ids: list[str] | None = None) -> dict:
+    """只读取配置与调度器，冻结真实来源ID和运行条件；不创建任务或访问云盘。"""
+    with config.runtime_config_read_guard():
+        state = _capture_strm_run(source_ids)
+        return {**_strm_run_preview(state), "fingerprint": state["fingerprint"]}
+
+
+def submit_strm_run(source_ids: list[str] | None = None, *, expected_fingerprint: str) -> dict:
+    """复验同一冻结范围后复用原scheduler准入和持久task_run；受理不代表同步完成。"""
+    with config.runtime_config_read_guard():
+        state = _capture_strm_run(source_ids)
+        if not isinstance(expected_fingerprint, str) or not secrets.compare_digest(state["fingerprint"], expected_fingerprint):
+            raise ValueError("STRM配置、来源或运行状态已变化，请重新预检")
+        preview = _strm_run_preview(state)
+        if not preview["ok"]:
+            return preview
+        result = (state["scheduler"].trigger("manual", selected_source_ids=state["selected"])
+                  if state["selected"] else state["scheduler"].trigger("manual"))
+        if not result["ok"]:
+            reason = str(result.get("error") or "")
+            if reason not in {"STRM 同步任务正在运行", "STRM 调度器正在停止", "STRM 同步任务启动失败",
+                              "STRM 变化目标持久化失败，已取消同步", "STRM 同步模式无效"}:
+                reason = "STRM同步任务未能启动，请稍后重新预检。"
+            busy = reason == "STRM 同步任务正在运行"
+            return {"ok": False, "status": "conflict" if busy else "failed",
+                    "summary": "STRM同步任务已在运行" if busy else "STRM同步任务启动失败", "error": reason, "data": {}}
+        return {"ok": True, "status": "accepted", "summary": "STRM同步任务已提交",
+                "data": {"accepted": True, "trigger": "manual", "run_id": int(result["run_id"]),
+                         "scoped": bool(state["selected"]), "source_count": len(state["sources"])}}
+
+
+def _public_strm_run(row: dict, runtime: dict) -> dict:
+    states = {"success": "completed", "completed": "completed", "partial": "partial", "failed": "failed",
+              "skipped": "failed", "running": "running"}
+    raw_status = str(row.get("status") or "").strip().casefold()
+    status = states.get(raw_status, "unknown")
+    trigger = str(row.get("trigger_type") or "").strip().casefold()
+    timestamps = {}
+    for key in ("started_at", "finished_at"):
+        value = str(row.get(key) or "").strip()
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            timestamps[key] = value if len(value) <= 40 else ""
+        except ValueError:
+            timestamps[key] = ""
+    payload = row.get("result") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    stats = payload.get("stats")
+    mode = str(payload.get("mode") or "").strip().casefold()
+    elapsed = None
+    try:
+        value = payload.get("elapsed_seconds")
+        parsed = float(value) if value is not None and not isinstance(value, bool) else math.nan
+        if math.isfinite(parsed) and parsed >= 0:
+            elapsed = parsed
+    except (TypeError, ValueError, OverflowError):
+        pass
+    progress = runtime.get("progress") if status == "running" and runtime.get("current_run_id") == row["id"] else {}
+    return {"run_id": int(row["id"]), "status": status, "raw_status": raw_status if raw_status in states else "unknown",
+            "trigger_type": trigger if trigger in {"manual", "cron", "organize", "telegram", "config-retirement"} else "unknown",
+            **timestamps, "mode": mode if mode in {"full", "fast", "incremental", "fast_noop", "fast_partial", "full_fallback"} else "unknown",
+            "elapsed_seconds": elapsed,
+            "progress": {key: value for key, value in (progress or {}).items()
+                         if key in {"stage", "completed", "total", "percent"}},
+            "stats": {key: _strm_count(value) for key, value in (stats or {}).items() if key in _STRM_STAT_FIELDS}
+                     if isinstance(stats, dict) else {}}
+
+
+def strm_status(run_id: int | None = None) -> dict:
+    """查询指定持久run_id或本进程调度状态；只公开业务字段，不返回路径/地址/原始错误。"""
+    if run_id is not None:
+        if type(run_id) is not int or run_id <= 0:
+            raise ValueError("run_id必须是正整数")
+        row = db.get_task_run(run_id)
+        if row is None or str(row["task_name"]) != TASK_NAME:
+            return {"ok": False, "status": "unknown", "summary": "STRM同步状态暂时无法确认", "data": {}}
+        runtime = get_scheduler().status() if str(row["status"]) == "running" else {}
+        task = _public_strm_run(dict(row), runtime)
+        status = task["status"]
+        summary = {"running": "STRM同步任务正在运行", "completed": "STRM同步已完成", "partial": "STRM同步部分完成",
+                   "failed": "STRM同步执行失败", "unknown": "STRM同步状态暂时无法确认"}[status]
+        return {"ok": status in {"running", "completed"}, "status": status, "summary": summary,
+                "data": {"task": task, "runtime_scope": "current_process"},
+                "error": "STRM同步未成功完成。" if status in {"partial", "failed"} else ""}
+    from app.modules.strm_metadata_management import metadata_status
+
+    raw = get_scheduler().status()
+    sources, source_error = configured_strm_source_plans()
+    running, configured = bool(raw.get("running")), not bool(raw.get("config_error"))
+    last = raw.get("last_run") or {}
+    last_run = _public_strm_run(last, raw) if last.get("id") else {}
+    status = "not_configured" if not configured else "running" if running else "attention" if last.get("status") == "failed" else "ready"
+    return {"ok": status not in {"not_configured", "attention"}, "status": status,
+            "summary": {"not_configured": "STRM配置尚不完整", "running": "STRM同步正在运行",
+                        "attention": "最近一次STRM同步未成功", "ready": "STRM当前空闲"}[status],
+            "data": {"enabled": bool(raw.get("enabled")), "configured": configured, "cron_valid": bool(raw.get("cron_valid")),
+                     "running": running, "current_run_id": _strm_count(raw.get("current_run_id")),
+                     "current_trigger": str(raw.get("current_trigger") or ""), "next_run": str(raw.get("next_run") or ""),
+                     "progress": {key: value for key, value in (raw.get("progress") or {}).items()
+                                  if key in {"stage", "completed", "total", "percent"}},
+                     "sources": _public_strm_sources(sources) if not source_error else [],
+                     "source_error": bool(source_error), "last_run": last_run,
+                     "source_runtime": [{key: value for key, value in item.items() if key in {"id", "name", "status", "completed", "total"}}
+                                        for item in raw.get("source_runtime") or []],
+                     "metadata_queue": metadata_status(), "runtime_scope": "current_process"}}
+
+
+def diagnose_strm() -> dict:
+    """只读索引/文件存在性与失败账本，不修复、不扫描云盘；历史项保留真实run_id。"""
+    diagnostics = db.list_strm_index_diagnostics(config.get("STRM_ROOT", ""))
+    failures = db.summarize_strm_failures()
+    sources = list(failures.get("sources") or [])
+    recent = [_public_strm_run(dict(row), {}) for row in db.list_task_runs(TASK_NAME, limit=5)]
+    issues = _strm_count(diagnostics.get("missing")) + _strm_count(failures.get("open"))
+    return {"ok": issues == 0, "status": "healthy" if not issues else "attention",
+            "summary": "STRM索引与失败记录正常" if not issues else f"STRM发现{issues}项需要关注",
+            "data": {"index": {key: _strm_count(diagnostics.get(key)) for key in
+                               ("total", "existing", "missing", "real_source", "confirmed_test_artifact")},
+                     "failures": {"open": _strm_count(failures.get("open")), "resolved": _strm_count(failures.get("resolved")),
+                                  "source_count": len(sources), "by_source": [
+                                      {"id": str(item.get("id") or ""), "open": _strm_count(item.get("open"))} for item in sources]},
+                     "recent_runs": recent, "recent_limit": 5}}
+
+
+def strm_history(status: str = "all", limit: int = 50, offset: int = 0) -> dict:
+    """完整SQL历史分页；计数与页同快照，复用公共运行投影，异常不会返回伪空。"""
+    allowed = {"all", "running", "success", "partial", "failed", "skipped"}
+    if not isinstance(status, str) or status.strip().casefold() not in allowed:
+        raise ValueError("status必须为all/running/success/partial/failed/skipped")
+    if type(limit) is not int or limit <= 0 or type(offset) is not int or offset < 0:
+        raise ValueError("limit必须为正整数，offset必须为非负整数")
+    selected = status.strip().casefold()
+    page = db.query_task_runs_page(TASK_NAME, status="" if selected == "all" else selected, limit=limit, offset=offset)
+    page["items"] = [_public_strm_run(dict(row), {}) for row in page["items"]]
+    with db.get_conn() as conn:
+        rows = conn.execute("SELECT state,COUNT(*) AS count FROM strm_change_queue GROUP BY state").fetchall()
+    change_counts = dict.fromkeys(("queued", "running", "dirty", "completed", "failed"), 0)
+    for row in rows:
+        if row["state"] in change_counts:
+            change_counts[row["state"]] = int(row["count"])
+    from app.modules.strm_metadata_management import metadata_status
+
+    return {**page, "failure_context": db.get_strm_failure_triage_summary(),
+            "queue_context": {"change_queue": change_counts, "metadata_queue": metadata_status()}}

@@ -6,8 +6,10 @@ import json
 import logging
 import secrets
 from collections.abc import Mapping
+from copy import deepcopy
 from contextlib import ExitStack
 from dataclasses import replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
@@ -29,10 +31,11 @@ from app.agent.kernel.state_types import (
     _PublicationUnprotected,
 )
 from app.agent.kernel.tool_calls import PipelineResult, ToolCallContext
-from app.agent.public_safety import public_tool_label
+from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.agent.public_view import (
     format_partial_progress,
     format_public_result,
+    public_activity,
     public_result_state,
     sanitize_confirmed_answer,
 )
@@ -40,16 +43,16 @@ from app.sensitive_data import contains_sensitive_credential
 
 from . import telegram_reference
 from .adapters import TurnViewBuilder
-from .capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from .continuation import _ContinuationAction, continuation_record
+from .capabilities import KernelToolSpec, ToolEffect
+from .continuation import (
+    _ContinuationAction, active_remaining, continuation_record, record_budget, reserve_budget_values,
+)
 from .conversation_context import (
-    capability_retrieval_context,
     contextual_message,
     restore_messages,
     tool_error_message,
 )
-from .discovery import CapabilityDiscovery
-from .effects import EffectPlan
+from .tool_calls import EffectPlan
 from .events import TERMINAL_EVENT_TYPES, AgentEvent, AgentEventType, EventFactory
 from .model import (
     BudgetedModelAdapter,
@@ -59,12 +62,12 @@ from .model import (
 )
 from .provider_model import ModelProviderError, UncommittableModelTurn
 from .session_guard import foreground_execution_guard, session_scope_guard
-from .task_state import task_projection
+from .task_state import TaskPatch, task_projection
 
 if TYPE_CHECKING:
     from .session import AgentSession
 from .model_rounds import model_loop
-from .turn_history import persist_conversation, preserve_checkpoint, remember_result
+from .turn_history import persist_conversation, preserve_checkpoint, record_result, remember_result
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,7 @@ class AgentTurn:
                  resume_context: tuple[PublicationLease, SessionState, Mapping[str, Any]] | None = None) -> None:
         self.session = session
         self.agent_input = agent_input
+        self.request_time = datetime.now().astimezone().isoformat(timespec="seconds")
         self.queue = queue
         self.plan_id = plan_id
         self.explain_plan_id = explain_plan_id
@@ -130,6 +134,8 @@ class AgentTurn:
         self._budget_task_id = ""
         self._budget_model_attempts = self._budget_tool_attempts = 0
         self._budget_paid_models = self._budget_paid_tools = 0
+        self._budget_token_attempts = self._budget_paid_tokens = 0
+        self._local_budget = session.limits.budget()
         self.confirmed_result: dict[str, Any] | None = None
         self.diagnosing_effect = False
         self.reobservation_source = None
@@ -140,7 +146,9 @@ class AgentTurn:
         self.parallel_call_ids: set[str] = set()
         self.publication_lock = asyncio.Lock()
         self.progress_results: list[tuple[str, dict[str, Any]]] = []
-        self.unresolved_errors: dict[tuple[str, int, str], ToolPipelineError] = {}
+        self.activities: dict[str, dict[str, str]] = {}
+        self.unresolved_results: dict[tuple[str, int, str], dict[str, Any]] = {}
+        self.user_memory = ""
         self.last_business_tool = ""
         self.context_revision = 0
         self.has_tool_result = False
@@ -171,6 +179,8 @@ class AgentTurn:
                     })
                     return
                 self.prepare_context()
+                if not self.confirming:
+                    await self.reserve_budget()
                 if self.is_effect_resume and not await self.resume_effect():
                     return
                 if self.plan_id is not None and not await self.confirm_effect():
@@ -248,6 +258,8 @@ class AgentTurn:
                     self.scope.close()
                     if self.lease is not None and self.token is not None:
                         try:
+                            if hasattr(self, "tool_context"):
+                                await self.reserve_budget(stop=True)
                             if (not self.lease.continuation_id
                                     or continuation_record(self.state, self.lease.continuation_id, self.lease.continuation_kind).get("state") in {"claimed", "running"}):
                                 update = _ContinuationAction("", {
@@ -369,7 +381,8 @@ class AgentTurn:
                         ))
                         self.contextual_message = contextual_message(self.agent_input)
                     if self.candidate_context is not None:
-                        self.contextual_message += "\n已校验的回复批次，仅可从该引用解析候选编号：" + str(self.candidate_context.guard.ref)
+                        self.contextual_message += "\n已校验的回复候选批次，仅可选择这些真实 result_ids：" + json.dumps(
+                            [item["result_id"] for item in (self.state.metadata.get("ux_candidate_view") or {}).get("items", [])], ensure_ascii=False)
                     self.messages = restore_messages(self.state)
                     self.current_user_index = len(self.messages)
                     self.messages.append(ModelMessage(role="user", content=self.contextual_message, history_id=secrets.token_hex(8)))
@@ -404,12 +417,15 @@ class AgentTurn:
             lease=self.lease,
             cancellation=self.token,
             report_progress=self.report_progress,
+            task_control=self.control_task, task_budget=self.adopt_task_budget,
             wait_for_completion=True,
+            read_only=bool(self.agent_input.initial_read_tool),
             channel=self.agent_input.channel,
             continuation_binding=self.session.continuation_binding,
             delivery_route=self.agent_input.delivery_route,
             continuation_policy={"model_policy": self.selected_model,
-                "model_limit": self.session.limits.max_model_rounds, "tool_limit": self.session.limits.max_tool_calls},
+                "model_limit": self.session.limits.max_model_rounds, "tool_limit": self.session.limits.max_tool_calls,
+                "budget": self.task_budget or self._local_budget},
             selection_arguments=self.validated_selection.arguments if self.validated_selection else None,
             resource_candidate_ref=self.candidate_context.guard.ref if self.candidate_context else "",
             # Capture the admitted/restored task before either stale refresh or
@@ -458,6 +474,19 @@ class AgentTurn:
         """确认只执行一次，保存真实回执后再进入只读诊断/后续规划。"""
         plan_id = self.plan_id
         assert plan_id is not None
+        lease = self.lease
+        assert lease is not None
+        plan = await self.session.pipeline.get_confirmation_evidence(
+            owner=self.agent_input.owner, session_id=self.agent_input.session_id, scoped=True,
+        )
+        if plan is not None and plan.plan_id == plan_id and (frozen := plan.metadata.get("continuation_budget")):
+            if not lease.continuation_id:
+                self._budget_task_id = frozen.get("task_id", "")
+                self._local_budget = deepcopy(frozen["budget"])
+            self._budget_paid_models = self._budget_model_attempts
+            self._budget_paid_tools = self._budget_tool_attempts
+            self._budget_paid_tokens = self._budget_token_attempts
+        await self.reserve_budget()
         public_result: dict[str, Any]
         result = None
         try:
@@ -502,10 +531,12 @@ class AgentTurn:
                 self.lease = adopted
                 self.state = await self.session.state_store.load(owner=adopted.owner, session_id=adopted.session_id)
                 self.tool_context = replace(self.tool_context, lease=adopted)
-                # 确认前的规划成本不属于新领取的 effect 续行。
+                # 新租约已继承冻结预算；本地已入账尝试只防止重复扣减，不清零原账。
                 self._budget_task_id = ""
                 self._budget_paid_models = self._budget_model_attempts
                 self._budget_paid_tools = self._budget_tool_attempts
+                self._budget_paid_tokens = self._budget_token_attempts
+                self.sync_budget_context()
                 if result is None:
                     from .continuation import confirmed_result as restore_confirmed
                     result = restore_confirmed(self.session.catalog, self.state, continuation_record(self.state, adopted.continuation_id, adopted.continuation_kind))
@@ -532,6 +563,18 @@ class AgentTurn:
             self.confirmed_result = public_result
             await self.failure("receipt_unavailable", "执行结果已取得，但会话记录保存失败，未继续后续步骤；请先核对任务状态。")
             return False
+        if plan is not None and plan.plan_id == plan_id:
+            # 执行回执已有专门的事件与正文位置，不再混入后续查询重复展示。
+            # 计划参数可被 validator/预检扩充；结清准入拒绝必须回到该计划的原调用。
+            arguments = plan.arguments
+            for index, message in enumerate(self.messages):
+                if message.role == "tool" and message.effect_plan_id == plan_id:
+                    original = next((call for previous in reversed(self.messages[:index])
+                                     for call in previous.tool_calls if call.call_id == message.tool_call_id), None)
+                    if original is not None and original.arguments is not None:
+                        arguments = original.arguments
+                    break
+            record_result(self, plan.tool_name, arguments, public_result, progress=False)
         background = (public_result.get("data") or {}).get("background_job") or {}
         if background.get("followup_pending") and str(background.get("status") or "") not in {
                 "completed", "partial", "failed", "cancelled", "manual_review", "stopped"}:
@@ -563,38 +606,28 @@ class AgentTurn:
 
     async def prepare_tools(self) -> None:
         lease = self.tool_context.lease
+        if self.session.user_memory is not None and self.agent_input.owner:
+            try:
+                self.user_memory = (await asyncio.to_thread(self.session.user_memory, self.agent_input.owner)).strip()
+            except Exception as exc:  # noqa: BLE001 - 记忆不可用不能阻断回合
+                logger.warning("用户长期记忆读取失败 type=%s", type(exc).__name__)
         reference_kinds = tuple(self.state.ref_kinds | ({"telegram_reference"} if self.agent_input.reply_context.get("reference_handle") or any(row.get("reply_context", {}).get("reference_handle") for row in self.state.conversation) else set()))
-        history = capability_retrieval_context(
-            self.state, current_turn=self.current_user_index is not None and not self.sensitive_input,
-        )
-        context = {
-            **history,
+        self.model_context = {
             "owner": self.agent_input.owner, "session_id": self.agent_input.session_id,
             "request_id": self.agent_input.request_id, "channel": self.agent_input.channel,
             "generation": lease.generation, "turn_id": lease.turn_id,
             "has_task": bool(self.state.metadata.get("task")),
+            "has_pending_effect": bool(self.state.pending_effect_plan_id),
             "reference_kinds": reference_kinds,
-            "has_current_reference": bool(self.agent_input.reply_context.get("text")),
         }
-        selection = None if self.explaining or self.agent_input.initial_read_tool else self.session.retriever.retrieve(
-            self.contextual_message, self.session.catalog, context=context,
-        )
-        self.discovery = CapabilityDiscovery(
-            self.session.catalog,
-            context=context,
-            maximum=self.session.limits.capability_window,
-        )
-        # 接力的整个回合只开放 READ，能力发现 callback 也不能加载写工具。
-        initial_tool = None
+        self.refresh_model_tools()
         self.pending_initial_read = None
         if self.agent_input.initial_read_tool:
-            self.discovery.catalog = ToolCatalog(
-                tool for tool in self.session.catalog.visible(self.discovery.context)
-                if tool.effect is ToolEffect.READ
-            )
             initial_tool = self.session.catalog.get(self.agent_input.initial_read_tool)
             if initial_tool.effect is not ToolEffect.READ:
                 raise ToolPipelineError("工作区行动必须是只读能力。", code="read_handoff_invalid")
+            self.pending_initial_read = ModelToolCall(secrets.token_urlsafe(12), initial_tool.model_name,
+                                                     dict(self.agent_input.initial_read_arguments))
         source = self.tool_context.reobservation_source
         source_read = source.get("read") if isinstance(source, Mapping) and source.get("available") is True else None
         source_name = source_read.get("tool") if isinstance(source_read, Mapping) else None
@@ -602,23 +635,6 @@ class AgentTurn:
         if not (self.diagnosing_effect and source_spec is not None and source_spec.effect is ToolEffect.READ
                 and "reobserve" in source_spec.input_schema.get("properties", {}).get("operation", {}).get("enum", ())):
             source_spec = None
-        # 真实确认结果的只读邻接优先用于核验；仍受同一窗口、可见性与授权过滤。
-        # 失败重观察保留最高优先级；加载不等于执行，更不为后续写入授予权限。
-        effect = self.tool_context.confirmed_effect
-        readbacks = tuple(self.session.catalog.get(name) for name in (
-            effect.tool.metadata.get("related_tools", ()) if effect else ()
-        ) if self.session.catalog.has(name) and self.session.catalog.get(name).effect is ToolEffect.READ)
-        # 历史调用仍在模型上下文中，其只读 Schema 按剩余容量续用，避免换话题
-        # 后同一能力突然不可调用。当前查询优先；仍由唯一窗口重查可见性与授权。
-        recent_reads = tuple(self.session.catalog.get(name) for name in history["recent_tool_names"]
-            if self.session.catalog.has(name) and self.session.catalog.get(name).effect is ToolEffect.READ)
-        self.selected_tools = () if self.explaining else self.discovery.window(
-            (selection.tools if selection else ()) + recent_reads,
-            ((initial_tool,) if initial_tool else ()) + ((source_spec,) if source_spec else ()) + readbacks)
-        if initial_tool is not None:
-            if initial_tool not in self.selected_tools:
-                raise ToolPipelineError("工作区行动当前不可用。", code="read_handoff_invalid")
-            self.pending_initial_read = ModelToolCall(secrets.token_urlsafe(12), initial_tool.model_name, {})
         self.pending_resume_call = None
         if self.resume_context is not None:
             from .continuation import history_call
@@ -628,10 +644,6 @@ class AgentTurn:
                 self.resumed_tool = self.session.catalog.get(record["anchor"]["tool"])
                 if self.resumed_tool.effect is not ToolEffect.READ or self.resumed_tool.name.startswith("agent."):
                     raise ToolPipelineError("等待能力不可恢复。", code="read_resume_invalid")
-                self.selected_tools = self.discovery.window(self.selected_tools, (self.resumed_tool,))
-        if self.validated_selection is not None:
-            assert self.selection_tool is not None
-            self.selected_tools = (self.selection_tool,)
         await self.publish(
             AgentEventType.CAPABILITIES_SELECTED,
             {
@@ -639,24 +651,26 @@ class AgentTurn:
                 "count": len(self.selected_tools),
             },
         )
-        self.available_names = {name for tool in self.selected_tools for name in (tool.name, tool.model_name)}
         if (self.pending_resume_call is None and self.tool_context.diagnostic_only
-                and source_spec is not None and source_spec.name in self.available_names):
+                and source_spec is not None):
             # 可信旧计划已保存原观察范围；重读不是新写入，不要求模型再征求许可。
             # 共用READ的准入、预算、检查点和取消链，不重放旧写操作。
             self.resumed_tool = source_spec
             self.pending_resume_call = {"arguments": {"operation": "reobserve"}}
-        self.tool_definitions = tuple(
-            tool.model_definition() for tool in self.selected_tools
-        )
         self.total_tool_calls = 0
         self.business_tool_calls = 0
         self.write_tool_calls = 0
-        self.discovery_tool_calls = 0
-        self.tool_budget_blocked = False
         self.total_usage: dict[str, int] = {}
         self.observed_reads: set[tuple[str, str]] = set()
-        self.tool_context = replace(self.tool_context, capability_search=self.discovery.search)
+
+    def refresh_model_tools(self) -> None:
+        self.model_context.update(reference_kinds=tuple(self.state.ref_kinds),
+                                  has_task=bool(self.state.metadata.get("task")),
+                                  has_pending_effect=bool(self.state.pending_effect_plan_id))
+        tools = () if self.explaining else self.session.visible_model_tools(self.model_context)
+        self.selected_tools = tuple(tool for tool in tools if not self.agent_input.initial_read_tool or tool.effect is ToolEffect.READ)
+        self.available_names = {name for tool in self.selected_tools for name in (tool.name, tool.model_name)}
+        self.tool_definitions = tuple(tool.model_definition() for tool in self.selected_tools)
 
     async def preview_selection(self) -> None:
         selection, tool = self.validated_selection, self.selection_tool
@@ -676,7 +690,7 @@ class AgentTurn:
         answer = "" if plan else format_public_result(dict(result.outcome.public_content))
         if answer:
             self.messages.append(ModelMessage(role="assistant", content=answer))
-        await persist_conversation(self)
+        await persist_conversation(self, preserve_capacity=plan is not None)
         await self.publish(AgentEventType.TURN_COMPLETED, {
             "status": "approval_required" if plan else "success", "answer": answer,
             "plan_id": plan.plan_id if plan else "", "usage": {}, "model_calls": 0, "tool_calls": 1,
@@ -729,7 +743,8 @@ class AgentTurn:
         if self.confirmed_result is not None or self.has_tool_result:
             answer = format_partial_progress(
                 message, self.progress_results, confirmed_result=self.confirmed_result, write_attempted=self.attempted_write,
-                current_errors=self.unresolved_errors.values(), analysis_text=analysis_text,
+                current_errors=(result.get("error") or result.get("summary") for result in self.unresolved_results.values()),
+                analysis_text=analysis_text,
             )
             self.messages.append(ModelMessage(role="assistant", content=answer, effect_plan_id=self.plan_id or ""))
         await preserve_checkpoint(self)
@@ -801,6 +816,16 @@ class AgentTurn:
                 and not await self.session.state_store.is_current(self.lease)):
             raise StalePublicationError("event revoked during journal I/O")
         await self.record_continuation_event(event)
+        activity = public_activity(event.payload.get("activity"))
+        if event.type.value == "model.reasoning_summary.delta":
+            identity = f"reasoning:{event.payload.get('round', 1)}:{event.payload.get('summary_id', '')}"
+            previous = self.activities.get(identity, {}).get("text", "")
+            activity = {"id": identity, "kind": "reasoning",
+                        "text": (previous + str(event.payload.get("delta", "")))[:8000]}
+        if activity:
+            self.activities[activity["id"]] = activity
+            if len(self.activities) > 80:
+                del self.activities[next(iter(self.activities))]
         self.emit(event)
 
     async def report_progress(self, payload: Mapping[str, Any]) -> None:
@@ -813,7 +838,17 @@ class AgentTurn:
         tool_name: str | None = None,
         **payload: Any,
     ) -> None:
+        assert self.factory is not None
         public_name = tool_name or call.name
+        if not public_name.startswith("agent."):
+            status = {AgentEventType.TOOL_STARTED: "running", AgentEventType.TOOL_COMPLETED: "success",
+                      AgentEventType.TOOL_FAILED: "failed", AgentEventType.EFFECT_APPROVAL_REQUIRED: "approval_required"}.get(event_type)
+            if status:
+                result = payload.get("result") or {}
+                payload["activity"] = public_activity({"id": f"tool:{self.factory.turn_id}:{self.round_index}:{call.call_id}", "kind": "tool",
+                    "method": public_name, "label": public_tool_label(public_name),
+                    "status": "failed" if result.get("ok") is False else "partial" if result.get("status") == "partial" else status,
+                    "summary": payload.get("message") or result.get("summary") or ""})
         await self.publish(event_type, {
             "call_id": call.call_id,
             "tool": public_name,
@@ -863,20 +898,23 @@ class AgentTurn:
         )
 
     async def finish_answer(self, answer: str, status: str, reason: str, model_calls: int,
-                            *, response_state: ProviderState | None = None) -> None:
+                            *, response_state: ProviderState | None = None, interrupted: bool = False) -> None:
         """正常回答与预算收尾共用一次持久化/终态发布，不丢失工具调用协议。"""
-        if self.unresolved_errors:
+        if self.unresolved_results and (interrupted or self.attempted_write or self.confirmed_result is not None):
             # 预算收尾仍以真实阻塞为准；语法错误不能掩盖尚未恢复的服务错误。
-            pending_error = next((error for error in self.unresolved_errors.values()
-                                  if error.code != "invalid_arguments"),
-                                 next(iter(self.unresolved_errors.values())))
-            message = f"仍有工具调用受到频率限制：{pending_error}" if pending_error.code == "rate_limited" else str(pending_error)
-            await self.failure(pending_error.code, message, analysis_text=answer)
+            pending = next((result for result in self.unresolved_results.values()
+                            if result.get("status") != "invalid_arguments"),
+                           next(iter(self.unresolved_results.values())))
+            await self.failure(str(pending.get("status") or "tool_failed"),
+                               sanitize_public_text(pending.get("error") or pending.get("summary")) or "工具调用未取得完整结果。",
+                               analysis_text=answer)
             return
+        if self.unresolved_results:
+            status = "partial"
         answer = answer or format_partial_progress(
             "本轮预算已用完，已保留已取得的结果；可回复继续。", self.progress_results,
             confirmed_result=self.confirmed_result, write_attempted=self.attempted_write,
-            current_errors=self.unresolved_errors.values(),
+            current_errors=(result.get("error") or result.get("summary") for result in self.unresolved_results.values()),
         )
         public_answer = sanitize_confirmed_answer(
             answer, self.confirmed_result, results=self.progress_results,
@@ -887,9 +925,28 @@ class AgentTurn:
             "status": status, "answer": public_answer, "finish_reason": reason,
             "usage": self.total_usage, "model_calls": model_calls, "tool_calls": self.total_tool_calls,
             "business_tool_calls": self.business_tool_calls,
-            "discovery_tool_calls": self.discovery_tool_calls,
+            "discovery_tool_calls": 0,
             "successful_read_queries": len(self.observed_reads),
         })
+
+    async def control_task(self, patch: TaskPatch | None) -> dict | None:
+        """原TaskPatch发布事务的原生入口；不新建任务存储或另一套收据。"""
+        self.tool_context.cancellation.raise_if_cancelled()
+        if not await self.session.state_store.is_current(self.tool_context.lease):
+            raise StalePublicationError("turn lost publication authority")
+        if patch is not None:
+            if patch.operation != "observe":
+                await self.reserve_budget(task_operation=patch.operation)
+            try:
+                await persist_conversation(self, task_patch=patch, preserve_capacity=True)
+            except ValueError as exc:
+                raise ToolPipelineError(str(exc), code="task_conflict") from exc
+            self.tool_context = replace(self.tool_context, current_task=self.state.metadata.get("task"))
+        return deepcopy(self.state.metadata.get("task"))
+
+    async def adopt_task_budget(self) -> None:
+        # 每段代码首次业务调用选取一次原累计预算，不按每个RPC重复记账。
+        await self.reserve_budget(task_operation="use")
 
     @property
     def uses_session_task(self) -> bool:
@@ -901,9 +958,9 @@ class AgentTurn:
 
     @property
     def task_budget(self) -> dict | None:
-        lease = self.tool_context.lease
-        if lease.continuation_id:
-            return continuation_record(self.state, lease.continuation_id, lease.continuation_kind)["budget"]
+        lease = self.lease
+        if lease is not None and lease.continuation_id:
+            return record_budget(self.state, continuation_record(self.state, lease.continuation_id, lease.continuation_kind))
         if self._budget_task_id:
             record = self.state.metadata.get("read_wait") or {}
             if record.get("task_id") != self._budget_task_id:
@@ -911,37 +968,79 @@ class AgentTurn:
             return record["budget"]
         return None
 
-    async def reserve_budget(self, *, model: int = 0, tools: int = 0,
+    def sync_budget_context(self) -> None:
+        budget = self.task_budget or self._local_budget
+        policy = self.tool_context.continuation_policy
+        lease = self.lease
+        assert policy is not None and lease is not None
+        policy["budget"] = budget
+        record = continuation_record(self.state, lease.continuation_id, lease.continuation_kind) if lease.continuation_id else {}
+        policy["budget_task_id"] = record.get("budget_task_id", "") or self._budget_task_id
+        remaining = active_remaining(budget, self.session.state_store._clock())
+        policy["deadline"] = None if remaining is None else asyncio.get_running_loop().time() + remaining
+
+    def seed_budget(self) -> dict:
+        budget = deepcopy(self._local_budget) if self.task_budget is None else {
+                **self.session.limits.budget(),
+                "model_spent": self._budget_model_attempts - self._budget_paid_models,
+                "tool_spent": self._budget_tool_attempts - self._budget_paid_tools,
+                "token_spent": self._budget_token_attempts - self._budget_paid_tokens,
+                "active_since": self.session.state_store._clock()}
+        # task预算一直计全部尝试；前台业务调用的发现折算不能扩大持久续行额度。
+        budget.pop("discovery_spent", None)
+        return budget
+
+    async def reserve_budget(self, *, model: int = 0, tools: int = 0, tokens: int = 0,
                              tool: KernelToolSpec | None = None,
-                             arguments: Mapping[str, Any] | None = None) -> None:
+                             arguments: Mapping[str, Any] | None = None, stop: bool = False,
+                             task_operation: str | None = None) -> None:
         self._budget_model_attempts += model
         self._budget_tool_attempts += tools
-        if self.session.continuation_binding is None:
-            return
+        self._budget_token_attempts += tokens
         lease = self.tool_context.lease
-        operation = (arguments or {}).get("operation") if tool is not None and tool.name == "agent.task" else None
-        if not lease.continuation_id and (operation in ("create", "cancel")
-                                         or (tool is not None and tool.name == "agent.pending_plan")):
-            return  # 耗尽后仍可停止/选择新任务；新建时在原事务内归账。
-        if tool is not None and not lease.continuation_id and not self._budget_task_id:
+        operation = task_operation
+        control = not lease.continuation_id and operation in ("create", "cancel")
+        selected = False
+        if (self.session.continuation_binding is not None and (tool is not None or operation is not None)
+                and not lease.continuation_id and not self._budget_task_id and not control):
             task = self.state.metadata.get("task")
             record = self.state.metadata.get("read_wait") or {}
-            continuing = (operation in ("checkpoint", "revise") or (
+            continuing = (operation in ("checkpoint", "revise")
+                or (operation == "use" and self.uses_session_task and task and task["status"] in {"partial", "blocked"}) or (
                 self.uses_session_task and task and task["status"] in {"partial", "blocked"}
-                and tool.name != "agent.capabilities"
-                and (not tool.metadata.get("kernel_utility") or tool.effect is not ToolEffect.READ
-                     or tool.name in {"agent.read_result", "agent.repair"})))
+                and tool is not None and tool.name != "agent.run_code"
+                and (not tool.metadata.get("kernel_utility") or tool.effect is not ToolEffect.READ)))
             if continuing and task and record.get("task_id") == task["task_id"]:
                 self._budget_task_id = task["task_id"]
-        if self.task_budget is not None:
-            try:
+                selected = True
+        budget = self.task_budget
+        value = {key: value for key, value in self.session.limits.budget().items() if key.endswith("_limit")}
+        value.update(stop=stop)
+        value["discovery_spent"] = 0
+        try:
+            if budget is not None and not control:
+                value.update(model_spent=0 if stop else self._budget_model_attempts - self._budget_paid_models,
+                             tool_spent=0 if stop else self._budget_tool_attempts - self._budget_paid_tools,
+                             token_spent=0 if stop else self._budget_token_attempts - self._budget_paid_tokens)
+                if selected:
+                    reserve_budget_values(self._local_budget, {"stop": True}, self.session.state_store._clock())
+                    value["active_spent"] = self._local_budget["active_spent"]
+                    value["discovery_spent"] += self._local_budget.get("discovery_spent", 0)
                 self.state = await self.session.state_store.commit(lease, updates=(_ContinuationAction("", {
-                    "operation": "reserve", "task_id": self._budget_task_id,
-                    "model_spent": self._budget_model_attempts - self._budget_paid_models,
-                    "tool_spent": self._budget_tool_attempts - self._budget_paid_tools,
-                    "model_limit": self.session.limits.max_model_rounds, "tool_limit": self.session.limits.max_tool_calls,
+                    **value, "operation": "reserve", "task_id": self._budget_task_id,
                 }, binding=self.session.continuation_binding),))
-            except ValueError as exc:
-                raise ToolPipelineError("任务累计预算已用完，未继续调用。", code="task_budget_exceeded") from exc
-            self._budget_paid_models = self._budget_model_attempts
-            self._budget_paid_tools = self._budget_tool_attempts
+                self._budget_paid_models = self._budget_model_attempts
+                self._budget_paid_tools = self._budget_tool_attempts
+                self._budget_paid_tokens = self._budget_token_attempts
+            elif not control or budget is None:
+                reserve_budget_values(self._local_budget, {**value, "model_spent": model,
+                    "tool_spent": tools, "token_spent": tokens}, self.session.state_store._clock())
+        except ValueError as exc:
+            if selected:
+                self._budget_task_id = ""  # 未取得原任务预算，不能在收尾时改写它。
+            reason = str(exc)
+            code = (reason if reason in {"token_budget_exceeded", "active_time_budget_exceeded"}
+                    else "task_budget_exceeded" if budget is not None
+                    else "model_round_budget_exceeded" if model else "tool_budget_exceeded")
+            raise ToolPipelineError("累计执行预算已用完，未继续调用；估算token额度不是实际账单。", code=code) from exc
+        self.sync_budget_context()

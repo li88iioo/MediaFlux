@@ -7,11 +7,7 @@ from fastapi import APIRouter, Body, Query, Request
 from app import database as db
 from app.logger import get_logger
 from app.modules.rss import RSSEngine, rss_entry_delivery
-from app.modules.rss_subscription_config import (
-    normalize_rss_subscription_create,
-    normalize_rss_subscription_update,
-    wake_rss_scheduler,
-)
+from app.modules.rss_subscriptions import RSSSubscriptionError, apply_change
 from app.web import api_error, api_response, require_api_login
 
 logger = get_logger(__name__)
@@ -52,16 +48,23 @@ def list_subs(request: Request):
     } for r in rows])
 
 
+def _subscription_response(result: dict):
+    if not result["ok"]:
+        return api_error(result.get("error") or result["summary"], 409 if result["status"] == "conflict" else 503)
+    data = {"success": True}
+    if result["data"]["operation"] == "create":
+        data["id"] = result["data"]["subscription_id"]
+    return api_response(data)
+
+
 @router.post("/subscriptions")
 def create_sub(request: Request, data: dict = Body(...)):
     require_api_login(request)
     try:
-        fields = normalize_rss_subscription_create(data, allow_target_paths=True)
+        result = apply_change("create", data)
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
-    sub_id = db.add_rss_subscription(**fields)
-    wake_rss_scheduler()
-    return api_response({"success": True, "id": sub_id})
+    return _subscription_response(result)
 
 
 @router.put("/subscriptions/{sid}")
@@ -71,21 +74,22 @@ def update_sub(sid: int, request: Request, data: dict = Body(...)):
     if current is None:
         return api_error("订阅项不存在", 404)
     try:
-        fields = normalize_rss_subscription_update(
-            data, current=dict(current), allow_target_paths=True
-        )
+        if "subscription_id" in data:
+            raise ValueError("订阅配置包含未支持字段")
+        result = apply_change("update", {**data, "subscription_id": sid})
     except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
-    db.update_rss_subscription(sid, fields)
-    wake_rss_scheduler()
-    return api_response({"success": True})
+    return _subscription_response(result)
 
 
 @router.delete("/subscriptions/{sid}")
 def delete_sub(sid: int, request: Request):
     require_api_login(request)
-    db.delete_rss_subscription(sid)
-    wake_rss_scheduler()
+    if db.get_rss_subscription(sid) is not None:
+        try:
+            return _subscription_response(apply_change("delete", {"subscription_id": sid}))
+        except RSSSubscriptionError as exc:
+            return api_error(str(exc), 409 if exc.code == "busy" else 400)
     return api_response({"success": True})
 
 

@@ -4,7 +4,6 @@
 {"id":"library-total","message":"我的媒体库中的媒体总数是多少","required":["provider.capabilities","provider.query"]}
 {"id":"qb-live","message":"查看 qBittorrent 当前实时任务、速度和进度","required":["provider.capabilities","provider.query","downloads.diagnose_queue"]}
 {"id":"subscription-summary","message":"我配置了哪些 RSS 订阅源和媒体订阅","required":["rss.subscription_summaries","media.subscription_summaries"]}
-{"id":"resource-search","message":"搜索一下蜘蛛侠崭新之日有没有资源","required":["indexer.search_resources"]}
 {"id":"rss-create","message":"https://mikanani.me/RSS/Bangumi?bangumiId=3979&subgroupid=1256 把这个添加到 RSS 订阅，6 小时刷新，下载到 QB，排除关键字 日，不启用","required":["rss.create_subscription"]}
 {"id":"series-count","message":"我的媒体库里光阴之外有多少集？","required":["library.count_series_episodes"]}
 {"id":"cloud-reorganize","message":"规整一下光鸭云盘根目录/动漫里的从零开始的异世界生活，创建一个新目录，然后按照 TMDB 1-85 集的方式重命名规整","required":["guangya.episode_naming.inspect","guangya.episode_naming.plan"]}

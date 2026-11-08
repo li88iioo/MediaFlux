@@ -7,7 +7,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from app.agent.domains.library.patrol_status import validate_persisted_patrol_projection
+from app.modules.library_patrol import validate_persisted_patrol_projection
 from app.config import get
 from app.notifier import NotificationAction, NotificationEvent, TelegramSendResult
 

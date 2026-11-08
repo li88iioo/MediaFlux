@@ -158,215 +158,32 @@ class MediaFluxPolicyTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.code, "rate_limited")
 
-    async def test_provider_query_budget_is_shared_by_provider_and_owner(self) -> None:
-        from app import database as db
-        from app.agent.provider_actions import get_provider_gateway
-
-        db.init_db()
-        from app.agent.provider_models import ProviderProfileView
-        profiles = [ProviderProfileView(ref, provider, ref, "online") for ref, provider in
-                    (("media-profile-a", "media"), ("media-profile-b", "media"), ("qb-profile-a", "qbittorrent"))]
-        with patch.object(get_provider_gateway(), "profiles", side_effect=lambda provider="": [p for p in profiles if not provider or p.provider == provider]):
-            await self._provider_budget_checks(get_provider_gateway().catalog)
-
-    async def _provider_budget_checks(self, catalog):
-        media_operation = catalog.get("media.system.info")
-        other_media_operation = catalog.get("media.items.counts")
-        qbittorrent_operation = catalog.get("qb.app.version")
-        self.assertEqual(media_operation.provider, "media")
-        self.assertEqual(other_media_operation.provider, "media")
-        self.assertEqual(qbittorrent_operation.provider, "qbittorrent")
-
-        # tests package pins the shared limiter to its isolated SQLite database.
-        first_limiter = MediaFluxToolRateLimiter()
-        second_limiter = MediaFluxToolRateLimiter()
-        owner = f"live-p2-01:{uuid.uuid4().hex}"
-        for index in range(8):
-            await (first_limiter if index % 2 == 0 else second_limiter).acquire(
-                owner=owner,
-                tool_name="provider.query",
-                cost=1,
-                arguments={
-                    "profile_ref": "media-profile-a",
-                    "operation": media_operation.operation_id,
-                    "arguments": {},
-                },
-            )
-
-        # Operation and profile changes do not mint another media-provider bucket.
-        with self.assertRaises(ToolPipelineError) as changed_operation:
-            await second_limiter.acquire(
-                owner=owner,
-                tool_name="provider.query",
-                cost=1,
-                arguments={
-                    "profile_ref": "media-profile-a",
-                    "operation": other_media_operation.operation_id,
-                    "arguments": {},
-                },
-            )
-        self.assertEqual(changed_operation.exception.code, "rate_limited")
-        self.assertIn("MediaFlux", str(changed_operation.exception))
-        self.assertIn("本地", str(changed_operation.exception))
-        self.assertIn("未访问后端", str(changed_operation.exception))
-
-        with self.assertRaises(ToolPipelineError) as changed_profile:
-            await first_limiter.acquire(
-                owner=owner,
-                tool_name="provider.query",
-                cost=1,
-                arguments={
-                    "profile_ref": "media-profile-b",
-                    "operation": media_operation.operation_id,
-                    "arguments": {},
-                },
-            )
-        self.assertEqual(changed_profile.exception.code, "rate_limited")
-
-        # A different owner has an independent budget; a different static provider
-        # has a separate suffix even for the original owner.
-        await second_limiter.acquire(
-            owner=f"live-p2-01:{uuid.uuid4().hex}",
-            tool_name="provider.query",
-            cost=1,
-            arguments={
-                "profile_ref": "media-profile-a",
-                "operation": media_operation.operation_id,
-                "arguments": {},
-            },
-        )
-        await second_limiter.acquire(
-            owner=owner,
-            tool_name="provider.query",
-            cost=1,
-            arguments={
-                "profile_ref": "qb-profile-a",
-                "operation": qbittorrent_operation.operation_id,
-                "arguments": {},
-            },
-        )
-
-    async def test_unknown_provider_operation_does_not_consume_budget(self) -> None:
-        limiter = MediaFluxToolRateLimiter()
-        with (
-            patch(
-                "app.agent.kernel.ports.mediaflux_policy.consume_agent_tool",
-                return_value=RateLimitDecision(
-                    allowed=True, limit=8, cost=1, remaining=7,
-                    retry_after_seconds=0.0, retry_at_epoch=None, reason="allowed",
-                ),
-            ) as allowed,
-            self.assertRaises(ToolPipelineError) as raised,
-        ):
-            await limiter.acquire(
-                owner="owner",
-                tool_name="provider.query",
-                cost=1,
-                arguments={
-                    "profile_ref": "not-used",
-                    "operation": "media.operation.not_registered",
-                    "arguments": {},
-                },
-            )
-        self.assertEqual(raised.exception.code, "invalid_arguments")
-        assert raised.exception.argument_schemas is not None
-        self.assertIn("operation", raised.exception.argument_schemas)
-        allowed.assert_not_called()
 
     async def test_preview_cannot_spend_confirmation_budget_across_workers(self) -> None:
         with isolated_test_database("confirmation-stage-budget.db"):
             limiters = (MediaFluxToolRateLimiter(), MediaFluxToolRateLimiter())
             owner = "webk:v1:" + uuid.uuid4().hex * 2
-            # Three complete preview/confirm pairs must work, including the
-            # first confirmation after the entire preview budget was spent.
+            # Every preview/confirm pair within the policy limit must work, including
+            # the first confirmation after the entire preview budget was spent.
+            from app.agent.rate_limit import tool_rate_limit_policy
+
+            limit = tool_rate_limit_policy("cloud.change")[1]
             for stage in ("", "confirm:"):
-                for index in range(3):
+                for index in range(limit):
                     await limiters[index % 2].acquire(
-                        owner=owner, tool_name=stage + "guangya.fs.change.execute",
+                        owner=owner, tool_name=stage + "cloud.change",
                         cost=1, arguments={},
                     )
                 with self.assertRaises(ToolPipelineError) as raised:
                     await limiters[1].acquire(
-                        owner=owner, tool_name=stage + "guangya.fs.change.execute",
+                        owner=owner, tool_name=stage + "cloud.change",
                         cost=1, arguments={},
                     )
                 self.assertEqual(raised.exception.code, "rate_limited")
                 self.assertIn("未访问后端", str(raised.exception))
 
-    async def test_guangya_directory_scrape_reads_have_independent_budgets(self) -> None:
-        with isolated_test_database("guangya-scrape-rate-limit.db"):
-            first_limiter = MediaFluxToolRateLimiter()
-            second_limiter = MediaFluxToolRateLimiter()
-            owner = "webk:v1:" + uuid.uuid4().hex * 2
-            other_owner = "webk:v1:" + uuid.uuid4().hex * 2
 
-            async def acquire(
-                limiter: MediaFluxToolRateLimiter, principal: str, tool_name: str
-            ) -> None:
-                await limiter.acquire(
-                    owner=principal,
-                    tool_name=tool_name,
-                    cost=1,
-                    arguments={},
-                )
-
-            # Different sessions/workers with the same owner share SQLite budgets.
-            for _ in range(2):
-                await acquire(
-                    first_limiter, owner, "guangya.directory_scrape.inspect"
-                )
-                await acquire(
-                    second_limiter, owner, "guangya.directory_scrape.search"
-                )
-
-            # Two inspect calls must not spend the search budget; search call 3
-            # and preview call 1 both remain available.
-            await acquire(
-                first_limiter, owner, "guangya.directory_scrape.search"
-            )
-            await acquire(
-                second_limiter, owner, "guangya.directory_scrape.preview"
-            )
-
-            # Each read tool independently allows four calls, then rejects call 5.
-            await acquire(
-                first_limiter, owner, "guangya.directory_scrape.search"
-            )
-            with self.assertRaises(ToolPipelineError) as search_limited:
-                await acquire(
-                    second_limiter, owner, "guangya.directory_scrape.search"
-                )
-            self.assertEqual(search_limited.exception.code, "rate_limited")
-
-            for _ in range(2):
-                await acquire(
-                    second_limiter, owner, "guangya.directory_scrape.inspect"
-                )
-            with self.assertRaises(ToolPipelineError) as inspect_limited:
-                await acquire(
-                    first_limiter, owner, "guangya.directory_scrape.inspect"
-                )
-            self.assertEqual(inspect_limited.exception.code, "rate_limited")
-
-            for _ in range(3):
-                await acquire(
-                    first_limiter, owner, "guangya.directory_scrape.preview"
-                )
-            with self.assertRaises(ToolPipelineError) as preview_limited:
-                await acquire(
-                    second_limiter, owner, "guangya.directory_scrape.preview"
-                )
-            self.assertEqual(preview_limited.exception.code, "rate_limited")
-
-            # A different owner has an independent per-tool budget.
-            for tool_name in (
-                "guangya.directory_scrape.inspect",
-                "guangya.directory_scrape.search",
-                "guangya.directory_scrape.preview",
-            ):
-                await acquire(second_limiter, other_owner, tool_name)
-
-    async def test_guangya_directory_scrape_run_confirm_has_own_write_budget(self) -> None:
+    async def test_native_cloud_scrape_confirm_has_own_write_budget(self) -> None:
         with isolated_test_database("guangya-scrape-run-rate-limit.db"):
             first_limiter = MediaFluxToolRateLimiter()
             second_limiter = MediaFluxToolRateLimiter()
@@ -375,7 +192,7 @@ class MediaFluxPolicyTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(3):
                 await first_limiter.acquire(
                     owner=owner,
-                    tool_name="guangya.directory_scrape.run",
+                    tool_name="cloud.scrape",
                     cost=1,
                     arguments={},
                 )
@@ -383,14 +200,14 @@ class MediaFluxPolicyTests(unittest.IsolatedAsyncioTestCase):
             # Preview exhaustion must not reject an already offered confirmation.
             await second_limiter.acquire(
                 owner=owner,
-                tool_name="confirm:guangya.directory_scrape.run",
+                tool_name="confirm:cloud.scrape",
                 cost=1,
                 arguments={},
             )
             with self.assertRaises(ToolPipelineError) as raised:
                 await first_limiter.acquire(
                     owner=owner,
-                    tool_name="guangya.directory_scrape.run",
+                    tool_name="cloud.scrape",
                     cost=1,
                     arguments={},
                 )
@@ -398,11 +215,11 @@ class MediaFluxPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_configuration_reads_do_not_spend_write_preview_budget(self) -> None:
         families = (
-            ("media.preferences", "media.set_preferences", "media.clear_preferences"),
+            (None, "preferences.update", "preferences.clear"),
             (
-                "media.subscription_notification_rule",
-                "media.set_subscription_notification_rule",
-                "media.reset_subscription_notification_rule",
+                "subscriptions.notification",
+                "subscriptions.set_notification",
+                "subscriptions.reset_notification",
             ),
         )
         with (
@@ -415,15 +232,23 @@ class MediaFluxPolicyTests(unittest.IsolatedAsyncioTestCase):
                     owner = "webk:v1:" + uuid.uuid4().hex * 2
                     # Actual shared SQLite budget, not an allow() mock. Queries
                     # before/after changes must not consume a write's allowance.
-                    for index in range(12):
-                        await limiters[index % 2].acquire(
-                            owner=owner, tool_name=read, cost=1, arguments={}
-                        )
-                    with self.assertRaises(ToolPipelineError) as read_limited:
-                        await limiters[1].acquire(
-                            owner=owner, tool_name=read, cost=1, arguments={}
-                        )
-                    self.assertEqual(read_limited.exception.code, "rate_limited")
+                    if read is None:
+                        from app.sdk import call_owner, preferences
+
+                        # 普通 SDK 读取不再伪装成旧只读工具；仍不能消耗或补充写预算。
+                        with call_owner(owner):
+                            for _ in range(12):
+                                self.assertFalse(preferences.get()["explicit"])
+                    else:
+                        for index in range(12):
+                            await limiters[index % 2].acquire(
+                                owner=owner, tool_name=read, cost=1, arguments={}
+                            )
+                        with self.assertRaises(ToolPipelineError) as read_limited:
+                            await limiters[1].acquire(
+                                owner=owner, tool_name=read, cost=1, arguments={}
+                            )
+                        self.assertEqual(read_limited.exception.code, "rate_limited")
                     for stage in ("", "confirm:"):
                         for index, tool in enumerate((update, clear, update, clear)):
                             await limiters[index % 2].acquire(

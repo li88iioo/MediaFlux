@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 from app.agent.models import ToolResult
 from app.agent.public_view import public_result_state
 
 from .completion_receipts import EFFECT_PENDING
+
+
+def restored_effect_tool(catalog, name, arguments):
+    """仅供已签名持久计划/续行恢复；旧标识没有目录注册或新预检入口。"""
+    tool = catalog.get("session.batch" if name == "agent.batch" else name).for_arguments(arguments)
+    return replace(tool, name=name) if name == "agent.batch" else tool
 
 
 def batch_result(arguments: dict, results: list[dict], *, waiting: bool = False) -> ToolResult:

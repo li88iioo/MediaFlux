@@ -359,7 +359,7 @@ def _extract_episode(
             return number
     return None
 
-def _extract_special_episode(text: str) -> int | None:
+def _extract_special_episode(text: str, *, default_episode: int | None = 1) -> int | None:
     if fractional_episode_position(text) is not None:
         return None
     shared_position = special_media_position(text)
@@ -371,4 +371,4 @@ def _extract_special_episode(text: str) -> int | None:
     for value in match.groups():
         if value:
             return int(value)
-    return 1
+    return default_episode

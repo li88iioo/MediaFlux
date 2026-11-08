@@ -5,24 +5,26 @@ import json
 import threading
 import time
 from datetime import datetime, timedelta
+from dataclasses import asdict
+from typing import Any
 from typing import Callable
 
 from app import config
 from app import database as db
-from app.agent.domains.library.patrol_progress import (
+from app.modules.library_patrol import (
     finalize_patrol_progress,
     load_patrol_progress,
     merge_patrol_progress,
 )
-from app.agent.domains.library.patrol_status import serialize_patrol_projection
+from app.modules.library_patrol import serialize_patrol_projection, patrol_policy
 from app.agent.feature_gate import (
     AgentRuntimeDisabled,
     agent_runtime_effect_admission,
     agent_runtime_generation_is_current,
     current_agent_runtime_generation,
 )
-from app.agent.models import ToolResult
 from app.logger import get_logger
+from app.modules.episode_audit import EpisodeAuditResult, audit_library_episodes_batch
 from app.modules.agent_library_patrol_notifications import (
     build_patrol_result_fingerprint,
     load_patrol_notification_payload,
@@ -54,7 +56,7 @@ class AgentLibraryPatrolScheduler:
     def __init__(
         self,
         *,
-        audit_executor: Callable[[dict], tuple[ToolResult, int]] | None = None,
+        audit_executor: Callable[[dict], tuple[EpisodeAuditResult, int]] | None = None,
         notification_sender: Callable[[dict], object] | None = None,
         interval: float = 30.0,
         clock: Callable[[], datetime] | None = None,
@@ -111,13 +113,17 @@ class AgentLibraryPatrolScheduler:
                 db.discard_agent_library_patrol_notifications()
         self._wake_event.set()
 
-    def trigger_now(self) -> dict[str, int | str | bool]:
+    def trigger_now(self, *, expected_state: dict[str, Any] | None = None,
+                    check_cancelled: Callable[[], None] | None = None) -> dict[str, int | str | bool]:
         """按当前策略将巡检排到现在；不修改配置，也不取消运行租约。"""
         if not self._enabled():
             return {"ok": False, "status": "disabled"}
         current = self._now()
-        outcome = db.trigger_agent_library_patrol(next_run_at=current)
-        self._wake_event.set()
+        outcome = db.trigger_agent_library_patrol(
+            next_run_at=current, expected_state=expected_state, check_cancelled=check_cancelled,
+        )
+        if outcome["ok"]:
+            self._wake_event.set()
         return outcome
 
     def status(self) -> dict[str, object]:
@@ -186,7 +192,7 @@ class AgentLibraryPatrolScheduler:
                 expected_lease_generation=int(job["lease_generation"]),
             )
             return
-        _batch_json, batch_projection = serialize_patrol_projection(result)
+        _batch_json, batch_projection = serialize_patrol_projection(asdict(result))
         merged = merge_patrol_progress(previous, batch_projection)
         continuation = bool(
             isinstance(result.data, dict)
@@ -310,8 +316,8 @@ class AgentLibraryPatrolScheduler:
             )
         ):
             return
-        failed = ToolResult(False, "failed", "自动缺集巡检未完成")
-        projection_json, projection = serialize_patrol_projection(failed)
+        failed = EpisodeAuditResult(False, "failed", "自动缺集巡检未完成")
+        projection_json, projection = serialize_patrol_projection(asdict(failed))
         updated = db.update_agent_library_patrol(
             status=status,
             outcome="failed",
@@ -480,11 +486,11 @@ class AgentLibraryPatrolScheduler:
 
     @staticmethod
     def _max_series() -> int:
-        return max(1, min(config.get_int("AGENT_LIBRARY_PATROL_MAX_SERIES", 50), 100))
+        return patrol_policy()["max_series"]
 
     @staticmethod
     def _interval_seconds() -> int:
-        hours = max(1, min(config.get_int("AGENT_LIBRARY_PATROL_INTERVAL_HOURS", 24), 168))
+        hours = patrol_policy()["interval_hours"]
         return hours * 60 * 60
 
     @staticmethod
@@ -498,11 +504,7 @@ class AgentLibraryPatrolScheduler:
         return self._format(self._clock() + timedelta(seconds=max(0.0, seconds)))
 
     @staticmethod
-    def _default_audit_executor(arguments: dict) -> tuple[ToolResult, int]:
-        from app.agent.domains.library.library_episode_audit import (
-            audit_library_episodes_batch,
-        )
-
+    def _default_audit_executor(arguments: dict) -> tuple[EpisodeAuditResult, int]:
         started = time.monotonic()
         result = audit_library_episodes_batch(arguments)
         return result, max(0, int((time.monotonic() - started) * 1000))

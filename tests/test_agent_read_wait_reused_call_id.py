@@ -1,5 +1,4 @@
 """跨模型轮次复用 call_id 时，SQLite READ 等待仍绑定原生工具组。"""
-
 import asyncio
 import json
 from dataclasses import replace
@@ -12,11 +11,12 @@ from app.agent.errors import ToolRateLimitError
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.rate_limit import RateLimitDecision
+from tests.agent_task_native_helpers import task_call
+from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import isolated_database as isolated_database
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
 
@@ -36,10 +36,10 @@ class ReusedCallScript(NativeScript):
             message = {"content": "仅报告已经取得的实际查询结果。"}
         else:
             name, arguments = {
-                "discover": ("agent__capabilities", {"tool_names": ["agent.task", "web.search"]}),
-                "create": ("agent__task", declaration()),
-                "read-first": ("web__search", {"query": "first"}),
-                "read-second": ("web__search", {"query": "second"}),
+                "discover": ("agent__run_code", {"language": "shell", "code": "mf --help"}),
+                "create": task_call(declaration(), wire=True),
+                "read-first": ("fixture__lookup", {"query": "first"}),
+                "read-second": ("fixture__lookup", {"query": "second"}),
             }[step]
             call_id = "read-id" if self.repeated and step.startswith("read-") else step
             message = {"tool_calls": [{
@@ -54,7 +54,7 @@ class ReusedCallScript(NativeScript):
 
 def read_results(conversation):
     call_ids = {call["call_id"] for row in conversation
-                for call in row.get("tool_calls", ()) if call["name"] in {"web.search", "web__search"}}
+                for call in row.get("tool_calls", ()) if call["name"] in {"fixture.lookup", "fixture__lookup"}}
     return [row for row in conversation if row.get("role") == "tool"
             and row.get("tool_call_id") in call_ids]
 
@@ -67,7 +67,7 @@ def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(re
         timer = [100]
         script = ReusedCallScript(repeated=repeated)
         store = SQLiteKernelStore(clock=lambda: timer[0])
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=store)
+        runtime = build_wait_runtime(model=script.adapter, store=store)
         runtime.session.continuation_binding = _capture_creation_binding()
         invoked = []
 
@@ -79,7 +79,7 @@ def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(re
             count = 0
 
             async def acquire(self, *, tool_name, **kwargs):
-                if tool_name == "web.search":
+                if tool_name == "fixture.lookup":
                     self.count += 1
                     if self.count == 2:
                         raise ToolRateLimitError(RateLimitDecision(
@@ -87,7 +87,7 @@ def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(re
                             retry_at_epoch=110, reason="quota",
                         ))
 
-        spec = runtime.session.catalog.get("web.search")
+        spec = runtime.session.catalog.get("fixture.lookup")
         runtime.session.catalog._tools[spec.name] = replace(spec, read=read)
         runtime.session.pipeline.rate_limiter = SecondReadQuota()
         events = [event async for event in runtime.session.run(AgentInput(
@@ -95,8 +95,8 @@ def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(re
         ))]
         assert events[-1].payload.get("status") == "waiting"
         assert len(script.requests) == 4
-        first_arguments = {"query": "first", "max_results": 5, "topic": "general"}
-        second_arguments = {"query": "second", "max_results": 5, "topic": "general"}
+        first_arguments = {"query": "first"}
+        second_arguments = {"query": "second"}
         assert invoked == [first_arguments]
 
         cold = SQLiteKernelStore(clock=lambda: timer[0])
@@ -116,14 +116,14 @@ def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(re
         candidates = await cold.due_continuations()
         assert len(candidates) == 1
         resumed_script = ReusedCallScript(resume=True)
-        fresh = build_agent_kernel_runtime(model=resumed_script.adapter, store=cold)
+        fresh = build_wait_runtime(model=resumed_script.adapter, store=cold)
         fresh.session.continuation_binding = _capture_creation_binding()
 
         async def resumed_read(arguments, context):
             assert not resumed_script.requests, "原参数 READ 应先于模型合成执行"
             return await read(arguments, context)
 
-        spec = fresh.session.catalog.get("web.search")
+        spec = fresh.session.catalog.get("fixture.lookup")
         fresh.session.catalog._tools[spec.name] = replace(spec, read=resumed_read)
         assert await fresh.session.resume_wait(candidate=candidates[0])
         assert invoked == [first_arguments, second_arguments]

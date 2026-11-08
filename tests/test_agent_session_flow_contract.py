@@ -9,20 +9,16 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domains.resources.presentation import ResourceSelection
+from app.agent.kernel.ports.resource_presentation import ResourceSelection
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import TERMINAL_EVENT_TYPES, AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.session import AgentSession, SessionLimits
+from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import public_conversation_messages
 from tests.support import isolated_test_database
@@ -68,10 +64,6 @@ def test_confirm_readback_is_loaded_without_discovery_but_never_grants_permissio
                 execute_confirmed=lambda *_: pytest.fail("不能执行未确认写入"))
         catalog = ToolCatalog([write, read, unrelated])
 
-        class MissedReadback(CapabilityRetriever):
-            def retrieve(self, *args, **kwargs):
-                return replace(super().retrieve(*args, **kwargs), tools=(write, unrelated))
-
         def call(name, call_id):
             return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
                                tool_call=ModelToolCall(call_id, name, {})),
@@ -88,8 +80,8 @@ def test_confirm_readback_is_loaded_without_discovery_but_never_grants_permissio
             store = SQLiteKernelStore(secret_provider=lambda: "readback-test-only")
             return AgentSession(
                 model=model, catalog=catalog, state_store=store,
-                retriever=MissedReadback(minimum=1, maximum=2),
-                limits=SessionLimits(capability_window=2),
+
+                model_tools=[write.name, read.name] if read_access != "write" else [write.name],
                 pipeline=ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
                     effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore())),
             )
@@ -155,7 +147,7 @@ def test_cold_explain_confirm_keep_event_and_plan_contract() -> None:
             # 每次从同一隔离 SQLite 重新构造，不依赖旧 Session 的内存状态。
             store = SQLiteKernelStore(secret_provider=lambda: "session-flow-test-secret")
             session = AgentSession(
-                model=model, catalog=catalog, retriever=CapabilityRetriever(), state_store=store,
+                model=model, catalog=catalog,  state_store=store,
                 pipeline=ToolPipeline(
                     catalog=catalog, state_store=store, reference_store=store,
                     effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore())),
@@ -252,7 +244,7 @@ def test_concurrent_public_runs_keep_different_sessions_isolated(cancel_first: b
         model = ScriptedModel(rounds)
         store = SQLiteKernelStore(secret_provider=lambda: "session-flow-test-secret")
         session = AgentSession(
-            model=model, catalog=catalog, retriever=CapabilityRetriever(), state_store=store,
+            model=model, catalog=catalog,  state_store=store,
             pipeline=ToolPipeline(catalog=catalog, state_store=store, reference_store=store),
         )
         tasks = []
@@ -314,7 +306,7 @@ def test_early_rejection_does_not_publish_a_late_terminal_or_poison_next_run(
         model = ScriptedModel([[ModelEvent(ModelEventType.TEXT_DELTA, text="正常后续回答。"),
                                 ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
         session = AgentSession(
-            model=model, catalog=catalog, retriever=CapabilityRetriever(), state_store=store,
+            model=model, catalog=catalog,  state_store=store,
             pipeline=ToolPipeline(catalog=catalog, state_store=store, reference_store=store),
             journal=store,
         )

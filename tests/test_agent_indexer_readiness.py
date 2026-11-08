@@ -6,11 +6,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.agent.domains.resources.readiness_actions import (
-    diagnose_indexer_readiness,
-    indexer_readiness_arguments,
-)
-from app.agent.errors import AgentToolError
+from app import sdk
 from app.indexers.models import IndexerCapabilities
 from tests.support import IsolatedDatabaseTestCase
 
@@ -61,29 +57,27 @@ class _Service:
 
 
 class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
-    def test_arguments_reject_extra_fields(self):
-        self.assertEqual(indexer_readiness_arguments({}), {})
-        with self.assertRaisesRegex(
-            AgentToolError, "^indexer\\.diagnose_readiness 不接受参数$"
-        ):
-            indexer_readiness_arguments({"debug": True})
+    def test_native_signature_rejects_extra_fields(self):
+        self.assertNotIn("resources.sources", sdk.WRITE_METHODS)
+        with self.assertRaises(TypeError):
+            sdk.METHODS["resources.sources"](debug=True)
 
     def test_disabled_state_does_not_construct_service(self):
         with (
             patch(
-                "app.agent.domains.resources.readiness_actions.config.get_bool",
+                "app.indexers.runtime.config.get_bool",
                 return_value=False,
             ),
             patch(
-                "app.agent.domains.resources.readiness_actions.get_indexer_service"
+                "app.indexers.runtime.get_indexer_service"
             ) as service_factory,
         ):
-            result = diagnose_indexer_readiness({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "disabled")
-        self.assertFalse(result.data["indexer_enabled"])
-        self.assertFalse(result.data["network_accessed"])
-        self.assertFalse(result.data["filesystem_accessed"])
+            result = sdk.resources.sources()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "disabled")
+        self.assertFalse(result["indexer_enabled"])
+        self.assertFalse(result["network_accessed"])
+        self.assertFalse(result["filesystem_accessed"])
         service_factory.assert_not_called()
 
     def test_ready_projection_reports_effective_capabilities_without_network(self):
@@ -103,18 +97,18 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         )
         with (
             patch(
-                "app.agent.domains.resources.readiness_actions.config.get_bool", return_value=True
+                "app.indexers.runtime.config.get_bool", return_value=True
             ),
             patch(
-                "app.agent.domains.resources.readiness_actions.get_indexer_service",
+                "app.indexers.runtime.get_indexer_service",
                 return_value=service,
             ),
         ):
-            result = diagnose_indexer_readiness({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "ready")
+            result = sdk.resources.sources()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ready")
         self.assertEqual(
-            result.data["counts"],
+            result["counts"],
             {
                 "registered": 3,
                 "enabled": 2,
@@ -123,7 +117,7 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
                 "attention": 0,
             },
         )
-        by_id = {site["site_id"]: site for site in result.data["sites"]}
+        by_id = {site["site_id"]: site for site in result["sites"]}
         self.assertEqual(by_id["nyaa"]["download_kinds"], ["magnet", "torrent"])
         self.assertEqual(by_id["search-only"]["reason"], "search_only")
         self.assertTrue(by_id["search-only"]["search_available"])
@@ -131,7 +125,7 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         self.assertTrue(by_id["sukebei"]["sensitive"])
         self.assertFalse(by_id["sukebei"]["enabled"])
         self.assertEqual(
-            result.data["transport"],
+            result["transport"],
             {"mode": "direct", "outbound_proxy_applied": False},
         )
 
@@ -142,31 +136,31 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         }
         with (
             patch(
-                "app.agent.domains.resources.readiness_actions.config.get_bool", return_value=True
+                "app.indexers.runtime.config.get_bool", return_value=True
             ),
             patch(
-                "app.agent.domains.resources.readiness_actions.get_indexer_service",
+                "app.indexers.runtime.get_indexer_service",
                 return_value=_Service(adapters, set()),
             ),
         ):
-            empty = diagnose_indexer_readiness({})
-        self.assertEqual(empty.status, "no_enabled_sites")
-        self.assertEqual(empty.data["counts"]["enabled"], 0)
+            empty = sdk.resources.sources()
+        self.assertEqual(empty["status"], "no_enabled_sites")
+        self.assertEqual(empty["counts"]["enabled"], 0)
         with (
             patch(
-                "app.agent.domains.resources.readiness_actions.config.get_bool", return_value=True
+                "app.indexers.runtime.config.get_bool", return_value=True
             ),
             patch(
-                "app.agent.domains.resources.readiness_actions.get_indexer_service",
+                "app.indexers.runtime.get_indexer_service",
                 return_value=_Service(adapters, {"nyaa", "mikan"}, broken={"mikan"}),
             ),
         ):
-            partial = diagnose_indexer_readiness({})
-        self.assertEqual(partial.status, "attention")
-        self.assertEqual(partial.data["counts"]["enabled"], 2)
-        self.assertEqual(partial.data["counts"]["attention"], 1)
+            partial = sdk.resources.sources()
+        self.assertEqual(partial["status"], "attention")
+        self.assertEqual(partial["counts"]["enabled"], 2)
+        self.assertEqual(partial["counts"]["attention"], 1)
         mikan = next(
-            site for site in partial.data["sites"] if site["site_id"] == "mikan"
+            site for site in partial["sites"] if site["site_id"] == "mikan"
         )
         self.assertEqual(mikan["reason"], "registry_unavailable")
         self.assertFalse(mikan["search_available"])
@@ -178,15 +172,15 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         )
         with (
             patch(
-                "app.agent.domains.resources.readiness_actions.config.get_bool", return_value=True
+                "app.indexers.runtime.config.get_bool", return_value=True
             ),
             patch(
-                "app.agent.domains.resources.readiness_actions.get_indexer_service",
+                "app.indexers.runtime.get_indexer_service",
                 return_value=service,
             ),
         ):
-            result = diagnose_indexer_readiness({})
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+            result = sdk.resources.sources()
+        serialized = json.dumps(result, ensure_ascii=False)
         for secret in (
             "INDEXER_ADAPTER_SECRET",
             "INDEXER_COOKIE_SECRET",
@@ -198,28 +192,28 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
             self.assertNotIn(secret, serialized)
         with (
             patch(
-                "app.agent.domains.resources.readiness_actions.config.get_bool", return_value=True
+                "app.indexers.runtime.config.get_bool", return_value=True
             ),
             patch(
-                "app.agent.domains.resources.readiness_actions.get_indexer_service",
+                "app.indexers.runtime.get_indexer_service",
                 side_effect=RuntimeError(
                     "INDEXER_EXCEPTION_SECRET /srv/indexer/private"
                 ),
             ),
         ):
-            unavailable = diagnose_indexer_readiness({})
-        serialized = json.dumps(unavailable.to_dict(), ensure_ascii=False)
-        self.assertFalse(unavailable.ok)
-        self.assertEqual(unavailable.status, "unavailable")
+            unavailable = sdk.resources.sources()
+        serialized = json.dumps(unavailable, ensure_ascii=False)
+        self.assertFalse(unavailable["ok"])
+        self.assertEqual(unavailable["status"], "unavailable")
         self.assertNotIn("INDEXER_EXCEPTION_SECRET", serialized)
         self.assertNotIn("/srv/indexer/private", serialized)
         with patch(
-            "app.agent.domains.resources.readiness_actions.config.get_bool",
+            "app.indexers.runtime.config.get_bool",
             side_effect=RuntimeError("INDEXER_CONFIG_SECRET /srv/config/private"),
         ):
-            unavailable = diagnose_indexer_readiness({})
-        serialized = json.dumps(unavailable.to_dict(), ensure_ascii=False)
-        self.assertEqual(unavailable.status, "unavailable")
-        self.assertIsNone(unavailable.data["indexer_enabled"])
+            unavailable = sdk.resources.sources()
+        serialized = json.dumps(unavailable, ensure_ascii=False)
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertIsNone(unavailable["indexer_enabled"])
         self.assertNotIn("INDEXER_CONFIG_SECRET", serialized)
         self.assertNotIn("/srv/config/private", serialized)

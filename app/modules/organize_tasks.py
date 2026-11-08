@@ -1247,33 +1247,21 @@ class OrganizeTaskManager:
         cancel_check()
         kind = str(row.get("job_kind") or "")
         if kind == "agent_directory_scrape":
-            from app.agent.domains.guangya.directory_scrape_actions import (
+            from app.modules.directory_scrape import (
                 execute_durable_directory_scrape_job,
             )
 
             return execute_durable_directory_scrape_job(
                 payload, cancel_check=cancel_check
             )
-        if kind == "agent_guangya_cleanup":
-            from app.agent.domains.guangya.cleanup_actions import (
-                execute_durable_guangya_cleanup_job,
-            )
-
-            return execute_durable_guangya_cleanup_job(
-                payload, cancel_check=cancel_check
-            )
-        if kind == "agent_guangya_rename":
-            from app.modules.guangya_rename import execute_rename_plan
-
-            return execute_rename_plan(
-                payload, cancel_check=cancel_check
-            )
+        if kind in {"agent_guangya_cleanup", "agent_guangya_rename"}:
+            # 只识别历史任务供核验；旧执行器已退役，禁止重放旧计划。
+            return {"status": "manual_review", "summary": "旧名称/清理任务已退役，请核验原对象后重新预览",
+                    "stats": {"unknown": 1}, "cloud_write": False}
         if kind == "agent_guangya_fs_change":
-            from app.agent.domains.guangya.fs_change_actions import (
-                execute_durable_guangya_fs_change_job,
-            )
+            from app.modules.guangya_fs_change import execute_fs_change_plan
 
-            return execute_durable_guangya_fs_change_job(
+            return execute_fs_change_plan(
                 payload, cancel_check=cancel_check, lease_generation=generation
             )
         raise ValueError("不支持的持久化操作类型")
@@ -1291,7 +1279,8 @@ class OrganizeTaskManager:
         try:
             try:
                 result = self._execute_durable_operation(row)
-                status = _operation_result_status(result)
+                status = ("manual_review" if row.get("job_kind") in {"agent_guangya_cleanup", "agent_guangya_rename"}
+                          else _operation_result_status(result))
             except GuangYaFSCopyPending as exc:
                 result = exc.operation_result
                 status, error_code = "queued", CLOUD_COPY_PENDING_CODE
@@ -2417,3 +2406,28 @@ _manager = OrganizeTaskManager()
 
 def get_organize_manager() -> OrganizeTaskManager:
     return _manager
+
+
+def get_organize_operation_status(operation_ref: str, *, owner: str) -> dict[str, Any]:
+    """按公开 GY 编号读取当前 owner 的安全回执；未找到时不回退到整体概览。"""
+    from app.modules.organize_results import project_organize_status
+
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("查询光鸭操作状态必须提供 owner")
+    if not isinstance(operation_ref, str):
+        raise ValueError("operation_ref 不是有效的光鸭操作编号")
+    reference = operation_ref.strip().upper()
+    organize_operation_job_id_from_public_ref(reference)
+    manager = get_organize_manager()
+    raw = manager.task_result(reference, owner=owner.strip())
+    if raw is None:
+        return {
+            "ok": False,
+            "status": "empty",
+            "summary": "没有找到这个光鸭操作编号",
+            "data": {"operation_ref": reference, "found": False},
+            "suggestions": ["请核对操作编号，或直接查看当前光鸭整理状态。"],
+        }
+    result = project_organize_status(raw, overview=manager.status(), operation_ref=reference)
+    result["data"]["found"] = True
+    return result

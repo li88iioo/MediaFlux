@@ -7,9 +7,10 @@ import pytest
 
 from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
 from app.agent.domains.library.missing_workflow_runtime import MissingMediaWorkflowRuntime
-from app.agent.domains.library.missing_workflows import SQLiteMissingMediaWorkflowRepository
+from app.repositories.agent_download_verification import SQLiteMissingMediaWorkflowRepository
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
@@ -24,7 +25,7 @@ from tests.test_agent_missing_media_workflows import _VERIFICATION, _search_resu
 def test_cancellation_releases_frozen_followup_without_reviving_expired_card(persistent, expired):
     async def scenario():
         repository = SQLiteMissingMediaWorkflowRepository()
-        repository.capture_search(owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result())
+        repository.capture_search(owner="owner", **_search_result())
         writes = []
 
         def execute(arguments, expected, context):
@@ -37,7 +38,7 @@ def test_cancellation_releases_frozen_followup_without_reviving_expired_card(per
             prepare=lambda arguments, context: PreparedEffect(
                 preview={"ok": True, "summary": "待确认"}, snapshot_fingerprint="snapshot",
                 metadata={"missing_media_candidates": [{
-                    "verification": _VERIFICATION, "candidate_title": "Show.E3", "target": "qb",
+                    "result_id": "resource-result-secret", "verification": _VERIFICATION, "candidate_title": "Show.E3", "target": "qb",
                 }]},
             ),
             execute_confirmed=execute,

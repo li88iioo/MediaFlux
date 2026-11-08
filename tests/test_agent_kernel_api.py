@@ -116,12 +116,15 @@ class FakeStore:
     async def load(self, *, owner, session_id):
         return self.state
 
-    async def list_events(self, *, owner, session_id, limit=200):
-        self.event_calls.append((owner, session_id, limit))
+    async def list_events(self, *, owner, session_id, limit=200, request_id="", turn_id=""):
+        self.event_calls.append((owner, session_id, limit, request_id, turn_id) if turn_id else (owner, session_id, limit))
         scoped = [
             event for event_owner, event_session, event in self.events
             if event_owner == owner and event_session == session_id
         ]
+        if turn_id:
+            return sorted((event for event in scoped if event.get("request_id") == request_id
+                           and event.get("turn_id") == turn_id), key=lambda event: event.get("sequence", 0))
         return scoped[-limit:]
 
     async def reset_session(self, *, owner, session_id):
@@ -428,13 +431,61 @@ class AgentKernelApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(
             payload["active_turn"],
-            {**activity, "detail": "正在执行工具"},
+            {**activity, "detail": "正在执行工具", "events": [{
+                "type": "turn.started", "request_id": request_id, "turn_id": turn_id,
+                "payload": {"kind": "query", "stream_display_enabled": False},
+            }]},
         )
         self.assertIsNone(payload["last_turn"])
         self.assertNotIn("private.tool", response.text)
         self.assertNotIn("private-argument", response.text)
         self.assertEqual(self.web.activity_calls, [(owner, session_id)] * 2)
-        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 64)])
+        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 500),
+            (owner, session_id, 200, request_id, turn_id)])
+
+    def test_active_restore_keeps_current_public_events_and_honors_original_stream_flag(self):
+        owner = "webk:v1:" + "a" * 64
+        sid = "session_1234567890"
+        activity = {"request_id": "active-request", "turn_id": "active-turn", "generation": 1,
+                    "protected": False, "status": "running"}
+        parts = ["already received "] + [f"part-{index} " for index in range(600)]
+        for enabled in (True, False):
+            with self.subTest(stream_display=enabled):
+                self.web.activity_results = [activity, activity]
+                self.runtime.store.events.clear()
+                events = [
+                    ("turn.started", {"stream_display_enabled": enabled}),
+                    ("model.started", {"round": 1}),
+                    ("model.tool_call", {"call_id": "actual-call", "tool": "agent.run_code",
+                                         "arguments": {"token": "private-argument"}}),
+                    ("tool.completed", {"call_id": "actual-call", "tool": "agent.run_code",
+                                        "result": {"summary": "命令已退出（退出码 0）", "data": {"stdout": "private-tool-data"}}}),
+                    ("model.started", {"round": 2}),
+                    *[("model.delta", {"round": 2, "delta": part}) for part in parts],
+                ]
+                for index, (kind, payload) in enumerate(events, 1):
+                    self.runtime.store.add_event(owner=owner, session_id=sid, event={
+                        "type": kind, "event_id": f"actual-{index}", "sequence": index,
+                        "request_id": activity["request_id"], "turn_id": activity["turn_id"], "payload": payload})
+                for event_owner, scope in (("another-owner", activity),
+                        (owner, {**activity, "request_id": "another-request"}),
+                        (owner, {**activity, "turn_id": "another-turn"})):
+                    self.runtime.store.add_event(owner=event_owner, session_id=sid, event={
+                        "type": "model.delta", "request_id": scope["request_id"], "turn_id": scope["turn_id"],
+                        "payload": {"delta": "other-private-marker"}})
+                response = self.client.get(f"/api/agent/sessions/{sid}")
+                self.assertEqual(response.status_code, 200, response.text)
+                restored = response.json()["active_turn"]["events"]
+                text = "".join(event["payload"]["delta"] for event in restored if event["type"] == "model.delta")
+                self.assertEqual(text, "".join(parts) if enabled else "")
+                step = next(event for event in restored if event["type"] == "tool.completed")
+                self.assertEqual(step["payload"], {"call_id": "actual-call", "label": "工作区代码执行",
+                                                 "result": {"summary": "命令已退出（退出码 0）"}})
+                self.assertEqual([event["event_id"] for event in restored],
+                                 [f"actual-{index}" for index in range(1, len(events) + 1 if enabled else 6)])
+                for private in ("private-argument", "private-tool-data", "other-private-marker"):
+                    self.assertNotIn(private, response.text)
+                self.assertEqual(self.web.queries, [])
 
     def test_session_restore_reloads_persisted_state_when_turn_finishes_during_read(self):
         owner = "webk:v1:" + "a" * 64
@@ -492,7 +543,43 @@ class AgentKernelApiTests(unittest.TestCase):
         )
         self.assertNotIn("private event body", response.text)
         self.assertEqual(self.runtime.store.load.await_count, 2)
-        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 64)] * 2)
+        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 500),
+            (owner, session_id, 200, request_id, turn_id), (owner, session_id, 64)])
+
+    def test_session_restore_reloads_current_scope_when_request_changes_during_journal_read(self):
+        owner = "webk:v1:" + "a" * 64
+        sid = "session_1234567890"
+        first = {"request_id": "first-request", "turn_id": "first-turn", "generation": 1,
+                 "protected": False, "status": "running"}
+        second = {**first, "request_id": "second-request", "turn_id": "second-turn", "generation": 2}
+        self.web.activity_results = [first, second]
+        for activity, marker in ((first, "old-marker"), (second, "new-marker")):
+            for sequence, (kind, payload) in enumerate((
+                ("turn.started", {"stream_display_enabled": True}),
+                ("model.delta", {"delta": marker, "round": 1}),
+            ), 1):
+                self.runtime.store.add_event(owner=owner, session_id=sid, event={
+                    "request_id": activity["request_id"], "turn_id": activity["turn_id"],
+                    "type": kind, "sequence": sequence, "event_id": f"{marker}-{sequence}", "payload": payload})
+        original = self.runtime.store.list_events
+        async def replace_during_read(**kwargs):
+            result = await original(**kwargs)
+            if kwargs.get("turn_id") == first["turn_id"]:
+                self.runtime.store.state = replace(self.runtime.store.state, generation=2,
+                    conversation=[{"role": "user", "content": "new-user-request"}])
+            return result
+        self.runtime.store.list_events = replace_during_read
+        response = self.client.get(f"/api/agent/sessions/{sid}")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["active_turn"]["request_id"], second["request_id"])
+        self.assertEqual(payload["generation"], 2)
+        self.assertIn("new-marker", response.text)
+        self.assertNotIn("old-marker", response.text)
+        self.assertEqual(self.web.activity_calls, [(owner, sid)] * 2)
+        self.assertEqual(self.runtime.store.event_calls, [
+            (owner, sid, 500), (owner, sid, 200, first["request_id"], first["turn_id"]),
+            (owner, sid, 500), (owner, sid, 200, second["request_id"], second["turn_id"])])
 
     def test_session_snapshot_is_uncached_and_draft_scope_matches_list(self):
         history = self.client.get("/api/agent/sessions")
@@ -734,12 +821,11 @@ class AgentKernelApiTests(unittest.TestCase):
         from app.agent.feature_gate import initialize_runtime_fence
         from app.agent.kernel.bootstrap import (
             _capture_creation_binding,
-            build_agent_kernel_runtime,
         )
         from app.agent.kernel.persistence import SQLiteKernelStore
         from app.agent.kernel.state_types import AgentInput
         from tests.support import isolated_test_database
-        from tests.test_agent_read_wait_lifecycle import GOAL, Quota, WaitScript
+        from tests.test_agent_read_wait_lifecycle import GOAL, Quota, WaitScript, build_wait_runtime
 
         owner, session_id = "webk:v1:" + "a" * 64, "session_wait_stop_0001"
         scopes = [(owner, session_id), (owner, "session_wait_other_0001"), ("webk:v1:" + "b" * 64, session_id)]
@@ -750,7 +836,7 @@ class AgentKernelApiTests(unittest.TestCase):
             async def park():
                 store = SQLiteKernelStore(clock=lambda: 100)
                 for scoped_owner, scoped_session in scopes:
-                    runtime = build_agent_kernel_runtime(model=WaitScript().adapter, store=store)
+                    runtime = build_wait_runtime(model=WaitScript().adapter, store=store)
                     runtime.session.continuation_binding = _capture_creation_binding()
                     runtime.session.pipeline.rate_limiter = Quota()
                     events = [event async for event in runtime.session.run(AgentInput(
@@ -788,7 +874,8 @@ class AgentKernelApiTests(unittest.TestCase):
             ToolCatalog,
             ToolEffect,
         )
-        from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.tool_calls import PreparedEffect
         from app.agent.kernel.pipeline import ToolPipeline
         from app.agent.kernel.state import InMemorySessionStateStore
         from app.agent.kernel.state_types import CancellationToken
@@ -854,7 +941,8 @@ class AgentKernelApiTests(unittest.TestCase):
     def test_session_restore_uses_persisted_plan_after_approval_event_is_evicted(self):
         from app.agent.confirmation import SQLiteConfirmationStore
         from app.agent.kernel.capabilities import ToolEffect
-        from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.tool_calls import PreparedEffect
         from app.agent.kernel.events import AgentEvent, AgentEventType
         from app.agent.kernel.persistence import SQLiteKernelStore
         from app.agent.kernel.state_types import StateUpdate
@@ -967,7 +1055,8 @@ class AgentKernelApiTests(unittest.TestCase):
     def test_sqlite_plan_restore_enforces_scope_expiry_consumption_and_restart(self):
         from app.agent.confirmation import SQLiteConfirmationStore
         from app.agent.kernel.capabilities import ToolEffect
-        from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.tool_calls import PreparedEffect
         from tests.support import isolated_test_database
 
         owner = "owner-restore"

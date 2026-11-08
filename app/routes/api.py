@@ -31,7 +31,8 @@ from app.indexers.config import (
     encode_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
-from app.logger import configure_telebot_logging, get_logger
+from app.logger import get_logger
+from app.modules.feature_config import BOOLEAN_VALUES, normalize_boolean, reload_runtime
 from app.security import redact_config
 from app.services import build_dashboards
 from app.web import api_error, config_write_api_error, require_api_login
@@ -53,7 +54,6 @@ _CLEARABLE_SECRET_KEYS = frozenset({
     "EMBY_TOKEN",
     "GY_ORGANIZE_NSFW_METATUBE_TOKEN",
 })
-_INDEXER_RUNTIME_REFRESH_TIMEOUT_SECONDS = 5.0
 _DISCOVERY_BOOLEAN_KEYS = {
     "DISCOVERY_ENABLED",
     "DISCOVERY_DOUBAN_ENABLED",
@@ -71,15 +71,6 @@ _DISCOVERY_TTL_DEFAULTS = {
     "DISCOVERY_STALE_TTL_SECONDS": 604_800,
     "DOUBAN_CACHE_TTL_SECONDS": 21_600,
 }
-_DISCOVERY_RUNTIME_KEYS = {
-    "DISCOVERY_ENABLED", "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS",
-    "DISCOVERY_RESOURCE_RESULTS_ENABLED",
-    "DISCOVERY_DOUBAN_ENABLED", "DOUBAN_DBCL2", "DOUBAN_CACHE_TTL_SECONDS", "BANGUMI_USER_AGENT",
-    "ORGANIZE_DOUBAN_HINTS_ENABLED", "ORGANIZE_BANGUMI_HINTS_ENABLED",
-    "TMDB_API_KEY", "TMDB_API_URL", "TMDB_MATCH_MODE",
-    "PROXY_URL",
-}
-
 _WEB_ACCESS_KEYS = {
     "WEB_READ_ENABLED", "WEB_READ_TIMEOUT_SECONDS", "WEB_READ_CACHE_TTL_SECONDS",
     "WEB_SEARCH_ENABLED", "TAVILY_API_KEY", "TAVILY_SEARCH_DEPTH",
@@ -97,6 +88,7 @@ _AGENT_LLM_KEYS = {
     "AGENT_LLM_CONTEXT_WINDOW_TOKENS",
     "AGENT_LLM_GENERATION_PROFILES",
     "AGENT_LLM_BUDGET_PROFILES",
+    "AGENT_LLM_REASONING_EFFORT",
 }
 
 _AGENT_LIBRARY_PATROL_KEYS = {
@@ -132,6 +124,7 @@ _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "128000",
     "AGENT_LLM_GENERATION_PROFILES": "[]",
     "AGENT_LLM_BUDGET_PROFILES": "[]",
+    "AGENT_LLM_REASONING_EFFORT": "",
     "WEB_SEARCH_ENABLED": "0",
     "WEB_READ_ENABLED": "1",
     "WEB_READ_TIMEOUT_SECONDS": "10",
@@ -239,19 +232,8 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     "GY_ORGANIZE_STRM_DETAIL_NOTIFY", "GY_ORGANIZE_EMBY_REFRESH",
     "GY_ORGANIZE_SCHEDULE_ENABLED", "GY_ORGANIZE_SCHEDULE_CRON",
 })
-_BOOLEAN_VALUES = {
-    "1": "1", "true": "1", "yes": "1", "on": "1", "y": "1",
-    "0": "0", "false": "0", "no": "0", "off": "0", "n": "0",
-}
 def _is_config_mask(value: Any) -> bool:
     return str(value).strip() == _CONFIG_MASK
-
-
-def _normalize_discovery_boolean(key: str, value: Any) -> str:
-    normalized = _BOOLEAN_VALUES.get(str(value).strip().lower())
-    if normalized is None:
-        raise ValueError(f"{key} 必须是布尔值（0/1、true/false）")
-    return normalized
 
 
 def _normalize_telegram_agent_user_ids(value: Any) -> str:
@@ -301,7 +283,7 @@ def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
 
     updates: dict[str, str] = {}
     if "TG_NOTIFICATION_ENABLED" in data:
-        updates["TG_NOTIFICATION_ENABLED"] = _normalize_discovery_boolean(
+        updates["TG_NOTIFICATION_ENABLED"] = normalize_boolean(
             "TG_NOTIFICATION_ENABLED", data["TG_NOTIFICATION_ENABLED"]
         )
     if "TG_NOTIFICATION_LEVEL" in data:
@@ -310,12 +292,12 @@ def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
             raise ValueError("TG_NOTIFICATION_LEVEL 必须是 essential、standard 或 detailed")
         updates["TG_NOTIFICATION_LEVEL"] = level
     if "TG_AGENT_ENABLED" in data:
-        updates["TG_AGENT_ENABLED"] = _normalize_discovery_boolean(
+        updates["TG_AGENT_ENABLED"] = normalize_boolean(
             "TG_AGENT_ENABLED", data["TG_AGENT_ENABLED"]
         )
     effective_enabled = updates.get(
         "TG_AGENT_ENABLED",
-        _BOOLEAN_VALUES.get(
+        BOOLEAN_VALUES.get(
             config.get("TG_AGENT_ENABLED", "0").strip().lower(), "0"
         ),
     ) == "1"
@@ -371,7 +353,7 @@ def _validate_indexer_updates(
 ) -> dict[str, str]:
     normalized: dict[str, str] = {}
     if "INDEXER_SEARCH_ENABLED" in data:
-        normalized["INDEXER_SEARCH_ENABLED"] = _normalize_discovery_boolean(
+        normalized["INDEXER_SEARCH_ENABLED"] = normalize_boolean(
             "INDEXER_SEARCH_ENABLED", data["INDEXER_SEARCH_ENABLED"]
         )
     key = "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"
@@ -393,7 +375,7 @@ def _validate_indexer_updates(
             raise ValueError("启用站点资源时至少选择一个资源站点")
         normalized.update(build_indexer_site_updates(sites))
     elif "INDEXER_SUKEBEI_ENABLED" in data:
-        normalized["INDEXER_SUKEBEI_ENABLED"] = _normalize_discovery_boolean(
+        normalized["INDEXER_SUKEBEI_ENABLED"] = normalize_boolean(
             "INDEXER_SUKEBEI_ENABLED", data["INDEXER_SUKEBEI_ENABLED"]
         )
     return normalized
@@ -410,7 +392,7 @@ def _validate_discovery_updates(data: dict[str, Any]) -> dict[str, str]:
             "ORGANIZE_BANGUMI_HINTS_ENABLED",
         } and str(value or "").strip() == "":
             value = "0"
-        normalized[key] = _normalize_discovery_boolean(key, value)
+        normalized[key] = normalize_boolean(key, value)
     for key in _DISCOVERY_TTL_LIMITS.keys() & data.keys():
         normalized[key] = _normalize_discovery_ttl(key, data[key])
 
@@ -446,7 +428,7 @@ def _validate_web_access_updates(data: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for key in ("WEB_SEARCH_ENABLED", "WEB_READ_ENABLED"):
         if key in data:
-            normalized[key] = _normalize_discovery_boolean(key, data[key])
+            normalized[key] = normalize_boolean(key, data[key])
     if "TAVILY_API_KEY" in data and not _is_config_mask(data["TAVILY_API_KEY"]):
         key = str(data["TAVILY_API_KEY"] or "").strip()
         if "\r" in key or "\n" in key or len(key) > 512:
@@ -481,15 +463,15 @@ def _validate_web_access_updates(data: dict[str, Any]) -> dict[str, str]:
 def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     if "AGENT_ENABLED" in data:
-        normalized["AGENT_ENABLED"] = _normalize_discovery_boolean(
+        normalized["AGENT_ENABLED"] = normalize_boolean(
             "AGENT_ENABLED", data["AGENT_ENABLED"]
         )
     if "AGENT_LLM_ENABLED" in data:
-        normalized["AGENT_LLM_ENABLED"] = _normalize_discovery_boolean(
+        normalized["AGENT_LLM_ENABLED"] = normalize_boolean(
             "AGENT_LLM_ENABLED", data["AGENT_LLM_ENABLED"]
         )
     if "AGENT_STREAM_DISPLAY_ENABLED" in data:
-        normalized["AGENT_STREAM_DISPLAY_ENABLED"] = _normalize_discovery_boolean(
+        normalized["AGENT_STREAM_DISPLAY_ENABLED"] = normalize_boolean(
             "AGENT_STREAM_DISPLAY_ENABLED", data["AGENT_STREAM_DISPLAY_ENABLED"]
         )
 
@@ -505,9 +487,7 @@ def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
         if api_url:
             inferred_protocol = infer_protocol_from_url(api_url) or ""
             try:
-                location = normalize_provider_location(
-                    api_url, https_only=True, public_only=True
-                )
+                location = normalize_provider_location(api_url)
             except ValueError as exc:
                 raise ValueError(str(exc)) from exc
             api_url = location.base_url
@@ -567,6 +547,14 @@ def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
             raise ValueError("AGENT_LLM_MODEL 不能包含换行且不能超过 200 个字符")
         normalized["AGENT_LLM_MODEL"] = model
 
+    if "AGENT_LLM_REASONING_EFFORT" in data:
+        from app.clients.openai_compatible import REASONING_EFFORTS
+
+        effort = str(data["AGENT_LLM_REASONING_EFFORT"] or "").strip().lower()
+        if effort and effort not in REASONING_EFFORTS:
+            raise ValueError("AGENT_LLM_REASONING_EFFORT 仅支持留空、low、medium 或 high")
+        normalized["AGENT_LLM_REASONING_EFFORT"] = effort
+
     limits = {
         "AGENT_LLM_TIMEOUT_SECONDS": (2, 120),
         "AGENT_LLM_CONTEXT_WINDOW_TOKENS": (16_384, 2_000_000),
@@ -590,7 +578,7 @@ def _validate_agent_episode_research_updates(data: dict[str, Any]) -> dict[str, 
     normalized: dict[str, str] = {}
     enabled_key = "AGENT_EPISODE_RESEARCH_ENABLED"
     if enabled_key in data:
-        normalized[enabled_key] = _normalize_discovery_boolean(enabled_key, data[enabled_key])
+        normalized[enabled_key] = normalize_boolean(enabled_key, data[enabled_key])
     limit_key = "AGENT_EPISODE_RESEARCH_DAILY_LIMIT"
     if limit_key in data:
         try:
@@ -623,7 +611,7 @@ def _validate_organize_policy_updates(data: dict[str, Any]) -> dict[str, str]:
 def _validate_ai_recognition_updates(data: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     if "AI_RECOGNITION_ENABLED" in data:
-        normalized["AI_RECOGNITION_ENABLED"] = _normalize_discovery_boolean(
+        normalized["AI_RECOGNITION_ENABLED"] = normalize_boolean(
             "AI_RECOGNITION_ENABLED",
             data["AI_RECOGNITION_ENABLED"],
         )
@@ -667,7 +655,7 @@ def _validate_ai_recognition_updates(data: dict[str, Any]) -> dict[str, str]:
 def _validate_organize_tavily_updates(data: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     if "ORGANIZE_TAVILY_HINTS_ENABLED" in data:
-        normalized["ORGANIZE_TAVILY_HINTS_ENABLED"] = _normalize_discovery_boolean(
+        normalized["ORGANIZE_TAVILY_HINTS_ENABLED"] = normalize_boolean(
             "ORGANIZE_TAVILY_HINTS_ENABLED",
             data["ORGANIZE_TAVILY_HINTS_ENABLED"],
         )
@@ -695,7 +683,7 @@ def _validate_nsfw_organize_updates(data: dict[str, Any]) -> dict[str, str]:
     if "GY_ORGANIZE_NSFW_ENABLED" in data:
         raw_enabled = data["GY_ORGANIZE_NSFW_ENABLED"]
         normalized["GY_ORGANIZE_NSFW_ENABLED"] = (
-            "0" if str(raw_enabled or "").strip() == "" else _normalize_discovery_boolean(
+            "0" if str(raw_enabled or "").strip() == "" else normalize_boolean(
                 "GY_ORGANIZE_NSFW_ENABLED", raw_enabled
             )
         )
@@ -841,14 +829,9 @@ def test_telegram_message(request: Request, data: Any = Body(default=None)):
         return api_error("请输入有效的 Chat ID", 400)
 
     try:
-        import telebot
+        from app.modules.telegram_connection_test import send_test_message
 
-        configure_telebot_logging()
-        bot = telebot.TeleBot(token, parse_mode="HTML", threaded=False)
-        sent = bot.send_message(
-            chat_id,
-            "<b>MediaFlux 连接测试</b>\nTelegram Bot 通知通道工作正常。",
-        )
+        sent = send_test_message(token, chat_id)
         return {
             "success": True,
             "message_id": getattr(sent, "message_id", None),
@@ -1059,6 +1042,10 @@ def get_config(request: Request):
     items.setdefault(
         "AGENT_LLM_BUDGET_PROFILES",
         _AGENT_SETTINGS_DEFAULTS["AGENT_LLM_BUDGET_PROFILES"],
+    )
+    items.setdefault(
+        "AGENT_LLM_REASONING_EFFORT",
+        _AGENT_SETTINGS_DEFAULTS["AGENT_LLM_REASONING_EFFORT"],
     )
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
@@ -1293,7 +1280,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
             if key not in data:
                 continue
             try:
-                agent_patrol_updates[key] = _normalize_discovery_boolean(key, data[key])
+                agent_patrol_updates[key] = normalize_boolean(key, data[key])
             except ValueError as exc:
                 return api_error(str(exc), 400)
         media_workflow_updates = {}
@@ -1621,66 +1608,13 @@ def save_config(request: Request, data: Any = Body(default=None)):
             logger.warning(
                 "整理标题线索缓存重置失败 type=%s", type(exc).__name__
             )
-    if {"LOGIN_WALLPAPER_MODE", "TMDB_API_KEY"} & changed_keys:
-        try:
-            from app.modules.login_wallpaper import schedule_login_wallpaper_refresh
-
-            schedule_login_wallpaper_refresh(force=True)
-        except Exception as exc:
-            logger.warning("登录壁纸后台刷新失败 type=%s", type(exc).__name__)
-    if _DISCOVERY_RUNTIME_KEYS & changed_keys:
-        try:
-            from app.discovery.search import shutdown_discovery_search_service
-            from app.discovery.service import shutdown_discovery_service
-            from app.modules.recognition_hints import clear_recognition_hint_cache
-
-            shutdown_discovery_service()
-            shutdown_discovery_search_service()
-            clear_recognition_hint_cache()
-        except Exception as exc:
-            warnings.append("发现页配置已保存，但运行中实例未能热更新；重启后生效")
-            restart_required = True
-            logger.warning(
-                "发现页运行时配置热更新失败 type=%s", type(exc).__name__
-            )
+    feature_warnings, feature_restart = reload_runtime(changed_keys)
+    warnings.extend(feature_warnings)
+    restart_required = restart_required or feature_restart
     if local_media_keys:
         local_warnings, local_restart_required = _reload_local_media_config()
         warnings.extend(local_warnings)
         restart_required = restart_required or local_restart_required
-    if any(key.startswith("INDEXER_") for key in changed_keys):
-        try:
-            from app.indexers.runtime import (
-                run_indexer_awaitable_sync,
-                shutdown_indexer_service,
-            )
-
-            run_indexer_awaitable_sync(
-                shutdown_indexer_service(),
-                timeout_seconds=_INDEXER_RUNTIME_REFRESH_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            warnings.append("Web 索引器配置已保存，但运行中实例未能热更新；重启后生效")
-            restart_required = True
-            logger.warning(
-                "Web Indexer 配置热更新失败 type=%s", type(exc).__name__
-            )
-        try:
-            from app.modules.telegram_resource_search import (
-                shutdown_telegram_indexer_worker,
-            )
-
-            if not shutdown_telegram_indexer_worker(
-                timeout=_INDEXER_RUNTIME_REFRESH_TIMEOUT_SECONDS
-            ):
-                warnings.append("Telegram 索引器配置已保存，但热更新超时；重启后生效")
-                restart_required = True
-                logger.warning("Telegram Indexer 配置热更新超时")
-        except Exception as exc:
-            warnings.append("Telegram 索引器配置已保存，但运行中实例未能热更新；重启后生效")
-            restart_required = True
-            logger.warning(
-                "Telegram Indexer 配置热更新失败 type=%s", type(exc).__name__
-            )
     bot_restart_ms = 0
     background_services_enabled = getattr(
         request.app.state, "background_services_enabled", False

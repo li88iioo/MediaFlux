@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 from typing import Any
-from typing import cast
 
 from collections.abc import Mapping
 import json
 import unittest
 from unittest.mock import patch
 
-from app.agent.domains.configuration.explanations import (
-    config_component_arguments,
-    explain_config_component,
-)
-from app.agent.errors import AgentToolError
+from app import sdk
+from app.modules import diagnostics
 from app.agent.models import ToolResult
 
 
@@ -21,43 +17,33 @@ def _config_get(values: Mapping[str, object]):
     return lambda key, default="": values.get(key, default)
 
 
-def _explain_with_values(component: str, values: Mapping[str, object]) -> ToolResult:
+def _explain_with_values(component: str, values: Mapping[str, object]) -> dict[str, Any]:
     with (
         patch(
-            "app.agent.domains.configuration.explanations.config.all_items",
+            "app.modules.diagnostics.config.all_items",
             return_value=dict(values),
         ),
         patch(
-            "app.agent.domains.configuration.explanations.config.get",
+            "app.modules.diagnostics.config.get",
             side_effect=_config_get(values),
         ),
         patch(
-            "app.agent.domains.configuration.explanations.config.has_external_override",
+            "app.modules.diagnostics.config.has_external_override",
             return_value=False,
         ),
     ):
-        return explain_config_component({"component": component})
+        return diagnostics.component(component)
 
 
 class ConfigComponentExplainUnitTests(unittest.TestCase):
     def test_arguments_are_strict_lowercase_whitelist(self):
-        self.assertEqual(
-            config_component_arguments({"component": " jellyfin "}),
-            {"component": "jellyfin"},
-        )
-        invalid = (
-            None,
-            {},
-            {"component": ""},
-            {"component": 1},
-            {"component": "JELLYFIN"},
-            {"component": "plex"},
-            {"component": "jellyfin", "url": "http://attacker.invalid"},
-            {"component": "jellyfin", "value": "secret"},
-        )
-        for arguments in invalid:
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                config_component_arguments(cast(dict[str, Any], arguments))
+        self.assertEqual(diagnostics.component(" jellyfin ")["data"]["component"], "jellyfin")
+        for arguments in ({}, {"component": ""}, {"component": 1}, {"component": "JELLYFIN"},
+                {"component": "plex"}, {"component": "jellyfin", "url": "http://attacker.invalid"},
+                {"component": "jellyfin", "value": "secret"}):
+            with self.subTest(arguments=arguments), self.assertRaises((ValueError, TypeError)):
+                normalized = sdk.prepare_sdk_method("diagnostics.component", arguments, owner="webk:v1:" + "a" * 64)
+                diagnostics.component(**normalized)
 
     def test_incomplete_component_returns_labels_without_configuration_values(self):
         values = {
@@ -68,15 +54,15 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
             "UNRELATED_PATH": "/srv/private/media",
         }
         result = _explain_with_values("qbittorrent", values)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "incomplete")
-        self.assertEqual(result.summary, "qBittorrent：配置不完整")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["summary"], "qBittorrent：配置不完整")
         self.assertEqual(
-            result.data["required_field_labels"], ["服务地址", "API Key 或用户名/密码"]
+            result["data"]["required_field_labels"], ["服务地址", "API Key 或用户名/密码"]
         )
-        self.assertEqual(result.data["missing_field_labels"], ["API Key 或用户名/密码"])
-        self.assertIn("提交资源到 qBittorrent", result.data["blocked_capabilities"])
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+        self.assertEqual(result["data"]["missing_field_labels"], ["API Key 或用户名/密码"])
+        self.assertIn("提交资源到 qBittorrent", result["data"]["blocked_capabilities"])
+        serialized = json.dumps(result, ensure_ascii=False)
         for forbidden in (
             "QB_URL",
             "QB_PASSWORD",
@@ -96,13 +82,13 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
                 "JELLYFIN_API_KEY": "retained-secret",
             },
         )
-        self.assertEqual(result.status, "disabled")
-        self.assertEqual(result.summary, "Jellyfin：已关闭")
-        self.assertFalse(result.data["enabled"])
-        self.assertEqual(result.data["missing_field_labels"], [])
-        self.assertTrue(result.data["blocked_capabilities"])
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["summary"], "Jellyfin：已关闭")
+        self.assertFalse(result["data"]["enabled"])
+        self.assertEqual(result["data"]["missing_field_labels"], [])
+        self.assertTrue(result["data"]["blocked_capabilities"])
         self.assertNotIn(
-            "retained-secret", json.dumps(result.to_dict(), ensure_ascii=False)
+            "retained-secret", json.dumps(result, ensure_ascii=False)
         )
 
     def test_base_component_reports_environment_management_without_keys(self):
@@ -113,23 +99,23 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.agent.domains.configuration.explanations.config.all_items",
+                "app.modules.diagnostics.config.all_items",
                 return_value=dict(values),
             ),
             patch(
-                "app.agent.domains.configuration.explanations.config.get",
+                "app.modules.diagnostics.config.get",
                 side_effect=_config_get(values),
             ),
             patch(
-                "app.agent.domains.configuration.explanations.config.has_external_override",
+                "app.modules.diagnostics.config.has_external_override",
                 side_effect=lambda key: key == "JELLYFIN_API_KEY",
             ),
         ):
-            result = explain_config_component({"component": "jellyfin"})
-        self.assertEqual(result.status, "incomplete")
-        self.assertTrue(result.data["managed_by_environment"])
-        self.assertIn("运行环境", "".join(result.suggestions))
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+            result = diagnostics.component("jellyfin")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertTrue(result["data"]["managed_by_environment"])
+        self.assertIn("运行环境", "".join(result["suggestions"]))
+        serialized = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("JELLYFIN_API_KEY", serialized)
         self.assertNotIn("jellyfin.internal", serialized)
 
@@ -142,12 +128,12 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
                 "JELLYFIN_API_KEY": "secret",
             },
         )
-        self.assertEqual(result.status, "ready")
-        self.assertEqual(result.summary, "Jellyfin：已就绪")
-        self.assertTrue(result.data["enabled"])
-        self.assertEqual(result.data["missing_field_labels"], [])
-        self.assertEqual(result.data["blocked_capabilities"], [])
-        self.assertIn("测试Jellyfin连接", "".join(result.suggestions))
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["summary"], "Jellyfin：已就绪")
+        self.assertTrue(result["data"]["enabled"])
+        self.assertEqual(result["data"]["missing_field_labels"], [])
+        self.assertEqual(result["data"]["blocked_capabilities"], [])
+        self.assertIn("测试Jellyfin连接", "".join(result["suggestions"]))
 
     def test_ai_recognition_reuses_media_agent_provider(self):
         result = _explain_with_values(
@@ -158,19 +144,19 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
                 "AGENT_LLM_MODEL": "shared-model",
             },
         )
-        self.assertEqual(result.status, "ready")
+        self.assertEqual(result["status"], "ready")
         self.assertEqual(
-            result.data["required_field_labels"], ["Media Agent 模型连接配置"]
+            result["data"]["required_field_labels"], ["Media Agent 模型连接配置"]
         )
-        self.assertEqual(result.data["missing_field_labels"], [])
+        self.assertEqual(result["data"]["missing_field_labels"], [])
 
     def test_ai_recognition_points_incomplete_setup_to_media_agent(self):
         result = _explain_with_values("ai_recognition", {"AI_RECOGNITION_ENABLED": "1"})
-        self.assertEqual(result.status, "incomplete")
+        self.assertEqual(result["status"], "incomplete")
         self.assertEqual(
-            result.data["missing_field_labels"], ["Media Agent 模型连接配置"]
+            result["data"]["missing_field_labels"], ["Media Agent 模型连接配置"]
         )
-        self.assertIn("Media Agent", "".join(result.suggestions))
+        self.assertIn("Media Agent", "".join(result["suggestions"]))
 
     def test_disabled_feature_offers_only_confirmed_safe_action(self):
         feature_summary = ToolResult(
@@ -191,16 +177,18 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
             },
         )
         with patch(
-            "app.agent.domains.configuration.explanations.summarize_feature_states",
-            return_value=feature_summary,
+            "app.modules.feature_config.features",
+            return_value=feature_summary.data,
         ):
-            result = explain_config_component({"component": "douban"})
-        self.assertEqual(result.status, "disabled")
+            result = diagnostics.component("douban")
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["data"]["reason_codes"], ["feature_disabled"])
+        self.assertIn("确认后保存", "".join(result["suggestions"]))
         self.assertEqual(
-            result.data["agent_action"],
+            result["data"]["agent_action"],
             {
                 "supported": True,
-                "tool": "config.set_feature_state",
+                "tool": "settings.set_feature",
                 "feature": "douban",
                 "enabled": True,
                 "requires_confirmation": True,
@@ -227,19 +215,18 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
             },
         )
         with patch(
-            "app.agent.domains.configuration.explanations.summarize_feature_states",
-            return_value=feature_summary,
+            "app.modules.feature_config.features",
+            return_value=feature_summary.data,
         ):
-            result = explain_config_component({"component": "douban"})
-        self.assertEqual(result.status, "blocked")
-        self.assertTrue(result.data["managed_by_environment"])
-        self.assertIsNone(result.data["agent_action"])
-        self.assertIn("运行环境", "".join(result.suggestions))
+            result = diagnostics.component("douban")
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(result["data"]["managed_by_environment"])
+        self.assertIsNone(result["data"]["agent_action"])
+        self.assertIn("运行环境", "".join(result["suggestions"]))
 
 
 class ConfigDiagnosisConsistencyTests(unittest.TestCase):
     def test_strm_summary_and_explanation_share_native_source_validation(self):
-        from app.agent.domains.configuration.diagnosis import diagnose_config
 
         cases = [
             ("", "0", "not_configured"), ("[]", "0", "not_configured"),
@@ -253,29 +240,28 @@ class ConfigDiagnosisConsistencyTests(unittest.TestCase):
             values = {"GY_STRM_SOURCE_DIRS": sources, "STRM_SCHEDULE_ENABLED": scheduled,
                       "GY_STRM_BASE_URL": "http://private.invalid", "STRM_ROOT": "/private/strm"}
             with self.subTest(sources=sources, scheduled=scheduled), patch(
-                "app.agent.domains.configuration.explanations.config.get", side_effect=_config_get(values)
-            ), patch("app.agent.domains.configuration.explanations.config.has_external_override", return_value=False):
-                summary = diagnose_config({})
-                explanation = explain_config_component({"component": "strm"})
-            entry = next(x for x in summary.data["components"] if x["name"] == "strm")
+                "app.modules.diagnostics.config.get", side_effect=_config_get(values)
+            ), patch("app.modules.diagnostics.config.has_external_override", return_value=False):
+                summary = diagnostics.configuration()
+                explanation = diagnostics.component("strm")
+            entry = next(x for x in summary["data"]["components"] if x["name"] == "strm")
             self.assertEqual(entry["status"], expected)
-            self.assertEqual(explanation.status, expected)
-            self.assertEqual(entry["enabled"], explanation.data["enabled"])
-            self.assertEqual("光鸭源目录" in explanation.data["missing_field_labels"], expected != "ready")
-            self.assertFalse(summary.data["network_accessed"])
-            self.assertFalse(explanation.data["network_accessed"])
-            self.assertNotIn("STRM 失败诊断", explanation.data["blocked_capabilities"])
-            self.assertEqual(summary.data["probe_mode"], "configuration_only")
+            self.assertEqual(explanation["status"], expected)
+            self.assertEqual(entry["enabled"], explanation["data"]["enabled"])
+            self.assertEqual("光鸭源目录" in explanation["data"]["missing_field_labels"], expected != "ready")
+            self.assertFalse(summary["data"]["network_accessed"])
+            self.assertFalse(explanation["data"]["network_accessed"])
+            self.assertNotIn("STRM 失败诊断", explanation["data"]["blocked_capabilities"])
+            self.assertEqual(summary["data"]["probe_mode"], "configuration_only")
             if expected == "incomplete":
-                self.assertFalse(summary.ok)
-                self.assertTrue(any(i["severity"] == "error" and i["code"].startswith("strm_") for i in summary.data["issues"]))
-            rendered = json.dumps([summary.to_dict(), explanation.to_dict()], ensure_ascii=False)
+                self.assertFalse(summary["ok"])
+                self.assertTrue(any(i["severity"] == "error" and i["code"].startswith("strm_") for i in summary["data"]["issues"]))
+            rendered = json.dumps([summary, explanation], ensure_ascii=False)
             for secret in ("private.invalid", "/private/strm", "PRIVATE_SOURCE", "GY_STRM_SOURCE_DIRS"):
                 self.assertNotIn(secret, rendered)
 
     def test_summary_reads_one_configuration_snapshot_and_preserves_disabled_servers(self):
         from app import config
-        from app.agent.domains.configuration.diagnosis import diagnose_config
         from app.modules.strm import parse_strm_sources
 
         self.assertEqual(parse_strm_sources("[]", require_nonempty=False), ([], ""))
@@ -285,38 +271,36 @@ class ConfigDiagnosisConsistencyTests(unittest.TestCase):
         with patch.object(config, "get", side_effect=_config_get(values)), patch.object(
             config, "get_many", wraps=config.get_many
         ) as reads, patch.object(config, "has_external_override", return_value=False):
-            summary = diagnose_config({})
+            summary = diagnostics.configuration()
         self.assertEqual(reads.call_count, 1)
-        states = {x["name"]: x["status"] for x in summary.data["components"]}
+        states = {x["name"]: x["status"] for x in summary["data"]["components"]}
         self.assertEqual(states["jellyfin"], "disabled")
         self.assertEqual(states["tmdb"], "ready")
         self.assertEqual(states["qbittorrent"], "ready")
-        self.assertFalse(summary.data["network_accessed"])
-        self.assertNotIn("secret", json.dumps(summary.to_dict()))
+        self.assertFalse(summary["data"]["network_accessed"])
+        self.assertNotIn("secret", json.dumps(summary))
 
     def test_manual_strm_incomplete_is_an_error_even_without_timer(self):
-        from app.agent.domains.configuration.diagnosis import diagnose_config
 
         values = {"GY_STRM_SOURCE_DIRS": '["source"]', "STRM_SCHEDULE_ENABLED": "0", "STRM_ROOT": "/private/strm"}
-        with patch("app.agent.domains.configuration.explanations.config.get", side_effect=_config_get(values)), patch(
-            "app.agent.domains.configuration.explanations.config.has_external_override", return_value=False
+        with patch("app.modules.diagnostics.config.get", side_effect=_config_get(values)), patch(
+            "app.modules.diagnostics.config.has_external_override", return_value=False
         ):
-            result = diagnose_config({})
-        self.assertEqual(result.status, "attention")
-        self.assertTrue(any(i["code"] == "strm_incomplete" for i in result.data["issues"]))
+            result = diagnostics.configuration()
+        self.assertEqual(result["status"], "attention")
+        self.assertTrue(any(i["code"] == "strm_incomplete" for i in result["data"]["issues"]))
 
     def test_diagnosis_reports_exact_missing_labels_without_values(self):
-        from app.agent.domains.configuration.diagnosis import diagnose_config
         for values, missing in (({"QB_API_KEY": "test-private-key"}, ["服务地址"]),
                                 ({"QB_URL": "https://private.invalid"}, ["API Key 或用户名/密码"])):
-            with patch("app.agent.domains.configuration.explanations.config.all_items", return_value=values), patch(
-                "app.agent.domains.configuration.explanations.config.get", side_effect=_config_get(values)
-            ), patch("app.agent.domains.configuration.explanations.config.has_external_override", return_value=False):
-                result = diagnose_config({})
-            qb = next(item for item in result.data["components"] if item["name"] == "qbittorrent")
+            with patch("app.modules.diagnostics.config.all_items", return_value=values), patch(
+                "app.modules.diagnostics.config.get", side_effect=_config_get(values)
+            ), patch("app.modules.diagnostics.config.has_external_override", return_value=False):
+                result = diagnostics.configuration()
+            qb = next(item for item in result["data"]["components"] if item["name"] == "qbittorrent")
             self.assertEqual(qb["missing_field_labels"], missing)
-            issue = next(item for item in result.data["issues"] if item["code"] == "qbittorrent_incomplete")
+            issue = next(item for item in result["data"]["issues"] if item["code"] == "qbittorrent_incomplete")
             self.assertEqual(issue["message"], "qBittorrent 配置不完整，需要补齐：" + "、".join(missing) + "。")
-            serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+            serialized = json.dumps(result, ensure_ascii=False)
             for value in values.values():
                 self.assertNotIn(value, serialized)

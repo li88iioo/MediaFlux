@@ -7,9 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.activity.actions import search_activities, timeline_snapshot
-from app.agent.models import ToolContext
+from app import sdk
 from app.modules import backup
+from app.repositories.activity import timeline_snapshot
 from app.runtime_paths import RuntimePaths
 from tests.support import isolated_test_database
 
@@ -48,11 +48,13 @@ class ActivityRestoreAuditTests(unittest.TestCase):
                 "INSERT INTO local_media_sources(name,local_root,created_at,updated_at) "
                 "VALUES('history','/fixture','2026-01-01 00:00:00','2026-01-01 00:00:00')"
             ).lastrowid
-            self.task = conn.execute(
+            task_id = conn.execute(
                 "INSERT INTO local_media_tasks(source_id,content_path,operation_token,title,status,created_at,updated_at) "
                 "VALUES(?,'/fixture','history-old','history-old','completed','2026-01-01 00:00:00','2026-01-09 00:00:00')",
                 (source,),
             ).lastrowid
+            assert task_id is not None
+            self.task = task_id
             conn.executemany(
                 "INSERT INTO local_media_tasks(source_id,content_path,operation_token,title,status,created_at,updated_at) "
                 "VALUES(?,'/fixture',?,?,'completed','2026-01-02 00:00:00','2026-01-02 00:00:00')",
@@ -73,10 +75,8 @@ class ActivityRestoreAuditTests(unittest.TestCase):
         self.target = {"kind": "local_media", "id": self.task}
 
     def _business(self):
-        search = search_activities(
-            {"query": "history", "limit": 2}, ToolContext(owner="fixture")
-        )
-        timeline = timeline_snapshot(self.target)
+        search = sdk.activity.search(query="history", limit=2)
+        timeline = timeline_snapshot(self.target["kind"], self.target["id"])
         with db.get_conn() as conn:
             raw = {
                 table: [
@@ -92,13 +92,13 @@ class ActivityRestoreAuditTests(unittest.TestCase):
             }
         return {
             "raw": raw,
-            "search": search.data,
-            "selection": search.references[0].value,
-            "status": timeline.status,
-            "attention": timeline.data["needs_attention"],
+            "search": search,
+            "selection": {"items": [{"kind": row["kind"], "id": row["id"]} for row in search["items"]]},
+            "status": timeline["status"],
+            "attention": timeline["data"]["needs_attention"],
             "members": next(
                 stage
-                for stage in timeline.data["stages"]
+                for stage in timeline["data"]["stages"]
                 if stage["stage"] == "成员处理"
             ),
         }

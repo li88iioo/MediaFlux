@@ -287,7 +287,8 @@ sys.addaudithook(audit)
     def test_fresh_start_rejects_non_loopback_environment_host(self) -> None:
         from app import cli
 
-        with patch.dict(os.environ, {"WEB_HOST": "0.0.0.0"}, clear=False), patch(
+        with patch.dict(os.environ, {"WEB_HOST": "0.0.0.0", "MEDIAFLUX_CONTAINER": "",
+                                    "MEDIAFLUX_ALLOW_REMOTE_SETUP": ""}, clear=False), patch(
             "app.modules.first_run.needs_initialization", return_value=True
         ), patch("app.cli.uvicorn.run") as run:
             exit_code = cli._start(None, 1258, None)
@@ -321,7 +322,8 @@ sys.addaudithook(audit)
                 release_startup_lifecycle_guard=lambda: events.append("app-release")
             )
         )
-        with patch("app.cli.get_runtime_paths", return_value=paths), patch(
+        environment = dict(os.environ)
+        with patch.dict(os.environ, {"MEDIAFLUX_CONTAINER": "1"}), patch("app.cli.get_runtime_paths", return_value=paths), patch(
             "app.modules.backup.runtime_lifecycle_guard",
             side_effect=lifecycle_guard,
         ), patch(
@@ -351,7 +353,9 @@ sys.addaudithook(audit)
             side_effect=lambda *_args, **_kwargs: events.append("uvicorn"),
         ):
             self.assertEqual(cli._start(None, None, None), 0)
+            self.assertEqual(os.environ["APP_ENV"], "production")
 
+        self.assertEqual(dict(os.environ), environment)
         self.assertEqual(
             events,
             [

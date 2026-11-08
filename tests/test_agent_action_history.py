@@ -7,13 +7,13 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.database import media_owner_digest
 from app.agent.action_history import (
-    action_history_owner_digest,
-    list_action_history,
+    read_actions,
     record_confirmed_result,
 )
 from app.agent.errors import AgentToolError
-from app.agent.models import RiskLevel, ToolContext, ToolResult
+from app.agent.models import RiskLevel, ToolResult
 from tests.support import isolated_test_database
 
 OWNER = "test-action-history-owner"
@@ -21,6 +21,20 @@ OWNER_DIGEST = "a" * 64
 
 
 class AgentActionHistoryCoreTests(unittest.TestCase):
+    def test_common_owner_digest_keeps_existing_partition_and_public_identity_errors(self):
+        from app.agent.action_history import record_confirmation_claimed
+
+        with patch("app.modules.web_secret.get_web_secret", return_value="fixed-secret"):
+            self.assertEqual(media_owner_digest(" owner-a "),
+                             "78c084ecc94934141e7ea8a17235b5a93ca99f03ae338afcc663ed36108b991c")
+        with self.assertRaises(ValueError) as missing:
+            media_owner_digest(" ")
+        self.assertIs(type(missing.exception), ValueError)
+        with self.assertRaises(AgentToolError) as rejected:
+            record_confirmation_claimed(owner=" ", confirmation_id="test", owner_generation=1,
+                                        tool_name="preferences.update", risk=RiskLevel.LOW_WRITE)
+        self.assertEqual(rejected.exception.code, "identity_required")
+
     def setUp(self) -> None:
         self._database = isolated_test_database("agent-action-history.db")
         self._database.__enter__()
@@ -73,7 +87,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             1,
         )
         with self.assertRaises(ValueError):
-            db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=51)
+            db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=502)
         with self.assertRaises(ValueError):
             db.add_agent_action_history(
                 owner_digest=OWNER_DIGEST,
@@ -125,7 +139,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertIn("idx_agent_action_history_owner_id", indexes)
 
     def test_failed_filter_excludes_in_progress_and_unknown_outcomes(self):
-        owner_digest = action_history_owner_digest(OWNER)
+        owner_digest = media_owner_digest(OWNER)
         for status in ("executing", "outcome_unknown"):
             db.add_agent_action_history(
                 owner_digest=owner_digest,
@@ -147,12 +161,41 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             owner_digest=owner_digest, limit=10, outcome="failed"
         )
         self.assertEqual([row["status"] for row in failed], ["failed"])
-        all_items = list_action_history(
-            {"limit": 10, "outcome": "all"}, ToolContext(owner=OWNER)
-        ).data["items"]
+        all_items = read_actions(owner=OWNER, **{"limit": 10, "outcome": "all"})["items"]
         outcomes = {item["status"]: item["outcome"] for item in all_items}
         self.assertEqual(outcomes["executing"], "pending")
         self.assertEqual(outcomes["outcome_unknown"], "unknown")
+
+    def test_native_sdk_receipts_keep_tool_identity_count_and_public_job_reference(self):
+        from app.repositories.organize_operation_jobs import organize_operation_public_ref
+
+        reference = organize_operation_public_ref("a" * 32)
+        cases = {
+            "resources.download": {"target": "qb", "total": 20},
+            "downloads.submit": {"request_id": 23, "target": "both", "status": "partial",
+                                 "created": True, "duplicate": False, "succeeded": 1, "failed": 1},
+            "cloud.change": {"total": 20, "operation_ref": reference, "queued": True},
+            **dict.fromkeys(("downloads.retry", "downloads.retry_submission"), {
+                "request_id": 23, "source_request_id": 19, "target": "both",
+                "status": "manual_review", "created": True, "duplicate": False,
+                "succeeded": 1, "failed": 1, "source_attention_preserved": True,
+            }),
+        }
+        for tool, details in cases.items():
+            data: dict = {**details, "payload": "private-value"}
+            if tool.startswith("downloads."):
+                data.update(succeeded=["qb", "qb", "private-value"], failed=["guangya"])
+            record_confirmed_result(
+                owner=OWNER, tool_name=tool, risk=RiskLevel.WRITE,
+                result=ToolResult(True, "accepted", "请求已受理", data=data),
+                elapsed_ms=1,
+            )
+        rows = db.list_agent_action_history(owner_digest=media_owner_digest(OWNER), limit=10)
+        self.assertEqual({row["tool_name"] for row in rows}, set(cases))
+        for row in rows:
+            self.assertEqual(row["status"], "accepted")
+            self.assertEqual(json.loads(row["safe_details"]), cases[row["tool_name"]])
+            self.assertNotIn("private-value", json.dumps(dict(row)))
 
     def test_projection_keeps_only_strict_safe_fields(self):
         record_confirmed_result(
@@ -180,7 +223,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             elapsed_ms=8,
         )
         row = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER), limit=1
+            owner_digest=media_owner_digest(OWNER), limit=1
         )[0]
         details = json.loads(row["safe_details"])
         self.assertEqual(
@@ -228,12 +271,10 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             elapsed_ms=9,
             confirmation_contract=contract,
         )
-        result = list_action_history(
-            {"limit": 20, "outcome": "all"}, ToolContext(owner=OWNER)
-        )
-        self.assertEqual(result.data["items"][0]["confirmation"], contract)
+        result = read_actions(owner=OWNER, **{"limit": 20, "outcome": "all"})
+        self.assertEqual(result["items"][0]["confirmation"], contract)
         row = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER), limit=1
+            owner_digest=media_owner_digest(OWNER), limit=1
         )[0]
         stored = json.loads(row["safe_details"])
         self.assertEqual(stored["contract_risk"], "danger")
@@ -269,7 +310,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             confirmation_contract=contract,
         )
         rows = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER), limit=1
+            owner_digest=media_owner_digest(OWNER), limit=1
         )
         self.assertEqual(len(rows), 1)
         stored = json.loads(rows[0]["safe_details"])
@@ -293,7 +334,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             elapsed_ms=5,
         )
         row = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER), limit=1
+            owner_digest=media_owner_digest(OWNER), limit=1
         )[0]
         self.assertEqual(row["tool_name"], "guangya.organize.stop")
         self.assertEqual(json.loads(row["safe_details"]), {"accepted": True})
@@ -335,9 +376,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
                 result=ToolResult(True, "completed", "done", data=data),
                 elapsed_ms=3,
             )
-        items = list_action_history(
-            {"limit": 10, "outcome": "all"}, ToolContext(owner=OWNER)
-        ).data["items"]
+        items = read_actions(owner=OWNER, **{"limit": 10, "outcome": "all"})["items"]
         by_tool = {item["tool"]: item for item in items}
         self.assertIn("local_media.retry_task", by_tool)
         self.assertIn("local_media.refresh_task_library", by_tool)
@@ -386,7 +425,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             elapsed_ms=5,
         )
         row = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER), limit=1
+            owner_digest=media_owner_digest(OWNER), limit=1
         )[0]
         self.assertEqual(row["tool_name"], "guangya.organize.cleanup.execute")
         self.assertEqual(
@@ -422,7 +461,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             elapsed_ms=5,
         )
         rows = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER), limit=1
+            owner_digest=media_owner_digest(OWNER), limit=1
         )
         self.assertEqual({row["tool_name"] for row in rows}, {"guangya.rename.execute"})
         self.assertEqual(
@@ -439,7 +478,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
     def test_startup_marks_orphaned_executing_action_as_unknown(self):
         confirmation_id = "orphaned-confirmation-1234567890"
         db.add_agent_action_history(
-            owner_digest=action_history_owner_digest("owner"),
+            owner_digest=media_owner_digest("owner"),
             tool_name="strm.run_once",
             risk="danger",
             status="executing",
@@ -449,14 +488,14 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         )
         db.init_db()
         rows = db.list_agent_action_history(
-            owner_digest=action_history_owner_digest("owner"), limit=1
+            owner_digest=media_owner_digest("owner"), limit=1
         )
         self.assertEqual(rows[0]["status"], "outcome_unknown")
         self.assertEqual(rows[0]["error_code"], "execution_interrupted")
 
     def test_read_tool_returns_safe_rows(self):
         db.add_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER),
+            owner_digest=media_owner_digest(OWNER),
             tool_name="config.set_feature_state",
             risk="low_write",
             status="completed",
@@ -465,19 +504,16 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             safe_details={"feature": "discovery", "enabled": False},
             elapsed_ms=3,
         )
-        result = list_action_history(
-            {"limit": 20, "outcome": "all"}, ToolContext(owner=OWNER)
-        )
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["count"], 1)
+        result = read_actions(owner=OWNER, **{"limit": 20, "outcome": "all"})
+        self.assertEqual(result["count"], 1)
         self.assertEqual(
-            result.data["items"][0]["details"],
+            result["items"][0]["details"],
             {"feature": "discovery", "enabled": False},
         )
 
     def test_read_tool_resanitizes_polluted_persisted_rows(self):
         db.add_agent_action_history(
-            owner_digest=action_history_owner_digest(OWNER),
+            owner_digest=media_owner_digest(OWNER),
             tool_name="strm.run_once",
             risk="danger",
             status="token-secret",
@@ -488,9 +524,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             elapsed_ms=3,
             finished_at="token-secret",
         )
-        item = list_action_history(
-            {"limit": 1, "outcome": "all"}, ToolContext(owner=OWNER)
-        ).data["items"][0]
+        item = read_actions(owner=OWNER, **{"limit": 1, "outcome": "all"})["items"][0]
         self.assertEqual(item["tool"], "strm.run_once")
         self.assertEqual(item["status"], "unavailable")
         self.assertEqual(item["summary"], "STRM 手动同步：暂时不可用")
@@ -512,28 +546,50 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         owner_b = "owner-b"
         for owner, status in ((owner_a, "accepted"), (owner_b, "completed")):
             db.add_agent_action_history(
-                owner_digest=action_history_owner_digest(owner),
+                owner_digest=media_owner_digest(owner),
                 tool_name="strm.run_once",
                 risk="danger",
                 status=status,
                 ok=True,
                 summary="STRM 手动同步：已记录",
             )
-        result_a = list_action_history(
-            {"limit": 20, "outcome": "all"}, ToolContext(owner=owner_a)
-        )
-        result_b = list_action_history(
-            {"limit": 20, "outcome": "all"}, ToolContext(owner=owner_b)
+        result_a = read_actions(owner=owner_a, **{"limit": 20, "outcome": "all"})
+        result_b = read_actions(owner=owner_b, **{"limit": 20, "outcome": "all"})
+        self.assertEqual(
+            [item["status"] for item in result_a["items"]], ["accepted"]
         )
         self.assertEqual(
-            [item["status"] for item in result_a.data["items"]], ["accepted"]
-        )
-        self.assertEqual(
-            [item["status"] for item in result_b.data["items"]], ["completed"]
+            [item["status"] for item in result_b["items"]], ["completed"]
         )
         with self.assertRaises(AgentToolError) as missing:
-            list_action_history({"limit": 20, "outcome": "all"}, ToolContext())
+            read_actions(owner="", **{"limit": 20, "outcome": "all"})
         self.assertEqual(missing.exception.code, "identity_required")
+
+    def test_native_actions_paginate_real_ids_without_crossing_owners(self):
+        from app import sdk
+        from app.agent.kernel.bootstrap import build_tool_catalog
+
+        assert "agent.action_history" not in {tool.name for tool in build_tool_catalog().visible()}
+        with db.get_conn() as conn:
+            for index in range(117):
+                conn.execute("INSERT INTO agent_action_history(owner_digest,tool_name,risk,status,ok,mode,summary,safe_details,error_code,elapsed_ms,started_at,finished_at) VALUES(?, 'strm.run', 'write', ?, 0, '', '', '{}', '', 0, '', '')",
+                             (media_owner_digest(OWNER if index % 7 else "other-owner"), "executing" if index % 2 else "outcome_unknown"))
+        found = []
+        arguments: dict = {"limit": 17}
+        with sdk.call_owner(OWNER):
+            while True:
+                page = sdk.activity.actions(**arguments)
+                assert page["count"] == len(page["items"])
+                assert page["outcome"] == "all"
+                found.extend(row["id"] for row in page["items"])
+                if not page["has_more"]:
+                    assert page["next"] is None
+                    break
+                arguments = page["next"]
+            assert sdk.activity.actions(outcome="failed")["items"] == []
+            assert sdk.activity.actions(before_id=found[-1])["items"] == []
+        assert len(found) == len(set(found)) == 100
+        assert found == sorted(found, reverse=True)
 
     def test_history_retention_keeps_latest_two_thousand_rows(self):
         timestamp = db.now()
@@ -578,7 +634,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertEqual(oldest, newest - 1999)
 
     def test_history_retention_does_not_evict_another_owner(self):
-        other_owner = action_history_owner_digest("owner-b")
+        other_owner = media_owner_digest("owner-b")
         db.add_agent_action_history(
             owner_digest=other_owner,
             tool_name="strm.run_once",
@@ -609,7 +665,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertEqual(other_count, 1)
 
     def test_history_global_cap_keeps_new_record_and_evicts_oldest_fairly(self):
-        owners = [action_history_owner_digest(f"owner-{index}") for index in range(4)]
+        owners = [media_owner_digest(f"owner-{index}") for index in range(4)]
         with patch("app.database._AGENT_ACTION_HISTORY_GLOBAL_LIMIT", 3):
             for index, owner in enumerate(owners):
                 db.add_agent_action_history(
@@ -627,9 +683,9 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertEqual([row["owner_digest"] for row in stored], owners[1:])
 
     def test_history_global_cap_prefers_owner_with_largest_share(self):
-        owner_a = action_history_owner_digest("owner-large-share")
-        owner_b = action_history_owner_digest("owner-small-share")
-        owner_c = action_history_owner_digest("owner-new-share")
+        owner_a = media_owner_digest("owner-large-share")
+        owner_b = media_owner_digest("owner-small-share")
+        owner_c = media_owner_digest("owner-new-share")
         with patch("app.database._AGENT_ACTION_HISTORY_GLOBAL_LIMIT", 3):
             for summary in ("A1", "A2"):
                 db.add_agent_action_history(
@@ -668,9 +724,9 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertEqual(int(rows[-1]["id"]), newest_id)
 
     def test_history_global_cap_converges_from_legacy_overflow(self):
-        owner_a = action_history_owner_digest("legacy-owner-a")
-        owner_b = action_history_owner_digest("legacy-owner-b")
-        owner_c = action_history_owner_digest("legacy-owner-c")
+        owner_a = media_owner_digest("legacy-owner-a")
+        owner_b = media_owner_digest("legacy-owner-b")
+        owner_c = media_owner_digest("legacy-owner-c")
         with db.get_conn() as conn:
             for owner, summary in (
                 (owner_a, "A1"),

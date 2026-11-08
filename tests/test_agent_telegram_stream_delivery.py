@@ -84,6 +84,45 @@ async def _wait_for_thread_event(event: threading.Event) -> None:
 
 
 class TelegramStreamDeliveryTests(unittest.TestCase):
+    def test_sdk_progress_shows_real_action_without_title_or_workspace_noise(self):
+        progress = ControlledProgress()
+        observer = adapter._TelegramEventObserver(progress)
+        factory = _factory()
+
+        async def show(kind, payload):
+            progress.update_called.clear()
+            await observer(factory.create(kind, payload))
+            await _wait_for_thread_event(progress.update_called)
+
+        async def operation():
+            await show(AgentEventType.MODEL_STARTED, {"round": 1})
+            for state in ("running", "completed", "failed", "approval_required"):
+                await show(AgentEventType.TOOL_PROGRESS, {
+                    "tool": "agent.run_code",
+                    "activity": {"kind": "tool", "label": "资源搜索", "status": state,
+                                 "summary": "完美世界 <4K>"},
+                })
+            shown = progress.started_snapshot()
+            for kind, payload in (
+                (AgentEventType.TOOL_PROGRESS, {"tool": "agent.run_code", "summary": "工作区代码执行完成"}),
+                (AgentEventType.TOOL_PROGRESS, {"activity": {"kind": "reasoning", "text": "PRIVATE-REASONING"}}),
+                (AgentEventType.TOOL_COMPLETED, {"tool": "agent.run_code", "result": {"summary": "退出码 0"}}),
+            ):
+                await observer(factory.create(kind, payload))
+            await asyncio.sleep(0.02)
+            self.assertEqual(progress.started_snapshot(), shown)
+            await show(AgentEventType.MODEL_DELTA, {"round": 1, "delta": "已找到对应资源。"})
+            await observer(factory.create(AgentEventType.TURN_COMPLETED))
+
+        with patch.object(adapter, "_STREAM_EDIT_INTERVAL_SECONDS", 0.001):
+            asyncio.run(observer.consume(operation()))
+        sent = progress.started_snapshot()
+        self.assertEqual(sent[0], "思考中…")
+        self.assertEqual(sent[1:5], [f"资源搜索 · {state}\n完美世界 &lt;4K&gt;"
+                                   for state in ("进行中", "已完成", "未完成", "等待确认")])
+        self.assertIn("已找到对应资源。", sent[-1])
+        self.assertNotIn("Media Agent", "\n".join(sent))
+
     def test_slow_update_does_not_backpressure_events_and_sends_only_latest_merge(self):
         progress = ControlledProgress(block_first=True, watch_for="LATEST-END")
         observer = adapter._TelegramEventObserver(progress)

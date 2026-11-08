@@ -113,12 +113,12 @@ def _plan_subtitles(
     combined = [(item, "video") for item in videos] + [(item, "subtitle") for item in subtitles]
     for entry, kind in combined:
         parent = _normalize_path(entry.get("parent_path"), field="parent_path")
-        handle = str(entry.get("handle") or "").strip().upper()
-        if not handle:
-            raise GuangYaEpisodeNamingError("目录观察中的媒体缺少真实对象 handle，无法计划字幕配对")
+        file_id = str(entry.get("file_id") or "").strip()
+        if not file_id:
+            raise GuangYaEpisodeNamingError("目录观察中的媒体缺少真实file_id，无法计划字幕配对")
         media = media_by_parent.setdefault(parent, {"video": [], "subtitle": []})
         media[kind].append(
-            SimpleNamespace(file_id=handle, name=str(entry.get("name") or ""), entry=entry)
+            SimpleNamespace(file_id=file_id, name=str(entry.get("name") or ""), entry=entry)
         )
 
     plans = []
@@ -138,16 +138,16 @@ def _subtitle_skips(result: SubtitlePlanResult) -> list[dict[str, str]]:
     ]
 
 
-def summarize_episode_naming_observation(
-    observation: dict[str, Any], *, target_root: str
+def summarize_episode_files(
+    snapshot: dict[str, Any], *, target_root: str
 ) -> dict[str, Any]:
     """把完整目录快照压缩为供模型判断篇章映射的小型 DTO。"""
 
-    if bool(observation.get("truncated")):
-        raise GuangYaEpisodeNamingError("光鸭目录观察不完整，请扩大 max_items 后重新读取")
+    if snapshot.get("scan_complete") is not True:
+        raise GuangYaEpisodeNamingError("光鸭目录读取不完整，请扩大扫描预算后重新读取")
     normalized_root = _normalize_path(target_root, field="target_root")
     grouped: dict[str, list[dict[str, Any]]] = {}
-    entries = [item for item in observation.get("entries") or () if isinstance(item, dict)]
+    entries = [item for item in snapshot.get("items") or () if isinstance(item, dict)]
     videos = [
         entry for entry in entries
         if not bool(entry.get("is_dir"))
@@ -189,6 +189,7 @@ def summarize_episode_naming_observation(
         total_unparsed += unparsed
         summaries.append({
             "source_path": parent_path,
+            "file_ids": [item["file_id"] for item in items],
             "directory_name": "(共同父目录)" if parent_path == normalized_root else Path(parent_path).name,
             **regular,
             "video_count": len(items),
@@ -241,7 +242,7 @@ def _summarize_positions(rows: list[tuple[dict[str, Any], int | None, int | None
 
 
 def compile_episode_naming_operations(
-    observation: dict[str, Any],
+    snapshot: dict[str, Any],
     *,
     title: str,
     target_root: str,
@@ -249,8 +250,8 @@ def compile_episode_naming_operations(
 ) -> dict[str, Any]:
     """按显式篇章映射展开视频与唯一配套字幕的文件变更。"""
 
-    if bool(observation.get("truncated")):
-        raise GuangYaEpisodeNamingError("光鸭目录观察不完整，请扩大 max_items 后重新读取")
+    if snapshot.get("scan_complete") is not True:
+        raise GuangYaEpisodeNamingError("光鸭目录读取不完整，请扩大扫描预算后重新读取")
     normalized_title = (title or "").strip()
     if not 1 <= len(normalized_title) <= 180:
         raise GuangYaEpisodeNamingError("title 长度必须在 1 到 180 之间")
@@ -258,7 +259,7 @@ def compile_episode_naming_operations(
     if not isinstance(groups, list) or not 1 <= len(groups) <= 32:
         raise GuangYaEpisodeNamingError("groups 必须包含 1 到 32 个篇章映射")
 
-    entries = [item for item in observation.get("entries") or () if isinstance(item, dict)]
+    entries = [item for item in snapshot.get("items") or () if isinstance(item, dict)]
     videos = [
         item for item in entries
         if not bool(item.get("is_dir"))
@@ -271,8 +272,8 @@ def compile_episode_naming_operations(
         and str(item.get("media_kind") or "") == "subtitle"
         and _within_root(item, normalized_root)
     ]
-    if any(not str(item.get("handle") or "").strip() for item in [*videos, *subtitles]):
-        raise GuangYaEpisodeNamingError("目录观察中的媒体缺少真实对象 handle，拒绝编译")
+    if any(not str(item.get("file_id") or "").strip() for item in [*videos, *subtitles]):
+        raise GuangYaEpisodeNamingError("目录观察中的媒体缺少真实file_id，拒绝编译")
 
     existing_directories = {
         _normalize_path(item.get("parent_path"), field="parent_path")
@@ -288,7 +289,7 @@ def compile_episode_naming_operations(
         if bool(item.get("is_dir")) and str(item.get("name") or "").strip()
     )
 
-    selected_handles: set[str] = set()
+    selected_ids: set[str] = set()
     selected_videos: list[dict[str, Any]] = []
     group_states: list[dict[str, Any]] = []
     for index, group in enumerate(groups, start=1):
@@ -297,6 +298,8 @@ def compile_episode_naming_operations(
         if type(group.get("include_extras", False)) is not bool:
             raise GuangYaEpisodeNamingError("include_extras 必须是布尔值")
         source_path = _normalize_path(group.get("source_path"), field="source_path")
+        if not (source_path == normalized_root or source_path.startswith(normalized_root.rstrip("/") + "/")):
+            raise GuangYaEpisodeNamingError("篇章来源不在当前真实作品根内")
         target_season = int(group["target_season"])
         source_start = int(group["source_episode_start"])
         source_end = int(group["source_episode_end"])
@@ -348,11 +351,11 @@ def compile_episode_naming_operations(
 
         rows = []
         for source_episode, entry in episode_entries:
-            handle = str(entry.get("handle") or "").strip().upper()
-            if not handle or handle in selected_handles:
+            file_id = str(entry.get("file_id") or "").strip()
+            if not file_id or file_id in selected_ids:
                 raise GuangYaEpisodeNamingError("篇章映射包含重复或无效对象")
-            selected_handles.add(handle)
-            row = {"handle": handle, "source_episode": source_episode, "entry": entry}
+            selected_ids.add(file_id)
+            row = {"file_id": file_id, "source_episode": source_episode, "entry": entry}
             rows.append(row)
             selected_videos.append(entry)
         group_states.append({
@@ -388,20 +391,20 @@ def compile_episode_naming_operations(
 
     selected_subtitles = [
         plan for plan in all_subtitle_plan.plans
-        if plan.video_file_id in selected_handles
+        if plan.video_file_id in selected_ids
     ]
     unselected_subtitles = [
-        plan for plan in all_subtitle_plan.plans if plan.video_file_id not in selected_handles
+        plan for plan in all_subtitle_plan.plans if plan.video_file_id not in selected_ids
     ]
-    selected_video_handles = set(selected_handles)
-    subtitle_handles = [
-        str(plan.file.entry.get("handle") or "").strip().upper()
+    selected_video_ids = set(selected_ids)
+    subtitle_ids = [
+        str(plan.file.entry.get("file_id") or "").strip()
         for plan in selected_subtitles
     ]
-    if any(not handle for handle in subtitle_handles) or len(set(subtitle_handles)) != len(subtitle_handles):
-        raise GuangYaEpisodeNamingError("字幕计划包含重复或无效对象 handle")
-    if selected_video_handles.intersection(subtitle_handles):
-        raise GuangYaEpisodeNamingError("字幕计划重复引用了已选视频对象 handle")
+    if any(not file_id for file_id in subtitle_ids) or len(set(subtitle_ids)) != len(subtitle_ids):
+        raise GuangYaEpisodeNamingError("字幕计划包含重复或无效对象 file_id")
+    if selected_video_ids.intersection(subtitle_ids):
+        raise GuangYaEpisodeNamingError("字幕计划重复引用了已选视频对象 file_id")
 
     target_names: set[tuple[str, str]] = set()
     video_targets: dict[str, dict[str, Any]] = {}
@@ -409,7 +412,7 @@ def compile_episode_naming_operations(
     create_operations: list[dict[str, Any]] = []
     change_operations: list[dict[str, Any]] = []
     group_summaries: list[dict[str, Any]] = []
-    selected_handles.update(subtitle_handles)
+    selected_ids.update(subtitle_ids)
     skipped_noop = 0
 
     for state in group_states:
@@ -438,7 +441,7 @@ def compile_episode_naming_operations(
                     f"多个篇章映射会生成同一目标：S{target_season:02d}E{target_episode:02d}"
                 )
             target_names.add(target_key)
-            video_targets[row["handle"]] = {
+            video_targets[row["file_id"]] = {
                 "target_path": target_path,
                 "target_episode": target_episode,
                 "desired_name": desired,
@@ -450,10 +453,10 @@ def compile_episode_naming_operations(
                     skipped_noop += 1
                 else:
                     rename_items.append(
-                        {"op": "rename", "object_ref": row["handle"], "new_name": desired}
+                        {"op": "rename", "file_id": row["file_id"], "new_name": desired}
                     )
             else:
-                relocate_items.append({"object_ref": row["handle"], "episode": target_episode})
+                relocate_items.append({"op": "relocate", "file_id": row["file_id"], "target_path": target_path, "new_name": desired})
 
         if (relocate_items or rename_items) and target_path not in existing_directories and target_path not in create_paths:
             create_paths.add(target_path)
@@ -461,16 +464,7 @@ def compile_episode_naming_operations(
                 {"op": "create_directory", "parent_path": normalized_root, "name": f"Season {target_season:02d}"}
             )
         change_operations.extend(rename_items)
-        if relocate_items:
-            change_operations.append({
-                "op": "batch_relocate",
-                "items": relocate_items,
-                "target_path": target_path,
-                "title": normalized_title,
-                "naming": "season_episode",
-                "season": target_season,
-                "episode_padding": 2,
-            })
+        change_operations.extend(relocate_items)
         group_summaries.append({
             "source_directory": "(共同父目录)" if state["source_path"] == normalized_root else Path(state["source_path"]).name,
             "season": target_season,
@@ -487,10 +481,10 @@ def compile_episode_naming_operations(
         })
 
     for plan in selected_subtitles:
-        video_handle = plan.video_file_id
-        target = video_targets[video_handle]
+        video_id = plan.video_file_id
+        target = video_targets[video_id]
         entry = plan.file.entry
-        handle = str(entry.get("handle") or "").strip().upper()
+        file_id = str(entry.get("file_id") or "").strip()
         desired = plan.target_name(target["desired_name"])
         target_key = (target["target_path"].casefold(), desired.casefold())
         if target_key in target_names:
@@ -502,17 +496,29 @@ def compile_episode_naming_operations(
             if current_name == desired:
                 skipped_noop += 1
             else:
-                change_operations.append({"op": "rename", "object_ref": handle, "new_name": desired})
+                change_operations.append({"op": "rename", "file_id": file_id, "new_name": desired})
         else:
             change_operations.append({
                 "op": "relocate",
-                "object_ref": handle,
+                "file_id": file_id,
                 "target_path": target["target_path"],
                 "new_name": desired,
             })
 
+    directory_ids = {_full_path(item["parent_path"], item["name"]): item["file_id"] for item in entries if item.get("is_dir")}
+    directory_ids[normalized_root] = snapshot.get("root", {}).get("file_id")
+    for operation in create_operations:
+        if directory_ids.get(operation["parent_path"]):
+            operation["parent_id"] = directory_ids[operation["parent_path"]]
+    by_id = {entry["file_id"]: entry for entry in entries}
+    for operation in change_operations:
+        entry = by_id[operation["file_id"]]
+        if operation.get("target_path") in directory_ids:
+            operation["target_id"] = directory_ids[operation["target_path"]]
+        operation["expected"] = {key: entry[key] for key in ("file_id", "parent_id", "name", "is_dir", "size", "etag", "updated_at")}
+        operation["expected"]["path"] = _full_path(entry["parent_path"], entry["name"])
     operations = [*create_operations, *change_operations]
-    selected_file_count = len(selected_handles)
+    selected_file_count = len(selected_ids)
     if selected_file_count > _MAX_MEDIA_OPERATIONS:
         raise GuangYaEpisodeNamingError(
             f"完整方案包含 {selected_file_count} 个媒体文件，单个冻结计划最多 "
@@ -523,10 +529,7 @@ def compile_episode_naming_operations(
             f"完整方案需要创建 {len(create_operations)} 个目录，单个冻结计划最多 "
             f"{_MAX_CREATE_DIRECTORY_OPERATIONS} 个"
         )
-    effective_total = len(create_operations) + sum(
-        len(item.get("items") or ()) if item.get("op") == "batch_relocate" else 1
-        for item in change_operations
-    )
+    effective_total = len(operations)
     if effective_total == 0:
         raise GuangYaEpisodeNamingError("所选文件已经符合目标分季命名，无需变更")
 
@@ -547,3 +550,46 @@ def compile_episode_naming_operations(
         "skipped_noop": skipped_noop,
         "groups": group_summaries,
     }
+
+
+def episode_inventory(client, file_id: str, *, should_stop=None) -> dict:
+    """完整真实目录事实与分类；源集号不能证明TMDB映射，缺依据时仍需核对。"""
+    from app.modules.guangya_workspace import list_files
+    if file_id == "0":
+        raise GuangYaEpisodeNamingError("剧集命名必须指定非账号根目录的真实ID")
+    snapshot = list_files(client, file_id, recursive=True, should_stop=should_stop)
+    root = snapshot["root"]
+    return {**snapshot, **summarize_episode_files(snapshot, target_root=root["path"])}
+
+
+def preview_episode_names(client, file_id: str, *, title: str, groups: list[dict], should_stop=None) -> dict:
+    """按明确source_path和季集映射编译真实ID操作；无观察句柄、TTL或单独执行入口。"""
+    if not isinstance(title, str):
+        raise GuangYaEpisodeNamingError("title必须是字符串")
+    if not isinstance(groups, list) or not 1 <= len(groups) <= 32:
+        raise GuangYaEpisodeNamingError("groups必须包含1到32个篇章映射")
+    allowed = {"source_path", "target_season", "source_episode_start", "source_episode_end", "target_episode_start",
+               "source_season", "name_contains", "expected_count", "include_extras"}
+    for group in groups:
+        if not isinstance(group, dict) or set(group) - allowed:
+            raise GuangYaEpisodeNamingError("篇章映射含不支持字段；使用真实source_path，不使用来源序号")
+        for key in ("source_path", "target_season", "source_episode_start", "source_episode_end", "expected_count"):
+            if key not in group:
+                raise GuangYaEpisodeNamingError("篇章映射缺少" + key)
+        if not isinstance(group["source_path"], str):
+            raise GuangYaEpisodeNamingError("source_path必须为实际读取的路径")
+        for key, minimum, maximum in (("target_season", 0, 999), ("source_season", 0, 999),
+                ("source_episode_start", 0, 9999), ("source_episode_end", 0, 9999),
+                ("target_episode_start", 1, 9999), ("expected_count", 1, 200)):
+            value = group.get(key)
+            if value is None and key in {"target_season", "source_episode_start", "source_episode_end", "expected_count"}:
+                raise GuangYaEpisodeNamingError(key + "不能为空")
+            if value is not None and (type(value) is not int or not minimum <= value <= maximum):
+                raise GuangYaEpisodeNamingError(key + "必须是范围内整数")
+        if type(group.get("include_extras", False)) is not bool:
+            raise GuangYaEpisodeNamingError("include_extras必须为布尔值")
+        if "name_contains" in group and (not isinstance(group["name_contains"], str) or len(group["name_contains"]) > 160):
+            raise GuangYaEpisodeNamingError("name_contains必须是最多160字符的字面文本")
+    snapshot = episode_inventory(client, file_id, should_stop=should_stop)
+    compiled = compile_episode_naming_operations(snapshot, title=title, target_root=snapshot["target_root"], groups=groups)
+    return {**compiled, "file_id": file_id, "target_root": snapshot["target_root"], "cloud_write": False}

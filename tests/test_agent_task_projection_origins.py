@@ -1,4 +1,5 @@
 """Task-only projection privacy and provenance through native wire/cold SQLite."""
+from tests.agent_task_native_helpers import task_function, task_values, returned_task
 from typing import cast
 
 import asyncio
@@ -35,9 +36,9 @@ class Script(NativeScript):
         payload = json.loads(response.content)
         calls = payload["choices"][0]["message"].get("tool_calls", [])
         if calls and step == "create":
-            args = json.loads(calls[0]["function"]["arguments"])
+            args = task_values(calls[0]["function"])
             args["obligations"] = args["obligations"][:1]
-            calls[0]["function"]["arguments"] = json.dumps(args)
+            calls[0]["function"] = task_function(args)
         for index, call in enumerate(calls):
             call["id"] = f"origin-{self.index}-{index}"
         if calls and self.index in self.edits:
@@ -73,9 +74,9 @@ async def drive(script):
 
 def blockers(values):
     def edit(calls):
-        args = json.loads(calls[0]["function"]["arguments"])
+        args = task_values(calls[0]["function"])
         args["blockers"] = values
-        calls[0]["function"]["arguments"] = json.dumps(args)
+        calls[0]["function"] = task_function(args)
     return edit
 
 
@@ -98,8 +99,8 @@ def test_observation_preserves_reported_collision(storage):
     )
     _, cold, events = asyncio.run(drive(script))
     checkpoints = [
-        e.payload.get("result", {}).get("task") for e in events
-        if e.type.value == "tool.completed" and e.payload.get("tool") == "agent.task"
+        returned_task(e.payload.get("result", {})) for e in events
+        if e.type.value == "tool.completed" and e.payload.get("tool") == "agent.run_code"
     ]
     assert any(t and t["status"] == "blocked" and t["obligations"][0]["state"] == "verified" for t in checkpoints)
     task = cold.metadata["task"]
@@ -122,7 +123,7 @@ def test_private_call_id_stays_internal_and_native(storage):
         runtime, cold, events = await drive(script)
         task = cold.metadata["task"]
         fact = task["verified_facts"][0]
-        assert fact["call_id"] == canary
+        assert fact["call_id"] == canary + ":1"
         assert fact["scope"]["owner"] == OWNER
         assert task["obligations"][0]["evidence_ids"] == [fact["evidence_id"]]
         assert task["status"] == "complete"
@@ -147,17 +148,20 @@ def test_private_call_id_stays_internal_and_native(storage):
     asyncio.run(run())
 
 
-def test_same_batch_server_snapshot_keeps_first_reported_blocker(storage):
+def test_sequential_native_calls_use_current_host_revision(storage):
     def batch(calls):
         blockers(["first-blocker"])(calls)
         assert "expected" not in json.loads(calls[0]["function"]["arguments"])
         second = deepcopy(calls[0])
         second["id"] += "-second"
-        blockers(["stale-second-blocker"])([second])
+        blockers(["second-blocker"])([second])
         calls.append(second)
     script = Script(["discover", "create", "checkpoint", "finish"], {2: batch})
     _, cold, events = asyncio.run(drive(script))
-    assert cold.metadata["task"]["revision"] == 2
-    assert cold.metadata["task"]["blockers"] == [{"origin": "reported", "text": "first-blocker"}]
-    assert any(e.type.value == "tool.failed" and e.payload.get("code") == "task_conflict" for e in events)
-    assert not any("stale-second-blocker" in json.dumps(e.payload.get("result", {})) for e in events if e.type.value == "tool.completed")
+    assert cold.metadata["task"]["revision"] == 3
+    assert cold.metadata["task"]["blockers"] == [{"origin": "reported", "text": "second-blocker"}]
+    checkpoints = [returned_task(e.payload.get("result", {})) for e in events if e.type.value == "tool.completed"]
+    assert any(t and t["blockers"] == [{"origin": "reported", "text": "first-blocker"}] for t in checkpoints)
+    last_checkpoint = checkpoints[-1]
+    assert last_checkpoint is not None
+    assert last_checkpoint["blockers"] == cold.metadata["task"]["blockers"]

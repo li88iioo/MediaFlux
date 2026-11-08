@@ -13,74 +13,69 @@ from tests.test_agent_effect_admission import _OfflineClient, _offline_runtime
 from tests.test_agent_guangya_preview_lifecycle import OWNER, runtime_for_test
 from tests.test_agent_kernel_existing_ports import context_for
 
-MAGNET = "magnet:?xt=urn:btih:" + "a" * 40
 SHARE = "https://www.guangyapan.com/s/1938060615538466851_aecd7hu726g3whGl#/share"
 
 
-async def inspect(runtime, session, source):
-    context = await context_for(runtime.store, owner=OWNER, session=session)
-    result = await runtime.session.pipeline.execute("ingest.inspect", {
-        "source_type": source, "input": MAGNET if source == "direct_url" else SHARE,
-    }, context=context)
-    public = result.outcome.public_content
-    assert MAGNET not in str(public) and SHARE not in str(public)
-    return public["reference_arguments"]["ingest_snapshot_ref"]
-
-
-async def submit(runtime, session, source, reference=None):
-    context = await context_for(runtime.store, owner=OWNER, session=session)
-    arguments = {"source_type": source, "target": "qb" if source == "direct_url" else "guangya"}
-    if reference is not None:
-        arguments["ingest_snapshot_ref"] = reference
-    return await runtime.session.pipeline.execute("ingest.submit", arguments, context=context)
-
-
-@pytest.mark.parametrize("source", ["direct_url", "guangya_share"])
 @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
 @pytest.mark.parametrize("operation", ["reset", "delete"])
-def test_ingest_reference_is_the_only_input_across_runtime_and_session_lifecycle(tmp_path, cold, operation, source):
+def test_native_share_confirmation_is_session_bound_and_revoked_by_lifecycle(tmp_path, cold, operation):
+    from app.modules import share_transfer
+    from tests.test_telegram_guangya_share import FakeShareClient
     async def run():
-        with initialized_web_runtime(), _offline_runtime(tmp_path, _OfflineClient()), patch(
-            "app.agent.domains.resources.ingest_actions.download_target_readiness", side_effect=lambda target: {target: True},
-        ), patch("app.agent.domains.resources.ingest_actions.inspect_share_for_transfer", return_value={
-            "preview_id": "private-preview", "share_id": "private-share",
-            "files": [{"id": "private-file", "name": "Episode.mkv", "is_dir": False, "size": 10}],
-            "target_id": "private-target", "target_name": "默认目录", "expires_in": 900,
-        }):
+        client = FakeShareClient()
+        with initialized_web_runtime(), _offline_runtime(tmp_path, _OfflineClient()), patch.object(
+            share_transfer, "GuangYaClient", return_value=client,
+        ):
             runtime = runtime_for_test()
-            first = await inspect(runtime, "ingest-a", source)
-            second = await inspect(runtime, "ingest-b", source)
+            context = await context_for(runtime.store, owner=OWNER, session="share-a")
+            other = await context_for(runtime.store, owner=OWNER, session="share-b")
+            args = {"url": SHARE, "file_ids": ["file-1"]}
+            first = (await runtime.session.pipeline.prepare("cloud.transfer_share", args, context=context)).effect_plan
+            second = (await runtime.session.pipeline.prepare("cloud.transfer_share", args, context=other)).effect_plan
+            assert first is not None and second is not None
             if cold:
                 runtime = runtime_for_test()
-
-            # 曾经 inspect 也必须带引用；不能借暖进程中的 latest 快照继续提交。
-            with pytest.raises(ToolPipelineError) as missing:
-                await submit(runtime, "ingest-a", source)
-            assert missing.value.code == "invalid_arguments"
-            with pytest.raises(ToolPipelineError) as cross_session:
-                await submit(runtime, "ingest-b", source, first)
-            assert cross_session.value.code == "reference_invalid"
-            prepared = await submit(runtime, "ingest-a", source, first)
-            assert prepared.effect_plan is not None
-
-            await getattr(runtime.lifecycle, operation)(owner=OWNER, session_id="ingest-a")
+            with pytest.raises(ToolPipelineError):
+                await runtime.session.pipeline.execute_confirmed(first.plan_id, context=other)
+            await getattr(runtime.lifecycle, operation)(owner=OWNER, session_id="share-a")
             if cold:
                 runtime = runtime_for_test()
-            with pytest.raises(ToolPipelineError) as expired:
-                await submit(runtime, "ingest-a", source, first)
-            assert expired.value.code == "reference_invalid"
-            with pytest.raises(ToolPipelineError) as missing_after_reset:
-                await submit(runtime, "ingest-a", source)
-            assert missing_after_reset.value.code == "invalid_arguments"
-            assert not (await runtime.store.load(owner=OWNER, session_id="ingest-a")).pending_effect_plan_id
-
-            unaffected = await submit(runtime, "ingest-b", source, second)
-            assert unaffected.effect_plan is not None
-            assert unaffected.effect_plan.session_id == "ingest-b"
-            fresh = await inspect(runtime, "ingest-a", source)
-            assert fresh != first
-            assert (await submit(runtime, "ingest-a", source, fresh)).effect_plan is not None
-            # 预检仅创建确认计划，不会提前创建下载请求。
+            fresh = await context_for(runtime.store, owner=OWNER, session="share-a")
+            with pytest.raises(ToolPipelineError):
+                await runtime.session.pipeline.execute_confirmed(first.plan_id, context=fresh)
+            unaffected = await runtime.session.pipeline.get_pending_plan(owner=OWNER, session_id="share-b")
+            assert unaffected is not None and unaffected.plan_id == second.plan_id
+            assert (await runtime.session.pipeline.prepare("cloud.transfer_share", args, context=fresh)).effect_plan
+            assert not client.restore_calls
             with db.get_conn() as conn:
                 assert conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0] == 0
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('operation', ['reset', 'delete'])
+def test_native_url_plan_is_session_bound_and_revoked_by_lifecycle(tmp_path, operation):
+    async def run():
+        with initialized_web_runtime(), _offline_runtime(tmp_path, _OfflineClient()), patch(
+            'app.indexers.downloads.download_target_readiness', return_value={'qb': True},
+        ), patch('app.indexers.downloads.dispatch_request') as dispatch:
+            runtime = runtime_for_test()
+            context = await context_for(runtime.store, owner=OWNER, session='url-a')
+            other = await context_for(runtime.store, owner=OWNER, session='url-b')
+            args = {'url': 'magnet:?xt=urn:btih:' + 'a' * 40, 'target': 'qb'}
+            first = (await runtime.session.pipeline.prepare('downloads.submit', args, context=context)).effect_plan
+            second = (await runtime.session.pipeline.prepare('downloads.submit', args, context=other)).effect_plan
+            assert first is not None and second is not None
+            with pytest.raises(ToolPipelineError):
+                await runtime.session.pipeline.execute_confirmed(first.plan_id, context=other)
+            await getattr(runtime.lifecycle, operation)(owner=OWNER, session_id='url-a')
+            runtime = runtime_for_test()
+            fresh = await context_for(runtime.store, owner=OWNER, session='url-a')
+            with pytest.raises(ToolPipelineError):
+                await runtime.session.pipeline.execute_confirmed(first.plan_id, context=fresh)
+            unaffected = await runtime.session.pipeline.get_pending_plan(owner=OWNER, session_id='url-b')
+            assert unaffected is not None and unaffected.plan_id == second.plan_id
+            assert (await runtime.session.pipeline.prepare('downloads.submit', args, context=fresh)).effect_plan
+            dispatch.assert_not_called()
+            with db.get_conn() as conn:
+                assert conn.execute('SELECT COUNT(*) FROM download_requests').fetchone()[0] == 0
     asyncio.run(run())

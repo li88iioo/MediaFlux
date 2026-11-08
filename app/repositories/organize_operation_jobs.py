@@ -320,7 +320,7 @@ def _cloud_plan_job_payload(
     row: dict[str, Any] | sqlite3.Row,
 ) -> dict[str, Any] | None:
     job_kind = _safe_kind(row["job_kind"])
-    if job_kind not in {"agent_guangya_rename", "agent_guangya_fs_change"}:
+    if job_kind != "agent_guangya_fs_change":
         return None
     if not verify_organize_operation_payload(row):
         raise ValueError("光鸭云盘任务参数完整性校验失败")
@@ -388,16 +388,6 @@ def _sync_cloud_plan_terminal(
                     if isinstance(stats, dict)
                     else 0
                 ),
-                error_code=error_code,
-            )
-        else:
-            from app.modules.guangya_rename import finalize_rename_plan_job
-
-            finalize_rename_plan_job(
-                str(payload["plan_id"]),
-                owner_digest=str(row["owner_digest"] or ""),
-                expected_fingerprint=str(payload["plan_fingerprint"]),
-                queue_status=status,
                 error_code=error_code,
             )
     except Exception as exc:  # noqa: BLE001 - SQLite 终态仍是权威恢复边界

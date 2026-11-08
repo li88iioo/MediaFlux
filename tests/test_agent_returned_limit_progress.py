@@ -1,4 +1,4 @@
-"""Returned rate limits keep error priority without reviving recovered history."""
+"""返回限流是模型观察；仅真实中断/写入收尾使用未恢复事实兜底。"""
 from __future__ import annotations
 
 import asyncio
@@ -10,12 +10,7 @@ import pytest
 
 from app import database as db
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession, SessionLimits
@@ -32,7 +27,7 @@ SUMMARY = "对象检查受到限制"
 PRIVATE = "检查失败 /srv/private/returned-limit"
 FINAL = "已按证据完成核验。"
 ENDINGS = [
-    ("answer", "rate_limited"), ("fault", "model_provider_error"),
+    ("answer", "stop"), ("fault", "model_provider_error"),
     ("round-empty", "rate_limited"), ("tool-empty", "rate_limited"),
 ]
 
@@ -83,17 +78,18 @@ async def scenario(store, steps, *, ending="answer", protocol="chat_completions"
     ) for name in sorted({step[0] for step in steps})])
     replies = [reply(protocol, name=catalog.get(name).model_name, arguments=args, index=index)
                for index, (name, args, _) in enumerate(steps)]
-    replies.append((b"not-json", "application/json") if ending == "fault" else reply(
-        protocol, text="" if ending in {"round-empty", "tool-empty"} else FINAL,
-    ))
     limits = None
     if ending == "round-empty":
-        limits = SessionLimits(max_model_rounds=len(replies))
+        limits = SessionLimits(max_model_rounds=len(steps))
     elif ending == "tool-empty":
         limits = SessionLimits(max_tool_calls=len(steps))
+        replies.append(reply(protocol, name=catalog.get(steps[0][0]).model_name,
+                             arguments=steps[0][1], index=len(steps)))
+    else:
+        replies.append((b"not-json", "application/json") if ending == "fault" else reply(protocol, text=FINAL))
     wire = Wire(protocol, replies)
     session = AgentSession(
-        model=wire.adapter, catalog=catalog, retriever=CapabilityRetriever(minimum=len(catalog), maximum=len(catalog)),
+        model=wire.adapter, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store, journal=store, limits=limits,
     )
     events = [event async for event in session.run(AgentInput(
@@ -101,14 +97,14 @@ async def scenario(store, steps, *, ending="answer", protocol="chat_completions"
     ))]
     assert seen == [(name, args) for name, args, _ in steps]
     assert all(value == original for value, original in returned)
-    wire.verify(posts=len(steps) + 1)
+    wire.verify(posts=len(steps) + (ending != "round-empty"))
     assert not wire.replies
     fresh = SQLiteKernelStore(secret_provider=lambda: "offline-returned-limit")
     saved = await fresh.load(owner="owner-a", session_id="returned-limit")
     journal = await fresh.list_events(owner="owner-a", session_id="returned-limit")
     assert journal == [event.to_dict() for event in events]
     tools = [row for row in saved.conversation if row["role"] == "tool"]
-    assert [row["tool_call_id"] for row in tools] == [f"call-{index}" for index in range(len(steps))]
+    assert [row["tool_call_id"] for row in tools] == [f"call-{index}" for index in range(len(steps) + (ending == "tool-empty"))]
     completed = [event for event in events if event.type.value == "tool.completed"]
     assert len(completed) == len(returned)
     # A returned failure stays a returned DTO in audit; it is not a thrown failure.
@@ -116,7 +112,7 @@ async def scenario(store, steps, *, ending="answer", protocol="chat_completions"
         original = value.to_dict() if isinstance(value, ToolResult) else value
         assert dict(event.payload)["result"] == original
     failures = [event for event in events if event.type.value == "tool.failed"]
-    assert len(failures) == sum(isinstance(value, ToolPipelineError) for _, _, value in steps)
+    assert len(failures) == sum(isinstance(value, ToolPipelineError) for _, _, value in steps) + (ending == "tool-empty")
     final = dict(events[-1].payload)
     public = public_conversation_messages(saved.conversation)
     if events[-1].type.value == "turn.completed":
@@ -140,15 +136,30 @@ def mixed(outcome):
 def test_unrecovered_returned_error_priority_survives_every_projection(store, protocol, ok, summary, ending, reason):
     outcome = ToolResult(ok, "rate_limited", summary, error=DETAIL)
     final, tools, wire, _ = asyncio.run(scenario(store, mixed(outcome), ending=ending, protocol=protocol))
-    assert final["status"] == "partial" and final["finish_reason"] == reason
+    assert final["status"] == "partial"
+    assert final["finish_reason"] == ("end_turn" if ending == "answer" and protocol == "anthropic_messages" else reason)
     assert json.loads(tools[1]["content"])["error"] == DETAIL
     assert DETAIL in encode(wire.requests[-1])
-    assert "已有工具返回真实频率限制" in encode(wire.requests[-1])
+    assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
+    if ending == "answer":
+        assert final["answer"] == FINAL
+        return
     assert "可信已得内容" in final["answer"]
     assert "对象甲旧限流" not in final["answer"]
     assert unfinished(final["answer"]) == "未完成的查询：" + DETAIL
-    if ending == "answer":
-        assert final["answer"].splitlines()[0] == "部分完成：仍有工具调用受到频率限制:" + DETAIL
+
+
+def test_primary_returned_limit_detail_survives_more_than_three_errors(store):
+    errors = [DETAIL, "对象丁被限流", "对象戊被限流", "对象己被限流"]
+    steps = [(C, {"ref": f"object-{index}"}, ToolResult(False, "rate_limited", SUMMARY, error=error))
+             for index, error in enumerate(errors)] + [(B, {}, None)]
+    final, _, _, _ = asyncio.run(scenario(store, steps, ending="round-empty"))
+
+    assert final["status"] == "partial" and final["finish_reason"] == "rate_limited"
+    assert DETAIL in final["answer"].splitlines()[0]
+    assert final["answer"].count(DETAIL) == 1
+    assert unfinished(final["answer"]) == "未完成的查询：" + "；".join(errors[-3:])
+    assert "可信已得内容" in final["answer"]
 
 
 @pytest.mark.parametrize("ok", [False, True])
@@ -162,7 +173,10 @@ def test_missing_empty_and_unsafe_errors_do_not_bypass_safe_filter(store, ok, ki
         outcome.pop("error")
     final, _, wire, _ = asyncio.run(scenario(store, mixed(outcome), ending=ending))
     assert final["status"] == "partial" and final["finish_reason"] == reason
-    assert "已有工具返回真实频率限制" in encode(wire.requests[-1])
+    assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
+    if ending == "answer":
+        assert final["answer"] == FINAL
+        return
     expected = SUMMARY if summary == SUMMARY and kind != "unsafe" else ""
     assert unfinished(final["answer"]) == ("未完成的查询：" + expected if expected else "")
     assert "/srv/private" not in final["answer"]
@@ -182,6 +196,9 @@ def test_returned_error_recovery_removes_only_current_request(store, ok, ending,
     assert "对象甲旧限流详情" in tools[0]["content"]
     assert "对象甲旧限流详情" in encode(wire.requests[-1])
     assert "对象甲旧限流详情" not in final["answer"]
+    if ending == "answer":
+        assert final["answer"] == FINAL
+        return
     assert unfinished(final["answer"]) == "未完成的查询：" + DETAIL
 
 
@@ -192,7 +209,7 @@ def test_repeated_returned_error_uses_latest_detail_in_ledger_order(store, recov
     if recover_between:
         steps.append((A, X, None))
     steps.append((A, X, ToolResult(False, "rate_limited", SUMMARY, error="第二版限流详情")))
-    final, tools, wire, _ = asyncio.run(scenario(store, steps))
+    final, tools, wire, _ = asyncio.run(scenario(store, steps, ending="round-empty"))
     assert final["status"] == "partial" and final["finish_reason"] == "rate_limited"
     expected = DETAIL + "；第二版限流详情" if recover_between else "第二版限流详情；" + DETAIL
     assert unfinished(final["answer"]) == "未完成的查询：" + expected
@@ -206,25 +223,30 @@ def test_same_summary_different_request_never_infers_recovery(store, other):
     steps = [(A, original, ToolResult(False, "rate_limited", SUMMARY, error="仅对象甲旧详情")),
              (A, other, ToolResult(False, "rate_limited", SUMMARY, error=DETAIL)),
              (B, {}, None), (A, original, None)]
-    final, _, wire, _ = asyncio.run(scenario(store, steps))
+    final, _, wire, _ = asyncio.run(scenario(store, steps, ending="round-empty"))
     assert final["status"] == "partial" and final["finish_reason"] == "rate_limited"
     assert unfinished(final["answer"]) == "未完成的查询：" + DETAIL
     assert "仅对象甲旧详情" not in final["answer"]
-    assert "已有工具返回真实频率限制" in encode(wire.requests[-1])
+    assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
 
 
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("error", [DETAIL, PRIVATE], ids=["safe-error", "unsafe-error"])
-def test_returned_limit_without_success_keeps_terminal_kind_and_safe_message(store, ok, error):
-    final, tools, wire, events = asyncio.run(scenario(store, [(C, Z, ToolResult(ok, "rate_limited", SUMMARY, error=error))]))
-    assert "已有工具返回真实频率限制" in encode(wire.requests[-1])
+@pytest.mark.parametrize("ending", ["answer", "round-empty"])
+def test_returned_limit_without_success_keeps_observation_or_interrupted_fallback(store, ok, error, ending):
+    final, tools, wire, events = asyncio.run(scenario(store, [(C, Z, ToolResult(ok, "rate_limited", SUMMARY, error=error))], ending=ending))
+    assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
     assert json.loads(tools[0]["content"])["status"] == "rate_limited"
-    if ok:
+    if ending == "answer":
+        assert events[-1].type.value == "turn.completed"
+        assert final["status"] == "partial" and final["finish_reason"] == "stop"
+        assert final["answer"] == FINAL
+    elif ok:
         assert events[-1].type.value == "turn.completed"
         assert final["status"] == "partial" and final["finish_reason"] == "rate_limited"
         assert unfinished(final["answer"]) == ("未完成的查询：" + DETAIL if error == DETAIL else "")
     else:
         assert events[-1].type.value == "turn.failed"
         assert final["code"] == "rate_limited"
-        assert final["message"] == "仍有工具调用受到频率限制：" + (DETAIL if error == DETAIL else "")
+        assert final["message"] == (DETAIL if error == DETAIL else "工具调用未取得完整结果。")
     assert "/srv/private" not in encode(final)

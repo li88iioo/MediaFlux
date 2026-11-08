@@ -3,12 +3,7 @@ import json
 
 import pytest
 
-from app.agent.kernel.capabilities import (
- CapabilityRetriever,
- KernelToolSpec,
- ToolCatalog,
- ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.model import ModelEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -73,7 +68,7 @@ def test_real_session_malformed_then_correction_reaches_model(store):
   final={'choices':[{'message':{'content':'已核验完成'},'finish_reason':'stop'}]}
   corrected, kind = reply('chat_completions','sse',False)
   transport=Wire('chat_completions',[reply('chat_completions','sse',True),(corrected.replace(b'call-0', b'call-corrected'),kind),(encode(final).encode(),'application/json')])
-  session=AgentSession(model=transport.adapter,catalog=catalog,retriever=CapabilityRetriever(minimum=1,maximum=1),pipeline=ToolPipeline(catalog=catalog,state_store=store),state_store=store)
+  session=AgentSession(model=transport.adapter,catalog=catalog,pipeline=ToolPipeline(catalog=catalog,state_store=store),state_store=store)
   events=[e async for e in session.run(AgentInput(message='只读核验',owner='owner',session_id='id26'))]
   saved=await SQLiteKernelStore(secret_provider=lambda:'offline-tool-argument-test').load(owner='owner',session_id='id26')
   assert events and saved.conversation

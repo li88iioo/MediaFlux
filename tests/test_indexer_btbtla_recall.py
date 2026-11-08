@@ -138,6 +138,49 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
         http.status_codes = [200, 200, status]
         return http, search, detail
 
+    async def test_same_page_details_continue_after_request_budget_without_losing_candidates(self):
+        search = ''.join(
+            f'<div class="module-item"><a class="module-item-title" href="/detail/{i}.html">Demo</a></div>'
+            for i in range(1, 4)
+        ).encode()
+        details = [
+            f'<div id="download-list"><div class="module-row-info"><a class="module-row-text" '
+            f'href="/tdown/{i}.html">Demo S01E{i:02d} [1GiB]</a></div></div>'.encode()
+            for i in range(1, 4)
+        ]
+        http = FakeHttpClient(_EMPTY)
+        http.responses = [search, *details]
+        adapter = BTBtlaAdapter(http=http, max_detail_candidates=2)
+
+        first = await adapter.search(IndexerSearchRequest.create('Demo'))
+        self.assertEqual([item.title for item in first.items], ['Demo S01E01', 'Demo S01E02'])
+        self.assertTrue(first.has_more)
+        self.assertEqual(len(http.calls), 3)
+        repeated = await adapter.search(IndexerSearchRequest.create('Demo'))
+        self.assertEqual(repeated.items, first.items)
+        self.assertEqual(len(http.calls), 3)
+
+        second = await adapter.search(IndexerSearchRequest.create('Demo', page=2))
+        self.assertEqual([item.title for item in second.items], ['Demo S01E03'])
+        self.assertFalse(second.has_more)
+        self.assertFalse(second.errors)
+        self.assertEqual(len(http.calls), 4)
+        self.assertTrue(http.calls[-1]['url'].endswith('/detail/3.html'))
+
+        http.responses = [search + b'<a href="/search/Demo/2">next</a>', *details,
+                          search.replace(b'/detail/', b'/detail/next-'),
+                          details[0].replace(b'/tdown/1', b'/tdown/next-1'),
+                          details[1].replace(b'/tdown/2', b'/tdown/next-2')]
+        adapter = BTBtlaAdapter(http=http, max_detail_candidates=2)
+        await adapter.search(IndexerSearchRequest.create('Demo'))
+        second = await adapter.search(IndexerSearchRequest.create('Demo', page=2))
+        self.assertEqual([item.title for item in second.items], ['Demo S01E03'])
+        self.assertTrue(second.has_more)
+        self.assertTrue(http.calls[-1]['url'].endswith('/detail/3.html'))
+        third = await adapter.search(IndexerSearchRequest.create('Demo', page=3))
+        self.assertEqual(len(third.items), 2)
+        self.assertTrue(http.calls[-3]['url'].endswith('/search/Demo/2'))
+
     async def test_partial_details_keep_candidates_and_errors_in_later_windows(self):
         for status, code in ((404, 'result_expired'), (503, 'unavailable')):
             with self.subTest(status=status):
@@ -562,12 +605,14 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_never_retains_unrequestable_windows(self):
         search, detail = self.catalog_html(105)
+        search += b'<div class="module-item"><a class="module-item-title" href="/detail/extra.html">Demo</a></div>'
         http=FakeHttpClient(search)
         http.responses=[search,detail]
-        adapter=BTBtlaAdapter(http=http,page_size=1)
+        adapter=BTBtlaAdapter(http=http,page_size=1,max_detail_candidates=1)
         await adapter.search(IndexerSearchRequest.create('Demo',sort_mode='source_order'))
         last=await adapter.search(IndexerSearchRequest.create('Demo',page=100,sort_mode='source_order'))
         self.assertFalse(last.has_more)
+        self.assertFalse(last.complete)  # 已达到公共页数上限，剩余详情不能冒充已查完。
         self.assertEqual(len(last.items),1)
         self.assertEqual(last.total_items,6)
         catalog=next(iter(adapter._catalogs.values()))
@@ -577,6 +622,9 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
         try:
             result=await service.search('Demo',page=100,site_ids=('btbtla',),sort_mode='source_order')
             self.assertEqual(result.site_truncated_counts['btbtla'],5)
+            self.assertTrue(result.partial)
+            self.assertEqual([error.code for error in result.errors], ['coverage_limited'])
+            self.assertEqual(len(http.calls), 2)
         finally:
             await service.aclose()
 
@@ -641,7 +689,8 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
         search = _SEARCH + '<a href="/search/征途/3">下一页</a>'.encode()
         http = FakeHttpClient(_EMPTY)
         http.responses = [_EMPTY, search, _DETAIL]
-        result = await BTBtlaAdapter(http=http)._search_native(IndexerSearchRequest.create('征途 2026', page=2))
+        result, remaining = await BTBtlaAdapter(http=http)._search_native(IndexerSearchRequest.create('征途 2026', page=2))
+        self.assertFalse(remaining)
         self.assertEqual(result.page, 2)
         self.assertTrue(result.has_more)
         self.assertTrue(unquote(http.calls[1]['url']).endswith('/search/征途/2'))

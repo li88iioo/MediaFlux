@@ -77,6 +77,7 @@ class AgentKernelMetricsTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(observed, events)
         snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["detached_deliveries"], 0)
         self.assertEqual(snapshot["turns"], 1)
         self.assertEqual(snapshot["statuses"], {"success": 1})
         self.assertEqual(snapshot["average_model_calls"], 2.0)

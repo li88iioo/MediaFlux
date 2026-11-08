@@ -20,13 +20,9 @@ from app import config
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import TurnViewBuilder
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -222,7 +218,7 @@ class Case:
             effect_lifecycle=MediaFluxEffectLifecycle(),
         )
         self.session = AgentSession(model=self.script.adapter, catalog=catalog,
-                                    retriever=CapabilityRetriever(minimum=2, maximum=2), pipeline=self.pipeline,
+                                     pipeline=self.pipeline,
                                     state_store=self.store, journal=self.store, turn_admission=MediaFluxTurnAdmission())
 
     async def state(self):

@@ -38,6 +38,8 @@
     const restoreActions = document.getElementById('agentRestoreActions');
     const SESSION_RE = /^[A-Za-z0-9_-]{16,64}$/;
     const MAX_TRANSCRIPT_ITEMS = 120;
+    const MAX_TURN_ACTIVITIES = 80;
+    const MAX_REASONING_TEXT = 8000;
     const STREAM_MARKDOWN_INTERVAL_MS = 72;
     const SESSION_POLL_INTERVAL_MS = 1750;
     const SESSION_POLL_MAX_INTERVAL_MS = 8000;
@@ -58,24 +60,6 @@
         superseded: '会话状态已变化，无法确认当前任务已停止，请核对任务状态。',
         stop_unconfirmed: '会话停止尚未确认，任务可能仍在运行；请核对状态或重试停止。',
     };
-    const TOOL_LABELS = {
-        cloud: '读取光鸭云盘',
-        guangya: '读取光鸭云盘',
-        library: '查询媒体库',
-        provider: '查询实时服务',
-        downloads: '查询下载任务',
-        download: '处理下载任务',
-        indexer: '搜索资源',
-        resource: '搜索资源',
-        rss: '检查 RSS',
-        media: '检查媒体订阅',
-        discovery: '检索媒体信息',
-        web: '查询公开信息',
-        strm: '检查 STRM',
-        local_media: '检查本地媒体',
-        automation: '检查自动化任务',
-        config: '检查项目配置',
-    };
 
     let draftScope = '';
     let sessionId = storedSessionId() || createId('session');
@@ -86,6 +70,7 @@
     const sessionEdits = new Set();
     let latestSessionId = '';
     let activeRequest = null;
+    let elapsedTimer = null;
     const receiptObservationWindows = new Map();
     let receiptResumeNeeded = false;
     let receiptResumeInFlight = false;
@@ -353,7 +338,7 @@
 
     function scrollToBottom(force = false) {
         if (!transcript) return;
-        if (!force && !followOutput) {
+        if (!force && (!followOutput || transcript.querySelector('.agent-process-toggle[aria-expanded="true"]'))) {
             if (newRepliesButton) newRepliesButton.hidden = false;
             return;
         }
@@ -361,7 +346,7 @@
         if (newRepliesButton) newRepliesButton.hidden = true;
         transcript.scrollTop = transcript.scrollHeight;
         requestAnimationFrame(() => {
-            if (followOutput) transcript.scrollTop = transcript.scrollHeight;
+            if (followOutput && !transcript.querySelector('.agent-process-toggle[aria-expanded="true"]')) transcript.scrollTop = transcript.scrollHeight;
         });
     }
 
@@ -375,14 +360,12 @@
     function appendMessage(role, {recovered = false, scroll = true} = {}) {
         const item = element('article', `agent-message agent-message-${role}`);
         if (recovered) item.classList.add('is-recovered');
-        const mark = element('div', 'agent-message-mark');
-        mark.append(icon(role === 'user' ? 'user-round' : 'bot'));
+        item.setAttribute('aria-label', role === 'user' ? '你的消息' : '助手回复');
         const body = element('div', 'agent-message-body');
-        item.append(mark, body);
+        item.append(body);
         transcript?.append(item);
         pruneTranscript();
         setConsoleEmpty(false);
-        renderIcons(item);
         if (scroll) scrollToBottom(true);
         return {item, body};
     }
@@ -823,12 +806,12 @@
         if (!turn?.text) return;
         turn.pendingMarkdown = String(text || '');
         const commit = () => {
-            const shouldFollow = transcriptNearBottom();
+            const shouldFollow = followOutput && transcriptNearBottom();
             turn.markdownTimer = null;
             turn.markdownFrame = null;
             replaceRichText(turn.text, normalizeStreamingMarkdown(turn.pendingMarkdown));
             turn.lastMarkdownRender = performance.now();
-            if (shouldFollow) scrollToBottom(true);
+            if (shouldFollow) scrollToBottom();
         };
         if (immediate) {
             cancelTurnMarkdownRender(turn);
@@ -843,20 +826,118 @@
         }, delay);
     }
 
-    function createStreamingCard() {
-        const card = element('section', 'agent-result-card agent-streaming');
+    function createTurnProcess() {
+        const processView = element('div', 'agent-process-view');
         const head = element('div', 'agent-stream-head');
-        head.append(icon('loader-circle'), element('span', '', '正在理解任务'));
+        const headText = element('span', 'agent-stream-label', '正在理解任务');
+        const elapsed = element('time', 'agent-stream-elapsed');
+        elapsed.hidden = true;
+        elapsed.title = '本轮处理耗时';
+        const toggle = element('button', 'agent-process-toggle');
+        toggle.type = 'button';
+        toggle.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-label', '展开处理过程');
+        toggle.setAttribute('aria-controls', createId('process'));
+        toggle.append(icon('chevron-right'));
+        toggle.addEventListener('click', () => setProcessExpanded(processView, toggle.getAttribute('aria-expanded') !== 'true'));
+        head.append(icon('loader-circle'), headText, elapsed, toggle);
+        processView.append(head);
+        return {processView, head, headText, elapsed, toggle};
+    }
+
+    function setProcessExpanded(view, expanded) {
+        const process = view.querySelector('.agent-process');
+        const toggle = view.querySelector('.agent-process-toggle');
+        if (!process || !toggle) return;
+        process.hidden = !expanded;
+        toggle.setAttribute('aria-expanded', String(expanded));
+        toggle.setAttribute('aria-label', expanded ? '收起处理过程' : '展开处理过程');
+    }
+
+    function updateTurnActivity(turn, activity) {
+        if (!activity || typeof activity.id !== 'string' || !activity.id.trim()) return;
+        const reasoning = activity.kind === 'reasoning';
+        const statuses = {running: '处理中', success: '已完成', partial: '部分完成', failed: '失败',
+            approval_required: '等待确认', cancelled: '已取消'};
+        if (reasoning ? typeof activity.text !== 'string' || !activity.text.trim()
+            : activity.kind !== 'tool' || !Object.hasOwn(statuses, activity.status)
+                || typeof activity.label !== 'string' || !activity.label.trim()) return;
+        turn.activities ||= new Map();
+        if (!turn.processView) {
+            Object.assign(turn, createTurnProcess());
+            turn.card.before(turn.processView);
+            renderIcons(turn.head);
+        }
+        turn.processView.hidden = false;
+        let process = turn.processView.querySelector('.agent-process');
+        if (!process) {
+            process = element('div', 'agent-process');
+            process.id = turn.toggle.getAttribute('aria-controls');
+            process.hidden = true;
+            process.tabIndex = 0;
+            process.setAttribute('role', 'region');
+            process.setAttribute('aria-label', '处理过程');
+            process.append(element('ol', 'agent-process-list'));
+            turn.processView.append(process);
+        }
+        const key = `${activity.kind}:${activity.id}`;
+        let record = turn.activities.get(key);
+        if (!record) {
+            const node = element('li', 'agent-process-item');
+            node.dataset.activityKey = key;
+            node.dataset.kind = activity.kind;
+            const heading = element('div', 'agent-activity-heading');
+            const label = element('strong', 'agent-activity-label');
+            const status = element('span', 'agent-activity-status');
+            const summary = element('p', 'agent-activity-summary');
+            heading.append(label, status);
+            node.append(heading, summary);
+            record = {node, label, status, summary, text: ''};
+            turn.activities.set(key, record);
+            process.firstElementChild.append(node);
+            if (turn.activities.size > MAX_TURN_ACTIVITIES) {
+                const oldest = turn.activities.keys().next().value;
+                turn.activities.get(oldest).node.remove();
+                turn.activities.delete(oldest);
+            }
+        }
+        const text = reasoning ? clipText(activity.text, MAX_REASONING_TEXT)
+            : typeof activity.summary === 'string' ? activity.summary : '';
+        const label = reasoning ? '思考摘要' : activity.label;
+        const status = reasoning ? '' : statuses[activity.status];
+        if (record.label.textContent !== label) record.label.textContent = label;
+        if (record.status.textContent !== status) record.status.textContent = status;
+        if (record.text !== text) record.summary.textContent = text;
+        record.text = text;
+        record.status.hidden = reasoning;
+        record.summary.hidden = !text;
+        record.node.dataset.status = reasoning ? '' : activity.status;
+        turn.toggle.hidden = false;
+    }
+
+    function createStreamingCard(turn = null) {
+        const card = element('section', 'agent-result-card agent-reply agent-streaming');
+        const process = turn?.processView ? {
+            processView: turn.processView, head: turn.head, headText: turn.headText,
+            elapsed: turn.elapsed, toggle: turn.toggle,
+        } : createTurnProcess();
+        process.processView.hidden = false;
         const text = element('div', 'agent-stream-text agent-rich-text');
-        const steps = element('div', 'agent-stream-steps');
-        card.append(head, text, steps);
+        card.append(process.processView, text);
         return {
             card,
-            head,
-            headText: head.querySelector('span'),
+            ...process,
             text,
-            steps,
         };
+    }
+
+    function settleTurnActivities(turn) {
+        turn?.activities?.forEach(record => {
+            if (record.node.dataset.status !== 'running') return;
+            record.status.textContent = '结果待核对';
+            record.node.dataset.status = 'unconfirmed';
+        });
     }
 
     function createAssistantTurn({recovered = false, scroll = true} = {}) {
@@ -867,9 +948,10 @@
         return {
             ...view,
             ...stream,
+            startedAt: recovered ? null : Date.now(),
+            finishedAt: null,
             rounds: new Map(),
             currentRound: 0,
-            toolSteps: new Map(),
             effectReceipts: new Map(),
             completedPlanIds: new Set(),
             approvalNode: null,
@@ -880,81 +962,27 @@
         };
     }
 
+    function updateTurnElapsed(turn) {
+        if (!turn?.elapsed || !Number.isFinite(turn.startedAt)) return;
+        const seconds = Math.max(0, Math.floor(((turn.finishedAt ?? Date.now()) - turn.startedAt) / 1000));
+        turn.elapsed.hidden = false;
+        turn.elapsed.dateTime = `PT${seconds}S`;
+        turn.elapsed.textContent = `· ${seconds}秒`;
+    }
+
     function setTurnStatus(turn, label, iconName = 'loader-circle') {
         if (!turn?.head) return;
         // 阶段切换先提交已收到的正文；正文不能依赖可能暂停的动画帧才追上状态。
         if (turn.markdownTimer !== null || turn.markdownFrame !== null) {
             renderTurnMarkdown(turn, turn.pendingMarkdown, {immediate: true});
         }
-        if (!turn.headText?.isConnected) {
-            turn.head.replaceChildren(icon(iconName), element('span', '', label));
-            turn.headText = turn.head.querySelector('span');
-            renderIcons(turn.head);
-            return;
-        }
         turn.headText.textContent = label;
-        const currentIcon = turn.head.querySelector('svg');
+        const currentIcon = turn.head.firstElementChild;
         if (currentIcon?.getAttribute('data-lucide') !== iconName) {
             currentIcon?.replaceWith(icon(iconName));
             renderIcons(turn.head);
         }
-    }
-
-    function toolLabel(tool, label = '') {
-        const explicit = String(label || '').trim();
-        if (explicit) return explicit;
-        const prefix = String(tool || '').split('.', 1)[0].toLowerCase();
-        return TOOL_LABELS[prefix] || '调用项目能力';
-    }
-
-    function updateStep(turn, key, label, {warning = false, pending = false, iconName = ''} = {}) {
-        if (!turn?.steps || !key) return;
-        let row = turn.toolSteps.get(key);
-        if (!row) {
-            row = element('div', 'agent-stream-step');
-            row.dataset.stepKey = key;
-            turn.toolSteps.set(key, row);
-            turn.steps.append(row);
-        }
-        row.classList.toggle('is-warning', warning);
-        row.classList.toggle('is-pending', pending);
-        row.replaceChildren(
-            icon(iconName || (pending ? 'loader-circle' : warning ? 'triangle-alert' : 'check')),
-            element('span', '', label),
-        );
-        renderIcons(row);
-        scrollToBottom();
-    }
-
-    function buildToolTrace(turn) {
-        if (!turn?.steps || !turn.steps.childElementCount) {
-            turn?.toolTrace?.remove();
-            if (turn) turn.toolTrace = null;
-            turn?.steps?.remove();
-            return null;
-        }
-        const trace = turn.toolTrace || element('details', 'agent-tool-trace');
-        let summary = trace.querySelector('.agent-tool-trace-summary');
-        if (!summary) {
-            summary = element('summary', 'agent-tool-trace-summary');
-            summary.append(icon('list-checks'), element('span'), icon('chevron-down'));
-            trace.append(summary);
-        }
-        const label = summary.querySelector('span');
-        if (label) label.textContent = `执行过程 · ${turn.steps.childElementCount} 步`;
-        if (turn.steps.parentElement !== trace) trace.append(turn.steps);
-        turn.toolTrace = trace;
-        renderIcons(trace);
-        return trace;
-    }
-
-    function addRecoveredToolTrace(turn, tools, labels = []) {
-        if (!Array.isArray(tools)) return;
-        for (const [index, name] of tools.entries()) {
-            const normalized = String(name || '').trim();
-            if (!normalized) continue;
-            updateStep(turn, `recovered:${index}:${normalized}`, `${toolLabel(normalized, labels[index])}完成`);
-        }
+        updateTurnElapsed(turn);
     }
 
     function publicSummary(value) {
@@ -967,13 +995,16 @@
     }
 
     function finalizeAnswer(turn, text) {
+        settleTurnActivities(turn);
         turn.failed = false;
         turn.followupFailed = false;
+        turn.finishedAt ??= Date.now();
         cancelTurnMarkdownRender(turn);
         promoteTurnCard(turn);
         const answer = typeof text === 'string' ? text : '';
         if (!answer.trim() && turn.candidateGroup) {
-            turn.head?.remove();
+            if (!turn.activities?.size) turn.processView?.remove();
+            else setTurnStatus(turn, '本轮已结束', 'check');
             turn.text?.remove();
             scrollToBottom();
             return;
@@ -982,7 +1013,7 @@
             finalizeError(turn, '服务端未提供最终答复；请以执行回执核对状态。');
             return;
         }
-        if (!answer.trim()) {
+        if (!answer.trim() && !turn.activities?.size) {
             turn.item?.remove();
             setConsoleEmpty(!transcript?.childElementCount);
             return;
@@ -990,11 +1021,15 @@
         turn.card.classList.remove('agent-streaming', 'is-interrupted');
         turn.card.classList.add('has-narrative', 'is-conversation');
         turn.item?.classList.remove('is-confirmation');
-        turn.head.remove();
+        if (Number.isFinite(turn.startedAt)) {
+            const waiting = turn.waiting || [...turn.effectReceipts.values()].some(record => record.followupPending);
+            const label = waiting ? '等待后台结果' : ({success: '已完成', effect_completed: '已完成',
+                partial: '部分完成', failed: '未能完成'}[turn.completionStatus] || '本轮已结束');
+            setTurnStatus(turn, label, waiting ? 'clock-3' : ['partial', 'failed'].includes(turn.completionStatus) ? 'triangle-alert' : 'check');
+        } else if (turn.activities?.size) setTurnStatus(turn, '处理过程', 'list-checks');
+        else turn.processView.remove();
         turn.text.className = 'agent-narrative agent-rich-text';
         replaceRichText(turn.text, answer);
-        const trace = buildToolTrace(turn);
-        if (trace) turn.card.append(trace);
         if (turn.candidateGroup && !turn.card.querySelector('.agent-result-downloads')) {
             const link = element('a', 'agent-result-downloads', '查看下载任务');
             link.href = '/downloads';
@@ -1005,8 +1040,10 @@
     }
 
     function finalizeError(turn, message, {cancelled = false} = {}) {
+        settleTurnActivities(turn);
         turn.failed = true;
         turn.cancelled = cancelled;
+        turn.finishedAt ??= Date.now();
         cancelTurnMarkdownRender(turn);
         const trustedReceipt = trustedEffectReceipt(turn);
         const protectedWriteStop = cancelled && turn.confirmationRequested === true;
@@ -1027,8 +1064,6 @@
                 turn.effectError && [...turn.effectReceipts.values()].every(value => value.receipt)
                     ? trustedReceipt : `${trustedReceipt}\n\n⚠️ 后续流程未完成：${finalMessage}`,
             );
-            const trace = buildToolTrace(turn);
-            if (trace) turn.card.append(trace);
             scrollToBottom();
             return;
         }
@@ -1040,8 +1075,6 @@
             protectedWriteStop ? 'triangle-alert' : cancelled ? 'circle-stop' : 'triangle-alert',
         );
         turn.text.textContent = finalMessage;
-        const trace = buildToolTrace(turn);
-        if (trace) turn.card.append(trace);
         if (turn.requestMessage && !turn.boundSelection && !turn.card.querySelector('.agent-retry-draft')) {
             const actions = element('div', 'agent-retry-actions');
             const retry = element('button', 'agent-retry-draft', '放回输入框修改');
@@ -1085,7 +1118,8 @@
 
     function buildApprovalScope(data) {
         if (!data || typeof data !== 'object') return null;
-        const resources = Array.isArray(data.resources) ? data.resources : data.resource ? [data.resource] : [];
+        const samples = Array.isArray(data.sample_changes) ? data.sample_changes : [];
+        const resources = Array.isArray(data.resources) ? data.resources : data.resource ? [data.resource] : samples;
         const effects = Array.isArray(data.effects) ? data.effects : [];
         if (!resources.length && !effects.length) return null;
         const scope = element('div', 'agent-confirmation-scope');
@@ -1094,13 +1128,16 @@
             const list = element('ul', 'agent-confirmation-list');
             const remaining = element('ul', 'agent-confirmation-list');
             for (const item of resources) {
-                if (!item || typeof item !== 'object') continue;
+                if (!item || !['object', 'string'].includes(typeof item)) continue;
                 const title = approvalListItem(item) || '未命名资源';
                 const site = String(item.site_name || '').trim();
                 const position = Number.isInteger(item.position) ? `#${item.position} · ` : '';
                 const destination = list.childElementCount < 8 ? list : remaining;
                 destination.append(element('li', '', `${position}${title}${site ? ` · ${site}` : ''}`));
             }
+            // 服务端只回传前几条变更样例；其余条数必须说明，避免误以为卡片已列全。
+            const unlisted = resources === samples && Number.isInteger(data.total) ? data.total - samples.length : 0;
+            if (unlisted > 0) list.append(element('li', 'is-muted', `其余 ${unlisted} 项未逐条列出`));
             if (list.childElementCount) scope.append(list);
             if (remaining.childElementCount) {
                 const more = element('details', 'agent-confirmation-editor');
@@ -1139,8 +1176,11 @@
         return record;
     }
 
-    function trustedEffectReceipt(turn) {
-        return [...(turn?.effectReceipts?.values() || [])].map(({receipt, summary}) => {
+    function trustedEffectReceipt(turn, planId = null) {
+        const records = planId === null
+            ? [...(turn?.effectReceipts?.values() || [])]
+            : [turn?.effectReceipts?.get(planId)].filter(Boolean);
+        return records.map(({receipt, summary}) => {
             if (receipt) return receipt;
             const detail = summary ? `服务端摘要：${summary}` : unconfirmedEffectMessage;
             return `⚠️ 执行状态未知。${detail}`;
@@ -1452,28 +1492,33 @@
         cancelTurnMarkdownRender(turn);
         turn.pendingMarkdown = '';
         const card = buildApproval(approval);
+        // 预授权操作可能跳过确认卡，按最近记录回执的独立计划选择结果。
+        const previousPlanId = [...(turn.effectReceipts?.keys() || [])].pop() || '';
+        const receipt = trustedEffectReceipt(turn, previousPlanId);
         turn.activePlanId = String(approval.plan_id || '');
-        const trace = buildToolTrace(turn);
-        if (trace) {
-            const status = card.querySelector('.agent-confirmation-status');
-            card.insertBefore(trace, status || null);
-        }
-        const receipt = trustedEffectReceipt(turn);
         if (receipt) {
+            // 上一项操作的回执置顶，避免被读成新计划自身的结果。
+            const previous = element('div', 'agent-confirmation-scope agent-confirmation-previous');
             const copy = element('div', 'agent-confirmation-result agent-rich-text');
             replaceRichText(copy, receipt);
-            card.insertBefore(copy, card.querySelector('.agent-confirmation-status'));
+            previous.append(element('h4', '', '上一项操作的执行结果'), copy);
+            card.insertBefore(previous, card.querySelector('.agent-confirmation-intro'));
         }
         // 确认卡包含真实写操作按钮，不应继承消息入场位移动画；否则在快速
         // 预检完成时按钮会短暂移动，既影响触控，也会造成自动化点击不稳定。
         turn.item?.classList.add('is-confirmation');
         const container = turn.approvalContainer || turn.card;
+        if (turn.processView) {
+            container.before(turn.processView);
+            turn.processView.hidden = !turn.activities?.size;
+            setTurnStatus(turn, '等待确认', 'circle-pause');
+        }
         container.replaceWith(card);
         turn.approvalContainer = null;
         turn.card = card;
         turn.approvalNode = card;
         card._agentTurn = turn;
-        scrollToBottom(true);
+        scrollToBottom();
     }
 
     function approvalTurnForCard(card) {
@@ -1485,10 +1530,8 @@
             head: null,
             headText: null,
             text: null,
-            steps: card?.querySelector('.agent-stream-steps') || null,
             rounds: new Map(),
             currentRound: 0,
-            toolSteps: new Map(),
             effectReceipts: new Map(),
             completedPlanIds: new Set(),
             approvalNode: card,
@@ -1537,14 +1580,7 @@
     }
 
     function restoreTurnFromApproval(turn, card) {
-        const stream = createStreamingCard();
-        const trace = turn.toolTrace || card.querySelector('.agent-tool-trace');
-        const steps = trace?.querySelector('.agent-stream-steps') || turn.steps;
-        if (steps) {
-            stream.steps.replaceWith(trace || steps);
-            stream.steps = steps;
-        }
-        turn.toolTrace = trace;
+        const stream = createStreamingCard(turn);
         card.append(stream.card);
         Object.assign(turn, stream, {approvalNode: null});
         turn.approvalContainer = card;
@@ -1605,7 +1641,15 @@
     }
 
     function applyEvent(turn, event) {
+        if (event?.event_id) {
+            const identity = `${event.turn_id || ''}:${event.request_id || ''}:${event.event_id}`;
+            turn.renderedEvents ||= new Set();
+            if (turn.renderedEvents.has(identity)) return;
+            turn.renderedEvents.add(identity);
+        }
         const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
+        updateTurnActivity(turn, payload.activity);
+        if (isTerminalEvent(event)) settleTurnActivities(turn);
         consumeTerminalTask(event);
         switch (event?.type) {
         case 'turn.started':
@@ -1619,24 +1663,28 @@
         case 'model.started':
             turn.currentRound = Number(payload.round || turn.currentRound + 1);
             turn.rounds.set(turn.currentRound, '');
-            setTurnStatus(turn, turn.currentRound > 1 ? '正在汇总结果' : '正在规划下一步');
+            setTurnStatus(turn, '正在思考');
             break;
         case 'model.delta': {
             if (turn.streamDisplayEnabled === false) break;
             const round = Number(payload.round || turn.currentRound || 1);
             const value = `${turn.rounds.get(round) || ''}${String(payload.delta || '')}`;
             turn.rounds.set(round, value);
+            if (value.trim() && turn.headText?.textContent !== '正在回复') setTurnStatus(turn, '正在回复', 'pen-line');
             renderTurnMarkdown(turn, value);
             break;
         }
-        case 'model.tool_call': {
-            const key = `call:${payload.call_id || event.sequence}`;
-            updateStep(turn, key, `${toolLabel(payload.tool, payload.label)}…`, {pending: true});
-            setTurnStatus(turn, toolLabel(payload.tool, payload.label));
+        case 'model.reasoning_summary.delta': {
+            if (typeof payload.delta !== 'string' || !payload.delta) break;
+            const round = Number(payload.round || turn.currentRound || 1);
+            const id = `reasoning:${round}:${payload.summary_id || ''}`;
+            const previous = turn.activities?.get(`reasoning:${id}`)?.text || '';
+            updateTurnActivity(turn, {id, kind: 'reasoning', text: clipText(previous + payload.delta, MAX_REASONING_TEXT)});
             break;
         }
+        case 'model.tool_call':
         case 'tool.started':
-            setTurnStatus(turn, toolLabel(payload.tool, payload.label));
+            setTurnStatus(turn, '正在处理');
             break;
         case 'tool.progress': {
             if (Object.prototype.hasOwnProperty.call(payload, 'candidate_view') && payload.candidate_view === null) removeCandidateView(turn);
@@ -1648,10 +1696,8 @@
         case 'tool.completed':
             if (payload.result?.candidate_view) renderCandidateView(turn, payload.result.candidate_view);
             else if (Object.prototype.hasOwnProperty.call(payload.result || {}, 'candidate_view')) removeCandidateView(turn);
-            updateStep(turn, `call:${payload.call_id || event.sequence}`, `${toolLabel(payload.tool, payload.label)}完成`);
             break;
         case 'tool.failed':
-            updateStep(turn, `call:${payload.call_id || event.sequence}`, `${toolLabel(payload.tool, payload.label)}未完成，正在调整`, {warning: true});
             setTurnStatus(turn, '正在调整方案');
             break;
         case 'effect.preview_started':
@@ -1659,11 +1705,6 @@
             break;
         case 'effect.approval_required':
             if (payload.plan) {
-                updateStep(
-                    turn,
-                    `call:${payload.call_id || event.sequence}`,
-                    `${toolLabel(payload.tool, payload.label)}预检完成`,
-                );
                 showApproval(turn, {
                     plan_id: payload.plan.plan_id,
                     tool_name: payload.plan.tool_name || payload.tool,
@@ -1681,35 +1722,20 @@
         case 'effect.completed': {
             if (payload.scoped_trust) renderScopedTrust(payload.scoped_trust);
             const planId = String(payload.plan_id || turn.activePlanId || '');
-            const record = rememberEffectReceipt(turn, planId, payload);
-            if (planId) {
-                turn.completedPlanIds?.add(planId);
-                updateStep(
-                    turn,
-                    `effect:${planId}`,
-                    record?.receipt ? '已记录服务端执行回执' : '执行状态未知，待核对服务端摘要',
-                    {warning: !record?.receipt, iconName: 'file-text'},
-                );
-            }
+            rememberEffectReceipt(turn, planId, payload);
+            if (planId) turn.completedPlanIds?.add(planId);
             rememberCandidateEffectResult(turn, payload.result || {});
             break;
         }
         case 'effect.failed': {
             const planId = String(payload.plan_id || turn.activePlanId || '');
-            const record = rememberEffectReceipt(turn, planId, payload);
-            if (planId) {
-                updateStep(
-                    turn,
-                    `effect:${planId}`,
-                    record?.receipt ? '已记录失败回执' : '执行状态未知，待核对服务端摘要',
-                    {warning: true, iconName: 'file-text'},
-                );
-            }
+            rememberEffectReceipt(turn, planId, payload);
             turn.effectError = String(payload.message || '操作未能确认，请以服务端回执核对。').trim();
             break;
         }
         case 'turn.completed': {
             const status = String(payload.status || '').toLowerCase();
+            turn.completionStatus = status || 'success';
             turn.waiting = status === 'waiting';
             if (status === 'approval_required') break;
             const answer = typeof payload.answer === 'string' ? payload.answer : '';
@@ -1806,6 +1832,8 @@
         const active = activeRequest;
         if (!active) return;
         activeRequest = null;
+        window.clearInterval(elapsedTimer);
+        elapsedTimer = null;
         clearActiveObservation(active);
         active.controller?.abort();
     }
@@ -1908,6 +1936,14 @@
         active.turnId = active.turnId || String(turn.turn_id || '');
         active.kernelGeneration = active.kernelGeneration ?? turn.generation;
         active.protected = turn.protected === true;
+        if (active.turn) {
+            for (const event of turn.events || []) {
+                if (sameActiveTurn(event, active)) applyEvent(active.turn, event);
+            }
+            if (active.turn.markdownTimer !== null || active.turn.markdownFrame !== null) {
+                renderTurnMarkdown(active.turn, active.turn.pendingMarkdown, {immediate: true});
+            }
+        }
         const detail = activeProgressText(turn, active);
         prepareActiveStatus(active, detail);
         setBusy(true);
@@ -2022,6 +2058,7 @@
 
     function stopActiveUnconfirmed(active, message) {
         if (!isCurrentActiveRequest(active)) return;
+        settleTurnActivities(active.turn);
         clearActiveObservation(active);
         activeRequest = null;
         active.controller?.abort();
@@ -2128,6 +2165,7 @@
 
     function startActiveObservation(active) {
         if (!isCurrentActiveRequest(active)) return;
+        settleTurnActivities(active.turn);
         active.observing = true;
         prepareActiveStatus(active, active.statusNode?.textContent || '正在只读核对任务状态');
         announce(responseStatus, active.cancelNotice || (active.cancelAccepted
@@ -2146,6 +2184,12 @@
 
     function setBusy(value) {
         busy = Boolean(value);
+        updateTurnElapsed(activeRequest?.turn);
+        if (busy && elapsedTimer === null) elapsedTimer = window.setInterval(() => updateTurnElapsed(activeRequest?.turn), 1000);
+        else if (!busy) {
+            window.clearInterval(elapsedTimer);
+            elapsedTimer = null;
+        }
         if (promptInput) promptInput.disabled = false;
         sendButton?.setAttribute('aria-busy', String(busy));
         syncSend();
@@ -2355,6 +2399,8 @@
         card.querySelectorAll('button').forEach(item => { item.disabled = true; });
         turn.activePlanId = planId;
         turn.confirmationRequested = true;
+        turn.startedAt = Date.now();
+        turn.finishedAt = null;
         restoreTurnFromApproval(turn, card);
         setTurnStatus(turn, '正在执行已确认计划');
         showExecutingApproval(card);
@@ -2660,6 +2706,8 @@
         view.body.append(card);
         const turn = approvalTurnForCard(card);
         turn.item = view.item;
+        if (Array.isArray(approval.activities)) approval.activities.slice(-MAX_TURN_ACTIVITIES).forEach(activity => updateTurnActivity(turn, activity));
+        if (turn.activities?.size) setTurnStatus(turn, '等待确认', 'circle-pause');
         return card;
     }
 
@@ -2668,6 +2716,16 @@
         renderTaskSnapshot(payload.task);
         const previousFollow = followOutput;
         const previousScrollTop = transcript?.scrollTop || 0;
+        const processStates = new Map();
+        if (preserveScroll) {
+            transcript?.querySelectorAll('.agent-process-view').forEach(view => {
+                const process = view.querySelector('.agent-process');
+                if (!process) return;
+                const state = {expanded: !process.hidden, scrollTop: process.scrollTop,
+                    focused: document.activeElement === view.querySelector('.agent-process-toggle')};
+                process.querySelectorAll('.agent-process-item').forEach(item => processStates.set(item.dataset.activityKey, state));
+            });
+        }
         expireCandidateCards();
         transcript?.replaceChildren();
         const candidateGroups = new Map();
@@ -2678,7 +2736,7 @@
                 const content = folded ? String(message.candidate_followup || '') : String(message.content || '');
                 if (folded && !content) continue;
                 const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
-                addRecoveredToolTrace(turn, message.tools, message.tool_labels);
+                if (Array.isArray(message.activities)) message.activities.slice(-MAX_TURN_ACTIVITIES).forEach(activity => updateTurnActivity(turn, activity));
                 finalizeAnswer(turn, content);
                 if (message.candidate_view) {
                     const group = renderCandidateView(turn, message.candidate_view);
@@ -2745,8 +2803,16 @@
 
         expireCandidateCards(candidateGroup || null);
         syncCandidateButtons();
+        transcript?.querySelectorAll('.agent-process-view').forEach(view => {
+            const process = view.querySelector('.agent-process');
+            const state = [...view.querySelectorAll('.agent-process-item')].map(item => processStates.get(item.dataset.activityKey)).find(Boolean);
+            if (!process || !state) return;
+            setProcessExpanded(view, state.expanded);
+            process.scrollTop = state.scrollTop;
+            if (state.focused) view.querySelector('.agent-process-toggle').focus({preventScroll: true});
+        });
         followOutput = preserveScroll ? previousFollow : true;
-        if (followOutput) scrollToBottom(true);
+        if (followOutput && ![...processStates.values()].some(state => state.expanded)) scrollToBottom(true);
         else if (transcript) {
             transcript.scrollTop = previousScrollTop;
             if (newRepliesButton) newRepliesButton.hidden = false;
@@ -3066,7 +3132,14 @@
         group._candidateState = {view: {...view, items}, selected, target, details, preview, count, note, output, storageKey: candidateStorageKey(view.ref)};
         select.addEventListener('change', () => { group._candidateState.target = select.value; syncCandidateButtons(); saveCandidateDraft(group); });
         details.addEventListener('toggle', () => saveCandidateDraft(group));
-        group.append(heading, summary, toolbar, note, details, output);
+        group.append(heading, summary);
+        const coverageNotice = typeof view.coverage_notice === 'string' ? view.coverage_notice.trim() : '';
+        if (coverageNotice) {
+            const coverageNote = element('p', 'agent-candidates-note', coverageNotice);
+            coverageNote.dataset.candidateCoverageNotice = 'true';
+            group.append(coverageNote);
+        }
+        group.append(toolbar, note, details, output);
         turn.candidateGroup = group;
         if (previousGroup?.isConnected) previousGroup.replaceWith(group);
         else turn.card.append(group);

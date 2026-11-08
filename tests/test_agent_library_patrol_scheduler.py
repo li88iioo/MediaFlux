@@ -1,6 +1,7 @@
 """Agent 持久化全库缺集巡检的状态机与安全投影测试。"""
 
 from __future__ import annotations
+from dataclasses import asdict
 from starlette.responses import JSONResponse
 from starlette.requests import Request
 from typing import cast
@@ -13,8 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.library.patrol_status import get_library_patrol_status
-from app.agent.models import ToolResult
+from app.modules.library_patrol import patrol_status
+from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
 from app.notifier import TelegramSendResult
 from app.routes.api import save_config
@@ -29,8 +30,8 @@ class MutableClock:
         return self.value
 
 
-def _patrol_result(*, status: str = "updates_available", ok: bool = True) -> ToolResult:
-    return ToolResult(
+def _patrol_result(*, status: str = "updates_available", ok: bool = True) -> EpisodeAuditResult:
+    return EpisodeAuditResult(
         ok,
         status,
         "巡检完成",
@@ -582,9 +583,9 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(interim["status"], "pending")
             self.assertEqual(interim["cycle_cursor_tmdb_id"], "12345")
             self.assertEqual(interim["last_finished_at"], None)
-            status = get_library_patrol_status({})
-            self.assertTrue(status.data["continuation_pending"])
-            self.assertEqual(status.data["cycle_checked_series_count"], 2)
+            status = patrol_status()
+            self.assertTrue(status["data"]["continuation_pending"])
+            self.assertEqual(status["data"]["cycle_checked_series_count"], 2)
             self.assertEqual(scheduler.run_once(), 1)
         executor.assert_has_calls(
             [
@@ -644,9 +645,9 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             assert first is not None
             self.assertEqual(first["cycle_cursor_tmdb_id"], "")
             self.assertEqual(first["cycle_stall_attempts"], 1)
-            status = get_library_patrol_status({})
-            self.assertTrue(status.data["continuation_pending"])
-            self.assertEqual(status.data["cycle_checked_series_count"], 0)
+            status = patrol_status()
+            self.assertTrue(status["data"]["continuation_pending"])
+            self.assertEqual(status["data"]["cycle_checked_series_count"], 0)
             self.assertEqual(scheduler.run_once(), 1)
             get_agent_library_patrol_result_4 = db.get_agent_library_patrol()
             assert get_agent_library_patrol_result_4 is not None
@@ -974,17 +975,17 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config():
             scheduler.run_once()
         with patch(
-            "app.agent.domains.library.patrol_status.config.get_bool", return_value=True
+            "app.modules.library_patrol.config.get_bool", return_value=True
         ):
-            result = get_library_patrol_status({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "updates_available")
-        self.assertEqual(result.data["missing_episode_count"], 2)
-        self.assertIn("最近一次自动缺集巡检", result.summary)
+            result = patrol_status()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "updates_available")
+        self.assertEqual(result["data"]["missing_episode_count"], 2)
+        self.assertIn("最近一次自动缺集巡检", result["summary"])
         self.assertEqual(
-            result.data["findings"][0]["missing_sample"][0], {"season": 2, "episode": 3}
+            result["data"]["findings"][0]["missing_sample"][0], {"season": 2, "episode": 3}
         )
-        self.assertIn("不会自动下载", " ".join(result.suggestions))
+        self.assertIn("不会自动下载", " ".join(result["suggestions"]))
 
     def test_projection_rejects_uncontrolled_status_and_sensitive_title(self):
         result = _patrol_result(status="token=SECRET", ok=False)
@@ -1014,15 +1015,15 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
                 ),
             )
         with patch(
-            "app.agent.domains.library.patrol_status.config.get_bool", return_value=True
+            "app.modules.library_patrol.config.get_bool", return_value=True
         ):
-            result = get_library_patrol_status({})
-        self.assertEqual(result.status, "inconclusive")
-        self.assertEqual(result.data["outcome"], "inconclusive")
-        self.assertEqual(result.data["findings"], [])
-        self.assertEqual(result.data["checked_series_count"], 0)
-        self.assertIn("覆盖不完整", result.summary)
-        self.assertNotIn("SECRET", repr(result.to_dict()))
+            result = patrol_status()
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(result["data"]["outcome"], "inconclusive")
+        self.assertEqual(result["data"]["findings"], [])
+        self.assertEqual(result["data"]["checked_series_count"], 0)
+        self.assertIn("覆盖不完整", result["summary"])
+        self.assertNotIn("SECRET", repr(result))
 
 
 class AgentLibraryPatrolCycleIdentityTests(IsolatedDatabaseTestCase):
@@ -1047,12 +1048,12 @@ class AgentLibraryPatrolCycleIdentityTests(IsolatedDatabaseTestCase):
         self.assertEqual(reused["run_id"], first["run_id"])
 
     def test_cycle_survives_batches_restart_and_rejects_old_lease_terminal(self):
-        from app.agent.domains.library.patrol_status import serialize_patrol_projection
+        from app.modules.library_patrol import serialize_patrol_projection
         current = "2026-08-03 12:00:00"
         first = db.trigger_agent_library_patrol(next_run_at=current)
         initial = db.claim_due_agent_library_patrol(current_time=current)
         assert initial is not None
-        raw, _projection = serialize_patrol_projection(_patrol_result())
+        raw, _projection = serialize_patrol_projection(asdict(_patrol_result()))
         self.assertTrue(db.continue_agent_library_patrol(
             expected_lease_generation=int(initial["lease_generation"]), next_run_at=current,
             cycle_as_of="2026-08-03", cycle_cursor_tmdb_id="12345", cycle_accumulator_json=raw,

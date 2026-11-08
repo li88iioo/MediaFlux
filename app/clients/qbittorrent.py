@@ -409,8 +409,10 @@ class QBittorrentClient:
         if not self.api_key:
             self.login()
         data = self._get("/transfer/info").json()
+        if not isinstance(data, dict) or not isinstance(data.get("connection_status"), str):
+            raise ValueError("qBittorrent 传输响应格式无效")
         return TransferInfo(
-            connection_status=data.get("connection_status", "disconnected"),
+            connection_status=data["connection_status"],
             dl_info_speed=data.get("dl_info_speed", 0),
             dl_info_data=data.get("dl_info_data", 0),
             up_info_speed=data.get("up_info_speed", 0),

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any
@@ -26,6 +27,7 @@ _DEFAULT_PREFERENCES = {
     "excluded_genres": [],
     "min_rating": 0,
     "exclude_played": True,
+    "memory_notes": [],
 }
 _PROFILE_KEYS = tuple(key for key in _DEFAULT_PREFERENCES if key not in {
     "preferred_server", "preferred_download_target",
@@ -85,6 +87,11 @@ def _preferences_from_row(row: sqlite3.Row | None) -> dict[str, Any]:
     }
 
 
+def merge_media_preferences(current: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    """字段级替换与保留共用同一规则；不会把软偏好扩展为硬筛选。"""
+    return {key: updates.get(key, current[key]) for key in _DEFAULT_PREFERENCES}
+
+
 def set_media_preferences(
     owner_digest: str, *, expected_revision: int, updates: dict[str, Any],
     expected_revision_token: str | None = None,
@@ -103,7 +110,7 @@ def set_media_preferences(
             str(current["revision_token"]), expected_revision_token
         ):
             return None
-        merged = {key: updates.get(key, current[key]) for key in _DEFAULT_PREFERENCES}
+        merged = merge_media_preferences(current, updates)
         profile_json = json.dumps(
             {key: merged[key] for key in _PROFILE_KEYS}, ensure_ascii=False,
             sort_keys=True, separators=(",", ":"), allow_nan=False,
@@ -210,6 +217,7 @@ def set_notification_rule(
     expected_subscription_revision: int,
     updates: dict[str, bool],
     expected_rule: dict[str, Any] | None = None,
+    check_cancelled: Callable[[], None] = lambda: None,
 ) -> dict[str, Any] | None:
     stamp = db.now()
     with db.get_conn() as conn:
@@ -220,6 +228,7 @@ def set_notification_rule(
         )
         if current is None:
             return None
+        check_cancelled()
         merged = {key: bool(updates.get(key, current[key])) for key in _DEFAULT_RULE}
         if not current["explicit"]:
             conn.execute(
@@ -255,6 +264,7 @@ def set_notification_rule(
 def reset_notification_rule(
     subscription_id: int, *, expected_rule_revision: int, expected_subscription_revision: int,
     expected_rule: dict[str, Any] | None = None,
+    check_cancelled: Callable[[], None] = lambda: None,
 ) -> bool:
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -264,6 +274,7 @@ def reset_notification_rule(
         )
         if current is None or not current["explicit"]:
             return False
+        check_cancelled()
         cur = conn.execute(
             "DELETE FROM media_subscription_notification_rules "
             "WHERE subscription_id=? AND revision=?",

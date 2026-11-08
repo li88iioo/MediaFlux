@@ -1,24 +1,7 @@
 """Normal final-answer consumer and memory checkpoint regressions."""
 import asyncio
 
-from tests.test_deadline_answer_evidence import (
-    EXPLANATION,
-    SUMMARY,
-    AgentInput,
-    AgentSession,
-    CapabilityRetriever,
-    InMemorySessionStateStore,
-    KernelToolSpec,
-    ModelEvent,
-    ModelEventType,
-    ModelToolCall,
-    PreparedEffect,
-    ScriptedModel,
-    ToolCatalog,
-    ToolEffect,
-    ToolPipeline,
-    consume_events,
-)
+from tests.test_deadline_answer_evidence import EXPLANATION, SUMMARY, AgentInput, AgentSession, InMemorySessionStateStore, KernelToolSpec, ModelEvent, ModelEventType, ModelToolCall, PreparedEffect, ScriptedModel, ToolCatalog, ToolEffect, ToolPipeline, consume_events
 
 
 def test_normal_submitted_read_answer_preserves_trusted_scope_once():
@@ -44,7 +27,7 @@ def test_normal_submitted_read_answer_preserves_trusted_scope_once():
             [ModelEvent(ModelEventType.TEXT_DELTA, text="删除已完成。All writes are finished. DO-NOT-PUBLISH"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         catalog, store = ToolCatalog([write, read]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="提交并检查后续任务", owner="o", session_id="s")))
         assert preview.approval is not None

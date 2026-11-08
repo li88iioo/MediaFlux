@@ -16,9 +16,9 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import config
-from app.agent.domain_catalog import build_tool_specs
+from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.kernel.capabilities import ToolEffect
-from app.agent.kernel.ports import catalog_from_tool_specs
+from app.agent.kernel.sandbox import workspace_unavailable_reason
 from app.clients.openai_compatible import (
     PROTOCOLS,
     normalize_provider_location,
@@ -88,14 +88,14 @@ def _provider_check() -> DiagnosticCheck:
             "协议请选择 auto、responses、chat_completions 或 anthropic_messages。",
         )
     try:
-        normalize_provider_location(base_url, https_only=True, public_only=True)
+        normalize_provider_location(base_url)
         resolved = resolve_protocol(protocol, base_url)
     except ValueError:
         return DiagnosticCheck(
             "agent.provider",
             "error",
-            "LLM Provider 地址未通过 HTTPS/公网安全校验。",
-            "使用无内嵌凭据、无查询参数的公网 HTTPS Base URL。",
+            "LLM Provider 地址格式无效。",
+            "使用无内嵌凭据、无查询参数和片段的 HTTP 或 HTTPS Base URL。",
         )
     key_state = (
         "API Key 已配置"
@@ -244,9 +244,10 @@ def _key_capabilities_check() -> DiagnosticCheck:
 
 def _tool_capabilities_check() -> DiagnosticCheck:
     try:
-        catalog = catalog_from_tool_specs(build_tool_specs())
+        catalog = build_tool_catalog()
         all_tools = catalog.visible({})
-        read_tools = [tool for tool in all_tools if tool.effect is ToolEffect.READ]
+        from app import sdk
+        read_tools = sorted(sdk.METHODS.keys() - sdk.WRITE_METHODS)
         effect_tools = [
             tool for tool in all_tools if tool.effect is not ToolEffect.READ
         ]
@@ -255,22 +256,33 @@ def _tool_capabilities_check() -> DiagnosticCheck:
             raise ValueError("duplicate model aliases")
     except Exception:  # noqa: BLE001 - diagnostic must report every catalog build failure
         return DiagnosticCheck(
-            "agent.capabilities",
+            "agent.sdk",
             "error",
             "Agent Kernel 能力目录无法构建。",
             "检查最近的分域工具定义、模型别名与 EffectPlan 契约变更。",
         )
     if not all_tools or not read_tools or not effect_tools:
         return DiagnosticCheck(
-            "agent.capabilities",
+            "agent.sdk",
             "error",
             "Agent Kernel 能力集合不完整。",
             "检查只读工具与需要 EffectPlan 确认的写入工具。",
         )
     return DiagnosticCheck(
-        "agent.capabilities",
+        "agent.sdk",
         "ok",
         f"Kernel 能力目录可用：{len(all_tools)} 项能力，{len(read_tools)} 项只读，{len(effect_tools)} 项确认后动作。",
+    )
+
+
+def _workspace_check() -> DiagnosticCheck:
+    reason = workspace_unavailable_reason()
+    return DiagnosticCheck(
+        "agent.workspace", "error" if reason else "ok",
+        reason or "代码工作区隔离启动检查通过；本次未调用模型或执行业务。",
+        "检查上述工作区运行条件；服务启动成功不代表 Agent 执行器可用。"
+        "修复后仍需实际执行一次工作区命令验证。"
+        if reason else "",
     )
 
 
@@ -284,6 +296,7 @@ def run_agent_diagnostics() -> DiagnosticReport:
             _web_secret_check(),
             _key_capabilities_check(),
             _tool_capabilities_check(),
+            _workspace_check(),
         )
     )
 

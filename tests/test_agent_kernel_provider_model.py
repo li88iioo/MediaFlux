@@ -42,6 +42,114 @@ async def collect(stream):
 
 
 class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_responses_public_summary_done_is_deduplicated_without_changing_private_state(self):
+        summary = "  Check library first.\n\nThen compare results.  "
+        reasoning = {
+            "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque-ciphertext",
+            "content": [{"type": "reasoning_text", "text": "private raw reasoning"}],
+            "summary": [{"type": "summary_text", "text": summary}],
+        }
+        done = {"type": "response.reasoning_summary_text.done", "item_id": "rs_1",
+                "output_index": 0, "summary_index": 0, "text": summary}
+        frames = [
+            {"type": "response.reasoning_text.delta", "item_id": "rs_1", "delta": "private raw reasoning"},
+            {"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
+             "output_index": 0, "summary_index": 0, "delta": summary[:17]},
+            {"type": "response.output_text.delta", "delta": "Ordinary answer."},
+            done, done,
+            {"type": "response.reasoning_summary_part.done", "item_id": "rs_1", "summary_index": 0,
+             "part": {"type": "summary_text", "text": summary}},
+            {"type": "response.reasoning_summary_text.done", "item_id": "rs_1", "summary_index": 1,
+             "text": summary},
+            {"type": "response.output_item.done", "output_index": 0, "item": reasoning},
+            {"type": "response.completed", "response": {"status": "completed"}},
+        ]
+        events = await collect(iter_protocol_model_events(chunks(frames, split=3), protocol="responses"))
+        summaries = [event for event in events if event.type is ModelEventType.REASONING_SUMMARY_DELTA]
+        self.assertEqual([(event.text, event.summary_id) for event in summaries],
+                         [(summary, "rs_1:0"), (summary, "rs_1:1")])
+        self.assertTrue(all(event.raw is None and event.provider_state is None for event in summaries))
+        self.assertEqual("".join(event.text for event in events if event.type is ModelEventType.TEXT_DELTA),
+                         "Ordinary answer.")
+        self.assertEqual(events[-1].provider_state.layout(), [reasoning])
+
+    async def test_responses_summary_completion_boundaries_and_incomplete_stream(self):
+        summary = " Think about the next step.\n"
+        for terminal in ("text", "part", "response", "incomplete"):
+            with self.subTest(terminal=terminal):
+                frames: list[dict[str, object]] = [
+                    {"type": "response.reasoning_summary_text.delta", "output_index": 0,
+                     "summary_index": 0, "delta": part}
+                    for part in (summary[:9], summary[9:])
+                ]
+                if terminal == "text":
+                    frames.append({"type": "response.reasoning_summary_text.done", "text": summary})
+                elif terminal == "part":
+                    frames.append({"type": "response.reasoning_summary_part.done",
+                                   "part": {"type": "summary_text", "text": summary}})
+                frames.append({"type": "response.incomplete" if terminal == "incomplete" else "response.completed",
+                               "response": {"status": "incomplete" if terminal == "incomplete" else "completed"}})
+                seen = []
+                try:
+                    async for event in iter_protocol_model_events(chunks(frames, split=7), protocol="responses"):
+                        seen.append(event)
+                except ModelProviderError:
+                    self.assertEqual(terminal, "incomplete")
+                else:
+                    self.assertNotEqual(terminal, "incomplete")
+                summaries = [event for event in seen if event.type is ModelEventType.REASONING_SUMMARY_DELTA]
+                self.assertEqual([event.text for event in summaries], [] if terminal == "incomplete" else [summary])
+                self.assertTrue(all(event.summary_id == "" for event in summaries))
+
+    def test_summary_after_completion_blocks_retry_and_protocol_fallback(self):
+        from tests.test_agent_protocol_fallback import protocols, sse, wire
+
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                frame = {"type": "response.reasoning_summary_text.done" if completed else
+                         "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0,
+                         "text" if completed else "delta": "Checking available results."}
+                result = wire([{"status": 200, "data": sse(frame),
+                                "headers": {"content-type": "text/event-stream"}}, None])
+                self.assertEqual(protocols(result), ["responses"] if completed else ["responses", "responses"])
+                summaries = [event for event in result["events"] if event.type is ModelEventType.REASONING_SUMMARY_DELTA]
+                self.assertEqual([event.text for event in summaries], ["Checking available results."] if completed else [])
+                if completed:
+                    self.assertIsInstance(result["error"], ModelProviderError)
+                else:
+                    self.assertIsNone(result["error"])
+                    self.assertEqual(result["events"][-1].type, ModelEventType.FINISH)
+
+    async def test_summary_opt_in_only_extends_existing_responses_reasoning_configuration(self):
+        from tests.test_agent_provider_state import WireClient
+
+        replies = {
+            "responses": {"status": "completed", "output": [
+                {"type": "reasoning", "id": "rs_json", "encrypted_content": "opaque",
+                 "summary": [{"type": "summary_text", "text": "Check the actual library."}]},
+            ]},
+            "chat_completions": {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+            "anthropic_messages": {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"},
+        }
+        for protocol, reply in replies.items():
+            for effort in ("", "high"):
+                with self.subTest(protocol=protocol, effort=effort):
+                    wire = WireClient([reply])
+                    adapter = OpenAICompatibleModelAdapter(
+                        ProviderSettings(api_url="https://api.example.com/v1", model="test", protocol=protocol,
+                                         reasoning_effort=effort),
+                        client_factory=cast(Callable[..., FixedHostHttpClient], lambda **_: wire),
+                    )
+                    events = await collect(adapter.stream(ModelRequest(system_prompt="test", messages=(), tools=()),
+                                                          cancellation=CancellationToken()))
+                    self.assertEqual(len(wire.requests), 1)
+                    expected = {"effort": "high", "summary": "auto"} if protocol == "responses" and effort else None
+                    self.assertEqual(wire.requests[0].get("reasoning"), expected)
+                    summaries = [event for event in events if event.type is ModelEventType.REASONING_SUMMARY_DELTA]
+                    self.assertEqual([(event.text, event.summary_id) for event in summaries],
+                                     [("Check the actual library.", "rs_json:0")] if protocol == "responses" else [])
+                    self.assertEqual(events[-1].type, ModelEventType.FINISH)
+
     async def test_sse_decoding_contract_is_shared_without_weakening_limits(self):
         async def raw_chunks(payload):
             for offset in range(0, len(payload), 13):
@@ -953,13 +1061,49 @@ class ParallelToolCallPermissionTests(unittest.IsolatedAsyncioTestCase):
                         ])
                     else:
                         self.assertEqual(body["messages"][-2], {"role": "assistant", "content": assistant})
+                        # 同批结果仍在同一用户轮；只有末块携带滚动缓存断点。
                         self.assertEqual(body["messages"][-1], {"role": "user", "content": [
-                            {"type": "tool_result", "tool_use_id": cid, "content": f"result-{index}"}
+                            {"type": "tool_result", "tool_use_id": cid, "content": f"result-{index}",
+                             **({"cache_control": {"type": "ephemeral"}} if index == len(call_ids) - 1 else {})}
                             for index, cid in enumerate(call_ids)
                         ]})
 
 
 class ProtocolTraceRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_waits_for_complete_part_then_is_visible_before_answer(self):
+        received, complete, answer = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        summary = "Keep spaces between words.\n"
+
+        async def gated_chunks():
+            async for chunk in chunks([{"type": "response.reasoning_summary_text.delta", "item_id": "rs_1",
+                                        "summary_index": 0, "delta": summary}]):
+                yield chunk
+            received.set()
+            await complete.wait()
+            async for chunk in chunks([{"type": "response.reasoning_summary_text.done", "item_id": "rs_1",
+                                        "summary_index": 0, "text": summary}]):
+                yield chunk
+            await answer.wait()
+            async for chunk in chunks([
+                {"type": "response.output_text.delta", "delta": "Final answer."},
+                {"type": "response.completed", "response": {"status": "completed"}},
+            ]):
+                yield chunk
+
+        stream = iter_protocol_model_events(gated_chunks(), protocol="responses")
+        pending = asyncio.ensure_future(anext(stream))
+        await asyncio.wait_for(received.wait(), timeout=1)
+        self.assertFalse(pending.done())
+        complete.set()
+        first = await asyncio.wait_for(pending, timeout=1)
+        self.assertEqual((first.type, first.text, first.summary_id),
+                         (ModelEventType.REASONING_SUMMARY_DELTA, summary, "rs_1:0"))
+        self.assertFalse(answer.is_set())
+        answer.set()
+        rest = await collect(stream)
+        self.assertEqual([event.text for event in rest if event.type is ModelEventType.TEXT_DELTA], ["Final answer."])
+        self.assertEqual(rest[-1].type, ModelEventType.FINISH)
+
     async def test_text_delta_is_visible_before_the_next_sse_event(self):
         gate = asyncio.Event()
 

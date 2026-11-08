@@ -1529,7 +1529,7 @@ class MultiVersionConfigApiTests(IsolatedDatabaseTestCase):
         organizer = Mock()
         organizer.organize.return_value = ([plan], {"total": 1, "matched": 1})
 
-        with patch("app.modules.organize.Organizer", return_value=organizer):
+        with patch("app.modules.organize_service.Organizer", return_value=organizer):
             response = self.client.post(
                 "/api/guangya/organize/preview",
                 json={
@@ -1560,7 +1560,7 @@ class MultiVersionConfigApiTests(IsolatedDatabaseTestCase):
         organizer = Mock()
         organizer.organize.side_effect = RuntimeError("private preview failure")
 
-        with patch("app.modules.organize.Organizer", return_value=organizer):
+        with patch("app.modules.organize_service.Organizer", return_value=organizer):
             response = self.client.post(
                 "/api/guangya/organize/preview",
                 json={

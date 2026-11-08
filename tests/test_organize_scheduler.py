@@ -16,7 +16,7 @@ except ModuleNotFoundError:
 
 from app.modules.organize import OrganizeRules, Organizer
 from app.modules.organize_tasks import OrganizeTaskManager
-from tests.support import isolated_test_database
+from tests.support import initialized_web_runtime, isolated_test_database
 
 
 class FakeManager:
@@ -329,6 +329,7 @@ class OrganizeSchedulerTests(unittest.TestCase):
         self.assertEqual(status["schedule"]["last_result"]["outcome"], "completed")
 
     def test_application_lifecycle_starts_and_stops_organize_scheduler(self):
+        self.enterContext(initialized_web_runtime())
         from app import main
 
         strm = MagicMock()
@@ -404,6 +405,7 @@ class OrganizeSchedulerTests(unittest.TestCase):
         notification_stop.assert_called_once_with(timeout=3.0)
 
     def test_application_shutdown_reports_undrained_organize_worker(self):
+        self.enterContext(initialized_web_runtime())
         from app import main
 
         manager = MagicMock()
@@ -441,6 +443,7 @@ class OrganizeSchedulerTests(unittest.TestCase):
         self.assertIn("停止网盘整理任务超时", "\n".join(captured.output))
 
     def test_application_shutdown_propagates_bot_and_download_tracker_timeouts(self):
+        self.enterContext(initialized_web_runtime())
         from app import main
 
         manager = MagicMock()
@@ -484,6 +487,7 @@ class OrganizeSchedulerTests(unittest.TestCase):
         self.assertIn("停止下载跟踪器超时", output)
 
     def test_verification_scheduler_stop_error_logs_only_exception_type(self):
+        self.enterContext(initialized_web_runtime())
         from app import main
 
         verification = MagicMock()

@@ -11,8 +11,6 @@ import sqlite3
 import time
 from typing import Any
 
-from app.agent.errors import AgentToolError
-from app.agent.models import EFFECT_RECEIPT_RETENTION_SECONDS
 from app.modules.web_secret import get_web_secret
 
 _ALLOWED_JOB_TYPES = {"library_episode_audit"}
@@ -23,16 +21,26 @@ _MAX_JSON_BYTES = 65_536
 _MAX_SUMMARY_LENGTH = 240
 _MAX_ERROR_CODE_LENGTH = 80
 _MAX_HISTORY_PER_OWNER = 50
+# 原有24小时回执恢复期保持不变，仓储不依赖Agent模型或异常协议。
+_RECEIPT_RETENTION_SECONDS = 24 * 60 * 60
+
+
+class AgentJobError(ValueError):
+    """持久任务身份、目标或事务预条件不成立。"""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
 
 
 def agent_job_owner_digest(owner: str) -> str:
     """使用独立 domain separator 派生不可逆 owner 分区键。"""
     normalized = (owner or "").strip()
     if not normalized or len(normalized) > _MAX_OWNER_LENGTH:
-        raise AgentToolError("无法确认当前 Agent 身份", code="identity_required")
+        raise AgentJobError("无法确认当前 Agent 身份", code="identity_required")
     secret = (get_web_secret() or "")
     if not secret:
-        raise AgentToolError("Agent 身份隔离密钥不可用", code="identity_required")
+        raise AgentJobError("Agent 身份隔离密钥不可用", code="identity_required")
     return hmac.new(
         secret.encode("utf-8"),
         b"mediaflux-agent-durable-job:v1\0" + normalized.encode("utf-8"),
@@ -50,7 +58,7 @@ def _safe_job_type(value: object) -> str:
 def _safe_job_id(value: object) -> str:
     job_id = str(value or "").strip()
     if not re.fullmatch(r"job_[A-Za-z0-9_-]{16,80}", job_id):
-        raise AgentToolError("未找到对应的后台任务", code="job_not_found")
+        raise AgentJobError("未找到对应的后台任务", code="job_not_found")
     return job_id
 
 
@@ -98,7 +106,7 @@ def _trim_owner_history(conn: sqlite3.Connection, *, owner_digest: str) -> None:
         "SELECT job_id FROM agent_jobs WHERE owner_digest=? "
         "AND status IN ('succeeded','failed','cancelled') "
         "ORDER BY updated_at DESC,job_id DESC LIMIT -1 OFFSET ?)",
-        (owner_digest, db.now(), f"-{EFFECT_RECEIPT_RETENTION_SECONDS} seconds",
+        (owner_digest, db.now(), f"-{_RECEIPT_RETENTION_SECONDS} seconds",
          owner_digest, _MAX_HISTORY_PER_OWNER),
     )
 
@@ -144,7 +152,7 @@ def create_agent_job(
             existing is None or str(existing["job_id"]) != expected_id
         ):
             # 预检承诺复用具体任务，等待写锁期间其完成/取消也不能扩大为新建。
-            raise AgentToolError("后台任务状态已变化，请重新确认", code="confirmation_stale")
+            raise AgentJobError("后台任务状态已变化，请重新确认", code="confirmation_stale")
         if existing is not None:
             return existing, False
         try:

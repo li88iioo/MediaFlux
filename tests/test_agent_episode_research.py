@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
-from app.agent.models import ToolResult
+from app.modules.web_evidence import _result as make_result
 from app.modules import agent_episode_research as runner
 
 
@@ -230,7 +230,7 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_web_does_not_prevent_tmdb_validation(self):
         self.search.side_effect = None
-        self.search.return_value = ToolResult(False, "disabled", "disabled")
+        self.search.return_value = make_result(False, "disabled", "disabled")
         model = success_model(prefix=(call("web_search", {"query": "Test episode order"}),))
         result = await self.run_case(model)
         self.assertEqual(result["status"], "verified")
@@ -298,7 +298,7 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
         limits = args["limits"]
         self.assertEqual((limits.max_model_rounds, limits.max_tool_calls, limits.max_output_tokens), (8, 14, 2000))
         self.assertEqual(len([tool for tool in args["catalog"].visible({}) if not tool.metadata.get("kernel_utility")]), 7)
-        self.assertEqual(args["catalog"].get("agent.read_result").effect.value, "read")
+        self.assertFalse(any(t.name == "agent.read_result" for t in args["catalog"].visible()))
         self.assertTrue(all(tool.effect is runner.ToolEffect.READ for tool in args["catalog"].visible()))
 
     async def test_model_failure_after_proposal_does_not_validate(self):
@@ -380,6 +380,20 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.requests), 8)
         self.assertEqual(self.reader.close_count, 1)
 
+    async def test_completed_budget_or_interruption_is_failed_but_normal_completion_can_abstain(self):
+        for reason in ("model_round_budget_exceeded", "tool_budget_exceeded", "task_budget_exceeded",
+                       "token_budget_exceeded", "active_time_budget_exceeded", "context_budget_exceeded",
+                       "model_output_budget_exceeded", "model_incomplete", "model_interrupted", "interrupted", "stop"):
+            async def events(_agent_input):
+                yield SimpleNamespace(type=runner.AgentEventType.TURN_COMPLETED,
+                                      payload={"status": "partial", "finish_reason": reason})
+
+            reader = FakeReader()
+            with self.subTest(reason=reason), patch.object(runner, "AgentSession", return_value=SimpleNamespace(run=events)):
+                result = await self.run_case(ScriptedModel([]), reader=reader)
+            self.assertEqual(result["status"], "abstained" if reason == "stop" else "failed")
+            self.assertEqual(result["reason_code"], "insufficient_evidence" if reason == "stop" else reason)
+            self.assertEqual(reader.close_count, 1)
     async def test_output_budget_counts_reported_and_missing_usage(self):
         for event in (ModelEvent(ModelEventType.TEXT_DELTA, text="x" * 2001),
                       ModelEvent(ModelEventType.USAGE, usage={"output_tokens": 2001})):
@@ -410,14 +424,13 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     def mock_search(self, *, url="https://example.org/episodes", title="Episode order", snippet="Order verified"):
         self.search.side_effect = None
-        self.search.return_value = ToolResult(True, "ok", "found", data={
+        self.search.return_value = make_result(True, "ok", "found", data={
             "results": [{"url": url, "title": title, "snippet": snippet}], "token": "private-token"})
         return url
 
     def mock_read(self, url, *, content="The public episode order.", final_url=None):
         self.web_read.side_effect = None
-        self.web_read.return_value = ToolResult(True, "ok", "read", data={"url": final_url or url, "requested_url": url}, model_data={
-            "url": final_url or url, "requested_url": url, "title": "Episode order", "content_chunks": [content], "owner": "private-owner"})
+        self.web_read.return_value = make_result(True, "ok", "read", data={"url": final_url or url, "requested_url": url, "title": "Episode order", "content": content, "owner": "private-owner"})
 
     async def test_successful_web_evidence_contains_only_digest_not_raw_content(self):
         url = self.mock_search()
@@ -435,12 +448,12 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-owner", messages)
         self.assertNotIn("private-token", messages)
         self.assertNotIn(content, json.dumps(result))
-        self.search.assert_called_once_with({"query": "Test episodes", "max_results": 5})
-        self.web_read.assert_called_once_with({"url": url, "max_chars": 4000})
+        self.search.assert_called_once_with(query="Test episodes", max_results=5)
+        self.web_read.assert_called_once_with(url=url, max_chars=4000)
 
     async def test_web_search_limit_counts_disabled_attempts(self):
         self.search.side_effect = None
-        self.search.return_value = ToolResult(False, "disabled", "disabled")
+        self.search.return_value = make_result(False, "disabled", "disabled")
         model = ScriptedModel(rounds(call("inspect_case"), *(
             call("web_search", {"query": "Test"}, f"s{i}") for i in range(3))))
         result = await self.run_case(model)
@@ -476,7 +489,7 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
         for status in ("configuration_missing", "unavailable", "budget_exhausted", "invalid_response"):
             with self.subTest(status=status):
                 self.search.side_effect = None
-                self.search.return_value = ToolResult(False, status, "unsafe error details /private")
+                self.search.return_value = make_result(False, status, "unsafe error details /private")
                 model = success_model(prefix=(call("web_search", {"query": "Test"}),))
                 result = await self.run_case(model, reader=FakeReader())
                 self.assertEqual(result["status"], "verified" if status == "configuration_missing" else "failed")

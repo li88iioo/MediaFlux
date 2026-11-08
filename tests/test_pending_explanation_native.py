@@ -11,13 +11,9 @@ import pytest
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import consume_events
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.provider_model import (
@@ -64,10 +60,13 @@ async def lifecycle(mode):
             ),
         )
 
+        business_round = [0]
+
         def handler(request):
             body = json.loads(request.content)
             wires.append(body)
-            n = len(wires)
+            n = business_round[0] + 1
+            business_round[0] += 1
             if n == 1 or (mode in ("cancel", "replacement") and n == 2):
                 cancelling = mode == "cancel" and n == 2
                 delta = {
@@ -78,12 +77,12 @@ async def lifecycle(mode):
                             "type": "function",
                             "function": {
                                 "name": (
-                                    catalog.get("agent.pending_plan").model_name
+                                    catalog.get("agent.run_code").model_name
                                     if cancelling
                                     else tool.model_name
                                 ),
                                 "arguments": json.dumps(
-                                    {"operation": "cancel"} if cancelling else {"step": n}
+                                    {"code": "from mf import session\nprint(session.pending_plan(operation='cancel'))"} if cancelling else {"step": n}
                                 ),
                             },
                         }
@@ -128,6 +127,10 @@ async def lifecycle(mode):
 
         def session():
             st = SQLiteKernelStore()
+            from app.agent.kernel import sandbox
+            pipeline = ToolPipeline(catalog=catalog, state_store=st, effect_store=effects, authorization=Authorization())
+            if not catalog.has("agent.run_code"):
+                catalog.register(sandbox.run_code_tool(pipeline))
             return AgentSession(
                 model=OpenAICompatibleModelAdapter(
                     ProviderSettings(
@@ -138,13 +141,8 @@ async def lifecycle(mode):
                     client_factory=cast(Callable[..., FixedHostHttpClient], lambda **_: Client()),
                 ),
                 catalog=catalog,
-                retriever=CapabilityRetriever(),
-                pipeline=ToolPipeline(
-                    catalog=catalog,
-                    state_store=st,
-                    effect_store=effects,
-                    authorization=Authorization(),
-                ),
+
+                pipeline=pipeline,
                 state_store=st,
             )
 
@@ -189,7 +187,7 @@ async def lifecycle(mode):
                 assert restored == frozen
             elif mode == "cancel":
                 assert follow.status == "success", follow
-                assert follow.tool_calls == ("agent.pending_plan",)
+                assert follow.tool_calls == ("agent.run_code",)
             assert writes == []
         if mode == "expiry":
             now[0] = frozen.expires_at + 1

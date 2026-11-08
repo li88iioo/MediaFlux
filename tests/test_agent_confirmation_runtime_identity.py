@@ -15,7 +15,7 @@ import pytest
 from app import config, database as db
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime, invalidate_agent_kernel_runtime
 from app.agent.kernel.model import ModelEvent, ModelEventType
-from app.agent.kernel.pipeline import InMemoryRateLimiter
+from app.agent.kernel.effects import InMemoryRateLimiter
 from app.clients.qbittorrent import TorrentAddResult
 from tests.support import initialized_web_runtime
 from tests.test_agent_kernel_core import ScriptedModel
@@ -49,12 +49,8 @@ def runtime():
 
 async def prepare(current, session_id):
     context = await context_for(current.store, owner=OWNER, session=session_id)
-    inspected = await current.session.pipeline.execute(
-        "ingest.inspect", {"input": "magnet:?xt=urn:btih:" + "b" * 40}, context=context,
-    )
-    reference = inspected.outcome.public_content["reference_arguments"]["ingest_snapshot_ref"]
-    result = await current.session.pipeline.execute(
-        "ingest.submit", {"source_type": "direct_url", "target": "qb", "ingest_snapshot_ref": reference}, context=context,
+    result = await current.session.pipeline.prepare(
+        "downloads.submit", {"url": "magnet:?xt=urn:btih:" + "b" * 40, "target": "qb"}, context=context,
     )
     assert result.effect_plan is not None
     return result.effect_plan
@@ -75,8 +71,7 @@ def save(values):
 def test_confirmed_restart_does_not_block_concurrent_web_runtime_lookup():
     from starlette.requests import Request
 
-    from app.agent.domains.playback import proxy_actions
-    from app.agent.kernel.state import InMemorySessionStateStore
+    from app.modules import media_proxy
     from app.modules.media_proxy import MediaProxyManager
     from app.routes import agent_api
 
@@ -99,7 +94,7 @@ def test_confirmed_restart_does_not_block_concurrent_web_runtime_lookup():
             lookup_started = asyncio.Event()
             restarted = []
 
-            async def restart(selected):
+            async def restart(selected, **_):
                 restart_started.set()
                 await lookup_started.wait()
                 assert await asyncio.to_thread(db.get_media_proxy_instance, selected) is not None
@@ -110,29 +105,28 @@ def test_confirmed_restart_does_not_block_concurrent_web_runtime_lookup():
                 loop.call_soon_threadsafe(lookup_started.set)
                 return get_agent_kernel_runtime()
 
-            context = await context_for(InMemorySessionStateStore(), owner=OWNER)
-            tool = current.session.catalog.get("media_proxy.restart_instance")
-            assert tool.prepare is not None and tool.execute_confirmed is not None
-            args = {"instance_number": 1}
-            prepared = await asyncio.to_thread(tool.prepare, args, context)
+            context = await context_for(current.store, owner=OWNER, session="proxy-restart")
+            args = {"instance_id": instance_id}
+            prepared = await current.session.pipeline.prepare("playback.restart", args, context=context)
+            assert prepared.effect_plan is not None
             try:
                 with (
-                    patch.object(proxy_actions, "get_media_proxy_manager", return_value=manager),
-                    patch.object(proxy_actions, "_MEDIA_PROXY_RESTART_WAIT_SECONDS", 1.0),
+                    patch.object(media_proxy, "get_media_proxy_manager", return_value=manager),
+                    patch.object(media_proxy, "_PROXY_RESTART_WAIT_SECONDS", 1.0),
                     patch.object(manager, "restart_instance", side_effect=restart),
                     patch.object(agent_api, "get_agent_kernel_runtime", side_effect=lookup),
                     patch.object(agent_api, "require_api_login"),
                     patch.object(agent_api, "_owner", return_value=OWNER),
                     patch.object(agent_api, "_draft_scope", return_value="test-scope"),
                 ):
-                    execution = asyncio.create_task(asyncio.to_thread(
-                        tool.execute_confirmed, args, prepared.snapshot_fingerprint, context,
+                    execution = asyncio.create_task(current.session.pipeline.execute_confirmed(
+                        prepared.effect_plan.plan_id, context=context,
                     ))
                     await asyncio.wait_for(restart_started.wait(), timeout=5)
                     response = await agent_api.list_sessions(Request({"type": "http"}))
                     result = await execution
                 assert response.status_code == 200
-                assert result.status == "completed"
+                assert result.outcome.public_content["status"] == "completed"
                 assert restarted == [instance_id]
             finally:
                 invalidate_agent_kernel_runtime()
@@ -201,9 +195,11 @@ def test_zero_generation_old_confirmation_is_rejected_after_configuration_change
 
 
 @pytest.mark.parametrize("tool,updates,arguments", [
-    ("config.create_media_path_mapping", {"JELLYFIN_PATH_MAPPINGS": "[]"},
-     {"provider": "jellyfin", "local_path": "/media/strm/movies", "server_path": "/mnt/media/movies"}),
+    ("library.create_path_mapping", {"JELLYFIN_PATH_MAPPINGS": "[]"},
+     {"server": "jellyfin", "local_path": "/media/strm/movies", "server_path": "/mnt/media/movies"}),
     ("library.set_patrol_policy", {"AGENT_LIBRARY_PATROL_ENABLED": "0"}, {"enabled": True}),
+    ("strm.set_schedule", {"STRM_SCHEDULE_ENABLED": "0"}, {"enabled": True}),
+    ("cloud.set_organize_schedule", {"GY_ORGANIZE_SCHEDULE_ENABLED": "0"}, {"enabled": True}),
 ])
 def test_configuration_writer_verifies_and_reloads_its_committed_snapshot(tool, updates, arguments):
     from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
@@ -217,14 +213,16 @@ def test_configuration_writer_verifies_and_reloads_its_committed_snapshot(tool, 
                 context = await context_for(current.store, owner=OWNER, session="config-writer")
                 preview = await current.session.pipeline.execute(tool, arguments, context=context)
                 assert preview.effect_plan is not None
+                invalidate_agent_kernel_runtime()
+                current = runtime()  # 从持久确认账本恢复；不能依赖原预检对象或原进程缓存。
                 scheduler = AgentLibraryPatrolScheduler()
                 with patch("app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler", return_value=scheduler):
                     events = await confirm(current, "config-writer", preview.effect_plan.plan_id)
                 result = next(event["payload"]["result"] for event in events if event["type"] == "effect.completed")
                 assert result["ok"] and result["status"] == "completed"
                 values = config.read_env_snapshot(config.ENV_FILE)[1]
-                if tool == "library.set_patrol_policy":
-                    assert values["AGENT_LIBRARY_PATROL_ENABLED"] == "1"
+                if tool in {"library.set_patrol_policy", "strm.set_schedule", "cloud.set_organize_schedule"}:
+                    assert values[next(iter(updates))] == "1"
                     assert result["data"]["policy"]["enabled"] is True
                     assert result["data"]["runtime_refreshed"] is True
                 else:

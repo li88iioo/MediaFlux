@@ -4,12 +4,13 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
 from app.database import get_conn, now, resolve_db_path
-from app.modules.tmdb_regex_rules import validate_safe_regex
+from app.modules.tmdb_regex_rules import RuleConflict, validate_safe_regex
 
 MAX_RULES = 200
 MAX_PATTERN_LENGTH = 500
@@ -446,14 +447,15 @@ def restore_builtin_rules() -> list[dict[str, Any]]:
     return list_rules()
 
 
-def list_rules(*, enabled_only: bool = False) -> list[dict[str, Any]]:
+def list_rules(*, enabled_only: bool = False, ensure_builtins: bool = True) -> list[dict[str, Any]]:
     global _active_cache
     cache_key = str(resolve_db_path())
     if enabled_only:
         with _cache_lock:
             if _active_cache is not None and _active_cache[0] == cache_key:
                 return [dict(item) for item in _active_cache[1]]
-    ensure_builtin_rules()
+    if ensure_builtins:
+        ensure_builtin_rules()
     where = "WHERE disabled=0" if enabled_only else ""
     try:
         with get_conn() as conn:
@@ -505,13 +507,25 @@ def create_rule(data: dict[str, Any]) -> dict[str, Any]:
     return get_rule(rule_id) or {}
 
 
-def update_rule(rule_id: int, data: dict[str, Any]) -> dict[str, Any]:
-    current = get_rule(rule_id)
-    if current is None:
-        raise ValueError("识别预处理规则不存在")
-    normalized = normalize_rule(data)
+def update_rule(rule_id: int, data: dict[str, Any], *, expected_snapshot: dict | None = None,
+                check_write: Callable[[sqlite3.Connection], None] | None = None) -> dict[str, Any]:
+    if expected_snapshot is None:
+        ensure_builtin_rules()
     timestamp = now()
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM recognition_preprocess_rules WHERE id=?", (rule_id,)).fetchone()
+        current = _row(row) if row is not None else {}
+        if expected_snapshot is not None and {k: v for k, v in current.items() if k != "updated_at"} != expected_snapshot:
+            raise RuleConflict("识别规则已变化，请重新预检")
+        if row is None:
+            raise ValueError("识别预处理规则不存在")
+        state_only = expected_snapshot is not None and set(data) == {"disabled"}
+        if state_only and type(data["disabled"]) is not bool:
+            raise ValueError("disabled 必须是布尔值")
+        normalized = {**current, **data} if state_only else normalize_rule(data)
+        if check_write:
+            check_write(conn)
         conn.execute(
             "UPDATE recognition_preprocess_rules SET name=?,matcher_type=?,pattern=?,scope=?,"
             "action=?,replacement=?,numeric_value=?,priority=?,disabled=?,updated_at=? WHERE id=?",
@@ -522,8 +536,11 @@ def update_rule(rule_id: int, data: dict[str, Any]) -> dict[str, Any]:
                 timestamp, rule_id,
             ),
         )
+        updated = conn.execute("SELECT * FROM recognition_preprocess_rules WHERE id=?", (rule_id,)).fetchone()
+        assert updated is not None
+        result = _row(updated)
     _invalidate_cache()
-    return get_rule(rule_id) or {}
+    return result
 
 
 def delete_rule(rule_id: int) -> bool:

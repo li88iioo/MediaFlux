@@ -212,7 +212,7 @@ class AgentPendingDialogueBrowserTests(AgentShellBrowserCase):
                 page = self.dialogue_page()
                 self.send(page, [
                     _event(1, "turn.started", {"kind": "query"}),
-                    _event(2, "tool.completed", {"tool": "agent.pending_plan", "result": {
+                    _event(2, "tool.completed", {"tool": "agent.run_code", "result": {
                         "ok": True, "data": {"pending": False, "cancelled": True},
                     }}),
                     terminal,

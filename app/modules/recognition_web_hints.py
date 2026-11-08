@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import httpx
 
-from app.agent.async_bridge import (
+from app.concurrency import (
     AsyncBridgeUnavailable,
     ensure_sync_bridge_available,
     run_awaitable_sync,

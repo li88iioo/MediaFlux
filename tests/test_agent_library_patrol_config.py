@@ -9,12 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import config
-from app.agent.domains.library.patrol_config_actions import (
-    patrol_policy_arguments,
-    prepare_patrol_policy_confirmation,
-    summarize_patrol_policy,
-)
-from app.agent.errors import AgentToolError
+from app.modules.schedule_policy import normalize_changes, prepare_policy_change, summarize_policy
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
 
 _PATROL_KEYS = {
@@ -28,7 +23,7 @@ _PATROL_KEYS = {
 class PatrolPolicyUnitTests(unittest.TestCase):
     def test_arguments_are_partial_bounded_and_strict(self):
         self.assertEqual(
-            patrol_policy_arguments(
+            normalize_changes("patrol",
                 {
                     "enabled": True,
                     "notify_enabled": False,
@@ -55,8 +50,8 @@ class PatrolPolicyUnitTests(unittest.TestCase):
             {"key": "AGENT_LIBRARY_PATROL_ENABLED"},
             {"token": "secret"},
         ):
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                patrol_policy_arguments(arguments)
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                normalize_changes("patrol", arguments)
 
     def test_summary_preview_and_context_do_not_leak_other_config(self):
         with tempfile.TemporaryDirectory() as root:
@@ -78,16 +73,16 @@ class PatrolPolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
             ):
-                summary = summarize_patrol_policy({})
-                preview, context = prepare_patrol_policy_confirmation(
+                summary = summarize_policy("patrol")
+                preview, context = prepare_policy_change("patrol",
                     {"notify_enabled": False}
                 )
-        rendered = repr((summary.to_dict(), preview.to_dict(), context))
+        rendered = repr((summary, preview, context))
         self.assertNotIn(secret, rendered)
         self.assertNotIn("TMDB_API_KEY", rendered)
         self.assertNotIn(str(env_file), rendered)
         self.assertEqual(len(context), 64)
-        self.assertIn("丢弃", " ".join(preview.suggestions))
+        self.assertIn("丢弃", " ".join(preview["suggestions"]))
 
     def test_notification_backlog_side_effect_is_disclosed_while_already_disabled(self):
         with tempfile.TemporaryDirectory() as root:
@@ -107,11 +102,11 @@ class PatrolPolicyUnitTests(unittest.TestCase):
                 patch.object(config, "_cache", None),
                 patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
             ):
-                preview, context = prepare_patrol_policy_confirmation({"enabled": True})
-        self.assertTrue(preview.ok)
+                preview, context = prepare_policy_change("patrol", {"enabled": True})
+        self.assertTrue(preview["ok"])
         self.assertEqual(len(context), 64)
-        self.assertIn("积压", " ".join(preview.suggestions))
-        self.assertIn("无法恢复", " ".join(preview.suggestions))
+        self.assertIn("积压", " ".join(preview["suggestions"]))
+        self.assertIn("无法恢复", " ".join(preview["suggestions"]))
 
     def test_scheduler_can_reload_without_immediate_patrol(self):
         scheduler = AgentLibraryPatrolScheduler(

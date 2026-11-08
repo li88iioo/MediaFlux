@@ -6,6 +6,8 @@ ToolPipeline -> EffectPlan -> execute_confirmed 的真实生命周期。
 
 from __future__ import annotations
 
+from app.agent.kernel.ports.sdk_effects import cloud_organize_tools
+
 import asyncio
 import secrets
 from collections.abc import Mapping
@@ -13,14 +15,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.agent.confirmation import ConfirmationStore
-from app.agent.domain_catalog import build_tool_specs
 from app.agent.errors import AgentToolError, ToolPipelineError
 from app.agent.kernel.bootstrap import _build_domain_dependencies
-from app.agent.kernel.capabilities import ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore
-from app.agent.kernel.pipeline import InMemoryRateLimiter, ToolPipeline
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
+from app.agent.kernel.capabilities import ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore, InMemoryRateLimiter
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
+from app.agent.kernel.ports.sdk_effects import subscription_tools, policy_config_tool, local_task_tools, automation_tools, indexer_configuration_tool, library_audit_job_tools, local_source_tools, activity_undo_tool, activity_follow_tools, preferences_tools, schedule_policy_tools, watchlist_tools
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import CancellationToken, SessionBusyError
 from app.agent.kernel.tool_calls import PipelineResult, ToolCallContext
@@ -89,20 +90,18 @@ class KernelDomainTestHarness:
     def __init__(self) -> None:
         self.state = InMemorySessionStateStore()
         (
-            self.domain_actions,
-            resource_store,
-            share_store,
             missing_media_runtime,
         ) = _build_domain_dependencies()
-        self.recent_resource_store = resource_store
-        self.catalog = catalog_from_tool_specs(
-            build_tool_specs(
-                resource_store,
-                share_store,
-                missing_media_runtime=missing_media_runtime,
-                domain_actions=self.domain_actions,
-            )
+        self.catalog = ToolCatalog()
+        from app.agent.kernel.ports.sdk_effects import (
+            playback_tools,
+            resource_download_tool,
+            rss_configuration_tools,
+            rss_delivery_tools,
+            share_transfer_tool,
         )
+        for tool in (*subscription_tools(), policy_config_tool(), *cloud_organize_tools(), *local_task_tools(), *automation_tools(), indexer_configuration_tool(), *library_audit_job_tools(), *local_source_tools(), *rss_configuration_tools(), *rss_delivery_tools(), activity_undo_tool(), resource_download_tool(), share_transfer_tool(), *playback_tools(), *watchlist_tools(), *preferences_tools(), *schedule_policy_tools(), *activity_follow_tools()):
+            self.catalog.register(tool)
         self.pipeline = ToolPipeline(
             catalog=self.catalog,
             state_store=self.state,

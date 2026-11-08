@@ -3,7 +3,7 @@ from typing import Any
 import asyncio
 import json
 
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.conversation_codec import (
     PendingText,
     conversation_cost,
@@ -55,7 +55,7 @@ def test_cold_followup_survives_oversize_history_without_replaying_tools():
             cold = sqlite_store()
             model = ScriptedModel([[ModelEvent(ModelEventType.TEXT_DELTA, text="历史查询有中断，不能将部分结果当作总数。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
             catalog = ToolCatalog([])
-            session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+            session = AgentSession(model=model, catalog=catalog,
                 pipeline=ToolPipeline(catalog=catalog, state_store=cold, reference_store=cold),
                 state_store=cold, limits=SessionLimits(context_window_tokens=16384))
             events = [e async for e in session.run(AgentInput(owner="o", session_id="history", message=question))]

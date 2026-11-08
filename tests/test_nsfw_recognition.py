@@ -214,7 +214,11 @@ class NsfwIdentifierTests(unittest.TestCase):
                            ("@FC2-1234567_CD2.mp4", "FC2-PPV-1234567"),
                            ("FC2-PPV-1234567C_CD2.mp4", "FC2-PPV-1234567"),
                            ("HEYZO-1234C_CD2.mp4", "HEYZO-1234"),
-                           ("1pondo-012324_001C_CD2.mp4", "1PONDO-012324-001")):
+                           ("1pondo-012324_001C_CD2.mp4", "1PONDO-012324-001"),
+                           ("091926-001-carib_CD2.mp4", "CARIB-091926-001"),
+                           ("SPSE-91_CD2.mp4", "SPSE-91"),
+                           ("C-2962_CD2.mp4", "C-2962"),
+                           ("4k2.me@kavr00527_2_8k.mp4", "KAVR-00527")):
             with self.subTest(name=name):
                 self.assertEqual(clean_nsfw_archive_title(name), code)
                 part = extract_nsfw_multipart(name)
@@ -222,7 +226,7 @@ class NsfwIdentifierTests(unittest.TestCase):
                 assert part is not None
                 self.assertEqual(part.part_index, 2)
 
-    def test_numeric_prefix_identifiers_feed_clean_title_candidates(self):
+    def test_alphanumeric_prefix_identifiers_feed_clean_title_candidates(self):
         cases = {
             "300MIUM-1474/300MIUM-1474.mp4": "300MIUM-1474",
             "300MIUM-1444.mp4": "300MIUM-1444",
@@ -237,6 +241,17 @@ class NsfwIdentifierTests(unittest.TestCase):
             "300MIUM-1999.mp4": "300MIUM-1999",
             "300MIUM-2026.mp4": "300MIUM-2026",
             "200GANA-2099.mp4": "200GANA-2099",
+            "4k688.com@T38-073.mp4": "T38-073",
+            "t38_073.mp4": "T38-073",
+            "T28-001.mp4": "T28-001",
+            "T38-1999.mp4": "T38-1999",
+            "T38-073C_CD2.mp4": "T38-073",
+            "hhd800.com@SPSE-91.mp4": "SPSE-91",
+            "SPSE-91C.mp4": "SPSE-91",
+            "hhd800.com@GRET-51.mp4": "GRET-51",
+            "hhd800.com@C-2962.mp4": "C-2962",
+            "091926-001-carib.mp4": "CARIB-091926-001",
+            "4k2.me@kavr00527_1_8k.mp4": "KAVR-00527",
         }
         for value, expected in cases.items():
             with self.subTest(value=value):
@@ -261,6 +276,24 @@ class NsfwIdentifierTests(unittest.TestCase):
             "H265-1234.mp4",
             "1080HEVC-1234.mp4",
             "2026WEB-1234.mp4",
+            "S01-073.mp4",
+            "E12-073.mp4",
+            "T-073.mp4",
+            "T38073.mp4",
+            "X264-073.mp4",
+            "Anime.Season-01.Episode-03.mp4",
+            "Disc-01.Part-02.mp4",
+            "Track-01.mp4",
+            "091926-001.mp4",
+            "S-2962.mp4",
+            "E-2962.mp4",
+            "Studio.26.05.22.Title.2160p.mp4",
+            "Saw.X.2023.2160p.BluRay.mkv",
+            "[长江七号]CJ7.2008.BluRay.1080p.x265.10bit.2Audio.BOBO.mkv",
+            "District9-2009.mp4",
+            "[ANi] 闇機 DARK MACHINE - 01 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+            "[Group][Yami Shibai 13][01][WebRip 1080p HEVC-10bit AAC].mkv",
+            "Police.Story.1985.BluRay.Remastered.1080p.x265.10bit.2Audio.mkv",
         ):
             with self.subTest(filename=filename):
                 self.assertIsNone(extract_nsfw_identifier(filename))
@@ -283,6 +316,7 @@ class NsfwIdentifierTests(unittest.TestCase):
             ("foo.bar.example.com@ABC-123.FHD.mkv", "ABC-123", "ABC-123", None),
             ("ABC-123.Release.Title-example.com.mkv", "ABC-123", "ABC-123", None),
             ("SPRBD-019.FHD-52iv.net-CD2.mkv", "SPRBD-019", "SPRBD-019", 2),
+            ("T38-073.FHD-example.com_CD2.mp4", "T38-073", "T38-073", 2),
         )
         for name, code, title, part_index in cases:
             with self.subTest(name=name):
@@ -741,80 +775,41 @@ class NsfwMultipartAndFallbackTests(unittest.TestCase):
 
     def test_no_metadata_confirmation_group_gets_clean_title_candidate(self):
         organizer = Organizer(client=cast(GuangYaClient, object()), scraper=TMDBScraper())
-        match = MatchResult(
-            media_type="movie", provider="metatube", need_confirm=True,
-            error="MetaTube 没有返回完全一致的结果",
-        )
-        plan = OrganizePlan(
-            file_id="f1", original_name="hhd800.com@ATID-675.mp4",
-            original_path="ATID-675", original_parent_id="p",
-            match=match, action="skip",
-        )
-        groups = organizer._build_confirmation_groups(
-            [plan], {}, source_dir_id="adult", source_name="NSFW",
-            rules=OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True),
-        )
-        self.assertEqual(groups[0]["candidates"][0]["provider"], "clean_title")
-        self.assertEqual(groups[0]["candidates"][0]["title"], "ATID-675")
-        validated, actionable = Organizer._validated_task_confirmation_groups({
-            "confirmation_groups": groups,
-        })
-        self.assertEqual(validated[0]["candidates"][0]["provider"], "clean_title")
-        self.assertEqual(actionable, 1)
-
-    def test_numeric_prefix_no_metadata_confirmation_group_gets_clean_title_candidate(self):
-        organizer = Organizer(client=cast(GuangYaClient, object()), scraper=TMDBScraper())
-        plan = OrganizePlan(
-            file_id="numeric-f1", original_name="200GANA-3419.mp4",
-            original_path="200GANA-3419", original_parent_id="p",
-            match=MatchResult(
-                media_type="movie", provider="metatube", need_confirm=True,
-                error="MetaTube 没有返回完全一致的结果",
-            ),
-            action="skip",
-        )
-        groups = organizer._build_confirmation_groups(
-            [plan], {}, source_dir_id="adult", source_name="NSFW",
-            rules=OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True),
-        )
-
-        self.assertEqual(groups[0]["candidates"][0]["provider"], "clean_title")
-        self.assertEqual(groups[0]["candidates"][0]["external_id"], "200GANA-3419")
-        self.assertEqual(groups[0]["candidates"][0]["title"], "200GANA-3419")
-
-    def test_sw_number_confirmation_group_offers_clean_title_instead_of_skip_only(self):
-        organizer = Organizer(client=cast(GuangYaClient, object()), scraper=TMDBScraper())
-        plan = OrganizePlan(
-            file_id="sw-video", original_name="SW-1047.mp4",
-            original_path="SW-1047", original_parent_id="adult-parent",
-            size=1024, etag="etag-sw", action="skip",
-            match=MatchResult(
-                media_type="movie", provider="metatube", need_confirm=True,
-                status="no_match", error="MetaTube 没有返回完全一致的结果",
-            ),
-        )
-        groups = organizer._build_confirmation_groups(
-            [plan], {}, source_dir_id="adult-source", source_name="NSFW",
-            rules=OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True),
-        )
-        validated, actionable = Organizer._validated_task_confirmation_groups({
-            "confirmation_groups": groups,
-        })
-
-        self.assertEqual(actionable, 1)
-        self.assertEqual(len(validated), 1)
-        self.assertEqual(validated[0]["identity"], "SW-1047")
-        self.assertEqual(validated[0]["candidates"], [{
-            "provider": "clean_title",
-            "external_id": "SW-1047",
-            "tmdb_id": "",
-            "media_type": "movie",
-            "title": "SW-1047",
-            "year": "",
-            "score": 1.0,
-            "support": 1,
-            "metadata": {"number": "SW-1047", "title": "SW-1047", "fallback": True},
-        }])
+        for filename, number, status in (
+            ("hhd800.com@ATID-675.mp4", "ATID-675", ""),
+            ("200GANA-3419.mp4", "200GANA-3419", ""),
+            ("SW-1047.mp4", "SW-1047", "no_match"),
+            ("4k688.com@T38-073.mp4", "T38-073", "no_match"),
+            ("SPSE-91.mp4", "SPSE-91", "no_match"),
+            ("C-2962.mp4", "C-2962", "no_match"),
+            ("091926-001-carib.mp4", "CARIB-091926-001", "no_match"),
+        ):
+            with self.subTest(filename=filename):
+                plan = OrganizePlan(
+                    file_id="video", original_name=filename,
+                    original_path=number, original_parent_id="adult-parent",
+                    size=1024, etag="etag", action="skip",
+                    match=MatchResult(
+                        media_type="movie", provider="metatube", need_confirm=True,
+                        status=status, error="MetaTube 没有返回完全一致的结果",
+                    ),
+                )
+                groups = organizer._build_confirmation_groups(
+                    [plan], {}, source_dir_id="adult-source", source_name="NSFW",
+                    rules=OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True),
+                )
+                validated, actionable = Organizer._validated_task_confirmation_groups({
+                    "confirmation_groups": groups,
+                })
+                self.assertEqual(actionable, 1)
+                self.assertEqual(len(validated), 1)
+                self.assertEqual(validated[0]["identity"], number)
+                self.assertEqual(validated[0]["candidates"], [{
+                    "provider": "clean_title", "external_id": number, "tmdb_id": "",
+                    "media_type": "movie", "title": number, "year": "",
+                    "score": 1.0, "support": 1,
+                    "metadata": {"number": number, "title": number, "fallback": True},
+                }])
 
     def test_confirmed_clean_title_match_is_accepted_by_nsfw_organizer(self):
         match = MatchResult(

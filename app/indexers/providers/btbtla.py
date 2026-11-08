@@ -54,6 +54,7 @@ _ACCESS_BLOCK_MARKERS = (
     "请求过于频繁",
     "人机验证",
 )
+_DetailCandidate = tuple[tuple[int, bool], str, str | None]
 
 
 @dataclass(slots=True)
@@ -62,7 +63,7 @@ class _ResourcePages:
     pages: list[IndexerPage]
     next_native_page: int | None = 1
     truncated_count: int = 0
-
+    pending_details: tuple[_DetailCandidate, ...] = ()
 
 
 class BTBtlaAdapter(IndexerAdapter):
@@ -107,9 +108,8 @@ class BTBtlaAdapter(IndexerAdapter):
         return self.min_interval_seconds * paced_gaps
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
-        # 站点一张影片详情含数百个版本。先排序再分页，不能让服务层40条窗口
-        # 截断整部作品；原生影片搜索页只在当前页的所有资源窗口用完后读取。
-        # 排序范围为已取回的影片搜索页；不会为“全站全局排序”后台遍历所有影片。
+        # 详情按请求预算分批展开，批内资源排序后分页；消费完当前搜索页的
+        # 详情与资源窗口才请求下一搜索页，不因详情预算耗尽丢失候选。
         key = replace(request, page=1)
         # 同键分页共享读取；不同作品不能拿着全站缓存锁等待网络。
         # 调用者持有强引用，进行中的锁不会随缓存淘汰；结束后弱引用自动释放。
@@ -123,12 +123,22 @@ class BTBtlaAdapter(IndexerAdapter):
                         del self._catalogs[old_key]
                 catalog = self._catalogs.get(key) or _ResourcePages(now + self.cache_ttl_seconds, [])
             fetches = 0
-            while len(catalog.pages) < request.page and catalog.next_native_page is not None:
+            while len(catalog.pages) < request.page and (catalog.pending_details or catalog.next_native_page is not None):
                 if fetches == 2:
                     raise IndexerResultExpired("BTBtla resource page requires earlier pages", public_message="资源分页已过期，请重新搜索后继续加载")
-                native = await self._search_native(
-                    replace(request, page=catalog.next_native_page), progressive=request.page == 1,
-                )
+                if catalog.pending_details:
+                    native, pending = await self._read_details(
+                        catalog.pending_details, request,
+                        has_more=catalog.next_native_page is not None,
+                    )
+                    next_native_page = catalog.next_native_page
+                else:
+                    native_page = catalog.next_native_page
+                    assert native_page is not None
+                    native, pending = await self._search_native(
+                        replace(request, page=native_page), progressive=request.page == 1,
+                    )
+                    next_native_page = native_page + 1 if native.has_more else None
                 ranked = self._rank_items(request, native.items)
                 known = {item.detail_url for resource_page in catalog.pages for item in resource_page.items if item.detail_url}
                 ranked = [item for item in ranked if not item.detail_url or item.detail_url not in known]
@@ -138,16 +148,14 @@ class BTBtlaAdapter(IndexerAdapter):
                 ranked = ranked[:room]
                 catalog.pages.extend(replace(native, items=ranked[offset:offset + self.page_size]) for offset in range(0, len(ranked), self.page_size))
                 # 含错误的空页直接交付；仅无错误空页在两次读取预算内补取下一原生页。
-                if not ranked and (native.errors or not native.has_more or fetches == 2):
+                if not ranked and (native.errors or not (pending or next_native_page) or fetches == 2):
                     catalog.pages.append(replace(native, items=[]))
                 if native.errors:
                     catalog.expires_at = min(catalog.expires_at, self._monotonic() + 15)
                 elif not any(resource_page.items for resource_page in catalog.pages):
                     catalog.expires_at = min(catalog.expires_at, self._monotonic() + 8)
-                catalog.next_native_page = (
-                    catalog.next_native_page + 1
-                    if native.has_more and len(catalog.pages) < _MAX_CATALOG_PAGES else None
-                )
+                catalog.pending_details = pending
+                catalog.next_native_page = next_native_page
                 with self._cache_lock:
                     self._catalogs[key] = catalog
                     self._catalogs.move_to_end(key)
@@ -159,7 +167,12 @@ class BTBtlaAdapter(IndexerAdapter):
             return replace(
                 resource_page, items=[replace(item) for item in resource_page.items],
                 page=request.page,
-                has_more=request.page < len(catalog.pages) or catalog.next_native_page is not None,
+                has_more=request.page < _MAX_CATALOG_PAGES and bool(
+                    request.page < len(catalog.pages) or catalog.pending_details or catalog.next_native_page is not None
+                ),
+                complete=resource_page.complete and not (
+                    request.page == _MAX_CATALOG_PAGES and (catalog.pending_details or catalog.next_native_page is not None)
+                ),
                 total_items=(len(resource_page.items) + catalog.truncated_count)
                 if request.page == len(catalog.pages) and catalog.truncated_count else None,
             )
@@ -173,7 +186,9 @@ class BTBtlaAdapter(IndexerAdapter):
         ranked = [rank_item(item, media=media, fallback_query=request.query) for item in items]
         return [entry[1] for entry in sorted(enumerate(ranked), key=lambda entry: candidate_sort_key((0, entry[0], entry[1]), request.sort_mode))]
 
-    async def _search_native(self, request: IndexerSearchRequest, *, progressive: bool = False) -> IndexerPage:
+    async def _search_native(
+        self, request: IndexerSearchRequest, *, progressive: bool = False,
+    ) -> tuple[IndexerPage, tuple[_DetailCandidate, ...]]:
         last_error: IndexerRateLimited | IndexerUnavailable | None = None
         for base_url in self._host_bases:
             try:
@@ -189,7 +204,7 @@ class BTBtlaAdapter(IndexerAdapter):
         request: IndexerSearchRequest,
         *,
         progressive: bool = False,
-    ) -> IndexerPage:
+    ) -> tuple[IndexerPage, tuple[_DetailCandidate, ...]]:
         # 原词优先：数字可能本就是片名（银翼杀手2049、1917）。仅原生明确空结果
         # 才拆出末尾年份；年份用于选详情而非继续拼进只索引片名的站点查询。
         queries = [(request.query, request.year)]
@@ -236,13 +251,24 @@ class BTBtlaAdapter(IndexerAdapter):
                                    candidate[3] == year if year is not None else False,
                                    self._search_candidate_score(query, candidate[0])[1]),
             reverse=True,
-        )[:self.max_detail_candidates]
+        )
+        details = tuple(
+            ((self._search_candidate_score(query, title)[0], year is not None and candidate_year == year), url, category)
+            for title, url, category, candidate_year in ranked_candidates
+        )
+        return await self._read_details(details, request, has_more=has_more, progressive=progressive)
+
+    async def _read_details(
+        self, candidates: tuple[_DetailCandidate, ...], request: IndexerSearchRequest,
+        *, has_more: bool, progressive: bool = False,
+    ) -> tuple[IndexerPage, tuple[_DetailCandidate, ...]]:
         items: dict[str | None, IndexerItem] = {}
         errors: list[HttpError] = []
         matched_tier = None
-        for title, detail_url, category, candidate_year in ranked_candidates:
-            tier = (self._search_candidate_score(query, title)[0], year is not None and candidate_year == year)
+        remaining = candidates
+        for index, (tier, detail_url, category) in enumerate(candidates[:self.max_detail_candidates]):
             if items and matched_tier is not None and tier < matched_tier:
+                remaining = ()
                 break  # 不为已精确命中的作品额外请求弱匹配；同名作品不能提前截断。
             try:
                 detail = await self._get(detail_url)
@@ -268,25 +294,30 @@ class BTBtlaAdapter(IndexerAdapter):
                 if not isinstance(exc, (HttpInvalidResponse, IndexerResultExpired)):
                     if not items:
                         raise
+                    remaining = candidates[index + 1:]
                     break
+                remaining = candidates[index + 1:]
                 continue
             for item in detail_items:
                 items.setdefault(item.detail_url, item)
             matched_tier = tier
+            remaining = candidates[index + 1:]
             if progressive and items:
                 # 复用服务层的渐进通道与最终排序；只发首个资源窗口，后续页不能混入第一页。
                 ranked = self._rank_items(request, list(items.values()))
                 report_page(self.site_id, IndexerPage(
-                    ranked[:self.page_size], 1, has_more or len(ranked) > self.page_size, True,
+                    ranked[:self.page_size], 1, bool(remaining) or has_more or len(ranked) > self.page_size, True,
                     complete=False,
                     errors=tuple(IndexerProviderError(self.site_id, error.code, error.public_message) for error in errors),
                 ))
         if not items and errors:
             raise errors[0]
+        if items and matched_tier is not None:
+            remaining = tuple(candidate for candidate in remaining if candidate[0] >= matched_tier)
         return IndexerPage(
             list(items.values()), request.page, has_more, True,
             errors=tuple(IndexerProviderError(self.site_id, error.code, error.public_message) for error in errors),
-        )
+        ), remaining
 
     async def resolve(self, stored_result: IndexerItem) -> ResolvedDownload:
         self._validate_stored_result(stored_result)

@@ -1,177 +1,116 @@
-"""自动化链路 Agent 诊断的状态、脱敏与 API 契约。"""
-
+"""原生本地诊断：复用公共汇总、完整来源/错误、真实SQLite分页与零业务写入。"""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from unittest.mock import patch
 
-from app.agent.domains.automation.diagnostics import (
-    automation_pipeline_arguments,
-    diagnose_automation_pipeline,
-)
-from app.agent.errors import AgentToolError
+from app import database as db, sdk
+from app.agent.kernel.bootstrap import build_tool_catalog
+from app.modules import diagnostics as diag
 from tests.support import IsolatedDatabaseTestCase
 
 
-def _aggregate(**overrides):
-    value = {
-        "downloads_active": 0,
-        "downloads_review": 0,
-        "rss_subscriptions": 0,
-        "rss_pending": 0,
-        "rss_failed": 0,
-        "organize_issues": 0,
-        "strm_failures": 0,
-        "strm_last_status": "",
-        "strm_last_at": "",
-    }
-    value.update(overrides)
-    return value
+def aggregate(**overrides):
+    value = {"downloads_active": 0, "downloads_review": 0, "rss_subscriptions": 0, "media_subscriptions": 0,
+             "subscriptions_total": 0, "rss_pending": 0, "rss_failed": 0, "organize_issues": 0,
+             "strm_failures": 0, "strm_last_status": "", "strm_last_at": "", "issues": 0,
+             "issue_source": "none", "healthy": True, "error": ""}
+    return {**value, **overrides}
 
 
-class AutomationPipelineUnitTests(IsolatedDatabaseTestCase):
-    def test_arguments_reject_every_extra_field(self):
-        self.assertEqual(automation_pipeline_arguments({}), {})
-        with self.assertRaisesRegex(
-            AgentToolError, "^automation\\.diagnose_pipeline 不接受参数$"
-        ):
-            automation_pipeline_arguments({"token": "PIPELINE_SECRET"})
+class AutomationPipelineTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM rss_entries")
+            conn.execute("DELETE FROM rss_items")
 
-    def test_empty_local_database_is_explicitly_not_configured(self):
-        result = diagnose_automation_pipeline({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "not_configured")
-        self.assertEqual(result.data["probe_mode"], "local")
-        self.assertFalse(result.data["network_accessed"])
-        self.assertEqual(result.data["attention"], {"total": 0, "blockers": []})
-        self.assertEqual(result.data["stages"]["rss"]["status"], "not_configured")
-        self.assertEqual(result.data["stages"]["strm"]["last_run"], "not_observed")
+    def test_native_signatures_and_old_specs_are_retired(self):
+        assert {"diagnostics.configuration", "diagnostics.component", "diagnostics.pipeline"} <= sdk.METHODS.keys()
+        assert not {"config.diagnose", "config.explain_component", "automation.diagnose_pipeline"} & {spec.name for spec in build_tool_catalog().visible()}
+        with self.assertRaises(TypeError):
+            sdk.prepare_sdk_method("diagnostics.pipeline", {"token": "secret"}, owner="webk:v1:" + "a" * 64)
+        for limit, offset in ((0, 0), (101, 0), (True, 0), (1, -1), (1, False)):
+            with self.subTest(limit=limit, offset=offset), self.assertRaises(ValueError):
+                diag.pipeline(limit, offset)
 
-    def test_active_work_without_issues_is_healthy(self):
-        snapshot = _aggregate(
-            downloads_active=3,
-            rss_subscriptions=2,
-            rss_pending=7,
-            strm_last_status="completed",
-        )
-        with patch(
-            "app.agent.domains.automation.diagnostics.db.get_dashboard_automation_summary",
-            return_value=snapshot,
-        ):
-            result = diagnose_automation_pipeline({})
-        self.assertEqual(result.status, "healthy")
-        stages = result.data["stages"]
-        self.assertEqual(
-            stages["downloads"], {"status": "active", "active": 3, "needs_review": 0}
-        )
-        self.assertEqual(stages["rss"]["status"], "active")
-        self.assertEqual(stages["guangya_organize"]["status"], "healthy")
-        self.assertEqual(
-            stages["strm"],
-            {"status": "healthy", "open_failures": 0, "last_run": "completed"},
-        )
+    def test_empty_database_is_not_configured_with_complete_sources(self):
+        result = diag.pipeline()
+        assert result["ok"] and result["status"] == "not_configured"
+        assert result["data"]["network_accessed"] is False
+        assert result["data"]["errors"] == []
+        assert set(result["data"]["sources"]) == {"automation_database", "rss"}
+        local = result["data"]["sources"]["automation_database"]
+        assert {"media_subscriptions", "subscriptions_total", "strm_last_at", "healthy"} <= local.keys()
+        assert result["data"]["sources"]["rss"]["status"] == "not_configured"
+        assert {row["source"] for row in result["evidence"]} == {"automation_database", "rss"}
 
-    def test_attention_is_bounded_to_counts_and_fixed_machine_codes(self):
-        snapshot = _aggregate(
-            downloads_active=1,
-            downloads_review=2,
-            rss_subscriptions=1,
-            rss_failed=3,
-            organize_issues=4,
-            strm_failures=5,
-            strm_last_status="failed",
-        )
-        with patch(
-            "app.agent.domains.automation.diagnostics.db.get_dashboard_automation_summary",
-            return_value=snapshot,
-        ):
-            result = diagnose_automation_pipeline({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "attention")
-        self.assertEqual(result.data["attention"]["total"], 14)
-        self.assertEqual(
-            result.data["attention"]["blockers"],
-            [
-                {"code": "downloads_need_review", "stage": "downloads", "count": 2},
-                {"code": "rss_failed_entries", "stage": "rss", "count": 3},
-                {
-                    "code": "organize_historical_issues",
-                    "stage": "guangya_organize",
-                    "count": 4,
-                },
-                {"code": "strm_open_failures", "stage": "strm", "count": 5},
-            ],
-        )
-        self.assertEqual(result.data["stages"]["strm"]["last_run"], "failed")
+    def test_status_retains_active_counts_and_last_failed_run_without_open_failure(self):
+        for value, status in ((aggregate(downloads_active=3, subscriptions_total=2, rss_pending=7, strm_last_status="completed"), "healthy"),
+                (aggregate(strm_last_status="failed"), "attention"), (aggregate(strm_last_status=" FAILED "), "attention"), (aggregate(downloads_review=2, issues=2), "attention")):
+            with self.subTest(status=status), patch("app.services.build_automation_summary", return_value=value):
+                result = diag.pipeline()
+            assert result["status"] == status
+            assert result["data"]["sources"]["automation_database"] == value
 
-    def test_failed_last_strm_run_without_open_failure_marks_pipeline_attention(self):
-        snapshot = _aggregate(rss_subscriptions=1, strm_last_status="failed")
-        with patch(
-            "app.agent.domains.automation.diagnostics.db.get_dashboard_automation_summary",
-            return_value=snapshot,
-        ):
-            result = diagnose_automation_pipeline({})
-        self.assertEqual(result.status, "attention")
-        self.assertEqual(
-            result.data["attention"],
-            {
-                "total": 1,
-                "blockers": [
-                    {"code": "strm_last_run_failed", "stage": "strm", "count": 1}
-                ],
-            },
-        )
-        self.assertEqual(result.data["stages"]["strm"]["status"], "attention")
+    def test_partial_failure_preserves_other_source_and_all_unavailable_is_explicit(self):
+        with patch("app.services.build_automation_summary", side_effect=RuntimeError("SECRET /srv/private")):
+            result = diag.pipeline()
+        assert result["ok"] and result["status"] == "partial"
+        assert result["data"]["sources"]["automation_database"] is None
+        assert result["data"]["sources"]["rss"]["ok"]
+        assert result["data"]["errors"][0]["exception_type"] == "RuntimeError"
+        assert "SECRET" not in json.dumps(result, ensure_ascii=False)
+        assert "/srv/private" not in json.dumps(result, ensure_ascii=False)
+        with patch("app.services.build_automation_summary", return_value=aggregate(error="自动化状态暂不可用")), patch(
+                "app.modules.rss_subscriptions.diagnose", return_value={"ok": False, "status": "unavailable", "error": "RSS诊断不可用", "data": {}}):
+            result = diag.pipeline()
+        assert not result["ok"] and result["status"] == "unavailable"
+        assert {row["source"] for row in result["data"]["errors"]} == {"automation_database", "rss"}
+        assert result["data"]["sources"]["rss"]["error"] == "RSS诊断不可用"
 
-    def test_malformed_values_are_sanitized_and_sensitive_fields_are_not_projected(
-        self,
-    ):
-        snapshot = _aggregate(
-            downloads_active=-8,
-            downloads_review="not-a-count",
-            rss_subscriptions="2",
-            rss_pending=True,
-            strm_last_status="TOKEN_9f /srv/private 192.0.2.10",
-            token="TOKEN_9f",
-            path="/srv/private",
-            url="http://192.0.2.10",
-            host="private-host",
-            hash="HASH_SECRET",
-            guid="GUID_SECRET",
-            id="ID_SECRET",
-            title="TITLE_SECRET",
-        )
-        with patch(
-            "app.agent.domains.automation.diagnostics.db.get_dashboard_automation_summary",
-            return_value=snapshot,
-        ):
-            result = diagnose_automation_pipeline({})
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-        self.assertNotIn("TOKEN_9f", serialized)
-        self.assertNotIn("/srv/private", serialized)
-        self.assertNotIn("192.0.2.10", serialized)
-        self.assertNotIn('"token"', serialized)
-        self.assertNotIn('"path"', serialized)
-        self.assertNotIn('"url"', serialized)
-        for secret in (
-            "private-host",
-            "HASH_SECRET",
-            "GUID_SECRET",
-            "ID_SECRET",
-            "TITLE_SECRET",
-        ):
-            self.assertNotIn(secret, serialized)
-        self.assertEqual(result.data["stages"]["strm"]["last_run"], "unknown")
+    def test_untrusted_extra_fields_and_invalid_status_do_not_leak_credentials_or_paths(self):
+        value = aggregate(strm_last_status="token=TOKEN_9f /srv/private", strm_last_at="private-host",
+                          token="HASH_SECRET", path="/srv/private", url="http://192.0.2.10", guid="GUID_SECRET", title="TITLE_SECRET")
+        with patch("app.services.build_automation_summary", return_value=value):
+            result = diag.pipeline()
+        assert result["status"] == "partial"
+        assert result["data"]["sources"]["automation_database"]["strm_last_status"] == "unknown"
+        assert result["data"]["sources"]["automation_database"]["strm_last_at"] is None
+        public = json.dumps(result, ensure_ascii=False)
+        for secret in ("TOKEN_9f", "/srv/private", "private-host", "HASH_SECRET", "GUID_SECRET", "TITLE_SECRET", "192.0.2.10"):
+            assert secret not in public
 
-    def test_database_exception_returns_fixed_sanitized_error(self):
-        with patch(
-            "app.agent.domains.automation.diagnostics.db.get_dashboard_automation_summary",
-            side_effect=RuntimeError("PIPELINE_SECRET /srv/hidden"),
-        ):
-            result = diagnose_automation_pipeline({})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "unavailable")
-        self.assertFalse(result.data["network_accessed"])
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-        self.assertNotIn("PIPELINE_SECRET", serialized)
-        self.assertNotIn("/srv/hidden", serialized)
+    def test_real_readonly_sqlite_rss_pages_are_exhaustive_and_match_public_service(self):
+        ids = []
+        for index in range(3):
+            identifier = db.add_rss_subscription(name=f"source-{index}", urls="https://rss.invalid/?passkey=SECRET", enabled=1)
+            row = db.add_rss_entry_with_media(identifier, f"entry-{index}", f"guid-{index}")
+            assert row is not None
+            with db.get_conn() as conn:
+                conn.execute("UPDATE rss_entries SET status='failed' WHERE id=?", (row["id"],))
+            ids.append(identifier)
+        original = db.get_conn
+        writes = []
+        @contextmanager
+        def readonly():
+            with original() as conn:
+                conn.execute("PRAGMA query_only=ON")
+                conn.set_trace_callback(lambda sql: writes.append(sql) if sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")) else None)
+                yield conn
+        observed = []
+        offset = 0
+        with patch.object(db, "get_conn", readonly):
+            while True:
+                result = diag.pipeline(limit=1, offset=offset)
+                rss = result["data"]["sources"]["rss"]
+                attention = rss["data"]["attention"]
+                observed.extend(row["subscription_id"] for row in attention["subscriptions"])
+                assert rss["data"]["subscriptions"]["total"] == len(ids)
+                if not attention["has_more"]:
+                    break
+                offset = attention["next"]["offset"]
+                assert offset <= len(ids)
+        assert set(observed) == set(ids) and len(observed) == len(ids)
+        assert not writes
+        assert "SECRET" not in json.dumps(result, ensure_ascii=False)

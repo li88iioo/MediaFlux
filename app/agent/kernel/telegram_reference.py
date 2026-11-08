@@ -45,7 +45,7 @@ def preview(reply, *, unavailable=False):
         data.update(source=reply['source'], reference_unavailable=True)
     elif reply.get('reference_handle'):
         data.update(source=reply['source'], reference_handle=reply['reference_handle'],
-                    read_tool='agent.read_result', path='/text', total=len(text))
+                    read_method='session.result', path='/text', total=len(text))
     # Text cannot close the enclosing data tag or inject a forged sibling tag.
     return json.dumps(data, ensure_ascii=False).replace('<', '\\u003c').replace('>', '\\u003e')
 
@@ -58,8 +58,10 @@ async def project_history(messages, replies, *, current_handle, **scope):
         if not handle or handle == current_handle:
             continue
         original = preview(reply)
-        users = [i for i, message in enumerate(projected)
-                 if message.role == 'user' and original in message.content]
+        # 已持久化的旧预览仍可降级；不恢复旧工具入口。
+        originals = (original, original.replace('"read_method": "session.result"', '"read_tool": "agent.read_result"'))
+        users = {i: value for i, message in enumerate(projected) for value in originals
+                 if message.role == 'user' and value in message.content}
         pages = {}
         for i, message in enumerate(projected):
             if message.role != 'tool' or message.tool_name != 'agent.read_result':
@@ -76,8 +78,8 @@ async def project_history(messages, replies, *, current_handle, **scope):
         try:
             await resolve(handle, **scope)
         except ReferenceError:
-            for i in users:
-                projected[i] = replace(projected[i], content=projected[i].content.replace(original, preview(reply, unavailable=True)))
+            for i, value in users.items():
+                projected[i] = replace(projected[i], content=projected[i].content.replace(value, preview(reply, unavailable=True)))
             for i, page in pages.items():
                 page.pop('result_handle', None)
                 page.pop('read_tool', None)

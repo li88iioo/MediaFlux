@@ -5,10 +5,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from app.agent.provider_models import ProviderGatewayError
-from app.agent.provider_projection import project_provider_value
-from app.agent.providers.media_server import MediaServerProviderTransport
-from app.agent.providers.qbittorrent import QBittorrentProviderTransport
+from app import services
 from app.clients.base import (
     MediaItem,
     MediaRecommendationCandidate,
@@ -20,6 +17,7 @@ from app.clients.base import (
 )
 from app.clients.qbittorrent import TorrentFile, TorrentTask, TransferInfo
 from app.modules.media_server_profiles import MediaServerProfile
+from app.modules import media_library, qb_control
 from app.modules.qb_control import (
     QBControlConflict,
     QBControlSafetyUnavailable,
@@ -127,7 +125,7 @@ class _FakeMediaClient:
         return items
 
     def list_recommendation_candidates(
-        self, user_id, *, media_type, max_items, page_size
+        self, user_id, *, media_type, max_items, page_size, cancelled=None
     ):
         assert user_id == "viewer-1"
         assert media_type == "tv"
@@ -216,8 +214,7 @@ class _FakeQBClient:
         return [TorrentFile(index=0, name="episode.mkv", size=100, progress=0.5)]
 
 
-def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
-    transport = MediaServerProviderTransport()
+def test_media_reads_reuse_profile_through_public_library(monkeypatch):
     profile = MediaServerProfile(
         source="configured:jellyfin",
         server_type="jellyfin",
@@ -227,190 +224,88 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
         enabled=True,
         user_id="viewer-1",
     )
-    monkeypatch.setattr(
-        "app.agent.providers.media_server.list_configured_profiles",
-        lambda: [profile],
-    )
-    monkeypatch.setattr(transport, "_client", lambda _profile: _FakeMediaClient())
+    monkeypatch.setattr(MediaServerProfile, "create_client", lambda _profile: _FakeMediaClient())
+    monkeypatch.setattr(services, "list_configured_profiles", lambda: [profile])
+    monkeypatch.setattr(media_library, "list_configured_profiles", lambda: [profile])
 
-    counts = transport.execute_read(
-        "configured:jellyfin", "media.items.counts", {}
-    )
-    assert counts.data == {
-        "server_label": "Jellyfin",
+    counts = services.get_library_counts("jellyfin")
+    assert counts["status"] == "success"
+    assert counts["data"]["counts"] == {
         "total_items": 166,
         "movie_count": 40,
         "series_count": 12,
         "episode_count": 114,
     }
 
-    libraries = transport.execute_read(
-        "configured:jellyfin", "media.libraries.list", {}
-    )
-    assert libraries.data["libraries"][0]["__object_id"] == "lib-1"
-    assert "paths" not in libraries.data["libraries"][0]
+    libraries = media_library.libraries("jellyfin")
+    assert libraries["libraries"][0]["id"] == "lib-1"
+    assert "paths" not in libraries["libraries"][0]
 
-    library_counts = transport.execute_read(
-        "configured:jellyfin",
-        "media.library.counts",
-        {"library_ref": "lib-1"},
-    )
-    assert library_counts.data == {
-        "server_label": "Jellyfin",
+    library_counts = services.get_library_counts("jellyfin", "lib-1")
+    assert library_counts["status"] == "success"
+    assert library_counts["data"]["counts"] == {
         "total_items": 126,
         "movie_count": 0,
         "series_count": 9,
         "episode_count": 126,
     }
-    assert "9 部剧集" in library_counts.summary
+    assert library_counts["data"]["scope"] == "library"
+    assert library_counts["data"]["library_id"] == "lib-1"
 
-    search = transport.execute_read(
-        "configured:jellyfin", "media.items.search", {"query": "暗芝居", "limit": 5}
-    )
-    assert search.data["items"][0]["name"] == "暗芝居"
-    assert search.data["items"][0]["open_url"].endswith("id=item-1")
+    recent = media_library.recent("jellyfin", limit=4)
+    assert recent["items"][0]["id"] == "recent-1"
+    assert recent["items"][0]["genres"] == ["科幻"]
+    assert recent["items"][0]["open_url"].endswith("id=recent-1")
 
-    recent = transport.execute_read(
-        "configured:jellyfin", "media.items.recent_added", {"limit": 4}
-    )
-    assert recent.data["items"][0]["genres"] == ["科幻"]
-    assert recent.data["items"][0]["open_url"].endswith("id=recent-1")
-
-    played = transport.execute_read(
-        "configured:jellyfin", "media.items.recent_played", {"limit": 6}
-    )
-    assert played.data["history_kind"] == "最近播放"
-    assert played.data["items"][0]["open_url"].endswith("id=played-1")
-    assert played.data["preference_signals"] == {
+    played = media_library.history("jellyfin", limit=6)
+    assert played["history_kind"] == "最近播放"
+    assert played["items"][0]["open_url"].endswith("id=played-1")
+    assert played["preference_signals"] == {
         "recent_titles": ["示例动画", "示例电影"],
         "top_genres": ["动画", "奇幻", "科幻"],
         "media_types": ["episode", "movie"],
     }
-
-    recommendations = transport.execute_read(
-        "configured:jellyfin",
-        "media.items.recommend_from_library",
-        {
-            "media_type": "tv",
-            "must_match": ["动画|Animation"],
-            "prefer": ["日本|Japan|Japanese", "喜剧|Comedy"],
-            "exclude": [],
-            "min_rating": 7.0,
-            "exclude_played": True,
-            "limit": 5,
-        },
+    recommendations = media_library.recommend(
+        "jellyfin", media_type="tv", must_match=["动画|Animation"],
+        prefer=["日本|Japan|Japanese", "喜剧|Comedy"], exclude=[],
+        min_rating=7.0, exclude_played=True, limit=5,
     )
-    assert recommendations.data["items"][0]["name"] == "男子高中生的日常"
-    assert recommendations.data["history"]["records_used"] == 2
-    assert recommendations.data["items"][0]["__object_kind"] == "media_item"
-    assert recommendations.data["items"][0]["open_url"].endswith(
-        "id=recommend-1"
-    )
+    assert recommendations["items"][0]["name"] == "男子高中生的日常"
+    assert recommendations["history"]["records_used"] == 2
+    assert recommendations["items"][0]["id"] == "recommend-1"
+    assert recommendations["items"][0]["open_url"].endswith("id=recommend-1")
+    resume = media_library.resume("jellyfin", limit=3)
+    assert resume["history_kind"] == "继续观看"
+    assert resume["items"][0]["progress"] == 42.5
+    assert resume["items"][0]["open_url"].endswith("id=resume-1")
 
-    resume = transport.execute_read(
-        "configured:jellyfin", "media.items.continue_watching", {"limit": 3}
-    )
-    assert resume.data["history_kind"] == "继续观看"
-    assert resume.data["items"][0]["progress_percent"] == 42.5
-    assert resume.data["items"][0]["open_url"].endswith("id=resume-1")
-
-    series = transport.execute_read(
-        "configured:jellyfin", "media.series.search", {"query": "暗芝居", "limit": 6}
-    )
-    assert series.data["series"][0]["__object_kind"] == "media_series"
-    assert series.data["series"][0]["open_url"].endswith("id=series-1")
-
-    episodes = transport.execute_read(
-        "configured:jellyfin",
-        "media.series.episodes",
-        {"series_ref": "series-1", "max_episodes": 10, "include_specials": False},
-    )
-    assert episodes.data["episodes"] == [
-        {"season": 1, "episode": 1},
-        {"season": 17, "episode": 6},
-    ]
+    episodes = media_library.series_episodes("jellyfin", "series-1", max_episodes=10, include_specials=False)
+    assert episodes["data"]["episodes"] == [{"season":1,"episode":1},{"season":17,"episode":6}]
 
 
-def test_media_transport_uses_server_default_user_when_not_configured(monkeypatch):
-    transport = MediaServerProviderTransport()
+def test_public_playback_uses_server_default_user_when_not_configured(monkeypatch):
     profile = MediaServerProfile(
-        source="configured:emby",
-        server_type="emby",
-        label="Emby",
-        url="http://hidden",
-        credential="hidden",
-        enabled=True,
-        user_id="",
+        source="configured:emby", server_type="emby", label="Emby",
+        url="http://hidden", credential="hidden", enabled=True, user_id="",
     )
-    monkeypatch.setattr(
-        "app.agent.providers.media_server.list_configured_profiles",
-        lambda: [profile],
-    )
-    monkeypatch.setattr(transport, "_client", lambda _profile: _FakeMediaClient())
-
-    played = transport.execute_read(
-        "configured:emby", "media.items.recent_played", {"limit": 6}
-    )
-    assert played.data["user_selection"] == "服务器默认用户"
-
-    resume = transport.execute_read(
-        "configured:emby", "media.items.continue_watching", {"limit": 3}
-    )
-    assert resume.data["user_selection"] == "服务器默认用户"
+    monkeypatch.setattr(media_library, "list_configured_profiles", lambda: [profile])
+    monkeypatch.setattr(MediaServerProfile, "create_client", lambda _profile: _FakeMediaClient())
+    for result in (media_library.history("emby", limit=6), media_library.resume("emby", limit=3)):
+        assert result["user_selection"] == "服务器默认用户"
+        assert result["scope"]["user_id"] == "viewer-1"
 
 
-def test_qb_transport_reuses_client_and_never_returns_paths(monkeypatch):
-    transport = QBittorrentProviderTransport()
-    monkeypatch.setattr(transport, "_client", lambda _profile_ref: _FakeQBClient())
-
-    queue = transport.execute_read(
-        "configured:qbittorrent", "qb.torrents.info", {"category": "tv", "limit": 10}
-    )
-    task = queue.data["torrents"][0]
-    assert task["__object_id"] == "a" * 40
-    assert "save_path" not in task
-    assert "content_path" not in task
-    assert task["progress_percent"] == 50.0
-    assert task["downloaded_bytes"] == 50
-    assert "progress" not in task
-    assert "downloaded" not in task
-    assert queue.summary == (
-        "qBittorrent 实时队列共 1 项：进行中 1、排队 0、暂停 0、异常 0、已完成 0、其他 0"
-    )
-    assert queue.data["state_counts"] == {
-        "active": 1,
-        "queued": 0,
-        "paused": 0,
-        "failed": 0,
-        "completed": 0,
-        "other": 0,
-    }
-    assert queue.data["transfer"] == {
-        "connection_status": "connected",
-        "download_speed": 1024,
-        "upload_speed": 0,
-    }
-
-    files = transport.execute_read(
-        "configured:qbittorrent",
-        "qb.torrents.files",
-        {"torrent_ref": "a" * 40, "limit": 50},
-    )
-    assert files.data["files"][0]["name"] == "episode.mkv"
-
-
-def test_media_transport_precise_refresh_never_calls_global_refresh(monkeypatch):
+def test_public_library_precise_refresh_never_calls_global_refresh(monkeypatch):
     calls: list[str] = []
 
     class _RefreshClient(_FakeMediaClient):
-        def refresh_library(self, target_id):
+        def refresh_library(self, target_id, **options):
             calls.append(target_id)
             return True
 
         def refresh_all(self):
-            raise AssertionError("Agent 精准刷新不得调用全库刷新")
+            raise AssertionError("精准刷新不得调用全库刷新")
 
-    transport = MediaServerProviderTransport()
     profile = MediaServerProfile(
         source="configured:jellyfin",
         server_type="jellyfin",
@@ -420,38 +315,45 @@ def test_media_transport_precise_refresh_never_calls_global_refresh(monkeypatch)
         enabled=True,
     )
     monkeypatch.setattr(
-        "app.agent.providers.media_server.list_configured_profiles",
+        media_library, "list_configured_profiles",
         lambda: [profile],
     )
-    monkeypatch.setattr(transport, "_client", lambda _profile: _RefreshClient())
+    monkeypatch.setattr(MediaServerProfile, "create_client", lambda _profile: _RefreshClient())
 
-    preview = transport.preview_write(
-        "configured:jellyfin",
-        "media.library.refresh",
-        {"library_ref": "lib-1"},
-        {"library_ref": {"name": "动漫", "collection_type": "tvshows"}},
+    preview = media_library.prepare_refresh("jellyfin", "lib-1")
+    assert preview["library"]["id"] == "lib-1"
+    assert preview["snapshot"]["profile_revision"] == profile.fingerprint()
+    result = media_library.refresh(
+        "jellyfin", "lib-1", expected_snapshot=preview["snapshot"],
     )
-    assert preview.data["scope"] == "library"
-    result = transport.execute_write(
-        "configured:jellyfin",
-        "media.library.refresh",
-        {"library_ref": "lib-1"},
-        expected_profile_revision=transport.profile_revision(
-            "configured:jellyfin"
-        ),
-    )
-    assert result.data["global_refresh"] is False
+    assert result["status"] == "accepted"
+    assert result["data"]["accepted"] is True
+    assert result["data"]["library_id"] == "lib-1"
+    assert result["data"]["global_refresh"] is False
+    for library_id in ("", "missing-library"):
+        with pytest.raises(media_library.MediaLibraryError):
+            media_library.prepare_refresh("jellyfin", library_id)
+        with pytest.raises(media_library.MediaLibraryError):
+            media_library.refresh("jellyfin", library_id, expected_snapshot=preview["snapshot"])
     assert calls == ["lib-1"]
 
 
-def test_media_transport_marks_rejected_refresh_as_possible_external_write(
-    monkeypatch,
+@pytest.mark.parametrize("failure", [False, TimeoutError("synthetic timeout")], ids=["false", "exception"])
+def test_public_library_refresh_rejection_or_exception_has_unknown_outcome(
+    monkeypatch, failure,
 ):
-    class _RejectedRefreshClient(_FakeMediaClient):
-        def refresh_library(self, _target_id):
-            return False
+    calls = []
 
-    transport = MediaServerProviderTransport()
+    class _RejectedRefreshClient(_FakeMediaClient):
+        def refresh_library(self, target_id, **options):
+            calls.append(target_id)
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+
+        def refresh_all(self):
+            raise AssertionError("结果未知时不得回退全库刷新")
+
     profile = MediaServerProfile(
         source="configured:jellyfin",
         server_type="jellyfin",
@@ -461,336 +363,146 @@ def test_media_transport_marks_rejected_refresh_as_possible_external_write(
         enabled=True,
     )
     monkeypatch.setattr(
-        "app.agent.providers.media_server.list_configured_profiles",
+        media_library, "list_configured_profiles",
         lambda: [profile],
     )
     monkeypatch.setattr(
-        transport, "_client", lambda _profile: _RejectedRefreshClient()
+        MediaServerProfile, "create_client", lambda _profile: _RejectedRefreshClient()
     )
 
-    with pytest.raises(ProviderGatewayError) as rejected:
-        transport.execute_write(
-            "configured:jellyfin",
-            "media.library.refresh",
-            {"library_ref": "lib-1"},
-            expected_profile_revision=transport.profile_revision(
-                "configured:jellyfin"
-            ),
+    preview = media_library.prepare_refresh("jellyfin", "lib-1")
+    with pytest.raises(media_library.MediaLibraryError) as rejected:
+        media_library.refresh(
+            "jellyfin", "lib-1", expected_snapshot=preview["snapshot"],
         )
 
-    assert rejected.value.code == "provider_write_failed"
-    assert rejected.value.external_write_possible
+    assert rejected.value.code == "outcome_unknown"
+    assert rejected.value.execution_started
+    assert calls == ["lib-1"]
 
 
-def test_qb_transport_writes_are_bounded_and_delete_keeps_files(monkeypatch):
-    calls: list[tuple] = []
+_QB_SETTINGS = {"QB_URL": "http://qb-a.invalid", "QB_USERNAME": "user-a", "QB_PASSWORD": "password-a", "QB_API_KEY": ""}
 
-    class _WriteQBClient(_FakeQBClient):
-        def pause_torrents(self, hashes):
-            calls.append(("pause", hashes))
-            return True
 
-        def resume_torrents(self, hashes):
-            calls.append(("resume", hashes))
-            return True
+def _qb_control_client(monkeypatch, client):
+    monkeypatch.setattr(qb_control.config, "get_many", lambda _keys: dict(_QB_SETTINGS))
+    monkeypatch.setattr(qb_control, "configured_qb_client", lambda _values: client)
+    return client
 
+
+def test_qb_shared_writes_are_bounded_and_delete_keeps_files(monkeypatch):
+    calls = []
+    class Client(_FakeQBClient):
+        removed = False
+        def list_torrents(self, category=""):
+            return [] if self.removed else super().list_torrents(category)
         def delete_torrents(self, hashes, delete_files=False):
             calls.append(("delete", hashes, delete_files))
+            self.removed = True
             return True
-
-    transport = QBittorrentProviderTransport()
-    monkeypatch.setattr(transport, "_client", lambda _profile_ref: _WriteQBClient())
-    monkeypatch.setattr(
-        transport,
-        "_client_from_settings",
-        lambda _profile_ref, _settings: _WriteQBClient(),
-    )
-    monkeypatch.setattr(
-        "app.agent.providers.qbittorrent.assert_qb_control_allowed",
-        lambda *_args, **_kwargs: None,
-    )
-    target_hash = "a" * 40
-
-    preview = transport.preview_write(
-        "configured:qbittorrent",
-        "qb.torrents.delete_task",
-        {"torrent_refs": [target_hash]},
-        {"torrent_refs": [{"name": "Demo"}]},
-    )
-    assert preview.data["delete_files"] is False
+    _qb_control_client(monkeypatch, Client())
     with isolated_test_database():
-        result = transport.execute_write(
-            "configured:qbittorrent",
-            "qb.torrents.delete_task",
-            {"torrent_refs": [target_hash]},
-            expected_profile_revision=transport.profile_revision(
-                "configured:qbittorrent"
-            ),
-        )
-    assert result.data["delete_files"] is False
-    assert calls == [("delete", target_hash, False)]
+        preview = qb_control.prepare_qb_control("delete", ["a" * 40])
+        result = qb_control.execute_qb_control(preview)
+    assert result["delete_files"] is False and result["verification"] == "verified"
+    assert calls == [("delete", "a" * 40, False)]
 
 
 def test_qb_pause_only_reports_verified_after_state_changes(monkeypatch):
-    class _PauseClient(_FakeQBClient):
+    class Client(_FakeQBClient):
         def pause_torrents(self, _hashes):
             return True
-
-    transport = QBittorrentProviderTransport()
-    monkeypatch.setattr(
-        transport,
-        "_client_from_settings",
-        lambda _profile_ref, _settings: _PauseClient(),
-    )
-    result = transport.execute_write(
-        "configured:qbittorrent",
-        "qb.torrents.pause",
-        {"torrent_refs": ["a" * 40]},
-        expected_profile_revision=transport.profile_revision(
-            "configured:qbittorrent"
-        ),
-    )
-    assert result.data["verification"] == "pending"
+    _qb_control_client(monkeypatch, Client())
+    result = qb_control.execute_qb_control(qb_control.prepare_qb_control("pause", ["a" * 40]))
+    assert result["verification"] == "pending" and result["status"] == "accepted"
 
 
-def test_qb_provider_maps_local_media_write_conflict(monkeypatch):
-    transport = QBittorrentProviderTransport()
-    monkeypatch.setattr(transport, "_client", lambda _profile_ref: _FakeQBClient())
-
-    def reject_control(*_args, **_kwargs):
-        raise QBControlConflict("本地整理写入中")
-
-    monkeypatch.setattr(
-        "app.agent.providers.qbittorrent.assert_qb_control_allowed",
-        reject_control,
-    )
-    try:
-        transport.preview_write(
-            "configured:qbittorrent",
-            "qb.torrents.resume",
-            {"torrent_refs": ["a" * 40]},
-            {"torrent_refs": [{"name": "Demo"}]},
-        )
-    except ProviderGatewayError as exc:
-        assert exc.code == "provider_conflict"
-        assert not exc.external_write_possible
-    else:
-        raise AssertionError("本地整理冲突必须拒绝 qB 恢复")
-
-    monkeypatch.setattr(
-        transport,
-        "_client_from_settings",
-        lambda _profile_ref, _settings: _FakeQBClient(),
-    )
-    with pytest.raises(ProviderGatewayError) as blocked:
-        transport.execute_write(
-            "configured:qbittorrent",
-            "qb.torrents.resume",
-            {"torrent_refs": ["a" * 40]},
-            expected_profile_revision=transport.profile_revision(
-                "configured:qbittorrent"
-            ),
-        )
-    assert blocked.value.code == "provider_conflict"
-    assert not blocked.value.external_write_possible
+@pytest.mark.parametrize("failure", [QBControlConflict, QBControlSafetyUnavailable])
+def test_qb_shared_control_rechecks_local_media_conflict_and_unavailable_safety(monkeypatch, failure):
+    client = _qb_control_client(monkeypatch, _FakeQBClient())
+    with isolated_test_database():
+        snapshot = qb_control.prepare_qb_control("resume", ["a" * 40])
+        def reject(*_args, **_kwargs):
+            raise failure("本地整理安全状态阻止恢复")
+        monkeypatch.setattr(qb_control, "assert_qb_control_allowed", reject)
+        with pytest.raises(failure):
+            qb_control.prepare_qb_control("resume", ["a" * 40])
+        with pytest.raises(failure):
+            qb_control.execute_qb_control(snapshot)
+    # 假客户端不提供写方法；如绕过安全检查便会得到错误结果，不能抛出这里要求的安全异常。
+    assert not hasattr(client, "resume_torrents")
 
 
-def test_qb_provider_distinguishes_unavailable_safety_state(monkeypatch):
-    transport = QBittorrentProviderTransport()
-    monkeypatch.setattr(transport, "_client", lambda _profile_ref: _FakeQBClient())
-
-    def unavailable(*_args, **_kwargs):
-        raise QBControlSafetyUnavailable("安全状态暂不可用")
-
-    monkeypatch.setattr(
-        "app.agent.providers.qbittorrent.assert_qb_control_allowed",
-        unavailable,
-    )
-    with pytest.raises(ProviderGatewayError) as preview_failure:
-        transport.preview_write(
-            "configured:qbittorrent",
-            "qb.torrents.resume",
-            {"torrent_refs": ["a" * 40]},
-            {"torrent_refs": [{"name": "Demo"}]},
-        )
-    assert preview_failure.value.code == "provider_unavailable"
-    assert not preview_failure.value.external_write_possible
-
-    monkeypatch.setattr(
-        transport,
-        "_client_from_settings",
-        lambda _profile_ref, _settings: _FakeQBClient(),
-    )
-    with pytest.raises(ProviderGatewayError) as execute_failure:
-        transport.execute_write(
-            "configured:qbittorrent",
-            "qb.torrents.resume",
-            {"torrent_refs": ["a" * 40]},
-            expected_profile_revision=transport.profile_revision(
-                "configured:qbittorrent"
-            ),
-        )
-    assert execute_failure.value.code == "provider_unavailable"
-    assert not execute_failure.value.external_write_possible
-
-
-def test_qb_provider_holds_shared_lease_across_check_write_and_verification(
-    monkeypatch,
-):
-    lease_active = False
-    checkpoints: list[str] = []
-
+def test_qb_shared_control_holds_lease_across_check_write_and_verification(monkeypatch):
+    checkpoints = []
+    active = False
+    class Client(_FakeQBClient):
+        def list_torrents(self, category=""):
+            assert active
+            checkpoints.append("read")
+            return super().list_torrents(category)
+        def pause_torrents(self, hashes):
+            assert active and hashes == "a" * 40
+            checkpoints.append("write")
+            return True
+    _qb_control_client(monkeypatch, Client())
     @contextmanager
     def lease():
-        nonlocal lease_active
-        assert not lease_active
-        lease_active = True
+        nonlocal active
+        assert not active
+        active = True
         checkpoints.append("lease_enter")
         try:
             yield
         finally:
             checkpoints.append("lease_exit")
-            lease_active = False
-
-    class _LeaseAwareClient(_FakeQBClient):
-        def list_torrents(self, category=""):
-            assert lease_active
-            checkpoints.append("read")
-            return super().list_torrents(category)
-
-        def pause_torrents(self, hashes):
-            assert lease_active
-            checkpoints.append("write")
-            assert hashes == "a" * 40
-            return True
-
-    def safety_check(*_args, **_kwargs):
-        assert lease_active
+            active = False
+    def safety(*_args, **_kwargs):
+        assert active
         checkpoints.append("safety")
-
-    transport = QBittorrentProviderTransport()
-    monkeypatch.setattr(
-        transport,
-        "_client_from_settings",
-        lambda _profile_ref, _settings: _LeaseAwareClient(),
-    )
-    monkeypatch.setattr(
-        "app.agent.providers.qbittorrent.qb_control_write_lease",
-        lease,
-    )
-    monkeypatch.setattr(
-        "app.agent.providers.qbittorrent.assert_qb_control_allowed",
-        safety_check,
-    )
-
-    result = transport.execute_write(
-        "configured:qbittorrent",
-        "qb.torrents.pause",
-        {"torrent_refs": ["a" * 40]},
-        expected_profile_revision=transport.profile_revision(
-            "configured:qbittorrent"
-        ),
-    )
-
-    assert result.data["accepted"] is True
-    assert checkpoints == [
-        "lease_enter",
-        "read",
-        "safety",
-        "write",
-        "read",
-        "lease_exit",
-    ]
+    monkeypatch.setattr(qb_control, "qb_control_write_lease", lease)
+    monkeypatch.setattr(qb_control, "assert_qb_control_allowed", safety)
+    snapshot = {"operation": "pause", "profile_revision": qb_control.qb_profile_revision(_QB_SETTINGS),
+                "targets": [{"hash": "a" * 40, "name": "Demo", "size": 100, "added_on": 1}]}
+    result = qb_control.execute_qb_control(snapshot)
+    assert result["accepted"] is True
+    assert checkpoints == ["lease_enter", "read", "safety", "write", "read", "lease_exit"]
 
 
 def test_qb_write_revision_and_client_share_one_settings_snapshot(monkeypatch):
-    settings_a = {
-        "QB_URL": "http://qb-a.invalid",
-        "QB_USERNAME": "user-a",
-        "QB_PASSWORD": "password-a",
-        "QB_API_KEY": "",
-    }
-    settings_b = {
-        "QB_URL": "http://qb-b.invalid",
-        "QB_USERNAME": "user-b",
-        "QB_PASSWORD": "password-b",
-        "QB_API_KEY": "",
-    }
-    transport = QBittorrentProviderTransport()
-    expected_revision = transport._profile_revision_from_settings(
-        "configured:qbittorrent", settings_a
-    )
-    settings_calls = 0
-    client_urls: list[str] = []
-    side_effects: list[str] = []
-
-    class _PauseClient(_FakeQBClient):
+    urls, writes, reads = [], [], []
+    class Client(_FakeQBClient):
         def pause_torrents(self, hashes):
-            side_effects.append(hashes)
+            writes.append(hashes)
             return True
-
-    def settings_snapshot():
-        nonlocal settings_calls
-        settings_calls += 1
-        return dict(settings_a if settings_calls == 1 else settings_b)
-
-    def client_from_settings(_profile_ref, values):
-        client_urls.append(str(values["QB_URL"]))
-        return _PauseClient()
-
-    monkeypatch.setattr(transport, "_settings", settings_snapshot)
-    monkeypatch.setattr(transport, "_client_from_settings", client_from_settings)
-    monkeypatch.setattr(
-        "app.agent.providers.qbittorrent.assert_qb_control_allowed",
-        lambda *_args, **_kwargs: None,
-    )
-
-    result = transport.execute_write(
-        "configured:qbittorrent",
-        "qb.torrents.pause",
-        {"torrent_refs": ["a" * 40]},
-        expected_profile_revision=expected_revision,
-    )
-
-    assert result.data["accepted"] is True
-    assert settings_calls == 1
-    assert client_urls == [settings_a["QB_URL"]]
-    assert side_effects == ["a" * 40]
+    def settings(_keys):
+        reads.append(True)
+        return dict(_QB_SETTINGS if len(reads) == 1 else dict(_QB_SETTINGS, QB_URL="http://qb-b.invalid"))
+    def client(values):
+        urls.append(values["QB_URL"])
+        return Client()
+    monkeypatch.setattr(qb_control.config, "get_many", settings)
+    monkeypatch.setattr(qb_control, "configured_qb_client", client)
+    snapshot = {"operation": "pause", "profile_revision": qb_control.qb_profile_revision(_QB_SETTINGS),
+                "targets": [{"hash": "a" * 40, "name": "Demo", "size": 100, "added_on": 1}]}
+    result = qb_control.execute_qb_control(snapshot)
+    assert result["accepted"] is True and len(reads) == 1
+    assert urls == [_QB_SETTINGS["QB_URL"]] and writes == ["a" * 40]
 
 
 def test_qb_write_rejects_changed_snapshot_before_client_or_side_effect(monkeypatch):
-    settings_a = {
-        "QB_URL": "http://qb-a.invalid",
-        "QB_USERNAME": "user-a",
-        "QB_PASSWORD": "password-a",
-        "QB_API_KEY": "",
-    }
-    settings_b = dict(settings_a, QB_URL="http://qb-b.invalid")
-    transport = QBittorrentProviderTransport()
-    expected_revision = transport._profile_revision_from_settings(
-        "configured:qbittorrent", settings_a
-    )
-    client_calls: list[dict] = []
-    monkeypatch.setattr(transport, "_settings", lambda: dict(settings_b))
-    monkeypatch.setattr(
-        transport,
-        "_client_from_settings",
-        lambda _profile_ref, values: client_calls.append(dict(values)),
-    )
-
-    with pytest.raises(ProviderGatewayError) as stale:
-        transport.execute_write(
-            "configured:qbittorrent",
-            "qb.torrents.pause",
-            {"torrent_refs": ["a" * 40]},
-            expected_profile_revision=expected_revision,
-        )
-
-    assert stale.value.code == "confirmation_stale"
-    assert client_calls == []
+    snapshot = {"operation": "pause", "profile_revision": qb_control.qb_profile_revision(_QB_SETTINGS),
+                "targets": [{"hash": "a" * 40, "name": "Demo", "size": 100, "added_on": 1}]}
+    monkeypatch.setattr(qb_control.config, "get_many", lambda _keys: dict(_QB_SETTINGS, QB_URL="http://qb-b.invalid"))
+    calls = []
+    monkeypatch.setattr(qb_control, "configured_qb_client", lambda values: calls.append(values))
+    with pytest.raises(qb_control.QBControlStale):
+        qb_control.execute_qb_control(snapshot)
+    assert calls == []
 
 
-def test_media_write_revision_and_client_share_one_profile_snapshot(monkeypatch):
+@pytest.mark.parametrize("stale", [False, True])
+def test_media_refresh_revision_and_client_share_one_profile_snapshot(monkeypatch, stale):
     profile_a = MediaServerProfile(
         source="configured:jellyfin",
         server_type="jellyfin",
@@ -807,84 +519,60 @@ def test_media_write_revision_and_client_share_one_profile_snapshot(monkeypatch)
         credential="token-b",
         enabled=True,
     )
-    transport = MediaServerProviderTransport()
-    expected_revision = transport._profile_revision_from_profile(profile_a)
+    expected_snapshot = {
+        "profile_revision": profile_a.fingerprint(),
+        "library": {"id": "lib-1", "name": "动漫", "collection_type": "tvshows"},
+        "options": {"mode": "scan", "replace_images": False, "regenerate_trickplay": False},
+    }
     profile_calls = 0
     client_urls: list[str] = []
     side_effects: list[str] = []
 
     class _RefreshClient(_FakeMediaClient):
-        def refresh_library(self, target_id):
+        def refresh_library(self, target_id, **options):
             side_effects.append(target_id)
             return True
 
     def configured_profiles():
         nonlocal profile_calls
         profile_calls += 1
-        return [profile_a if profile_calls == 1 else profile_b]
+        return [profile_a if not stale and profile_calls == 1 else profile_b]
 
     def client_from_profile(profile):
         client_urls.append(profile.url)
         return _RefreshClient()
 
     monkeypatch.setattr(
-        "app.agent.providers.media_server.list_configured_profiles",
+        media_library, "list_configured_profiles",
         configured_profiles,
     )
-    monkeypatch.setattr(transport, "_client", client_from_profile)
+    monkeypatch.setattr(MediaServerProfile, "create_client", client_from_profile)
 
-    result = transport.execute_write(
-        "configured:jellyfin",
-        "media.library.refresh",
-        {"library_ref": "lib-1"},
-        expected_profile_revision=expected_revision,
-    )
-
-    assert result.data["accepted"] is True
+    if stale:
+        with pytest.raises(media_library.MediaLibraryError) as rejected:
+            media_library.refresh("jellyfin", "lib-1", expected_snapshot=expected_snapshot)
+        assert rejected.value.code == "confirmation_stale"
+        assert not rejected.value.execution_started
+        assert side_effects == []
+    else:
+        result = media_library.refresh("jellyfin", "lib-1", expected_snapshot=expected_snapshot)
+        assert result["data"]["accepted"] is True
+        assert side_effects == ["lib-1"]
     assert profile_calls == 1
-    assert client_urls == [profile_a.url]
-    assert side_effects == ["lib-1"]
+    assert client_urls == [profile_b.url if stale else profile_a.url]
 
 
-def test_provider_projection_preserves_dotted_name_without_relaxing_other_fields():
-    dotted_name = "Example.Show.S01E01.1080p.mkv"
-    internal_text = "private.provider.operation"
-    projected = project_provider_value(
-        {
-            "name": dotted_name,
-            "description": internal_text,
-            "path": "/secret/Example.Show.S01E01.1080p.mkv",
-            "nested": {"name": "Another.Show.S02E03.mkv", "note": internal_text},
-            "open_url": "http://media.local/web/index.html#!/details?id=item-1",
-        },
-        allow_open_url=True,
-    )
-
-    assert projected["name"] == dotted_name
-    assert projected["description"] != internal_text
-    assert "path" not in projected
-    assert projected["nested"]["name"] == "Another.Show.S02E03.mkv"
-    assert projected["nested"]["note"] != internal_text
-    assert projected["open_url"].endswith("id=item-1")
-    assert "open_url" not in project_provider_value(
-        {"open_url": "http://media.local/web/index.html#!/details?id=item-1"}
-    )
-    assert "open_url" not in project_provider_value(
-        {"open_url": "http://media.local/web?api_key=secret"},
-        allow_open_url=True,
-    )
-    assert project_provider_value({"name": "/secret/Hidden.Show.mkv"})["name"] == ""
 
 
 @pytest.mark.parametrize("failure", ["timeout", "invalid_payload", "server_error"])
-def test_emby_counts_failure_reaches_agent_instead_of_zero_inventory(monkeypatch, failure):
+def test_emby_counts_failure_reaches_public_service_instead_of_zero_inventory(monkeypatch, failure):
     import requests
 
     profile = MediaServerProfile(
         source="configured:emby", server_type="emby", label="Emby",
         url="http://media.invalid", credential="test-only", enabled=True, user_id="viewer-1",
     )
-    monkeypatch.setattr("app.agent.providers.media_server.list_configured_profiles", lambda: [profile])
+    monkeypatch.setattr(services, "list_configured_profiles", lambda: [profile])
     paths = []
 
     def get(_session, url, **_kwargs):
@@ -903,14 +591,15 @@ def test_emby_counts_failure_reaches_agent_instead_of_zero_inventory(monkeypatch
         return response
 
     monkeypatch.setattr(requests.Session, "get", get)
-    with pytest.raises(ProviderGatewayError) as error:
-        MediaServerProviderTransport().execute_read("configured:emby", "media.items.counts", {})
-    assert error.value.code == "provider_unavailable"
+    result = services.get_library_counts("emby")
+    assert result["ok"] is False and result["status"] == "unavailable"
+    assert result["data"]["counts"]["total_items"] is None
+    assert result["data"]["sources"][0]["status"] == "unavailable"
     assert len(paths) == 2
 
 
 @pytest.mark.parametrize("server_type", ["jellyfin", "emby"])
-@pytest.mark.parametrize("scope_key", ["library_name", "library_ref"])
+@pytest.mark.parametrize("scope_key", ["library_name", "library_id"])
 @pytest.mark.parametrize("media_type,item_types,expected_names", [
     (None, "Movie,Series,Episode", ["第6集", "其他剧", "第三部剧"]),
     ("all", "Movie,Series,Episode", ["第6集", "其他剧", "第三部剧"]),
@@ -918,24 +607,17 @@ def test_emby_counts_failure_reaches_agent_instead_of_zero_inventory(monkeypatch
     ("movie", "Movie", []),
     ("episode", "Episode", ["第6集", "第5集", "第4集"]),
 ])
-def test_recent_added_granularity_through_domain_provider_and_shared_clients(
+def test_recent_added_granularity_through_public_library_and_client_http(
     monkeypatch, server_type, scope_key, media_type, item_types, expected_names,
 ):
-    from app.agent.domain_catalog import build_tool_specs
-    from app.agent.models import ToolContext
-    from app.agent.provider_gateway import ProviderGateway
-    from app.agent.provider_operations import build_provider_catalog
-    from app.clients.emby import EmbyClient
-    from app.clients.jellyfin import JellyfinClient
+    import json
+    import requests
 
     profile = MediaServerProfile(
         source=f"configured:{server_type}", server_type=server_type, label=server_type,
         url="http://media.invalid", credential="test", enabled=True, user_id="viewer",
     )
-    monkeypatch.setattr("app.agent.providers.media_server.list_configured_profiles", lambda: [profile])
-    monkeypatch.setattr("app.agent.domains.subscriptions.consumption_actions.list_configured_profiles", lambda: [profile])
-    gateway = ProviderGateway(catalog=build_provider_catalog(), transports=[MediaServerProviderTransport()])
-    monkeypatch.setattr("app.agent.domains.subscriptions.consumption_actions.get_provider_gateway", lambda: gateway)
+    monkeypatch.setattr(media_library, "list_configured_profiles", lambda: [profile])
     folders = [
         {"ItemId": "tv-library", "Name": "电视剧", "CollectionType": "tvshows"},
         {"ItemId": "anime-library", "Name": "动漫", "CollectionType": "tvshows"},
@@ -963,7 +645,7 @@ def test_recent_added_granularity_through_domain_provider_and_shared_clients(
     ])
     calls = []
 
-    def request(_self, path, **kwargs):
+    def request(path, **kwargs):
         if path == "/System/Info/Public":
             return {"ProductName": server_type, "Version": "4.9"}
         if path == "/Library/VirtualFolders/Query":
@@ -981,34 +663,35 @@ def test_recent_added_granularity_through_domain_provider_and_shared_clients(
         offset = params["StartIndex"]
         return {"Items": filtered[offset:offset + params["Limit"]]}
 
-    monkeypatch.setattr(JellyfinClient if server_type == "jellyfin" else EmbyClient, "_request", request)
-    context = ToolContext(owner="recent-owner", session_id="recent-session")
-    if scope_key == "library_ref":
-        libraries = gateway.query(profile_ref=profile.source, operation="media.libraries.list", arguments={}, context=context)
-        scope_value = libraries.data["libraries"][0]["object_ref"]
+    def get(_session, url, **kwargs):
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        response._content = json.dumps(request(url.removeprefix(profile.url), **kwargs)).encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", get)
+    if scope_key == "library_id":
+        libraries = media_library.libraries(server_type)
+        scope_value = libraries["libraries"][0]["id"]
     else:
         scope_value = "电视剧"
     arguments = {"server": server_type, "limit": 3, scope_key: scope_value}
     if media_type is not None:
         arguments["media_type"] = media_type
-    spec = next(spec for spec in build_tool_specs() if spec.name == "media.recently_added")
     with isolated_test_database():
-        assert spec.context_handler is not None
-        result = spec.context_handler(spec.validator(arguments), context)
-    assert result.ok, result.summary
-    assert [item["name"] for item in result.data["items"]] == expected_names
-    assert result.data["count"] == len(expected_names)
-    assert len({item["object_ref"] for item in result.data["items"]}) == len(expected_names)
-    assert result.data["granularity"] == ("episode" if media_type == "episode" else "work")
-    assert result.data["scope"]["kind"] == "library"
-    assert result.data["scope"]["library"]["name"] == "电视剧"
-    assert result.data["scope"]["media_type"] == (media_type or "all")
+        result = media_library.recent(**arguments)
+    assert [item["name"] for item in result["items"]] == expected_names
+    assert result["count"] == len(expected_names)
+    assert len({item["id"] for item in result["items"]}) == len(expected_names)
+    assert result["granularity"] == ("episode" if media_type == "episode" else "work")
+    assert result["scope"]["kind"] == "library"
+    assert result["scope"]["library"]["id"] == "tv-library"
+    assert result["scope"]["library"]["name"] == "电视剧"
+    assert result["scope"]["media_type"] == (media_type or "all")
     if media_type == "episode":
         assert [(item["series_name"], item["season_number"], item["episode_number"])
-                for item in result.data["items"]] == [("黑镜", 7, 6), ("黑镜", 7, 5), ("黑镜", 7, 4)]
-        assert "3 个单集" in result.summary
-    else:
-        assert f"{len(expected_names)} 部作品" in result.summary
+                for item in result["items"]] == [("黑镜", 7, 6), ("黑镜", 7, 5), ("黑镜", 7, 4)]
     assert len(calls) == 1
     assert calls[0]["ParentId"] == "tv-library"
     assert calls[0]["IncludeItemTypes"] == item_types
@@ -1018,18 +701,15 @@ def test_recent_added_granularity_through_domain_provider_and_shared_clients(
 
 
 def test_recent_added_uses_real_library_scope_and_never_genre_guessing(monkeypatch):
-    from app.agent.models import ToolContext
-    from app.agent.provider_gateway import ProviderGateway
-    from app.agent.provider_operations import build_provider_catalog
-    from app.clients.jellyfin import JellyfinClient
+    import json
+    import requests
 
-    transport = MediaServerProviderTransport()
     profile = MediaServerProfile(source="configured:jellyfin", server_type="jellyfin", label="Jellyfin", url="http://media.invalid", credential="test", enabled=True, user_id="viewer")
-    monkeypatch.setattr("app.agent.providers.media_server.list_configured_profiles", lambda: [profile])
+    monkeypatch.setattr(media_library, "list_configured_profiles", lambda: [profile])
     calls = []
     folders = [{"ItemId": "tv-library", "Name": "电视剧", "CollectionType": "tvshows"},
                {"ItemId": "anime-library", "Name": "动漫", "CollectionType": "tvshows"}]
-    def request(_self, path, **kwargs):
+    def request(path, **kwargs):
         calls.append((path, kwargs))
         if path == "/Library/VirtualFolders":
             return folders
@@ -1037,25 +717,32 @@ def test_recent_added_uses_real_library_scope_and_never_genre_guessing(monkeypat
         parent = kwargs["params"].get("ParentId")
         # 动漫条目没有Animation标签；只能由ParentId排除，不能从Genres猜测。
         return {"Items": [{"Id": "one", "Name": "真人剧" if parent == "tv-library" else "无动画标签的动漫", "Type": "Series", "Genres": []}]}
-    monkeypatch.setattr(JellyfinClient, "_request", request)
-    gateway = ProviderGateway(catalog=build_provider_catalog(), transports=[transport])
-    context = ToolContext(owner="owner", session_id="session")
+    def get(_session, url, **kwargs):
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        response._content = json.dumps(request(url.removeprefix(profile.url), **kwargs)).encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", get)
     for query in ({"library_name": "电视剧"}, {}):
-        result = gateway.query(profile_ref=profile.source, operation="media.items.recent_added", arguments=query, context=context)
-        assert result.data["scope"]["kind"] == ("library" if query else "all")
-        assert result.data["items"][0]["name"] == ("真人剧" if query else "无动画标签的动漫")
-    listed = gateway.query(profile_ref=profile.source, operation="media.libraries.list", arguments={}, context=context)
-    library_ref = listed.data["libraries"][0]["object_ref"]
-    result = gateway.query(profile_ref=profile.source, operation="media.items.recent_added", arguments={"library_ref": library_ref, "media_type": "tv"}, context=context)
-    assert result.data["scope"]["library"]["name"] == "电视剧"
-    assert "__object_id" not in result.data["scope"]["library"]
+        result = media_library.recent("jellyfin", **query)
+        assert result["scope"]["kind"] == ("library" if query else "all")
+        assert result["items"][0]["name"] == ("真人剧" if query else "无动画标签的动漫")
+    listed = media_library.libraries("jellyfin")
+    library_id = listed["libraries"][0]["id"]
+    result = media_library.recent("jellyfin", library_id=library_id, media_type="tv")
+    assert result["scope"]["library"]["name"] == "电视剧"
+    assert result["scope"]["library"]["id"] == library_id
+    assert "__object_id" not in result["scope"]["library"]
     assert calls[-1][1]["params"]["ParentId"] == "tv-library"
     assert calls[-1][1]["params"]["IncludeItemTypes"] == "Series,Episode"
-    for library_name in ("不存在", "电视剧"):
-        if library_name == "电视剧":
+    for query in ({"library_id": "missing-library"}, {"library_name": "不存在"}, {"library_name": "电视剧"}):
+        if query.get("library_name") == "电视剧":
             folders.append({"ItemId": "tv-duplicate", "Name": "电视剧"})
         before = len(calls)
-        with pytest.raises(ProviderGatewayError):
-            gateway.query(profile_ref=profile.source, operation="media.items.recent_added", arguments={"library_name": library_name}, context=context)
+        with pytest.raises(media_library.MediaLibraryError) as rejected:
+            media_library.recent("jellyfin", **query)
+        assert rejected.value.code == "precondition_failed"
         assert len(calls) == before + 1
         assert calls[-1][0] == "/Library/VirtualFolders"

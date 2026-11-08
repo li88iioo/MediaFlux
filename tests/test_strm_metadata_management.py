@@ -9,8 +9,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.strm.metadata_actions import cancel_confirmed, prepare_cancel
-from app.agent.models import ToolContext
 from app.modules import strm_metadata_management as service
 from app.repositories import strm as repository
 from tests.support import IsolatedDatabaseTestCase
@@ -194,15 +192,6 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
             self.assertFalse(thread.is_alive())
         self.assertCountEqual(results, [1, "stale"])
 
-    def test_agent_preview_does_not_execute_and_confirm_uses_same_service(self):
-        self._enqueue()
-        context = ToolContext(owner="tg:unit", session_id="session")
-        result, token = prepare_cancel({}, context)
-        self.assertEqual(result.status, "confirmation_required")
-        self.assertEqual(self._status()["a"], "queued")
-        completed = cancel_confirmed({}, token, context)
-        self.assertTrue(completed.ok)
-        self.assertEqual(completed.data["cancelled"], 1)
 
     def test_empty_queue_does_not_generate_confirmation(self):
         with self.assertRaisesRegex(ValueError, "没有可取消"):

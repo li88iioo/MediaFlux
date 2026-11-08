@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from app import config
-from app.agent.async_bridge import ensure_sync_bridge_available
+from app.concurrency import ensure_sync_bridge_available
 from app.concurrency import KeyedSingleFlight
 from app.modules.episode_research import (
     POLICY_VERSION,

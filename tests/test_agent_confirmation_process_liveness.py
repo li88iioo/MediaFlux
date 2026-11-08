@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
-from app.agent.kernel.capabilities import CapabilityRetriever
+
 from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.model import ModelEvent, ModelEventType as M, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
@@ -29,7 +29,7 @@ _WEB_SECRET = "scoped-trust-test-only"
 
 
 def _session(rig, model, *, journal=None):
-    return AgentSession(model=model, catalog=rig.pipeline.catalog, retriever=CapabilityRetriever(),
+    return AgentSession(model=model, catalog=rig.pipeline.catalog,
                         pipeline=rig.pipeline, state_store=rig.store, journal=journal)
 
 

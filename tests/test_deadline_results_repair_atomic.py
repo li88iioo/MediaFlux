@@ -11,6 +11,7 @@ from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffec
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import ToolOutcome
+from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests.support import isolated_test_database
@@ -48,13 +49,12 @@ def test_atomic_unknown_metadata_keeps_native_fact_and_cold_source():
                  for ref in manifest["parts"]]
         assert json.loads("".join(parts)) == source
         cold = ToolPipeline(catalog=ToolCatalog([]), state_store=reopened, reference_store=reopened)
-        page = await cold.execute("agent.read_result", {"handle": handle, "path": "/code", "offset": len(source["code"]) - 100, "limit": 200}, context=context)
-        content = json.loads(page.outcome.model_content)
+        content = await SessionService(cold, context).result(handle)
         assert content["result_handle"] == handle
-        assert content["data"]["items"] == source["code"][len(source["code"]) - 100:]
-        assert content["data"]["has_more"] is False
+        assert content["data"] == source  # unknown、错误码与原事实全部保留
+        assert (await SessionService(cold, context).result(handle, "/code"))["data"][-100:] == source["code"][-100:]
         with pytest.raises(ToolPipelineError) as error:
-            await cold.execute("agent.read_result", {"handle": handle, "path": "/code"}, context=replace(context, owner="other"))
+            await SessionService(cold, replace(context, owner="other")).result(handle, "/code")
         assert error.value.code == "reference_invalid"
         assert calls == ["read"]
 

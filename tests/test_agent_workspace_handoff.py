@@ -1,52 +1,44 @@
 """工作区接力专属回归：客户端仅传 action_key，共用原生 READ 执行链。"""
 from __future__ import annotations
-from app.agent.kernel.pipeline import AuthorizationPolicy
-from app.agent.kernel.pipeline import RateLimiter
-from app.agent.kernel.session import TurnAdmissionPolicy
-from app.agent.kernel.turn import AgentTurn
-from typing import cast
 
 import json
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from app.agent.domains.workspace import next_actions as workspace_next_actions
 from app.agent.errors import ToolPipelineError, ToolRateLimitError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import AuthorizationPolicy, RateLimiter
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.model_rounds import next_round
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.session import AgentSession
+from app.agent.kernel.session import AgentSession, TurnAdmissionPolicy
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput
-from app.agent.models import ToolResult
+from app.agent.kernel.turn import AgentTurn
 from app.agent.rate_limit import RateLimitDecision
 from app.agent.transports import (
     QueryEnvelope,
     TransportInputError,
     WebKernelTransport,
 )
+from app.modules import workspace as workspace_next_actions
 from app.routes import agent_api
 from tests import test_agent_ux_backend as backend_support
 from tests.test_agent_kernel_api import FakeWeb
-from tests.test_agent_kernel_capability_discovery import capability_tool
+
 from tests.test_agent_kernel_core import ScriptedModel, collect, read_tool
 from tests.test_agent_ux_backend import CSRF, SESSION, _login, _web_owner
 
 store = backend_support.store
 web_api = backend_support.api
 
-TARGET = "downloads.diagnose_queue"
+TARGET = "agent.run_code"
 ACTION = {"action_key": "review_downloads", "session_id": SESSION, "request_id": "handoff-1"}
 
 
@@ -56,10 +48,10 @@ def handoff_api(web_api, monkeypatch):
     api.runtime.web = FakeWeb()
     api.runtime.session = SimpleNamespace(catalog=ToolCatalog([read_tool(TARGET)]))
     # 快照中的工具名/参数不可信；resolver 必须使用自己的固定映射。
-    snapshot = Mock(return_value=ToolResult(True, "attention", "待检查", data={"actions": [{
+    snapshot = Mock(return_value={"ok": True, "status": "attention", "data": {"actions": [{
         "action_key": "review_downloads", "target_tool": "unsafe.write", "arguments": {"delete": True},
-    }]}))
-    monkeypatch.setattr(workspace_next_actions, "summarize_workspace_next_actions", snapshot)
+    }]}})
+    monkeypatch.setattr(workspace_next_actions, "next_actions", snapshot)
     api.snapshot = snapshot
     _login(api)
     return api
@@ -69,9 +61,11 @@ def handoff_api(web_api, monkeypatch):
 def test_action_resolves_current_snapshot_to_server_read_envelope(handoff_api, stream):
     result = handoff_api.client.post("/api/agent/query", headers=CSRF, json={**ACTION, "stream": stream})
     assert result.status_code == 200, result.text
-    handoff_api.snapshot.assert_called_once_with({})
+    handoff_api.snapshot.assert_called_once_with()
     envelope, = handoff_api.runtime.web.queries
     assert envelope.initial_read_tool == TARGET
+    assert "downloads.diagnose()" in envelope.initial_read_arguments["code"]
+    assert envelope.to_agent_input().initial_read_arguments == envelope.initial_read_arguments
     assert envelope.message == "检查下载队列"
     assert envelope.owner == _web_owner(handoff_api)
     assert envelope.session_id == SESSION and envelope.request_id == "handoff-1"
@@ -85,7 +79,7 @@ def test_action_resolves_current_snapshot_to_server_read_envelope(handoff_api, s
 @pytest.mark.parametrize("extra", [
     {"message": ""}, {"message": "直接写入"}, {"selection": None}, {"selection": {}},
     {"tool": "unsafe.write"}, {"target_tool": TARGET}, {"arguments": {}},
-    {"initial_read_tool": TARGET}, {"metadata": {}}, {"owner": "other-owner"},
+    {"initial_read_tool": TARGET}, {"initial_read_arguments": {"code": "injected"}}, {"metadata": {}}, {"owner": "other-owner"},
 ])
 def test_client_cannot_mix_prompt_or_inject_tool_arguments(handoff_api, extra):
     result = handoff_api.client.post("/api/agent/query", headers=CSRF, json={**ACTION, **extra})
@@ -98,7 +92,7 @@ def test_action_keeps_request_owner_when_snapshot_wait_rotates_account(handoff_a
     owner = _web_owner(handoff_api)
     snapshot = handoff_api.snapshot.return_value
 
-    def rotate(_arguments):
+    def rotate():
         handoff_api.principal["username"] = "another-account"
         return snapshot
 
@@ -119,7 +113,7 @@ def test_unknown_action_is_rejected_before_snapshot_or_runtime(handoff_api, key)
 
 @pytest.mark.parametrize("ok", [True, False])
 def test_stale_or_unavailable_snapshot_never_enters_kernel(handoff_api, monkeypatch, ok):
-    handoff_api.snapshot.return_value = ToolResult(ok, "empty", "没有当前行动", data={"actions": []})
+    handoff_api.snapshot.return_value = {"ok": ok, "status": "empty", "data": {"actions": []}}
     runtime = Mock(side_effect=AssertionError("陈旧快照不得启动 Kernel"))
     monkeypatch.setattr(agent_api, "get_agent_kernel_runtime", runtime)
     result = handoff_api.client.post("/api/agent/query", headers=CSRF, json=ACTION)
@@ -184,6 +178,8 @@ def test_http_handoff_runs_real_web_transport_and_kernel(handoff_api, stream):
     assert len(run.observed) == 1 and len(run.model.requests) == 1
     assert run.observed[0][2] == 0
     assert run.observed[0][1].owner == _web_owner(handoff_api)
+    assert run.observed[0][1].read_only is True
+    assert "downloads.diagnose()" in run.observed[0][0]["code"]
     if stream:
         events = [json.loads(line) for line in response.text.splitlines()]
         assert any(event["type"] == "tool.completed" for event in events)
@@ -210,13 +206,13 @@ def make_handoff_session(rounds):
         return {"ok": True, "summary": "已读取当前队列", "data": {"count": 2}}
     write = KernelToolSpec(name="unsafe.write", domain="unsafe", description="不应生成写卡", input_schema={},
                            effect=ToolEffect.WRITE, prepare=Mock(), execute_confirmed=Mock())
-    catalog = ToolCatalog([read_tool(TARGET, handler=read), capability_tool(), write])
+    catalog = ToolCatalog([replace(read_tool(TARGET, handler=read), input_schema={"type": "object", "properties": {"code": {"type": "string"}}, "additionalProperties": False}),  write])
     state = InMemorySessionStateStore()
     authorization = SimpleNamespace(authorize=AsyncMock())
     limiter = SimpleNamespace(acquire=AsyncMock())
     admission = SimpleNamespace(begin=AsyncMock(return_value="owner-admitted"), is_current=AsyncMock(return_value=True))
     pipeline = ToolPipeline(catalog=catalog, state_store=state, authorization=cast(AuthorizationPolicy | None, authorization), rate_limiter=cast(RateLimiter | None, limiter))
-    session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline,
+    session = AgentSession(model=model, catalog=catalog,  pipeline=pipeline,
                            state_store=state, turn_admission=cast(TurnAdmissionPolicy | None, admission))
     request = QueryEnvelope(owner="owner-handoff", session_id=SESSION, message="检查下载队列", channel="web",
                             initial_read_tool=TARGET).to_agent_input()
@@ -234,6 +230,7 @@ class WorkspaceHandoffKernelTests(unittest.IsolatedAsyncioTestCase):
         arguments, context, prior_model_calls = run.observed[0]
         assert arguments == {} and prior_model_calls == 0
         assert context.owner == run.request.owner and context.session_id == SESSION
+        assert context.read_only is True
         run.admission.begin.assert_awaited_once_with(run.request)
         run.authorization.authorize.assert_awaited_once()
         run.limiter.acquire.assert_awaited_once_with(owner=run.request.owner, tool_name=TARGET, cost=1.0, arguments={})
@@ -259,8 +256,16 @@ class WorkspaceHandoffKernelTests(unittest.IsolatedAsyncioTestCase):
         target.side_effect = error
         events = await collect(run.session.run(run.request))
         assert not run.observed
-        assert events[-1].type is AgentEventType.TURN_FAILED
-        assert events[-1].payload["code"] == error.code
+        if blocked == "turn_admission":
+            assert events[-1].type is AgentEventType.TURN_FAILED
+            assert events[-1].payload["code"] == error.code
+            assert run.model.requests == []
+        else:
+            assert events[-1].type is AgentEventType.TURN_COMPLETED
+            assert events[-1].payload["status"] == "partial"
+            # 普通工具拒绝交还模型，不隐藏错误，也不把未执行记为查询成功。
+            errors = [json.loads(message.content) for message in run.model.requests[0].messages if message.role == "tool"]
+            assert errors[-1]["code"] == error.code
         assert not any(event.type is AgentEventType.TOOL_COMPLETED for event in events)
         if blocked != "turn_admission":
             assert any(event.type is AgentEventType.TOOL_FAILED and event.payload["code"] == error.code for event in events)
@@ -270,9 +275,8 @@ class WorkspaceHandoffKernelTests(unittest.IsolatedAsyncioTestCase):
         run.write.prepare.assert_not_called()
 
 
-    async def test_callback_discovery_cannot_load_write_and_model_cannot_prepare_card(self):
+    async def test_read_handoff_cannot_expand_model_write_surface_or_prepare_card(self):
         run = make_handoff_session([
-            call("agent__capabilities", {"tool_names": ["unsafe.write"]}),
             call("unsafe__write"), final(),
         ])
         events = await collect(run.session.run(run.request))
@@ -282,16 +286,17 @@ class WorkspaceHandoffKernelTests(unittest.IsolatedAsyncioTestCase):
         assert not any(event.type is AgentEventType.EFFECT_APPROVAL_REQUIRED for event in events)
         for request in run.model.requests:
             assert "unsafe__write" not in {tool["name"] for tool in request.tools}
-        # 不只是隐藏按钮：业务 READ 取得的同一 callback 也必须收紧。
-        discovery = run.observed[0][1].capability_search({"tool_names": ["unsafe.write"]})
-        assert discovery["tools"] == []
         assert any(event.type is AgentEventType.TOOL_FAILED
                    and event.payload["tool"] in {"unsafe.write", "unsafe__write"}
                    and event.payload["code"] in {"tool_not_available", "read_scope_required"} for event in events)
         assert events[-1].type is AgentEventType.TURN_COMPLETED
         assert events[-1].payload["status"] == "partial"
-        assert "已读取当前队列" in events[-1].payload["answer"]
-        assert events[-1].payload["answer"] != "依据当前只读结果回答。"
+        answer = events[-1].payload["answer"]
+        assert answer.startswith("部分完成：")
+        assert "依据当前只读结果回答。" in answer
+        assert "本轮未执行新的写操作" in answer
+        observations = [json.loads(message.content) for message in run.model.requests[-1].messages if message.role == "tool"]
+        assert any(row.get("summary") == "已读取当前队列" for row in observations)
 
 
     async def test_initial_read_round_does_not_claim_or_settle_quota_resume(self):
@@ -299,7 +304,7 @@ class WorkspaceHandoffKernelTests(unittest.IsolatedAsyncioTestCase):
         pending_resume = {"arguments": {"page": 2}}
         turn = SimpleNamespace(pending_initial_read=initial, pending_resume_call=pending_resume,
                                tool_definitions=(), session=SimpleNamespace(system_prompt="system"))
-        result = await next_round(cast(AgentTurn, turn), None, 4)
+        result = await next_round(cast(AgentTurn, turn), None)
         assert result is not None
         assert result.calls == (initial,) and result.resuming_read is False
         assert turn.pending_initial_read is None and turn.pending_resume_call is pending_resume

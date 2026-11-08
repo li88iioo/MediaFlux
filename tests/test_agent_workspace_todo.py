@@ -1,13 +1,13 @@
 """Media Agent 统一工作区待办的安全、路由与 API 回归测试。"""
 
 from __future__ import annotations
-from typing import Any
 
 import json
+from typing import Any
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.workspace.todo_actions import summarize_workspace_todo
+from app.modules.workspace import _backlog
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -82,15 +82,20 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
         db.update_download_request(
             request_id, targets="qb", status="submitted", qb_status="submitted"
         )
-        self.assertTrue(
+        self.assertEqual(
             db.enqueue_agent_download_verification(
                 request_id,
-                title="https://private.example/path?token=PRIVATE",
-                tmdb_id="12345",
-                season=1,
-                episode=2,
-                as_of="2026-08-03",
-            )
+                targets=[
+                    {
+                        "title": "https://private.example/path?token=PRIVATE",
+                        "tmdb_id": "12345",
+                        "season": 1,
+                        "episode": 2,
+                        "as_of": "2026-08-03",
+                    }
+                ],
+            ),
+            "queued",
         )
         db.ensure_agent_library_patrol(next_run_at="2026-08-03 20:00:00")
         with db.get_conn() as conn:
@@ -136,7 +141,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(secret, serialized)
 
-    def test_maps_fixed_area_order_counts_reasons_and_next_tools(self):
+    def test_maps_fixed_area_order_counts_reasons_and_next_methods(self):
         automation = _automation(
             downloads_active=2,
             downloads_review=3,
@@ -177,30 +182,45 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
         )
         with (
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_dashboard_automation_summary",
+                "app.modules.workspace.db.get_dashboard_automation_summary",
                 return_value=automation,
             ),
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_local_media_diagnostic_summary",
+                "app.modules.workspace.diagnose_rss",
+                return_value={
+                    "ok": True,
+                    "data": {
+                        "subscriptions": {
+                            "enabled": automation.get("rss_subscriptions", 0)
+                        },
+                        "entries": {
+                            "pending": automation.get("rss_pending", 0),
+                            "failed": automation.get("rss_failed", 0),
+                        },
+                    },
+                },
+            ),
+            patch(
+                "app.modules.workspace.db.get_local_media_diagnostic_summary",
                 return_value=local,
             ),
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_agent_persistent_health_summary",
+                "app.modules.workspace.db.get_agent_persistent_health_summary",
                 return_value=persistent,
             ),
         ):
-            result = summarize_workspace_todo({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "attention")
+            result = _backlog()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "attention")
         self.assertEqual(
-            result.data["attention_total"], 3 + 7 + 11 + 13 + 23 + 31 + 37 + 59 + 67
+            result["data"]["attention_total"], 3 + 7 + 11 + 13 + 23 + 31 + 37 + 59 + 67
         )
-        self.assertEqual(result.data["active_total"], 2 + 19 + 43)
-        self.assertEqual(result.data["waiting_total"], 5 + 17 + 29 + 41 + 47 + 1)
-        self.assertFalse(result.data["network_accessed"])
-        self.assertFalse(result.data["filesystem_accessed"])
-        self.assertEqual(result.data["unavailable_areas"], [])
-        areas = result.data["areas"]
+        self.assertEqual(result["data"]["active_total"], 2 + 19 + 43)
+        self.assertEqual(result["data"]["waiting_total"], 5 + 17 + 29 + 41 + 47 + 1)
+        self.assertFalse(result["data"]["network_accessed"])
+        self.assertFalse(result["data"]["filesystem_accessed"])
+        self.assertEqual(result["data"]["unavailable_areas"], [])
+        areas = result["data"]["areas"]
         self.assertEqual(
             [item["source"] for item in areas],
             [
@@ -222,11 +242,11 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                 "active_count": 2,
                 "waiting_count": 0,
                 "reason_codes": ["download_needs_review"],
-                "next_tool": "downloads.diagnose_queue",
+                "next_method": "downloads.diagnose",
             },
         )
         self.assertEqual(areas[1]["reason_codes"], ["rss_failed", "rss_pending"])
-        self.assertEqual(areas[2]["next_tool"], "guangya.organize.status")
+        self.assertEqual(areas[2]["next_method"], "cloud.organize_status")
         self.assertEqual(areas[3]["reason_codes"], ["strm_open_failure"])
         self.assertEqual(
             areas[4]["reason_codes"],
@@ -249,7 +269,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(areas[6]["missing_episode_count"], 71)
         self.assertTrue(areas[6]["findings_truncated"])
         self.assertEqual(
-            result.suggestions,
+            result["suggestions"],
             [
                 "检查下载队列里的异常",
                 "检查 RSS 订阅为什么需要关注",
@@ -260,8 +280,8 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                 "查看缺集巡检需要关注的内容",
             ],
         )
-        self.assertNotIn("可调用", " ".join(result.suggestions))
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+        self.assertNotIn("可调用", " ".join(result["suggestions"]))
+        serialized = json.dumps(result, ensure_ascii=False)
         for secret in (
             "PRIVATE-TITLE",
             "private.example",
@@ -311,19 +331,34 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
             with (
                 self.subTest(status=status),
                 patch(
-                    "app.agent.domains.workspace.todo_actions.db.get_dashboard_automation_summary",
+                    "app.modules.workspace.db.get_dashboard_automation_summary",
                     return_value=automation,
                 ),
                 patch(
-                    "app.agent.domains.workspace.todo_actions.db.get_local_media_diagnostic_summary",
+                    "app.modules.workspace.diagnose_rss",
+                    return_value={
+                        "ok": True,
+                        "data": {
+                            "subscriptions": {
+                                "enabled": automation.get("rss_subscriptions", 0)
+                            },
+                            "entries": {
+                                "pending": automation.get("rss_pending", 0),
+                                "failed": automation.get("rss_failed", 0),
+                            },
+                        },
+                    },
+                ),
+                patch(
+                    "app.modules.workspace.db.get_local_media_diagnostic_summary",
                     return_value=local,
                 ),
             ):
-                result = summarize_workspace_todo({})
-            self.assertEqual(result.status, status)
-            self.assertEqual(result.data["attention_total"], attention)
-            self.assertEqual(result.data["active_total"], active)
-            self.assertEqual(result.data["waiting_total"], waiting)
+                result = _backlog()
+            self.assertEqual(result["status"], status)
+            self.assertEqual(result["data"]["attention_total"], attention)
+            self.assertEqual(result["data"]["active_total"], active)
+            self.assertEqual(result["data"]["waiting_total"], waiting)
 
     def test_strm_last_run_state_is_preserved_without_exposing_raw_status(self):
         scenarios = (
@@ -335,17 +370,38 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
             with (
                 self.subTest(last_status=last_status),
                 patch(
-                    "app.agent.domains.workspace.todo_actions.db.get_dashboard_automation_summary",
+                    "app.modules.workspace.db.get_dashboard_automation_summary",
                     return_value=_automation(strm_last_status=last_status),
                 ),
                 patch(
-                    "app.agent.domains.workspace.todo_actions.db.get_local_media_diagnostic_summary",
+                    "app.modules.workspace.diagnose_rss",
+                    return_value={
+                        "ok": True,
+                        "data": {
+                            "subscriptions": {
+                                "enabled": _automation(
+                                    strm_last_status=last_status
+                                ).get("rss_subscriptions", 0)
+                            },
+                            "entries": {
+                                "pending": _automation(
+                                    strm_last_status=last_status
+                                ).get("rss_pending", 0),
+                                "failed": _automation(strm_last_status=last_status).get(
+                                    "rss_failed", 0
+                                ),
+                            },
+                        },
+                    },
+                ),
+                patch(
+                    "app.modules.workspace.db.get_local_media_diagnostic_summary",
                     return_value=_local_media(),
                 ),
             ):
-                result = summarize_workspace_todo({})
-            strm = result.data["areas"][3]
-            self.assertEqual(result.status, overall)
+                result = _backlog()
+            strm = result["data"]["areas"][3]
+            self.assertEqual(result["status"], overall)
             self.assertEqual(strm["attention_count"], attention)
             self.assertEqual(strm["active_count"], active)
             self.assertEqual(strm["reason_codes"], reasons)
@@ -359,19 +415,40 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
             with (
                 self.subTest(last_status=last_status),
                 patch(
-                    "app.agent.domains.workspace.todo_actions.db.get_dashboard_automation_summary",
+                    "app.modules.workspace.db.get_dashboard_automation_summary",
                     return_value=_automation(
                         strm_failures=2, strm_last_status=last_status
                     ),
                 ),
                 patch(
-                    "app.agent.domains.workspace.todo_actions.db.get_local_media_diagnostic_summary",
+                    "app.modules.workspace.diagnose_rss",
+                    return_value={
+                        "ok": True,
+                        "data": {
+                            "subscriptions": {
+                                "enabled": _automation(
+                                    strm_failures=2, strm_last_status=last_status
+                                ).get("rss_subscriptions", 0)
+                            },
+                            "entries": {
+                                "pending": _automation(
+                                    strm_failures=2, strm_last_status=last_status
+                                ).get("rss_pending", 0),
+                                "failed": _automation(
+                                    strm_failures=2, strm_last_status=last_status
+                                ).get("rss_failed", 0),
+                            },
+                        },
+                    },
+                ),
+                patch(
+                    "app.modules.workspace.db.get_local_media_diagnostic_summary",
                     return_value=_local_media(),
                 ),
             ):
-                result = summarize_workspace_todo({})
-            strm = result.data["areas"][3]
-            self.assertEqual(result.status, "attention")
+                result = _backlog()
+            strm = result["data"]["areas"][3]
+            self.assertEqual(result["status"], "attention")
             self.assertEqual(strm["attention_count"], 2)
             self.assertEqual(strm["active_count"], active)
             self.assertEqual(strm["reason_codes"], reasons)
@@ -379,42 +456,42 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
     def test_partial_and_total_failures_never_expose_exception_text(self):
         with (
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_dashboard_automation_summary",
+                "app.modules.workspace.db.get_dashboard_automation_summary",
                 side_effect=RuntimeError("token=PRIVATE-A /secret/a"),
             ),
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_local_media_diagnostic_summary",
+                "app.modules.workspace.db.get_local_media_diagnostic_summary",
                 return_value=_local_media(failed=2),
             ),
         ):
-            partial = summarize_workspace_todo({})
-        self.assertTrue(partial.ok)
-        self.assertEqual(partial.status, "partial")
+            partial = _backlog()
+        self.assertTrue(partial["ok"])
+        self.assertEqual(partial["status"], "partial")
         self.assertEqual(
-            partial.data["unavailable_areas"], ["downloads", "rss", "organize", "strm"]
+            partial["data"]["unavailable_areas"],
+            ["downloads", "rss", "organize", "strm"],
         )
-        self.assertEqual(partial.data["attention_total"], 2)
+        self.assertEqual(partial["data"]["attention_total"], 2)
         with (
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_dashboard_automation_summary",
+                "app.modules.workspace.db.get_dashboard_automation_summary",
                 side_effect=RuntimeError("PRIVATE-A"),
             ),
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_local_media_diagnostic_summary",
+                "app.modules.workspace.db.get_local_media_diagnostic_summary",
                 side_effect=RuntimeError("PRIVATE-B"),
             ),
             patch(
-                "app.agent.domains.workspace.todo_actions.db.get_agent_persistent_health_summary",
+                "app.modules.workspace.db.get_agent_persistent_health_summary",
                 side_effect=RuntimeError("PRIVATE-C"),
             ),
         ):
-            unavailable = summarize_workspace_todo({})
-        self.assertFalse(unavailable.ok)
-        self.assertEqual(unavailable.status, "unavailable")
-        self.assertEqual(len(unavailable.data["unavailable_areas"]), 7)
+            unavailable = _backlog()
+        self.assertFalse(unavailable["ok"])
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertEqual(len(unavailable["data"]["unavailable_areas"]), 7)
         serialized = json.dumps(
-            {"partial": partial.to_dict(), "unavailable": unavailable.to_dict()},
-            ensure_ascii=False,
+            {"partial": partial, "unavailable": unavailable}, ensure_ascii=False
         )
         self.assertNotIn("PRIVATE-A", serialized)
         self.assertNotIn("PRIVATE-B", serialized)

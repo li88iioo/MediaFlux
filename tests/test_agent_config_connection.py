@@ -1,354 +1,216 @@
-"""Media Agent 媒体服务器连通性测试。"""
-
+"""公共连接服务与SDK的真实HTTP边界；不访问配置外地址或真实媒体。"""
 from __future__ import annotations
-from requests import Response
-from typing import cast
 
-import unittest
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+import json
+from dataclasses import replace
+from unittest.mock import Mock
 
+import pytest
 import requests
 
-from app.agent.domains.configuration.connection_actions import media_server_arguments
-from app.agent.domains.configuration.connection_actions import (
-    test_media_server as run_media_server_test,
-)
-from app.agent.errors import AgentToolError
+from app import sdk
+from app.modules import media_server_profiles as profiles
+from app.modules.media_server_profiles import MediaServerProfile
 
 
-def _identity(arguments):
-    return dict(arguments)
+@pytest.fixture
+def connection_backend(monkeypatch):
+    selected = [MediaServerProfile("configured:jellyfin", "jellyfin", "Jellyfin", "http://jellyfin.internal:8096", "jellyfin-secret-token", True),
+                MediaServerProfile("configured:emby", "emby", "Emby", "https://emby.internal/base", "emby-secret-token", False)]
+    payloads = {"jellyfin": {"ServerName": " Living\nRoom ", "ProductName": "Jellyfin Server", "Version": "12.0.1"},
+                "emby": {"ServerName": "Legacy Room", "ProductName": "Emby", "Version": "4.9.1"}}
+    calls = []
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        slot = next(profile.server_type for profile in selected if url == profile.url.rstrip("/") + "/System/Info")
+        payload = payloads[slot]
+        if isinstance(payload, Exception):
+            raise payload
+        if isinstance(payload, requests.Response):
+            return payload
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(payload).encode()
+        return response
+    monkeypatch.setattr(profiles, "list_configured_profiles", lambda: list(selected))
+    monkeypatch.setattr(profiles.requests, "get", get)
+    return selected, payloads, calls
 
 
-def _config_values(server_type: str, *, enabled: bool = True) -> dict[str, str]:
-    if server_type == "jellyfin":
-        return {
-            "JELLYFIN_ENABLED": "1" if enabled else "0",
-            "JELLYFIN_URL": "http://jellyfin.internal:8096",
-            "JELLYFIN_API_KEY": "jellyfin-secret-token",
-        }
-    return {
-        "EMBY_ENABLED": "1" if enabled else "0",
-        "EMBY_URL": "https://emby.internal/base",
-        "EMBY_TOKEN": "emby-secret-token",
-    }
+def test_connection_uses_configured_snapshot_and_returns_complete_safe_identity(connection_backend):
+    selected, payloads, calls = connection_backend
+    payloads["jellyfin"]["Secret"] = "must-not-leak"
+    result = sdk.library.connection(" JellyFin ")
+    node = result["data"]["nodes"][0]
+    assert result["status"] == "healthy" and result["ok"]
+    assert node["server_name"] == "Living Room" and node["product_name"] == "Jellyfin Server"
+    assert node["product"] == "jellyfin" and node["product_detected"] is True
+    assert node["version"] == "12.0.1" and node["major_version"] == 12
+    assert node["compatibility"] == "compatible" and node["error"] == ""
+    assert 1 <= node["latency_ms"] <= 11_500 and result["data"]["checked_at"]
+    assert calls[0][0] == selected[0].url + "/System/Info"
+    assert calls[0][1] == {"headers": {"Accept": "application/json", "Authorization": 'MediaBrowser Token="jellyfin-secret-token"'},
+                            "params": None, "timeout": (3.5, 8), "allow_redirects": False}
+    serialized = json.dumps(result)
+    assert all(value not in serialized for value in ("jellyfin.internal", "jellyfin-secret-token", "must-not-leak"))
 
 
-def _config_get(values: dict[str, str]):
-    return lambda key, default="": values.get(key, default)
+@pytest.mark.parametrize("url,credential", [
+    ("", "x"), ("file:///tmp/media", "x"), ("https://user:pass@emby.internal", "x"),
+    ("https://emby.internal/base?next=/admin", "x"), ("https://emby.internal/base#fragment", "x"),
+    ("https://emby.internal:bad", "x"), ("http://[invalid", "x"), ("http://media.invalid:0", "x"),
+    ("http://media.invalid:65536", "x"), ("http://media.invalid", ""),
+])
+def test_invalid_configured_endpoints_do_not_send_credentials(connection_backend, url, credential):
+    selected, _, calls = connection_backend
+    selected[0] = replace(selected[0], url=url, credential=credential)
+    result = sdk.library.connection("jellyfin")
+    assert not result["ok"] and result["status"] == "not_configured"
+    assert result["data"]["network_accessed"] is False and not calls
+    assert result["data"]["nodes"][0]["reason_code"] == "configuration_incomplete"
 
 
-class AgentConfigConnectionTests(unittest.TestCase):
-    def test_arguments_are_strict_and_normalized(self):
-        self.assertEqual(
-            media_server_arguments({"server_type": " JellyFin "}),
-            {"server_type": "jellyfin"},
-        )
-        self.assertEqual(
-            media_server_arguments({"server_type": "ＥＭＢＹ"}), {"server_type": "emby"}
-        )
-        invalid = (
-            {},
-            {"server_type": 1},
-            {"server_type": "plex"},
-            {"server_type": "jellyfin", "url": "http://attacker.invalid"},
-            {"server_type": "emby", "token": "secret"},
-            {"server_type": "emby", "headers": {}},
-            {"server_type": "emby", "timeout": 30},
-        )
-        for arguments in invalid:
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                media_server_arguments(arguments)
+def test_disabled_and_all_unconfigured_keep_nodes_without_network(connection_backend):
+    selected, _, calls = connection_backend
+    selected[0] = replace(selected[0], enabled=False)
+    single = sdk.library.connection("jellyfin")
+    assert single["status"] == "disabled" and not single["ok"]
+    result = sdk.library.connection()
+    assert result["status"] == "not_configured" and result["ok"]
+    assert [node["slot"] for node in result["data"]["nodes"]] == ["jellyfin", "emby"]
+    assert result["data"]["counts"] == {"enabled": 0, "configured": 0, "online": 0, "compatible": 0, "attention": 0}
+    assert not result["data"]["network_accessed"] and not calls
 
-    def test_disabled_and_incomplete_configuration_do_not_send_requests(self):
-        cases = (
-            ("jellyfin", False, _config_values("jellyfin", enabled=False), "disabled"),
-            (
-                "jellyfin",
-                True,
-                {"JELLYFIN_ENABLED": "1", "JELLYFIN_URL": "", "JELLYFIN_API_KEY": "x"},
-                "not_configured",
-            ),
-            (
-                "emby",
-                True,
-                {
-                    "EMBY_ENABLED": "1",
-                    "EMBY_URL": "file:///tmp/media",
-                    "EMBY_TOKEN": "x",
-                },
-                "not_configured",
-            ),
-            (
-                "emby",
-                True,
-                {
-                    "EMBY_ENABLED": "1",
-                    "EMBY_URL": "https://user:pass@emby.internal",
-                    "EMBY_TOKEN": "x",
-                },
-                "not_configured",
-            ),
-            (
-                "emby",
-                True,
-                {
-                    "EMBY_ENABLED": "1",
-                    "EMBY_URL": "https://emby.internal/base?next=/admin",
-                    "EMBY_TOKEN": "x",
-                },
-                "not_configured",
-            ),
-            (
-                "emby",
-                True,
-                {
-                    "EMBY_ENABLED": "1",
-                    "EMBY_URL": "https://emby.internal/base#fragment",
-                    "EMBY_TOKEN": "x",
-                },
-                "not_configured",
-            ),
-            (
-                "emby",
-                True,
-                {
-                    "EMBY_ENABLED": "1",
-                    "EMBY_URL": "https://emby.internal:bad",
-                    "EMBY_TOKEN": "x",
-                },
-                "not_configured",
-            ),
-            (
-                "emby",
-                True,
-                {"EMBY_ENABLED": "1", "EMBY_URL": "http://[invalid", "EMBY_TOKEN": "x"},
-                "not_configured",
-            ),
-        )
-        for server_type, enabled, values, expected in cases:
-            with (
-                self.subTest(server_type=server_type, expected=expected),
-                patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=enabled),
-                patch(
-                    "app.agent.domains.configuration.connection_actions.config.get",
-                    side_effect=_config_get(values),
-                ),
-                patch("app.agent.domains.configuration.connection_actions.requests.get") as request_get,
-            ):
-                result = run_media_server_test({"server_type": server_type})
-            self.assertFalse(result.ok)
-            self.assertEqual(result.status, expected)
-            request_get.assert_not_called()
 
-    def test_jellyfin_success_uses_server_configuration_and_returns_safe_identity(self):
-        values = _config_values("jellyfin")
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {
-            "ServerName": " Living\nRoom ",
-            "ProductName": "Jellyfin Server",
-            "Version": "12.0.1",
-            "Secret": "must-not-leak",
-        }
-        with (
-            patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.configuration.connection_actions.config.get", side_effect=_config_get(values)
-            ),
-            patch(
-                "app.agent.domains.configuration.connection_actions.requests.get", return_value=response
-            ) as request_get,
-        ):
-            result = run_media_server_test({"server_type": "jellyfin"})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.data["server_name"], "Living Room")
-        self.assertEqual(result.data["product"], "Jellyfin")
-        self.assertEqual(result.data["version"], "12.0.1")
-        self.assertGreaterEqual(result.data["latency_ms"], 1)
-        call = request_get.call_args
-        self.assertEqual(call.args[0], "http://jellyfin.internal:8096/System/Info")
-        self.assertEqual(call.kwargs["timeout"], (3.5, 8))
-        self.assertFalse(call.kwargs["allow_redirects"])
-        self.assertIsNone(call.kwargs["params"])
-        self.assertIn("jellyfin-secret-token", call.kwargs["headers"]["Authorization"])
-        serialized = repr(result.to_dict())
-        self.assertNotIn("jellyfin.internal", serialized)
-        self.assertNotIn("jellyfin-secret-token", serialized)
-        self.assertNotIn("must-not-leak", serialized)
+@pytest.mark.parametrize("slot,product,version,compatibility,reason", [
+    ("jellyfin", "Jellyfin", "12.1.0", "compatible", "jellyfin12_slot_compatible"),
+    ("jellyfin", "Jellyfin", "13.0.0", "compatible", "jellyfin12_slot_compatible"),
+    ("emby", "Emby", "4.9.1", "compatible", "emby_legacy_slot_compatible"),
+    ("emby", "Emby", None, "compatible", "emby_legacy_slot_compatible"),
+    ("emby", "Jellyfin", "10.11.11", "compatible", "jellyfin10_legacy_slot_compatible"),
+    ("jellyfin", "Emby", "4.9.0", "wrong_slot", "use_legacy_slot"),
+    ("jellyfin", "Jellyfin", "10.10.7", "wrong_slot", "use_legacy_slot"),
+    ("emby", "Jellyfin", "12.0.0", "wrong_slot", "use_jellyfin12_slot"),
+    ("emby", "Jellyfin", "9.1.0", "review", "jellyfin_major_not_classified"),
+    ("jellyfin", "Jellyfin", "11.0.0", "review", "jellyfin_major_not_classified"),
+    ("jellyfin", None, "12.0.1", "review", "product_unrecognized"),
+    ("jellyfin", "Other Server", "12.0.1", "review", "product_unrecognized"),
+    ("jellyfin", "Jellyfin", None, "review", "version_unrecognized"),
+])
+def test_version_and_slot_boundaries_are_preserved(connection_backend, slot, product, version, compatibility, reason):
+    selected, payloads, _ = connection_backend
+    for index, profile in enumerate(selected):
+        selected[index] = replace(profile, enabled=profile.server_type == slot)
+    payloads[slot] = {"Name": "Media Room", "Product": product, "ServerVersion": version}
+    result = sdk.library.connection()
+    node = next(node for node in result["data"]["nodes"] if node["enabled"])
+    assert node["online"] and node["compatibility"] == compatibility and node["reason_code"] == reason
+    assert result["status"] == ("healthy" if compatibility == "compatible" else "attention")
+    assert node["product_detected"] is (product in {"Jellyfin", "Emby"})
 
-    def test_emby_compatible_auth_identifies_legacy_jellyfin(self):
-        values = _config_values("emby")
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {
-            "ServerName": "Legacy Room",
-            "ProductName": "Jellyfin Server",
-            "Version": "10.11.11",
-        }
-        with (
-            patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.configuration.connection_actions.config.get", side_effect=_config_get(values)
-            ),
-            patch(
-                "app.agent.domains.configuration.connection_actions.requests.get", return_value=response
-            ) as request_get,
-        ):
-            result = run_media_server_test({"server_type": "emby"})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["product"], "Jellyfin")
-        call = request_get.call_args
-        self.assertEqual(call.args[0], "https://emby.internal/base/System/Info")
-        self.assertEqual(call.kwargs["headers"]["X-Emby-Token"], "emby-secret-token")
-        self.assertIn("emby-secret-token", call.kwargs["headers"]["Authorization"])
-        self.assertNotIn("emby.internal", repr(result.to_dict()))
-        self.assertNotIn("emby-secret-token", repr(result.to_dict()))
 
-    def test_jellyfin_slot_reports_detected_emby_product_for_compatibility_checks(self):
-        values = _config_values("jellyfin")
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {
-            "ServerName": "Media Room",
-            "ProductName": "Emby Server",
-            "Version": "4.9.0",
-        }
-        with (
-            patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.configuration.connection_actions.config.get", side_effect=_config_get(values)
-            ),
-            patch("app.agent.domains.configuration.connection_actions.requests.get", return_value=response),
-        ):
-            result = run_media_server_test({"server_type": "jellyfin"})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["product"], "Emby")
-        self.assertTrue(result.data["product_detected"])
-        self.assertEqual(result.data["version"], "4.9.0")
+@pytest.mark.parametrize("version", ["12.0.0+tokensecret123", "12.0.0-secretvalue", "token=other-secret", "012.0", "12.12345", True])
+def test_unrecognized_versions_are_unknown_and_never_reflect_suffixes(connection_backend, version):
+    _, payloads, _ = connection_backend
+    payloads["jellyfin"]["Version"] = version
+    result = sdk.library.connection()
+    node = result["data"]["nodes"][0]
+    assert node["version"] is node["major_version"] is None
+    assert node["reason_code"] == "version_unrecognized"
+    if isinstance(version, str):
+        assert version not in json.dumps(result)
 
-    def test_product_field_is_checked_when_product_name_is_generic(self):
-        values = _config_values("jellyfin")
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {
-            "ServerName": "Media Room",
-            "ProductName": "Media Server",
-            "Product": "Jellyfin",
-            "Version": "12.0.1",
-        }
-        with (
-            patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.configuration.connection_actions.config.get", side_effect=_config_get(values)
-            ),
-            patch("app.agent.domains.configuration.connection_actions.requests.get", return_value=response),
-        ):
-            result = run_media_server_test({"server_type": "jellyfin"})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["product"], "Jellyfin")
-        self.assertTrue(result.data["product_detected"])
 
-    def test_unknown_product_keeps_display_fallback_but_marks_identity_unverified(self):
-        values = _config_values("jellyfin")
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"ServerName": "Media Room", "Version": "12.0.1"}
-        with (
-            patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.configuration.connection_actions.config.get", side_effect=_config_get(values)
-            ),
-            patch("app.agent.domains.configuration.connection_actions.requests.get", return_value=response),
-        ):
-            result = run_media_server_test({"server_type": "jellyfin"})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["product"], "Jellyfin")
-        self.assertFalse(result.data["product_detected"])
+@pytest.mark.parametrize("status,expected", [(301, "redirect_not_allowed"), (307, "redirect_not_allowed"),
+                                         (401, "authentication"), (403, "authentication"), (404, "not_found"), (503, "http_error")])
+def test_http_failures_are_distinct_and_do_not_redirect_or_disappear(connection_backend, status, expected):
+    _, payloads, calls = connection_backend
+    response = requests.Response()
+    response.status_code = status
+    response.url = "http://private.invalid/?token=secret"
+    response.headers["Location"] = "http://169.254.169.254/latest/secret"
+    response._content = b"private body"
+    payloads["jellyfin"] = response
+    result = sdk.library.connection("jellyfin")
+    assert result["status"] == expected and not result["ok"]
+    node = result["data"]["nodes"][0]
+    assert node["connection_status"] == expected and node["online"] is False and node["error"]
+    assert len(calls) == 1 and calls[0][1]["allow_redirects"] is False
+    assert result["data"]["nodes"] and result["data"]["network_accessed"]
+    assert all(value not in json.dumps(result) for value in ("169.254.169.254", "private.invalid", "private body", "token=secret"))
 
-    def test_failure_mapping_is_stable_and_never_leaks_exception_text(self):
-        values = _config_values("jellyfin")
-        http_cases = (
-            (requests.Timeout("secret timeout details"), "timeout"),
-            (requests.ConnectionError("secret host details"), "connection"),
-            (
-                requests.HTTPError(
-                    "secret auth details", response=cast(Response | None, SimpleNamespace(status_code=401))
-                ),
-                "authentication",
-            ),
-            (
-                requests.HTTPError(
-                    "secret path details", response=cast(Response | None, SimpleNamespace(status_code=404))
-                ),
-                "not_found",
-            ),
-            (
-                requests.HTTPError(
-                    "secret upstream details", response=cast(Response | None, SimpleNamespace(status_code=503))
-                ),
-                "http_error",
-            ),
-            (RuntimeError("secret internal details"), "unavailable"),
-        )
-        for error, expected in http_cases:
-            response = Mock()
-            response.raise_for_status.side_effect = error
-            with (
-                self.subTest(expected=expected),
-                patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-                patch(
-                    "app.agent.domains.configuration.connection_actions.config.get",
-                    side_effect=_config_get(values),
-                ),
-                patch("app.agent.domains.configuration.connection_actions.requests.get", return_value=response),
-            ):
-                result = run_media_server_test({"server_type": "jellyfin"})
-            self.assertFalse(result.ok)
-            self.assertEqual(result.status, expected)
-            serialized = repr(result.to_dict())
-            self.assertNotIn("secret", serialized)
-            self.assertNotIn("jellyfin.internal", serialized)
 
-    def test_redirect_is_rejected_without_following_or_exposing_location(self):
-        values = _config_values("jellyfin")
-        response = Mock(status_code=302)
-        response.headers = {"Location": "http://169.254.169.254/latest/secret"}
-        with (
-            patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.configuration.connection_actions.config.get", side_effect=_config_get(values)
-            ),
-            patch(
-                "app.agent.domains.configuration.connection_actions.requests.get", return_value=response
-            ) as request_get,
-        ):
-            result = run_media_server_test({"server_type": "jellyfin"})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "redirect_not_allowed")
-        self.assertFalse(request_get.call_args.kwargs["allow_redirects"])
-        self.assertNotIn("169.254.169.254", repr(result.to_dict()))
-        response.raise_for_status.assert_not_called()
+@pytest.mark.parametrize("failure,expected", [(requests.Timeout("secret timeout"), "timeout"),
+                                          (requests.ConnectionError("secret host"), "connection"),
+                                          (ValueError("secret json"), "invalid_response"),
+                                          (RuntimeError("secret internal"), "unavailable")])
+def test_upstream_exceptions_are_safe_failures_not_empty_results(connection_backend, failure, expected):
+    _, payloads, _ = connection_backend
+    payloads["jellyfin"] = failure
+    result = sdk.library.connection("jellyfin")
+    assert result["status"] == expected and not result["ok"]
+    assert result["data"]["nodes"][0]["error"] and "secret" not in json.dumps(result)
 
-    def test_invalid_json_shape_is_safe(self):
-        values = _config_values("jellyfin")
-        for payload in (["not", "a", "dict"], ValueError("secret json body")):
-            response = Mock()
-            response.raise_for_status.return_value = None
-            if isinstance(payload, Exception):
-                response.json.side_effect = payload
-            else:
-                response.json.return_value = payload
-            with (
-                patch("app.agent.domains.configuration.connection_actions.config.get_bool", return_value=True),
-                patch(
-                    "app.agent.domains.configuration.connection_actions.config.get",
-                    side_effect=_config_get(values),
-                ),
-                patch("app.agent.domains.configuration.connection_actions.requests.get", return_value=response),
-            ):
-                result = run_media_server_test({"server_type": "jellyfin"})
-            self.assertEqual(result.status, "invalid_response")
-            self.assertNotIn("secret", repr(result.to_dict()))
+
+@pytest.mark.parametrize("payload", [["not", "a", "dict"], None, "private"])
+def test_invalid_system_info_shape_is_a_failed_probe(connection_backend, payload):
+    _, payloads, _ = connection_backend
+    payloads["jellyfin"] = payload
+    result = sdk.library.connection("jellyfin")
+    assert result["status"] == "invalid_response" and result["data"]["nodes"][0]["online"] is False
+
+
+@pytest.mark.parametrize("value", ["jellyfin-secret-token", "http://jellyfin.internal:8096", "Authorization: Bearer unseen-private-token", "/private/config"])
+def test_identity_fields_cannot_reflect_credentials_or_addresses(connection_backend, value):
+    _, payloads, _ = connection_backend
+    payloads["jellyfin"] = {"ServerName": value, "ProductName": value, "Version": value}
+    result = sdk.library.connection()
+    assert result["data"]["nodes"][0]["server_name"] is None
+    assert value not in json.dumps(result)
+
+
+@pytest.mark.parametrize("server", [None, 1, True, "auto", "plex", "http://attacker.invalid"])
+def test_invalid_sdk_server_arguments_do_not_probe(connection_backend, server):
+    _, _, calls = connection_backend
+    with pytest.raises(TypeError if not isinstance(server, str) else ValueError):
+        sdk.library.connection(server)
+    assert not calls
+    with pytest.raises(TypeError):
+        sdk.METHODS["library.connection"](url="http://attacker.invalid")
+    assert not calls
+
+
+def test_busy_or_configuration_failure_keeps_unobserved_counts_unknown(connection_backend, monkeypatch):
+    _, _, calls = connection_backend
+    semaphore = Mock()
+    semaphore.acquire.return_value = False
+    monkeypatch.setattr(profiles, "_CONNECTION_LIMIT", semaphore)
+    busy = sdk.library.connection()
+    assert not busy["ok"] and busy["status"] == "unavailable" and not busy["data"]["probe_complete"]
+    assert busy["data"]["counts"]["online"] is None and busy["data"]["nodes"][0]["online"] is None
+    assert busy["data"]["network_accessed"] is False and not calls
+    semaphore.release.assert_not_called()
+    monkeypatch.setattr(profiles, "list_configured_profiles", lambda: (_ for _ in ()).throw(RuntimeError("secret config path")))
+    failed = sdk.library.connection()
+    assert len(failed["data"]["nodes"]) == 2 and all(value is None for value in failed["data"]["counts"].values())
+    assert failed["status"] == "unavailable" and "secret" not in json.dumps(failed)
+
+
+def test_probe_latency_is_bounded_without_affecting_identity(connection_backend, monkeypatch):
+    clock = iter([0, 1000])
+    monkeypatch.setattr(profiles.time, "perf_counter", lambda: next(clock))
+    result = sdk.library.connection("jellyfin")
+    assert result["data"]["nodes"][0]["latency_ms"] == 11_500
+
+
+def test_interrupted_probe_batch_does_not_fabricate_zero_counts_or_leak_errors(connection_backend, monkeypatch):
+    worker = Mock()
+    worker.map.side_effect = RuntimeError("secret http://private.internal")
+    pool = Mock()
+    pool.__enter__ = Mock(return_value=worker)
+    pool.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(profiles, "ThreadPoolExecutor", lambda **_: pool)
+    result = sdk.library.connection()
+    assert result["status"] == "unavailable" and result["data"]["nodes"]
+    assert result["data"]["network_accessed"] is None and result["data"]["counts"]["online"] is None
+    assert "secret" not in json.dumps(result) and "private.internal" not in json.dumps(result)

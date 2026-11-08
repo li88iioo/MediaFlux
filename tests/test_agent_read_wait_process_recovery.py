@@ -12,12 +12,12 @@ from app import config
 from app import database as db
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.model import ModelEvent, ModelEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import PublicationLease
 from tests.support import isolated_test_database
+from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import OWNER, parked_runtime
 
 SESSION = "read-process-recovery"
@@ -51,11 +51,11 @@ def _worker(db_path, candidate, binding, phase, termination, ready, release):
 
     class Limiter:
         async def acquire(self, *, tool_name, **kwargs):
-            if phase == "acquire" and tool_name == "web.search":
+            if phase == "acquire" and tool_name == "fixture.lookup":
                 await pause()
 
     async def run():
-        runtime = build_agent_kernel_runtime(model=HeldModel(), store=SQLiteKernelStore(clock=lambda: 110))
+        runtime = build_wait_runtime(model=HeldModel(), store=SQLiteKernelStore(clock=lambda: 110))
         runtime.session.continuation_binding = binding
         runtime.session.pipeline.rate_limiter = Limiter()
 
@@ -70,7 +70,7 @@ def _worker(db_path, candidate, binding, phase, termination, ready, release):
             raise AssertionError("READ continuation must not execute a write")
 
         catalog = runtime.session.catalog
-        tool = catalog.get("web.search")
+        tool = catalog.get("fixture.lookup")
         catalog._tools[tool.name] = replace(tool, read=read)
         for tool in tuple(catalog._tools.values()):
             if tool.execute_confirmed is not None:

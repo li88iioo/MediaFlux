@@ -35,10 +35,11 @@ def profiles(model, protocol='chat_completions'):
 
 
 @contextmanager
-def settings(model='o3', protocol='chat_completions', profile=''):
+def settings(model='o3', protocol='chat_completions', profile='', effort=''):
     values = {'AGENT_LLM_API_URL': BASE, 'AGENT_LLM_MODEL': model,
               'AGENT_LLM_API_KEY': 'offline-fixture-only', 'AGENT_LLM_PROTOCOL': protocol,
-              'AGENT_LLM_CONTEXT_WINDOW_TOKENS': '128000', KEY: profile}
+              'AGENT_LLM_CONTEXT_WINDOW_TOKENS': '128000', KEY: profile,
+              'AGENT_LLM_REASONING_EFFORT': effort}
     old = config.get
     with patch.object(config, 'get', side_effect=lambda key, default='': values.get(key, old(key, default))):
         yield values
@@ -76,14 +77,14 @@ class Wire:
         return self.requests[0]['body']
 
 
-def native(model, protocol, profile='', selected=''):
+def native(model, protocol, profile='', selected='', effort=''):
     wire = Wire()
     async def run():
         adapter = OpenAICompatibleModelAdapter(ProviderSettings.from_config(), client_factory=wire.factory)
         request = ModelRequest(system_prompt='offline', messages=(ModelMessage('user', 'hello'),), tools=(), model=selected)
         events = [event async for event in adapter.stream(request, cancellation=CancellationToken())]
         assert events[-1].type.value == 'finish'
-    with settings(model, protocol, profile):
+    with settings(model, protocol, profile, effort):
         asyncio.run(run())
     return wire
 
@@ -220,6 +221,7 @@ def config_api(local_config):
     from fastapi.testclient import TestClient
 
     from app.routes.api import router
+    from app.routes.tools_api import router as tools_router
 
     application = FastAPI()
     application.state.background_services_enabled = False
@@ -229,6 +231,7 @@ def config_api(local_config):
         request.scope['session'] = {'logged_in': True}
         return await call_next(request)
     application.include_router(router)
+    application.include_router(tools_router)
     with TestClient(application) as client:
         yield client
 
@@ -392,7 +395,7 @@ def invalid_profile_cases():
                          ('model', 'x\udfff'), ('base_url', 'https://api.example.com:secret-sentinel'),
                          ('base_url', 'https://secret-sentinel@api.example.com'),
                          ('base_url', 'https://api.example.com/?key=secret-sentinel'),
-                         ('base_url', 'http://api.example.com'), ('base_url', 'https://localhost')]:
+                         ('base_url', 'ftp://api.example.com'), ('base_url', 'http://localhost:0')]:
         cases.append(json.dumps([dict(row, **{field: value})]))
     cases.extend([json.dumps([dict(row, extra_body='secret-sentinel')]),
                   json.dumps([{k: v for k, v in row.items() if k != 'model'}]),
@@ -530,7 +533,7 @@ def test_telegram_callback_real_kv_next_turn_title_and_web_isolation():
 
     import telebot
 
-    from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+    from app.agent.kernel.capabilities import ToolCatalog
     from app.agent.kernel.pipeline import ToolPipeline
     from app.agent.kernel.ports.mediaflux_policy import select_channel_model
     from app.agent.kernel.session import AgentSession
@@ -560,7 +563,7 @@ def test_telegram_callback_real_kv_next_turn_title_and_web_isolation():
         catalog = ToolCatalog([])
         session = AgentSession(model=OpenAICompatibleModelAdapter(ProviderSettings.from_config(), client_factory=wire.factory),
             catalog=catalog, pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
-            retriever=CapabilityRetriever(), model_selector=select_channel_model)
+             model_selector=select_channel_model)
         async def turn(channel='telegram', principal=owner, session_id='profile-topic'):
             events = [e async for e in session.run(AgentInput(message='hello', owner=principal,
                 session_id=session_id, channel=channel))]
@@ -869,3 +872,180 @@ def test_profile_identity_survives_repeated_save_get_post_cold_load(protocol, ma
         assert loaded['raw'] == saved and loaded['rows'] == list(expected)
         assert_route_generation(loaded['calls'], protocol, path, matched)
         submitted = saved
+
+
+REASONING_FIELDS = {'reasoning', 'reasoning_effort', 'thinking', 'output_config'}
+REASONING_SHAPES = {
+    'responses': {'reasoning': {'effort': 'high'}},
+    'chat_completions': {'reasoning_effort': 'high'},
+    'anthropic_messages': {'thinking': {'type': 'adaptive'}, 'output_config': {'effort': 'high'}},
+}
+NATIVE_REASONING_SHAPES = {**REASONING_SHAPES, 'responses': {'reasoning': {'effort': 'high', 'summary': 'auto'}}}
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+def test_reasoning_effort_reaches_native_tool_loop_without_sampling(protocol):
+    body = native('tenant/opaque-alias', protocol, effort='high').single_body()
+    assert {key: body[key] for key in REASONING_FIELDS & body.keys()} == NATIVE_REASONING_SHAPES[protocol]
+    assert 'temperature' not in body
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+def test_unset_reasoning_effort_keeps_legacy_request_shape(protocol):
+    body = native('tenant/opaque-alias', protocol).single_body()
+    assert not REASONING_FIELDS & body.keys()
+    assert body['temperature'] == 0
+
+
+def test_reasoning_effort_overrides_profile_sampling_but_keeps_token_parameter():
+    row = json.loads(profiles('tenant/opaque-alias', 'chat_completions'))[0]
+    row['temperature'] = 'zero'
+    body = native('tenant/opaque-alias', 'chat_completions', json.dumps([row]), effort='low').single_body()
+    assert body['reasoning_effort'] == 'low' and 'temperature' not in body
+    assert body['max_completion_tokens'] == 1500 and 'max_tokens' not in body
+
+
+@pytest.mark.parametrize('stored,expected', [
+    ('', ''), ('low', 'low'), (' HIGH ', 'high'), ('max', ''), ('none', ''),
+])
+def test_provider_settings_treat_invalid_stored_effort_as_unset(stored, expected):
+    with settings(effort=stored):
+        assert ProviderSettings.from_config().reasoning_effort == expected
+
+
+def test_reasoning_effort_rejects_values_outside_shared_protocol_set():
+    from app.clients.openai_compatible import native_tool_request_body
+
+    with pytest.raises(ValueError):
+        ProviderSettings(api_url=BASE, model='alias', reasoning_effort='xhigh')
+    with pytest.raises(ValueError):
+        native_tool_request_body(protocol='responses', model='alias', system_prompt='', history=[],
+                                 tools=[], max_tokens=64, reasoning_effort='max')
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+@pytest.mark.parametrize('effort', ['', 'low', 'medium', 'high'])
+def test_connection_probe_preserves_user_reasoning_effort(protocol, effort):
+    from app.routes import tools_api
+
+    wire = Wire('{"ok":true}')
+    with settings('tenant/opaque-alias', protocol), patch.object(tools_api, 'FixedHostHttpClient', wire.factory):
+        asyncio.run(tools_api._test_ai_provider(
+            base_url=BASE, api_key='offline-fixture-only', protocol=protocol,
+            model='tenant/opaque-alias', timeout_seconds=12, reasoning_effort=effort))
+    structured_body, tool_body, stream_body = (call['body'] for call in wire.requests)
+    # 只有工具循环探测携带推理参数；结构化输出与纯文本流式不受影响。
+    for body in (structured_body, stream_body):
+        assert not {'reasoning', 'reasoning_effort', 'thinking'} & body.keys()
+        assert 'effort' not in body.get('output_config', {})
+    if effort:
+        expected = {key: (dict(value, effort=effort) if isinstance(value, dict) and 'effort' in value else
+                          effort if key == 'reasoning_effort' else value)
+                    for key, value in REASONING_SHAPES[protocol].items()}
+        assert {key: tool_body[key] for key in REASONING_FIELDS & tool_body.keys()} == expected
+        assert 16_000 in tool_body.values()
+        assert 'temperature' not in tool_body
+    else:
+        assert not REASONING_FIELDS & tool_body.keys()
+        assert 64 in tool_body.values()
+
+
+class HighReasoningWire(Wire):
+    """模拟只接受 high、且需先消耗推理额度再输出工具调用的服务。"""
+    def __init__(self, *, tool_delay=0):
+        super().__init__('{"ok":true}')
+        self.tool_delay = tool_delay
+
+    async def handler(self, request):
+        reply = await super().handler(request)
+        protocol, body = self.requests[-1]['protocol'], self.requests[-1]['body']
+        if not body.get('tools'):
+            return reply
+        reasoning = {key: body[key] for key in REASONING_FIELDS & body.keys()}
+        if reasoning not in (REASONING_SHAPES[protocol], NATIVE_REASONING_SHAPES[protocol]):
+            return httpx.Response(400, json={'error': {'message': 'Only high reasoning effort is supported'}})
+        budget = max(body.get(key, 0) for key in ('max_tokens', 'max_completion_tokens', 'max_output_tokens'))
+        if budget < 4096:
+            return httpx.Response(400, json={'error': {'message': 'Insufficient output budget for reasoning'}})
+        await asyncio.sleep(self.tool_delay)
+        name = 'mediaflux_connectivity_probe'
+        envelopes = {
+            'chat_completions': {'choices': [{'finish_reason': 'tool_calls', 'message': {
+                'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'call-probe',
+                    'type': 'function', 'function': {'name': name, 'arguments': '{}'}}]}}]},
+            'responses': {'status': 'completed', 'output': [{'type': 'function_call',
+                'id': 'item-probe', 'call_id': 'call-probe', 'name': name, 'arguments': '{}'}]},
+            'anthropic_messages': {'stop_reason': 'tool_use', 'content': [{'type': 'tool_use',
+                'id': 'call-probe', 'name': name, 'input': {}}]},
+        }
+        if protocol == 'anthropic_messages':
+            # 推理正文可能超过旧探测的 64 KiB，仍应解析出随后的工具调用。
+            envelopes[protocol]['content'].insert(0, {'type': 'thinking',
+                'thinking': 'synthetic reasoning ' * 4096, 'signature': 'offline-fixture-only'})
+        return httpx.Response(200, json=envelopes[protocol])
+
+
+@pytest.mark.parametrize('protocol', PROTOCOLS)
+@pytest.mark.parametrize('effort_source', ['draft', 'stored'])
+def test_high_only_provider_accepts_connection_route_and_native_adapter(protocol, effort_source, local_config, config_api):
+    from app.routes import tools_api
+
+    wire = HighReasoningWire()
+    model = 'tenant/opaque-alias'
+    raw = profiles(model, protocol)
+    before = local_config.read_bytes()
+    data = {'base_url': BASE, 'api_key': 'offline-fixture-only', 'protocol': protocol,
+            'model': model, 'timeout_seconds': 12}
+    if effort_source == 'draft':
+        data['reasoning_effort'] = ' HIGH '
+    with settings(model, protocol, raw, effort='low' if effort_source == 'draft' else 'high'), \
+            patch.object(tools_api, 'FixedHostHttpClient', wire.factory):
+        result = config_api.post('/api/tools/ai/test', json=data)
+    assert result.status_code == 200, result.text
+    assert result.json()['capabilities']['tool_calling'] is True
+    assert wire.clients[0]._client.timeout.read == 12
+    # 同一服务确实拒绝 low，不能靠降级得到探测成功。
+    with settings(model, protocol, raw), patch.object(tools_api, 'FixedHostHttpClient', wire.factory):
+        rejected = config_api.post('/api/tools/ai/test', json={**data, 'reasoning_effort': 'low'})
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()['capabilities']['tool_calling'] is False
+    assert local_config.read_bytes() == before
+
+    async def run():
+        adapter = OpenAICompatibleModelAdapter(ProviderSettings.from_config(), client_factory=wire.factory)
+        request = ModelRequest(system_prompt='offline', messages=(ModelMessage('user', 'call probe'),),
+            tools=({'name': 'mediaflux_connectivity_probe', 'parameters': {
+                'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}},),
+            max_output_tokens=16_000)
+        return [event async for event in adapter.stream(request, cancellation=CancellationToken())]
+
+    with settings(model, protocol, raw, effort='high'):
+        events = asyncio.run(run())
+    calls = [event.tool_call for event in events if event.type.value == 'tool_call_completed']
+    assert len(calls) == 1 and calls[0] is not None
+    assert calls[0].name == 'mediaflux_connectivity_probe' and calls[0].arguments == {}
+    assert events[-1].type.value == 'finish'
+    tool_bodies = [call['body'] for call in wire.requests if call['body'].get('tools')]
+    assert len(tool_bodies) == 3
+    for body, expected in ((tool_bodies[0], REASONING_SHAPES[protocol]),
+                           (tool_bodies[-1], NATIVE_REASONING_SHAPES[protocol])):
+        assert {key: body[key] for key in REASONING_FIELDS & body.keys()} == expected
+        assert 'temperature' not in body
+        assert set(body) & {'max_tokens', 'max_completion_tokens', 'max_output_tokens'} == {
+            json.loads(raw)[0]['token_parameter']}
+    assert all(client._client.is_closed for client in wire.clients)
+
+
+@pytest.mark.parametrize('delay,timeout_seconds,status', [(4.1, 12, 200), (2.1, 2, 504)])
+def test_high_reasoning_probe_uses_configured_deadline(delay, timeout_seconds, status, config_api):
+    from app.routes import tools_api
+
+    model, protocol = 'tenant/opaque-alias', 'responses'
+    wire = HighReasoningWire(tool_delay=delay)
+    with settings(model, protocol, profiles(model, protocol), effort='high'), \
+            patch.object(tools_api, 'FixedHostHttpClient', wire.factory):
+        result = config_api.post('/api/tools/ai/test', json={'timeout_seconds': timeout_seconds})
+    assert result.status_code == status, result.text
+    if status == 200:
+        assert result.json()['capabilities']['tool_calling'] is True
+    assert wire.clients and all(client._client.is_closed for client in wire.clients)

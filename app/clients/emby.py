@@ -5,6 +5,8 @@ Emby 和 Jellyfin 10.x 的页面路由。
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import requests
 
 from app.clients.base import (
@@ -24,6 +26,7 @@ logger = get_logger(__name__)
 
 class EmbyClient(MediaServerClient):
     display_name = "Emby / Jellyfin 10.x"
+    _REFRESH_SERVER = "emby"
     _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
         "tvshows": "Series",
@@ -209,6 +212,7 @@ class EmbyClient(MediaServerClient):
         )[:12]
         return MediaItem(
             id=item_id,
+            tmdb_id=self._provider_tmdb_id(item.get("ProviderIds")),
             name=item.get("Name", ""),
             type=item.get("Type", ""),
             year=str(item.get("ProductionYear", "") or ""),
@@ -230,11 +234,12 @@ class EmbyClient(MediaServerClient):
     def search_media(
         self, query: str, limit: int = 12, *, offset: int = 0,
         search_by: str = "title", media_type: str = "all", count_only: bool = False,
+        cancelled: Callable[[], bool] | None = None,
     ) -> MediaSearchResult:
         self._prime_product_identity()
         return super().search_media(
             query, limit, offset=offset, search_by=search_by,
-            media_type=media_type, count_only=count_only,
+            media_type=media_type, count_only=count_only, cancelled=cancelled,
         )
 
     def _total_items(self) -> int:
@@ -250,8 +255,8 @@ class EmbyClient(MediaServerClient):
         )
         return int(data.get("TotalRecordCount", 0) or 0)
 
-    def get_media_counts(self) -> dict[str, int]:
-        """读取计数；仅旧服务未提供端点时降级为总项数。"""
+    def get_media_counts(self) -> dict[str, int | None]:
+        """读取计数；旧服务未提供端点时保留总项数，分类未知。"""
         total_items = max(0, (self._total_items() or 0))
         try:
             counts = self._request(
@@ -268,9 +273,9 @@ class EmbyClient(MediaServerClient):
             raise TypeError("媒体服务器计数响应无效")
         return {
             "total_items": total_items,
-            "movie_count": max(0, int(counts.get("MovieCount", 0) or 0)),
-            "series_count": max(0, int(counts.get("SeriesCount", 0) or 0)),
-            "episode_count": max(0, int(counts.get("EpisodeCount", 0) or 0)),
+            **{key: max(0, int(counts[field])) if counts.get(field) is not None else None
+               for key, field in (("movie_count", "MovieCount"), ("series_count", "SeriesCount"),
+                                  ("episode_count", "EpisodeCount"))},
         }
 
     def recently_played(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
@@ -376,27 +381,6 @@ class EmbyClient(MediaServerClient):
             params={"Limit": 0, "MediaTypes": "Video", "EnableImages": "false"},
         )
         return int(data.get("TotalRecordCount", 0) or 0)
-
-    def refresh_library(self, library_id: str) -> bool:
-        """轻量刷新 Item/Folder/媒体库；自动流程不强制重抓全部元数据。"""
-        try:
-            resp = self._session.post(
-                f"{self.url}/Items/{library_id}/Refresh",
-                headers=self._headers(),
-                params={
-                    "Recursive": "true",
-                    "MetadataRefreshMode": "Default",
-                    "ImageRefreshMode": "None",
-                    "ReplaceAllMetadata": "false",
-                    "ReplaceAllImages": "false",
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception as e:
-            logger.error("Emby 刷新目标失败 target=%s type=%s", library_id, type(e).__name__)
-            return False
 
     @staticmethod
     def _normalize_path(path: str) -> str:

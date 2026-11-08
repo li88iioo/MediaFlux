@@ -1,0 +1,2 @@
+{"id":"watchlist_updates","version":2,"split":"regression","messages":["我收藏的剧有更新吗？","这些缺集找一下资源。"],"rubric":{"kind":"favorite_search"}}
+{"id":"constraints_eight","version":2,"split":"holdout","messages":["找《黑镜》第一季第一集的1080p资源，只看，不下载。","换成第二季第一集，其他不变。","画质换成2160p。","排除HDR。","换第三季第一集。","只要明确标注SDR的。","画质恢复1080p，其他不变。","就按现在这些条件把结果给我。"],"rubric":{"kind":"constraint_memory","identity":{"provider":"tmdb","external_id":"42009","media_type":"tv"}}}

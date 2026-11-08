@@ -11,13 +11,8 @@ from unittest.mock import patch
 import pytest
 
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -90,7 +85,7 @@ def wire(protocol, replies):
 def session(catalog, transport, *, state_store=None, limits=None):
     state_store = state_store if state_store is not None else store()
     return AgentSession(
-        model=transport.adapter, catalog=catalog, retriever=CapabilityRetriever(minimum=3),
+        model=transport.adapter, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=state_store, reference_store=state_store),
         state_store=state_store, journal=state_store, limits=limits,
         system_prompt="按实际工具事实回答，未知不等于成功。",
@@ -138,7 +133,8 @@ def assert_native_wire(protocol, payload, calls):
         results = [m["call_id"] for m in messages if m.get("type") == "function_call_output"]
         reasoning = next(m for m in messages if m.get("type") == "reasoning")
         assert reasoning == {"type": "reasoning", "id": "rs_1", "encrypted_content": REDACTED,
-                             "summary": [{"type": "summary_text", "text": THINKING}]}
+                             "summary": [{"type": "summary_text", "text": "Checking the actual result."}],
+                             "content": [{"type": "reasoning_text", "text": THINKING}]}
     else:
         blocks = [b for m in payload["messages"] if isinstance(m.get("content"), list) for b in m["content"]]
         actual = [(b["id"], b["name"], b["input"]) for b in blocks if b.get("type") == "tool_use"]
@@ -161,7 +157,8 @@ def test_batch_activation_characterization(protocol, blocked):
         calls = [(key, "inspect_batch", {"selector": key, "exclude_played": True}) for key in ("a", "b")]
         catalog = ToolCatalog([spec("inspect_batch", lambda a, c: handled.append(deepcopy(a)) or {"data": a})])
         transport = wire(protocol, [batch(protocol, calls), native_reply(protocol, "核对完成", private=False)])
-        events = await collect(session(catalog, transport, limits=SessionLimits(max_tool_calls=1 if blocked else 16)))
+        agent = session(catalog, transport, limits=SessionLimits(max_tool_calls=1 if blocked else 16))
+        events = await collect(agent)
         state = await reopened()
         assert_pairs(state, calls)
         assert handled == ([] if blocked else [args for _, _, args in calls])
@@ -174,6 +171,9 @@ def test_batch_activation_characterization(protocol, blocked):
         assert events[-1].payload["tool_calls"] == (0 if blocked else 2)
         assert [e.payload["call_id"] for e in events if e.type is AgentEventType.TOOL_STARTED] == ([] if blocked else ["a", "b"])
         assert [e.payload["call_id"] for e in events if e.type is (AgentEventType.TOOL_FAILED if blocked else AgentEventType.TOOL_COMPLETED)] == ["a", "b"]
+        if blocked:
+            assert len(transport.requests) == 1  # 预算终结不偷偷追加汇总请求。
+            await collect(agent, request="inspect-retained-native-history")
         assert_native_wire(protocol, transport.requests[-1], calls)
         transport.verify(2)
     with isolated_test_database():

@@ -13,6 +13,7 @@ import secrets
 import sqlite3
 import threading
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -439,7 +440,8 @@ def save(value: Any) -> tuple[dict, bool]:
     return item, True
 
 
-def change(rule_id: int, value: object, *, delete: bool = False) -> dict:
+def change(rule_id: int, value: object, *, delete: bool = False, expected_snapshot: dict | None = None,
+           check_write: Callable[[sqlite3.Connection], None] | None = None) -> dict:
     from app import database as db
 
     allowed = {"revision"} if delete else {"revision", "disabled"}
@@ -452,6 +454,8 @@ def change(rule_id: int, value: object, *, delete: bool = False) -> dict:
     item = next((item for item in stored if item["id"] == rule_id), None)
     if item is None or item["revision"] != revision:
         raise FormatConflict("规则已改变或删除，请刷新列表")
+    if expected_snapshot is not None and {k: v for k, v in item.items() if k != "updated_at"} != expected_snapshot:
+        raise FormatConflict("发布格式规则已变化，请重新预检")
     if not delete and not value["disabled"]:
         request = {"draft": {key: item[key] for key in ("name", "template", "scope", "parent_path")},
                    "examples": item["examples"], "filenames": []}
@@ -462,6 +466,8 @@ def change(rule_id: int, value: object, *, delete: bool = False) -> dict:
         conn.execute("BEGIN IMMEDIATE")
         if _registry(conn)[1] != registry:
             raise FormatConflict("规则库已变化，请刷新列表")
+        if check_write:
+            check_write(conn)
         if delete:
             conn.execute("DELETE FROM recognition_format_rules WHERE id=? AND revision=?", (rule_id, revision))
             result = {"deleted": True}

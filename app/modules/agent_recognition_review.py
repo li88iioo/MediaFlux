@@ -20,7 +20,6 @@ from app.agent.kernel import (
     AgentEventType,
     AgentInput,
     AgentSession,
-    CapabilityRetriever,
     InMemorySessionStateStore,
     KernelToolSpec,
     ToolCatalog,
@@ -535,7 +534,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
     session = AgentSession(
         model=OpenAICompatibleModelAdapter(settings),
         catalog=catalog,
-        retriever=CapabilityRetriever(minimum=4, maximum=4),
+        model_tools=tuple(tool.name for tool in specs),
         pipeline=pipeline,
         state_store=state_store,
         journal=None,

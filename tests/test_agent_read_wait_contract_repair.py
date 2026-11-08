@@ -17,11 +17,11 @@ from app.agent.feature_gate import (
 )
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
+from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import (
     GOAL,
     OWNER,
@@ -36,16 +36,17 @@ from tests.test_agent_read_wait_lifecycle import (
 
 def resumed(clock, script=None):
     script = script or WaitScript(True)
-    runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
+    runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
     runtime.session.continuation_binding = _capture_creation_binding()
+    runtime.session.model_tools = frozenset({"agent.run_code", "fixture.lookup"})
     calls = []
 
     async def read(args, context):
         calls.append(args)
         return {'ok': True, 'summary': 'contract READ'}
 
-    tool = runtime.session.catalog.get('web.search')
-    runtime.session.catalog._tools['web.search'] = replace(tool, read=read)
+    tool = runtime.session.catalog.get('fixture.lookup')
+    runtime.session.catalog._tools['fixture.lookup'] = replace(tool, read=read)
     return runtime, script, calls
 
 
@@ -74,6 +75,7 @@ def test_tool_budget_precedes_model_without_precharging(limit):
             assert calls == []
             assert record['budget']['model_spent'] == 3
             assert record['budget']['tool_spent'] == 3
+            assert record['budget']['token_spent'] == candidate['budget']['token_spent']
             assert record['terminal_reason'] == 'task_budget_exceeded'
         else:
             assert len(calls) == 1 and len(script.requests) == 1
@@ -96,7 +98,7 @@ def test_telegram_issued_model_policy_is_not_rerouted(changed):
         owner, sid = 'tg:v1:-100123\x1f7', 'tg-route-wait'
         first = WaitScript()
         first.adapter.settings = replace(first.adapter.settings, telegram_channel=provider_channel_fingerprint(config.get_many(("AGENT_LLM_API_URL", "AGENT_LLM_PROTOCOL", "AGENT_LLM_API_KEY"))))
-        runtime = build_agent_kernel_runtime(model=first.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
+        runtime = build_wait_runtime(model=first.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
         binding = _capture_creation_binding()
         runtime.session.continuation_binding = binding
         runtime.session.pipeline.rate_limiter = Quota()

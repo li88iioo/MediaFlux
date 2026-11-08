@@ -16,15 +16,9 @@ from app import database as db
 from app.agent import effect_completion as effects
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import _capture_creation_binding
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports import existing_actions
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolContext, ToolResult
@@ -48,7 +42,7 @@ GOAL = '将 source 中的测试视频改名为 admitted.mp4，完成后重新读
 class FollowScript(NativeScript):
     def __init__(self, *, resume=False):
         super().__init__('tmdb')
-        self.steps = ['inspect', 'finish'] if resume else ['discover', 'change']
+        self.steps = ['inspect', 'finish'] if resume else ['change']
         self.prefix = 'resumed' if resume else 'source'
         self.change_arguments = None
 
@@ -66,8 +60,8 @@ class FollowScript(NativeScript):
             message = {'content': '已重新读取，文件实际名称是 admitted.mp4。'}
         else:
             tool, args = {
-                'discover': ('agent__capabilities', {'tool_names': ['guangya.fs.change.execute']}),
-                'change': ('guangya__fs__change__execute', self.change_arguments),
+                'discover': ('agent__run_code', {'language': 'shell', 'code': 'mf --help'}),
+                'change': ('cloud__change', self.change_arguments),
                 'inspect': ('guangya__inspect_after', {}),
             }[step]
             message = {'tool_calls': [{'id': self.prefix+'-'+step, 'type': 'function',
@@ -88,19 +82,19 @@ def _session(store, script, client, reads, *, stack):
         reads.append(item.name)
         return ToolResult(True, 'success', '已重新读取真实文件信息', data={'name': item.name, 'size': item.size})
     tools = [
-        existing_actions.adapt_tool_spec(replace(_spec('fs', actions=stack.domain_actions), workflow='guangya_fs_change', workflow_stage=20)),
+        replace(_spec('fs'), metadata={**_spec('fs').metadata, 'workflow': 'guangya_fs_change', 'workflow_stage': 20}),
         KernelToolSpec(name='guangya.inspect_after', domain='cloud', description='读取改名后的文件信息 名称 云盘 source',
             input_schema={'type': 'object', 'properties': {}}, effect=ToolEffect.READ, read=inspect),
     ]
     catalog = ToolCatalog(tools)
-    session = AgentSession(model=script.adapter, catalog=catalog, retriever=CapabilityRetriever(maximum=10),
+    session = AgentSession(model=script.adapter, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
     session.continuation_binding = _capture_creation_binding()
     return session
 
 
 @asynccontextmanager
-async def _ready_case(tmp_path, *, channel='web', route=None, fail_write=False, runtime_settings=None):
+async def _ready_case(tmp_path, *, channel='web', route=None, fail_write=False, runtime_settings=None, active_seconds=900, source_script=None):
     class RefusingClient(_OfflineClient):
         def rename(self, *_args, **_kwargs):
             raise RuntimeError('offline Provider refused rename')
@@ -110,16 +104,15 @@ async def _ready_case(tmp_path, *, channel='web', route=None, fail_write=False, 
         initialize_runtime_fence()
         if runtime_settings is not None:
             config.set_and_save(runtime_settings)
-        from app.agent.domains.guangya import (
-            fs_change_actions as guangya_fs_change_actions,
-        )
-        client = guangya_fs_change_actions.GuangYaClient()
-        store, reads, first = SQLiteKernelStore(), [], FollowScript()
+        from app.agent.kernel.ports import sdk_effects
+        client = sdk_effects.GuangYaClient()
+        store, reads, first = SQLiteKernelStore(), [], source_script or FollowScript()
         session = _session(store, first, client, reads, stack=stack)
+        session.limits = replace(session.limits, max_active_seconds=active_seconds)
         events = [e async for e in session.run(AgentInput(message=GOAL, owner=OWNER, session_id=SID, channel=channel))]
         assert events[-1].payload['status'] == 'approval_required'
         plan_id = (await store.load(owner=OWNER, session_id=SID)).pending_effect_plan_id
-        with patch.object(existing_actions, 'wait_for_effect_completion', partial(effects.wait_for_effect_completion, timeout_seconds=0)):
+        with patch.object(effects, 'wait_for_effect_completion', partial(effects.wait_for_effect_completion, timeout_seconds=0)):
             confirmation = [e async for e in session.confirm(owner=OWNER, session_id=SID, plan_id=plan_id, channel=channel, delivery_route=route or {})]
         assert confirmation[-1].payload.get('status') == 'waiting', [(e.type.value, dict(e.payload)) for e in confirmation]
         from app.agent.kernel.adapters import TurnViewBuilder
@@ -177,7 +170,7 @@ class NextWriteScript(FollowScript):
         step = self.steps.pop(0)
         assert self.change_arguments is not None
         assert step == 'execute' and self.change_arguments['operations']
-        name = 'guangya__fs__change__execute'
+        name = 'cloud__change'
         return httpx.Response(200, json={'choices': [{'message': {'tool_calls': [{
             'id': 'next-'+step, 'type': 'function',
             'function': {'name': name, 'arguments': json.dumps(self.change_arguments)},
@@ -297,21 +290,36 @@ def test_competing_claims_and_superseding_user_revoke_old_lease(tmp_path):
 def test_model_budget_is_durable_across_worker_restart(tmp_path):
     async def run():
         from app.agent.kernel.continuation import _ContinuationAction
-        async with _ready_case(tmp_path) as (store, candidate, *_):
+        script = FollowScript()
+        async with _ready_case(tmp_path, source_script=script) as (store, candidate, *_):
             binding = _capture_creation_binding()
-            lease, _ = await store.claim_continuation(candidate, binding)
-            await store.commit(lease, updates=(_ContinuationAction('', {
-                'operation': 'reserve', 'model_limit': 1, 'tool_limit': 2,
+            initial = (await store.load(owner=OWNER, session_id=SID)).metadata['effect_waits'][candidate['wait_id']]['continuation']['budget']
+            before = initial['model_spent']
+            assert before == len(script.requests) > 0
+            restarted = SQLiteKernelStore()
+            claimed = await restarted.claim_continuation(candidate, binding)
+            assert claimed is not None
+            lease, state = claimed
+            budget = state.metadata['effect_waits'][candidate['wait_id']]['continuation']['budget']
+            for kind in ('model', 'tool', 'token'):
+                assert budget[kind + '_spent'] == initial[kind + '_spent']
+            await restarted.commit(lease, updates=(_ContinuationAction('', {
+                'operation': 'reserve', 'model_limit': before + 1, 'tool_limit': 10,
                 'model_spent': 1, 'tool_spent': 1,
             }, binding=binding),))
             cold = SQLiteKernelStore()
-            with pytest.raises(ValueError, match='budget exhausted'):
+            saved = (await cold.load(owner=OWNER, session_id=SID)).metadata['effect_waits'][candidate['wait_id']]['continuation']['budget']
+            assert saved['model_spent'] == before + 1
+            assert saved['tool_spent'] == initial['tool_spent'] + 1
+            assert saved['token_spent'] == initial['token_spent']
+            assert saved['model_limit'] == before + 1
+            with pytest.raises(ValueError, match='model_budget_exceeded'):
                 await cold.commit(lease, updates=(_ContinuationAction('', {
                     'operation': 'reserve', 'model_limit': 100, 'tool_limit': 100,
                     'model_spent': 1, 'tool_spent': 0,
                 }, binding=binding),))
-            row = (await cold.load(owner=OWNER, session_id=SID)).metadata['effect_waits'][candidate['wait_id']]['continuation']
-            assert row['budget']['model_spent'] == 1 and row['budget']['model_limit'] == 1
+            row = (await SQLiteKernelStore().load(owner=OWNER, session_id=SID)).metadata['effect_waits'][candidate['wait_id']]['continuation']
+            assert row['budget'] == saved, '被拒绝的预留不能丢失成本或放宽原上限'
     asyncio.run(run())
 
 
@@ -322,7 +330,7 @@ def test_expired_running_lease_can_resume_without_replaying_confirmed_write(tmp_
             EFFECT_ACTIVE_SECONDS,
             _ContinuationAction,
         )
-        async with _ready_case(tmp_path) as (store, candidate, client, reads, stack, _users):
+        async with _ready_case(tmp_path, active_seconds=3600) as (store, candidate, client, reads, stack, _users):
             binding = _capture_creation_binding()
             old_lease, _ = await store.claim_continuation(candidate, binding)
             await store.commit(old_lease, updates=(_ContinuationAction('', {
@@ -333,9 +341,13 @@ def test_expired_running_lease_can_resume_without_replaying_confirmed_write(tmp_
             candidates = await cold.due_continuations()
             assert len(candidates) == 1 and candidates[0]['state'] == 'running'
             session = _session(cold, FollowScript(resume=True), client, reads, stack=stack)
+            session.limits = replace(session.limits, max_active_seconds=3600)
             assert await session.resume_wait(candidate=candidates[0])
             assert not await cold.is_current(old_lease)
             assert reads == ['admitted.mp4']
+            budget = (await cold.load(owner=OWNER, session_id=SID)).metadata['effect_waits'][candidate['wait_id']]['continuation']['budget']
+            assert budget['active_spent'] >= EFFECT_ACTIVE_SECONDS + CLAIM_SECONDS
+            assert budget['token_spent'] > candidate['budget']['token_spent']
             with db.get_conn() as conn:
                 assert conn.execute('SELECT COUNT(*) FROM organize_operation_jobs').fetchone()[0] == 1
     asyncio.run(run())
@@ -409,23 +421,22 @@ def test_foreground_completion_consumes_same_goal_without_background_double_run(
     async def run():
         with isolated_test_database(), _offline_runtime(tmp_path, RefusingClient() if fail_write else _OfflineClient()) as stack, _paused_manager():
             initialize_runtime_fence()
-            from app.agent.domains.guangya import (
-                fs_change_actions as guangya_fs_change_actions,
-            )
-            client = guangya_fs_change_actions.GuangYaClient()
+            from app.agent.kernel.ports import sdk_effects
+            client = sdk_effects.GuangYaClient()
             store, reads, script = SQLiteKernelStore(), [], FollowScript()
             script.steps += ['finish'] if fail_write else ['inspect', 'finish']
             session = _session(store, script, client, reads, stack=stack)
             events = [e async for e in session.run(AgentInput(message=GOAL, owner=OWNER, session_id=SID, channel='web'))]
             assert events[-1].payload['status'] == 'approval_required'
             plan_id = (await store.load(owner=OWNER, session_id=SID)).pending_effect_plan_id
+            original_wait = effects.wait_for_effect_completion
             async def complete_before_wait(result, **options):
                 with db.get_conn() as conn:
                     job = conn.execute('SELECT job_id FROM organize_operation_jobs').fetchone()
                 worker = _run_real_worker(jobs.claim_organize_operation_job(job['job_id']))
                 with patch.object(organize_tasks, 'get_organize_manager', lambda: worker):
-                    return await effects.wait_for_effect_completion(result, **options)
-            with patch.object(existing_actions, 'wait_for_effect_completion', complete_before_wait):
+                    return await original_wait(result, **options)
+            with patch.object(effects, 'wait_for_effect_completion', complete_before_wait):
                 confirmed = [e async for e in session.confirm(owner=OWNER, session_id=SID, plan_id=plan_id, channel='web')]
             assert confirmed[-1].payload['status'] == ('partial' if fail_write else 'success'), confirmed[-1].payload
             assert not script.steps

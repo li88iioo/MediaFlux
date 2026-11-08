@@ -4,38 +4,30 @@ from __future__ import annotations
 from typing import Any
 
 import asyncio
+import json
 import unittest
-from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-from app.agent.domains.resources.candidate_actions import (
-    present_candidates,
-    present_candidates_arguments,
+from app.modules.resource_candidates import _serialize_private_item, select_candidates
+from app.indexers.service import IndexerService
+from types import SimpleNamespace
+from app.indexers.downloads import (
+    DownloadSnapshotChanged, download_indexer_result, preflight_indexer_download_batch,
+    preview_indexer_download_batch, submit_indexer_download_batch,
 )
-from app.agent.domains.resources.indexer_actions import (
-    _submit_resource,
-    _submit_resource_batch,
-    prepare_submit_resource,
-    search_arguments,
-    search_resources,
-)
-from app.agent.errors import AgentToolError
-from app.indexers.downloads import download_indexer_result
 from app.indexers.errors import (
-    IndexerChallengeRequired,
-    IndexerQueryRejected,
     IndexerResultExpired,
 )
 from app.indexers.models import (
     AggregatedIndexerResult,
     IndexerItem,
     IndexerMediaSearchRequest,
+    IndexerCapabilities,
     IndexerProviderError,
     ResolvedDownload,
 )
-from app.indexers.providers.empire import EmpireAdapter
 from app.modules.download_dispatcher import DownloadInput
 
 _RESULT_ID = "opaque-result-1234"
@@ -56,7 +48,7 @@ class FakeResultStore:
         return self.item
 
 
-class FakeIndexerService:
+class FakeIndexerService(IndexerService):
     def __init__(
         self,
         *,
@@ -66,14 +58,17 @@ class FakeIndexerService:
         sites_attempted: tuple[str, ...] = ("nyaa", "broken"),
         sites_succeeded: tuple[str, ...] = ("nyaa",),
         partial: bool = True,
+        private_results: bool = True,
+        result_store=None,
     ):
         self.item = item or _resource_item()
         self.items = list(items) if items is not None else [self.item]
-        self.result_store = FakeResultStore(self.item)
+        self.result_store: Any = result_store if result_store is not None else FakeResultStore(self.item) if private_results else None
         self.enabled_site_ids = frozenset(enabled_site_ids)
         self.sites_attempted = sites_attempted
         self.sites_succeeded = sites_succeeded
         self.partial = partial
+        self.registry: Any = SimpleNamespace(ids=lambda: tuple(self.enabled_site_ids), enabled_ids=lambda: (), get=lambda site: SimpleNamespace(site_name=site.upper(), capabilities=IndexerCapabilities(True), http_client_for_result=lambda _: None))
         self.search_calls: list[tuple[IndexerMediaSearchRequest, list[str] | None]] = []
 
     def site_ids_for_scope(self, scope="manual"):
@@ -84,9 +79,9 @@ class FakeIndexerService:
         assert scope == "agent"
         return self.result_store.get(result_id)
 
-    async def search_media(self, request, sites=None, *, scope="manual", timeout_seconds=None):
+    async def search_media(self, request, site_ids=None, *, scope="manual", timeout_seconds=None, on_progress=None):
         assert scope == "agent"
-        self.search_calls.append((request, sites))
+        self.search_calls.append((request, site_ids))
         return AggregatedIndexerResult(
             query=request.title,
             page=request.page,
@@ -139,7 +134,7 @@ def _resource_item(**overrides) -> IndexerItem:
 
 
 def _candidate_snapshot(*, count=2) -> dict[str, Any]:
-    candidates = []
+    candidates: list[dict[str, Any]] = []
     for position in range(1, count + 1):
         candidates.append(
             {
@@ -163,7 +158,8 @@ def _candidate_snapshot(*, count=2) -> dict[str, Any]:
         "candidates": candidates,
         "_private_version": 1,
         "_private_items": [
-            {"magnet": _SECRET_MAGNET, "torrent_url": _SECRET_TORRENT_URL}
+            _serialize_private_item(item["result_id"], _resource_item(title=item["title"]))
+            for item in candidates
         ],
     }
 
@@ -173,439 +169,61 @@ def _identity(arguments):
 
 
 class AgentIndexerActionUnitTests(unittest.TestCase):
-    def test_search_arguments_normalize_and_reject_unsafe_fields(self):
-        service = FakeIndexerService()
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-        ):
-            normalized = search_arguments(
-                {
-                    "title": "  Demo  ",
-                    "aliases": ["Alias"],
-                    "year": 2026,
-                    "media_type": "ANIME",
-                    "season": 1,
-                    "episode": 192,
-                    "sites": ["NYAA", "nyaa"],
-                    "sort_mode": "PUBLISHED_DESC",
-                    "limit": 12,
-                }
-            )
-        self.assertEqual(normalized["title"], "Demo")
-        self.assertEqual(normalized["media_type"], "anime")
-        self.assertEqual(normalized["sites"], ["nyaa"])
-        self.assertEqual(normalized["sort_mode"], "published_desc")
-        self.assertEqual((normalized["season"], normalized["episode"]), (1, 192))
-        self.assertEqual(normalized["limit"], 12)
-        invalid_payloads = (
-            {"title": "Demo", "magnet": _SECRET_MAGNET},
-            {"title": ""},
-            {"title": "Demo\x00"},
-            {"title": "Demo", "aliases": ["x"] * 9},
-            {"title": "Demo", "year": True},
-            {"title": "Demo", "page": 0},
-            {"title": "Demo", "limit": 51},
-            {"title": "Demo", "sites": ["../nyaa"]},
-            {"title": "Demo", "sort_mode": "newest"},
-            {"title": "Demo", "season": True},
-            {"title": "Demo", "season": -1},
-            {"title": "Demo", "season": 101},
-            {"title": "Demo", "episode": 0},
-            {"title": "Demo", "episode": 1001},
-        )
-        for payload in invalid_payloads:
-            with self.subTest(payload=payload), self.assertRaises(AgentToolError):
-                search_arguments(payload)
 
-    def test_search_arguments_reject_site_absent_from_agent_registry(self):
-        service = FakeIndexerService()
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            self.assertRaises(AgentToolError) as rejected,
-        ):
-            search_arguments({"title": "Demo", "sites": ["mikan"]})
-        self.assertIn("未启用", rejected.exception.safe_message)
 
-    def test_disabled_sukebei_does_not_suggest_enabling_all_sites(self):
-        service = FakeIndexerService()
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            self.assertRaises(AgentToolError) as rejected,
-        ):
-            search_arguments(
-                {
-                    "title": "uncensored",
-                    "sites": ["sukebei"],
-                    "sort_mode": "published_desc",
-                }
-            )
 
-        self.assertEqual(rejected.exception.code, "precondition_failed")
-        self.assertIn("单独授权成人来源", rejected.exception.safe_message)
-        self.assertNotIn("启用所有", rejected.exception.safe_message)
 
-    def test_recent_adult_search_is_restricted_to_sukebei_and_sorted_by_date(self):
-        item = _resource_item(
-            site_id="sukebei",
-            site_name="Sukebei",
-            category="Real Life",
-        )
-        service = FakeIndexerService(
-            item=item,
-            enabled_site_ids=("sukebei",),
-            sites_attempted=("sukebei",),
-            sites_succeeded=("sukebei",),
-            partial=False,
-        )
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-        ):
-            arguments = search_arguments(
-                {
-                    "title": "uncensored",
-                    "sites": ["sukebei"],
-                    "sort_mode": "published_desc",
-                    "limit": 10,
-                }
-            )
-            result = search_resources(arguments)
 
-        request, sites = service.search_calls[0]
-        self.assertEqual(sites, ["sukebei"])
-        self.assertEqual(request.title, "uncensored")
-        self.assertEqual(request.sort_mode, "published_desc")
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.data["sort_mode"], "published_desc")
-        self.assertEqual(result.data["sites_attempted"], ["sukebei"])
-        self.assertEqual(result.data["sites_succeeded"], ["sukebei"])
-        self.assertEqual(result.data["items"][0]["site_id"], "sukebei")
 
-    def test_search_reports_service_and_tool_caps_without_site_failure(self):
-        service = FakeIndexerService(partial=False)
-        for limit_source in ("service", "tool", "provider"):
-            with self.subTest(limit_source=limit_source):
-                result = AggregatedIndexerResult(query="Demo", page=1, items=[service.item],
-                                                 sites_attempted=("nyaa",), sites_succeeded=("nyaa",))
-                if limit_source == "service":
-                    result.site_collected_counts = {"nyaa": 60}
-                    result.site_truncated_counts = {"nyaa": 20}
-                elif limit_source == "provider":
-                    result.errors = [IndexerProviderError("nyaa", "coverage_limited", "本轮仅检索 3/15 个作品候选")]
-                    result.partial = True
-                else:
-                    result.items = [service.item, service.item]
-                with (
-                    patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-                    patch("app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service),
-                    patch.object(service, "search_media", new=AsyncMock(return_value=result)),
-                ):
-                    output = search_resources({"title": "Demo", "original_title": "", "english_title": "",
-                                               "aliases": [], "year": None, "media_type": "",
-                                               "page": 1, "sites": ["nyaa"], "limit": 1})
-                self.assertTrue(output.ok)
-                self.assertEqual(output.status, "partial" if limit_source == "provider" else "success")
-                self.assertTrue(output.data["truncated"])
-                self.assertIn("未覆盖部分仍未知", output.summary)
-                if limit_source == "provider":
-                    self.assertEqual(output.data["errors"][0]["code"], "coverage_limited")
-                    self.assertIn("3/15", output.data["errors"][0]["message"])
 
-    def test_search_resources_returns_only_public_projection(self):
-        service = FakeIndexerService()
-        arguments = {
-            "title": "Demo",
-            "original_title": "",
-            "english_title": "",
-            "aliases": [],
-            "year": None,
-            "media_type": "",
-            "page": 1,
-            "sites": ["nyaa"],
-            "limit": 20,
-        }
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-        ):
-            result = search_resources(arguments)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.data["items"][0]["result_id"], _RESULT_ID)
-        self.assertEqual(result.data["items"][0]["position"], 1)
-        self.assertEqual(service.search_calls[0][1], ["nyaa"])
-        self.assertEqual(len(result.references), 1)
-        self.assertEqual(result.references[0].kind, "resource_candidates")
-        self.assertEqual(
-            result.references[0].value["candidates"][0]["result_id"],
-            _RESULT_ID,
-        )
-        serialized = str(result.to_dict())
-        self.assertNotIn("references", serialized)
-        self.assertNotIn(_SECRET_MAGNET, serialized)
-        self.assertNotIn(_SECRET_TORRENT_URL, serialized)
-        self.assertNotIn(_SECRET_DETAIL_URL, serialized)
 
-    def test_search_resources_propagates_safe_query_errors_and_keeps_candidates(self):
-        private_html = "<html>private cookie=secret; upstream diagnostic</html>"
-        rejected = IndexerQueryRejected(private_html)
-        challenge = IndexerChallengeRequired(private_html)
-        detail_error = EmpireAdapter(
-            site_id="ys5266",
-            site_name="5266影视",
-            base_url="https://www.5266ys.net/",
-            http=object(),
-        )._detail_error(challenge)
-        self.assertEqual(detail_error.site_id, "ys5266")
 
-        service = FakeIndexerService(partial=False)
-        result = AggregatedIndexerResult(
-            query="Demo",
-            page=1,
-            items=[service.item],
-            sites_attempted=("nyaa", "dygang", "ys5266"),
-            sites_succeeded=("nyaa",),
-            site_item_counts={"nyaa": 1},
-            errors=[
-                IndexerProviderError("dygang", rejected.code, rejected.public_message),
-                detail_error,
-            ],
-            partial=True,
-        )
-        arguments = {
-            "title": "Demo",
-            "original_title": "",
-            "english_title": "",
-            "aliases": [],
-            "year": None,
-            "media_type": "",
-            "page": 1,
-            "sites": ["nyaa", "dygang", "ys5266"],
-            "limit": 20,
-        }
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch("app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service),
-            patch.object(service, "search_media", new=AsyncMock(return_value=result)),
-        ):
-            output = search_resources(arguments)
 
-        self.assertTrue(output.ok)
-        self.assertEqual(output.status, "partial")
-        self.assertEqual(output.data["items"][0]["title"], service.item.title)
-        self.assertEqual(
-            [(error["site_id"], error["code"]) for error in output.data["errors"]],
-            [("dygang", "query_rejected"), ("ys5266", "challenge_required")],
-        )
-        self.assertEqual(output.data["errors"][0]["message"], rejected.public_message)
-        self.assertEqual(output.data["errors"][1]["message"], detail_error.message)
-        self.assertIn("关键词", output.data["errors"][0]["message"])
-        self.assertTrue(
-            any(term in output.data["errors"][0]["message"] for term in ("片名", "别名"))
-        )
-        self.assertNotIn("缩短", output.data["errors"][0]["message"])
-        self.assertIn("人机验证", output.data["errors"][1]["message"])
-        serialized = str(output.to_dict())
-        self.assertNotIn(private_html, serialized)
-        self.assertNotIn("btbtla", serialized)
 
-    def test_present_candidates_is_read_only_keeps_original_positions_and_hides_private_data(self):
-        snapshot = _candidate_snapshot()
-        with (
-            patch(
-                "app.agent.domains.resources.candidate_actions.restore_resource_candidate_reference"
-            ) as restore,
-            patch(
-                "app.agent.domains.resources.candidate_actions.active_agent_resource_candidates"
-            ) as active,
-        ):
-            result = present_candidates(
-                {"resource_candidates": snapshot, "positions": [2, 1]}
-            )
 
-        restore.assert_not_called()
-        active.assert_not_called()
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "found")
-        self.assertEqual(result.summary, "已筛选2项资源候选")
-        self.assertEqual(result.data, {"positions": [2, 1]})
-        self.assertEqual(len(result.references), 1)
-        self.assertEqual(result.references[0].kind, "resource_candidates")
-        self.assertIs(result.references[0].value, snapshot)
-        self.assertEqual(
-            [item["position"] for item in result.references[0].value["candidates"]],
-            [1, 2],
-        )
-        serialized = str(result.to_dict())
-        self.assertNotIn("_private_items", serialized)
-        self.assertNotIn(_SECRET_MAGNET, serialized)
-        self.assertNotIn(_SECRET_TORRENT_URL, serialized)
-
-    def test_present_candidates_rejects_invalid_positions(self):
-        reference = "ref_" + "a" * 16
-        for positions in ([0], [51], [1, 1], None, "all"):
-            with self.subTest(positions=positions), self.assertRaises(AgentToolError):
-                present_candidates_arguments(
-                    {"resource_candidates_ref": reference, "positions": positions}
-                )
-
-        with self.assertRaisesRegex(AgentToolError, "不存在"):
-            present_candidates(
-                {"resource_candidates": _candidate_snapshot(count=1), "positions": [2]}
-            )
-
-    def test_present_candidates_empty_is_explicit_clear_and_keeps_reference(self):
-        snapshot = _candidate_snapshot()
-        result = present_candidates(
-            {"resource_candidates": snapshot, "positions": []}
-        )
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "empty")
-        self.assertEqual(result.data, {"positions": []})
-        self.assertEqual(len(result.references), 1)
-        self.assertIs(result.references[0].value, snapshot)
-
-    def test_search_candidate_positions_skip_unavailable_items_without_gaps(self):
-        unavailable = _resource_item(
-            result_id="unavailable-result-1234",
-            title="Unavailable",
-            download_state="unavailable",
-            download_kinds=(),
-        )
-        first = _resource_item(result_id="eligible-result-0001", title="First")
-        second = _resource_item(result_id="eligible-result-0002", title="Second")
-        service = FakeIndexerService(items=[unavailable, first, second])
-        arguments = {
-            "title": "Demo",
-            "original_title": "",
-            "english_title": "",
-            "aliases": [],
-            "year": None,
-            "media_type": "",
-            "page": 1,
-            "sites": ["nyaa"],
-            "limit": 20,
-        }
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-        ):
-            result = search_resources(arguments)
-        self.assertNotIn("position", result.data["items"][0])
-        self.assertEqual(
-            [item.get("position") for item in result.data["items"]], [None, 1, 2]
-        )
-
-    def test_search_resources_enforces_caller_timeout(self):
-        service = FakeIndexerService()
-
-        async def slow_search(_request, _sites=None, *, scope="agent", timeout_seconds=None):
-            await asyncio.sleep(0.05)
-            raise AssertionError("timeout should cancel the slow search")
-
-        self.enterContext(patch.object(service, "search_media", slow_search))
-        arguments = {
-            "title": "Demo",
-            "original_title": "",
-            "english_title": "",
-            "aliases": [],
-            "year": None,
-            "media_type": "",
-            "page": 1,
-            "sites": ["nyaa"],
-            "limit": 20,
-        }
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-        ):
-            result = search_resources(arguments, timeout_seconds=0.001)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "timeout")
-        self.assertEqual(result.error, "资源检索超时。")
-
-    def test_search_resources_disabled_does_not_create_service(self):
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=False),
-            patch("app.agent.domains.resources.indexer_actions.get_indexer_service") as service_factory,
-        ):
-            result = search_resources({})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "disabled")
-        service_factory.assert_not_called()
 
     def test_preview_is_safe_and_requires_ready_target(self):
         service = FakeIndexerService()
         arguments = {"result_id": _RESULT_ID, "target": "qb"}
         with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
+            patch("app.indexers.downloads.config.get_bool", return_value=True),
             patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch(
-                "app.agent.domains.resources.indexer_actions.download_target_readiness",
+                "app.indexers.downloads.download_target_readiness",
                 return_value={"qb": True},
             ),
         ):
-            result, _context = prepare_submit_resource(arguments)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "confirmation_required")
-        serialized = str(result.to_dict())
+            result, _context = preview_indexer_download_batch(service, [arguments["result_id"]], arguments["target"], scope="agent")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "confirmation_required")
+        serialized = str(result)
         self.assertNotIn(_SECRET_MAGNET, serialized)
         self.assertNotIn(_SECRET_TORRENT_URL, serialized)
         self.assertNotIn(_SECRET_DETAIL_URL, serialized)
         with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
+            patch("app.indexers.downloads.config.get_bool", return_value=True),
             patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch(
-                "app.agent.domains.resources.indexer_actions.download_target_readiness",
+                "app.indexers.downloads.download_target_readiness",
                 return_value={"qb": False},
             ),
         ):
-            unavailable, _context = prepare_submit_resource(arguments)
-        self.assertFalse(unavailable.ok)
-        self.assertEqual(unavailable.status, "not_configured")
+            unavailable, _context = preview_indexer_download_batch(service, [arguments["result_id"]], arguments["target"], scope="agent")
+        self.assertFalse(unavailable["ok"])
+        self.assertEqual(unavailable["status"], "not_configured")
 
     def test_preview_rejects_expired_and_non_downloadable_results(self):
         service = FakeIndexerService()
         with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
+            patch("app.indexers.downloads.config.get_bool", return_value=True),
         ):
-            expired, _context = prepare_submit_resource(
-                {"result_id": "expired-result-1234", "target": "qb"}
-            )
+            expired, _context = preview_indexer_download_batch(service, ["expired-result-1234"], "qb", scope="agent")
             service.result_store.item = _resource_item(
                 download_state="unavailable", download_kinds=()
             )
-            blocked, _context = prepare_submit_resource(
-                {"result_id": _RESULT_ID, "target": "qb"}
-            )
-        self.assertFalse(expired.ok)
-        self.assertEqual(expired.status, "result_expired")
-        self.assertFalse(blocked.ok)
-        self.assertEqual(blocked.status, "validation_error")
+            blocked, _context = preview_indexer_download_batch(service, [_RESULT_ID], "qb", scope="agent")
+        self.assertFalse(expired["ok"])
+        self.assertEqual(expired["status"], "result_expired")
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["status"], "validation_error")
 
     def test_preview_expires_legacy_combined_ticket_without_rebinding_child_site(self):
         service = FakeIndexerService(
@@ -617,222 +235,132 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             enabled_site_ids=("btbtla", "aipan"),
         )
         with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch("app.agent.domains.resources.indexer_actions.download_target_readiness") as readiness,
+            patch("app.indexers.downloads.config.get_bool", return_value=True),
+            patch("app.indexers.downloads.download_target_readiness") as readiness,
         ):
-            expired, _context = prepare_submit_resource(
-                {"result_id": _RESULT_ID, "target": "qb"}
-            )
+            expired, _context = preview_indexer_download_batch(service, [_RESULT_ID], "qb", scope="agent")
 
-        self.assertFalse(expired.ok)
-        self.assertEqual(expired.status, "result_expired")
-        assert expired.error is not None
-        self.assertIn("旧资源确认已过期，请重新搜索", expired.error)
+        self.assertFalse(expired["ok"])
+        self.assertEqual(expired["status"], "result_expired")
+        assert expired["error"] is not None
+        self.assertIn("旧资源确认已过期，请重新搜索", expired["error"])
         readiness.assert_not_called()
 
     def test_confirmation_context_changes_when_resource_changes(self):
         service = FakeIndexerService()
         arguments = {"result_id": _RESULT_ID, "target": "qb"}
         with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
+            patch("app.indexers.downloads.config.get_bool", return_value=True),
             patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch(
-                "app.agent.domains.resources.indexer_actions.download_target_readiness",
+                "app.indexers.downloads.download_target_readiness",
                 return_value={"qb": True},
             ),
         ):
-            first = prepare_submit_resource(arguments)[1]
+            first = preview_indexer_download_batch(service, [arguments["result_id"]], arguments["target"], scope="agent")[1]
             service.result_store.item = _resource_item(title="Changed Resource")
-            second = prepare_submit_resource(arguments)[1]
+            second = preview_indexer_download_batch(service, [arguments["result_id"]], arguments["target"], scope="agent")[1]
         self.assertNotEqual(first, second)
-        self.assertNotIn("Changed", first + second)
+        self.assertEqual((first["resources"][0]["title"], second["resources"][0]["title"]), (service.item.title, "Changed Resource"))
+        self.assertNotIn(_SECRET_MAGNET, str((first, second)))
 
     def test_submit_resource_returns_sanitized_public_result(self):
-        service = FakeIndexerService()
-        dispatch = AsyncMock(
-            return_value={
-                "result_id": _RESULT_ID,
-                "ok": True,
-                "request_id": 12,
-                "created": True,
-                "target": "both",
-                "status": "partial",
-                "succeeded": ["qb"],
-                "failed": ["guangya"],
-                "duplicate": False,
-                "error": "private backend error",
-                "results": {"qb": {"token": "secret"}},
-            }
-        )
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch("app.agent.domains.resources.indexer_actions.download_indexer_result", dispatch),
-        ):
-            result = _submit_resource({"result_id": _RESULT_ID, "target": "both"})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(
-            set(result.data),
-            {
-                "result_id",
-                "request_id",
-                "created",
-                "target",
-                "status",
-                "succeeded",
-                "failed",
-                "duplicate",
-                "ok",
-                "error",
-            },
-        )
-        self.assertNotIn("private backend error", str(result.to_dict()))
-        self.assertNotIn("secret", str(result.to_dict()))
-        dispatch.assert_awaited_once_with(
-            service, _RESULT_ID, "both", origin_namespace="agent", scope="agent"
-        )
+        service = FakeDownloadService(_resource_item())
+        with patch("app.indexers.downloads._persist_and_dispatch", return_value=(
+            {"created": True}, 12, {"status": "partial", "succeeded": ["qb"], "failed": ["guangya"],
+                                  "error": "private backend error", "results": {"qb": {"token": "secret"}}},
+        )) as dispatch:
+            snapshot = preflight_indexer_download_batch(service, [_RESULT_ID], "both", scope="agent")
+            result = asyncio.run(submit_indexer_download_batch(
+                service, [_RESULT_ID], "both", expected_snapshot=snapshot, origin_namespace="agent", scope="agent",
+            ))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        item = result["items"][0]
+        self.assertEqual(set(item), {"result_id", "request_id", "created", "target", "status",
+                                    "succeeded", "failed", "duplicate", "ok", "error"})
+        self.assertEqual((result["total"], result["succeeded"], result["failed"]), (1, 1, 0))
+        self.assertEqual((item["request_id"], item["status"], item["succeeded"], item["failed"]),
+                         (12, "partial", ["qb"], ["guangya"]))
+        self.assertNotIn("private backend error", str(result))
+        self.assertNotIn("secret", str(result))
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[1:3], ("agent:nyaa", "both"))
 
     def test_submit_resource_maps_duplicate_failure_and_internal_error(self):
-        service = FakeIndexerService()
-        base = {
-            "result_id": _RESULT_ID,
-            "request_id": 12,
-            "created": False,
-            "target": "qb",
-            "succeeded": [],
-            "failed": [],
-        }
-        outcomes = (
-            (
-                {**base, "ok": False, "status": "duplicate", "duplicate": True},
-                "conflict",
-            ),
-            (
-                {**base, "ok": False, "status": "failed", "duplicate": False},
-                "unavailable",
-            ),
-        )
-        for payload, expected_status in outcomes:
-            with (
-                self.subTest(expected_status=expected_status),
-                patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-                patch(
-                    "app.agent.domains.resources.indexer_actions.get_indexer_service",
-                    return_value=service,
-                ),
-                patch(
-                    "app.agent.domains.resources.indexer_actions.download_indexer_result",
-                    AsyncMock(
-                        return_value={**payload, "error": "private backend detail"}
-                    ),
-                ),
-            ):
-                result = _submit_resource({"result_id": _RESULT_ID, "target": "qb"})
-            self.assertFalse(result.ok)
-            self.assertEqual(result.status, expected_status)
-            self.assertNotIn("private backend detail", str(result.to_dict()))
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch(
-                "app.agent.domains.resources.indexer_actions.download_indexer_result",
-                AsyncMock(side_effect=RuntimeError("secret internal error")),
-            ),
-        ):
-            internal = _submit_resource({"result_id": _RESULT_ID, "target": "qb"})
-        self.assertFalse(internal.ok)
-        self.assertEqual(internal.status, "unavailable")
-        self.assertNotIn("secret internal error", str(internal.to_dict()))
+        service = FakeDownloadService(_resource_item())
+        for outcome, expected_status in (("duplicate", "conflict"), ("failed", "unavailable")):
+            with self.subTest(outcome=outcome), patch("app.indexers.downloads._persist_and_dispatch", return_value=(
+                {"created": False}, 12, {"status": outcome, "succeeded": [], "failed": [], "duplicate": outcome == "duplicate",
+                                       "error": "private backend detail"},
+            )):
+                snapshot = preflight_indexer_download_batch(service, [_RESULT_ID], "qb", scope="agent")
+                result = asyncio.run(submit_indexer_download_batch(
+                    service, [_RESULT_ID], "qb", expected_snapshot=snapshot, scope="agent",
+                ))
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], expected_status)
+            self.assertEqual(result["items"][0]["status"], outcome)
+            self.assertNotIn("private backend detail", str(result))
+        with patch("app.indexers.downloads._persist_and_dispatch", side_effect=RuntimeError("secret internal error")):
+            snapshot = preflight_indexer_download_batch(service, [_RESULT_ID], "qb", scope="agent")
+            result = asyncio.run(submit_indexer_download_batch(
+                service, [_RESULT_ID], "qb", expected_snapshot=snapshot, scope="agent",
+            ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotIn("secret internal error", str(result))
 
     def test_submit_resource_preserves_manual_review_without_private_error(self):
-        service = FakeIndexerService()
-        dispatch = AsyncMock(
-            return_value={
-                "result_id": _RESULT_ID,
-                "ok": False,
-                "request_id": 12,
-                "created": True,
-                "target": "guangya",
-                "status": "manual_review",
-                "succeeded": [],
-                "failed": ["guangya"],
-                "duplicate": False,
-                "error": "private timeout magnet:?xt=urn:btih:secret",
-            }
-        )
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch("app.agent.domains.resources.indexer_actions.download_indexer_result", dispatch),
-        ):
-            result = _submit_resource({"result_id": _RESULT_ID, "target": "guangya"})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "review_required")
-        self.assertEqual(result.summary, "下载任务提交结果待核对")
-        self.assertNotIn("private timeout", str(result.to_dict()))
-        self.assertNotIn("magnet:", str(result.to_dict()))
+        service = FakeDownloadService(_resource_item())
+        with patch("app.indexers.downloads._persist_and_dispatch", return_value=(
+            {"created": True}, 12, {"status": "manual_review", "succeeded": [], "failed": ["guangya"],
+                                  "error": "private timeout magnet:?xt=urn:btih:secret"},
+        )):
+            snapshot = preflight_indexer_download_batch(service, [_RESULT_ID], "guangya", scope="agent")
+            result = asyncio.run(submit_indexer_download_batch(
+                service, [_RESULT_ID], "guangya", expected_snapshot=snapshot, scope="agent",
+            ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "review_required")
+        self.assertEqual((result["review_required"], result["failed"]), (1, 0))
+        self.assertEqual(result["items"][0]["status"], "manual_review")
+        self.assertIn("勿直接重复提交", result["error"])
+        self.assertNotIn("private timeout", str(result))
+        self.assertNotIn("magnet:", str(result))
 
     def test_single_resource_preserves_safe_guangya_rejection_reason(self):
-        with patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True), patch(
-            "app.agent.domains.resources.indexer_actions.download_indexer_result", AsyncMock(return_value={
-                "ok": False, "result_id": _RESULT_ID, "request_id": 88, "created": True,
-                "target": "guangya", "status": "failed", "succeeded": [], "failed": ["guangya"],
-                "error": "上游文件违规 https://private.example/token=SECRET", "duplicate": False,
-            })
-        ):
-            result = _submit_resource({"result_id": _RESULT_ID, "target": "guangya"}, service=FakeIndexerService())
-        self.assertFalse(result.ok)
-        self.assertEqual(result.error, "光鸭返回：文件违规")
-        self.assertEqual(result.data["error"], result.error)
-        self.assertEqual(result.data["request_id"], 88)
-        self.assertNotIn("SECRET", str(result.to_dict()))
-        self.assertNotIn("https://", str(result.to_dict()))
+        service = FakeDownloadService(_resource_item())
+        with patch("app.indexers.downloads._persist_and_dispatch", return_value=(
+            {"created": True}, 88, {"status": "failed", "succeeded": [], "failed": ["guangya"],
+                                  "error": "上游文件违规 https://private.example/token=SECRET"},
+        )):
+            snapshot = preflight_indexer_download_batch(service, [_RESULT_ID], "guangya", scope="agent")
+            result = asyncio.run(submit_indexer_download_batch(
+                service, [_RESULT_ID], "guangya", expected_snapshot=snapshot, scope="agent",
+            ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["items"][0]["error"], "光鸭返回：文件违规")
+        self.assertEqual(result["items"][0]["request_id"], 88)
+        self.assertNotIn("SECRET", str(result))
+        self.assertNotIn("https://", str(result))
 
     def test_submit_resource_batch_counts_manual_review_separately(self):
-        service = FakeIndexerService()
-        public_result = {
-            "result_id": _RESULT_ID,
-            "ok": False,
-            "request_id": 12,
-            "created": True,
-            "target": "guangya",
-            "status": "manual_review",
-            "succeeded": [],
-            "failed": ["guangya"],
-            "duplicate": False,
-            "error": "下载后端提交结果未知，请先核对下载器，勿直接重复提交",
-        }
-        dispatch = AsyncMock(return_value=public_result)
+        service = FakeDownloadService(_resource_item())
         result_ids = [_RESULT_ID, "opaque-result-5678"]
-        with (
-            patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-            patch(
-                "app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=service
-            ),
-            patch("app.agent.domains.resources.indexer_actions.download_indexer_result_public", dispatch),
-        ):
-            result = _submit_resource_batch(
-                {"result_ids": result_ids, "target": "guangya"}
-            )
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "review_required")
-        self.assertEqual(result.data["review_required"], 2)
-        self.assertEqual(result.data["failed"], 0)
-        assert result.error is not None
-        self.assertIn("勿直接重复提交", result.error)
-        self.assertEqual(dispatch.await_count, 2)
+        with patch("app.indexers.downloads._persist_and_dispatch", side_effect=[
+            ({"created": True}, number, {"status": "manual_review", "succeeded": [], "failed": ["guangya"]})
+            for number in (12, 13)
+        ]):
+            snapshot = preflight_indexer_download_batch(service, result_ids, "guangya", scope="agent")
+            result = asyncio.run(submit_indexer_download_batch(
+                service, result_ids, "guangya", expected_snapshot=snapshot, scope="agent",
+            ))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "review_required")
+        self.assertEqual(result["review_required"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual([item["result_id"] for item in result["items"]], result_ids)
+        self.assertIn("勿直接重复提交", result["error"])
 
     def test_shared_download_service_dispatches_only_server_resolved_value(self):
         item = _resource_item(download_kinds=("magnet",))
@@ -865,7 +393,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         create.assert_called_once_with(
             replace(normalized, display_title=item.title), "", "", origin="indexer:nyaa", user_id=""
         )
-        dispatch.assert_called_once_with(7, "qb")
+        dispatch.assert_called_once_with(7, "qb", qb_save_path="", qb_category="")
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "submitted")
 
@@ -924,8 +452,8 @@ class IndexerReceivingSourceTests(unittest.TestCase):
                     origin_namespace="agent", scope="agent",
                 ))
                 self.assertTrue(result["ok"])
-                self.assertEqual(submit.call_args.kwargs.get("gy_target_dir", ""), "source-123" if routed else "")
-                self.assertEqual(submit.call_args.kwargs.get("gy_target_name", ""), "FixtureSpecial" if routed else "")
+                self.assertEqual(submit.call_args.kwargs.get("gy_target_dir", ""), "source-123" if routed else "0" if target == "guangya" else "")
+                self.assertEqual(submit.call_args.kwargs.get("gy_target_name", ""), "FixtureSpecial" if routed else "默认目录" if target == "guangya" else "")
 
     def test_missing_or_ambiguous_source_never_falls_back_to_normal_inbox(self):
         from app.indexers.downloads import download_indexer_result_public
@@ -943,46 +471,80 @@ class IndexerReceivingSourceTests(unittest.TestCase):
                 submit.assert_not_called()
 
     def test_single_and_batch_confirmation_bind_actual_receiving_source(self):
-        from app.agent.domains.resources.indexer_actions import (
-            prepare_submit_resource_batch,
-            submit_resource_batch_confirmed,
-            submit_resource_confirmed,
-        )
-        for batch in (False, True):
-            with (self.subTest(batch=batch),
-                patch("app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True),
-                patch("app.agent.domains.resources.indexer_actions.get_indexer_service", return_value=FakeIndexerService(item=_resource_item(site_id="sukebei"))),
-                patch("app.agent.domains.resources.indexer_actions.download_target_readiness", return_value={"guangya": True}),
+        for result_ids in ([_RESULT_ID], [_RESULT_ID, "opaque-result-5678"]):
+            service = FakeDownloadService(_resource_item(site_id="sukebei"))
+            with (self.subTest(result_ids=result_ids),
+                patch("app.indexers.downloads.config.get_bool", return_value=True),
+                patch("app.indexers.downloads.download_target_readiness", return_value={"guangya": True}),
                 patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[{"id": "source-123", "name": "FixtureSpecial"}]) as sources,
-                patch("app.agent.domains.resources.indexer_actions._submit_resource") as single,
-                patch("app.agent.domains.resources.indexer_actions._submit_resource_batch") as multiple,
+                patch("app.indexers.downloads.submit_download_input") as submit,
             ):
-                arguments = {"result_ids": [_RESULT_ID], "target": "guangya"} if batch else {"result_id": _RESULT_ID, "target": "guangya"}
-                preview, token = (prepare_submit_resource_batch(arguments) if batch
-                                  else prepare_submit_resource({"result_id": _RESULT_ID, "target": "guangya"}))
-                self.assertTrue(preview.ok)
-                resources = preview.data["resources"] if batch else [preview.data["resource"]]
-                self.assertEqual(resources[0]["receiving_folder"], "FixtureSpecial")
-                self.assertNotIn("source-123", str(preview.to_dict()))
+                preview, token = preview_indexer_download_batch(service, result_ids, "guangya", scope="agent")
+                self.assertTrue(preview["ok"])
+                self.assertEqual(preview["data"]["resources"][0]["receiving_folder"], "FixtureSpecial")
+                self.assertNotIn("source-123", str(preview))
                 sources.return_value = [{"id": "different-source", "name": "FixtureSpecial"}]
-                with self.assertRaises(AgentToolError) as caught:
-                    if batch:
-                        submit_resource_batch_confirmed(arguments, token)
-                    else:
-                        submit_resource_confirmed({"result_id": _RESULT_ID, "target": "guangya"}, token)
+                with self.assertRaises(DownloadSnapshotChanged) as caught:
+                    asyncio.run(submit_indexer_download_batch(service, result_ids, "guangya", expected_snapshot=token, scope="agent"))
                 self.assertEqual(caught.exception.code, "confirmation_stale")
-                single.assert_not_called()
-                multiple.assert_not_called()
+                submit.assert_not_called()
+
+    def test_resource_or_defaults_changing_during_resolution_never_reach_dispatch(self):
+        from app import config
+        from app.indexers.downloads import DownloadSnapshotChanged, preflight_indexer_download
+        from app.modules.offline import OfflineRules
+
+        for target, field in (("qb", "title"), ("qb", "TG_QB_SAVE_PATH"), ("qb", "TG_QB_CATEGORY"),
+                              ("guangya", "target_dir_id"), ("guangya", "secondary_dir_id")):
+            with self.subTest(target=target, field=field):
+                service = FakeDownloadService(_resource_item())
+                values = {"TG_QB_SAVE_PATH": "/frozen", "TG_QB_CATEGORY": "original",
+                          "QB_PASSWORD": "fixture-private-password"}
+                rules = replace(OfflineRules.from_config(), target_dir_id="original", secondary_enabled=True,
+                                secondary_dir_id="secondary-original", secondary_keywords=("Demo",))
+                original_get = config.get
+                with (
+                    patch.object(config, "get", side_effect=lambda key, default="": values.get(key, original_get(key, default))),
+                    patch("app.modules.offline.OfflineRules.from_config", return_value=rules) as routing,
+                    patch("app.indexers.downloads.download_target_readiness", return_value={target: True}),
+                    patch("app.indexers.downloads.submit_download_input") as submit,
+                ):
+                    frozen = preflight_indexer_download(service, _RESULT_ID, target, scope="agent")
+                    serialized = json.dumps(frozen)
+                    for secret in ("fixture-private-password", _SECRET_MAGNET, _SECRET_TORRENT_URL, _SECRET_DETAIL_URL):
+                        self.assertNotIn(secret, serialized)
+
+                    async def resolve(_result_id: str, *, scope: str = "manual") -> ResolvedDownload:
+                        if field == "title":
+                            service.result_store.item = replace(service.result_store.item, title="changed candidate")
+                        elif target == "qb":
+                            values[field] = "changed"
+                        else:
+                            routing.return_value = (replace(rules, target_dir_id="changed") if field == "target_dir_id"
+                                                    else replace(rules, secondary_dir_id="changed"))
+                        return ResolvedDownload("magnet", _SECRET_MAGNET)
+
+                    service.resolve = resolve
+                    with self.assertRaises(DownloadSnapshotChanged):
+                        asyncio.run(download_indexer_result(service, _RESULT_ID, target, scope="agent",
+                                                            expected_snapshot=json.loads(serialized)))
+                    submit.assert_not_called()
 
     def test_receiving_summary_combines_selected_routes_without_false_default(self):
-        from app.agent.domains.resources.ingest_actions import _receiving_folders
         from app.modules.offline import OfflineRules
-        with patch("app.modules.offline.OfflineRules.from_config", return_value=replace(OfflineRules.from_config(), target_dir_id="normal", target_dir_name="Inbox", secondary_enabled=False)):
-            self.assertEqual(_receiving_folders("guangya", []), _receiving_folders("guangya", [{}]))
-            folders, _ = _receiving_folders("guangya", [{"receiving_folder": "FixtureSpecial"}])
-            self.assertEqual(folders, ["光鸭：FixtureSpecial / 每任务隔离目录"])
-            folders, _ = _receiving_folders("guangya", [{"receiving_folder": "FixtureSpecial"}, {}])
-            self.assertEqual(set(folders), {"光鸭：FixtureSpecial / 每任务隔离目录", "光鸭：Inbox / 每任务隔离目录"})
+        service = FakeIndexerService()
+        service.get_result = lambda result_id, **_kw: _resource_item(site_id="sukebei" if result_id == "special" else "nyaa")
+        with (
+            patch("app.modules.offline.OfflineRules.from_config", return_value=replace(OfflineRules.from_config(), target_dir_id="normal", target_dir_name="Inbox", secondary_enabled=False)),
+            patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[{"id": "special", "name": "FixtureSpecial"}]),
+            patch("app.modules.missing_resources.config.get_bool", return_value=True),
+            patch("app.indexers.runtime.get_indexer_service", return_value=service),
+            patch("app.indexers.downloads.download_target_readiness", return_value={"guangya": True}),
+        ):
+            special, _ = preview_indexer_download_batch(service, ["special"], "guangya", scope="agent")
+            combined, _ = preview_indexer_download_batch(service, ["special", "normal"], "guangya", scope="agent")
+        self.assertEqual(special["data"]["receiving_folders"], ["光鸭：FixtureSpecial / 每任务隔离目录"])
+        self.assertEqual(set(combined["data"]["receiving_folders"]), {"光鸭：FixtureSpecial / 每任务隔离目录", "光鸭：Inbox / 每任务隔离目录"})
 
     def test_classification_survives_persisted_staging_and_retry_without_remote_writes(self):
         from types import SimpleNamespace
@@ -1021,207 +583,24 @@ class IndexerReceivingSourceTests(unittest.TestCase):
             backend.assert_called_once()
 
 
-def test_explicit_quality_filters_before_limit_without_treating_unknown_as_sdr():
-    items = [_resource_item(title='Demo.S03E01.1080p.H264', result_id='unknown-result-1234'),
-             _resource_item(title='Demo.S03E01.1080p.HDR10', result_id='hdr-result-id-1234'),
-             _resource_item(title='Demo.S03E01.2160p.SDR', result_id='fourk-result-1234'),
-             _resource_item(title='Demo.S03E01.1080p.SDR', result_id='matched-result-1234')]
-    service = FakeIndexerService(items=items, partial=False)
-    with (patch('app.agent.domains.resources.indexer_actions.config.get_bool', return_value=True),
-          patch('app.agent.domains.resources.indexer_actions.get_indexer_service', return_value=service)):
-        args = search_arguments({'title': 'Demo', 'resolution': '1080p', 'dynamic_range': 'SDR', 'limit': 1})
-        result = search_resources(args)
-        assert [row['result_id'] for row in result.data['items']] == ['matched-result-1234']
-        assert not result.data['truncated']
-        assert result.data['technical_filter']['unknown_excluded'] == 1
-        assert result.data['technical_filter']['mismatched_excluded'] == 2
-        assert result.references[0].value['candidates'][0]['result_id'] == 'matched-result-1234'
-        service.items = items[:3]
-        result = search_resources(args)
-        assert result.data['items'] == [] and result.status == 'empty'
-        assert result.references[0].value['candidates'] == []
-        assert result.references[0].value['_query_arguments'] == args
-        # 未指定规格的旧调用仍返回原候选；不改变源查询条件和默认行为。
-        result = search_resources(search_arguments({'title': 'Demo'}))
-        assert len(result.data['items']) == 3
-        assert all(call[0].title == 'Demo' for call in service.search_calls)
 
 
-def test_search_quality_enums_reject_invalid_types():
-    for field, value in [('resolution', ['1080p']), ('dynamic_range', True), ('dynamic_range', 'guessed SDR')]:
-        for validator, base in (
-            (search_arguments, {'title': 'Demo'}),
-            (present_candidates_arguments, {'resource_candidates_ref': 'ref_' + 'a' * 24, 'positions': [1]}),
-        ):
-            try:
-                validator({**base, field: value})
-            except AgentToolError:
-                continue
-            raise AssertionError(f'{field} accepted invalid value')
 
 
-def test_quality_filter_keeps_combined_hdr_evidence_and_public_title_boundary():
-    for title, desired, matched in [
-        ('Demo.2160p.DoVi.HDR10', 'HDR10', True),
-        ('Demo.2160p.DoVi.HDR10', 'HDR', True),
-        ('Demo.2160p.HLG', 'HDR', True),
-        ('Demo.1080p.SDR.HDR10', 'SDR', False),
-        ('Demo.' + 'a' * 350 + '.1080p.SDR', 'SDR', False),
-    ]:
-        service = FakeIndexerService(item=_resource_item(title=title), partial=False)
-        with (patch('app.agent.domains.resources.indexer_actions.config.get_bool', return_value=True),
-              patch('app.agent.domains.resources.indexer_actions.get_indexer_service', return_value=service)):
-            result = search_resources(search_arguments({'title': 'Demo', 'dynamic_range': desired}))
-            assert bool(result.data['items']) is matched, (title, desired)
-
-
-def test_refining_existing_candidates_reuses_search_evidence_without_network_or_renumbering():
-    items = [_resource_item(title=title, result_id=f'candidate-{number:016d}') for number, title in enumerate([
-        'Demo.1080p.H264', 'Demo.1080p.HDR10', 'Demo.2160p.SDR',
-        'Demo.1080p.SDR', 'Demo.1080p.SDR.HDR10', 'Demo.2160p.DoVi.HDR10',
-    ])]
-    service = FakeIndexerService(items=items, partial=False)
-    with (patch('app.agent.domains.resources.indexer_actions.config.get_bool', return_value=True),
-          patch('app.agent.domains.resources.indexer_actions.get_indexer_service', return_value=service)):
-        original = search_resources(search_arguments({'title': 'Demo'})).references[0].value
-        before = deepcopy(original)
-        for quality, expected in [
-            ({'resolution': '1080p', 'dynamic_range': 'SDR'}, [4]),
-            ({'dynamic_range': 'SDR'}, [3, 4]),
-            ({'dynamic_range': 'HDR10'}, [2, 5, 6]),
-            ({'dynamic_range': 'HDR'}, [2, 5, 6]),
-            ({'resolution': '720p', 'dynamic_range': 'SDR'}, []),
-            ({'resolution': '', 'dynamic_range': ''}, [1, 2, 3, 4, 5, 6]),
-        ]:
-            fresh = search_resources(search_arguments({'title': 'Demo', **quality}))
-            with patch('app.agent.domains.resources.indexer_actions.get_indexer_service', side_effect=AssertionError('refinement must be offline')):
-                presented = present_candidates({'resource_candidates': original, 'positions': list(range(1, 7)), **quality})
-            assert presented.data['positions'] == expected
-            assert {k: v for k, v in presented.references[0].value.items() if k != '_query_arguments'} == {k: v for k, v in before.items() if k != '_query_arguments'}
-            assert presented.data['effective_query'] == {**before['_query_arguments'], **quality}
-            assert [row['result_id'] for row in fresh.data['items']] == [original['candidates'][pos - 1]['result_id'] for pos in expected]
-            if any(quality.values()):
-                assert presented.data['technical_filter'] == fresh.data['technical_filter']
-            assert presented.status == ('found' if expected else 'empty')
-        # 有限筛选保留请求顺序；没有隐式继承上一轮的 SDR 条件。
-        assert present_candidates({'resource_candidates': original, 'positions': [6, 2, 4], 'dynamic_range': 'HDR'}).data['positions'] == [6, 2]
-        assert present_candidates({'resource_candidates': original, 'positions': [1]}).data == {'positions': [1], 'effective_query': before['_query_arguments']}
-        assert original == before
 
 
 def test_candidate_refinement_reports_scope_without_confusing_subset_with_complete_snapshot():
     snapshot = _candidate_snapshot(count=50)
-    for item in snapshot['candidates']:
-        item['title'] = f"Demo.1080p.{'SDR' if item['position'] == 50 else 'H264'}"
-    args = present_candidates_arguments({'resource_candidates_ref': 'ref_' + 'a' * 24,
-                                        'positions': list(range(1, 51)), 'dynamic_range': 'SDR'})
-    result = present_candidates({**args, 'resource_candidates': snapshot})
-    assert result.data['positions'] == [50]
-    assert result.data['scope'] == {'candidate_count': 50, 'considered_count': 50, 'complete': True}
-    assert result.data['technical_filter']['unknown_excluded'] == 49
-    partial = present_candidates({**args, 'resource_candidates': snapshot, 'positions': list(range(1, 13))})
-    assert partial.data['positions'] == []
-    assert partial.data['scope'] == {'candidate_count': 50, 'considered_count': 12, 'complete': False}
-    cleared = present_candidates({**args, 'resource_candidates': snapshot, 'positions': []})
-    assert cleared.data['positions'] == []
-    assert cleared.data['scope']['considered_count'] == 0
-
-
-def test_query_refinement_normalizes_only_explicit_patch_and_rejects_invalid_values():
-    ref = 'ref_' + 'q' * 24
-    assert search_arguments({'resource_candidates_ref': ref, 'season': 2}) == {
-        'resource_candidates_ref': ref, 'season': 2,
-    }
-    assert search_arguments({'resource_candidates_ref': ref, 'resolution': '', 'season': None}) == {
-        'resource_candidates_ref': ref, 'resolution': '', 'season': None,
-    }
-    for patch_args in ({'season': True}, {'episode': 0}, {'resolution': None}, {'title': ''},
-                       {'aliases': 'Alias'}, {'sites': None}, {'page': None}, {'resource_candidates_ref': None}):
-        with unittest.TestCase().assertRaises(AgentToolError):
-            search_arguments({'resource_candidates_ref': ref, **patch_args})
-
-
-def test_empty_search_can_refine_filters_without_cross_query_state_or_snapshot_mutation():
-    service = FakeIndexerService(items=[], partial=False)
-    with (patch('app.agent.domains.resources.indexer_actions.config.get_bool', return_value=True),
-          patch('app.agent.domains.resources.indexer_actions.get_indexer_service', return_value=service)):
-        first = search_resources(search_arguments({
-            'title': 'Black Mirror', 'original_title': '黑镜', 'year': 2011, 'media_type': 'tv',
-            'season': 1, 'episode': 1, 'resolution': '1080p', 'sites': ['nyaa'], 'page': 3,
-        }))
-        snapshot = first.references[0].value
-        before = deepcopy(snapshot)
-        assert snapshot['candidates'] == []
-        next_result = search_resources({'resource_candidates': snapshot, 'season': 2})
-        effective = next_result.data['effective_query']
-        assert effective == {**first.data['effective_query'], 'season': 2, 'page': 1}
-        narrowed = present_candidates({'resource_candidates': next_result.references[0].value,
-                                       'positions': [], 'dynamic_range': 'SDR'})
-        assert narrowed.data['effective_query'] == {**effective, 'dynamic_range': 'SDR'}
-        continued = search_resources({'resource_candidates': narrowed.references[0].value,
-                                      'resolution': '2160p', 'page': 2})
-        assert continued.data['effective_query'] == {**effective, 'dynamic_range': 'SDR', 'resolution': '2160p', 'page': 2}
-        cleared = search_resources({'resource_candidates': continued.references[0].value,
-                                    'resolution': '', 'dynamic_range': '', 'season': None,
-                                    'episode': None, 'year': None, 'sites': [], 'original_title': ''})
-        assert cleared.data['effective_query'] == {
-            **effective, 'resolution': '', 'dynamic_range': '', 'season': None, 'episode': None,
-            'year': None, 'sites': [], 'original_title': '',
-        }
-        independent = search_resources(search_arguments({'title': 'Another Film', 'media_type': 'movie'}))
-        assert independent.data['effective_query'] == search_arguments({'title': 'Another Film', 'media_type': 'movie'})
-        assert snapshot == before
-        assert service.search_calls[1][0].season == 2 and service.search_calls[1][1] == ['nyaa']
-        assert service.search_calls[-1][0].season is None and service.search_calls[-1][1] is None
-
-
-def test_present_inherits_only_the_selected_reference_and_updates_query_for_next_search():
-    original = _candidate_snapshot(count=3)
-    original['candidates'][0]['title'] = 'Demo.S03E01.1080p.H264'
-    original['candidates'][1]['title'] = 'Demo.S03E01.2160p.SDR'
-    original['candidates'][2]['title'] = 'Demo.S03E01.1080p.SDR'
-    original['_query_arguments'] = search_arguments({'title': 'Demo', 'season': 3, 'episode': 1, 'resolution': '1080p'})
-    before = deepcopy(original)
-    with patch('app.agent.domains.resources.indexer_actions.get_indexer_service', side_effect=AssertionError('offline refinement')):
-        first = present_candidates({'resource_candidates': original, 'positions': [1, 2, 3], 'dynamic_range': 'SDR'})
-        assert first.data['positions'] == [3]
-        second = present_candidates({'resource_candidates': first.references[0].value, 'positions': [1, 2, 3]})
-        assert second.data['positions'] == [3]  # 不重抄规格，也不会放回未知或其它画质。
-        relaxed = present_candidates({'resource_candidates': second.references[0].value, 'positions': [1, 2, 3], 'resolution': ''})
-        assert relaxed.data['positions'] == [2, 3]
-        assert relaxed.data['effective_query']['dynamic_range'] == 'SDR'
-        assert present_candidates({'resource_candidates': original, 'positions': [1, 2, 3]}).data['positions'] == [1, 3]
-        assert original == before
-        assert first.references[0].value['candidates'] == original['candidates']
-
-
-def test_legacy_and_combined_candidate_snapshots_cannot_guess_a_query_for_refinement():
-    from app.agent.domains.resources.candidate_context import (
-        restore_resource_candidate_reference,
-    )
-
-    legacy = {key: value for key, value in _candidate_snapshot().items() if not key.startswith('_private')}
-    for snapshot in (legacy, {**legacy, '_query_arguments': []}):
-        with (patch('app.agent.domains.resources.indexer_actions.config.get_bool', return_value=True),
-              patch('app.agent.domains.resources.indexer_actions.get_indexer_service', side_effect=AssertionError('no implicit search')),
-              unittest.TestCase().assertRaises(AgentToolError)):
-            search_resources({'resource_candidates': snapshot, 'resolution': '2160p'})
-    # 历史候选正常展示/恢复；新查询元数据不能变成下载身份或权限。
-    assert present_candidates({'resource_candidates': legacy, 'positions': [1]}).data == {'positions': [1]}
-    assert restore_resource_candidate_reference({**legacy, '_query_arguments': {'title': 'Demo'}}) == legacy
-    assert restore_resource_candidate_reference({**legacy, '_query_arguments': {'title': 'Demo'}, '_extra': True}) is None
-
-
-def test_excluding_hdr_keeps_unknown_distinct_from_explicit_sdr():
-    from app.agent.domains.resources.indexer_actions import filter_technical_candidates
-
-    items = [{'title': f'Demo.1080p.{suffix}'} for suffix in ('H264', 'SDR', 'HDR10', 'DoVi', 'HLG', 'SDR.HDR10')]
-    selected, stats = filter_technical_candidates(items, {'exclude_hdr': True})
-    assert selected == items[:2] and stats['mismatched_excluded'] == 4
-    assert stats['requested'] == {'exclude_hdr': True} and not stats['stream_verified']
-    selected, stats = filter_technical_candidates(items, {'exclude_hdr': True, 'dynamic_range': 'SDR'})
-    assert selected == items[1:2] and stats['unknown_excluded'] == 1
-    assert filter_technical_candidates(items, {'exclude_hdr': False})[0] == items
-    for value in ('false', 'true', 0, 1, None, []):
-        with unittest.TestCase().assertRaises(AgentToolError):
-            search_arguments({'title': 'Demo', 'exclude_hdr': value})
+    for item, private in zip(snapshot['candidates'], snapshot['_private_items'], strict=True):
+        item['title'] = private['title'] = f"Demo.1080p.{'SDR' if item['position'] == 50 else 'H264'}"
+    ids = [item['result_id'] for item in snapshot['candidates']]
+    result = select_candidates(snapshot, ids, {'dynamic_range': 'SDR'})
+    assert result['result_ids'] == [ids[-1]]
+    assert result['scope'] == {'candidate_count': 50, 'considered_count': 50, 'complete': True, 'pages': []}
+    assert result['technical_filter']['unknown_excluded'] == 49
+    assert _SECRET_MAGNET not in json.dumps(result) and _SECRET_TORRENT_URL not in json.dumps(result)
+    partial = select_candidates(snapshot, ids[:12], {'dynamic_range': 'SDR'})
+    assert partial['result_ids'] == []
+    assert partial['scope'] == {'candidate_count': 50, 'considered_count': 12, 'complete': False, 'pages': []}
+    cleared = select_candidates(snapshot, [], {'dynamic_range': 'SDR'})
+    assert cleared['result_ids'] == []

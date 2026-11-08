@@ -3,22 +3,7 @@ import asyncio
 import json
 
 from app.agent.public_view import sanitize_confirmed_answer
-from tests.test_agent_kernel_core import (
-    AgentInput,
-    AgentSession,
-    CapabilityRetriever,
-    InMemorySessionStateStore,
-    KernelToolSpec,
-    ModelEvent,
-    ModelEventType,
-    ModelToolCall,
-    PreparedEffect,
-    ScriptedModel,
-    ToolCatalog,
-    ToolEffect,
-    ToolPipeline,
-    consume_events,
-)
+from tests.test_agent_kernel_core import AgentInput, AgentSession, InMemorySessionStateStore, KernelToolSpec, ModelEvent, ModelEventType, ModelToolCall, PreparedEffect, ScriptedModel, ToolCatalog, ToolEffect, ToolPipeline, consume_events
 
 SUMMARY = "独立目录核验:另一目录还有2项待处理"
 EXPLANATION = "核验范围仅为另一目录;不能据此确认提交任务已完成。"
@@ -47,7 +32,7 @@ def test_submitted_then_independent_read_survives_provider_failure():
             # Exhausted offline model raises; real Session failure consumer must preserve evidence.
         ])
         catalog, store = ToolCatalog([write, read]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="提交并检查后续任务", owner="o", session_id="s")))
         assert preview.approval is not None

@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app import sdk
 from app.clients.qbittorrent import TorrentAddResult
 from app.config import web_credentials
 from app.main import create_app
@@ -59,14 +60,22 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM download_requests")
 
     def test_attention_list_and_dashboard_count_share_the_same_predicate(self):
+        from app.repositories.download_requests import list_download_request_summaries
+
         request_id = _create_interrupted_request()
 
         self.assertEqual(db.count_download_requests_requiring_attention(), 1)
         rows = db.list_download_requests_requiring_attention(limit=20, offset=0)
         self.assertEqual([int(row["id"]) for row in rows], [request_id])
         self.assertEqual(db.get_dashboard_automation_summary()["downloads_review"], 1)
+        public = list_download_request_summaries(scope="attention")
+        self.assertEqual([item["request_number"] for item in public["items"]], [request_id])
+        self.assertEqual({issue["key"] for issue in public["items"][0]["postprocess_issues"]},
+                         {"organize", "strm"})
 
     def test_retained_staging_directory_is_visible_as_attention(self):
+        from app.repositories.download_requests import list_download_request_summaries
+
         request_id, created = db.create_download_request(
             "attention:staging-retained",
             "magnet",
@@ -87,6 +96,13 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(db.count_download_requests_requiring_attention(), 1)
         rows = db.list_download_requests_requiring_attention(limit=20, offset=0)
         self.assertEqual([int(row["id"]) for row in rows], [request_id])
+        item = list_download_request_summaries(scope="attention")["items"][0]
+        self.assertEqual(item["request_number"], request_id)
+        self.assertEqual(item["status"], "completed")
+        self.assertEqual(item["postprocess_issues"], [{
+            "key": "staging_cleanup", "label": "暂存清理", "status": "retained",
+            "error": "隔离目录仍有 2 项未整理或未识别：sample.txt、poster.jpg",
+        }])
 
     def test_resubmit_creates_successor_and_resolves_previous_attention(self):
         request_id = _create_interrupted_request()
@@ -281,6 +297,41 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             request_id,
             {int(row["id"]) for row in db.list_active_download_requests()},
         )
+
+    def test_resubmitted_requests_keep_real_status_across_sdk_pages(self):
+        item = download_dispatcher.DownloadInput(
+            "magnet", "Transferred query fixture", "magnet:?xt=urn:btih:" + "a" * 40
+        )
+        request_id = int(download_dispatcher.create_request(item, "", "", origin="agent")["id"])
+        db.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
+        with patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "a" * 40}) as submit:
+            result = download_dispatcher.resubmit_download_request(
+                request_id, "qb", qb_runtime_config={"url": "http://fixture.invalid"}
+            )
+        self.assertTrue(result["ok"], result)
+        submit.assert_called_once()
+        successor_id = result["request_id"]
+        first = sdk.downloads.requests(scope="recent", limit=1)
+        last = sdk.downloads.requests(scope="recent", limit=1, offset=first["next_offset"])
+        self.assertEqual(first["items"][0]["request_number"], successor_id)
+        self.assertEqual((first["has_more"], first["next_offset"]), (True, 1))
+        self.assertEqual((last["has_more"], last["next_offset"]), (False, None))
+        old = last["items"][0]
+        self.assertEqual((old["request_number"], old["status"], old["qb_status"]),
+                         (request_id, "resubmitted", "resubmitted"))
+        search = sdk.activity.search(item.title, limit=1)
+        searched_old = sdk.activity.search(item.title, limit=1, offset=search["next_offset"])
+        self.assertEqual((search["total"], searched_old["total"]), (2, 2))
+        self.assertEqual((searched_old["items"][0]["id"], searched_old["items"][0]["status"]),
+                         (request_id, "resubmitted"))
+        self.assertEqual([row["request_number"] for row in sdk.downloads.requests()["items"]], [successor_id])
+        self.assertEqual(sdk.downloads.requests(scope="attention")["items"], [])
+        timeline = sdk.activity.timeline("download", request_id)
+        self.assertTrue(timeline["data"]["terminal"])
+        self.assertEqual(timeline["status"], "completed")
+        self.assertIn("移交", timeline["message"])
+        self.assertIn("不代表实际下载或入库完成", timeline["message"])
+        self.assertFalse(sdk.activity.timeline("download", successor_id)["data"]["terminal"])
 
     def test_http_qb_resubmit_preserves_persisted_torrent_identity(self):
         infohash = "7" * 40

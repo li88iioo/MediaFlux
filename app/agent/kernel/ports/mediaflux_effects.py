@@ -16,8 +16,7 @@ from app.agent.action_history import (
     record_confirmation_interrupted,
     record_confirmed_result,
 )
-from app.agent.domains.activity.actions import attach_activity_reference
-from app.agent.domains.activity.undo import attach_undo_receipt, compensation_candidate
+from app.modules.activity_undo import preference_compensation, preference_undo_receipt
 from app.agent.domains.library.missing_workflow_runtime import (
     MISSING_MEDIA_CANDIDATES_KEY,
     MISSING_MEDIA_FOLLOWUPS_KEY,
@@ -25,12 +24,13 @@ from app.agent.domains.library.missing_workflow_runtime import (
 )
 from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.kernel.tool_calls import ToolCallContext
-from app.agent.models import RiskLevel, ToolContext, ToolResult
+from app.agent.models import RiskLevel, ToolResult
 from app.logger import get_logger
+from app.modules.guangya_fs_change import discard_fs_change_plan
 
 from ..capabilities import KernelToolSpec, ToolEffect
 from ..completion_receipts import EffectCompletionScope
-from ..effects import EffectPlan, PreparedEffect
+from ..tool_calls import EffectPlan, PreparedEffect
 
 logger = get_logger(__name__)
 
@@ -106,7 +106,7 @@ class MediaFluxEffectLifecycle:
         runtime = self.missing_media_runtime
         metadata = dict(prepared.metadata)
         metadata["configuration_fingerprint"] = self._configuration_fingerprint()
-        inverse = compensation_candidate(tool.name, dict(arguments), dict(prepared.preview))
+        inverse = preference_compensation(tool.name, dict(arguments), dict(prepared.preview))
         if inverse:
             metadata["compensation"] = inverse
         candidates = metadata.pop(MISSING_MEDIA_CANDIDATES_KEY, None)
@@ -124,6 +124,17 @@ class MediaFluxEffectLifecycle:
         self, *, prepared: PreparedEffect, context: ToolCallContext
     ) -> None:
         self._release_followups(prepared, context)
+        self._discard_native_cloud_preview(prepared)
+
+    @staticmethod
+    def _discard_native_cloud_preview(source: EffectPlan | PreparedEffect) -> None:
+        if source.metadata.get("source_kind") != "native_cloud_change":
+            return
+        if isinstance(source, EffectPlan) and source.tool_name != "cloud.change":
+            return
+        plan_id = source.metadata.get("fs_change_plan_id")
+        if plan_id:
+            discard_fs_change_plan(plan_id, preview_only=True)
 
     def substep_started(self, *, plan: EffectPlan) -> None:
         record_confirmation_claimed(**self._audit_fields(plan), action_arguments=dict(plan.arguments))
@@ -139,12 +150,16 @@ class MediaFluxEffectLifecycle:
             )
         if not isinstance(value, ToolResult):
             return
-        attach_activity_reference(value, plan.tool_name)
         try:
-            attach_undo_receipt(
-                value, plan.metadata.get("compensation"), key=plan.plan_id,
-                context=ToolContext(owner=plan.owner, session_id=plan.session_id),
-            )
+            if value.ok and value.status in {"completed", "success"}:
+                receipt = preference_undo_receipt(
+                    plan.metadata.get("compensation"), value.effect_metadata.get("compensation_after"),
+                    key=plan.plan_id, owner=plan.owner,
+                )
+                if receipt:
+                    value.data["receipt_id"] = receipt
+                    value.data["undo"] = {"method": "activity.undo", "arguments": {"receipt_id": receipt}}
+                    value.suggestions.append("需要恢复操作前设置时，可使用本次回退凭证生成确认计划；不会撤回已经启动的任务。")
         except Exception as exc:  # noqa: BLE001 -- 可选后置凭证失败不得覆写真实写入结果
             # 原操作的事实不能被可选回退凭证失败覆写。
             logger.warning("回退凭证创建失败 type=%s", type(exc).__name__)
@@ -177,6 +192,7 @@ class MediaFluxEffectLifecycle:
 
     def cancelled(self, *, plan: EffectPlan) -> None:
         self._release_followups(plan, plan)
+        self._discard_native_cloud_preview(plan)
 
     async def register_terminal_failure(
         self, *, scope: EffectCompletionScope, tool: str, result: Mapping[str, Any],

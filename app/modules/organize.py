@@ -7037,10 +7037,28 @@ class Organizer:
             current = matches[0].file_id
         return current
 
+    @staticmethod
+    def _directory_identity_key(provider: str, external_id: str, *number_sources: str) -> str:
+        """仅目录守卫按可信番号合并跨源身份；缺少番号时保留精确来源。"""
+        if not provider or not external_id:
+            return ""
+        if provider in {"metatube", "clean_title"}:
+            from app.modules.nsfw import extract_nsfw_identifier
+            for source in number_sources:
+                # 只接受前导归档 token，不能把剧情中引用的其他番号当身份。
+                head = re.split(r"[^A-Za-z0-9._-]", source.strip(), maxsplit=1)[0]
+                identifier = extract_nsfw_identifier(head)
+                if identifier is not None and head.upper().startswith(identifier.matched_text.upper()):
+                    return f"nsfw:{identifier.code}"
+        return f"{provider}:{external_id}"
+
     @classmethod
     def _plan_identity(cls, plan: OrganizePlan) -> tuple[str, str]:
         match = plan.match or MatchResult()
-        return (match.media_type or ""), cls._match_identity_key(match)
+        return (match.media_type or ""), cls._directory_identity_key(
+            cls._match_provider(match), cls._match_external_id(match),
+            str(match.metadata.get("number") or ""), match.title,
+        )
 
     @staticmethod
     def _identity_marker(path: str) -> str:
@@ -7063,7 +7081,9 @@ class Organizer:
             if not provider and tmdb_id:
                 provider, external_id = "tmdb", tmdb_id
             if media_type and provider and external_id:
-                result.add((media_type, f"{provider}:{external_id}"))
+                result.add((media_type, self._directory_identity_key(
+                    provider, external_id, str(row["title"] or ""), str(row["current_name"] or ""),
+                )))
         return result
 
     def _identity_guard_reason(
@@ -7080,8 +7100,10 @@ class Organizer:
         identity = self._plan_identity(plan)
         if not all(identity):
             return "目录模板未包含媒体身份标识，且当前媒体身份不完整，已阻止归档"
+        # 历史缺少归档番号时，仍只能接受原有精确来源身份。
+        identities = {identity, (identity[0], self._match_identity_key(plan.match))}
         bound = batch_bindings.get(plan.media_root_path)
-        if bound and bound != identity:
+        if bound and bound not in identities:
             return "目录模板未包含媒体身份标识，同名目录对应不同媒体，已阻止混入"
         marker = self._identity_marker(plan.media_root_path)
         expected_marker = self._match_identity_tag(plan.match).lower()
@@ -7096,9 +7118,9 @@ class Organizer:
                 known_identities = identity_history_loader(plan)
             history_cache[plan.media_root_path] = set(known_identities or set())
         known = history_cache[plan.media_root_path]
-        if any(existing != identity for existing in known):
+        if any(existing not in identities for existing in known):
             return "历史整理记录显示该目录属于其他媒体，已阻止混入"
-        batch_bindings.setdefault(plan.media_root_path, identity)
+        batch_bindings[plan.media_root_path] = identity
         return ""
 
     def _apply_identity_guards(

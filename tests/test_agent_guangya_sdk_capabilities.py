@@ -12,11 +12,11 @@ from unittest import mock
 
 import httpx
 
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.domains.guangya import account_actions, recycle_actions, share_actions
-from app.agent.domains.guangya.workspace_actions import GuangyaWorkspaceActions
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext
+from app.agent.kernel.bootstrap import build_tool_catalog
+from app import sdk
+from app.clients.guangya import GuangYaShareError, _extract_created_share
+from app.modules import guangya_account
+from app.modules import guangya_recycle as recycle
 from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaWriteRejected
 
 
@@ -163,7 +163,7 @@ class GuangYaSdkClientTests(unittest.TestCase):
         with mock.patch.object(raw, "share_create", return_value=response):
             created = _Client(raw).create_user_share(["file-1"], title="Probe")
         self.assertEqual(created, response)
-        self.assertEqual(share_actions._extract_created_share(created)["access_code"], "AB12")
+        self.assertEqual(_extract_created_share(created)["access_code"], "AB12")
         for failure in (
             {**response, "code": 10},
             {**response, "data": {**response["data"], "success": False}},
@@ -173,9 +173,14 @@ class GuangYaSdkClientTests(unittest.TestCase):
                     _Client(raw).create_user_share(["file-1"], title="Probe")
 
     def test_agent_catalog_keeps_local_upload_disabled(self) -> None:
-        cloud = [spec for spec in build_tool_specs() if spec.name.startswith("guangya.")]
-        self.assertTrue(cloud)
-        self.assertFalse(any("upload" in spec.name for spec in cloud))
+        cloud = {name for name in sdk.METHODS if name.startswith("cloud.")}
+        registered = {spec.name for spec in build_tool_catalog().visible()}
+        self.assertIn("cloud.change", cloud & registered)
+        self.assertFalse(any("upload" in name for name in cloud | registered))
+        self.assertFalse(any(name.startswith("guangya.") for name in registered))
+        self.assertFalse(hasattr(sdk.cloud, "upload_local_file"))
+        with self.assertRaises(KeyError):
+            sdk.prepare_sdk_method("cloud.upload_local_file", {}, owner="sdk-owner")
 
 
 class GuangYaLocalUploadTests(unittest.TestCase):
@@ -473,73 +478,38 @@ class _RecycleClient:
         return True
 
 
-class GuangYaRecycleActionTests(unittest.TestCase):
-    def test_list_restore_and_clear_use_frozen_private_snapshots(self) -> None:
-        client = _RecycleClient()
-        context = ToolContext(owner="owner", session_id="session")
-        with mock.patch.object(
-            recycle_actions, "GuangYaClient", return_value=client
-        ):
-            listed = recycle_actions.list_guangya_recycle(
-                {"page": 1, "page_size": 50}, context
-            )
-            self.assertNotIn("trash-1", str(listed.to_dict()))
-            collection = listed.references[0].value
-            arguments = {"guangya_recycle_items": collection, "indices": [1]}
-            preview, fingerprint = recycle_actions.prepare_restore_guangya_recycle(
-                arguments, context
-            )
-            self.assertEqual(preview.data["count"], 1)
-            restored = recycle_actions.execute_restore_guangya_recycle(
-                arguments, fingerprint, context
-            )
-            self.assertEqual(restored.status, "accepted")
-            self.assertFalse(restored.data["verified"])
-            self.assertTrue(restored.data["verification_pending"])
-            self.assertEqual(restored.references[0].kind, "guangya_task")
+class GuangYaRecycleServiceTests(unittest.TestCase):
+    def test_restore_and_clear_use_real_ids_and_return_original_task(self):
+        client = cast(GuangYaClient, _RecycleClient())
+        frozen = recycle.prepare_restore(client, ["trash-1", "trash-1"])
+        self.assertEqual([item["file_id"] for item in frozen["items"]], ["trash-1"])
+        self.assertEqual(len(client.list_recycle()), 1)
+        restored = recycle.restore_prepared(client, frozen)
+        self.assertEqual(restored["status"], "accepted")
+        self.assertFalse(restored["verified"])
+        self.assertTrue(restored["verification_pending"])
+        self.assertEqual(restored["task_id"], "restore-task")
+        self.assertEqual(client.list_recycle(), [])
+        self.assertEqual(recycle.read_task(client, restored["task_id"]), {"status": "completed", "progress": 1.0})
 
-            client.items = [
-                GuangYaFile("trash-2", "待清空", True, parent_id="0", etag="dir")
-            ]
-            clear_preview, clear_fingerprint = (
-                recycle_actions.prepare_clear_guangya_recycle({}, context)
-            )
-            self.assertTrue(clear_preview.data["irreversible"])
-            cleared = recycle_actions.execute_clear_guangya_recycle(
-                {}, clear_fingerprint, context
-            )
-            self.assertEqual(cleared.status, "accepted")
-            self.assertFalse(cleared.data["verified"])
-            self.assertTrue(cleared.data["verification_pending"])
-            self.assertEqual(cleared.references[0].kind, "guangya_task")
+        client = cast(GuangYaClient, _RecycleClient())
+        frozen = recycle.prepare_clear(client)
+        cleared = recycle.clear_prepared(client, frozen)
+        self.assertTrue(cleared["irreversible"])
+        self.assertEqual(cleared["status"], "accepted")
+        self.assertEqual(cleared["task_id"], "clear-task")
+        self.assertFalse(cleared["verified"])
+        self.assertEqual(client.list_recycle(), [])
 
-            status = recycle_actions.query_guangya_task_status(
-                {
-                    "guangya_task": {
-                        "task_id": "clear-task",
-                        "operation": "recycle_clear",
-                    }
-                },
-                context,
-            )
-            self.assertEqual(status.status, "completed")
-
-    def test_clear_fingerprint_is_stable_when_provider_reorders_items(self) -> None:
-        client = _RecycleClient()
-        client.items = [
-            GuangYaFile("trash-2", "第二项", False, size=2, parent_id="0"),
-            GuangYaFile("trash-1", "第一项", False, size=1, parent_id="0"),
-        ]
-        context = ToolContext(owner="owner", session_id="session")
-        with mock.patch.object(
-            recycle_actions, "GuangYaClient", return_value=client
-        ):
-            _preview, fingerprint = recycle_actions.prepare_clear_guangya_recycle(
-                {}, context
-            )
-            client.items.reverse()
-            _safe, reordered_fingerprint = recycle_actions._clear_snapshot()
-        self.assertEqual(reordered_fingerprint, fingerprint)
+    def test_clear_snapshot_is_stable_when_provider_reorders_items(self):
+        fake = _RecycleClient()
+        fake.items = [GuangYaFile("trash-2", "第二项", False, size=2, parent_id="0"),
+                      GuangYaFile("trash-1", "第一项", False, size=1, parent_id="0")]
+        client = cast(GuangYaClient, fake)
+        snapshot = recycle.prepare_clear(client)
+        fake.items.reverse()
+        self.assertEqual(snapshot, recycle.prepare_clear(client))
+        self.assertEqual(recycle.clear_prepared(client, snapshot)["status"], "accepted")
 
 
 class _AccountClient:
@@ -566,18 +536,21 @@ class _AccountClient:
 class GuangYaAccountActionTests(unittest.TestCase):
     def test_account_projection_masks_identity_and_whitelists_capacity(self) -> None:
         with mock.patch.object(
-            account_actions, "GuangYaClient", return_value=_AccountClient()
+            guangya_account, "GuangYaClient", return_value=_AccountClient()
         ):
-            result = account_actions.get_guangya_account_status({})
-        self.assertEqual(result.data["masked_phone"], "138****8000")
-        self.assertEqual(result.data["masked_email"], "a***@example.com")
-        self.assertEqual(result.data["storage"]["available_bytes"], 750)
-        rendered = str(result.to_dict())
+            result = guangya_account.account_status()
+        self.assertEqual(result["masked_phone"], "138****8000")
+        self.assertEqual(result["masked_email"], "a***@example.com")
+        self.assertEqual(result["storage"]["available_bytes"], 750)
+        rendered = str(result)
         self.assertNotIn("must-not-leak", rendered)
         self.assertNotIn("13800138000", rendered)
 
 
-class _ShareClient:
+class _ShareClient(GuangYaClient):
+    logged_in = True
+    credential_generation = 9
+
     def __init__(self) -> None:
         self.logged_in = True
         self.credential_generation = 9
@@ -620,173 +593,48 @@ class _ShareClient:
         return True
 
 
-class GuangYaShareActionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.workspace_actions = GuangyaWorkspaceActions()
-
-    def test_share_snapshot_requires_management_record_id_not_public_link_id(self) -> None:
+class GuangYaShareServiceTests(unittest.TestCase):
+    def test_share_snapshot_requires_management_record_id_not_public_link_id(self):
         client = _ShareClient()
-        snapshot = share_actions._load_share_snapshots(cast(GuangYaClient, client))[0]
-        self.assertEqual(snapshot["share_id"], "10001")
-        self.assertEqual(share_actions._public_share({**snapshot, "title": "Test_Share.01"}, index=1)["title"], "Test_Share.01")
+        item = client.user_share_snapshot()["items"][0]
+        self.assertEqual(item["share_id"], "10001")
+        self.assertEqual(item["title"], "动画")
         del client.shares[0]["id"]
-        with self.assertRaises(AgentToolError):
-            share_actions._load_share_snapshots(cast(GuangYaClient, client))
+        with self.assertRaises(GuangYaShareError):
+            client.user_share_snapshot()
 
-    def test_create_returns_link_only_to_public_result_and_revoke_revalidates(self) -> None:
+    def test_sdk_creation_and_revoke_use_real_ids(self):
         client = _ShareClient()
-        context = ToolContext(owner="owner", session_id="session")
-        observation_ref = "OBS" + "A" * 32
-        object_ref = "OBJ" + "B" * 24
-        entry = {
-            "file_id": "file-1",
-            "parent_id": "0",
-            "name": "动画",
-            "is_dir": True,
-            "size": 0,
-            "etag": "etag-1",
-            "updated_at": 0,
-        }
-        observation = {"plan_id": "a" * 32, "credential_generation": 9,
-                       "entries": [{**entry, "handle": object_ref}]}
-        normalized = share_actions.guangya_share_create_arguments(
-            {
-                "observation_ref": observation_ref,
-                "object_refs": [object_ref],
-                "expires_days": 7,
-                "auto_access_code": True,
-                "allow_download": True,
-            }
-        )
-        with (
-            mock.patch.object(share_actions, "GuangYaClient", return_value=client),
-            mock.patch.object(
-                share_actions,
-                "load_directory_observation",
-                return_value=observation,
-            ),
-            mock.patch.object(share_actions.time, "sleep", return_value=None),
-        ):
-            preview, fingerprint = share_actions.prepare_create_guangya_share(
-                normalized, context
-            , workspace_actions=self.workspace_actions)
-            self.assertNotIn("file-1", str(preview.to_dict()))
-            created = share_actions.execute_create_guangya_share(
-                normalized, fingerprint, context
-            , workspace_actions=self.workspace_actions)
-            self.assertEqual(created.data["access_code"], "AB12")
-            self.assertNotEqual(created.data["access_code"], "200")
-            self.assertIn("created-share", created.data["share_url"])
-            assert created.model_data is not None
-            self.assertNotIn("share_url", created.model_data)
+        with mock.patch("app.clients.guangya.GuangYaClient", return_value=client):
+            listed = sdk.cloud.shares()
+            self.assertEqual(listed["items"][0]["share_id"], "10001")
+            created = sdk.cloud.share(["file-1"], expires_days=7)
+            self.assertEqual(created["access_code"], "AB12")
+            self.assertIn("created-share", created["share_url"])
+            self.assertEqual(created["status"], "completed")
+            self.assertTrue(sdk.cloud.revoke_share(["10001"])["verified"])
 
-            listed = share_actions.list_guangya_user_shares(
-                {"page": 1, "page_size": 50}, context
-            )
-            collection = listed.references[0].value
-            revoke_args = {"guangya_shares": collection, "indices": [1]}
-            revoke_preview, revoke_fingerprint = (
-                share_actions.prepare_revoke_guangya_shares(revoke_args, context)
-            )
-            self.assertEqual(revoke_preview.data["count"], 1)
-            revoked = share_actions.execute_revoke_guangya_shares(
-                revoke_args, revoke_fingerprint, context
-            )
-            self.assertTrue(revoked.data["verified"])
-
-    def test_create_share_does_not_expose_untrusted_provider_url_or_code(self) -> None:
+    def test_create_share_does_not_expose_untrusted_provider_url_or_code(self):
         client = _ShareClient()
-        client.create_response = {
-            "code": 200,
-            "data": {
-                "shareId": "valid_share_1234",
-                "shareUrl": "https://attacker.invalid/steal",
-                "accessCode": "<script>alert(1)</script>",
-            },
-        }
-        context = ToolContext(owner="owner", session_id="session")
-        observation_ref = "OBS" + "A" * 32
-        object_ref = "OBJ" + "B" * 24
-        normalized = share_actions.guangya_share_create_arguments(
-            {
-                "observation_ref": observation_ref,
-                "object_refs": [object_ref],
-            }
-        )
-        entry = {
-            "file_id": "file-1",
-            "parent_id": "0",
-            "name": "动画",
-            "is_dir": True,
-            "size": 0,
-            "etag": "etag-1",
-            "updated_at": 0,
-        }
-        with (
-            mock.patch.object(share_actions, "GuangYaClient", return_value=client),
-            mock.patch.object(
-                share_actions,
-                "load_directory_observation",
-                return_value={"plan_id": "a" * 32, "credential_generation": 9,
-                              "entries": [{**entry, "handle": object_ref}]},
-            ),
-        ):
-            _preview, fingerprint = share_actions.prepare_create_guangya_share(
-                normalized, context
-            , workspace_actions=self.workspace_actions)
-            created = share_actions.execute_create_guangya_share(
-                normalized, fingerprint, context
-            , workspace_actions=self.workspace_actions)
+        client.create_response = {"code": 200, "data": {
+            "shareId": "valid_share_1234", "shareUrl": "https://attacker.invalid/steal",
+            "accessCode": "<script>alert(1)</script>",
+        }}
+        with mock.patch("app.clients.guangya.GuangYaClient", return_value=client):
+            created = sdk.cloud.share(["file-1"])
+        self.assertEqual(created["share_url"], "https://www.guangyapan.com/s/valid_share_1234#/share")
+        self.assertEqual(created["access_code"], "")
+        self.assertNotIn("attacker.invalid", str(created))
+        self.assertNotIn("<script>", str(created))
 
-        self.assertEqual(
-            created.data["share_url"],
-            "https://www.guangyapan.com/s/valid_share_1234#/share",
-        )
-        self.assertEqual(created.data["access_code"], "")
-        self.assertNotIn("attacker.invalid", str(created.to_dict()))
-        self.assertNotIn("<script>", str(created.to_dict()))
-
-    def test_create_share_without_verifiable_handle_is_reported_as_accepted(self) -> None:
+    def test_create_share_without_verifiable_handle_is_reported_as_accepted(self):
         client = _ShareClient()
         client.create_response = {"code": 200, "msg": "操作成功"}
-        context = ToolContext(owner="owner", session_id="session")
-        observation_ref = "OBS" + "A" * 32
-        object_ref = "OBJ" + "B" * 24
-        normalized = share_actions.guangya_share_create_arguments(
-            {
-                "observation_ref": observation_ref,
-                "object_refs": [object_ref],
-            }
-        )
-        entry = {
-            "file_id": "file-1",
-            "parent_id": "0",
-            "name": "动画",
-            "is_dir": True,
-            "size": 0,
-            "etag": "etag-1",
-            "updated_at": 0,
-        }
-        with (
-            mock.patch.object(share_actions, "GuangYaClient", return_value=client),
-            mock.patch.object(
-                share_actions,
-                "load_directory_observation",
-                return_value={"plan_id": "a" * 32, "credential_generation": 9,
-                              "entries": [{**entry, "handle": object_ref}]},
-            ),
-        ):
-            _preview, fingerprint = share_actions.prepare_create_guangya_share(
-                normalized, context
-            , workspace_actions=self.workspace_actions)
-            created = share_actions.execute_create_guangya_share(
-                normalized, fingerprint, context
-            , workspace_actions=self.workspace_actions)
-
-        self.assertEqual(created.status, "accepted")
-        self.assertTrue(created.data["verification_pending"])
-        assert created.model_data is not None
-        self.assertFalse(created.model_data["share_created"])
+        with mock.patch("app.clients.guangya.GuangYaClient", return_value=client):
+            created = sdk.cloud.share(["file-1"])
+        self.assertEqual(created["status"], "accepted")
+        self.assertTrue(created["verification_pending"])
+        self.assertFalse(created["verified"])
 
 
 

@@ -68,10 +68,10 @@ def _load_settings_api(config) -> dict[str, Any]:
     exec(compile(defaults_path.read_text("utf-8"), str(defaults_path), "exec"), namespace)
     path = ROOT / "app/routes/api.py"
     tree = ast.parse(path.read_text("utf-8"), filename=str(path))
-    functions = {"_is_config_mask", "_normalize_discovery_boolean", VALIDATOR, "get_config", "save_config"}
+    functions = {"_is_config_mask", VALIDATOR, "get_config", "save_config"}
     nodes: list[ast.stmt] = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib"}:
+        if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib", "app.modules.feature_config"}:
             nodes.append(node)
         elif isinstance(node, ast.Assign) and all(
             isinstance(target, ast.Name) and target.id.startswith("_") for target in node.targets

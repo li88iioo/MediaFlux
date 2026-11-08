@@ -1,8 +1,9 @@
 """TMDB 媒体探索 Provider。"""
 from __future__ import annotations
 
+import math
 import threading
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from app.clients.tmdb import TMDBClient
@@ -177,6 +178,10 @@ class TMDBProvider(DiscoveryProvider):
             primary_original or raw.get("original_title") or raw.get("original_name") or ""
         ).strip()
         release_date = _date(raw.get("first_air_date") if media_type == "tv" else raw.get("release_date"))
+        countries, language, genres = raw.get("origin_country"), raw.get("original_language"), raw.get("genre_ids")
+        popularity = raw.get("popularity")
+        if genres is None and isinstance(raw.get("genres"), list):
+            genres = [item.get("id") if isinstance(item, dict) else None for item in raw["genres"]]
         return MediaCard(
             provider="tmdb",
             external_id=external_id,
@@ -189,9 +194,15 @@ class TMDBProvider(DiscoveryProvider):
             backdrop_key=_poster_key(raw.get("backdrop_path")),
             rating=_rating(raw.get("vote_average")),
             rating_source="tmdb",
+            vote_count=_count(raw.get("vote_count")),
+            popularity=float(popularity) if isinstance(popularity, (int, float)) and not isinstance(popularity, bool)
+                and math.isfinite(popularity) and popularity >= 0 else None,
             release_date=release_date,
             tmdb_id=external_id,
             number_of_seasons=_count(raw.get("number_of_seasons")) if media_type == "tv" else None,
             number_of_episodes=_count(raw.get("number_of_episodes")) if media_type == "tv" else None,
             seasons=_seasons(raw.get("seasons")) if media_type == "tv" else None,
+            origin_country=tuple(countries) if isinstance(countries, list) and all(isinstance(c, str) and c for c in countries) else None,
+            original_language=language.strip() or None if isinstance(language, str) else None,
+            genre_ids=cast(tuple[int, ...], tuple(genres)) if isinstance(genres, list) and all(type(g) is int and g > 0 for g in genres) else None,
         )

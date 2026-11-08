@@ -3,36 +3,29 @@
 不访问真实模型或 RSS 网络服务；业务写入落到隔离数据库的 rss_items。
 """
 from __future__ import annotations
-from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.effects import ConfirmationEffectPlanStore, DefaultAuthorizationPolicy, NoopEffectLifecycle
 
 import unittest
+import json
+from app.agent.kernel import sandbox
 from unittest.mock import patch
 
 from app import database as db
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.model import ModelEvent, ModelToolCall
 from app.agent.kernel.model import ModelEventType as M
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel.pipeline import (
-    DefaultAuthorizationPolicy,
-    NoopEffectLifecycle,
-    ToolPipeline,
-)
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from tests.support import isolated_test_database
 
 OWNER, SID = "dialogue-owner", "pending-dialogue"
-WRITE, READ, CONTROL = "rss.create_subscription", "rss.list_subscriptions", "agent.pending_plan"
+WRITE, READ, CONTROL = "rss.create_subscription", "rss.list_subscriptions", "agent.run_code"
 
 
 class ScriptedModel:
@@ -47,6 +40,15 @@ class ScriptedModel:
         cancellation.raise_if_cancelled()
         if self.calls:
             name, arguments = self.calls.pop(0)
+            if name == CONTROL:
+                arguments = {"code": (
+                    "import json\nfrom mf import session, Error\n"
+                    f"payload={arguments!r}\n"
+                    "try:\n    result=session.pending_plan(**payload)\n"
+                    "except (Error, TypeError) as exc:\n"
+                    "    result={'sdk_error': getattr(exc, 'code', type(exc).__name__)}\n"
+                    "print(json.dumps(result, ensure_ascii=False))"
+                )}
             call = ModelToolCall(f"call-{len(self.requests)}", name, arguments)
             yield ModelEvent(M.TOOL_CALL_COMPLETED, tool_call=call)
             yield ModelEvent(M.FINISH, finish_reason="tool_calls")
@@ -112,7 +114,8 @@ class PendingDialogueTests(unittest.IsolatedAsyncioTestCase):
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
                                 effect_store=ConfirmationEffectPlanStore(tickets),
                                 authorization=Policy(), effect_lifecycle=Lifecycle())
-        return AgentSession(model=ScriptedModel(), catalog=catalog, retriever=CapabilityRetriever(),
+        catalog.register(sandbox.run_code_tool(pipeline))
+        return AgentSession(model=ScriptedModel(), catalog=catalog,
                             pipeline=pipeline, state_store=store, journal=store)
 
     async def run_turn(self, *calls, session=None, owner=OWNER, sid=SID,
@@ -153,7 +156,11 @@ class PendingDialogueTests(unittest.IsolatedAsyncioTestCase):
         matches = [e.payload["result"] for e in events
                    if e.type == E.TOOL_COMPLETED and e.payload.get("tool") == name]
         self.assertEqual(len(matches), 1, self.summary(events))
-        return matches[0]
+        result = matches[0]
+        if name == CONTROL:
+            self.assertEqual(result["data"]["exit_code"], 0, result)
+            return json.loads(result["data"]["stdout"])
+        return result
 
     def control_visible(self, session):
         alias = session.catalog.get(CONTROL).model_name
@@ -217,11 +224,11 @@ class PendingDialogueTests(unittest.IsolatedAsyncioTestCase):
         self.rejected(await self.confirm(replacement, session=self.runtime()))
         self.assertEqual(self.rows(), ["replacement"])
 
-    async def test_model_inspect_preserves_and_advertises_pending_card(self):
+    async def test_native_inspect_preserves_pending_card(self):
         original = await self.preview()
         cold = self.runtime()
         events = await self.run_turn((CONTROL, {"operation": "inspect"}), session=cold)
-        self.assertTrue(self.control_visible(cold), "有效 pending 必须向模型开放 agent.pending_plan")
+        self.assertTrue(self.control_visible(cold), "原生工作区应保持可用")
         inspected = self.result(events, CONTROL)
         self.assertTrue(inspected["data"]["pending"])
         self.assertIn("original", str(inspected["data"]["preview"]))
@@ -229,9 +236,10 @@ class PendingDialogueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.trace, [("prepare", "original", None)])
         self.assertEqual(self.rows(), [])
 
-    async def test_hello_loads_control_only_when_pending(self):
+    async def test_hello_keeps_native_entry_without_registering_pending_tool(self):
         await self.run_turn(message="hello")
-        self.assertFalse(self.control_visible(self.session))
+        self.assertTrue(self.control_visible(self.session))
+        self.assertFalse(self.session.catalog.has("agent.pending_plan"))
         self.assertIsNone(await self.pending())
         original = await self.preview()
         await self.run_turn(message="hello")
@@ -261,14 +269,17 @@ class PendingDialogueTests(unittest.IsolatedAsyncioTestCase):
             (WRITE, {"name": "replacement"}, True, "authorization_denied"),
             (READ, {"fail": True}, False, "read_failed"),
             (CONTROL, {"operation": "confirm"}, False, "invalid_arguments"),
-            (CONTROL, {"operation": "cancel", "plan_id": "foreign-card"}, False, "invalid_arguments"),
+            (CONTROL, {"operation": "cancel", "plan_id": "foreign-card"}, False, "TypeError"),
         ]
         for name, arguments, denied, code in cases:
             with self.subTest(tool=name, arguments=arguments):
                 self.denied = denied
                 events = await self.run_turn((name, arguments))
                 failures = [e for e in events if e.type == E.TOOL_FAILED]
-                self.assertTrue(any(e.payload.get("code") == code for e in failures), self.summary(events))
+                if name == CONTROL:
+                    self.assertEqual(self.result(events, name)["sdk_error"], code)
+                else:
+                    self.assertTrue(any(e.payload.get("code") == code for e in failures), self.summary(events))
                 self.assertEqual(await self.pending(), original)
                 self.assertEqual(self.rows(), [])
                 self.assertEqual(self.trace, [("prepare", "original", None)])

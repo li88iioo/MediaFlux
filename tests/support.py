@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Generator, NotRequired, TypedDict, TypeVar
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
+from app.modules.scraper import Candidate, MatchResult
 
 _TEST_DATABASE_LOCK = threading.RLock()
 
@@ -269,3 +272,171 @@ def assert_present(value: _ReceiptT | None) -> _ReceiptT:
     """验证正向测试中的回执存在，允许在推导式中保留这一断言。"""
     assert value is not None
     return value
+
+
+class _ParsingScraper:
+    @staticmethod
+    def _fields(filename: str) -> dict[str, object]:
+        tmdb = re.search(r"(?i)tmdb-(\d+)", filename)
+        season_episode = re.search(r"(?i)S(\d{1,2})E(\d{1,3})", filename)
+        if season_episode:
+            return {
+                "type": "tv",
+                "title": re.split(r"(?i)[._ -]S\d{1,2}E\d{1,3}", filename)[0],
+                "season": int(season_episode.group(1)),
+                "episode": int(season_episode.group(2)),
+                "tmdb_id": tmdb.group(1) if tmdb else "",
+            }
+        stem = filename.rsplit(".", 1)[0]
+        title = re.sub(r"[._ -]+(?:19|20)\d{2}.*$", "", stem)
+        return {
+            "type": "movie", "title": title, "season": None, "episode": None,
+            "tmdb_id": tmdb.group(1) if tmdb else "",
+        }
+
+    @classmethod
+    def parse_media(cls, filename: str, parent_path: str = "", match=None, *, filename_only=False):
+        return release_parse_result(
+            cls._fields(filename), filename=filename, parent_path=parent_path
+        )
+
+
+
+class _DirectoryScrapeTMDB:
+    confirm: Mock
+    api_key = "tmdb-test-key"
+
+    def __init__(self):
+        self.search_calls: list[tuple[str, str, str]] = []
+        self.detail_calls: list[tuple[str, str]] = []
+        self.auto_result = MatchResult(
+            tmdb_id="1726",
+            title="钢铁侠",
+            year="2008",
+            media_type="movie",
+            confidence=0.96,
+            status="matched",
+            matched_by="search",
+            threshold=0.9,
+        )
+
+    def search_candidates(
+        self,
+        query: str,
+        year: str = "",
+        media_type: str = "movie",
+    ) -> list[Candidate]:
+        self.search_calls.append((query, year, media_type))
+        if media_type == "tv":
+            return [
+                Candidate(
+                    "123",
+                    "钢铁侠：装甲冒险",
+                    "2009",
+                    0.81,
+                    "tv",
+                    original_title="Iron Man: Armored Adventures",
+                )
+            ]
+        return [
+            Candidate(
+                "1726",
+                "钢铁侠",
+                "2008",
+                0.96,
+                "movie",
+                original_title="Iron Man",
+                overview="托尼·斯塔克制造钢铁战甲。",
+                poster_path="/movie.jpg",
+                backdrop_path="/movie-bg.jpg",
+                release_date="2008-04-30",
+            )
+        ]
+
+    def get_detail_with_credits(self, tmdb_id: str, media_type: str) -> dict:
+        self.detail_calls.append((tmdb_id, media_type))
+        if media_type == "tv":
+            return {
+                "id": int(tmdb_id),
+                "name": "钢铁侠：装甲冒险",
+                "original_name": "Iron Man: Armored Adventures",
+                "first_air_date": "2009-04-24",
+                "overview": "少年托尼·斯塔克的装甲冒险。",
+                "vote_average": 7.2,
+                "poster_path": "/tv.jpg",
+                "backdrop_path": "/tv-bg.jpg",
+                "genres": [{"name": "动画"}],
+                "created_by": [{"name": "Craig Kyle"}],
+                "credits": {"cast": [{"name": "Adrian Petriw"}], "crew": []},
+            }
+        return {
+            "id": int(tmdb_id),
+            "title": "钢铁侠",
+            "original_title": "Iron Man",
+            "release_date": "2008-04-30",
+            "overview": "托尼·斯塔克制造钢铁战甲。",
+            "vote_average": 7.6,
+            "poster_path": "/movie.jpg",
+            "backdrop_path": "/movie-bg.jpg",
+            "genres": [{"name": "动作"}, {"name": "科幻"}],
+            "credits": {
+                "cast": [
+                    {"name": "小罗伯特·唐尼"},
+                    {"name": "格温妮斯·帕特洛"},
+                ],
+                "crew": [{"name": "乔恩·费儒", "job": "Director"}],
+            },
+        }
+
+    def match_from_tmdb(self, tmdb_id: str, media_type: str) -> MatchResult:
+        detail = self.get_detail_with_credits(tmdb_id, media_type)
+        title = detail.get("name") or detail.get("title") or ""
+        date = detail.get("first_air_date") or detail.get("release_date") or ""
+        return MatchResult(
+            tmdb_id=tmdb_id,
+            title=title,
+            year=str(date)[:4],
+            media_type=media_type,
+            confidence=1.0,
+            locked=True,
+            status="matched",
+            matched_by="tmdb_id",
+            threshold=1.0,
+        )
+
+    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False):
+        return release_parse_result(
+            _ParsingScraper._fields(filename),
+            filename=filename, parent_path=parent_path,
+        )
+
+    def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False) -> dict:
+        return self.get_detail_with_credits(tmdb_id, media_type)
+
+    def match(self, _filename: str, _parent_path: str = "") -> MatchResult:
+        return self.auto_result
+
+
+def _prepare_batch(_service, result_ids, target, *, scope):
+    assert scope == "agent"
+    return {"ok": True, "status": "confirmation_required", "summary": "等待整批确认", "data": {
+        "count": len(result_ids), "target": target,
+        "resources": [{"result_id": result_id, "title": str(result_id)} for result_id in result_ids],
+    }}, {"target": target, "resources": [{"result_id": identity, "target": target} for identity in result_ids]}
+
+
+@contextmanager
+def isolated_indexer_results():
+    """候选链只使用内存结果仓库，不启动真实索引器客户端或线程。"""
+    from app.indexers.result_store import IndexerResultStore
+
+    results = IndexerResultStore()
+    service = SimpleNamespace(
+        result_store=results,
+        get_result=lambda identity, **_kwargs: results.get(identity),
+    )
+    with (
+        patch("app.indexers.runtime.get_indexer_service", return_value=service),
+        patch("app.agent.kernel.ports.sdk_effects.get_indexer_service", return_value=service),
+    ):
+        yield service

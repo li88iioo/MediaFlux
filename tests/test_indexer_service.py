@@ -23,7 +23,7 @@ from app.indexers.models import (
     IndexerProviderError,
     ResolvedDownload,
 )
-from app.indexers.providers.base import IndexerAdapter
+from app.indexers.providers.base import IndexerAdapter, report_page
 from app.indexers.ranking import candidate_sort_key
 from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
@@ -32,7 +32,7 @@ from app.indexers.service import IndexerService
 HASH = "0123456789abcdef0123456789abcdef01234567"
 
 
-class FakeAdapter:
+class FakeAdapter(IndexerAdapter):
     def __init__(
         self,
         site_id,
@@ -84,6 +84,9 @@ class FakeAdapter:
         if self.resolve_error:
             raise self.resolve_error
         return ResolvedDownload(kind="magnet", value=f"magnet:?xt=urn:btih:{HASH}")
+
+    def http_client_for_result(self, stored_result):
+        return None
 
 
 class CrossLoopAdapter(FakeAdapter):
@@ -460,7 +463,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active.calls, 1)
         self.assertEqual(retired.calls, 0)
 
-    async def test_partial_success_caps_each_site_and_returns_safe_error(self):
+    async def test_partial_success_preserves_good_site_page_and_returns_safe_error(self):
         good = FakeAdapter(
             "nyaa", [item("nyaa", "one"), item("nyaa", "two"), item("nyaa", "three")]
         )
@@ -477,7 +480,8 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry.site_id for entry in result.errors], ["mikan"])
         self.assertEqual(result.errors[0].code, "unavailable")
         self.assertNotIn("internal upstream", result.errors[0].message)
-        self.assertEqual([entry.title for entry in result.items], ["one", "two"])
+        self.assertEqual([entry.title for entry in result.items], ["one", "two", "three"])
+        self.assertEqual(result.site_truncated_counts, {"nyaa": 0})
         self.assertTrue(all(entry.result_id for entry in result.items))
         assert result.items[0].result_id is not None
         self.assertEqual(self.store.get(result.items[0].result_id).title, "one")
@@ -689,31 +693,77 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.partial)
         self.assertEqual(result.errors[0].code, "timeout")
 
-    async def test_source_order_does_not_reorder_by_relevance_before_or_after_limit(self):
+    async def test_source_order_preserves_the_whole_native_page(self):
         rows = [item("btbtla", title, magnet=f"magnet:?xt=urn:btih:{n + 1:040x}")
                 for n, title in enumerate(("Other 2020", "Demo 2026", "Demo 2026 4K"))]
         service = self.service([FakeAdapter("btbtla", rows)], max_results_per_site=2)
         result = await service.search_media(IndexerMediaSearchRequest.create(title="Demo", year=2026, sort_mode="source_order"))
-        self.assertEqual([row.title for row in result.items], ["Other 2020", "Demo 2026"])
+        self.assertEqual([row.title for row in result.items], ["Other 2020", "Demo 2026", "Demo 2026 4K"])
 
-    async def test_candidate_cap_is_visible_without_inventing_pagination_or_outage(self):
+    async def test_complete_native_page_is_preserved_in_results_and_cache(self):
         rows = [item("btbtla", f"Demo 2026 version{n}", magnet=f"magnet:?xt=urn:btih:{n + 1:040x}")
                 for n in range(60)]
-        service = self.service([FakeAdapter("btbtla", rows)], max_results_per_site=40)
+        adapter = FakeAdapter("btbtla", rows)
+        service = self.service([adapter], max_results_per_site=40)
         request = IndexerMediaSearchRequest.create(title="Demo", year=2026)
         first = await service.search_media(request)
         cached = await service.search_media(request)
         self.assertTrue(cached.cached)
         for result in (first, cached):
-            self.assertEqual(len(result.items), 40)
+            self.assertEqual({row.title for row in result.items}, {row.title for row in rows})
             self.assertEqual(result.site_collected_counts, {"btbtla": 60})
-            self.assertEqual(result.site_truncated_counts, {"btbtla": 20})
+            self.assertEqual(result.site_truncated_counts, {"btbtla": 0})
+            self.assertTrue(result.complete)
             self.assertFalse(result.partial)
             self.assertFalse(result.has_more)
+            self.assertIsNone(result.site_page_states["btbtla"].next_page)
             self.assertEqual(result.errors, [])
+            stored_titles = set()
+            for row in result.items:
+                assert row.result_id is not None
+                stored_titles.add(self.store.get(row.result_id).title)
+            self.assertEqual(stored_titles, {row.title for row in rows})
         cached.site_truncated_counts["btbtla"] = 999
         again = await service.search_media(request)
-        self.assertEqual(again.site_truncated_counts["btbtla"], 20)
+        self.assertEqual(again.site_truncated_counts["btbtla"], 0)
+        self.assertEqual(adapter.calls, 1)
+
+    async def test_progress_limit_does_not_truncate_the_final_native_page(self):
+        rows = [item("btbtla", f"Demo {number}", magnet=f"magnet:?xt=urn:btih:{number + 1:040x}")
+                for number in range(60)]
+        adapter = FakeAdapter("btbtla")
+        service = self.service([adapter], max_results_per_site=40)
+        arrived, release = asyncio.Event(), asyncio.Event()
+        frames = []
+
+        async def search(request):
+            report_page("btbtla", IndexerPage(rows, request.page, False, True, complete=False))
+            await release.wait()
+            return IndexerPage(rows, request.page, False, True)
+
+        def observe(result):
+            frames.append(result)
+            arrived.set()
+
+        with patch.object(adapter, "search", side_effect=search):
+            task = asyncio.create_task(service.search("Demo", on_progress=observe))
+            try:
+                await asyncio.wait_for(arrived.wait(), 2)
+                self.assertFalse(task.done())
+                snapshot = frames[0]
+                self.assertFalse(snapshot.complete)
+                self.assertEqual(len(snapshot.items), 40)
+                self.assertEqual(snapshot.site_collected_counts, {"btbtla": 60})
+                self.assertEqual(snapshot.site_truncated_counts, {"btbtla": 20})
+                release.set()
+                final = await task
+            finally:
+                release.set()
+                await task
+        self.assertTrue(final.complete)
+        self.assertEqual(len(final.items), 60)
+        self.assertEqual(final.site_truncated_counts, {"btbtla": 0})
+        self.assertLessEqual({row.result_id for row in snapshot.items}, {row.result_id for row in final.items})
 
     async def test_requested_sort_mode_controls_final_aggregate_order(self):
         newer = item(
@@ -743,7 +793,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             [entry.title for entry in result.items], ["Demo newer", "Demo older"]
         )
 
-    async def test_alias_merge_applies_requested_sort_before_per_site_limit(self):
+    async def test_alias_merge_preserves_all_candidates_in_requested_sort_order(self):
         older_relevant = IndexerItem(
             site_id="nyaa",
             site_name="NYAA",
@@ -777,7 +827,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(adapter.queries, ["Alias", "Target"])
         self.assertEqual(
-            [entry.title for entry in result.items], [newer_downloadable.title]
+            [entry.title for entry in result.items], [newer_downloadable.title, older_relevant.title]
         )
 
     def test_dedupe_and_sort_choose_the_same_stronger_identity(self):
@@ -1217,14 +1267,148 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first.has_more, False)
         self.assertIs(cached.has_more, False)
 
+    async def test_empty_alias_pages_preserve_known_pagination_and_completion(self):
+        request = IndexerMediaSearchRequest.create(title="演示", english_title="Demo")
+        for has_more in (True, False):
+            with self.subTest(has_more=has_more):
+                adapter = FakeAdapter("btbtla")
+                service = self.service([adapter])
+                with patch.object(adapter, "search", side_effect=[
+                    IndexerPage([], 1, has_more, True), IndexerPage([], 1, False, True),
+                ]) as search:
+                    result = await service.search_media(request, ("btbtla",))
+                state = result.site_page_states["btbtla"]
+                self.assertEqual([call.args[0].query for call in search.call_args_list], ["演示", "Demo"])
+                self.assertEqual(result.items, [])
+                self.assertIs(result.has_more, has_more)
+                self.assertIs(state.has_more, has_more)
+                self.assertEqual(state.next_page, 2 if has_more else None)
+                self.assertTrue(state.pagination_supported)
+                self.assertEqual(result.sites_succeeded, ("btbtla",))
+                self.assertFalse(result.errors)
+                self.assertFalse(result.partial)
+                self.assertTrue(result.complete)
+
+    async def test_alias_failure_preserves_known_empty_page_and_errors(self):
+        request = IndexerMediaSearchRequest.create(title="演示", english_title="Demo")
+        earlier_error = IndexerProviderError("btbtla", "coverage_limited", "仅检索部分候选")
+        for first_page in (None, IndexerPage([], 1, True, True),
+                           IndexerPage([], 1, True, True, errors=(earlier_error,))):
+            with self.subTest(first_page=first_page):
+                adapter = FakeAdapter("btbtla")
+                service = self.service([adapter])
+                responses = ([first_page] if first_page is not None else []) + [IndexerUnavailable("alias failed")]
+                with patch.object(adapter, "search", side_effect=responses):
+                    result = await service.search_media(request, ("btbtla",))
+                state = result.site_page_states["btbtla"]
+                self.assertEqual(result.items, [])
+                self.assertIs(result.has_more, first_page is not None)
+                self.assertIs(state.has_more, True if first_page is not None else None)
+                self.assertEqual(state.next_page, 2 if first_page is not None else None)
+                expected_errors = {"unavailable"} | ({"coverage_limited"} if first_page and first_page.errors else set())
+                self.assertEqual({error.code for error in result.errors}, expected_errors)
+                self.assertEqual(result.sites_succeeded, ())
+                self.assertTrue(result.partial)
+                self.assertTrue(result.complete)
+
     async def test_has_more_is_true_when_any_successful_provider_has_more(self):
-        first = FakeAdapter("nyaa", [item("nyaa", "one")], has_more=False)
-        second = FakeAdapter("mikan", [item("mikan", "two")], has_more=True)
+        rows = [item("nyaa", f"Demo {number}", magnet=f"magnet:?xt=urn:btih:{number:040x}")
+                for number in range(1, 64)]
+        for media in (False, True):
+            with self.subTest(media=media):
+                first = FakeAdapter("nyaa")
+                second = FakeAdapter("mikan", [item("mikan", "other work")])
+                service = self.service([first, second])
+
+                async def read(page):
+                    if media:
+                        return await service.search_media(IndexerMediaSearchRequest.create(title="Demo", page=page))
+                    return await service.search("Demo", page)
+
+                with patch.object(first, "search", side_effect=[
+                    IndexerPage(rows[:60], 1, True, True),
+                    IndexerPage(rows[60:61], 2, True, True),
+                    IndexerPage(rows[61:], 3, False, True),
+                ]) as search:
+                    result = await read(1)
+                    self.assertEqual(tuple(site for site, state in result.site_page_states.items() if state.has_more), ("nyaa",))
+                    following = await read(result.site_page_states["nyaa"].next_page)
+                    last = await read(following.site_page_states["nyaa"].next_page)
+                    empty = await read(4)
+                self.assertTrue(result.has_more)
+                self.assertEqual([len(page.items) for page in (result, following, last, empty)], [61, 1, 2, 0])
+                self.assertEqual(len({row.title for page in (result, following, last) for row in page.items}), 64)
+                self.assertFalse(last.has_more or empty.has_more)
+                for number, page in enumerate((result, following, last, empty), 1):
+                    self.assertEqual(page.sites_attempted, ("nyaa", "mikan"))
+                    self.assertEqual(page.sites_succeeded, ("nyaa", "mikan"))
+                    self.assertEqual(page.site_truncated_counts, {"nyaa": 0, "mikan": 0})
+                    self.assertEqual(page.site_page_states["mikan"].requested_page, number)
+                    self.assertFalse(page.site_page_states["mikan"].has_more)
+                    self.assertTrue(page.complete)
+                    self.assertFalse(page.partial)
+                self.assertEqual(following.site_attempt_counts["mikan"], 0)
+                self.assertEqual(empty.site_attempt_counts, {"nyaa": 0, "mikan": 0})
+                self.assertEqual([call.args[0].page for call in search.call_args_list], [1, 2, 3])
+                self.assertEqual(second.calls, 1)
+
+    async def test_paging_retries_failed_unknown_partial_and_truncated_sources(self):
+        for reason in ("unknown", "partial", "incomplete", "truncated"):
+            with self.subTest(reason=reason):
+                healthy = FakeAdapter("nyaa", [item("nyaa", "Demo")], has_more=True)
+                retry = FakeAdapter("mikan")
+                service = self.service([healthy, retry])
+                first_page = IndexerPage([item("mikan", "Demo first")], 1, False, True)
+                if reason == "unknown":
+                    first_page = IndexerUnavailable("temporary")
+                elif reason == "partial":
+                    first_page.errors = (IndexerProviderError("mikan", "coverage_limited", "partial page"),)
+                elif reason == "incomplete":
+                    first_page.complete = False
+                else:
+                    first_page.total_items = 10
+                with patch.object(retry, "search", side_effect=[
+                    first_page, IndexerPage([item("mikan", "Demo recovered")], 2, False, True),
+                ]) as search:
+                    previous = await service.search("Demo", 1)
+                    if reason == "unknown":
+                        self.assertIsNone(previous.site_page_states["mikan"].has_more)
+                    current = await service.search("Demo", 2)
+                self.assertEqual(search.await_count, 2)
+                self.assertIn("Demo recovered", [row.title for row in current.items])
+                self.assertFalse(current.partial)
+
+    async def test_paging_requires_same_query_sites_plan_and_immediate_previous_page(self):
+        for change in ("query", "sites", "plan", "missing_page"):
+            with self.subTest(change=change):
+                adapter = FakeAdapter("nyaa", [item("nyaa", "Demo")])
+                service = self.service([adapter, FakeAdapter("mikan")])
+                request = IndexerMediaSearchRequest.create(title="Demo")
+                await service.search_media(request)
+                if change == "query":
+                    request = IndexerMediaSearchRequest.create(title="Other", page=2)
+                else:
+                    request = IndexerMediaSearchRequest.create(title="Demo", page=3 if change == "missing_page" else 2)
+                if change == "plan":
+                    with patch("app.indexers.service.build_site_queries", return_value=("Changed",)):
+                        current = await service.search_media(request)
+                else:
+                    current = await service.search_media(request, ("nyaa",) if change == "sites" else None)
+                self.assertEqual(adapter.calls, 2)
+                self.assertFalse(current.cached)
+                self.assertEqual(len(current.items), 1)
+
+    async def test_paging_does_not_extend_previous_page_expiry(self):
+        first = FakeAdapter("nyaa", [item("nyaa", "Demo")], has_more=True)
+        second = FakeAdapter("mikan")
         service = self.service([first, second])
-
-        result = await service.search("Frieren", 1, ("nyaa", "mikan"))
-
-        self.assertIs(result.has_more, True)
+        await service.search("Demo", 1)
+        self.now += timedelta(seconds=20)
+        await service.search("Demo", 2)
+        self.assertEqual(second.calls, 1)
+        self.now += timedelta(seconds=10)
+        await service.search("Demo", 3)
+        self.assertEqual((first.calls, second.calls), (3, 2))
 
     async def test_page_100_never_reports_more_even_if_provider_has_next_page(self):
         adapter = FakeAdapter("nyaa", [item("nyaa", "one")], has_more=True)
@@ -1583,6 +1767,52 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CallerDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_during_cancel_cleanup_does_not_join_cancelled_search(self):
+        entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class SlowCleanupAdapter(FakeAdapter):
+            async def search(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        cleaning.set()
+                        await release.wait()
+                        raise
+                return IndexerPage([], request.page, False, True)
+
+        adapter = SlowCleanupAdapter("nyaa")
+        service = IndexerService(registry=IndexerRegistry({"nyaa": adapter}),
+                                 result_store=IndexerResultStore())
+        request = IndexerMediaSearchRequest.create(title="Example")
+        first = asyncio.create_task(service.search_media(request))
+        retried = None
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            first.cancel()
+            await asyncio.wait_for(cleaning.wait(), 1)
+            started = asyncio.get_running_loop().time()
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(service.search_media(request, timeout_seconds=0.02), 1)
+            self.assertLess(asyncio.get_running_loop().time() - started, 0.5)
+            self.assertFalse(first.done(), "短请求超时不能强制打断旧任务清理")
+            retried = asyncio.create_task(service.search_media(request))
+            await asyncio.sleep(0)
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            result = await retried
+            self.assertEqual(result.sites_succeeded, ("nyaa",))
+            self.assertTrue(result.complete)
+            self.assertFalse(result.cached)
+            self.assertEqual(adapter.calls, 2)
+        finally:
+            release.set()
+            await asyncio.gather(first, *([retried] if retried is not None else []), return_exceptions=True)
+            await service.aclose()
+
     async def test_short_waiter_keeps_ready_results_without_stopping_long_waiter(self):
         fast = FakeAdapter("fast", [IndexerItem("fast", "Fast", "Example 1080p", magnet="magnet:?xt=urn:btih:" + HASH, download_state="ready", download_kinds=("magnet",))])
         slow = FakeAdapter("slow", [IndexerItem("slow", "Slow", "Example 2160p", magnet="magnet:?xt=urn:btih:" + "b" * 40, download_state="ready", download_kinds=("magnet",))], delay=0.15)
@@ -1629,3 +1859,25 @@ class CallerDeadlineTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublicSiteSelectionTests(unittest.TestCase):
+    def test_public_selection_preserves_scope_and_error_contract(self):
+        registry = IndexerRegistry({"nyaa": FakeAdapter("nyaa"), "sukebei": FakeAdapter("sukebei")})
+        service = IndexerService(registry=registry, result_store=IndexerResultStore(),
+                                 enabled_site_ids=("nyaa",), sukebei_authorized=False)
+        with patch("app.indexers.service.config.get_bool", return_value=True):
+            for scope in ("manual", "agent"):
+                with self.subTest(scope=scope):
+                    self.assertEqual(service.select_sites(["NYAA", "nyaa"], scope=scope), ("nyaa",))
+                    for requested in (["sukebei"], ["unknown"], []):
+                        with self.subTest(requested=requested), self.assertRaises(IndexerValidationError) as caught:
+                            service.select_sites(requested, scope=scope)
+                        self.assertEqual(caught.exception.code, "validation_error")
+                        self.assertEqual(caught.exception.public_message,
+                                         "未选择可用资源站点，请在设置中重新选择" if not requested else "搜索参数无效")
+        with patch("app.indexers.service.config.get_bool", return_value=False):
+            with self.assertRaises(IndexerValidationError) as caught:
+                service.select_sites(None, scope="agent")
+            self.assertEqual((caught.exception.code, caught.exception.public_message),
+                             ("validation_error", "资源检索功能已关闭"))

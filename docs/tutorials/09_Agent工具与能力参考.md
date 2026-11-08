@@ -1,402 +1,390 @@
 # Media Agent：工具与能力参考
 
-> 核对日期：2026-09-10；代码基线：`main` 的 `d2318f4`。本文列出当前对话 Agent 的实际工具声明及 Provider 操作白名单，不代表所有工具在未配置服务时都可用。
+> 核对日期：2026-11-06。本文说明工作区 SDK 与会话控制方法；配置、权限和部署条件会影响实际可用能力。`mf --help` 查看分组，`mf <模块> --help` 查看方法，完整签名以 `mf <模块.方法> --help` 为准。
 
 架构与操作流程见 [Agent 架构与使用实战](08_Agent架构与使用实战.md)。用户不必背工具名，直接描述目标；工具名主要供能力查询、排错和维护使用。
 
 ## 1. 如何阅读清单
 
-- 当前对话工具目录共 **190 项**：**115 READ、55 WRITE、20 DANGER**。
-- 领域声明中的 `LOW_WRITE` 进入 Kernel 后也映射为 **WRITE**，仍需确认。原声明计数为 READ 115、LOW_WRITE 35、WRITE 20、DANGER 20。
-- 另有 **31 项 Provider 操作**，由受控网关或具体工具复用，**不能与 190 相加当作独立工具总数**。
-- 这是注册目录，不是一次模型调用的工具窗口。初始通常召回 6–10 项；缺少相关能力时可通过 `agent.capabilities` 动态发现。
+- 普通生产模型只有 `agent.run_code`；业务与会话控制通过 Python/Shell 工作区中的 `mf` SDK 使用，Skills 按需读取。
+- 下表业务方法是工作区接口；完整签名以 `mf --help` 和 SDK methods 为准，不把内部执行目录作为模型工具集。
+- `LOW_WRITE` 进入确认执行器后仍按 WRITE 处理；已授予的范围授权按原范围、期限和次数生效。
 - `READ` 指不执行目标业务写入；仍可能发起外部请求、消耗搜索额度、写入会话引用或刷新缓存。它不等于完全离线、零成本。
 - `WRITE` / `DANGER` 表示普通聊天调用时先准备 EffectPlan，用户确认后才执行。带 `preview` 的只读工具只能冻结计划，不能替代执行确认。
-- 各领域（包括光鸭）的完整能力清单统一由 `agent.capabilities` 的 `catalog` 模式提供，使用当前会话可见目录；不再维护独立的光鸭静态概览。下方历史基线计数不作为当前运行时数量。
-- 参数、选择范围和当前条件以运行时 Schema、能力查询和确认卡为准；不提供手工绕过 owner、会话引用或快照的调用方式。
+- 各领域（包括光鸭）的可调用方法通过 `mf --help`、`mf <模块> --help` 和 SDK 方法文档发现；读取方法文档不会取得写入授权。
+- 参数、选择范围和当前条件以实际 SDK 签名、方法文档和确认卡为准。使用业务响应中的真实 ID 与版本；结果归档、卡片选择和补偿凭据各有专用语义，不是通用业务句柄，也不能绕过 owner 或快照校验。
 - 内部主动识别复核只使用专门的小型工具集，不等于后台自动取得下方全部权限。
 
-| 工具组 | 数量 |
-|---|---:|
-| 工作区与综合查询 | 5 |
-| 系统、配置诊断与能力发现 | 23 |
-| 活动、跟踪与撤销 | 7 |
-| 媒体库、缺集与批量核对 | 14 |
-| 媒体质量、观看状态与播放列表 | 11 |
-| 探索、元数据、推荐与网页 | 17 |
-| 资源索引与统一接入 | 5 |
-| 下载诊断与提交续查 | 3 |
-| RSS、媒体追更与个人偏好 | 32 |
-| 媒体自动化规则与摘要 | 3 |
-| 识别知识、本地来源与路径映射 | 11 |
-| 光鸭目录、文件变更与整理 | 22 |
-| 光鸭账号、回收站与分享 | 8 |
-| 本地媒体整理 | 13 |
-| STRM 同步与失败处理 | 8 |
-| STRM 伴随元数据 | 3 |
-| 播放就绪与媒体反代 | 5 |
+## 2. 按领域列出的工作区 SDK
 
-## 2. 按领域列出的对话工具
+### 2.1 工作区与综合查询
 
-### 2.1 工作区与综合查询（5 项）
+在原生 Python/Shell 工作区用 `from mf import diagnostics` 或 `mf diagnostics --help` 查询。公共业务实现：[`workspace.py`](../../app/modules/workspace.py) 与 [`workspace_search.py`](../../app/modules/workspace_search.py)。这些 SDK 读方法不注册为模型窄工具。
 
-看板、健康状况、待办、下一步建议和全局搜索。
+`session.result(handle, path="")`（原生 SDK READ）读取当前 owner/会话已保存结果的完整快照；`data` 保留原节点类型与全文，`path` 可选 JSON Pointer。沿用原引用有效期，失效或路径错误可捕获，不重新查询业务服务；SDK 响应保存在既有工作区输出文件中。
 
-定义：[`domains/workspace/tools.py`](../../app/agent/domains/workspace/tools.py)。
+会话方法定义于 [`sdk.Session`](../../app/sdk.py)，状态控制沿 [`kernel/session_service.py`](../../app/agent/kernel/session_service.py)。普通查询和计划笔记无需创建持久任务；只有跨回合恢复或严格验收场景才使用以下任务方法。
 
-| 工具 | Kernel 风险 | 用途 |
-|---|---|---|
-| `workspace.briefing` | READ | 生成本地系统简报，汇总工作区待办、下载后核验、媒体库巡检、索引器就绪与媒体服务器配置完整性；不访问网络，也不扫描媒体或云盘内容目录。 |
-| `workspace.health` | READ | 执行媒体系统健康总检，聚合本地工作区、关键配置与媒体服务器连通性；不扫描内容目录、不搜索资源且不执行写操作。 |
-| `workspace.todo` | READ | 只读汇总下载、RSS、整理、STRM、本地媒体、下载后核验与媒体库巡检的工作区待办计数；不返回标题、路径、URL、凭据、哈希、业务标识或错误正文。 |
-| `workspace.next_actions` | READ | 从本地安全待办快照生成按固定优先级排列的只读下一步行动卡；不执行诊断、预检或写操作，不返回标题、路径、URL、凭据、哈希、业务标识或错误正文。 |
-| `workspace.search` | READ | 按标题搜索媒体库、RSS、下载、整理与本地媒体工作流；不返回路径、URL、凭据、哈希、业务标识或错误正文。 |
+| SDK 方法 | 边界 |
+|---|---|
+| `session.task()` | 只读当前验收任务及真实证据；没有任务返回 `empty`。 |
+| `session.start_task(root_goal, constraints, obligations, *, source)` | `source` 必须是已接纳用户完整原文；义务包含 `id/description/required=true/acceptance`，不预猜工具名、不授业务写权。 |
+| `session.revise_task(root_goal, constraints, obligations, *, source)` | 按当前用户原文修订；保留任务 ID、推进 epoch、使旧证据失效，累计预算不重置。 |
+| `session.checkpoint_task(evidence_ids, blockers, *, read_evidence=None)` | 只关联本任务、本 epoch 已登记的真实成功 READ 证据；`read_evidence` 为义务 ID 到证据 ID 的映射，不能用笔记或 `result_handle` 代替。 |
+| `session.cancel_task(source)` | 取消持久验收跟踪；不取消确认卡、不停止后台业务、不撤销已执行操作。 |
+| `session.pending_plan(operation="inspect")` | `inspect/cancel` 查看或取消当前未执行确认卡；不接受模型指定 owner、plan_id 或确认指令。 |
+| `session.batch(steps)` | 将已声明可组合的写方法 `method/arguments` 冻结为一张确认卡，沿原逐项额度、快照和确认执行器；失败或 unknown 停止后项，不回滚或重放。 |
 
-### 2.2 系统、配置诊断与能力发现（23 项）
+`session.batch` 是业务确认写入口；任务方法仅更新会话验收状态。普通生产模型不再获得 `agent.task`。默认模型轮次与工具总次数均无额外次数上限，仍受 `SessionLimits` 的累计估算 Token、活跃时间、写调用限制及业务限流约束；具体预算见 [架构与使用实战](08_Agent架构与使用实战.md#32-一轮请求如何运行)。
 
-当前运行条件、工具发现、Provider 网关、功能与索引站开关、任务状态。
+| SDK 方法 | 用途 |
+|---|---|
+| `diagnostics.overview(probe=False)` | 汇总本地待办、固定行动卡、索引器声明和完整配置事实；`probe=True` 复用媒体节点连接服务。保留 partial、来源失败和未知计数；空待办不证明外部健康。Web 下一步也读取同一公共服务。 |
+| `diagnostics.search(query, sections=None, limit=20, offset=0)` | 按标题检索媒体库、RSS、下载、整理与本地媒体任务。返回真实 ID 与来源分页；仅 `library` 访问媒体节点，其他来源仅读 SQLite。按各来源的 `has_more/next_offset` 继续，不把同名记录视为同一任务链。 |
 
-定义：[`domains/system/tools.py`](../../app/agent/domains/system/tools.py)。
+### 2.2 系统、配置诊断与能力发现
+
+当前运行条件、模型路由、功能与索引站开关、配置诊断。
+
+定义：[`sdk.py`](../../app/sdk.py)、[`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `agent.runtime_status` | READ | 只读返回 Media Agent 总开关、Telegram 接入和模型路由的当前启用状态，不返回令牌、密钥或供应商配置值。 |
-| `provider.capabilities` | READ | 列出媒体服务器与 qBittorrent 当前已开放的原生语义操作、参数和非敏感 profile；不会连接上游，也不会返回地址或凭据。 |
-| `provider.query` | READ | 调用静态目录中已登记的 Jellyfin、Emby 或 qBittorrent 只读操作。 |
-| `provider.change.preview` | READ | 为静态目录中已开放的媒体服务器或 qBittorrent 写操作执行实时预检并冻结短期计划。 |
-| `provider.change.execute` | WRITE | 在用户确认后执行一个 owner/session 绑定的冻结 Provider 写计划。 |
-| `provider.job.status` | READ | 读取当前会话中指定 Provider 写计划的持久状态、公开目标摘要与写后核验结果。 |
-| `config.diagnose` | READ | 检查媒体服务器、TMDB、下载器、STRM 与 AI 回退配置是否完整，不返回配置值。 |
-| `config.explain_component` | READ | 解释一个白名单配置组件的状态、必要字段标签、受影响能力与安全下一步，不返回配置键或配置值。 |
-| `config.feature_summary` | READ | 只读汇总媒体探索、资源检索与联网搜索的启用状态和依赖可用性，不返回配置值或供应商凭据。 |
-| `automation.diagnose_pipeline` | READ | 只读汇总下载、RSS、光鸭整理与 STRM 的本地自动化状态，不访问外部服务且不返回路径、凭据或业务标识。 |
-| `config.diagnose_media_servers` | READ | 使用服务端当前生效配置汇总诊断 Jellyfin 12 与 Emby / Jellyfin 10.x 节点的连通性、产品版本和兼容槽位，不返回地址、服务器名称或凭据。 |
-| `config.test_media_server` | READ | 使用服务端当前生效配置测试 Jellyfin 或 Emby / Jellyfin 10.x 的连通性与鉴权，不返回地址或凭据。 |
-| `recognition.set_rule_enabled` | WRITE | 预检并在用户确认后，按明确规则类型和编号启用或停用一条识别规则；不会修改规则内容、映射、别名或优先级。 |
-| `config.indexer_sites_summary` | READ | 读取当前固定白名单资源站点的选择，仅返回站点 ID、展示名和数量。 |
-| `config.set_indexer_sites` | WRITE | 预检并在用户确认后更新固定白名单资源站点，不接受配置键、URL、凭据、Cookie 或路径。 |
-| `telegram.send_test_notification` | WRITE | 预检并在用户确认后向当前已配置会话发送一条固定 Telegram 连接测试消息；不接受消息、凭据或会话参数。 |
-| `config.safe_policy_summary` | READ | 读取 Agent 可安全管理的固定白名单策略，只返回公开值和环境托管状态。 |
-| `config.set_safe_policy` | WRITE | 预检并在用户确认后修改一项固定白名单非敏感策略，不接受任意配置键、凭据、URL 或路径。 |
-| `config.set_feature_state` | WRITE | 预检并在用户确认后开启或关闭一个非敏感白名单功能，不接受配置键或任意配置值。 |
-| `agent.job_status` | READ | 查询当前登录会话发起的后台全库检查进度与安全结果；不会启动或修改任务。 |
-| `agent.cancel_job` | WRITE | 预检并在用户确认后安全取消当前会话的后台全库检查。 |
-| `agent.action_history` | READ | 查看最近经确认执行的 Agent 动作审计，仅返回脱敏状态、聚合计数与耗时。 |
-| `agent.capabilities` | READ | 回答 MediaFlux Media Agent 是谁、能做什么，并列出当前可以读取或经确认执行的项目能力；传query可从全项目发现需要的原子工具，或传tool_names核实可用状态，并在下一次模型调用加载Schema。 |
+| `diagnostics.runtime()`（SDK） | READ | 只读返回 Media Agent 总开关、Telegram 接入和模型路由的当前启用状态，不返回令牌、密钥或供应商配置值。 |
+| `diagnostics.configuration()`（SDK） | READ | 完整读取媒体服务器、TMDB、下载器、STRM 与 AI 回退的配置事实、字段来源和全部问题；不返回配置键、值或凭据，不探测连通性。 |
+| `diagnostics.component(component)`（SDK） | READ | 读取一个白名单组件的完整状态、字段来源、缺项、校验错误、能力影响和安全下一步；功能开关共用公共功能配置服务。 |
+| `settings.features()`（SDK） | READ | 只读汇总媒体探索、资源检索与联网搜索的启用状态和依赖可用性，不返回配置值或供应商凭据。 |
+| `diagnostics.pipeline(limit=20, offset=0)`（SDK） | READ | 读取完整本地自动化汇总和 RSS 公共诊断，保留来源、错误及真实订阅 ID；RSS 关注项按 `limit`（1–100）与 `offset` 穷尽分页，部分来源失败仍保留其余事实。不访问外网或启动任务，不返回路径、配置值或凭据。 |
+| `recognition.rules(rule_type)`（SDK） | READ | 完整只读列出 `preprocess_rule/tmdb_regex_rule/release_format` 的真实 ID、启停状态和内容；格式包含 revision，类型间 ID 可重号，不初始化种子或使用临时编号。 |
+| `recognition.set_rule_enabled(rule_type, rule_id, enabled)`（SDK） | LOW_WRITE | 确认后单条启停三类规则，事务内复核业务行；格式仍走原 change 的 revision/注册表复验及启用回归检查。知识不在此接口，统一使用 `recognition.update_knowledge(entry_id, disabled=not enabled)`。不会改变内容、TMDB 或优先级，未知结果先回读，不重放旧卡或原脚本。 |
+| `resources.sources()`（SDK） | READ | 读取当前固定白名单资源站点的选择，仅返回站点 ID、展示名和数量。 |
+| `resources.configure_sites(site_ids, enable_search=None)`（SDK） | WRITE | 预检并在用户确认后更新固定白名单资源站点，不接受配置键、URL、凭据、Cookie 或路径。 |
+| `settings.test_notification` | WRITE | 预检并在用户确认后向当前已配置会话发送一条固定 Telegram 连接测试消息；不接受消息、凭据或会话参数。 |
+| `settings.policies` | READ | 读取 Agent 可安全管理的固定白名单策略，只返回公开值和环境托管状态。 |
+| `settings.set_policy` | WRITE | 预检并在用户确认后修改一项固定白名单非敏感策略，不接受任意配置键、凭据、URL 或路径。 |
+| `settings.set_feature(feature, enabled)`（SDK） | WRITE | 预检并在用户确认后开启或关闭一个非敏感白名单功能，不接受配置键或任意配置值。 |
+| `library.audit_job(job_id=None, limit=5)`（SDK） | READ | 查询当前用户真实 job_id 或最近任务窗口，保留聚合计数、未知总数与覆盖完整度；持久缺集样本最多20项、每项20集，不能冒充全量结果。 |
+| `library.cancel_audit(job_id=None)`（SDK） | WRITE | 确认后取消指定后台全库检查；省略ID在预检时冻结最近活动任务，运行任务在批次边界停止并保留已保存结果。 |
+| `activity.actions(limit=50, outcome="all", before_id=None)`（SDK） | READ | 查看最近经确认执行的 Agent 动作审计，仅返回脱敏状态、聚合计数与耗时。 |
+| `diagnostics.query_db`（SDK） | READ | 仅 Web 登录身份：在运维表上执行一条只读 SELECT；SQLite 授权回调限定白名单表与非凭据列，不可读 Agent 私有会话表，不带 sql 时返回可读表与列，结果中的凭据片段打码。 |
+| `diagnostics.search_logs`（SDK） | READ | 仅 Web 登录身份：按关键词、最低级别和日期检索最近 14 天运行日志，返回最近的完整匹配记录及扫描范围，最多读取文件末尾32MiB；凭据片段打码。 |
 
-### 2.3 活动、跟踪与撤销（7 项）
+### 2.3 活动、跟踪与撤销
 
 按媒体或任务查活动时间线；回退必须先检查支持范围，不能承诺任意操作可撤销。
 
-定义：[`domains/activity/tools.py`](../../app/agent/domains/activity/tools.py)。
+稳定接口：[`sdk.py`](../../app/sdk.py)；补偿业务复用 [`activity_undo.py`](../../app/modules/activity_undo.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `activity.search` | READ | 按标题查找下载、光鸭整理和本地整理活动，并返回可续查的会话引用。 |
-| `activity.timeline` | READ | 通过安全活动引用读取下载→整理→STRM→媒体库复核的持久化阶段及故障原因，只按真实请求/运行标识关联。 |
-| `action.undo.inspect` | READ | 核对指定光鸭整理日志是否有可逆移动/改名的完整操作快照。 |
-| `action.undo.execute` | DANGER | 使用服务端回退凭证生成冻结恢复计划；用户确认后才调用原领域执行器。 |
-| `activity.follow` | WRITE | 持续跟踪选定任务，异常、已有阶段结束或到期时发送一次 Telegram 通知；只观察、不替任务重试。 |
-| `activity.follows` | READ | 查看我持久保存的任务跟踪规则及启用状态和到期时间。 |
-| `activity.unfollow` | WRITE | 停用我的活动跟踪通知，不停止或删除下载/整理任务。 |
+| `activity.search` | READ | 按标题分页查找下载、光鸭整理和本地整理活动，返回真实 kind/id、总数和 next_offset。 |
+| `activity.timeline` | READ | 使用真实 kind/id 读取下载→整理→STRM→媒体库复核的持久化阶段及故障原因，只按真实请求/运行标识关联。 |
+| `activity.inspect_undo(log_id)` | READ | 核对真实整理日志的最近可逆移动/改名快照，宿主签发当前 owner 的补偿凭据。 |
+| `activity.undo(receipt_id)` | DANGER | 使用 data.receipt_id 原样生成冻结恢复计划；确认后调用公共补偿业务，拒绝覆盖后续修改，凭据只消费一次。明确未受理可重新预检；写后结果未知不可重投。 |
+| `activity.follow(kind, identifier, hours=24)` | SDK确认写 | 按activity.search/timeline的持久kind/id持续跟踪任务，异常、已有阶段结束或到期时发送一次 Telegram 通知；只观察、不替任务重试。 |
+| `activity.follows()` | SDK只读 | 查看我持久保存的任务跟踪规则及启用状态和到期时间。 |
+| `activity.unfollow(rule_id)` | SDK确认写 | 停用我的活动跟踪通知，不停止或删除下载/整理任务。 |
 
-### 2.4 媒体库、缺集与批量核对（14 项）
+### 2.4 媒体库、缺集与批量核对
 
 库存搜索、批量在库匹配、季集计数、缺集资源、巡检与复核工作流。
 
-定义：[`domains/library/tools.py`](../../app/agent/domains/library/tools.py)。
+定义：[`sdk.py`](../../app/sdk.py)、公共 [`media_library.py`](../../app/modules/media_library.py) 与 [`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `library.search` | READ | 在已配置的 Jellyfin / Emby 媒体库中搜索一个具体标题；适合单片核对，并在可用时返回已校验的 open_url。 |
-| `library.batch_presence` | READ | 一次按 TMDB ID 批量核对最多 50 部电影或剧集是否存在于已配置的 Jellyfin / Emby。 |
-| `library.search_missing_episode_resources` | READ | 先确认指定季集属于已播缺集，再按当前身份保存的资源偏好排序；本次 preference_overrides 优先于长期偏好（空数组/0/any 可取消对应约束），不会自动下载。 |
-| `library.search_missing_season_resources` | READ | 单部核对指定季度；多部用 items 一次核对最多 12 部/季。每部可用 episodes 指定 1–3 个集号（例如 `[4]`、`[7]`），不指定才从最早缺集开始，每部最多搜索 3 集。整批候选使用全局编号及同一快照，统一业务容量 50 项，保留未覆盖项和季集映射不确定性；一次预检整批、人工确认后才下载。 |
-| `library.missing_media_workflows` | READ | 查看当前用户最近缺集补库流程的安全状态；只返回剧名、季集、阶段、目标类型与是否已建立下载任务，不返回资源句柄、磁力、URL、路径或凭据。 |
-| `library.check_updates` | READ | 单部或批量核对最多 20 部媒体；默认刷新 Jellyfin / Emby 库存，对照 TMDB 已播季集。逐部保留缺集、无已播缺集、歧义与不可用状态；不代表全网资源发布进度。 |
-| `library.audit_library_episodes` | READ | 有界枚举已配置媒体服务器中的剧集，并按可靠 TMDB 映射巡检截至指定日期的已播缺集。 |
-| `library.start_episode_audit` | WRITE | 在用户确认后创建可恢复、可查询进度、可取消的后台全库剧集完整性检查。 |
-| `library.patrol_status` | READ | 查询最近一次后台全库缺集巡检的安全摘要；不会触发巡检、资源搜索或下载。 |
-| `library.patrol_policy` | READ | 读取后台全库缺集巡检的启用、通知、间隔和单轮检查上限，不返回其他配置。 |
-| `library.set_patrol_policy` | WRITE | 预检并在用户确认后修改全库缺集巡检的四项白名单策略，不接受配置键、凭据、URL 或路径。 |
-| `library.trigger_patrol_now` | WRITE | 预检并在用户确认后，按当前全库缺集巡检策略把单例后台任务排到现在；不修改策略、不搜索资源、不下载。 |
-| `library.count_series_episodes` | READ | 直接读取已配置 Jellyfin / Emby 中指定剧集的本地普通集数量与季度分布；不访问 TMDB，也不判断缺集。 |
-| `library.audit_episodes` | READ | 核对媒体库剧集与 TMDB 截止日期前已播普通集，报告缺集或可更新集。 |
+| `library.search(...)`（工作区 SDK） | READ | 共用服务按标题或演员元数据搜索；保留真实对象 ID、准确总数、分页与来源范围。`count_only=True` 只统计；旧工具入口已退役。 |
+| `resources.search_missing`（SDK） | READ | items统一单集、单季和最多12部/季的已播缺集资源检索；保留真实result_ids、完整verification_targets和来源分页/partial/未完成目标，不自动下载。 |
+| `resources.missing_workflows`（SDK） | READ | 当前用户的持久补库流程、全部成员、真实workflow_id/item_id/revision/request_id与状态；total/has_more/next_offset用于分页。 |
+| `library.connection`（SDK） | READ | 当前配置单槽位或全部媒体服务器的连接与身份诊断；server=all/jellyfin/emby，保留产品、版本、兼容性、disabled/unknown与安全错误；固定目标拒绝凭据重定向，不返回地址或凭据，失败不当空结果。 |
+| `library.libraries(server="auto")`（SDK） | READ | 返回真实库 ID、名称和类型；auto 遵循已保存的首选服务器，多源未选定时需明确服务器。 |
+| `library.recent`（SDK） | READ | 按真实库 ID 或精确库名读取最近入库；支持电影、剧集或单集，最多200项，最多扫描2000条；不代表全库库存。 |
+| `library.quality`（SDK） | READ | 按真实库 ID 分页检查版本、分辨率、字幕及服务器缺失状态；未知保持未知，重复检查仅限本页，不播放或探测 STRM。 |
+| `library.refresh(server, library_id, mode="scan", replace_images=False, regenerate_trickplay=False)`（SDK） | LOW_WRITE | 明确指令直接执行，不弹确认卡；scan增量扫描、missing补齐缺失、replace覆盖元数据，后两种模式可独立替换图片／重建Jellyfin预览图。复用一次执行与持久回执；accepted仅表示排队，结果未知不重发。自动入库仍使用增量。 |
+| `media.refresh(item_id, server="auto", ...)`（SDK） | LOW_WRITE | 与媒体库刷新同参数，目标为真实电影、整部剧、季或单集ID；不扩展为全库。默认不覆盖元数据、图片或预览图。 |
+| `library.presence(items)`（SDK） | READ | 一次按 TMDB ID 批量核对最多 50 部电影或剧集是否存在于已配置的 Jellyfin / Emby。 |
+| `library.updates`（SDK） | READ | 单部或批量核对媒体；默认刷新 Jellyfin / Emby 库存，对照 TMDB 已播季集。逐部保留缺集、无已播缺集、歧义与不可用状态；不代表全网资源发布进度。 |
+| `library.audit_all(as_of=None, max_series=50, after_tmdb_id="")`（SDK） | READ | 分批检查全库剧集与已播缺集；按返回游标续查，保留来源失败与未知映射。 |
+| `library.start_audit(as_of=None, max_series=50)`（SDK） | WRITE | 确认后创建可恢复的后台全库剧集检查并返回真实 job_id；max_series为每批上限，活动同范围任务复用，accepted仅表示已入队。 |
+| `library.patrol_status(run_id=None)`（SDK） | READ | 查询最近或指定 run_id 的后台巡检状态及安全缺集摘要，不触发巡检或下载。 |
+| `library.patrol_policy`（工作区 SDK） | READ | 读取后台全库缺集巡检的启用、通知、间隔和单轮检查上限，不返回其他配置。 |
+| `library.set_patrol_policy`（工作区 SDK） | WRITE | 预检并在用户确认后修改全库缺集巡检的四项白名单策略，不接受配置键、凭据、URL 或路径。 |
+| `library.run_patrol()`（SDK） | WRITE | 确认后按当前策略立即排队；已运行时复用 run_id。accepted 表示已受理，可按 run_id 继续查询；不修改策略、不搜索或下载。 |
+| `library.episodes(query, tmdb_id="", library_name="")`（SDK） | READ | 直接读取已配置 Jellyfin / Emby 中指定剧集的本地普通集数量与季度分布；不访问 TMDB，也不判断缺集。 |
+| `library.audit`（SDK） | READ | 核对媒体库剧集与 TMDB 截止日期前已播普通集，报告缺集或可更新集。 |
 
-### 2.5 媒体质量、观看状态与播放列表（11 项）
+### 2.5 媒体质量、观看状态与播放列表
 
 读取服务器报告的质量和用户状态，受控修改已看、收藏和播放列表；不进行真实播放探测。
 
-定义：[`domains/library/quality_tools.py`](../../app/agent/domains/library/quality_tools.py)。
+定义：[`modules/media_user.py`](../../app/modules/media_user.py)，原生SDK见[`app/sdk.py`](../../app/sdk.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `media.library.quality` | READ | 分页只读检查媒体库视频版本、分辨率、中文字幕和服务器报告缺失状态；未知字段保持 unknown，仅本页查重，不将分页样本当全库结果，不播放或探测 STRM。 |
-| `media.user.inspect` | READ | 读取搜索结果中单个媒体条目的已看、收藏和观看进度状态，创建绑定用户的短期状态引用；修改前必须读取。 |
-| `media.playlists.list` | READ | 分页列出当前媒体服务器用户可访问的播放列表，并返回短期列表引用。 |
-| `media.playlist.inspect` | READ | 读取播放列表及完整成员快照，最多250项；条目分页展示；返回修改用的列表快照引用和移除用的成员引用。 |
-| `media.user.mark_played` | WRITE | 人工确认后标记已看单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.user.mark_unplayed` | WRITE | 人工确认后标记未看单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.user.favorite` | WRITE | 人工确认后收藏单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.user.unfavorite` | WRITE | 人工确认后取消收藏单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.playlist.create` | WRITE | 人工确认后为配置用户创建私有 Jellyfin 视频播放列表；可放入最多20个明确视频，不展开剧集。 |
-| `media.playlist.add_items` | WRITE | 人工确认后把明确视频加入已有播放列表，跳过已经存在的条目；playlist_ref 来自 media.playlist.inspect。 |
-| `media.playlist.remove_items` | WRITE | 人工确认后按成员引用移出播放列表，只改成员关系，绝不删除媒体文件；两个引用均来自 media.playlist.inspect。 |
+| `library.user_state`（SDK） | READ | 按真实item_id读取配置/默认用户的已看、收藏、计数和进度；缺失字段保持None，返回用户scope。 |
+| `library.playlists`（SDK） | READ | 当前用户可访问列表分页；真实id及total/has_more/next_offset，公开和归属未知保持None。 |
+| `library.playlist`（SDK） | READ | 真实playlist_id与完整成员item_id/entry_id，默认最多250项；next_offset续页，完整快照才允许修改。 |
+| `library.set_played`（SDK） | WRITE | 按真实item_id与布尔played设置当前用户已看状态；冻结状态、用户和配置，确认后回读，不展开剧集。 |
+| `library.set_favorite`（SDK） | WRITE | 按真实item_id与布尔favorite设置收藏；普通播放变化不使收藏确认失效。 |
+| `library.create_playlist`（SDK） | WRITE | 为明确配置用户创建Jellyfin私有Video列表；1–20个真实视频ID，同名拒绝，Emby无法验证归属时不支持。 |
+| `library.add_to_playlist`（SDK） | WRITE | 1–20个真实视频ID加入列表，跳过已有媒体；完整成员CAS校验，最多250成员，写后返回完整成员。 |
+| `library.remove_from_playlist`（SDK） | WRITE | 按真实entry_ids移出列表成员；不接受媒体ID代替，不删除媒体文件；完整成员CAS及写后回读。 |
 
-### 2.6 探索、元数据、推荐与网页（17 项）
+### 2.6 探索、元数据、推荐与网页
 
 元数据详情与演职员、电影人作品列表、本地与外部推荐、网页搜索/正文及两类动漫日历。
 
-定义：[`domains/discovery/tools.py`](../../app/agent/domains/discovery/tools.py)。
+元数据、评分、周历及映射接口统一见 [`sdk.py`](../../app/sdk.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `web.search` | READ | 通过受控 Tavily Provider 搜索公开网页；用于核对官方平台当前更新进度、最新播出信息和其他时效性事实。 |
-| `web.read` | READ | 读取一个普通公开 HTTPS 网页的正文，用于总结用户给出的文章、公告、文档，或在网页搜索后打开权威来源核实事实。 |
-| `discovery.search` | READ | 搜索 TMDB、豆瓣与 Bangumi 的影视身份和概况，不含演职员表。 |
-| `discovery.person_filmography` | READ | 按人物名称读取 TMDB 电影演职员表，可按导演、演员、编剧或制片身份筛选，并一次返回按上映日期升序排列的有界作品列表。 |
-| `discovery.lookup_rating` | READ | 按明确影视名称、类型和年份查询豆瓣评分；优先使用豆瓣结构化数据，必要时受控检索并读取已验证的豆瓣条目页。 |
-| `discovery.detail` | READ | 读取精确条目的标题、年份、播出时间、简介和映射状态，不包含演职员表。 |
-| `discovery.credits` | READ | 只读查询已确认 TMDB 作品的演员、角色/配音及导演等主创。 |
-| `discovery.mapping_candidates` | READ | 只读查询一个非 TMDB 来源条目的 TMDB 映射候选，并将内部候选身份短期绑定到当前会话；不会自动保存高置信映射。 |
-| `discovery.confirm_mapping` | WRITE | 预检并在用户确认后保存当前会话最近映射候选中的一个；候选会重新通过 TMDB 详情核验。 |
-| `discovery.watchlist_summaries` | READ | 统一读取收藏摘要：默认分页列表、`mode=statistics` 全库统计，或仅传 `watchlist_number` 查已知编号（返回 0 或 1 项）。列表按返回游标续页，不猜编号枚举。 |
-| `discovery.add_watchlist` | WRITE | 预检并在用户确认后把一个精确影视条目加入本地探索收藏；不会下载资源。 |
-| `discovery.remove_watchlist` | WRITE | 预检并在用户确认后按精确收藏编号移除本地探索收藏；不会删除媒体文件或下载任务。 |
-| `media.recommend_from_library` | READ | 从已配置的 Jellyfin / Emby 本地媒体库中推荐可以立即观看的作品。 |
-| `discovery.recommend` | READ | 读取 TMDB 或豆瓣推荐列表，支持年份范围、地区和题材；`exclude_library=true` 批量核验并排除已入库作品，仅返回确认不在库的候选。未映射或库不可达不代表未入库，候选不足时可继续分页。 |
-| `discovery.anime_calendar` | READ | 读取腾讯视频、爱奇艺和优酷公开动漫排期的追漫日历；默认今天，可按日期、平台和片名筛选。 |
-| `bangumi.calendar` | READ | 读取用户明确指定的 Bangumi 本周或指定星期放送表，不表示国内视频平台排期；不返回图片地址、收藏状态或 Provider 配置。 |
+| `web.search` | READ | Tavily 公开网页搜索；支持包含/排除域名及相对或绝对日期范围，返回实际筛选条件和条数上限。日期可能是发布或更新时间，具体事实需读原文。 |
+| `web.read` | READ | 读取公开 HTTPS 正文，标记正文截断，并保留本次响应正文中的完整可读链接供继续查证。不执行 JavaScript，不支持登录验证或 PDF。 |
+| `media.search`（SDK） | READ | 搜索 TMDB、豆瓣与 Bangumi 的完整当前页；类型/年份精确过滤，地区/题材仅作关键词。保留来源错误与实际分页，不含演职员表。 |
+| `media.people`（SDK） | READ | 按姓名读取完整 TMDB 人物候选页及真实 ID/已知作品，保留 total_pages/next_page；不按热度自动挑选，同名歧义须核对。 |
+| `media.filmography`（SDK） | READ | 按明确 TMDB 人物 ID 读取完整电影作品、年份与角色；可筛选职务/已上映作品，`library_check_items` 可直接用于 `library.presence`。 |
+| `media.rating(query, media_type, year)`（SDK） | READ | 按明确影视名称、类型和年份查询豆瓣评分；优先使用豆瓣结构化数据，必要时受控检索并读取已验证的豆瓣条目页。 |
+| `media.detail`（SDK） | READ | 读取真实作品 ID 的完整概况、映射确认状态与默认季集；未知计数保留 null，未查询演员不表示源站没有演员。 |
+| `media.credits`（SDK） | READ | 按已确认 TMDB 作品 ID 读取电影、全剧或指定季（含第 0 季）完整演职员及 roles/jobs；默认不截表，显式 limit 可配合 offset 续读。 |
+| `media.resolve(provider, external_id, media_type, title, year="")`（SDK） | READ | 只读返回已确认映射或完整 TMDB 候选，包含真实 tmdb_id/media_type；不自动保存。 |
+| `media.confirm_mapping(provider, external_id, media_type, tmdb_id)`（SDK） | WRITE | 按真实来源与目标 ID 预览，用户确认后保存映射。来源、目标或旧映射变化时需重新预检；不收藏、订阅或下载。 |
+| `watchlist.list/get/statistics`（SDK） | READ | 读取本地收藏列表、真实 id 对应作品及完整统计。列表按 `next` 续页，`total` 为全库总数；外部探索关闭时仍可读取已保存收藏。 |
+| `watchlist.add` | WRITE | 工作区通过 `mf.watchlist.add(provider, media_type, external_id)` 预检并确认添加精确影视条目；支持原有范围授权和批量确认，不会下载资源。 |
+| `watchlist.remove` | WRITE | 工作区通过 `mf.watchlist.remove(watchlist_number)` 预检并确认移除精确收藏；不会删除媒体文件或下载任务。 |
+| `library.recommend`（SDK） | READ | 从已配置的 Jellyfin / Emby 本地媒体库分页读取最多5000个候选，结合50条真实历史确定性推荐；仅最终作品列表按limit截取。省略参数采用当前身份已存偏好，显式空数组/0/False优先。库存未读全或总数未知保留partial/None，计数仅代表已扫描范围；返回真实ID及完整元数据。 |
+| `media.catalog`（SDK） | READ | 默认读取一页榜单。显式 `limit` 收集 TMDB/discover 或豆瓣/recommend，支持年份范围、产地和题材；`exclude_library=true` 只保留核验不在库者。未知不是缺失；按 `scope.next_page/next_offset` 续取，达到请求数后不因 `has_more` 继续。 |
+| `media.calendar`（SDK） | READ | 返回上海当前周完整七天的腾讯视频、爱奇艺和优酷排期，保留会员/免费事件、未知时间和来源状态；脚本可按日期、平台、片名筛选，不推断本周外排期。 |
+| `media.catalog("bangumi", "calendar", "tv")`（SDK） | READ | 读取 Bangumi 周历的一页，`filters={"weekday":"1"}` 可选星期；不表示国内三平台排期，按 `has_more` 续页。 |
 
-### 2.7 资源索引与统一接入（5 项）
+### 2.7 资源索引与统一接入
 
-搜索得到候选引用，再检查、确认和提交资源；直接链接与分享也复用受控接入链路。
+资源搜索返回真实 `result_ids`；工作区用 `resources.present` 将当前搜索批的候选投递到现有 Web/TG 卡片，下载另行预检和确认。直接链接与分享复用受控接入链路。
 
-定义：[`domains/resources/tools.py`](../../app/agent/domains/resources/tools.py)。
-
-| 工具 | Kernel 风险 | 用途 |
-|---|---|---|
-| `indexer.diagnose_readiness` | READ | 只读检查多站资源索引器的本地开关、启用站点与能力声明；不访问资源站、网络或文件系统，也不返回 URL、Cookie 或凭据。 |
-| `indexer.search_resources` | READ | 在已启用的多站索引中搜索短期资源结果，只返回 opaque result_id 与公开元数据。 |
-| `ingest.inspect` | READ | 只读检查光鸭分享、Magnet、ED2K、明确 HTTP(S) 下载直链或资源候选快照。仅 `resource_candidates` 支持可选 `positions`：按指定顺序返回并保留原序号，省略时读取全部；`count` 是本次检查数，`total` 是快照总数。读取候选快照不等于已验证下载可用性，不创建下载计划。 |
-| `ingest.submit` | DANGER | 在用户确认后统一提交最近检查的直链或光鸭分享，或按资源搜索候选序号提交。 |
-| `ingest.status` | READ | 按公开请求编号读取统一资源接入状态，覆盖 qB、光鸭、整理与 STRM 阶段；不返回链接、路径、哈希或后端任务标识。 |
-
-资源提交只使用 `candidate_numbers.position` 和配套候选引用，集号、质量排序名次不是提交序号。待核对资源不会自动推荐，但用户明确选择后可以生成预检卡；候选仍需确认才能提交。同一快照的业务容量为 50 项，与搜索最大结果数一致；推荐摘要和模型上下文预算不裁剪快照、确认范围或批量结果。默认搜索返回 20 项时，可在一次预检和人工确认中提交全部 20 项，无需为尾项再次发指令。
-
-### 2.8 下载诊断与提交续查（3 项）
-
-查看下载队列及最近提交，重试前检查结果与幂等边界；实时 qB 操作另见 Provider 目录。
-
-定义：[`domains/downloads/tools.py`](../../app/agent/domains/downloads/tools.py)。
+定义：[`sdk.py`](../../app/sdk.py)、[`kernel/ports/resource_presentation.py`](../../app/agent/kernel/ports/resource_presentation.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `downloads.diagnose_queue` | READ | 只读诊断 qBittorrent 当前队列、传输状态与疑似停滞任务，不返回 hash、路径或凭据。 |
-| `downloads.request_summaries` | READ | 只读列出 MediaFlux 统一下载请求在 qB、光鸭、整理与 STRM 各阶段的安全状态摘要，不返回链接、路径、哈希或云端任务标识。 |
-| `downloads.retry_submission` | DANGER | 预检并在用户确认后，将一条明确编号的下载待处理记录重新提交到 qBittorrent、光鸭或两者；不返回资源链接、种子、路径、任务标识或凭据。 |
+| `resources.sources()`（SDK） | READ | 只读检查多站资源索引器的本地开关、启用站点与能力声明；不访问资源站、网络或文件系统，也不返回 URL、Cookie 或凭据。 |
+| `resources.search(...)`（SDK） | READ | 使用共用索引服务检索资源；完整结果可在工作区过滤、保存，返回实际参与站点、部分失败与截取范围。 |
+| `resources.present(result_ids, ...)`（SDK） | READ | 只展示当前会话最近一次实际搜索批中的 0–50 个真实 ID，沿用查询规格和缺集复核目标；空列表明确撤卡。复用 Web/TG 批选与回复绑定，不下载、不新建确认。 |
+| `cloud.inspect_share(url)`（SDK） | READ | 完整读取分享顶层文件列表，返回真实文件 ID、数量与覆盖范围；分页无法完成时明确失败，不截取前 200 项冒充完整。 |
+| `cloud.transfer_share(url, file_ids)`（SDK） | DANGER | 明确选择真实文件 ID，冻结所选文件及配置目标；冷确认重新读取并核对后进入既有持久转存任务。结果未知时不得重新转存。 |
+| `resources.download(result_ids, target="preferred", verification_targets=None)`（SDK） | WRITE | 按真实资源 ID 批量预检和确认，沿用 owner 偏好或显式目标；缺集复核目标经服务端审计后随原请求持久化。 |
+| `downloads.submit(url, target="preferred")`（SDK） | DANGER | 只读预检 Magnet、ED2K 或明确 HTTP(S) 下载直链，冻结实际目标后由唯一 EffectExecutor 确认提交。活跃请求不隐式补投；request_id 可交给 activity.timeline("download", request_id) 跟踪。 |
+| `activity.timeline("download", request_id)`（SDK） | READ | 按原请求编号续查下载、转存、整理与 STRM 状态；受理或转存完成不等于全部后处理成功。 |
 
-### 2.9 RSS、媒体追更与个人偏好（32 项）
+原生资源提交使用实际 `result_ids`；候选卡仍保留签名批次与展示序号，提交前转换为同批真实 ID，集号或质量排名不能替代 ID。待核对资源不会自动推荐，但用户明确选择后可以生成预检卡；候选仍需确认才能提交。单次候选卡和确认的业务容量为 50 项，完整搜索观察不因展示容量而截断；推荐摘要和模型上下文预算不裁剪快照、确认范围或批量结果。默认搜索返回 20 项时，可在一次预检和人工确认中提交全部 20 项，无需为尾项再次发指令。
+
+### 2.8 下载诊断与提交续查
+
+查看下载队列及最近提交，重试前检查结果与幂等边界；实时 qB 任务和传输信息通过 SDK downloads.tasks/transfer 读取。
+
+定义：[`sdk.py`](../../app/sdk.py)，诊断复用 [`modules/download_diagnosis.py`](../../app/modules/download_diagnosis.py)。
+
+| 工具 | Kernel 风险 | 用途 |
+|---|---|---|
+| `downloads.diagnose()`（SDK） | READ | 只读诊断 qBittorrent 当前队列、传输状态与疑似停滞任务，保留原诊断字段并返回关注任务的真实 hash；不公开凭据、路径或下载链接。queue_state 和 unavailable_sources 区分已读空队列与读取失败；partial 保留成功读取的事实，快照不证明持续停滞或入库完成。 |
+| `downloads.requests(scope="active", limit=12, offset=0)` | READ | 分页读取 MF 持久请求；`request_number` 是可传给 retry 的真实请求 ID，按 next_offset 续读；不代表 qB 或光鸭全账户实时队列。 |
+| `downloads.retry(request_id, target)` | DANGER | 真实请求 ID 来自 `downloads.requests`；target 为 qb/guangya/both。只补可重试目标，未知受理不重投；确认后沿原请求和配置快照提交，回执实际 request_id 可供 activity.timeline 核验。 |
+
+### 2.9 RSS、媒体追更与个人偏好
 
 RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下载偏好、最近播放与内容汇总。
 
-定义：[`domains/subscriptions/tools.py`](../../app/agent/domains/subscriptions/tools.py)。
+定义：媒体追更与 RSS 均使用 [`sdk.py`](../../app/sdk.py) 中的原生方法；公共业务分别位于 [`media_subscriptions.py`](../../app/modules/media_subscriptions.py) 与 [`rss.py`](../../app/modules/rss.py)，写入共用 [`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `rss.diagnose` | READ | 只读诊断 RSS 订阅、待处理、失败与长期提交中条目，不访问订阅源且不返回 URL、GUID、payload 或路径。 |
-| `rss.subscription_summaries` | READ | 只读列出 RSS 规则订阅（不是媒体追更订阅）的安全摘要，仅含编号、名称、启用/调度状态和条目计数，不返回 URL、过滤词、正文或路径。 |
-| `rss.get_subscription_summary` | READ | 按精确订阅编号读取 RSS 安全摘要，仅含名称、启用/调度状态和条目计数，不返回 URL、过滤词、正文或路径。 |
-| `rss.create_subscription` | WRITE | 预检并在用户确认后创建一个 RSS 订阅；支持订阅地址、过滤、刷新、下载目标和媒体去重配置，不接受任意下载路径或云端目录标识。 |
-| `rss.update_subscription` | WRITE | 预检并在用户确认后更新一个指定 RSS 订阅的名称、地址、过滤、刷新、下载目标或媒体去重配置；不接受任意路径。 |
-| `rss.delete_subscription` | DANGER | 预检并在用户确认后永久删除一个指定 RSS 订阅及其本地条目记录；不删除下载任务或已下载文件。 |
-| `media.subscription_summaries` | READ | 只读列出影视/动画媒体追更订阅（不是 RSS 规则订阅）摘要，仅含编号、标题、媒体类型、启用状态和缺失数量。 |
-| `media.subscription_updates` | READ | 实时检查全部媒体追更订阅：逐条比较 TMDB 已播清单与 Jellyfin/Emby 本地库存，并对确认缺失项执行有界多站资源搜索；只返回下载建议，不提交 qBittorrent 或光鸭。 |
-| `media.get_subscription_summary` | READ | 按精确订阅编号读取一条媒体追更订阅的安全摘要。 |
-| `media.get_subscription_policy` | READ | 按精确订阅编号读取追更范围、动作模式、下载目标和检查周期；不返回站点明细或凭据。 |
-| `media.set_subscription_policy` | DANGER | 预检并在用户确认后修改一个媒体追更订阅的追更范围、动作模式、下载目标或检查周期；不会立即检查或下载。 |
-| `media.create_subscription` | WRITE | 预检并在用户确认后，为一个精确影视条目创建媒体追更订阅；不会立即搜索或下载资源。 |
-| `media.delete_subscription` | DANGER | 预检并在用户明确确认后软删除一个精确编号的媒体追更订阅；不会删除已提交下载任务或媒体文件。 |
-| `media.set_subscription_enabled` | WRITE | 预检并在用户确认后暂停或恢复一个指定媒体追更订阅；不会操作已提交下载任务或媒体文件。 |
-| `media.recently_played` | READ | 读取媒体服务器用户的真实最近播放历史（播放事件/DatePlayed）；优先使用明确配置的用户，未配置时沿用服务器默认用户选择。 |
-| `media.recently_added` | READ | 读取 Jellyfin 或 Emby 最近入库的内容；连续单集会按作品去重，并在可用时返回已校验的 open_url。 |
-| `media.continue_watching` | READ | 读取媒体服务器用户的继续观看列表；优先使用明确配置用户，未配置时沿用服务器默认用户选择；不返回用户 ID、路径或凭据，但会在可用时返回已校验的 open_url。 |
-| `media.preferences` | READ | 读取当前身份显式保存的媒体服务器、下载目标、清晰度/HDR/编码/字幕/音轨/发布组/排除词/单集大小/题材与观看偏好；单次请求条件优先，不从聊天摘要推断。 |
-| `media.set_preferences` | WRITE | 预检并在用户确认后按字段更新结构化媒体偏好；本地推荐和资源排序使用这些默认偏好，单次显式参数（包括空数组、0、False）优先。 |
-| `media.clear_preferences` | WRITE | 预检并在用户确认后清除当前会话保存的显式媒体偏好，恢复产品默认值。 |
-| `media.today_summary` | READ | 按本机今天的日期汇总全局管理员范围内的追更检查、整理入库、RSS 与下载内容事件；不返回路径、磁力、凭据或错误正文。 |
-| `media.subscription_notification_rule` | READ | 读取指定全局媒体追更订阅的通知规则；只返回公开订阅编号、标题和布尔开关。 |
-| `media.set_subscription_notification_rule` | WRITE | 预检并在用户确认后修改指定全局媒体追更订阅的缺集、满足或错误通知开关；不会改变订阅巡检策略。 |
-| `media.reset_subscription_notification_rule` | WRITE | 预检并在用户确认后删除指定全局媒体追更订阅的显式通知规则，恢复默认关闭状态。 |
-| `rss.recent_activity` | READ | 统计最近 24 小时 RSS 成功下载次数，并按订阅名称汇总；不返回 URL、条目正文或路径。 |
-| `rss.entry_summaries` | READ | 安全列出 RSS 条目的公开编号、标题、状态、季集线索和固定失败分类；不返回 GUID、payload、下载 URL、路径或凭据。 |
-| `rss.mark_entries` | WRITE | 预检并在用户确认后把精确 RSS 条目编号标记为已处理或未处理；不会覆盖正在提交或已下载的条目。 |
-| `rss.submit_entries_to_qb` | DANGER | 预检并在用户确认后把精确的 pending RSS 条目集合提交到 qBittorrent；集合与配置会在确认时重新核对。 |
-| `rss.refresh_subscription` | WRITE | 预检并在用户确认后刷新一个指定 RSS 订阅；不自动下载且不返回 URL、过滤词、条目正文或凭据。 |
-| `rss.refresh_subscriptions` | WRITE | 预检并在用户确认后依次刷新一组 RSS 订阅，单次最多 32 个；不自动下载且不返回 URL、过滤词、条目正文或凭据。 |
-| `rss.submit_pending_to_qb` | DANGER | 预检并在用户确认后，将最新的待处理 RSS 条目有界提交到 qBittorrent；不返回条目、URL、路径或凭据。 |
-| `rss.retry_failed` | DANGER | 预检并在用户确认后，按各订阅目标有界重试已明确分类为可安全重试的 qBittorrent / 光鸭 RSS 失败条目；不返回条目、URL、路径、失败原文或凭据。 |
+| `rss.diagnose` | READ | 原生 SDK 本地诊断调度、积压、失败和不一致状态；`attention.next` 可续页，不访问订阅源。 |
+| `rss.subscriptions` | READ | 原生 SDK 读取完整 RSS 配置及条目计数；`limit/after_id` 与 `next` 真实分页，URL 凭据脱敏。 |
+| `rss.subscription` | READ | 按真实 `subscription_id` 读取完整配置、调度及条目聚合；保留长字段，URL 凭据脱敏。 |
+| `rss.create` | WRITE | 原生 SDK 创建 RSS 配置；沿 Web 规则校验地址、过滤、调度、下载目标/路径及媒体绑定，工作区先确认，不立即刷新或下载。 |
+| `rss.update` | WRITE | 仅更新明确提供的配置字段；保留 False、0、空字符串语义，确认时原子复核配置快照，无关计数不使确认失效。 |
+| `rss.delete` | DANGER | 确认后删除指定订阅及其本地条目；运行中刷新/提交拒绝删除，不删除下载任务或媒体文件。 |
+| `subscriptions.list(status="", enabled=None, limit=200, before_updated_at=None, before_id=None)` | READ | 完整持久订阅、真实 id、revision、last_error、缺失与工作流；按 next 续读，不再裁成16条摘要。持久状态不等于实时库存。 |
+| `subscriptions.check_updates(subscription_id=None, limit=8, before_updated_at=None, before_id=None)` | READ | 分页实时比较 TMDB 已播与 Jellyfin/Emby 库存，保留全部缺失差异与不完整原因；每项资源搜索仍限首个缺集及有界候选，按 next 读完。不提交下载，不创建后台检查。 |
+| `subscriptions.get(subscription_id)` | READ | 精确真实 ID 读取完整配置/策略、修订号、已保存错误与缺失；不存在直接报错。 |
+| `subscriptions.update(subscription_id, **显式变更)` | LOW_WRITE / DANGER | 启停与策略合并；未传字段保留，单独恢复启用保留在途工作；暂停/策略变化使未提交工作失效。完整配置/修订/准入作用域CAS，已进入提交阶段无法撤回，不立即检查下载。 |
+| `subscriptions.create(provider, external_id, media_type, season=None, check_interval_minutes=4320, action="confirm", download_target="guangya", sites=None, enabled=True)` | LOW_WRITE / WRITE | 唯一媒体追更创建/恢复入口；精确来源与已确认映射，支持单季、站点、策略、目标及启停。默认3天；原自动规则的每周语义显式传10080。auto确认后持续自动下载，仅沿已有整理/STRM联动，不支持固定星期或独立4K/字幕硬过滤。 |
+| `subscriptions.delete(subscription_id)` | DANGER | 确认后软删除并停止后续检查，失效未提交工作；保留下载、媒体文件和历史。 |
+| `library.history`（SDK） | READ | 读取媒体服务器用户的真实最近播放历史（播放事件/DatePlayed），limit为1–50；优先配置用户，否则沿用默认用户。auto使用当前身份已存首选服务器；保留真实ID、完整条目及用户范围，count仅为返回数，未知total/has_more/complete保持None；状态按本次窗口为success（有项）或empty（真实空）。 |
+| `library.resume`（SDK） | READ | 读取当前配置或默认用户的继续观看列表，limit为1–20，auto遵循首选服务器。完整条目保留真实ID及用户范围，可用时返回open_url；状态按本次窗口为success/empty，未知total/has_more/complete保持None，不能用返回数推算总量。 |
+| `preferences.get` | READ | 工作区读取当前身份显式保存的媒体服务器、下载目标、清晰度/HDR/编码/字幕/音轨/发布组/排除词/单集大小/题材与观看偏好及长期备忘；单次请求条件优先，不从聊天摘要推断。 |
+| `preferences.update` | WRITE | 工作区按命名字段预检并确认更新（如 `preferences.update(preferred_resolution="2160p")`），确认卡支持编辑；更新结构化媒体偏好与长期备忘 `memory_notes`（最多 20 条、每条 200 字，按完整列表替换）；保存后每轮对话都会作为用户数据带入上下文；本地推荐和资源排序使用这些默认偏好，单次显式参数（包括空数组、0、False）优先。 |
+| `preferences.clear` | WRITE | 工作区预检并确认清除当前用户保存的显式媒体偏好，恢复产品默认值。 |
+| `subscriptions.today()` | READ | 管理员全局今日追更、整理、RSS、下载事件，全量计数与明确本地日期/as_of；最多8个安全标题样本，不把失败当空记录。 |
+| `subscriptions.notification(subscription_id)` | READ | 原全局媒体订阅通知规则；完整返回规则/订阅版本、explicit/default和开关，不按当前聊天另建规则。 |
+| `subscriptions.set_notification(subscription_id, **显式通知开关)` | LOW_WRITE | 未传开关保留，以完整原规则与订阅版本做事务CAS；模型不能指定owner/chat/route，沿原通知中心授权。 |
+| `subscriptions.reset_notification(subscription_id)` | LOW_WRITE | 确认后删除显式规则，恢复默认并返回explicit=false/revision=0；已默认时不生成新写计划，已入队消息仍沿原授权处理。 |
+| `rss.activity` | READ | 最近24小时成功下载总数与逐订阅计数；全局总数不受分页影响，可用 `next` 续页。 |
+| `rss.entries` | READ | 真实条目 ID、完整标题、状态与持久 delivery；offset/next 真实分页。 |
+| `rss.mark` | WRITE | 确认后原子标记选定 entry_ids；不覆盖正在提交或已下载条目。 |
+| `rss.refresh` | WRITE | 刷新 subscription_ids 或 scope=all_configured，不自动下载；run_id 可用 rss.activity(run_id=...) 查询。 |
+| `rss.download` | DANGER | 指定 pending entry_ids，或省略 ID 选择最近 limit 项（默认10，可按 subscription_id 过滤）；确认冻结完整集合及 qB/光鸭目标，has_more 明示剩余。 |
+| `rss.retry` | DANGER | 范围参数同 download，仅重试原冷却、次数和失败分类允许的条目；未知投递结果不重放。 |
 
-### 2.10 媒体自动化规则与摘要（3 项）
+### 2.10 媒体自动化规则与摘要
 
-创建媒体规则、查询或配置定时摘要；配置变更仍需要确认。
+媒体追更创建统一使用 `subscriptions.create`；`automation` 仅查询或配置定时摘要，配置变更仍需要确认。
 
-定义：[`domains/automation/tools.py`](../../app/agent/domains/automation/tools.py)。
+定义：[`sdk.Automation`](../../app/sdk.py)，写入经原生 EffectExecutor 确认；业务由公共 `media_subscriptions` / `media_automation_rules` 服务编排。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `automation.create_media_rule` | WRITE | 创建持续运行的媒体追更规则：既有调度器按每3天或7天检查缺集、搜索指定站点、按提醒/确认/自动策略提交光鸭或qB。 |
-| `automation.digest_rules` | READ | 读取当前身份保存的每日媒体动态/异常摘要规则，默认没有开启。 |
-| `automation.set_digest` | WRITE | 确认后新增或修改每日摘要规则；按本机时区每天指定时刻汇总媒体动态，或只汇总失败和需关注项。 |
+| `automation.digests()`（SDK） | READ | 完整读取当前身份全部每日媒体动态/异常摘要规则，保留真实 rule_id、revision 和 settings_error，默认没有开启。 |
+| `automation.set_digest(...)`（SDK） | WRITE | 确认后新增或修改每日摘要规则；新增需 hour，修改用真实 rule_id，未传设置保留。按本机时区定时汇总，停用不依赖当前目标；投递 owner/context 由宿主绑定，不能传 chat。复用原表、定时和通知队列。 |
 
-### 2.11 识别知识、本地来源与路径映射（11 项）
+### 2.11 文件名识别、发布格式教学与识别配置
 
-在白名单范围内管理识别知识、来源和媒体路径映射，复用现有配置服务。
+文件名解析与发布格式教学通过原生 `mf.recognition` 使用公共识别服务，完整数据可在工作区保存并继续核对。识别知识、来源和媒体路径映射沿用现有配置工具。
 
-定义：[`domains/configuration/tools.py`](../../app/agent/domains/configuration/tools.py)。
+定义：[`sdk.py`](../../app/sdk.py)、[`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `config.recognition_knowledge` | READ | 读取Web识别知识库的发布组/尾部制作组词条与别名，区分内置和用户词条；不是媒体TMDB锁定规则。 |
-| `config.create_recognition_knowledge` | WRITE | 添加用户识别知识（发布组或尾部制作组与别名），与Web知识库共用实现。 |
-| `config.update_recognition_knowledge` | WRITE | 修改识别知识名称、别名或停用状态；不允许篡改来源、证据或内置知识身份。 |
-| `config.delete_recognition_knowledge` | DANGER | 删除用户识别知识；内置知识不能删除，只能停用。 |
-| `config.create_local_source` | WRITE | 新增Web本地媒体来源。 |
-| `config.update_local_source` | WRITE | 修改本地媒体来源名称、容器目录、qB路径前缀、识别类型或整理模式，保留既有归档映射。 |
-| `config.delete_local_source` | DANGER | 删除本地媒体来源配置（不删除媒体文件）；有未完成任务的来源不能删除。 |
-| `config.media_path_mappings` | READ | 读取Jellyfin/Emby的STRM与本地路径前缀映射摘要；不暴露配置凭据，不等同于本地分类归档绑定。 |
-| `config.create_media_path_mapping` | WRITE | 添加Jellyfin/Emby路径前缀映射，使用用户给出的本地STRM目录和媒体服务器可见目录。 |
-| `config.update_media_path_mapping` | WRITE | 修改一条媒体服务器路径前缀映射，保留同服务器其它映射。 |
-| `config.delete_media_path_mapping` | WRITE | 删除一条媒体库路径前缀映射，不删除媒体文件；后续该路径将不再进行前缀转换。 |
+| `recognition.inspect_filenames(filenames, parent_path="")`（SDK） | READ | 用内置解析器完整返回 1–100 个真实文件名的标题候选、原始发布季集、目录上下文与清洗证据；未知保留空值，不读取文件或查询 TMDB，不保存规则。 |
+| `recognition.preview_release_format(draft, examples, filenames=None)`（SDK） | READ | 仅用户明确要求教学时，以用户标注的 2–8 个不同文件、至少两个原始集号核对模板，完整返回全部样本与最多 100 个批量结果；只读预览不会创建保存确认。模板由助手生成，缺少样本需补齐，不编造标签。 |
+| `recognition.save_release_format(draft, examples, filenames=None)`（SDK） | WRITE | 仅用户明确要求记住格式时，经原 EffectExecutor 冻结 Web 预览和配置快照、确认后一次保存；取消或快照失效不写入。默认仅此目录，跨目录需授权及不同标题样本；不移动文件、不绑定 TMDB、不偏移季集，不重新启用已停用的重复规则。 |
+| `recognition.knowledge(keyword="", knowledge_type="", limit=300, offset=0)`（SDK） | READ | 完整返回公共知识库事实，`items[].id` 为真实 `entry_id`；`total` 为筛选后总数，`summary` 为全库统计。最多 500 条，按 `has_more/next_offset` 穷尽分页，不截成 50 条。 |
+| `recognition.create_knowledge(knowledge_type, canonical_value, aliases=..., disabled=False)`（SDK） | WRITE | 确认后新增用户词条，复用公共 CRUD 和缓存；不允许指定来源、证据、知识键或置信度。 |
+| `recognition.update_knowledge(entry_id, knowledge_type=..., canonical_value=..., aliases=..., disabled=...)`（SDK） | WRITE | 真实 ID 定位，事务内比较确认的业务行；统计命中不使确认失效，未传字段保留。 |
+| `recognition.delete_knowledge(entry_id)`（SDK） | DANGER | 确认后删除用户或学习词条；内置不能删除，只能停用。 |
+| `library.path_mappings(server)`（SDK） | READ | 完整返回指定 Jellyfin/Emby 的路径对与部署覆盖状态，不探测上游；以 `server + items[].local` 的规范化路径键定位。 |
+| `library.create_path_mapping(server, local_path, server_path)`（SDK） | WRITE | 确认后复用 Web 公共校验、配置锁和文件 CAS 新增映射；不移动文件或刷新媒体库。 |
+| `library.update_path_mapping(server, local_path, new_local_path=..., server_path=...)`（SDK） | WRITE | 原 `local_path` 定位；修改本地前缀用 `new_local_path`，未传字段保留。不使用重排后的序号。 |
+| `library.delete_path_mapping(server, local_path)`（SDK） | WRITE | 确认后只删除指定自然键映射；不删除媒体、STRM 或本地归档绑定。配置漂移拒绝旧卡，未知结果先回读，不重放。 |
 
-### 2.12 光鸭目录、文件变更与整理（22 项）
+### 2.12 光鸭目录、文件变更与整理
 
 浏览与文件变更不同于刮削整理；预览可以是 READ，但实际执行入口仍受确认约束。
 
-定义：[`domains/guangya/tools.py`](../../app/agent/domains/guangya/tools.py)。
+定义：[`sdk.py`](../../app/sdk.py)、公共 [`guangya_workspace.py`](../../app/modules/guangya_workspace.py) 与 [`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `guangya.connection_status` | READ | 验证光鸭账号是否已配置且可通过普通最小只读请求连接；允许 SDK 续签登录态，但不返回凭据。 |
-| `guangya.organize.schedule_policy` | READ | 读取光鸭定时整理的启用状态、五段 cron 和通知开关，不返回目录或凭据。 |
-| `guangya.organize.set_schedule_policy` | WRITE | 预检并在用户确认后修改光鸭定时整理三项白名单策略，不立即运行整理。 |
-| `guangya.organize.status` | READ | 查看光鸭整理任务、排队操作和定时调度状态；可按公开操作编号查询终态，不返回目录或错误正文。 |
-| `organize.audit_logs` | READ | 按来源和规范状态只读查看整理记录摘要，不返回路径、任务标识、文件名、外部 ID 或错误正文。 |
-| `guangya.organize.cleanup.preview` | READ | 只读检查指定精确光鸭目录，或未指定时检查所有正式整理来源中的真空目录和严格垃圾残留目录。 |
-| `guangya.organize.cleanup.classify` | READ | 逐项复核最近冻结的光鸭残留候选。 |
-| `guangya.organize.cleanup.execute` | DANGER | 在用户确认后执行最近一次冻结的光鸭整理残留计划：真空目录经复核后进入回收站，仅将逐项确认隔离的残留目录整体移入 MediaFlux 隔离区。 |
-| `guangya.fs.query` | READ | 通用只读光鸭文件查询。 |
-| `guangya.fs.change.execute` | DANGER | 接收必填的完整 `operations` 及可选 `observation_ref`、`trigger_strm`，一次调用即可编译冻结计划并准备确认卡；准备阶段不写云端，用户确认后才执行卡中固定的计划。`observation_ref` 只指定主快照，同一 owner 与凭据世代的近期安全引用会自动合并，无需为了跨快照对象重复扫描。 |
-| `guangya.media_hygiene.preview` | READ | 只读扫描一个精确光鸭目录中的媒体名称污染。 |
-| `guangya.rename.preview` | READ | 按 1 到 4 个精确光鸭绝对路径只读预览批量名称转换；支持递归删除旧式 Mbps 码率字段或字面文本替换。 |
-| `guangya.rename.execute` | DANGER | 在用户确认后执行当前会话最近冻结的光鸭重命名计划，包括批量名称转换和媒体名称清理；不接受文件 ID、路径或名称参数，执行前复核凭据、快照和目标冲突，写后按file_id 验证真实名称。 |
-| `guangya.directory_scrape.inspect` | READ | 按当前整理规则只读检查一个准备直接识别并归档入媒体库的精确光鸭目录或视频；后续可搜索 TMDB、预览最终归档目录与编号方案。 |
-| `guangya.directory_scrape.search` | READ | 基于当前会话最近一次光鸭刮削检查搜索 TMDB/MetaTube 匹配候选；不写入映射或云盘。 |
-| `guangya.directory_scrape.preview` | READ | 按当前会话最近的匹配候选生成安全刮削预览，展示将创建的归档目录、TMDB 绝对集数或季度编号映射以及批量重命名结果；只做 dry-run，不移动、重命名或删除云盘文件。 |
-| `guangya.directory_scrape.run` | DANGER | 预检并在用户确认后把当前会话最近的光鸭刮削预览提交到现有整理互斥队列；执行前会重新核对内容与计划。 |
-| `guangya.organize.preview` | READ | 按当前服务端配置只读预览光鸭整理计划，不移动、改名或删除内容。 |
-| `guangya.organize.run_once` | DANGER | 预览并在用户确认后按当前配置启动一次光鸭网盘整理，不接受执行参数。 |
-| `guangya.organize.stop` | DANGER | 预检并在用户确认后协作式停止当前光鸭整理任务；已完成的云盘操作不会回滚。 |
+| `cloud.connection()`（SDK） | READ | 通过最小只读请求核验云盘连接；未知配置或连通性保留 null，返回采样时间，不返回凭据。 |
+| `cloud.organize_schedule`（工作区 SDK） | READ | 读取光鸭定时整理的启用状态、五段 cron 和通知开关，不返回目录或凭据。 |
+| `cloud.set_organize_schedule`（工作区 SDK） | WRITE | 预检并在用户确认后修改光鸭定时整理三项白名单策略，不立即运行整理。 |
+| `cloud.organize_status` | READ | 读取整理概览；按 `run_id` 查询原持久运行。文件操作的 `GY-` 编号用 `cloud.operation` 查询。 |
+| `activity.organize_logs`（SDK） | READ | 按来源、状态、关键词分页查看完整整理时间线；保留真实 ID、路径和脱敏错误，总数/分类计数与 Web 同源，支持按 kind/id 继续读取时间线。本地待确认使用 `origin="local", status="manual"`，终态使用 `success`/`failed`；原始状态、触发来源和时间戳均保留，供脚本统计。 |
+| `cloud.list` / `cloud.info` | READ | 使用真实目录/文件ID读取完整属性；list支持递归、名称/类型过滤和offset/limit，total为实际总数，扫描不完整直接报错。 |
+| `cloud.preview_names` | READ | 按真实ID预览删除旧Mbps字段、字面替换或media_hygiene；返回完整名称、冲突与operations，无序号、TTL或私有计划。 |
+| `cloud.preview_cleanup` | READ | 检查整理/离线来源或真实来源ID；只显式quarantine_ids进入隔离区，其余残留保留。候选分页，operations为完整选择；空目录要求原子回收能力。 |
+| `cloud.change` | WRITE/DANGER | 提交预览operations或真实ID操作；expected/expected_tree保留预览快照，require_empty要求真空目录。单次最多200对象与200新建目录，超限报错。沿用SQLite冻结确认与持久operation_ref；取消不写、未知结果先核验，不重放脚本。 |
+| `cloud.inspect_media(file_id)` | SDK READ | 检查真实云盘目录或文件，保留完整视频、伴随文件与目录事实。 |
+| `cloud.search_media(file_id, query, media_type, year)` | SDK READ | 查询匹配候选，返回明确 provider/external_id/tmdb_id，不依赖会话临时序号。 |
+| `cloud.scrape(file_id, media_type, ...)` | SDK DANGER | 冻结明确媒体身份及完整归档计划，确认后提交现有持久任务；用 cloud.operation 查询执行结果，受理不等于完成。AI 建议不会自动学习为人工纠正。 |
+| `cloud.preview_organize` | READ | 按当前服务端配置只读预览光鸭整理计划，不移动、改名或删除内容。 |
+| `cloud.organize` | DANGER | 预览并在用户确认后按当前配置启动一次光鸭网盘整理，接受已配置来源的真实 source_ids；省略选全部。 |
+| `cloud.stop_organize` | DANGER | 预检并在用户确认后协作式停止当前光鸭整理任务；已完成的云盘操作不会回滚。 |
 
-### 2.13 光鸭账号、回收站与分享（8 项）
+### 2.13 光鸭账号、回收站与分享
 
 账号容量、回收站恢复/全局清空、异步操作状态及分享管理；不开放本地上传。
 
-定义：[`domains/guangya/sdk_tools.py`](../../app/agent/domains/guangya/sdk_tools.py)。
+定义：[`app/sdk.py`](../../app/sdk.py) 与 [`sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `guangya.account.status` | READ | 读取当前光鸭账号连接状态与服务端可用的容量摘要。 |
+| `cloud.account()`（工作区 SDK） | READ | 读取当前光鸭账号连接状态与容量摘要；返回总量、已用、可用字节及部分成功状态。 |
 | `guangya.recycle.list` | READ | 分页读取光鸭回收站，返回名称、类型、体积和会话绑定的 guangya_recycle_items_ref；不返回 Provider 文件 ID。 |
 | `guangya.recycle.restore` | WRITE | 对 guangya.recycle.list 返回的回收站引用按 index 冻结恢复计划。 |
 | `guangya.recycle.clear` | DANGER | 完整读取并冻结当前光鸭回收站后生成不可逆清空计划。 |
 | `guangya.operation.status` | READ | 使用回收站恢复、清空或其他 SDK 异步操作返回的 guangya_task_ref 查询 Provider 状态。 |
-| `guangya.share.list` | READ | 分页读取当前账号自己创建的光鸭分享，返回标题、状态、时间摘要和会话绑定引用；不返回分享 ID、访问码或底层响应。 |
-| `guangya.share.create` | WRITE | 为 guangya.fs.query 最近观察中的 1–100 个 object_ref 创建分享。 |
-| `guangya.share.revoke` | WRITE | 按 guangya.share.list 返回的分享引用和 index 冻结撤销计划；确认后仅撤销分享链接，不会删除或移动原始云盘文件。 |
+| `cloud.shares()`（SDK） | READ | 完整读取当前账号自建分享；返回真实管理 `share_id`，不返回访问码。分页失败或超预算显式报错。 |
+| `cloud.share(file_ids, ...)`（SDK） | WRITE | 按 1–100 个真实 `file_id` 冻结对象、凭据与分享策略，确认后创建；链接和访问码只返回当前用户。 |
+| `cloud.revoke_share(share_ids)`（SDK） | WRITE | 按列表返回的真实管理 `share_id` 冻结撤销计划；确认后只撤销分享链接，不改动原文件。受理仍待验证，结果未知时先查询，不重复提交。 |
 
-### 2.14 本地媒体整理（13 项）
+### 2.14 本地媒体整理
 
-只处理已配置来源和可核验任务，不开放任意本地路径操作；任务已索引不代表真实播放测试。
+来源 CRUD 只保存配置；扫描只处理已配置来源，后续任务沿原归档链路执行。写方法共用持久 SQLite 确认账本，取消、配置漂移、已用票据或未知回执不会重放；关闭 qB 接管不会取消已入队的手动扫描。任务已索引不代表真实播放测试。
 
-定义：[`domains/local_media/tools.py`](../../app/agent/domains/local_media/tools.py)。
+本地来源与持久任务定义：[`app/sdk.py`](../../app/sdk.py)、[`local_media_service.py`](../../app/modules/local_media_service.py)；任务与诊断继续沿既有领域入口。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `local_media.diagnose` | READ | 只读汇总本地媒体来源、整理任务与调度器状态，不扫描文件系统、不访问外部服务且不返回路径或业务标识。 |
-| `local_media.source_summaries` | READ | 只读列出本地媒体来源的公开序号、触发状态和安全配置摘要，不返回名称、路径、媒体库标识或凭据。 |
-| `local_media.get_source_summary` | READ | 只读查看一个公开序号对应的本地媒体来源触发状态与安全摘要，不返回名称、路径、媒体库标识或凭据。 |
-| `local_media.set_source_trigger_enabled` | WRITE | 确认后精确启停一个本地媒体来源的 qB 下载完成自动接管；不修改目录、规则、目标或凭据。 |
-| `local_media.scan_sources` | WRITE | 预检并确认后扫描全部或指定公开序号的已配置本地媒体来源，把发现的媒体加入整理队列；不接受任意路径。 |
-| `local_media.review_queue_summary` | READ | 只读汇总本地媒体待人工确认队列的数量、触发来源和等待时长，不返回标题、路径、任务标识或错误正文。 |
-| `local_media.task_summaries` | READ | 只读列出本地媒体任务的 owner 绑定短期公开序号、媒体标题、阶段和可用动作，不返回路径、哈希、数据库 ID 或错误正文。 |
-| `local_media.inspect_task` | READ | 只读检查一个短期公开序号对应的待人工确认任务，生成 owner 绑定检查序号；不返回路径、错误正文或内部句柄。 |
-| `local_media.preview_task` | READ | 基于 owner 绑定短期检查序号生成本地整理匹配预览；只读且不返回路径、TMDB ID、规则快照或内部检查 ID。 |
-| `local_media.retry_task` | WRITE | 预检并确认后仅重试 failed 或 requires_manual 的本地媒体任务；使用版本条件原子重新排队，不直接移动文件。 |
-| `local_media.refresh_task_library` | WRITE | 预检并确认后，仅对已完成任务重新解析出的唯一绑定媒体服务器与媒体库执行精准路径刷新；不接受 URL、路径或内部 ID。 |
-| `local_media.verify_task_library_visibility` | READ | 只读核验已完成任务的媒体是否已在唯一绑定媒体库中索引，并明确标记未执行真实播放探测。 |
-| `local_media.history_summary` | READ | 只读汇总本地媒体已完成与失败历史的数量、触发来源和时间分布，不返回标题、路径、任务标识或错误正文。 |
+| `local.diagnose()`（SDK） | READ | 读取本地来源、持久任务真实聚合和进程内调度状态，不初始化调度器、不扫描文件或联网；读取错误直接反馈。 |
+| `local.sources()`（SDK） | READ | 完整读取所有来源的真实 ID、名称、容器路径、qB 路径前缀/完成接管开关及 targets/媒体库映射；不返回废弃 SMB 凭据。 |
+| `local.source(source_id)`（SDK） | READ | 以真实来源 ID 读取完整事实，不按列表位置或公开序号选取。 |
+| `local.create_source(name, local_root, ..., targets=None)`（SDK） | WRITE | 复用 Web 的目录/分类目标校验与来源事务；原生默认仅预览、关闭 qB 完成接管，不创建目录或修改文件权限。 |
+| `local.update_source(source_id, ..., enabled=..., targets=...)`（SDK） | WRITE | 仅改明确指定字段；`enabled` 控制 qB 下载完成自动接管，未传 targets 时保留全部映射及目标 ID。有未完成任务时禁止修改运行配置。 |
+| `local.delete_source(source_id)`（SDK） | DANGER | 删除配置，不删除媒体文件；未完成任务阻止删除。确认后的来源或映射漂移由写入事务拒绝。 |
+| `local.scan_sources(source_ids=None, query="")`（SDK） | WRITE | 冻结全部或指定真实来源 ID、配置和 targets，经原 EffectExecutor 确认后沿原 scheduler 入队；返回真实 `data.task_ids` 和原 task_runs 的 `scan_ref`。`accepted` 只代表入队，扫描失败/部分失败不等于没有候选。 |
+| `local.tasks(scope="all", source_id=None, scan_ref="", limit=100, offset=0)`（SDK） | READ | 完整任务/错误及文件结果，真实 task_id、真实匹配总数、returned/has_more/next_offset；最多每页500条。scan_ref限定原LM扫描成员，通知快照与当前状态分别保留；缺记录不以全历史代替。 |
+| `local.task(task_id, inspect=False)`（SDK） | READ | 读取完整持久任务、全部文件项和执行步骤；inspect=True复用Web只读检查待人工任务的全部文件，不创建序号或会话TTL上下文。 |
+| `local.preview(task_id, tmdb_id=..., media_type=..., season=..., episode=..., numbering_mode=...)`（SDK） | READ | 沿原service和来源路径边界重新检查、生成全部候选及计划；省略参数使用已保存识别/季集/规则。无需检查句柄，不执行文件操作。 |
+| `local.retry(task_id, ..., confirm_interrupted_write=False)`（SDK） | WRITE | 冻结原任务、来源、targets和必要文件预览，原SQLite事务CAS后重新排队。沿Web支持识别/季集/编号覆盖，省略保留原值；中断写入需先核验文件及qB并明确确认。只重试原持久任务，不扫描新范围。 |
+| `local.refresh_library(task_id)`（SDK） | WRITE | 冻结真实任务/媒体服务器配置、全部归档路径及唯一绑定媒体库，经原确认执行器提交精准刷新并复用原跨owner去重租约；绝不回退全库刷新，未知回执不重放。 |
+| `local.verify_library(task_id)`（SDK） | READ | 核验唯一绑定库中的精确电影/季集可见性；服务异常和不完整清单保留不确定。库中可见不代表已执行播放探测。 |
 
-### 2.15 STRM 同步与失败处理（8 项）
+### 2.15 STRM 同步与失败处理
 
 状态、历史、失败诊断、受控重试及指定来源同步；不以排队成功冒充生成完成。
 
-定义：[`domains/strm/tools.py`](../../app/agent/domains/strm/tools.py)。
+定义：[`app/sdk.py`](../../app/sdk.py)、[`strm.py`](../../app/modules/strm.py) 与原确认执行器。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `strm.diagnose` | READ | 检查 STRM 索引、缺失文件、失败记录和最近同步状态，不执行修复。 |
-| `strm.run_history` | READ | 读取最近 STRM 运行的安全历史、固定统计、失败聚合和队列计数；不返回运行 ID、来源、路径、文件名、对象标识或错误正文。 |
-| `strm.triage_failures` | READ | 只读汇总 STRM 失败账本的状态与动作类别，不返回路径、文件名、来源、对象标识或错误正文。 |
-| `strm.retry_failures` | DANGER | 预检并在用户确认后重试当前 STRM 失败项，仅返回聚合计数，不暴露失败明细。 |
-| `strm.run_once` | DANGER | 预检并在用户确认后同步全部或指定的已配置 STRM 来源；source_names 只能使用设置中名称唯一的来源，不接受目录或来源 ID。 |
-| `strm.status` | READ | 查看 STRM 当前运行进度、调度状态、最近结果和可选择的来源显示名称；不返回目录、来源 ID 或错误正文。 |
-| `strm.schedule_policy` | READ | 读取 STRM 定时同步的启用状态、五段 cron 和任务通知开关，不返回目录、地址或凭据。 |
-| `strm.set_schedule_policy` | WRITE | 预检并在用户确认后修改 STRM 定时同步的三项白名单策略，不立即运行同步。 |
+| `strm.diagnose` | READ | 原生SDK只读检查STRM索引、缺失文件、失败汇总与最近5次同步真实run_id；不修复、不重试、不扫描云盘。 |
+| `strm.history` | READ | 原生SDK按持久状态过滤完整历史，limit/offset真实SQL分页；返回真实run_id、total/returned/has_more/next_offset及失败/队列上下文，不返回路径、URL或错误正文。 |
+| `strm.failures` | READ | 原生 SDK 读取真实失败 ID、状态、来源对象与完整已保存错误；按 status/action/source_id 筛选，limit/offset 分页，使用 data.next_offset 继续。错误沿用账本入库脱敏和最多 500 字边界，不能还原上游原文。 |
+| `strm.retry_failures(ids)` | DANGER | 从失败账本选择 open 的真实整数 ID 数组，预检冻结选中行和运行配置，确认复验后复用公共重试；无 scope 或旧 100 项模型上限。返回实际 claim/解决/失败/延期及扫描、停止计数，未匹配不能视为成功。 |
+| `strm.run` | DANGER | 原生SDK预检并确认同步全部或指定的真实来源ID；来源取 `strm.status().data.sources`，受理返回 `data.run_id`，继续按该ID回读。 |
+| `strm.status` | READ | 原生SDK读取当前进程调度状态与完整来源ID/名称；传run_id只回读该持久任务，进度仅在当前运行ID匹配时提供，不返回路径或错误正文。 |
+| `strm.schedule`（工作区 SDK） | READ | 读取 STRM 定时同步的启用状态、五段 cron 和任务通知开关，不返回目录、地址或凭据。 |
+| `strm.set_schedule`（工作区 SDK） | WRITE | 预检并在用户确认后修改 STRM 定时同步的三项白名单策略，不立即运行同步。 |
 
-### 2.16 STRM 伴随元数据（3 项）
+```python
+from mf import strm
+page = strm.failures(status="open", action="metadata")
+ids = [row["id"] for row in page["data"]["items"]]
+# 先核对 items[].error；如 has_more，按 next_offset 继续读取再选择。
+strm.retry_failures(ids)  # 原确认执行器准备确认卡，确认前不重试
+```
+
+Shell 同样可调用 `mf strm.failures --status open --limit 200 --offset 0`，再以 `mf strm.retry_failures --ids '[12,34]'` 准备确认；ID 必须来自实际账本。冷确认、取消及未知结果沿用原 SQLite 一次性票据，不自动重放。
+
+### 2.16 STRM 伴随元数据
 
 管理 NFO 等伴随元数据同步及待处理队列，与视频 STRM 生成状态分开解释。
 
-定义：[`domains/strm/metadata_tools.py`](../../app/agent/domains/strm/metadata_tools.py)。
+定义：[`app/sdk.py`](../../app/sdk.py) 与 [`strm_metadata_management.py`](../../app/modules/strm_metadata_management.py)。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `strm.metadata.status` | READ | 读取伴随元数据（云盘 NFO、字幕、海报同步）队列数量、开关、消费者线程和熔断状态；running=0只代表瞬时任务数，不代表不会自动工作。 |
-| `strm.metadata.set_enabled` | WRITE | 经人工确认调整已有伴随同步开关。 |
-| `strm.metadata.cancel_pending` | WRITE | 预览并经人工确认取消当前 queued/retry_wait 伴随元数据积压。 |
+| `strm.metadata_status` | READ | 读取伴随元数据（云盘 NFO、字幕、海报同步）队列数量、开关、消费者线程和熔断状态；running=0只代表瞬时任务数，不代表不会自动工作。 |
+| `strm.set_metadata_enabled` | WRITE | 经人工确认调整已有伴随同步开关。 |
+| `strm.cancel_metadata_pending` | WRITE | 预览并经人工确认取消当前 queued/retry_wait 伴随元数据积压。 |
 
-### 2.17 播放就绪与媒体反代（5 项）
+### 2.17 播放就绪与媒体反代
 
 查看媒体链接相关状态、反代和播放准备情况；重启/修改反代策略属于写入。
 
-定义：[`domains/playback/tools.py`](../../app/agent/domains/playback/tools.py)。
+定义：[`app/sdk.py`](../../app/sdk.py)、[`media_proxy.py`](../../app/modules/media_proxy.py) 与既有实例生命周期。
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `media_proxy.status_summary` | READ | 安全汇总媒体反代实例的数量、类型、启用状态与运行状态，不返回地址、端口、路径、实例 ID 或凭据。 |
-| `media_proxy.playback_failure_summary` | READ | 按固定时间窗聚合已记录的媒体反代播放请求、失败阶段、路由类别、缓存命中与平均时延；不返回媒体名、用户、会话、URL、路径或错误正文。 |
-| `media_proxy.test_instance` | READ | 按公开序号测试一个已保存媒体反代实例的上游连通性，不返回地址、端口、路径、实例 ID、凭据或原始错误。 |
-| `media_proxy.set_instance_enabled` | WRITE | 预检并在用户确认后按公开序号启用或停用一个媒体反代实例；不会修改地址、监听、路径或凭据。 |
-| `media_proxy.restart_instance` | WRITE | 预检并确认后按公开序号强制重建一个已启用媒体反代实例的运行时；不修改实例配置。 |
+| `playback.instances()` | READ | 完整读取实例真实 ID、已保存/有效配置、错误和当前进程运行事实；凭据脱敏，运行态不可用标为 unknown。 |
+| `playback.failures(hours, instance_id, limit, offset)` | READ | 同一 SQLite 快照读取故障汇总与完整已保存失败记录；真实实例/记录 ID、HTTP 状态、路由、阶段、时延及错误均保留。按 next_offset 读完；错误入库已脱敏且最多1000字，汇总排名最多8组仅是摘要。覆盖仅代表 best-effort 已记录请求。 |
+| `playback.test(instance_id)` | READ | 使用已保存真实 ID 沿原固定上游探测；保留HTTP状态和耗时，不跟随重定向。 |
+| `playback.set_enabled(instance_id, enabled)` | WRITE | 原确认执行器冻结目标与有效配置，复验后原子更新 enabled 并请求原运行时协调。runtime_refreshed 只代表排队；不能视为已完成启动或关闭。 |
+| `playback.restart(instance_id)` | WRITE | 确认后沿既有 Manager/Future 重建指定实例；运行前再次核对冻结配置。completed 需要真实 restarted=true；outcome_unknown 时读取状态，不自动重投。 |
 
-## 3. Provider 操作白名单
-
-Provider 网关包含 **24 项媒体操作与 7 项 qB 操作**，是复用现有客户端的受控入口，不是让模型持有服务器密钥直接调用任意 API。可用操作由 [`provider_operations.py`](../../app/agent/provider_operations.py) 声明；会话只得到必要的安全引用。
-
-```text
-provider.capabilities                 查看当前支持的操作与条件
-provider.query                       执行白名单读取
-provider.change.preview              校验并冻结白名单变更
-provider.change.execute              请求确认；确认后执行冻结内容
-provider.job.status                  查询当前会话冻结写计划的持久状态与已记录执行结果
+```python
+from mf import playback
+instances = playback.instances()["data"]["instances"]
+instance_id = instances[0]["instance_id"]  # 来自真实配置，不是公开序号
+facts = playback.failures(instance_id=instance_id)
+# 先读取 items[].error 和 next_offset，再决定是否需要重启。
+playback.restart(instance_id)  # 准备原确认卡，确认前不修改实例
 ```
 
-计划 `succeeded` 表示该写计划已完成其声明的执行或受理验证，不一定表示上游异步工作完成；媒体库刷新、下载进度等仍需查询相应业务事实。
+Shell 同样使用 `mf playback.instances`、`mf playback.failures --instance-id <真实ID>` 和 `mf playback.restart --instance-id <真实ID>`。只读事实可保存为 JSON 后由 Python/Shell 继续处理。
 
-部分操作同时由更具体的领域工具暴露，例如最近播放、媒体质量和播放列表。它们复用底层能力和同一确认边界，不是两套 Agent 决策循环。
 
-`provider.capabilities` 中的 profile `online` 表示已启用且必要配置完整，并不执行真实网络连通测试。实际读取成功与否仍以 `provider.query` 或对应业务检查结果为准。
+## 3. 媒体服务器与下载器原生 SDK
+
+媒体查询与变更直接使用原生 SDK 和共用客户端，结果使用服务器真实 ID；不再创建 Provider 临时对象引用。
 
 ### 3.1 Jellyfin / Emby
 
@@ -406,50 +394,31 @@ provider.job.status                  查询当前会话冻结写计划的持久�
 
 | 操作 | Kernel 风险 | 用途 |
 |---|---|---|
-| `media.system.info` | READ | 读取已配置 Jellyfin 或 Emby 的产品、版本和服务器状态。 |
-| `media.items.counts` | READ | 读取媒体服务器中的可播放媒体总数，以及电影、剧集和单集数量。 |
-| `media.items.recent_added` | READ | 读取媒体服务器最近入库的电影、剧集或单集，按作品去除重复单集展示，并返回可用的已校验 open_url。 |
-| `media.items.recent_played` | READ | 读取媒体服务器用户的真实最近播放历史；优先使用明确配置用户，未配置时沿用服务器默认用户选择。 |
-| `media.items.recommend_from_library` | READ | 从 Jellyfin 或 Emby 本地媒体库读取 Genres、Tags、评分和用户播放状态，结合最近播放题材信号排序，并可排除已播放或已开始的作品；候选会返回可用的已校验 open_url。 |
-| `media.items.continue_watching` | READ | 读取媒体服务器用户尚未看完的继续观看 Resume 列表，并返回可用的已校验 open_url。 |
-| `media.libraries.list` | READ | 列出指定媒体服务器中的媒体库，不返回真实目录路径。 |
-| `media.library.counts` | READ | 读取先前列出的指定媒体库中的可播放媒体总数，以及电影、剧集和单集数量；library_ref 必须来自 media.libraries.list。 |
-| `media.items.search` | READ | 使用媒体服务器原生搜索查询电影、剧集或单集，并返回可用的已校验 open_url。 |
-| `media.series.search` | READ | 在媒体服务器中搜索剧集候选，并返回 TMDB 映射、对象引用和可用的已校验 open_url。 |
-| `media.series.episodes` | READ | 读取先前选中剧集的本地季集位置，用于集数和缺集核验。 |
-| `media.library.refresh` | WRITE | 精准提交先前选中媒体库的后台刷新，不允许退化为全库刷新。 |
-| `media.item.refresh` | WRITE | 精准提交先前搜索到的单个媒体条目刷新，不允许全库刷新。 |
-| `media.library.quality` | READ | 分页只读检查媒体库视频版本、分辨率、中文字幕和服务器报告缺失状态；未知字段保持 unknown，仅本页查重，不将分页样本当全库结果，不播放或探测 STRM。 |
-| `media.user.inspect` | READ | 读取搜索结果中单个媒体条目的已看、收藏和观看进度状态，创建绑定用户的短期状态引用；修改前必须读取。 |
-| `media.playlists.list` | READ | 分页列出当前媒体服务器用户可访问的播放列表，并返回短期列表引用。 |
-| `media.playlist.inspect` | READ | 读取播放列表及完整成员快照，最多250项；条目分页展示；返回修改用的列表快照引用和移除用的成员引用。 |
-| `media.user.mark_played` | WRITE | 人工确认后标记已看单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.user.mark_unplayed` | WRITE | 人工确认后标记未看单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.user.favorite` | WRITE | 人工确认后收藏单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.user.unfavorite` | WRITE | 人工确认后取消收藏单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。 |
-| `media.playlist.create` | WRITE | 人工确认后为配置用户创建私有 Jellyfin 视频播放列表；可放入最多20个明确视频，不展开剧集。 |
-| `media.playlist.add_items` | WRITE | 人工确认后把明确视频加入已有播放列表，跳过已经存在的条目；playlist_ref 来自 media.playlist.inspect。 |
-| `media.playlist.remove_items` | WRITE | 人工确认后按成员引用移出播放列表，只改成员关系，绝不删除媒体文件；两个引用均来自 media.playlist.inspect。 |
+| `library.counts(server="all", library_id="")` | SDK READ | 实时全库或指定库统计；指定真实库 ID 时必须明确 Jellyfin/Emby。保留已知计数和失败来源，未知不冒充零，多服务器记录不按作品去重。 |
+| `library.search(query, server="all", offset=0)` | READ | 使用媒体服务器原生搜索查询电影、剧集或单集，并返回可用的已校验 open_url。 |
+| `library.search(query, media_type="series")` | READ | 在媒体服务器中搜索剧集候选，并返回 TMDB 映射、对象引用和可用的已校验 open_url。 |
+| `library.episodes(series_id="…", server="jellyfin")` | READ | 读取先前选中剧集的本地季集位置，用于集数和缺集核验。 |
+| `media.refresh(item_id="…", server="jellyfin")` | LOW_WRITE | 用户明确要求后直接刷新已核实的单个媒体条目，不弹确认卡、不扩大为全库；支持 scan、missing、replace，默认保留图片与预览图。 |
 
 ### 3.2 qBittorrent
 
-实时 qB 任务与 MediaFlux 的历史下载请求不是同一份数据。询问“qB 当前任务”应读取 Provider，不应只用本地活动队列替代。
+实时 qB 任务与 MediaFlux 的历史下载请求不是同一份数据。询问“qB 当前任务”可以用 SDK `downloads.tasks()` 读取真实任务及 hash，再按 hash 控制；本地活动队列用于跟踪 MF 提交的请求。
 
 | 操作 | Kernel 风险 | 用途 |
 |---|---|---|
-| `qb.app.version` | READ | 读取 qBittorrent 应用和 WebUI API 版本。 |
-| `qb.transfer.info` | READ | 读取 qBittorrent 全局传输速度、累计流量和连接状态。 |
-| `qb.torrents.info` | READ | 列出 qBittorrent 下载任务的状态、进度、速度和分类。 |
-| `qb.torrents.pause` | WRITE | 暂停或停止先前查询选中的一个或多个 qBittorrent 任务。 |
-| `qb.torrents.resume` | WRITE | 恢复或开始先前查询选中的一个或多个 qBittorrent 任务。 |
-| `qb.torrents.delete_task` | WRITE | 只从 qBittorrent 移除先前查询选中的任务，始终保留已下载文件。 |
-| `qb.torrents.files` | READ | 读取先前选中 qB 任务的文件清单，不返回保存目录或任务 hash。 |
+| `downloads.version()` | SDK READ | 读取 qBittorrent 应用和 WebUI API 版本。 |
+| `downloads.transfer()` | SDK READ | 读取 qBittorrent 全局传输速度、累计流量和连接状态。 |
+| `downloads.tasks(category="")` | SDK READ | 列出 qBittorrent 下载任务的状态、进度、速度和分类。 |
+| `downloads.pause(hashes)`（SDK） | LOW_WRITE | 确认后暂停指定的真实 qB 任务；最多20项，回读核验实际状态。 |
+| `downloads.resume(hashes)`（SDK） | LOW_WRITE | 确认后恢复指定的真实 qB 任务；与本地整理冲突时拒绝执行。 |
+| `downloads.remove(hashes)`（SDK） | WRITE | 确认后停止 MF 跟踪并移除指定任务，始终保留已下载文件。 |
+| `downloads.files(torrent_hash)` | SDK READ | 按真实任务 hash 完整读取文件清单与原生 progress，不受旧50/200条上限截断。 |
 
-下载新资源走 `ingest.inspect` → `ingest.submit` 的资源接入链路，不需要给模型开放任意种子提交 HTTP 接口。`qb.torrents.delete_task` 只删除任务并保留下载文件，没有开放删除下载数据的操作。
+下载新资源使用 `downloads.submit` 或 `resources.download`。qB 控制冻结下载器配置和任务身份，状态自然变化不会使确认失效；结果未知时先查询，不自动重复执行。`downloads.remove` 只删除任务并保留下载文件。
 
-### 3.3 光鸭为什么不在上面的 Provider 操作表中？
+### 3.3 光鸭
 
-光鸭通过第 2 节的 `guangya.*` 和统一 `ingest.*` 领域工具复用 SDK/项目客户端，不要求再加一层相同的 `provider.query` 操作。目录浏览、文件计划、账号容量、回收站和分享已各有专门约束。
+光鸭原生 `cloud.*` 方法直接共用项目客户端与业务服务，文件变更统一经 `cloud.change` 预检、确认和原持久任务执行。
 
 通用文件变更工具支持的操作枚举：
 
@@ -459,44 +428,47 @@ provider.job.status                  查询当前会话冻结写计划的持久�
 | `move` | 移动到核验后的目标目录 |
 | `copy` | 复制明确对象；异步/大目录结果须继续核验 |
 | `relocate` | 在同一冻结计划内移动并改名 |
-| `batch_relocate` | 按对象引用与季集等参数展开批量规范命名计划 |
+| `batch_files` | 按真实非根目录ID完整展开显式大小/类型/名称筛选与移动/空目录规则；不返回私有句柄 |
 | `create_directory` | 新建目录，可与指向该目录的后续操作一起规划 |
 | `trash` | 将活动目录中的明确对象移入回收站 |
 
-这些是唯一入口 `guangya.fs.change.execute` 的 `operations` 参数枚举，不是额外七个免确认工具。准备确认卡时必须传入完整且非空的 `operations`，可同时提供 `observation_ref` 与 `trigger_strm`；不接受 `{}` 沿用上次计划生成新卡，也不需要先调用另一个预览工具。
+这些都是 SDK `cloud.change(operations, trigger_strm=...)` 的操作枚举。剧集规整先用 `cloud.episodes(file_id)` 取得完整真实ID、路径及正片/额外素材/未知/字幕事实；使用实际 `source_path`、明确季集范围、目标季与起点及 `expected_count` 调用 `cloud.preview_episodes`，然后把返回的完整 `operations` 交给 `cloud.change`。源文件数量不是TMDB季偏移依据；缺少资料或用户明确映射时应先判断，不得猜测。字幕只跟随唯一配对视频，多版本和目标冲突需要明确选择。
 
-一次调用会完成只读观察复核、完整计划冻结和确认卡准备，**并不表示云端写已执行**。确认后只执行卡中固定的对象和目标，写前复核快照与冲突，写后逐项验证；不能临时追加对象或改写路径。范围变化时须用新的完整 `operations` 重新准备确认卡。`trigger_strm` 仅控制已确认变更完成后的 STRM 衔接，不绕过云端写确认。
+SDK预览不保存目录TTL、序号或OBS/OBJ句柄。普通操作直接使用真实 `file_id`；已读目标/父目录可传 `target_id`/`parent_id` 防同名替换，已计划创建的新目录仍以 `target_path`/`parent_path` 组织。`expected` 与其 `path` 约束读取时的身份、版本和原路径。确认只执行原冻结计划、原持久任务，取消不写、结果未知不可自动重投，脚本不重放。`batch_files`沿用原规则、原2000项/500目录/12层完整读取预算与回收保护，不能截断范围；手工对象操作最多200项，目录创建最多200项。
 
-已存的 `guangya.fs.change.execute` 确认卡仍绑定原来的冻结计划；确认执行时不重新要求准备阶段的 `operations` schema，也不能据此空参生成新卡。
+旧三个工具入口及其上下文存储已经退役；已入队的公共文件变更job仍沿用签名计划、SQLite归属、检查点与原任务回执，历史字段仅为校验既有签名保留。
+
+
+旧 Provider 写计划保留历史存储：未执行计划失效，运行中计划只有在旧执行者释放锁后才恢复为结果未知。旧确认票据不转换成新的写请求，需重新从原生入口预检。历史受理回执不代表上游异步任务已完成。
 
 ## 4. 容易混淆的能力边界
 
 | 需求 | 正确入口或边界 |
 |---|---|
-| RSS 订阅源列表 | `rss.subscription_summaries`；不是媒体追更列表 |
-| 媒体追更列表 | `media.subscription_summaries`；不是 RSS 规则 |
-| 全库总数与单库总数 | `media.items.counts` 与 `media.library.counts`；先确定库，再统计 |
-| 查询一批影视是否在库 | `library.batch_presence`，不要循环几十次单片搜索 |
-| 最近播放与继续观看 | `media.recently_played` 与 `media.continue_watching`；含义不同 |
-| 本地推荐与公开推荐 | `media.recommend_from_library` 与 `discovery.recommend`；外部推荐不代表已经在库 |
-| 演员与作品详情 | `discovery.credits` 与 `discovery.detail`；缺少演职员数据时再核实其他来源 |
-| 三平台更新与 Bangumi 放送 | `discovery.anime_calendar` 与 `bangumi.calendar`；不能混用日期和来源完整性 |
+| RSS 订阅源列表 | `rss.subscriptions`；不是媒体追更列表 |
+| 媒体追更列表 | `subscriptions.list`；不是 RSS 规则 |
+| 全库总数与单库总数 | `library.counts`；指定库需明确服务器和真实库 ID，部分来源失败保留未知 |
+| 查询一批影视是否在库 | `library.presence(items)`（SDK），不要循环几十次单片搜索 |
+| 最近播放与继续观看 | `library.history`（SDK） 与 `library.resume`（SDK）；含义不同 |
+| 本地推荐与公开推荐 | `library.recommend`（SDK） 与 `media.catalog`（SDK）；外部推荐不代表已经在库 |
+| 演员与作品详情 | `media.credits` 与 `media.detail`（SDK）；缺少演职员数据时再核实其他来源 |
+| 三平台更新与 Bangumi 放送 | `media.calendar` 与 `media.catalog("bangumi", "calendar", "tv")`；不能混用日期和来源完整性 |
 | 网页搜索与打开正文 | `web.search` 使用 Tavily Search，`web.read` 由本机直接获取并提取公开 HTTPS 正文，仅受独立 `WEB_READ_ENABLED` 控制，不使用 Key 或 Tavily 额度；搜索仍需 `WEB_SEARCH_ENABLED` 与 `TAVILY_API_KEY`，不是任意 HTTP/浏览器工具 |
-| 列云盘目录与刮削/清理 | `guangya.fs.query`；普通浏览不需要启动刮削或垃圾清理计划 |
+| 列云盘目录与刮削/清理 | `cloud.list(parent_id="0")`；普通浏览不需要启动刮削或垃圾清理计划 |
 | 停止回合与停止任务 | 停止模型不撤销已经发生的业务写入，需查询并使用对应任务控制 |
-| 关闭元数据同步与取消积压 | `strm.metadata.set_enabled` 与 `strm.metadata.cancel_pending` 是不同操作 |
-| 清空回收站 | `guangya.recycle.clear` 为全账号永久清空，不是当前页/选中项删除 |
+| 关闭元数据同步与取消积压 | `strm.set_metadata_enabled` 与 `strm.cancel_metadata_pending` 是不同操作 |
+| 清空回收站 | `cloud.clear_recycle` 为全账号永久清空，不是当前页/选中项删除 |
 | 本地上传到光鸭 | 不向 Agent 开放；不能从 SDK 存在上传方法推断 Agent 有权限 |
-| 任意配置、Shell、内网 Fetch | 不开放；只能使用声明的配置字段、来源与操作 |
+| 宿主 Shell、任意配置或内网 Fetch | 不开放宿主执行或任意网络访问；Python/Shell 仅在隔离工作区运行，业务访问沿 SDK 声明的字段、来源与操作 |
 | 媒体详情链接 | 条件满足时返回已校验的打开链接，不保证唤起 App 或提供永久直链 |
 | 识别主动复核 | 单独授权、有限案例工具及结构化审计，不放开聊天 Agent 的全部写权限 |
 
 ## 5. 维护这份清单
 
-1. 以 [`domain_catalog/catalog.py`](../../app/agent/domain_catalog/catalog.py) 的 `build_tool_specs()` 及各 `register_specs()` 实际注册结果为准。循环注册的工具也应计入，不能只搜索字面量 `name=`。
-2. 按 [`kernel/ports/existing_actions.py`](../../app/agent/kernel/ports/existing_actions.py) 核对领域风险到 Kernel 风险的映射。不要因 `LOW_WRITE` 字样取消确认。
-3. 单独核对 Provider 操作目录；不得把内部操作、参数枚举与顶层工具重复相加。
-4. 功能新增/退役时同步更新名称、用途、配置条件和本文核对日期；运行时能力窗口和 Schema 始终优先。
+1. 公开方法以 [`app/sdk.py`](../../app/sdk.py) 的 `METHODS`、真实签名与 `describe_methods()` 为准；普通模型入口以 [`kernel/bootstrap.py`](../../app/agent/kernel/bootstrap.py) 的显式集合为准，不按内部注册数量推断模型工具数量。
+2. 业务写入同时核对 `WRITE_METHODS`、`build_tool_catalog()` 及 [`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py) 的执行合同；媒体刷新明确声明无需交互确认，仍沿原执行器留存回执。其他操作不因 `LOW_WRITE` 自动取消确认；[`kernel/batch_effects.py`](../../app/agent/kernel/batch_effects.py) 负责组合确认。
+3. `session.*` 的宿主状态方法沿 [`kernel/session_service.py`](../../app/agent/kernel/session_service.py)，不把内部业务函数重复计为模型工具；SDK 业务对象必须沿真实 ID 和版本核验。
+4. 功能新增/退役时同步更新名称、用途、配置条件和本文核对日期；真实 SDK 签名、方法语义和确认卡优先，不恢复动态业务窗口或旧工具目录。
 5. 注册表/文档校验只证明声明一致，不能替代真实 Provider 冒烟、确认安全测试、跨轮引用和两端事件验收。
 
 返回：[Agent 架构与使用实战](08_Agent架构与使用实战.md) · [自动化流转全景](00_自动化流转全景与工作流程.md) · [开发文档](../开发文档.md)。

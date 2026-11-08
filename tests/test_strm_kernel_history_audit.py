@@ -10,26 +10,25 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.action_history import action_history_owner_digest
+from app.database import media_owner_digest
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.domains.strm import runtime as strm_runtime
-from app.agent.errors import ConfirmationClaimError
+from app.modules import scheduler as strm_runtime
+from app.agent.errors import ConfirmationClaimError, ToolPipelineError
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import adapt_tool_spec
+from app.agent.kernel.ports.sdk_effects import strm_run_tool
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.modules.scheduler import STRMScheduler
-from tests.support import isolated_test_database
+from tests.support import initialized_web_runtime
 
 
 class STRMKernelHistoryAuditTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.enterContext(isolated_test_database())
+        self.enterContext(initialized_web_runtime())
         self.scheduler = STRMScheduler()
         self.scheduler._run_lock = cast(CrossProcessLock, threading.Lock())
         self.enterContext(
@@ -41,29 +40,29 @@ class STRMKernelHistoryAuditTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(
             patch.object(self.scheduler, "status", return_value={"running": False})
         )
+        self.config_value = "synthetic"
         original = strm_runtime.config.get
         self.enterContext(
             patch.object(
                 strm_runtime.config,
                 "get",
                 side_effect=lambda key, default="": (
-                    "synthetic"
+                    self.config_value
                     if key in strm_runtime._STRM_CONFIRMATION_KEYS
                     else original(key, default)
                 ),
             )
         )
-        self.spec = next(
-            spec for spec in build_tool_specs() if spec.name == "strm.run_once"
-        )
-        self.owner = "synthetic-kernel-owner"
+        self.enterContext(patch.object(strm_runtime, "configured_strm_source_plans", return_value=([], "")))
+        self.spec = strm_run_tool()
+        self.owner = "webk:v1:" + "a" * 64
 
     def pipeline(self):
         state = SQLiteKernelStore(
             secret_provider=lambda: "synthetic-kernel-history-secret"
         )
         return ToolPipeline(
-            catalog=ToolCatalog([adapt_tool_spec(self.spec)]),
+            catalog=ToolCatalog([self.spec]),
             state_store=state,
             reference_store=state,
             effect_store=ConfirmationEffectPlanStore(
@@ -90,13 +89,13 @@ class STRMKernelHistoryAuditTests(unittest.IsolatedAsyncioTestCase):
             cancellation=CancellationToken(),
             report_progress=ignore,
         )
-        result = await pipeline.execute("strm.run_once", arguments, context=context)
+        result = await pipeline.execute("strm.run", arguments, context=context)
         assert (result.effect_plan) is not None
         return context, result.effect_plan.plan_id
 
     def audit(self):
         return db.list_agent_action_history(
-            owner_digest=action_history_owner_digest(self.owner), limit=10
+            owner_digest=media_owner_digest(self.owner), limit=10
         )
 
     async def test_restored_confirmation_preserves_failed_receipt_and_cannot_replay(
@@ -130,7 +129,7 @@ class STRMKernelHistoryAuditTests(unittest.IsolatedAsyncioTestCase):
     async def test_restored_scoped_confirmation_submits_once_and_persists_success(self):
         with (
             patch(
-                "app.modules.strm.configured_strm_source_plans",
+                "app.modules.scheduler.configured_strm_source_plans",
                 return_value=([{"id": "source-a", "name": "Alpha"}], ""),
             ),
             patch.object(
@@ -140,7 +139,7 @@ class STRMKernelHistoryAuditTests(unittest.IsolatedAsyncioTestCase):
                 "app.agent.kernel.ports.mediaflux_effects.invalidate_agent_runtime_generation"
             ) as invalidate,
         ):
-            context, plan_id = await self.prepare({"source_names": ["Alpha"]})
+            context, plan_id = await self.prepare({"source_ids": ["source-a"]})
             db.init_db()
             rebuilt, state = self.pipeline()
             await rebuilt.execute_confirmed(plan_id, context=context)
@@ -160,3 +159,24 @@ class STRMKernelHistoryAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertTrue(bool(rows[0]["ok"]))
         self.assertEqual(rows[0]["status"], "accepted")
+
+
+    async def test_cancelled_native_card_does_not_start_a_task(self):
+        context, plan_id = await self.prepare({})
+        rebuilt, _ = self.pipeline()
+        self.assertTrue(await rebuilt.cancel_effect(plan_id, lease=context.lease))
+        with self.assertRaises(ConfirmationClaimError):
+            await rebuilt.execute_confirmed(plan_id, context=context)
+        self.assertEqual(db.list_task_runs("strm_sync"), [])
+        self.assertIsNone(self.scheduler._worker)
+
+    async def test_native_confirm_rechecks_common_config_before_admission(self):
+        context, plan_id = await self.prepare({})
+        self.config_value = "changed"
+        rebuilt, _ = self.pipeline()
+        with self.assertRaises(ToolPipelineError) as error:
+            await rebuilt.execute_confirmed(plan_id, context=context)
+        self.assertEqual(error.exception.code, "confirmation_stale")
+        self.assertFalse(error.exception.execution_started)
+        self.assertEqual(db.list_task_runs("strm_sync"), [])
+        self.assertIsNone(self.scheduler._worker)

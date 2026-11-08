@@ -64,6 +64,12 @@ class KernelMetrics:
         self._history: deque[TurnMeasurement] = deque(maxlen=max(20, history_size))
         self._status_counts: Counter[str] = Counter()
         self._task_status_counts: Counter[str] = Counter()
+        self._detached_deliveries = 0
+
+    def record_delivery_detached(self) -> None:
+        """消费者离开后执行转入后台；不改变任务终态统计。"""
+        with self._lock:
+            self._detached_deliveries += 1
 
     async def track(
         self,
@@ -124,9 +130,11 @@ class KernelMetrics:
             history = list(self._history)
             statuses = dict(self._status_counts)
             task_statuses = dict(self._task_status_counts)
+            detached_deliveries = self._detached_deliveries
         return {
             "turns": sum(statuses.values()),
             "statuses": statuses,
+            "detached_deliveries": detached_deliveries,
             # Last terminal snapshot per normally exhausted, recorded turn;
             # not distinct tasks, and not a task success rate.
             "task_statuses_by_turn": task_statuses,

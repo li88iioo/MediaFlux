@@ -113,8 +113,7 @@ class MediaListPayloadContractTests(unittest.TestCase):
     def test_provider_reports_failure_and_releases_client_instead_of_empty_success(
         self,
     ):
-        from app.agent.provider_models import ProviderGatewayError
-        from app.agent.providers.media_server import MediaServerProviderTransport
+        from app.modules.media_library import MediaLibraryError, recent
         from app.modules.media_server_profiles import MediaServerProfile
 
         for cls, name in ((EmbyClient, "emby"), (JellyfinClient, "jellyfin")):
@@ -128,17 +127,14 @@ class MediaListPayloadContractTests(unittest.TestCase):
                 True,
                 "viewer",
             )
-            transport = MediaServerProviderTransport()
             with (
                 self.subTest(server=name),
-                patch.object(transport, "_profile", return_value=profile),
-                patch.object(transport, "_client", return_value=client),
+                patch("app.modules.media_library.list_configured_profiles", return_value=[profile]),
+                patch.object(MediaServerProfile, "create_client", return_value=client),
                 patch.object(client, "_request", return_value={"Items": False}),
                 patch.object(client, "close", wraps=client.close) as close,
             ):
-                with self.assertRaises(ProviderGatewayError) as error:
-                    transport.execute_read(
-                        profile.source, "media.items.recent_added", {"limit": 5}
-                    )
+                with self.assertRaises(MediaLibraryError) as error:
+                    recent(name, limit=5)
                 self.assertEqual(error.exception.code, "provider_unavailable")
                 close.assert_called_once()

@@ -11,12 +11,12 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.database import media_owner_digest
 from app.agent.action_history import (
-    action_history_owner_digest,
     record_confirmation_claimed,
 )
 from app.agent.kernel.capabilities import ToolEffect
-from app.agent.kernel.effects import EffectPlan, PreparedEffect
+from app.agent.kernel.tool_calls import EffectPlan, PreparedEffect
 from app.agent.kernel.ports import mediaflux_effects as target
 from app.agent.models import RiskLevel, ToolResult
 from tests.support import isolated_test_database
@@ -122,8 +122,7 @@ def capture_hook(terminal, fault):
                                ("record_confirmation_error", "audit-failed"),
                                ("record_confirmation_interrupted", "audit-interrupted")):
             stack.enter_context(patch.object(target, function, side_effect=lambda name=name, **kw: emit(name, **kw)))
-        stack.enter_context(patch.object(target, "attach_activity_reference", side_effect=lambda *a: emit("activity")))
-        stack.enter_context(patch.object(target, "attach_undo_receipt", side_effect=lambda *a, **kw: emit("undo")))
+        stack.enter_context(patch.object(target, "preference_undo_receipt", side_effect=lambda *a, **kw: emit("undo")))
         stack.enter_context(patch.object(target, "invalidate_agent_runtime_generation", side_effect=lambda: emit("invalidate")))
         stack.enter_context(patch.object(lifecycle, "_configuration_fingerprint", side_effect=lambda: (emit("fingerprint"), "new")[1]))
         try:
@@ -146,7 +145,7 @@ def test_hook_order_return_exception_and_identity(terminal, fault):
     names = [item[0] for item in result["trace"]]
     if terminal == "completed":
         expected = [] if fault == "no-runtime" else ["complete"]
-        assert names == expected + ["activity", "undo", "risk", "contract", "audit-completed", "fingerprint", "invalidate"]
+        assert names == expected + ["undo", "risk", "contract", "audit-completed", "fingerprint", "invalidate"]
         assert result["outcome"] == {"returned": None}
     elif fault in {"release", "cancel:release"}:
         assert names == ["release"]
@@ -198,13 +197,13 @@ def test_real_sqlite_audit_is_scoped_and_finalizes_once(terminal):
             owner_generation=plan.owner_generation, tool_name=plan.tool_name, risk=RiskLevel.DANGER,
             confirmation_contract={"version": 1, "action": "同步"})
         value = ToolResult(True, "completed", "完成", data={"accepted": True})
-        with patch.object(target, "attach_activity_reference"), patch.object(target, "attach_undo_receipt"), \
+        with patch.object(target, "preference_undo_receipt"), \
                 patch.object(lifecycle, "_configuration_fingerprint", return_value="fixed"):
             invoke(lifecycle, terminal, replace(plan, metadata={"configuration_fingerprint": "fixed"}), value)
-        rows = db.list_agent_action_history(owner_digest=action_history_owner_digest(plan.owner), limit=10)
+        rows = db.list_agent_action_history(owner_digest=media_owner_digest(plan.owner), limit=10)
         assert len(rows) == 1
         assert rows[0]["status"] == {"completed": "completed", "failed": "confirmation_stale", "interrupted": "outcome_unknown"}[terminal]
-        assert db.list_agent_action_history(owner_digest=action_history_owner_digest("other-owner"), limit=10) == []
+        assert db.list_agent_action_history(owner_digest=media_owner_digest("other-owner"), limit=10) == []
         # Reopen the real SQLite path rather than accepting only the API result.
         import sqlite3
         with sqlite3.connect(path) as conn:
@@ -213,7 +212,7 @@ def test_real_sqlite_audit_is_scoped_and_finalizes_once(terminal):
             assert len(persisted) == 1
             assert {key: persisted[0][key] for key in rows[0].keys()} == dict(rows[0])
             assert persisted[0]["confirmation_id"] == "capacity-ticket-11"
-            assert persisted[0]["owner_digest"] == action_history_owner_digest(plan.owner)
+            assert persisted[0]["owner_digest"] == media_owner_digest(plan.owner)
         assert rows[0]["mode"] == "confirmed_action"
         assert rows[0]["tool_name"] == "strm.run_once"
         assert rows[0]["risk"] == "danger"
@@ -242,10 +241,10 @@ def test_completion_failure_boundaries(fault):
         assert result["outcome"]["error"]["type"] == ("CancelledError" if fault.startswith("cancel:") else "RuntimeError")
 
 
-def test_plain_qa_keeps_one_model_zero_tool_eight_write_transactions():
+def test_plain_qa_keeps_one_model_zero_tool_nine_write_transactions():
     from contextlib import contextmanager
 
-    from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+    from app.agent.kernel.capabilities import ToolCatalog
     from app.agent.kernel.model import ModelEvent, ModelEventType
     from app.agent.kernel.persistence import SQLiteKernelStore
     from app.agent.kernel.pipeline import ToolPipeline
@@ -253,7 +252,7 @@ def test_plain_qa_keeps_one_model_zero_tool_eight_write_transactions():
     from app.agent.kernel.state_types import AgentInput
 
     async def check():
-        writes = []
+        writes, read_changes = [], []
         class Model:
             count = 0
             async def stream(self, request, *, cancellation):
@@ -266,16 +265,22 @@ def test_plain_qa_keeps_one_model_zero_tool_eight_write_transactions():
         lifecycle = target.MediaFluxEffectLifecycle()
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store, effect_lifecycle=lifecycle)
         session = AgentSession(model=model, catalog=catalog, pipeline=pipeline, state_store=store,
-            journal=store, retriever=CapabilityRetriever(), system_prompt="Offline QA control")
+            journal=store,  system_prompt="Offline QA control")
         original = db.get_conn
         @contextmanager
         def traced():
             with original() as conn:
-                conn.set_trace_callback(lambda sql: writes.append(sql) if sql.startswith("BEGIN") else None)
+                begins, changes_before = [], conn.total_changes
+                conn.set_trace_callback(lambda sql: begins.append(sql) if sql.startswith("BEGIN") else None)
                 try:
                     yield conn
                 finally:
                     conn.set_trace_callback(None)
+                    if begins == ["BEGIN"]:
+                        # 发布权检查在一致读事务中执行；不能把它算成写事务，或允许其偷偷写入。
+                        read_changes.append(conn.total_changes - changes_before)
+                    else:
+                        writes.extend(begins)
         with isolated_test_database("capacity-qa.db"), patch.object(db, "get_conn", traced):
             events = [event async for event in session.run(AgentInput(
                 message="你好", owner="capacity-qa", session_id="qa", request_id="request",
@@ -285,6 +290,7 @@ def test_plain_qa_keeps_one_model_zero_tool_eight_write_transactions():
         tool_count = sum(event.type.value == "tool.started" for event in events)
         assert (model.count, tool_count, len(writes)) == (1, 0, 9)  # Includes durable publication finish.
         assert writes == ["BEGIN IMMEDIATE"] * 9
+        assert read_changes and set(read_changes) == {0}
         assert [[event.type.value, event.sequence, dict(event.payload)] for event in events] == [
             ["turn.started", 1, {"channel": "api", "generation": 1, "stream_display_enabled": True}],
             ["capabilities.selected", 2, {"count": 0, "tools": []}],
@@ -305,12 +311,16 @@ def test_plain_qa_keeps_one_model_zero_tool_eight_write_transactions():
 
 
 @pytest.mark.parametrize("terminal", ["prepare_failed", "failed", "interrupted", "cancelled"])
-def test_absent_runtime_does_not_copy_followup_metadata(terminal):
+def test_absent_missing_media_runtime_skips_followups_but_keeps_cloud_preview_cleanup(terminal):
     from collections.abc import Mapping
 
     class Metadata(Mapping):
         def __getitem__(self, key):
-            raise AssertionError("followup metadata accessed without runtime")
+            if key == "source_kind":
+                return "native_cloud_change"
+            if key == "fs_change_plan_id":
+                return "private-preview"
+            raise AssertionError("unrelated followup metadata accessed without runtime")
         def __iter__(self):
             raise AssertionError("followup metadata copied without runtime")
         def __len__(self):
@@ -320,12 +330,18 @@ def test_absent_runtime_does_not_copy_followup_metadata(terminal):
         def _risk(self, plan):
             return RiskLevel.DANGER
 
-    with patch.object(target, "record_confirmation_error"), patch.object(target, "record_confirmation_interrupted"):
-        invoke(Lifecycle(), terminal, replace(plan_fixture(), metadata=Metadata()), None)
+    with patch.object(target, "record_confirmation_error"), patch.object(target, "record_confirmation_interrupted"), \
+            patch.object(target, "discard_fs_change_plan") as discard:
+        invoke(Lifecycle(), terminal, replace(plan_fixture(), tool_name="cloud.change", metadata=Metadata()), None)
+    if terminal in {"prepare_failed", "cancelled"}:
+        discard.assert_called_once_with("private-preview", preview_only=True)
+    else:
+        # 执行失败/中断的结果可能未知，不得按未提交预览清掉原计划。
+        discard.assert_not_called()
 
 
 def test_cancelled_undo_is_not_an_optional_failure():
     result = capture_hook("completed", "cancel:undo")
-    assert [item[0] for item in result["trace"]] == ["complete", "activity", "undo"]
+    assert [item[0] for item in result["trace"]] == ["complete", "undo"]
     assert result["outcome"]["error"]["type"] == "CancelledError"
     assert result["value"]["suggestions"] == []

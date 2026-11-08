@@ -8,12 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.conversation_codec import pending_content
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -69,7 +64,7 @@ def test_real_returned_read(backend, mode):
             if mode == "no_return":
                 raise asyncio.CancelledError("never returned")
             if mode == "late_write":
-                from app.agent.kernel.effects import PreparedEffect
+                from app.agent.kernel.tool_calls import PreparedEffect
                 return PreparedEffect(preview={"effect": "read", "receipt": payload}, snapshot_fingerprint="fake-read-authority")
             if mode == "compact_outcome":
                 from app.agent.kernel.projection import ToolOutcome
@@ -83,7 +78,7 @@ def test_real_returned_read(backend, mode):
             read=read if mode != "late_write" else None,
             prepare=read if mode == "late_write" else None,
             execute_confirmed=forbidden_write if mode == "late_write" else None)])
-        active = AgentSession(model=model(), catalog=catalog, retriever=CapabilityRetriever(),
+        active = AgentSession(model=model(), catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=store,
                                   reference_store=store if isinstance(store, SQLiteKernelStore) else None), state_store=store)
         holder["session"] = active
@@ -123,7 +118,7 @@ def test_real_returned_read(backend, mode):
         if mode in {"returned", "wire_budget", "fake_handle"}:
             next_model = model(False)
             from app.agent.kernel.session import SessionLimits
-            following = AgentSession(model=next_model, catalog=catalog, retriever=CapabilityRetriever(),
+            following = AgentSession(model=next_model, catalog=catalog,
                 pipeline=ToolPipeline(catalog=catalog, state_store=cold), state_store=cold,
                 limits=SessionLimits(context_window_tokens=16384) if mode in {"wire_budget", "fake_handle"} else None)
             following_events = [e async for e in following.run(AgentInput(owner="o", session_id="s", message="describe existing facts"))]
@@ -150,11 +145,14 @@ def test_small_cancelled_fact_real_consumer():
             calls.append(arguments)
             assert await holder["session"].cancel(owner="o", session_id="small")
             return payload
-        catalog = ToolCatalog([replace(READ_TOOL, read=read)])
         def session(m, limits=None):
+            from app.agent.kernel.sandbox import run_code_tool
             cold = sqlite_store()
-            return AgentSession(model=m, catalog=catalog, retriever=CapabilityRetriever(),
-                pipeline=ToolPipeline(catalog=catalog, state_store=cold, reference_store=cold),
+            catalog = ToolCatalog([replace(READ_TOOL, read=read)])
+            pipeline = ToolPipeline(catalog=catalog, state_store=cold, reference_store=cold)
+            catalog.register(run_code_tool(pipeline))
+            return AgentSession(model=m, catalog=catalog,
+                pipeline=pipeline,
                 state_store=cold, limits=limits)
         holder["session"] = session(model())
         events = [e async for e in holder["session"].run(AgentInput(owner="o", session_id="small", message="Q" * 12000))]

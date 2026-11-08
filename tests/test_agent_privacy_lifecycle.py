@@ -1,11 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
-import threading
 import time
-from contextlib import contextmanager
-from unittest.mock import patch
 
 from app import database as db
 from app.agent.action_history import (
@@ -15,31 +13,11 @@ from app.agent.action_history import (
     record_confirmed_result,
 )
 from app.agent.models import RiskLevel, ToolResult
+from app.agent.kernel.events import AgentEvent, AgentEventType
+from app.agent.kernel.persistence import SQLiteKernelStore
 from app.modules.web_secret import get_web_secret
-from app.repositories.agent_provider_plans import (
-    claim_provider_plan,
-    create_provider_plan,
-    finish_provider_plan,
-)
+from app.repositories.agent_skills import save_skill
 from tests.support import IsolatedDatabaseTestCase
-
-
-class _ObservedConnection:
-    def __init__(self, connection, *, before_execute=None, after_execute=None):
-        self._connection = connection
-        self._before_execute = before_execute
-        self._after_execute = after_execute
-
-    def execute(self, sql, parameters=()):
-        if self._before_execute is not None:
-            self._before_execute(sql, parameters)
-        cursor = self._connection.execute(sql, parameters)
-        if self._after_execute is not None:
-            self._after_execute(sql, parameters)
-        return cursor
-
-    def __getattr__(self, name):
-        return getattr(self._connection, name)
 
 
 class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
@@ -132,7 +110,7 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
             )
             conn.execute(
                 "INSERT INTO agent_missing_media_workflows(workflow_id,owner_digest,source_tool,title,tmdb_id,season,as_of,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                ("workflow_privacy_0001", digests["workflow"], "library.search_missing_episode_resources", "Demo", "1", 1, "2026-08-22", "search_ready", now, now),
+                ("workflow_privacy_0001", digests["workflow"], "resources.search_missing", "Demo", "1", 1, "2026-08-22", "search_ready", now, now),
             )
             conn.execute(
                 "INSERT INTO telegram_agent_actions(action_id,owner_digest,action_kind,group_id,expires_at,created_at) VALUES(?,?,?,?,?,?)",
@@ -147,6 +125,16 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
                 (digests["conversation"], "privacy_session_0001", 1, now),
             )
 
+        async def seed_native():
+            store = SQLiteKernelStore()
+            lease, _ = await store.begin_turn(owner=owner, session_id="native", request_id="privacy")
+            await store.put_for_turn(lease, owner=owner, session_id="native", kind="private", value="private")
+            await store.append_for_turn(AgentEvent(
+                type=AgentEventType.TOOL_COMPLETED, session_id="native", turn_id=lease.turn_id,
+                request_id=lease.request_id, sequence=1), lease)
+
+        asyncio.run(seed_native())
+        save_skill(owner=owner, name="private-method", description="私有方法", content="# method", expected_revision=0)
         deleted = db.purge_agent_subject_data(owner=owner, principal=principal)
         aggregate = {
             key: value
@@ -169,7 +157,7 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
             for suffix, state in (("done", "visible"), ("active", "verification_pending")):
                 conn.execute(
                     "INSERT INTO agent_missing_media_workflows(workflow_id,owner_digest,source_tool,title,tmdb_id,season,as_of,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (f"workflow_ttl_{suffix}", "b" * 64, "library.search_missing_episode_resources", "Demo", "1", 1, "2026-07-01", state, old, old),
+                    (f"workflow_ttl_{suffix}", "b" * 64, "resources.search_missing", "Demo", "1", 1, "2026-07-01", state, old, old),
                 )
             for suffix, status in (("done", "succeeded"), ("active", "running")):
                 conn.execute(
@@ -305,300 +293,3 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
                     ).fetchone()[0],
                     0,
                 )
-
-    def test_running_provider_plan_is_scrubbed_then_removed_by_finisher(self):
-        owner = "web:running-provider-owner"
-        plan = create_provider_plan(
-            owner=owner,
-            session_id="session-running-provider",
-            provider="demo",
-            profile_ref="configured:demo",
-            operation="demo.items.update",
-            risk="write",
-            arguments={"private": "secret"},
-            target_snapshot={"title": "Sensitive target"},
-            context_fingerprint="context-running-provider",
-        )
-        claim_provider_plan(
-            owner=owner,
-            session_id="session-running-provider",
-            plan_ref=plan["plan_ref"],
-            expected_context="context-running-provider",
-        )
-
-        deleted = db.purge_agent_subject_data(owner=owner)
-
-        self.assertEqual(deleted["provider_plans"], 1)
-        self.assertEqual(deleted["provider_plans_scrubbed_running"], 1)
-        self.assertEqual(deleted["provider_plans_deleted"], 0)
-        with db.get_conn() as conn:
-            row = conn.execute(
-                "SELECT owner_digest,session_digest,provider,profile_ref,operation,"
-                "arguments_json,target_snapshot_json,result_json,"
-                "context_fingerprint,error_code,status "
-                "FROM agent_provider_plans WHERE plan_id=?",
-                (plan["plan_ref"].removeprefix("provider_plan:"),),
-            ).fetchone()
-        assert (row) is not None
-        self.assertNotEqual(row["owner_digest"], self._digest(
-            b"mediaflux-agent-provider-plan-owner:v1\0", owner
-        ))
-        self.assertRegex(str(row["owner_digest"]), r"^[0-9a-f]{64}$")
-        self.assertRegex(str(row["session_digest"]), r"^[0-9a-f]{64}$")
-        self.assertEqual(row["provider"], "")
-        self.assertEqual(row["profile_ref"], "")
-        self.assertEqual(row["operation"], "")
-        self.assertEqual(row["arguments_json"], "{}")
-        self.assertEqual(row["target_snapshot_json"], "{}")
-        self.assertEqual(row["result_json"], "{}")
-        self.assertEqual(row["context_fingerprint"], "")
-        self.assertEqual(row["error_code"], "privacy_purge_pending")
-        self.assertEqual(row["status"], "running")
-
-        finish_provider_plan(
-            plan_ref=plan["plan_ref"],
-            status="succeeded",
-            result={"private": "must-not-persist"},
-            summary="done",
-        )
-        with db.get_conn() as conn:
-            remaining = conn.execute(
-                "SELECT COUNT(*) FROM agent_provider_plans WHERE plan_id=?",
-                (plan["plan_ref"].removeprefix("provider_plan:"),),
-            ).fetchone()[0]
-        self.assertEqual(remaining, 0)
-
-    def test_provider_plan_purge_first_never_rewrites_sensitive_finish_payload(self):
-        owner = "web:provider-purge-first-owner"
-        session_id = "session-provider-purge-first"
-        plan = create_provider_plan(
-            owner=owner,
-            session_id=session_id,
-            provider="demo",
-            profile_ref="configured:demo",
-            operation="demo.items.update",
-            risk="write",
-            arguments={"private": "purge-first-argument"},
-            target_snapshot={"title": "purge-first-target"},
-            context_fingerprint="context-provider-purge-first",
-        )
-        claim_provider_plan(
-            owner=owner,
-            session_id=session_id,
-            plan_ref=plan["plan_ref"],
-            expected_context="context-provider-purge-first",
-        )
-        first_statement_gate = threading.Barrier(2)
-        allow_finish = threading.Event()
-        first_statements: list[str] = []
-        finish_updates: list[tuple[str, str]] = []
-        finish_errors: list[Exception] = []
-        original_get_conn = db.get_conn
-
-        def before_finish_execute(sql, parameters):
-            normalized_sql = " ".join(str(sql).split()).upper()
-            if not first_statements:
-                first_statements.append(normalized_sql)
-                first_statement_gate.wait(timeout=5)
-                if not allow_finish.wait(timeout=5):
-                    raise TimeoutError("finisher 未获准继续")
-            if normalized_sql.startswith(
-                "UPDATE AGENT_PROVIDER_PLANS SET STATUS=?"
-            ):
-                finish_updates.append((str(parameters[1]), str(parameters[2])))
-
-        @contextmanager
-        def observed_finish_connection():
-            with original_get_conn() as connection:
-                if threading.current_thread().name == "provider-purge-first-finisher":
-                    yield _ObservedConnection(connection, before_execute=before_finish_execute)
-                else:
-                    yield connection
-
-        def run_finish() -> None:
-            try:
-                finish_provider_plan(
-                    plan_ref=plan["plan_ref"],
-                    status="succeeded",
-                    result={"private": "purge-first-result-must-not-persist"},
-                    summary="purge-first-summary-must-not-persist",
-                )
-            except Exception as exc:  # noqa: BLE001  # pragma: no cover - 主线程统一断言
-                finish_errors.append(exc)
-
-        finisher = threading.Thread(
-            target=run_finish, name="provider-purge-first-finisher", daemon=True
-        )
-        with patch(
-            "app.database.get_conn",
-            new=observed_finish_connection,
-        ):
-            finisher.start()
-            try:
-                first_statement_gate.wait(timeout=5)
-                deleted = db.purge_agent_subject_data(owner=owner)
-            finally:
-                allow_finish.set()
-                finisher.join(timeout=5)
-
-        self.assertFalse(finisher.is_alive())
-        self.assertEqual(finish_errors, [])
-        self.assertEqual(deleted["provider_plans"], 1)
-        self.assertEqual(first_statements, ["BEGIN IMMEDIATE"])
-        self.assertEqual(finish_updates, [("{}", "")])
-        plan_id = str(plan["plan_ref"])
-        with db.get_conn() as connection:
-            row = connection.execute(
-                "SELECT result_json,summary,context_fingerprint "
-                "FROM agent_provider_plans WHERE plan_id=?",
-                (plan_id,),
-            ).fetchone()
-            leaked = connection.execute(
-                "SELECT COUNT(*) FROM agent_provider_plans "
-                "WHERE result_json LIKE ? OR summary LIKE ?",
-                ("%purge-first-result-must-not-persist%", "%purge-first-summary%"),
-            ).fetchone()[0]
-        self.assertIsNone(row)
-        self.assertEqual(leaked, 0)
-
-    def test_provider_plan_finish_first_is_removed_by_concurrent_subject_purge(self):
-        owner = "web:provider-finish-first-owner"
-        session_id = "session-provider-finish-first"
-        plan = create_provider_plan(
-            owner=owner,
-            session_id=session_id,
-            provider="demo",
-            profile_ref="configured:demo",
-            operation="demo.items.update",
-            risk="write",
-            arguments={"private": "finish-first-argument"},
-            target_snapshot={"title": "finish-first-target"},
-            context_fingerprint="context-provider-finish-first",
-        )
-        claim_provider_plan(
-            owner=owner,
-            session_id=session_id,
-            plan_ref=plan["plan_ref"],
-            expected_context="context-provider-finish-first",
-        )
-        finish_updated_gate = threading.Barrier(2)
-        allow_finish_commit = threading.Event()
-        purge_begin_gate = threading.Barrier(2)
-        purge_acquired = threading.Event()
-        finish_errors: list[Exception] = []
-        purge_errors: list[Exception] = []
-        purge_results: list[dict[str, int]] = []
-        finish_statements: list[str] = []
-        original_get_conn = db.get_conn
-        purge_thread_name = "provider-finish-first-purge"
-
-        def before_finish_execute(sql, _parameters):
-            if not finish_statements:
-                finish_statements.append(" ".join(str(sql).split()).upper())
-
-        def after_finish_execute(sql, _parameters):
-            normalized_sql = " ".join(str(sql).split()).upper()
-            if normalized_sql.startswith(
-                "UPDATE AGENT_PROVIDER_PLANS SET STATUS=?"
-            ):
-                finish_updated_gate.wait(timeout=5)
-                if not allow_finish_commit.wait(timeout=5):
-                    raise TimeoutError("finisher 未获准提交")
-
-        @contextmanager
-        def observed_finish_connection():
-            with original_get_conn() as connection:
-                yield _ObservedConnection(
-                    connection,
-                    before_execute=before_finish_execute,
-                    after_execute=after_finish_execute,
-                )
-
-        def before_purge_execute(sql, _parameters):
-            if (
-                threading.current_thread().name == purge_thread_name
-                and " ".join(str(sql).split()).upper() == "BEGIN IMMEDIATE"
-            ):
-                purge_begin_gate.wait(timeout=5)
-
-        def after_purge_execute(sql, _parameters):
-            if (
-                threading.current_thread().name == purge_thread_name
-                and " ".join(str(sql).split()).upper() == "BEGIN IMMEDIATE"
-            ):
-                purge_acquired.set()
-
-        @contextmanager
-        def observed_database_connection():
-            with original_get_conn() as connection:
-                yield _ObservedConnection(
-                    connection,
-                    before_execute=before_purge_execute,
-                    after_execute=after_purge_execute,
-                )
-
-        def run_finish() -> None:
-            try:
-                finish_provider_plan(
-                    plan_ref=plan["plan_ref"],
-                    status="succeeded",
-                    result={"private": "finish-first-result-must-not-persist"},
-                    summary="finish-first-summary-must-not-persist",
-                )
-            except Exception as exc:  # noqa: BLE001  # pragma: no cover - 主线程统一断言
-                finish_errors.append(exc)
-
-        def run_purge() -> None:
-            try:
-                purge_results.append(db.purge_agent_subject_data(owner=owner))
-            except Exception as exc:  # noqa: BLE001  # pragma: no cover - 主线程统一断言
-                purge_errors.append(exc)
-
-        finisher = threading.Thread(
-            target=run_finish, name="provider-finish-first-finisher", daemon=True
-        )
-        purger = threading.Thread(
-            target=run_purge, name=purge_thread_name, daemon=True
-        )
-        @contextmanager
-        def observed_connection():
-            factory = (observed_finish_connection if threading.current_thread() is finisher
-                       else observed_database_connection)
-            with factory() as connection:
-                yield connection
-
-        with patch.object(db, "get_conn", new=observed_connection):
-            finisher.start()
-            try:
-                finish_updated_gate.wait(timeout=5)
-                purger.start()
-                purge_begin_gate.wait(timeout=5)
-                self.assertFalse(purge_acquired.is_set())
-            finally:
-                allow_finish_commit.set()
-                finisher.join(timeout=5)
-                if purger.ident is not None:
-                    purger.join(timeout=5)
-
-        self.assertFalse(finisher.is_alive())
-        self.assertFalse(purger.is_alive())
-        self.assertEqual(finish_errors, [])
-        self.assertEqual(purge_errors, [])
-        self.assertEqual(finish_statements, ["BEGIN IMMEDIATE"])
-        self.assertTrue(purge_acquired.is_set())
-        self.assertEqual(len(purge_results), 1)
-        self.assertEqual(purge_results[0]["provider_plans"], 1)
-        plan_id = str(plan["plan_ref"])
-        with db.get_conn() as connection:
-            row = connection.execute(
-                "SELECT result_json,summary,context_fingerprint "
-                "FROM agent_provider_plans WHERE plan_id=?",
-                (plan_id,),
-            ).fetchone()
-            leaked = connection.execute(
-                "SELECT COUNT(*) FROM agent_provider_plans "
-                "WHERE result_json LIKE ? OR summary LIKE ?",
-                ("%finish-first-result-must-not-persist%", "%finish-first-summary%"),
-            ).fetchone()[0]
-        self.assertIsNone(row)
-        self.assertEqual(leaked, 0)

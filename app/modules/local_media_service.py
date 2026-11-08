@@ -33,6 +33,7 @@ from app.modules.local_media_cleanup import (
     probable_sample_video_paths,
 )
 from app.modules.local_media_models import (
+    LOCAL_MEDIA_CATEGORIES,
     LocalLibraryTarget,
     canonical_local_media_content_path,
     local_media_paths_overlap,
@@ -51,6 +52,7 @@ from app.modules.local_move_transaction import (
 from app.modules.local_path_mapping import (
     assert_within,
     require_container_absolute_path,
+    is_windows_or_unc_path,
     validate_source_target_roots,
 )
 from app.modules.local_storage import (
@@ -944,7 +946,7 @@ class LocalMediaService:
         prefix = canonical_local_media_content_path(media_root).rstrip("/") + "/"
         with db.get_conn() as conn:
             rows = conn.execute(
-                "SELECT step.source_path,i.media_group,t.content_path,s.local_root "
+                "SELECT step.source_path,step.target_path,i.media_group,t.content_path,s.local_root "
                 "FROM local_media_operation_steps step "
                 "JOIN local_media_tasks t ON t.id=step.task_id "
                 "JOIN local_media_sources s ON s.id=t.source_id AND s.owner=t.owner "
@@ -965,7 +967,7 @@ class LocalMediaService:
                 raise LocalMediaServiceError(
                     "目标目录存在已完成的本地移动记录，但身份快照已缺失，请人工核验"
                 )
-            # media_group 是执行前保存的完整身份，不从标题/识别摘要猜番号。
+            # media_group 保留来源身份；目录比较只补充该文件已提交的归档名。
             # 先还原确定的源组后缀再移除，避免切断 MetaTube ID 或目录中的冒号。
             source_path = Path(row["source_path"])
             selected_path = Path(row["content_path"])
@@ -990,7 +992,9 @@ class LocalMediaService:
                 raise LocalMediaServiceError(
                     "本地历史执行记录缺少可验证的媒体身份，请人工核验目标目录"
                 )
-            identities.add((media_type, identity_key))
+            identities.add((media_type, Organizer._directory_identity_key(
+                provider, external_id, Path(row["target_path"]).name,
+            )))
         return identities
 
     @staticmethod
@@ -2179,3 +2183,300 @@ def close_local_media_service() -> bool:
             if _service is service:
                 _service = None
     return closed
+
+
+# 来源配置由Web和原生SDK共用；任务检查/识别/重试链不经过这里。
+def local_source_payload(source, targets) -> dict:
+    return {
+        "id": source.id, "name": source.name, "qb_profile": source.qb_profile,
+        "qb_path_prefix": source.qb_path_prefix, "local_root": source.local_root,
+        "enabled": source.enabled,
+        "media_type": source.media_type, "mode": source.mode,
+        "targets": [
+            {"id": item.id, "category": item.category, "path": item.path,
+             "provider": item.provider, "library_id": item.library_id,
+             "library_name": item.library_name, "server_path": item.server_path}
+            for item in targets
+        ],
+    }
+
+
+def _source_text(payload: dict, key: str, *, required: bool = False, max_length: int = 2048) -> str:
+    value = payload.get(key, "")
+    if value is None:
+        value = ""
+    if isinstance(value, (dict, list, tuple, bool)):
+        raise ValueError(f"{key} 必须是字符串")
+    text = str(value).strip()
+    if "\x00" in text:
+        raise ValueError(f"{key} 包含非法字符")
+    if required and not text:
+        raise ValueError(f"{key} 不能为空")
+    if len(text) > max_length:
+        raise ValueError(f"{key} 过长")
+    return text
+
+
+def _source_boolean(payload: dict, key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} 必须是布尔值")
+    return value
+
+
+def _source_targets(payload: dict) -> list[dict[str, str]] | None:
+    if "targets" not in payload or payload.get("targets") is None:
+        return None
+    targets = payload["targets"]
+    if not isinstance(targets, list) or len(targets) > len(LOCAL_MEDIA_CATEGORIES):
+        raise ValueError("targets 必须是分类目标数组")
+    normalized: list[dict[str, str]] = []
+    submitted: set[str] = set()
+    for item in targets:
+        if not isinstance(item, dict):
+            raise ValueError("目标配置格式错误")
+        category = _source_text(item, "category", required=True, max_length=32).lower()
+        if category not in LOCAL_MEDIA_CATEGORIES or category in submitted:
+            raise ValueError("目标分类无效或重复")
+        submitted.add(category)
+        path = _source_text(item, "path", required=True)
+        provider = _source_text(item, "provider", max_length=32).lower()
+        library_id = _source_text(item, "library_id", max_length=256)
+        library_name = _source_text(item, "library_name", max_length=128)
+        server_path = _source_text(item, "server_path", max_length=2048)
+        if provider not in {"", "jellyfin", "emby"}:
+            raise ValueError("目标媒体服务器类型无效")
+        if provider and not library_name:
+            raise ValueError("媒体服务器和媒体库名称必须同时选择")
+        if not provider and (library_id or library_name or server_path):
+            raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
+        if server_path:
+            server_path = MediaServerPathMapping(path, server_path).server_prefix
+        normalized.append({
+            "category": category,
+            "path": path,
+            "provider": provider,
+            "library_id": library_id,
+            "library_name": library_name,
+            "server_path": server_path,
+        })
+    return normalized
+
+
+def _source_directory(value: str, label: str) -> Path:
+    raw = (value or "").strip()
+    if is_windows_or_unc_path(raw):
+        raise ValueError(
+            f"{label}必须填写 Docker 容器内路径；请先把宿主机或 NAS 目录挂载到容器，"
+            "再填写例如 /media/downloads 的路径"
+        )
+    directory = Path(raw).expanduser()
+    try:
+        if not directory.is_absolute() or not directory.exists() or not directory.is_dir():
+            raise ValueError(f"{label}必须是容器内已存在的绝对目录: {raw}")
+        return assert_within(directory, directory)
+    except OSError as exc:
+        raise ValueError(f"{label}无法访问，请检查 Docker 卷挂载与容器目录权限") from exc
+
+
+def _source_paths(
+    local_root: str,
+    targets: list[dict[str, str]],
+) -> tuple[str, list[dict[str, str]]]:
+    source = _source_directory(local_root, "来源目录")
+    target_paths: list[Path] = []
+    normalized_targets: list[dict[str, str]] = []
+    for item in targets:
+        target = _source_directory(item["path"], "媒体库目标")
+        target_paths.append(target)
+        normalized_targets.append({**item, "path": str(target)})
+    validate_source_target_roots(source, target_paths)
+    return str(source), normalized_targets
+
+
+
+def local_sources() -> list[dict]:
+    targets_by_source: dict[int, list] = {}
+    for target in db.list_local_library_targets(owner="admin"):
+        targets_by_source.setdefault(target.source_id, []).append(target)
+    return [local_source_payload(source, targets_by_source.get(source.id, []))
+            for source in db.list_local_media_sources(owner="admin")]
+
+
+def local_source(source_id: int) -> dict:
+    _local_source_id(source_id)
+    source = db.get_local_media_source(source_id, owner="admin")
+    if source is None:
+        raise LookupError("本地媒体来源不存在")
+    return local_source_payload(source, db.list_local_library_targets(source_id, owner="admin"))
+
+
+def _local_source_id(source_id: int) -> int:
+    if type(source_id) is not int or source_id <= 0:
+        raise ValueError("source_id必须是已保存来源的真实正整数ID")
+    return source_id
+
+
+def _local_source_snapshot(source_id: int | None) -> dict:
+    from app.repositories.local_media import local_media_source_snapshot
+    with db.get_conn() as conn:
+        conn.execute("BEGIN")
+        return local_media_source_snapshot(conn, source_id)
+
+
+def _local_source_plan(operation: str, source_id: int | None, changes: dict) -> dict:
+    if operation not in {"create", "update", "delete"}:
+        raise ValueError("来源操作无效")
+    if operation != "create":
+        if source_id is None:
+            raise ValueError("必须提供source_id")
+        _local_source_id(source_id)
+    snapshot = _local_source_snapshot(source_id)
+    current = snapshot.get("source") or {}
+    if operation != "create" and not current:
+        raise LookupError("本地媒体来源不存在")
+    if operation == "delete":
+        return {"snapshot": snapshot, "payload": {}}
+    targets = _source_targets(changes)
+    effective_targets = targets if targets is not None else snapshot.get("targets", [])
+    local_root = _source_text(changes, "local_root", required=True) if "local_root" in changes else str(current.get("local_root") or "")
+    local_root, normalized_targets = _source_paths(local_root, effective_targets)
+    payload = {"name": _source_text(changes, "name", required=True, max_length=128) if "name" in changes else current.get("name", ""),
+               "local_root": local_root,
+               "qb_profile": _source_text(changes, "qb_profile", max_length=64) if "qb_profile" in changes else current.get("qb_profile", "configured:qb"),
+               "qb_path_prefix": _source_text(changes, "qb_path_prefix") if "qb_path_prefix" in changes else current.get("qb_path_prefix", ""),
+               "enabled": _source_boolean(changes, "enabled", bool(current.get("enabled", True))),
+               "media_type": _source_text(changes, "media_type", max_length=16) if "media_type" in changes else current.get("media_type", "auto"),
+               "mode": _source_text(changes, "mode", max_length=16) if "mode" in changes else current.get("mode", "move"),
+               "targets": normalized_targets if targets is not None or operation == "create" else None}
+    if operation == "create":
+        payload["qb_profile"] = payload["qb_profile"] or "configured:qb"
+        payload["media_type"] = payload["media_type"] or "auto"
+        payload["mode"] = payload["mode"] or "move"
+    return {"snapshot": snapshot, "payload": payload}
+
+
+def _local_source_reload() -> bool:
+    from app.modules.local_media_scheduler import get_local_media_scheduler
+    get_local_media_scheduler().reload()
+    return True
+
+
+def _write_local_source(operation: str, source_id: int | None, plan: dict, cancelled=None) -> dict:
+    from app.repositories import local_media as repository
+    if operation == "delete":
+        if source_id is None:
+            raise ValueError("必须提供source_id")
+        deleted = repository.delete_local_media_source(source_id, expected_snapshot=plan["snapshot"], cancelled=cancelled)
+        return {"source_id": source_id, "deleted": deleted, "runtime_refreshed": _local_source_reload() if deleted else False}
+    saved_id = repository.save_local_media_source_bundle(source_id=source_id, owner="admin", **plan["payload"],
+                                                        expected_snapshot=plan["snapshot"], cancelled=cancelled)
+    refreshed = _local_source_reload()
+    try:
+        saved_source = local_source(saved_id)
+    except Exception as exc:
+        raise RuntimeError("来源事务已提交，但读取保存结果失败，请核实配置后再操作") from exc
+    return {"source_id": saved_id, "source": saved_source, "runtime_refreshed": refreshed}
+
+
+def save_local_source_config(changes: dict, source_id: int | None = None) -> dict:
+    """Web和SDK共享来源/targets事务以及同一调度器reload。"""
+    operation = "create" if source_id is None else "update"
+    return _write_local_source(operation, source_id, _local_source_plan(operation, source_id, changes))
+
+
+def delete_local_source_config(source_id: int) -> dict:
+    return _write_local_source("delete", source_id, _local_source_plan("delete", source_id, {}))
+
+
+def prepare_local_source_change(operation: str, source_id: int | None = None, changes: dict | None = None) -> dict:
+    from app.modules.web_secret import signed_context_fingerprint
+    changes = dict(changes or {})
+    allowed = {"name", "local_root", "qb_profile", "qb_path_prefix", "enabled", "media_type", "mode", "targets"}
+    if set(changes) - allowed or (operation == "update" and not changes):
+        raise ValueError("来源参数包含禁止字段或未指定修改内容")
+    plan = _local_source_plan(operation, source_id, changes)
+    if operation != "delete":
+        payload = plan["payload"]
+        if payload["local_root"] == Path(payload["local_root"]).anchor:
+            raise ValueError("来源必须是非根目录")
+        if payload["mode"] not in {"move", "preview_only"} or payload["media_type"] not in {"auto", "movie", "tv", "nsfw"}:
+            raise ValueError("来源模式或媒体类型无效")
+        if operation == "create" and any(row["name"] == payload["name"] or row["local_root"] == payload["local_root"] for row in plan["snapshot"]["existing"]):
+            raise ValueError("相同名称或目录的媒体来源已存在")
+    fingerprint = signed_context_fingerprint({"operation": operation, "source_id": source_id, "changes": changes, **plan}, domain="local-source-change")
+    return {"ok": True, "status": "confirmation_required", "summary": "确认后保存本地来源配置" if operation != "delete" else "确认后删除本地来源配置",
+            "data": {"operation": operation, "source_id": source_id, "changed_fields": sorted(changes), "count": 1,
+                     "configuration": plan["payload"],
+                     "effects": ["只修改来源配置；不会改文件权限、移动或删除媒体文件", "targets未提供时保留原归档映射；enabled控制qB完成接管"]},
+            "fingerprint": fingerprint, "plan": plan}
+
+
+def apply_local_source_change(operation: str, source_id: int | None = None, changes: dict | None = None, *, expected_fingerprint: str, cancelled=None) -> dict:
+    import secrets
+    from app.repositories.local_media import LocalMediaSourceChanged, LocalMediaSourceCancelled
+    try:
+        prepared = prepare_local_source_change(operation, source_id, changes)
+    except LookupError as exc:
+        raise LocalMediaSourceChanged("来源已变化，请重新预检") from exc
+    if not secrets.compare_digest(prepared["fingerprint"], expected_fingerprint):
+        raise LocalMediaSourceChanged("来源配置已变化，请重新预检")
+    try:
+        result = _write_local_source(operation, source_id, prepared["plan"], cancelled)
+    except LocalMediaSourceCancelled:
+        return {"ok": False, "status": "cancelled", "summary": "来源操作已取消", "data": {}}
+    return {"ok": True, "status": "completed" if result["runtime_refreshed"] else "partial",
+            "summary": "本地来源配置已保存" if operation != "delete" else "本地来源配置已删除", "data": {"operation": operation, **result}}
+
+
+def prepare_local_source_scan(source_ids: list[int] | None = None, query: str = "") -> dict:
+    from app.modules.web_secret import signed_context_fingerprint
+    from app.sensitive_data import contains_sensitive_credential
+    if source_ids is not None and (not isinstance(source_ids, list) or any(type(item) is not int or item <= 0 for item in source_ids)):
+        raise ValueError("source_ids必须是真实来源ID的正整数数组")
+    if not isinstance(query, str) or len(query) > 120 or contains_sensitive_credential(query) or "://" in query or query.strip().startswith(("/", "\\")):
+        raise ValueError("query必须是媒体标题过滤词，不是路径、URL或凭据")
+    ids = sorted(set(source_ids)) if source_ids is not None else [source.id for source in db.list_local_media_sources(owner="admin")]
+    if not ids:
+        raise ValueError("尚未选择本地媒体来源")
+    snapshots = {source_id: _local_source_snapshot(source_id) for source_id in ids}
+    if any(not snapshot["source"] for snapshot in snapshots.values()):
+        from app.repositories.local_media import LocalMediaSourceChanged
+        raise LocalMediaSourceChanged("所选来源已不存在")
+    eligible = {source_id: snapshot for source_id, snapshot in snapshots.items() if snapshot["source"]["mode"] != "preview_only" and snapshot["targets"]}
+    if not eligible:
+        raise ValueError("所选来源均为仅预览或尚未配置归档目标")
+    args = {"source_ids": ids, "query": query.strip()}
+    fingerprint = signed_context_fingerprint({"arguments": args, "sources": snapshots}, domain="local-source-scan")
+    return {"ok": True, "status": "confirmation_required", "summary": f"确认后扫描 {len(eligible)} 个本地来源",
+            "data": {"source_ids": ids, "eligible": len(eligible), "skipped": len(ids) - len(eligible), "count": len(ids),
+                     "effects": ["只扫描选定配置目录并将候选入队；不改文件权限", "扫描入队与后续归档分别核验，扫描失败不表示没有候选"]},
+            "arguments": args, "fingerprint": fingerprint, "eligible_sources": eligible}
+
+
+def scan_local_sources(source_ids: list[int] | None = None, query: str = "", *, expected_fingerprint: str, cancelled=None) -> dict:
+    import secrets
+    from app.modules.local_media_scheduler import get_local_media_scheduler
+    from app.repositories.local_media import LocalMediaSourceChanged
+    try:
+        prepared = prepare_local_source_scan(source_ids, query)
+    except (ValueError, LookupError) as exc:
+        raise LocalMediaSourceChanged("来源或归档目标已变化，请重新预检") from exc
+    if not secrets.compare_digest(prepared["fingerprint"], expected_fingerprint):
+        raise LocalMediaSourceChanged("来源或归档目标已变化，请重新预检")
+    if cancelled is not None and cancelled():
+        return {"ok": False, "status": "cancelled", "summary": "扫描已取消", "data": {}}
+    scheduler = get_local_media_scheduler()
+    was_running = bool(scheduler.status().get("running"))
+    result = scheduler.enqueue_manual_scan_candidates(silent=True, source_ids=set(prepared["eligible_sources"]),
+        candidate_query=prepared["arguments"]["query"], expected_sources=prepared["eligible_sources"], cancelled=cancelled)
+    started = False
+    if result["queued_count"] and not was_running:
+        scheduler.start()
+        started = True
+    return {"ok": bool(result["queued_count"]) or result["scan_status"] == "completed",
+            "status": "accepted" if result["queued_count"] else result["scan_status"],
+            "summary": f"本地扫描状态 {result['scan_status']}：{result['queued_count']} 个持久任务入队，{result['failed_sources']} 个来源失败",
+            "data": {**result, "source_ids": prepared["arguments"]["source_ids"], "operation": "scan_sources", "runtime_started": started,
+                     "queued_tasks": result["queued_count"], "candidates": result["candidate_count"]},
+            "error": "扫描失败，不能判断所选来源没有候选" if result["failed_sources"] and not result["queued_count"] else ""}

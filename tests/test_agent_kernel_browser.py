@@ -385,9 +385,6 @@ class AgentKernelBrowserTests(unittest.TestCase):
         )
         page.locator("#agentPrompt").fill("我的媒体库里光阴之外有多少集")
         page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
-        page.wait_for_function(
-            "() => document.querySelector('.agent-stream-steps')?.textContent.includes('查询媒体库完成')"
-        )
         page.locator(".agent-narrative").wait_for()
         self.assertEqual(page.locator(".agent-message-user").count(), 1)
         self.assertEqual(page.locator(".agent-message-assistant").count(), 1)
@@ -437,7 +434,6 @@ class AgentKernelBrowserTests(unittest.TestCase):
                 page.get_by_text(expected, exact=True).wait_for()
                 self.assertEqual(page.locator("[data-effect-confirm]").count(), 0)
                 self.assertEqual(page.locator("[data-effect-cancel]").count(), 0)
-                self.assertEqual(page.locator(".agent-tool-trace").count(), 1)
                 self.assertNotIn("已提交操作可能继续执行", page.locator("#agentTranscript").inner_text())
                 page.close()
 
@@ -462,7 +458,7 @@ class AgentKernelBrowserTests(unittest.TestCase):
                 page.locator(".agent-narrative").wait_for()
                 snapshots = page.evaluate("window.__streamSnapshots")
                 self.assertEqual(any("尚未完成的草稿" in text for text in snapshots), enabled)
-                self.assertTrue(any("查询进行中" in text for text in snapshots))
+                self.assertTrue(any("正在处理" in text for text in snapshots))
                 self.assertEqual(page.locator(".agent-narrative").inner_text(), "完整回答已取得")
 
     def test_tool_boundary_flushes_buffered_markdown_with_animation_frames_paused(self) -> None:
@@ -485,7 +481,7 @@ class AgentKernelBrowserTests(unittest.TestCase):
             window.__boundaryBodies = [];
             new MutationObserver(() => {
                 const card = document.querySelector('.agent-result-card');
-                if (card?.querySelector('.agent-stream-head')?.textContent.includes('工具阶段：媒体库查询')) {
+                if (card?.querySelector('.agent-stream-head')?.textContent.includes('正在处理')) {
                     window.__boundaryBodies.push(card.querySelector('.agent-stream-text')?.textContent || '');
                 }
             }).observe(document.querySelector('#agentTranscript'), {childList: true, characterData: true, subtree: true});
@@ -554,10 +550,10 @@ class AgentKernelBrowserTests(unittest.TestCase):
         page.locator("#agentPrompt").fill("查询媒体库")
         page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
         page.wait_for_function("""() => window.__agentBodySnapshots.some(
-          item => item.status.includes('工具阶段：媒体库查询')
+          item => item.status.includes('正在处理')
         )""")
         during_tools = page.evaluate("""() => window.__agentBodySnapshots.filter(
-          item => item.status.includes('工具阶段：媒体库查询')
+          item => item.status.includes('正在处理')
         )""")
         self.assertTrue(during_tools)
         self.assertTrue(
@@ -907,6 +903,43 @@ Season 1 / S01E01
         self.assertEqual(payload["plan_id"], approval["plan_id"])
         self.assertEqual(payload["session_id"], SESSION_ID)
 
+    def test_native_sdk_batch_card_displays_all_items_and_confirms_original_plan(self):
+        for tool in ("resources.download", "cloud.change"):
+            with self.subTest(tool=tool):
+                approval = {
+                    "plan_id": "native-sdk-plan", "tool_name": tool, "effect": "write",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                    "preview": {"summary": "整批20项待确认", "data": {
+                        "count": 20, "resources": [{"title": f"对象 {i:02d}"} for i in range(1, 21)],
+                    }},
+                }
+                page = self.make_page({
+                    "sessions": {"sessions": [{"session_id": SESSION_ID, "title": "脚本操作"}]},
+                    "sessionDetails": {SESSION_ID: {
+                        "messages": [{"role": "user", "content": "处理这20项"}], "pending_approval": approval,
+                    }},
+                    "confirmEvents": [
+                        _event(1, "turn.started", {"kind": "confirmation"}),
+                        _event(2, "effect.completed", {"plan_id": approval["plan_id"], "result": {
+                            "ok": True, "status": "accepted", "summary": "20项已受理，等待完成",
+                        }}),
+                        _event(3, "turn.completed", {"status": "success", "answer": "20项已受理，等待完成"}),
+                    ],
+                }, stored_session=SESSION_ID)
+                card = page.locator(".agent-confirmation-card")
+                card.wait_for()
+                self.assertIn("20 项", card.inner_text())
+                card.get_by_text("另有 12 项，展开核对", exact=True).click()
+                self.assertEqual(card.locator(".agent-confirmation-list li:visible").count(), 20)
+                self.assertIn("对象 20", card.inner_text())
+                card.locator("[data-effect-confirm]").click()
+                page.locator(".agent-result-card").filter(has_text="20项已受理").wait_for()
+                calls = [call for call in page.evaluate("window.__kernelCalls")
+                         if call["url"] == "/api/agent/actions/confirm"]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(json.loads(calls[0]["body"])["plan_id"], approval["plan_id"])
+                page.close()
+
     def test_confirm_stream_accepts_legacy_effect_completed_turn_terminal(self):
         approval = {
             "plan_id": "plan-browser-legacy-terminal-0001",
@@ -1078,6 +1111,8 @@ Season 1 / S01E01
         self.assertEqual(page.locator(".is-interrupted").count(), 0)
 
     def test_confirm_stream_replaces_completed_step_with_a_new_plan_only(self):
+        from app.agent.public_view import format_public_result
+
         first = {
             "plan_id": "plan-browser-chain-0001",
             "tool_name": "download.pause",
@@ -1094,6 +1129,15 @@ Season 1 / S01E01
             "result": {},
             "expires_at": "2026-09-03T12:06:00+00:00",
         }
+        third = {
+            **second,
+            "plan_id": "plan-browser-chain-0003",
+            "preview": {"summary": "重新预检继续下载任务", "data": {"任务": "第三步"}},
+        }
+        first_result = {"ok": True, "status": "completed", "summary": "第一步已完成"}
+        second_result = {"ok": False, "status": "failed", "summary": "第二步未执行，下载任务状态已变化"}
+        first_receipt = format_public_result(first_result)
+        second_receipt = format_public_result(second_result)
         page = self.make_page({
             "sessions": {"sessions": []},
             "queryEvents": [
@@ -1104,7 +1148,8 @@ Season 1 / S01E01
             "confirmEvents": [
                 _event(4, "effect.completed", {
                     "plan_id": first["plan_id"],
-                    "result": {"ok": True, "summary": "第一步已完成"},
+                    "result": first_result,
+                    "receipt": first_receipt,
                 }),
                 _event(5, "model.started", {"round": 2}),
                 _event(6, "model.delta", {"round": 2, "delta": "准备第二步。"}),
@@ -1122,14 +1167,141 @@ Season 1 / S01E01
         self.assertEqual(page.locator('[data-effect-confirm="plan-browser-chain-0001"]').count(), 0)
         self.assertTrue(next_card.locator('[data-effect-confirm="plan-browser-chain-0002"]').is_enabled())
         self.assertIn("第一步已完成", next_card.inner_text())
+        self.assertEqual(next_card.locator(".agent-confirmation-previous .agent-confirmation-result").inner_text(),
+                         first_receipt)
+        page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+        self.assertEqual(page.evaluate(
+            "window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').map(call => JSON.parse(call.body).plan_id)"
+        ), [first["plan_id"]])
+
+        page.evaluate("events => { window.__kernelConfig.confirmEvents = events; }", [
+            _event(9, "effect.failed", {
+                "plan_id": second["plan_id"],
+                "code": "confirmation_stale",
+                "message": second_result["summary"],
+                "result": second_result,
+                "receipt": second_receipt,
+            }),
+            _event(10, "effect.approval_required", {"tool": "download.resume", "plan": third}),
+            _event(11, "turn.completed", {"status": "approval_required", "answer": "已重新预检，尚未执行新计划"}),
+        ])
+        next_card.locator("[data-effect-confirm]").click()
+
+        refreshed_card = page.locator('.agent-confirmation-card[data-plan-id="plan-browser-chain-0003"]')
+        refreshed_card.wait_for()
+        self.assertEqual(page.locator(".agent-confirmation-card").count(), 1)
+        self.assertEqual(page.locator('[data-effect-confirm="plan-browser-chain-0002"]').count(), 0)
+        self.assertTrue(refreshed_card.locator('[data-effect-confirm="plan-browser-chain-0003"]').is_enabled())
+        previous = refreshed_card.locator(".agent-confirmation-previous")
+        self.assertIn("上一项操作的执行结果", previous.inner_text())
+        self.assertEqual(previous.locator(".agent-confirmation-result").inner_text(), second_receipt)
+        self.assertNotIn("第一步已完成", refreshed_card.inner_text())
+        self.assertIn("重新预检继续下载任务", refreshed_card.inner_text())
+        page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+        self.assertEqual(page.evaluate(
+            "window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').map(call => JSON.parse(call.body).plan_id)"
+        ), [first["plan_id"], second["plan_id"]])
+
+        # 显式确认 C 后流程失败；C 没有执行回执，最终汇总仍须保留 A/B 的事实。
+        page.evaluate("events => { window.__kernelConfig.confirmEvents = events; }", [
+            _event(12, "turn.failed", {"message": "模型暂时不可用"}),
+        ])
+        refreshed_card.locator("[data-effect-confirm]").click()
+        narrative = page.locator(".agent-result-card.has-narrative .agent-narrative")
+        narrative.wait_for()
+        text = narrative.inner_text()
+        self.assertEqual(text.count(first_receipt), 1)
+        self.assertEqual(text.count(second_receipt), 1)
+        page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+        self.assertEqual(page.evaluate(
+            "window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').map(call => JSON.parse(call.body).plan_id)"
+        ), [first["plan_id"], second["plan_id"], third["plan_id"]])
         self.assertEqual(
-            page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"),
-            1,
+            page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 1,
         )
 
+    def test_preauthorized_effect_receipt_precedes_next_confirmation(self):
+        from app.agent.public_view import format_public_result
+
+        earlier = {
+            "plan_id": "plan-browser-before-trust-0001", "tool_name": "download.pause",
+            "effect": "WRITE", "preview": {"summary": "暂停下载任务"},
+        }
+        pending = {
+            "plan_id": "plan-browser-after-trust-0003", "tool_name": "watchlist.add",
+            "effect": "WRITE", "preview": {"summary": "电影收藏仍需确认"},
+        }
+        earlier_result = {"ok": True, "status": "completed", "summary": "此前暂停已完成"}
+        trusted_result = {"ok": True, "status": "completed", "summary": "预授权剧集收藏已保存"}
+        earlier_receipt = format_public_result(earlier_result)
+        trusted_receipt = format_public_result(trusted_result)
+        following_events = [
+            _event(5, "effect.completed", {
+                "plan_id": "plan-browser-trusted-0002", "tool": "watchlist.add",
+                "result": trusted_result, "receipt": trusted_receipt,
+                "scoped_trust": {"active": False},
+            }),
+            _event(6, "effect.approval_required", {"plan": pending}),
+            _event(7, "turn.completed", {"status": "approval_required"}),
+        ]
+        for has_earlier_card in (False, True):
+            with self.subTest(has_earlier_card=has_earlier_card):
+                query_events = [_event(1, "turn.started", {"kind": "query"})]
+                if has_earlier_card:
+                    query_events.extend([
+                        _event(2, "effect.approval_required", {"plan": earlier}),
+                        _event(3, "turn.completed", {"status": "approval_required"}),
+                    ])
+                else:
+                    query_events.extend(following_events)
+                page = self.make_page({
+                    "sessions": {"sessions": []}, "queryEvents": query_events,
+                    "confirmEvents": [
+                        _event(4, "effect.completed", {
+                            "plan_id": earlier["plan_id"], "result": earlier_result,
+                            "receipt": earlier_receipt,
+                        }),
+                        *following_events,
+                    ],
+                })
+                page.locator("#agentPrompt").fill("按已有授权收藏剧集，再预检电影收藏")
+                page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+                if has_earlier_card:
+                    page.locator(f'[data-effect-confirm="{earlier["plan_id"]}"]').click()
+
+                card = page.locator(f'.agent-confirmation-card[data-plan-id="{pending["plan_id"]}"]')
+                card.wait_for()
+                previous = card.locator(".agent-confirmation-previous")
+                self.assertEqual(previous.count(), 1)
+                self.assertIn("上一项操作的执行结果", previous.inner_text())
+                self.assertEqual(previous.locator(".agent-confirmation-result").inner_text(), trusted_receipt)
+                self.assertNotIn("此前暂停已完成", card.inner_text())
+                self.assertTrue(card.locator("[data-effect-confirm]").is_enabled())
+                page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+                confirmed_ids = [earlier["plan_id"]] if has_earlier_card else []
+                self.assertEqual(page.evaluate(
+                    "window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').map(call => JSON.parse(call.body).plan_id)"
+                ), confirmed_ids)
+
+                # 新卡仍需显式确认；后续失败不能丢掉预授权或更早卡片的累计回执。
+                page.evaluate("events => { window.__kernelConfig.confirmEvents = events; }", [
+                    _event(8, "turn.failed", {"message": "后续检查未完成"}),
+                ])
+                card.locator("[data-effect-confirm]").click()
+                narrative = page.locator(".agent-result-card.has-narrative .agent-narrative")
+                narrative.wait_for()
+                text = narrative.inner_text()
+                self.assertEqual(text.count(trusted_receipt), 1)
+                self.assertEqual(text.count(earlier_receipt), int(has_earlier_card))
+                self.assertIn("后续流程未完成", text)
+                page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+                self.assertEqual(page.evaluate(
+                    "window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').map(call => JSON.parse(call.body).plan_id)"
+                ), confirmed_ids + [pending["plan_id"]])
+
     def test_changed_snapshot_keeps_new_confirmation_actionable_without_resubmission(self):
-        first = {"plan_id": "plan-stale-original-0001", "tool_name": "guangya.recycle.clear",
-                 "effect": "WRITE", "preview": {"summary": "确认清空2项"}}
+        first = {"plan_id": "plan-stale-original-0001", "tool_name": "cloud.clear_recycle",
+                 "effect": "DANGER", "preview": {"summary": "确认清空2项"}}
         second = {**first, "plan_id": "plan-stale-refreshed-0002", "preview": {"summary": "确认清空3项"}}
         page = self.make_page({
             "sessions": {"sessions": []},
@@ -1153,6 +1325,13 @@ Season 1 / S01E01
         self.assertEqual(page.locator(".agent-confirmation-card").count(), 1)
         self.assertTrue(next_card.locator("[data-effect-confirm]").is_enabled())
         self.assertIn("确认清空3项", next_card.inner_text())
+        # 旧卡未执行的原因须置顶并标明归属，不能被读成新计划的结果。
+        previous = next_card.locator(".agent-confirmation-previous")
+        self.assertIn("上一项操作的执行结果", previous.inner_text())
+        self.assertIn("回收站内容已变化", previous.inner_text())
+        self.assertTrue(previous.evaluate(
+            "node => !!(node.compareDocumentPosition(node.parentNode.querySelector('.agent-confirmation-intro'))"
+            " & Node.DOCUMENT_POSITION_FOLLOWING)"))
         self.assertEqual(page.locator('[data-effect-confirm="plan-stale-original-0001"]').count(), 0)
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
 

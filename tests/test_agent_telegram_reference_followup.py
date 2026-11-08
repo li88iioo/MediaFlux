@@ -13,6 +13,7 @@ from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import ToolOutcome
 from app.agent.kernel.session import SessionLimits
+from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.state_types import AgentInput, CancellationToken, StateUpdate
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests import test_agent_kernel_telegram_reference as o
@@ -31,6 +32,7 @@ from tests.test_agent_capacity_recovery import (
 )
 
 store = o.store
+native_workspace = o.native_workspace
 
 
 def send(store, message, window=128000):
@@ -60,25 +62,24 @@ def test_unrelated_turn_after_reader_roundtrip_and_expiry(store, elapsed):
         assert 'reference_unavailable' in users[0]
         assert 'untrusted_reference' in users[0] and 'source' in users[0]
         assert before['reference_handle'] not in users[0]
-        assert 'read_tool' not in users[0]
-        # Only reader-result advertising is downgraded; native tool-call history stays intact.
-        tools = [json.loads(m['content']) for m in wire.requests[0]['messages'] if m['role'] == 'tool']
-        assert tools and tools[0]['reference_unavailable'] is True
-        assert 'result_handle' not in tools[0]
+        assert 'read_method' not in users[0]
+        # 原工作区输出是已读事实；过期只撤回引用入口，不覆写持久 stdout。
+        old_tools = [m for m in wire.requests[0]['messages'] if m['role'] == 'tool']
+        assert old_tools
+        assert before['text'][2000:] in o.reader_content(wire.requests[0], 'chat_completions')['data']
     async def read():
         lease, _ = await cold.begin_turn(owner=owner, session_id=sid, request_id='expired-reader')
         async def progress(payload):
             pass
         context = ToolCallContext(owner=owner, session_id=sid, request_id='expired-reader',
             turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=progress)
-        return await ToolPipeline(catalog=ToolCatalog([]), state_store=cold, reference_store=cold).execute(
-            'agent.read_result', {'handle': before['reference_handle'], 'path': '/text', 'offset': 2000, 'limit': 1000}, context=context)
+        return await SessionService(ToolPipeline(catalog=ToolCatalog([]), state_store=cold, reference_store=cold), context).result(before['reference_handle'], '/text')
     if elapsed:
         with pytest.raises(ToolPipelineError) as error:
             asyncio.run(read())
         assert error.value.code == 'reference_invalid'
     else:
-        assert json.loads(asyncio.run(read()).outcome.model_content)['data']['items'] == o.LONG[2000:]
+        assert asyncio.run(read())['data'] == o.LONG
 
 
 @pytest.mark.parametrize('window', [128000, 16384])

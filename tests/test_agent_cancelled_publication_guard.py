@@ -68,7 +68,7 @@ async def held_turn(rig, protocol, kind, *, defer_cancel=False):
 def lifecycle(session):
     return AgentSessionLifecycle(session=session, store=session.state_store,
         effect_store=session.pipeline.effect_store,
-        clear_provider_state=lambda **_: None, clear_domain_state=lambda **_: None)
+        clear_legacy_plans=lambda **_: None)
 
 
 async def fresh_turn(session, protocol):

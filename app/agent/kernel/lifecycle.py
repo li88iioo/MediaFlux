@@ -11,6 +11,7 @@ from app.agent.kernel.state_types import SessionBusyError
 from .effects import ConfirmationEffectPlanStore
 from .session import AgentSession
 from .session_guard import guarded_state_call, session_scope_guard
+from .sandbox import clear_workspace
 
 
 class SessionLifecycleStore(Protocol):
@@ -28,25 +29,24 @@ class AgentSessionLifecycle:
         session: AgentSession,
         store: SessionLifecycleStore,
         effect_store: ConfirmationEffectPlanStore,
-        clear_provider_state: Callable[..., Any],
-        clear_domain_state: Callable[..., Any],
+        clear_legacy_plans: Callable[..., Any],
     ) -> None:
         self.session = session
         self.store = store
         self.effect_store = effect_store
-        self.clear_provider_state = clear_provider_state
-        self.clear_domain_state = clear_domain_state
+        self.clear_legacy_plans = clear_legacy_plans
 
     async def _invalidate(self, *, owner: str, session_id: str) -> None:
+        await guarded_state_call(owner, session_id, partial(
+            clear_workspace, owner=owner, session_id=session_id,
+        ))
         await guarded_state_call(owner, session_id, partial(
             self.effect_store.revoke_session, owner=owner, session_id=session_id,
         ))
         await guarded_state_call(owner, session_id, partial(
-            self.clear_provider_state, owner=owner, session_id=session_id,
+            self.clear_legacy_plans, owner=owner, session_id=session_id,
         ))
-        await guarded_state_call(owner, session_id, partial(
-            self.clear_domain_state, owner=owner, session_id=session_id,
-        ))
+
 
     async def _change[T](
         self, change: Callable[..., Awaitable[T]], owner: str, session_id: str,

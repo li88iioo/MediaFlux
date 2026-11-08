@@ -2,7 +2,6 @@
 from app.agent.kernel.model import ModelAdapter
 from app.agent.kernel.provider_model import OpenAICompatibleModelAdapter
 from typing import cast
-import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -12,7 +11,7 @@ from app import config, database as db
 from app.agent import feature_gate
 from app.agent.kernel import bootstrap
 from tests import test_agent_generation_profiles as profiles
-from tests import test_first_run as support
+from tests.test_setup_bootstrap_support import first_run_case
 
 local_config = profiles.local_config
 
@@ -68,49 +67,44 @@ def test_publisher_does_not_recreate_missing_database(local_config):
 
 @pytest.mark.parametrize('state', ['missing-db', 'corrupt-db', 'missing-config', 'corrupt-config', 'stable', 'changing'])
 def test_actual_lifespan_storage_authorization(state):
-    with patch.dict(os.environ):
-        case = support.FirstRunTests()
-        case.setUp()
-        try:
-            case.paths.ensure_writable_dirs()
-            case.paths.env_file.write_text('MEDIAFLUX_INITIALIZED=1\nENV_WEB_PASSPORT=admin\nENV_WEB_PASSWORD=synthetic-password\nWEB_SECRET_KEY=synthetic-secret\n')
+    with first_run_case() as case:
+        case.paths.ensure_writable_dirs()
+        case.paths.env_file.write_text('MEDIAFLUX_INITIALIZED=1\nENV_WEB_PASSPORT=admin\nENV_WEB_PASSWORD=synthetic-password\nWEB_SECRET_KEY=synthetic-secret\n')
+        case._reload_runtime_modules()
+        before = None
+        if state == 'corrupt-db':
+            case.paths.database_path.write_bytes(b'not sqlite')
+        elif state != 'missing-db':
+            case.database.init_db()
+            before = feature_gate.initialize_runtime_fence()
+            if state == 'changing':
+                with db.get_conn() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    assert before is not None
+                    before = feature_gate.begin_runtime_change(conn, before)
+            if state == 'missing-config':
+                case.paths.env_file.unlink()
+            elif state == 'corrupt-config':
+                case.paths.env_file.write_bytes(b'\xff')
             case._reload_runtime_modules()
-            before = None
-            if state == 'corrupt-db':
-                case.paths.database_path.write_bytes(b'not sqlite')
-            elif state != 'missing-db':
-                case.database.init_db()
-                before = feature_gate.initialize_runtime_fence()
-                if state == 'changing':
-                    with db.get_conn() as conn:
-                        conn.execute('BEGIN IMMEDIATE')
-                        assert before is not None
-                        before = feature_gate.begin_runtime_change(conn, before)
-                if state == 'missing-config':
-                    case.paths.env_file.unlink()
-                elif state == 'corrupt-config':
-                    case.paths.env_file.write_bytes(b'\xff')
-                case._reload_runtime_modules()
-            env_before = case.paths.env_file.read_bytes() if case.paths.env_file.exists() else None
-            if state == 'missing-db':
-                # 已有管理员配置却丢失DB，不能作为可提交的全新安装开放。
-                with pytest.raises(RuntimeError):
-                    case._new_client()
-                assert not case.paths.database_path.exists()
-            elif state == 'stable':
+        env_before = case.paths.env_file.read_bytes() if case.paths.env_file.exists() else None
+        if state == 'missing-db':
+            # 已有管理员配置却丢失DB，不能作为可提交的全新安装开放。
+            with pytest.raises(RuntimeError):
+                case._new_client()
+            assert not case.paths.database_path.exists()
+        elif state == 'stable':
+            with case._new_client():
+                with db.get_conn() as conn:
+                    assert feature_gate.read_runtime_fence(conn) == before
+        else:
+            with pytest.raises((RuntimeError, sqlite3.DatabaseError, UnicodeError, ValueError)):
                 with case._new_client():
-                    with db.get_conn() as conn:
-                        assert feature_gate.read_runtime_fence(conn) == before
-            else:
-                with pytest.raises((RuntimeError, sqlite3.DatabaseError, UnicodeError, ValueError)):
-                    with case._new_client():
-                        pass
-                if state == 'changing':
-                    with db.get_conn() as conn:
-                        assert feature_gate.read_runtime_fence(conn) == before
-                before = None
-            if state == 'corrupt-db':
-                    assert case.paths.database_path.read_bytes() == b'not sqlite'
-            assert (case.paths.env_file.read_bytes() if case.paths.env_file.exists() else None) == env_before
-        finally:
-            case.tearDown()
+                    pass
+            if state == 'changing':
+                with db.get_conn() as conn:
+                    assert feature_gate.read_runtime_fence(conn) == before
+            before = None
+        if state == 'corrupt-db':
+                assert case.paths.database_path.read_bytes() == b'not sqlite'
+        assert (case.paths.env_file.read_bytes() if case.paths.env_file.exists() else None) == env_before

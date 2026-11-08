@@ -5,13 +5,12 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-from app.agent.domains.workspace.next_actions import (
-    resolve_workspace_action_handoff,
-    summarize_workspace_next_actions,
-    workspace_action_handoff_arguments,
-)
 from app.agent.errors import AgentToolError
-from app.agent.models import Evidence, ToolResult
+from app.modules.workspace import (
+    action_handoff_arguments,
+    next_actions,
+    resolve_action_handoff,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 _ACTION_KEYS = {
@@ -31,16 +30,22 @@ _ACTION_KEYS = {
 }
 
 
-def _todo(*, ok=True, status="attention", areas=None, **data) -> ToolResult:
-    return ToolResult(
-        ok=ok,
-        status=status,
-        summary="PRIVATE CHILD SUMMARY",
-        data={"areas": list(areas or []), **data},
-        evidence=[Evidence("PRIVATE", "https://private.example/token", "2026-08-05")],
-        suggestions=["PRIVATE CHILD SUGGESTION"],
-        error="PRIVATE CHILD ERROR",
-    )
+def _todo(*, ok=True, status="attention", areas=None, **data) -> dict:
+    return {
+        "ok": ok,
+        "status": status,
+        "summary": "PRIVATE CHILD SUMMARY",
+        "data": {"areas": list(areas or []), **data},
+        "evidence": [
+            {
+                "source": "PRIVATE",
+                "description": "https://private.example/token",
+                "collected_at": "2026-08-05",
+            }
+        ],
+        "suggestions": ["PRIVATE CHILD SUGGESTION"],
+        "error": "PRIVATE CHILD ERROR",
+    }
 
 
 def _area(source: str, reason: str, count: object = 1, **extra):
@@ -60,43 +65,59 @@ def _area(source: str, reason: str, count: object = 1, **extra):
 
 class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
     def test_empty_local_snapshot_keeps_health_scope_in_model_dto_without_probing(self):
-        from app.agent.domains.workspace.todo_actions import (
-            WORKSPACE_BACKLOG_SCOPE,
-            summarize_workspace_todo,
-        )
-        from app.agent.kernel.projection import DefaultProjector
+        from app.modules.workspace import WORKSPACE_BACKLOG_SCOPE, _backlog
 
-        with patch("app.agent.domains.workspace.health_actions.diagnose_media_servers") as probe:
-            results = (summarize_workspace_todo({}), summarize_workspace_next_actions({}))
+        with patch("app.modules.workspace.connection") as probe:
+            results = (_backlog(), next_actions())
         probe.assert_not_called()
         for result in results:
-            with self.subTest(tool=result.data.get("source_tool", "workspace.todo")):
-                self.assertEqual(result.status, "empty")
-                self.assertEqual(result.data["scope"], WORKSPACE_BACKLOG_SCOPE)
-                self.assertFalse(result.data["network_accessed"])
-                self.assertEqual(result.data["attention_total"], 0)
-                self.assertIn("本地任务记录", result.summary)
-                projected = DefaultProjector().project(result)
-                self.assertEqual(json.loads(projected.model_content)["data"]["scope"], WORKSPACE_BACKLOG_SCOPE)
-        self.assertEqual(results[1].data["actions"], [])
-        self.assertEqual(results[1].suggestions, [])
+            with self.subTest(
+                tool=result["data"].get("source_tool", "diagnostics.overview")
+            ):
+                self.assertEqual(result["status"], "empty")
+                self.assertEqual(result["data"]["scope"], WORKSPACE_BACKLOG_SCOPE)
+                self.assertFalse(result["data"]["network_accessed"])
+                self.assertEqual(result["data"]["attention_total"], 0)
+                self.assertIn("本地任务记录", result["summary"])
+                self.assertEqual(
+                    json.loads(json.dumps(result))["data"]["scope"],
+                    WORKSPACE_BACKLOG_SCOPE,
+                )
+        self.assertEqual(results[1]["data"]["actions"], [])
+        self.assertEqual(results[1]["suggestions"], [])
 
     def test_scope_is_fixed_even_when_child_contains_a_broader_claim(self):
-        from app.agent.domains.workspace.todo_actions import WORKSPACE_BACKLOG_SCOPE
+        from app.modules.workspace import WORKSPACE_BACKLOG_SCOPE
 
-        for status in ("attention", "active", "waiting", "empty", "partial", "unavailable"):
-            with self.subTest(status=status), patch(
-                "app.agent.domains.workspace.next_actions.summarize_workspace_todo",
-                return_value=_todo(status=status, ok=status != "unavailable", scope="PRIVATE: 所有模块正常"),
+        for status in (
+            "attention",
+            "active",
+            "waiting",
+            "empty",
+            "partial",
+            "unavailable",
+        ):
+            with (
+                self.subTest(status=status),
+                patch(
+                    "app.modules.workspace._backlog",
+                    return_value=_todo(
+                        status=status,
+                        ok=status != "unavailable",
+                        scope="PRIVATE: 所有模块正常",
+                    ),
+                ),
             ):
-                result = summarize_workspace_next_actions({})
-            self.assertEqual(result.status, "empty" if status == "attention" else status)
-            self.assertEqual(result.data["scope"], WORKSPACE_BACKLOG_SCOPE)
-            self.assertNotIn("PRIVATE", json.dumps(result.to_dict(), ensure_ascii=False))
+                result = next_actions()
+            self.assertEqual(
+                result["status"], "empty" if status == "attention" else status
+            )
+            self.assertEqual(result["data"]["scope"], WORKSPACE_BACKLOG_SCOPE)
+            self.assertNotIn("PRIVATE", json.dumps(result, ensure_ascii=False))
 
     def test_handoff_arguments_and_fresh_resolution_are_strict(self):
         self.assertEqual(
-            workspace_action_handoff_arguments({"action_key": " review_rss "}),
+            action_handoff_arguments({"action_key": " review_rss "}),
             {"action_key": "review_rss"},
         )
         for invalid in (
@@ -106,42 +127,52 @@ class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
             {"action_key": "rss.retry_failed"},
         ):
             with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
-                workspace_action_handoff_arguments(invalid)
-        fresh = ToolResult(
-            True,
-            "attention",
-            "有 1 个下一步",
-            data={"actions": [{"action_key": "review_rss", "target_tool": "PRIVATE"}]},
-        )
+                action_handoff_arguments(invalid)
+        fresh = {
+            "ok": True,
+            "status": "attention",
+            "summary": "有 1 个下一步",
+            "data": {
+                "actions": [{"action_key": "review_rss", "target_tool": "PRIVATE"}]
+            },
+        }
         with patch(
-            "app.agent.domains.workspace.next_actions.summarize_workspace_next_actions",
-            return_value=fresh,
+            "app.modules.workspace.next_actions", return_value=fresh
         ) as summarize:
-            resolved = resolve_workspace_action_handoff({"action_key": "review_rss"})
-        summarize.assert_called_once_with({})
+            resolved = resolve_action_handoff({"action_key": "review_rss"})
+        summarize.assert_called_once_with()
         self.assertEqual(
             resolved,
             {
                 "action_key": "review_rss",
                 "label": "检查 RSS 订阅",
-                "target_tool": "rss.diagnose",
-                "arguments": {},
+                "target_tool": "agent.run_code",
+                "arguments": {
+                    "code": "import json\nfrom mf import rss\nprint(json.dumps(rss.diagnose(), ensure_ascii=False))"
+                },
             },
         )
 
     def test_handoff_rejects_stale_or_unavailable_snapshot(self):
-        stale = ToolResult(True, "empty", "没有下一步", data={"actions": []})
-        unavailable = ToolResult(False, "unavailable", "不可用", data={"actions": []})
+        stale = {
+            "ok": True,
+            "status": "empty",
+            "summary": "没有下一步",
+            "data": {"actions": []},
+        }
+        unavailable = {
+            "ok": False,
+            "status": "unavailable",
+            "summary": "不可用",
+            "data": {"actions": []},
+        }
         for snapshot in (stale, unavailable):
             with (
-                self.subTest(status=snapshot.status),
-                patch(
-                    "app.agent.domains.workspace.next_actions.summarize_workspace_next_actions",
-                    return_value=snapshot,
-                ),
+                self.subTest(status=snapshot["status"]),
+                patch("app.modules.workspace.next_actions", return_value=snapshot),
                 self.assertRaises(AgentToolError) as captured,
             ):
-                resolve_workspace_action_handoff({"action_key": "review_downloads"})
+                resolve_action_handoff({"action_key": "review_downloads"})
             self.assertEqual(captured.exception.code, "precondition_failed")
 
     def test_projection_is_allowlisted_deduplicated_and_stably_ordered(self):
@@ -164,15 +195,12 @@ class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
             unavailable_areas=["unknown", "rss", "downloads", "rss"],
             token="PRIVATE-DATA",
         )
-        with patch(
-            "app.agent.domains.workspace.next_actions.summarize_workspace_todo",
-            return_value=child,
-        ) as summarize:
-            result = summarize_workspace_next_actions({})
-        summarize.assert_called_once_with({})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "attention")
-        actions = result.data["actions"]
+        with patch("app.modules.workspace._backlog", return_value=child) as summarize:
+            result = next_actions()
+        summarize.assert_called_once_with()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "attention")
+        actions = result["data"]["actions"]
         self.assertEqual(
             [item["source"] for item in actions],
             [
@@ -186,16 +214,17 @@ class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
             ],
         )
         self.assertEqual(actions[1]["attention_count"], 3)
+        self.assertEqual(actions[-1]["target_tool"], "agent.run_code")
         for action in actions:
             self.assertEqual(set(action), _ACTION_KEYS)
             self.assertEqual(action["risk"], "read")
             self.assertFalse(action["requires_confirmation"])
             self.assertEqual(action["status"], "attention")
             self.assertNotIn("PRIVATE_REASON", action["reason_codes"])
-        self.assertEqual(result.data["unavailable_areas"], ["downloads", "rss"])
-        self.assertFalse(result.data["network_accessed"])
-        self.assertFalse(result.data["filesystem_accessed"])
-        payload = json.dumps(result.to_dict(), ensure_ascii=False)
+        self.assertEqual(result["data"]["unavailable_areas"], ["downloads", "rss"])
+        self.assertFalse(result["data"]["network_accessed"])
+        self.assertFalse(result["data"]["filesystem_accessed"])
+        payload = json.dumps(result, ensure_ascii=False)
         for secret in (
             "PRIVATE-TITLE",
             "/private/path",
@@ -218,48 +247,46 @@ class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
             _area("local_media", "local_media_failed", 3, status="active"),
         ]
         with patch(
-            "app.agent.domains.workspace.next_actions.summarize_workspace_todo",
+            "app.modules.workspace._backlog",
             return_value=_todo(status="empty", areas=areas),
         ):
-            result = summarize_workspace_next_actions({})
-        self.assertEqual(result.status, "empty")
-        self.assertEqual(result.data["actions"], [])
+            result = next_actions()
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["data"]["actions"], [])
 
     def test_partial_and_unavailable_results_do_not_leak_child_errors(self):
         with patch(
-            "app.agent.domains.workspace.next_actions.summarize_workspace_todo",
+            "app.modules.workspace._backlog",
             return_value=_todo(
                 status="partial",
                 areas=[_area("downloads", "download_needs_review")],
                 unavailable_areas=["rss", "PRIVATE-SOURCE"],
             ),
         ):
-            partial = summarize_workspace_next_actions({})
-        self.assertTrue(partial.ok)
-        self.assertEqual(partial.status, "partial")
-        self.assertEqual(partial.data["unavailable_areas"], ["rss"])
-        self.assertEqual(len(partial.data["actions"]), 1)
+            partial = next_actions()
+        self.assertTrue(partial["ok"])
+        self.assertEqual(partial["status"], "partial")
+        self.assertEqual(partial["data"]["unavailable_areas"], ["rss"])
+        self.assertEqual(len(partial["data"]["actions"]), 1)
         with patch(
-            "app.agent.domains.workspace.next_actions.summarize_workspace_todo",
+            "app.modules.workspace._backlog",
             return_value=_todo(ok=False, status="unavailable", areas=[]),
         ):
-            unavailable = summarize_workspace_next_actions({})
-        self.assertFalse(unavailable.ok)
-        self.assertEqual(unavailable.status, "unavailable")
-        self.assertNotIn(
-            "PRIVATE", json.dumps(unavailable.to_dict(), ensure_ascii=False)
-        )
+            unavailable = next_actions()
+        self.assertFalse(unavailable["ok"])
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertNotIn("PRIVATE", json.dumps(unavailable, ensure_ascii=False))
 
     def test_active_waiting_and_empty_have_no_action_cards(self):
         for status in ("active", "waiting", "empty"):
             with (
                 self.subTest(status=status),
                 patch(
-                    "app.agent.domains.workspace.next_actions.summarize_workspace_todo",
+                    "app.modules.workspace._backlog",
                     return_value=_todo(status=status, areas=[]),
                 ),
             ):
-                result = summarize_workspace_next_actions({})
-                self.assertTrue(result.ok)
-                self.assertEqual(result.status, status)
-                self.assertEqual(result.data["actions"], [])
+                result = next_actions()
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["data"]["actions"], [])

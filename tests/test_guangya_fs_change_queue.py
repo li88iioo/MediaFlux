@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from app.modules.process_lock import CrossProcessLock
 from threading import Thread
+from copy import deepcopy
+from functools import partial
+from dataclasses import asdict
 
 from typing import cast
 from collections.abc import Callable
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, GuangYaFile
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import sqlite3
 import tempfile
 import threading
@@ -20,7 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from app import database, database_migrations
-from app.agent.domains.guangya.runtime import guangya_organize_status
+from app.modules.organize_tasks import get_organize_operation_status
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.models import ToolContext, ToolResult
 from app.modules import guangya_fs_change
@@ -34,6 +40,7 @@ from app.repositories.organize_operation_jobs import (
     get_organize_operation_job,
     organize_operation_owner_digest,
     organize_operation_public_ref,
+    request_cancel_organize_operation_job,
     sanitize_organize_operation_result,
     verify_organize_operation_payload,
 )
@@ -143,6 +150,7 @@ class GuangYaFSChangeQueueTests(unittest.TestCase):
 
 class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
+        self.enterContext(mock.patch("socket.socket.connect", side_effect=AssertionError("禁止外联")))
         with database.get_conn() as conn:
             conn.execute("DELETE FROM organize_operation_jobs")
         self.temp = tempfile.TemporaryDirectory()
@@ -162,6 +170,446 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
         for patcher in reversed(self.patches):
             patcher.stop()
         self.temp.cleanup()
+
+    def _file_id_plan(self, client=None, operations=None):
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        client = client or FakeGatewayClient()
+        plan = guangya_fs_change.build_fs_change_plan(
+            cast(GuangYaClient, client),
+            owner="queue-owner",
+            trigger_strm=False,
+            operations=operations
+            or [{"op": "rename", "file_id": "rename", "new_name": "New.mp4"}],
+        )
+        return client, plan
+
+    def _submit_shared(self, plan, **kwargs):
+        manager = OrganizeTaskManager()
+        manager._worker = cast(Thread, object())
+        with (
+            mock.patch(
+                "app.modules.organize_tasks.get_organize_manager", return_value=manager
+            ),
+            mock.patch.object(manager, "_ensure_operation_dispatcher"),
+        ):
+            return guangya_fs_change.submit_fs_change_plan(
+                plan["plan_id"],
+                owner="queue-owner",
+                expected_fingerprint=plan["fingerprint"],
+                **kwargs,
+            )
+
+    def test_file_id_preflight_is_readonly_and_returns_every_frozen_target(self):
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        client = FakeGatewayClient()
+        operations = [
+            {"op": "rename", "file_id": "rename", "new_name": "New.mp4"},
+            {"op": "move", "file_id": "move", "target_path": "/target"},
+            {"op": "trash", "file_id": "trash"},
+        ]
+        for index in range(8):
+            file_id = f"Copy.Mixed-{index}"
+            client.directories["source"].append(
+                GuangYaFile(
+                    file_id,
+                    f"Copy-{index}.mp4",
+                    False,
+                    parent_id="source",
+                    size=12,
+                    etag=file_id,
+                )
+            )
+            operations.append(
+                {"op": "copy", "file_id": file_id, "target_path": "/target"}
+            )
+        original_operations, original_files = (
+            deepcopy(operations),
+            deepcopy(client.directories),
+        )
+        self.assertFalse(hasattr(guangya_fs_change, "capture_observation_source"))
+        _, plan = self._file_id_plan(client, operations)
+        self.assertEqual(client.directories, original_files)
+        self.assertEqual(operations, original_operations)
+        self.assertEqual(
+            (plan["stats"]["total"], len(plan["operations"]), len(plan["samples"])),
+            (11, 11, 6),
+        )
+        self.assertEqual(
+            {item["source"]["file_id"] for item in plan["operations"]},
+            {item["file_id"] for item in operations},
+        )
+        for item in plan["operations"]:
+            self.assertNotIn("object_ref", item)
+            self.assertTrue(item["source_path"].startswith("/source/"))
+            if item["op"] in {"move", "copy"}:
+                self.assertEqual(
+                    (item["target_id"], item["target_path"]), ("target", "/target")
+                )
+        self.assertNotIn("observation_ref", plan)
+        self.assertNotIn("observation_source", plan)
+        json.dumps(plan, allow_nan=False)
+
+    def test_file_id_preflight_rejects_missing_root_and_ambiguous_parameters(self):
+        for operation in (
+            {"op": "trash", "file_id": "missing"},
+            {"op": "trash", "file_id": "0"},
+            {"op": "trash", "file_id": True},
+            {"op": "trash", "file_id": "trash", "permanent": True},
+            {"op": "rename", "file_id": "rename", "new_name": "New.txt"},
+        ):
+            with (
+                self.subTest(operation=operation),
+                self.assertRaises(guangya_fs_change.GuangYaFSChangeError),
+            ):
+                self._file_id_plan(operations=[operation])
+        self.assertFalse(self.plan_dir.exists())
+
+    def test_shared_submission_reuses_job_and_preserves_admission_transaction(self):
+        _, plan = self._file_id_plan()
+        admitted = mock.Mock()
+        first = self._submit_shared(plan, on_admitted=admitted)
+        second = self._submit_shared(plan, on_admitted=admitted)
+        self.assertEqual(
+            (first["status"], first["queued"], first["replayed"]),
+            ("pending", True, False),
+        )
+        self.assertEqual(
+            (second["task_id"], second["replayed"]), (first["task_id"], True)
+        )
+        self.assertEqual(second["expires_at"], first["expires_at"])
+        self.assertEqual(
+            [call.args[2] for call in admitted.call_args_list], [False, True]
+        )
+        row = get_organize_operation_job(first["task_id"])
+        assert row is not None
+        self.assertEqual(row["job_kind"], "agent_guangya_fs_change")
+        self.assertTrue(verify_organize_operation_payload(row))
+        self.assertEqual(
+            guangya_fs_change._read(plan["plan_id"])["job_id"], row["job_id"]
+        )
+        self.assertEqual(count_pending_organize_operation_jobs(), 1)
+        for owner, fingerprint in (
+            ("another-owner", plan["fingerprint"]),
+            ("queue-owner", "0" * 64),
+            ("queue-owner", ""),
+        ):
+            with (
+                self.subTest(owner=owner, fingerprint=fingerprint),
+                self.assertRaises(guangya_fs_change.GuangYaFSChangeError),
+            ):
+                guangya_fs_change.submit_fs_change_plan(
+                    plan["plan_id"], owner=owner, expected_fingerprint=fingerprint
+                )
+
+    def test_shared_submission_denied_admission_rolls_back_before_binding(self):
+        _, plan = self._file_id_plan()
+        from app.repositories.organize_operation_jobs import (
+            OrganizeOperationAdmissionError,
+        )
+
+        with self.assertRaises(OrganizeOperationAdmissionError):
+            self._submit_shared(
+                plan, on_admitted=mock.Mock(side_effect=PermissionError("denied"))
+            )
+        self.assertEqual(count_pending_organize_operation_jobs(), 0)
+        self.assertNotIn("job_id", guangya_fs_change._read(plan["plan_id"]))
+        self.assertTrue(self._submit_shared(plan)["ok"])
+
+    def test_shared_submission_recovers_commit_before_local_claim_failure(self):
+        _, plan = self._file_id_plan()
+        manager = OrganizeTaskManager()
+        manager._lock = cast(CrossProcessLock, threading.Lock())
+        with (
+            mock.patch(
+                "app.modules.organize_tasks.get_organize_manager", return_value=manager
+            ),
+            mock.patch(
+                "app.modules.organize_tasks.claim_organize_operation_job",
+                side_effect=RuntimeError("claim failed"),
+            ),
+        ):
+            task = guangya_fs_change.submit_fs_change_plan(
+                plan["plan_id"],
+                owner="queue-owner",
+                expected_fingerprint=plan["fingerprint"],
+            )
+        self.assertEqual(
+            (task["status"], task["queued"], task["replayed"]), ("pending", True, True)
+        )
+        self.assertEqual(self._submit_shared(plan)["task_id"], task["task_id"])
+        self.assertEqual(count_pending_organize_operation_jobs(), 1)
+
+    def test_shared_submission_dispatch_failure_is_not_reported_as_accepted(self):
+        _, plan = self._file_id_plan()
+        manager = OrganizeTaskManager()
+        manager._worker = cast(Thread, object())
+        with (
+            mock.patch(
+                "app.modules.organize_tasks.get_organize_manager", return_value=manager
+            ),
+            mock.patch.object(
+                manager,
+                "_ensure_operation_dispatcher",
+                side_effect=RuntimeError("dispatcher failed"),
+            ),
+            self.assertRaises(guangya_fs_change.GuangYaFSChangeError),
+        ):
+            guangya_fs_change.submit_fs_change_plan(
+                plan["plan_id"],
+                owner="queue-owner",
+                expected_fingerprint=plan["fingerprint"],
+            )
+        persisted = guangya_fs_change._read(plan["plan_id"])
+        self.assertEqual(persisted["status"], "failed")
+        job = get_organize_operation_job(persisted["job_id"])
+        assert job is not None
+        self.assertEqual(job["status"], "failed")
+
+    def test_cancelled_shared_task_is_not_resubmitted(self):
+        _, plan = self._file_id_plan()
+        task = self._submit_shared(plan)
+        row, outcome = request_cancel_organize_operation_job(
+            task["task_id"], owner="queue-owner", expected_lease_generation=0
+        )
+        assert row is not None
+        self.assertEqual(outcome, "cancelled")
+        self.assertEqual(row["status"], "cancelled")
+        with mock.patch(
+            "app.modules.organize_tasks.get_organize_manager",
+            side_effect=AssertionError("终态不再入队"),
+        ):
+            repeated = guangya_fs_change.submit_fs_change_plan(
+                plan["plan_id"],
+                owner="queue-owner",
+                expected_fingerprint=plan["fingerprint"],
+            )
+        self.assertEqual(
+            (repeated["task_id"], repeated["status"], repeated["replayed"]),
+            (task["task_id"], "cancelled", True),
+        )
+
+    def test_expired_shared_task_does_not_create_or_extend_another_job(self):
+        _, plan = self._file_id_plan()
+        task = self._submit_shared(plan)
+        with (
+            mock.patch.object(
+                guangya_fs_change.time, "time", return_value=task["expires_at"] + 1
+            ),
+            mock.patch(
+                "app.modules.organize_tasks.get_organize_manager",
+                side_effect=AssertionError("过期不重新入队"),
+            ),
+        ):
+            expired = guangya_fs_change.submit_fs_change_plan(
+                plan["plan_id"],
+                owner="queue-owner",
+                expected_fingerprint=plan["fingerprint"],
+            )
+        row = get_organize_operation_job(task["task_id"])
+        assert row is not None
+        self.assertEqual(
+            (expired["task_id"], expired["status"]), (task["task_id"], "cancelled")
+        )
+        self.assertEqual(row["status"], "cancelled")
+        self.assertEqual(row["expires_at"], task["expires_at"])
+        self.assertEqual(count_pending_organize_operation_jobs(), 0)
+        with database.get_conn() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM organize_operation_jobs").fetchone()[
+                    0
+                ],
+                1,
+            )
+
+    def test_real_id_plan_runs_through_common_worker_and_returns_same_terminal_job(
+        self,
+    ):
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        client = FakeGatewayClient()
+        client.directories["source"].append(
+            GuangYaFile(
+                "Copy.ID", "Copy.mp4", False, parent_id="source", size=12, etag="copy"
+            )
+        )
+        _, plan = self._file_id_plan(
+            client,
+            [
+                {"op": "rename", "file_id": "rename", "new_name": "New.mp4"},
+                {"op": "move", "file_id": "move", "target_path": "/target"},
+                {"op": "copy", "file_id": "Copy.ID", "target_path": "/target"},
+                {"op": "trash", "file_id": "trash"},
+                {"op": "create_directory", "parent_path": "/target", "name": "New"},
+            ],
+        )
+        task = self._submit_shared(plan)
+        claimed = claim_organize_operation_job(task["task_id"])
+        assert claimed is not None
+        execute = partial(
+            guangya_fs_change.execute_fs_change_plan,
+            client_factory=lambda: cast(GuangYaClient, client),
+        )
+        with (
+            mock.patch.object(guangya_fs_change, "execute_fs_change_plan", execute),
+            mock.patch.object(client, "delete", wraps=client.delete) as recycle,
+        ):
+            result = OrganizeTaskManager._execute_durable_operation(dict(claimed))
+        assert isinstance(result, dict)
+        self.assertEqual(
+            {
+                key: result["stats"][key]
+                for key in ("renamed", "moved", "copied", "trashed", "created")
+            },
+            {"renamed": 1, "moved": 1, "copied": 1, "trashed": 1, "created": 1},
+        )
+        self.assertFalse(result["partial"])
+        recycle.assert_called_once_with(["trash"])
+        self.assertTrue(
+            finish_organize_operation_job(
+                task["task_id"],
+                expected_lease_generation=claimed["lease_generation"],
+                status="completed",
+                result=result,
+            )
+        )
+        with mock.patch(
+            "app.modules.organize_tasks.get_organize_manager",
+            side_effect=AssertionError("终态不再入队"),
+        ):
+            repeated = guangya_fs_change.submit_fs_change_plan(
+                plan["plan_id"],
+                owner="queue-owner",
+                expected_fingerprint=plan["fingerprint"],
+            )
+        self.assertEqual(
+            (repeated["task_id"], repeated["status"], repeated["replayed"]),
+            (task["task_id"], "completed", True),
+        )
+
+    def test_cold_process_restores_complete_signed_plan_and_original_queue_payload(
+        self,
+    ):
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        client = FakeGatewayClient()
+        operations = [
+            {"op": "move", "file_id": "move", "target_path": "/target"},
+            {"op": "copy", "file_id": "rename", "target_path": "/target"},
+            {"op": "trash", "file_id": "trash"},
+        ]
+        for index in range(7):
+            file_id = f"cold-{index}"
+            client.directories["source"].append(
+                GuangYaFile(
+                    file_id,
+                    f"Old-{index}.mp4",
+                    False,
+                    parent_id="source",
+                    size=12,
+                    etag=file_id,
+                )
+            )
+            operations.append(
+                {"op": "rename", "file_id": file_id, "new_name": f"New-{index}.mp4"}
+            )
+        _, plan = self._file_id_plan(client, operations)
+        task = self._submit_shared(plan)
+        state_path = Path(self.temp.name) / "fake-cloud.json"
+        from app.repositories import agent_jobs, organize_operation_jobs as jobs
+
+        state_path.write_text(
+            json.dumps(
+                {
+                    "directories": {
+                        key: [asdict(item) for item in items]
+                        for key, items in client.directories.items()
+                    },
+                    "plan_secret": guangya_fs_change.get_web_secret(),
+                    "queue_secret": jobs.get_web_secret(),
+                    "owner_secret": agent_jobs.get_web_secret(),
+                }
+            )
+        )
+        script = r"""
+import tests
+import json, os, socket, sys
+from functools import partial
+from pathlib import Path
+from unittest.mock import patch
+def deny(*args, **kwargs):
+    raise AssertionError("cold restart forbids network")
+for method in ("connect", "connect_ex", "sendto"):
+    setattr(socket.socket, method, deny)
+from app import database
+database.configure_database(sys.argv[1], test_mode=True)
+database.init_db()
+from app.clients.guangya import GuangYaFile
+from app.modules import guangya_fs_change as fs
+from app.modules.organize_tasks import OrganizeTaskManager
+from app.repositories import agent_jobs, organize_operation_jobs as jobs
+from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+state = json.loads(Path(sys.argv[6]).read_text())
+fs._directory = lambda: Path(sys.argv[2])
+fs.get_web_secret = lambda: state["plan_secret"]
+jobs.get_web_secret = lambda: state["queue_secret"]
+agent_jobs.get_web_secret = lambda: state["owner_secret"]
+plan = fs.load_fs_change_plan(sys.argv[3], owner="queue-owner", expected_fingerprint=sys.argv[4])
+assert "observation_ref" not in plan and "observation_source" not in plan
+row = jobs.get_organize_operation_job(sys.argv[5])
+assert row["job_id"] == plan["job_id"] and jobs.verify_organize_operation_payload(row)
+client = FakeGatewayClient()
+client.directories = {key: [GuangYaFile(**item) for item in items] for key, items in state["directories"].items()}
+claimed = jobs.claim_organize_operation_job(row["job_id"])
+execute = partial(fs.execute_fs_change_plan, client_factory=lambda: client)
+with patch.object(fs, "execute_fs_change_plan", execute):
+    result = OrganizeTaskManager._execute_durable_operation(dict(claimed))
+assert jobs.finish_organize_operation_job(row["job_id"], expected_lease_generation=claimed["lease_generation"], status="completed", result=result)
+print(json.dumps({"pid": os.getpid(), "job_id": row["job_id"], "stats": result["stats"],
+                  "ids": [item["source"]["file_id"] for item in plan["operations"]],
+                  "names": [item.name for item in client.directories["source"]],
+                  "target_ids": [item["target_id"] for item in plan["operations"] if "target_id" in item]}))
+"""
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.test_db_path),
+                str(self.plan_dir),
+                plan["plan_id"],
+                plan["fingerprint"],
+                task["task_id"],
+                str(state_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(child.returncode, 0, child.stderr)
+        restored = json.loads(child.stdout)
+        self.assertNotEqual(restored["pid"], os.getpid())
+        self.assertEqual(restored["job_id"], task["task_id"])
+        self.assertEqual(set(restored["ids"]), {item["file_id"] for item in operations})
+        self.assertEqual((restored["stats"]["total"], len(plan["samples"])), (10, 6))
+        self.assertEqual(
+            (
+                restored["stats"]["renamed"],
+                restored["stats"]["copied"],
+                restored["stats"]["moved"],
+                restored["stats"]["trashed"],
+            ),
+            (7, 1, 1, 1),
+        )
+        self.assertEqual(restored["target_ids"], ["target", "target"])
+        self.assertTrue(
+            {f"New-{index}.mp4" for index in range(7)}.issubset(restored["names"])
+        )
+        repeated = self._submit_shared(plan)
+        self.assertEqual(
+            (repeated["task_id"], repeated["status"]), (task["task_id"], "completed")
+        )
 
     def _confirmed_plan(self, plan_id: str = "1" * 32) -> dict:
         current = time.time()
@@ -205,19 +653,15 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
         )
 
     def test_waiting_copy_releases_worker_and_resumes_same_plan_without_recopy(self):
-        from app.modules import guangya_workspace as workspace
         from app.repositories.organize_operation_jobs import CLOUD_COPY_PENDING_CODE
         from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
 
         for source_id in ("trash", "move"):
             with self.subTest(object_type="directory" if source_id == "trash" else "file"):
                 client = FakeGatewayClient()
-                with mock.patch.object(workspace, "_directory", return_value=Path(self.temp.name) / "observations"):
-                    observation = workspace.create_directory_observation(cast(GuangYaClient, client), owner="queue-owner", session_id="session", path="/", recursive=True)
-                    refs = {row["file_id"]: row["handle"] for row in observation["entries"]}
-                    plan = guangya_fs_change.build_fs_change_plan(cast(GuangYaClient, client), owner="queue-owner", observation=observation,
-                        operations=[{"op": "copy", "object_ref": refs[source_id], "target_path": "/target"},
-                                    {"op": "move", "object_ref": refs["source"], "target_path": "/target"}], trigger_strm=False)
+                plan = guangya_fs_change.build_fs_change_plan(cast(GuangYaClient, client), owner="queue-owner",
+                    operations=[{"op": "copy", "file_id": source_id, "target_path": "/target"},
+                                {"op": "move", "file_id": "source", "target_path": "/target"}], trigger_strm=False)
                 guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="queue-owner", expected_fingerprint=plan["fingerprint"])
                 queued, _ = self._enqueue(plan)
                 job_id = queued["job_id"]
@@ -404,7 +848,7 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 mock.patch("app.modules.organize_tasks.get_organize_manager", return_value=current),
                 mock.patch.object(current, "status", return_value={}),
             ):
-                public = guangya_organize_status({"operation_ref": public_ref}, context)
+                public = ToolResult(**get_organize_operation_status(public_ref, owner=context.owner))
                 self.assertEqual(public.data["task"]["status"], "running")
                 self.assertEqual(public.data["task"]["stats"], {})
 
@@ -460,9 +904,9 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 mock.patch.object(current, "status", return_value={}),
             ):
                 raw = current.task_result(public_ref, owner=context.owner)
-                public = guangya_organize_status({"operation_ref": public_ref}, context)
+                public = ToolResult(**get_organize_operation_status(public_ref, owner=context.owner))
                 receipt = asyncio.run(wait_for_effect_completion(
-                    accepted, tool="guangya.fs.change.execute", context=context,
+                    accepted, tool="cloud.change", context=context,
                 ))
                 self.assertEqual(receipt.data["stats"], stats)
                 self.assertEqual(receipt.data["background_job"]["stats"], stats)
@@ -522,7 +966,7 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 mock.patch.object(current, "status", return_value={}),
             ):
                 receipt = asyncio.run(wait_for_effect_completion(
-                    accepted, tool="guangya.fs.change.execute", context=context,
+                    accepted, tool="cloud.change", context=context,
                 ))
                 self.assertFalse(receipt.ok)
                 self.assertEqual(receipt.status, "failed")
@@ -703,3 +1147,17 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_change_labels_show_the_parent_of_same_named_targets():
+    """真实验收：分季方案把 Season 01 建在了根目录，而卡片只写“→ Season 01”，用户与模型都无法分辨。"""
+    from app.modules.guangya_fs_change import _operation_label
+
+    relocate = {"op": "relocate", "source": {"name": "[GroupA] 测试剧 - 01.mkv"},
+                "target_path": "/测试根/Season 01", "new_name": "测试剧 (2024) - S01E01.mkv"}
+    nested = {**relocate, "target_path": "/测试根/测试剧 (2024)/Season 01"}
+    created = {"op": "create_directory", "name": "Season 01", "parent_path": "/测试根"}
+    assert _operation_label(relocate) == "移动并改名：[GroupA] 测试剧 - 01.mkv → 测试根 › Season 01 / 测试剧 (2024) - S01E01.mkv"
+    assert "测试剧 (2024) › Season 01" in _operation_label(nested)
+    assert _operation_label(created) == "新建目录：测试根 › Season 01"
+    assert _operation_label({"op": "move", "source": {"name": "a"}, "target_path": "/"}) == "移动：a → 账号根目录"

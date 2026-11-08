@@ -12,12 +12,13 @@ from app.agent.errors import ToolPipelineError, ToolRateLimitError
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.kernel.task_state import identity
 from app.agent.rate_limit import RateLimitDecision
+from tests.agent_task_native_helpers import task_call
+from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import isolated_database as isolated_database
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
 
@@ -37,17 +38,26 @@ class ResultScript(NativeScript):
             message = {'content': '已取得本次读取结果；其余任务未宣称完成。'}
         else:
             name, args = {
-                'discover': ('agent__capabilities', {'tool_names': ['agent.task', self.tool]}),
-                'create': ('agent__task', declaration()),
-                'read': (self.tool.replace('.', '__'), {'component': 'tmdb'} if self.tool == 'config.explain_component' else {'query': 'quota fixture'}),
+                'discover': ('agent__run_code', {'language': 'shell', 'code': 'mf --help'}),
+                'create': task_call(declaration(), wire=True),
+                'read': (self.tool.replace('.', '__'), {'component': 'tmdb'} if self.tool == 'fixture.configuration' else {'query': 'quota fixture'}),
             }[step]
             message = {'content': '', 'tool_calls': [{'id': f'{self.prefix}-{len(self.requests)}', 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args, ensure_ascii=False)}}]}
         return httpx.Response(200, json={'choices': [{'message': message, 'finish_reason': 'stop' if step == 'finish' else 'tool_calls'}]})
 
 
 def runtime_for(script, clock):
-    runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
+    runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
+    from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
+    from app.agent.kernel.task_state import configuration_observations
+    from app.modules.diagnostics import component
+    runtime.session.catalog.register(KernelToolSpec(name="fixture.configuration", domain="fixture", effect=ToolEffect.READ,
+        description="配置观察回执的等待/恢复夹具",
+        input_schema={"type": "object", "required": ["component"], "additionalProperties": False,
+                      "properties": {"component": {"type": "string", "enum": ["tmdb"]}}},
+        read=lambda arguments, context: component(**arguments), observe=configuration_observations))
     runtime.session.continuation_binding = _capture_creation_binding()
+    runtime.session.model_tools = (runtime.session.model_tools or frozenset()) | {"fixture.configuration"}
     return runtime
 
 
@@ -74,7 +84,7 @@ def test_resumed_read_result_branches(mode, tmp_path):
         clock = [100]
         observing = mode in {'observation', 'observation_failure', 'invalid_observation'}
         success = mode in {'observation', 'plain'}
-        tool_name = 'config.explain_component' if observing else 'web.search'
+        tool_name = 'fixture.configuration' if observing else 'fixture.lookup'
         candidate, parked = await park(clock, tool_name)
         clock[0] = 110
         script = ResultScript(tool_name, resume=True)
@@ -139,7 +149,7 @@ def test_resumed_read_result_branches(mode, tmp_path):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('tool_name', ['web.search', 'config.explain_component'])
+@pytest.mark.parametrize('tool_name', ['fixture.lookup', 'fixture.configuration'])
 def test_foreground_error_still_allows_model_repair(tool_name):
     async def run():
         clock = [100]
@@ -171,7 +181,7 @@ def test_foreground_error_still_allows_model_repair(tool_name):
 def test_interrupted_synthesis_does_not_repeat_completed_resumed_read():
     async def run():
         clock = [100]
-        candidate, parked = await park(clock, 'web.search')
+        candidate, parked = await park(clock, 'fixture.lookup')
         clock[0] = 110
 
         class Interrupted(ResultScript):
@@ -186,7 +196,7 @@ def test_interrupted_synthesis_does_not_repeat_completed_resumed_read():
                 body = response.json()
                 return httpx.Response(200, json=body)
 
-        script = Interrupted('web.search', resume=True)
+        script = Interrupted('fixture.lookup', resume=True)
         script.steps = ['finish']
         runtime = runtime_for(script, clock)
         calls = []
@@ -195,7 +205,7 @@ def test_interrupted_synthesis_does_not_repeat_completed_resumed_read():
             calls.append(dict(arguments))
             return {'ok': True, 'summary': '原范围核验完成'}
 
-        tool = runtime.session.catalog.get('web.search')
+        tool = runtime.session.catalog.get('fixture.lookup')
         runtime.session.catalog._tools[tool.name] = replace(tool, read=read)
         assert await runtime.session.resume_wait(candidate=candidate)
         assert script.requests[0]['tools'] == script.requests[1]['tools']
@@ -204,7 +214,7 @@ def test_interrupted_synthesis_does_not_repeat_completed_resumed_read():
         wait = cold.metadata['read_wait']
         assert wait['state'] == 'terminal'
         assert wait['terminal_reason'] == 'completed'
-        assert calls == [{'query': 'quota fixture', 'max_results': 5, 'topic': 'general'}]
+        assert calls == [{'query': 'quota fixture'}]
         assert wait['budget']['model_spent'] == 5
         assert wait['budget']['tool_spent'] == 4
         assert len(script.requests) == 2
@@ -214,6 +224,6 @@ def test_interrupted_synthesis_does_not_repeat_completed_resumed_read():
         before = len(script.requests)
         assert not await runtime.session.resume_wait(candidate=candidate)
         assert len(script.requests) == before
-        assert calls == [{'query': 'quota fixture', 'max_results': 5, 'topic': 'general'}]
+        assert calls == [{'query': 'quota fixture'}]
 
     asyncio.run(run())

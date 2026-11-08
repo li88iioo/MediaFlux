@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.subscriptions.rss_actions import (
-    diagnose_rss,
-    rss_diagnosis_arguments,
-)
-from app.agent.errors import AgentToolError
+from app import sdk
 from tests.support import IsolatedDatabaseTestCase
 
 _SNAPSHOT = "2026-08-01 12:00:00"
@@ -43,25 +40,24 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         _clear_rss()
 
     def _diagnose(self):
-        with patch("app.agent.domains.subscriptions.rss_actions.db.now", return_value=_SNAPSHOT):
-            return diagnose_rss({})
+        with patch("app.modules.rss_subscriptions.db.now", return_value=_SNAPSHOT):
+            return sdk.rss.diagnose()
 
-    def test_arguments_reject_extra_fields(self):
-        self.assertEqual(rss_diagnosis_arguments({}), {})
-        with self.assertRaisesRegex(AgentToolError, "^rss\\.diagnose 不接受参数$"):
-            rss_diagnosis_arguments({"RSS_PASSKEY_9f": 1})
+    def test_native_signature_rejects_extra_fields(self):
+        with self.assertRaises(TypeError):
+            cast(Any, sdk.rss.diagnose)(RSS_PASSKEY_9f=1)
 
     def test_empty_and_disabled_states_are_explicit(self):
         result = self._diagnose()
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "not_configured")
-        self.assertEqual(result.data["subscriptions"]["total"], 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "not_configured")
+        self.assertEqual(result["data"]["subscriptions"]["total"], 0)
         db.add_rss_subscription(
             name="disabled", urls="https://example.invalid/private", enabled=0
         )
         result = self._diagnose()
-        self.assertEqual(result.status, "inactive")
-        self.assertEqual(result.data["subscriptions"]["disabled"], 1)
+        self.assertEqual(result["status"], "inactive")
+        self.assertEqual(result["data"]["subscriptions"]["disabled"], 1)
 
     def test_counts_schedule_backlog_stale_failed_and_inconsistent_states(self):
         scheduled = db.add_rss_subscription(
@@ -132,9 +128,9 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         _set_entry(inconsistent, status="mystery", processed=0)
         _set_entry(null_status, status=None, processed=0)
         result = self._diagnose()
-        self.assertEqual(result.status, "attention")
+        self.assertEqual(result["status"], "attention")
         self.assertEqual(
-            result.data["subscriptions"],
+            result["data"]["subscriptions"],
             {
                 "total": 4,
                 "enabled": 3,
@@ -147,7 +143,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
                 "cron_configured_but_not_scheduled": 1,
             },
         )
-        entries = result.data["entries"]
+        entries = result["data"]["entries"]
         self.assertEqual(entries["total"], 9)
         self.assertEqual(entries["pending"], 2)
         self.assertEqual(entries["pending_backlog"], 1)
@@ -160,12 +156,12 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(entries["skipped"], 1)
         self.assertEqual(entries["terminal"], 2)
         self.assertEqual(entries["unknown_or_inconsistent"], 2)
-        self.assertEqual(result.data["attention"]["total"], 7)
-        self.assertFalse(result.data["attention"]["truncated"])
+        self.assertEqual(result["data"]["attention"]["total"], 7)
+        self.assertFalse(result["data"]["attention"]["truncated"])
         invalid_attention = next(
 
                 item
-                for item in result.data["attention"]["subscriptions"]
+                for item in result["data"]["attention"]["subscriptions"]
                 if item["subscription_id"] == invalid_refresh
 
         )
@@ -189,9 +185,9 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("UPDATE rss_items SET enabled=NULL WHERE id=?", (sub_id,))
         result = self._diagnose()
-        self.assertEqual(result.status, "inactive")
-        self.assertEqual(result.data["subscriptions"]["disabled"], 1)
-        attention = result.data["attention"]["subscriptions"]
+        self.assertEqual(result["status"], "inactive")
+        self.assertEqual(result["data"]["subscriptions"]["disabled"], 1)
+        attention = result["data"]["attention"]["subscriptions"]
         self.assertEqual(attention[0]["schedule_state"], "disabled")
 
     def test_sensitive_subscription_and_entry_fields_never_leave_projection(self):
@@ -224,7 +220,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         )["id"]
         assert entry_id is not None
         _set_entry(entry_id, status="failed", created_at="2026-07-01 00:00:00")
-        serialized = json.dumps(self._diagnose().to_dict(), ensure_ascii=False)
+        serialized = json.dumps(self._diagnose(), ensure_ascii=False)
         for secret in secrets:
             self.assertNotIn(secret, serialized)
         for forbidden_key in (
@@ -248,16 +244,16 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
             assert entry_id is not None
             _set_entry(entry_id, status="failed")
         result = self._diagnose()
-        self.assertEqual(result.data["entries"]["failed"], 25)
-        self.assertEqual(len(result.data["attention"]["subscriptions"]), 20)
-        self.assertTrue(result.data["attention"]["truncated"])
+        self.assertEqual(result["data"]["entries"]["failed"], 25)
+        self.assertEqual(len(result["data"]["attention"]["subscriptions"]), 20)
+        self.assertTrue(result["data"]["attention"]["truncated"])
 
     def test_database_exception_is_fixed_and_sanitized(self):
-        with patch("app.agent.domains.subscriptions.rss_actions.db.get_rss_diagnostic_summary") as mocked:
+        with patch("app.modules.rss_subscriptions.db.get_rss_diagnostic_summary") as mocked:
             mocked.side_effect = RuntimeError("RSS_PASSKEY_9f /srv/RSS_PATH_SECRET")
             result = self._diagnose()
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "unavailable")
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unavailable")
+        serialized = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("RSS_PASSKEY_9f", serialized)
         self.assertNotIn("RSS_PATH_SECRET", serialized)

@@ -1,118 +1,53 @@
-"""全库巡检结果安全接力测试。"""
-
+"""公共巡检投影保留安全缺集接力信息，并可读取历史持久快照。"""
 from __future__ import annotations
 
-import unittest
+import json
 
-from app.agent.domains.library.recent_patrol import RecentPatrolStore
-from app.agent.models import ToolResult
-
-
-def _identity(arguments):
-    return dict(arguments)
+from app.modules.library_patrol import project_library_patrol_status, serialize_patrol_projection, validate_persisted_patrol_projection
 
 
-def _patrol_result(*, findings=None, status="updates_available", ok=True):
-    return ToolResult(
-        ok,
-        status,
-        "patrol",
-        data={
-            "as_of": "2026-08-01",
-            "findings_truncated": False,
-            "findings": list(findings or []),
-            "sources": [{"server_name": "private", "path": "/secret/media"}],
-        },
-        error="private upstream details",
-    )
+def _finding(title="示例剧", tmdb_id="12345", *, status="updates_available", truncated=False):
+    return {"title": title, "tmdb_id": tmdb_id, "status": status, "missing_sample_truncated": truncated,
+            "missing_sample": [{"season": 2, "episode": 4}, {"season": 2, "episode": 3}, {"season": 3, "episode": 1}],
+            "sources": [{"path": "/private"}], "token": "must-not-leak"}
 
 
-def _finding(
-    title="示例剧",
-    tmdb_id="12345",
-    missing=None,
-    *,
-    status="updates_available",
-    truncated=False,
-):
-    return {
-        "title": title,
-        "tmdb_id": tmdb_id,
-        "status": status,
-        "missing_count": len(missing or []),
-        "missing_sample": list(missing or [{"season": 2, "episode": 3}]),
-        "missing_sample_truncated": truncated,
-        "sources": [{"path": "/private"}],
-        "token": "must-not-leak",
-    }
+def _row(raw):
+    return {"status": "pending", "outcome": "updates_available", "projection_json": raw,
+            "cycle_as_of": "", "cycle_accumulator_json": "{}", "last_finished_at": "2026-08-01 12:00:00", "next_run_at": ""}
 
 
-class RecentPatrolStoreTests(unittest.TestCase):
-    def test_snapshot_is_session_bound_short_lived_and_safely_projected(self):
-        now = [100.0]
-        store = RecentPatrolStore(ttl_seconds=10, clock=lambda: now[0])
-        result = _patrol_result(
-            findings=[
-                _finding(
-                    missing=[
-                        {"season": 2, "episode": 4},
-                        {"season": 2, "episode": 3},
-                        {"season": 3, "episode": 1},
-                    ]
-                ),
-                _finding(title="不可靠", tmdb_id="999", status="inconclusive"),
-                _finding(title="已截断", tmdb_id="998", truncated=True),
-            ],
-            status="inconclusive",
-            ok=False,
-        )
-        store.capture(owner="session-a", result=result)
-        snapshot = store.get(owner="session-a")
-        assert (snapshot) is not None
-        self.assertEqual(snapshot["patrol_status"], "inconclusive")
-        self.assertEqual(
-            snapshot["options"],
-            [
-                {
-                    "position": 1,
-                    "title": "示例剧",
-                    "tmdb_id": "12345",
-                    "season": 2,
-                    "missing_count": 2,
-                    "episode_sample": [3, 4],
-                },
-                {
-                    "position": 2,
-                    "title": "示例剧",
-                    "tmdb_id": "12345",
-                    "season": 3,
-                    "missing_count": 1,
-                    "episode_sample": [1],
-                },
-            ],
-        )
-        serialized = repr(snapshot)
-        self.assertNotIn("private", serialized)
-        self.assertNotIn("secret", serialized)
-        self.assertNotIn("token", serialized)
-        self.assertIsNone(store.get(owner="session-b"))
-        now[0] = 110.0
-        self.assertIsNone(store.get(owner="session-a"))
+def test_public_patrol_result_preserves_safe_resource_followup_without_session_store():
+    raw, projection = serialize_patrol_projection({"ok": False, "status": "inconclusive", "data": {
+        "as_of": "2026-08-01", "checked_series_count": 3, "missing_episode_count": 3, "findings_truncated": False,
+        "findings": [_finding(), _finding("不可靠", "999", status="inconclusive"), _finding("已截断", "998", truncated=True)],
+        "sources": [{"server_name": "private", "path": "/secret/media"}],
+    }})
+    row = _row(raw)
+    row["outcome"] = "inconclusive"
+    shown = project_library_patrol_status(row, enabled=True)
+    assert shown["status"] == "inconclusive"
+    assert shown["data"]["findings"] == [
+        {"title": "示例剧", "tmdb_id": "12345", "status": "updates_available", "missing_count": 2,
+         "missing_sample": [{"season": 2, "episode": 3}, {"season": 2, "episode": 4}], "missing_sample_truncated": False},
+        {"title": "示例剧", "tmdb_id": "12345", "status": "updates_available", "missing_count": 1,
+         "missing_sample": [{"season": 3, "episode": 1}], "missing_sample_truncated": False},
+    ]
+    assert any("找资源" in suggestion for suggestion in shown["suggestions"])
+    for forbidden in ("private", "secret", "token"):
+        assert forbidden not in repr(shown) and forbidden not in raw
+    assert validate_persisted_patrol_projection(json.loads(raw)) == projection
 
-    def test_latest_patrol_replaces_previous_snapshot(self):
-        store = RecentPatrolStore()
-        store.capture(
-            owner="owner", result=_patrol_result(findings=[_finding(title="旧剧")])
-        )
-        store.capture(
-            owner="owner", result=_patrol_result(findings=[_finding(title="新剧")])
-        )
-        get_result = store.get(owner="owner")
-        assert get_result is not None
-        self.assertEqual(get_result["options"][0]["title"], "新剧")
-        store.capture(
-            owner="owner", result=_patrol_result(findings=[], status="up_to_date")
-        )
-        get_result_2 = store.get(owner="owner")
-        assert get_result_2 is not None
-        self.assertEqual(get_result_2["options"], [])
+
+def test_historical_projection_remains_readable_and_tampered_projection_is_not_relayed():
+    historical = {"as_of": "2026-08-01", "patrol_status": "updates_available", "findings_truncated": False,
+                  "checked_series_count": 8, "updates_available_count": 1, "missing_episode_count": 1,
+                  "inconclusive_count": 0, "unmapped_series_count": 0, "options": [
+                      {"position": 1, "title": "历史剧集", "tmdb_id": "12345", "season": 2, "missing_count": 1, "episode_sample": [3]}]}
+    shown = project_library_patrol_status(_row(json.dumps(historical)), enabled=False)
+    assert shown["ok"] and shown["data"]["findings"][0]["tmdb_id"] == "12345"
+    assert shown["data"]["missing_episode_count"] == 1
+    historical["options"][0]["path"] = "/secret/media"
+    rejected = project_library_patrol_status(_row(json.dumps(historical)), enabled=False)
+    assert rejected["status"] == "inconclusive" and rejected["data"]["findings"] == []
+    assert "secret" not in repr(rejected)

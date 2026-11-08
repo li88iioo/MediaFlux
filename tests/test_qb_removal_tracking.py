@@ -184,46 +184,37 @@ class QbRemovalTrackingTests(unittest.TestCase):
         assert get_download_request_result_10 is not None
         self.assertEqual(get_download_request_result_10["qb_status"], "downloading")
 
-    def test_agent_delete_uses_same_durable_tracking_contract(self):
-        from app.agent.providers.qbittorrent import QBittorrentProviderTransport
+    def test_public_delete_uses_same_durable_tracking_contract(self):
+        from app.modules import qb_control
 
         request_id = self.request()
-        transport = QBittorrentProviderTransport()
         client = Mock()
-        client.list_torrents.side_effect = [[SimpleNamespace(hash="a" * 40)], []]
-
+        task = SimpleNamespace(hash="a" * 40, name="测试任务", size=123, added_on=1)
+        client.list_torrents.side_effect = [[task], [task], []]
         def delete(*_args, **_kwargs):
-            get_download_request_result_11 = db.get_download_request(request_id)
-            assert get_download_request_result_11 is not None
-            self.assertEqual(get_download_request_result_11["qb_status"], "cancelled")
+            row = db.get_download_request(request_id)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["qb_status"], "cancelled")
             return True
-
         client.delete_torrents.side_effect = delete
-        with patch.object(transport, "_settings", return_value={}), patch.object(transport, "_client_from_settings", return_value=client):
-            result = transport.execute_write(
-                "configured:qbittorrent", "qb.torrents.delete_task", {"torrent_refs": ["a" * 40]},
-                expected_profile_revision=transport.profile_revision("configured:qbittorrent"),
-            )
-        self.assertEqual(result.data["verification"], "verified")
+        with patch.object(qb_control.config, "get_many", return_value={}), patch.object(qb_control, "configured_qb_client", return_value=client):
+            snapshot = qb_control.prepare_qb_control("delete", ["a" * 40])
+            result = qb_control.execute_qb_control(snapshot)
+        self.assertEqual(result["verification"], "verified")
         client.delete_torrents.assert_called_once_with("a" * 40, delete_files=False)
 
-    def test_agent_db_preflight_failure_is_not_a_remote_unknown_write(self):
-        from app.agent.provider_models import ProviderGatewayError
-        from app.agent.providers.qbittorrent import QBittorrentProviderTransport
+    def test_public_db_preflight_failure_is_not_a_remote_unknown_write(self):
+        from app.modules import qb_control
 
         request_id = self.request()
-        transport = QBittorrentProviderTransport()
         client = Mock()
-        client.list_torrents.return_value = [SimpleNamespace(hash="a" * 40)]
-        with patch.object(transport, "_settings", return_value={}), patch.object(transport, "_client_from_settings", return_value=client), patch.object(db, "cancel_qb_download_tracking", side_effect=sqlite3.OperationalError("locked")):
-            with self.assertRaises(ProviderGatewayError) as failure:
-                transport.execute_write(
-                    "configured:qbittorrent", "qb.torrents.delete_task", {"torrent_refs": ["a" * 40]},
-                    expected_profile_revision=transport.profile_revision("configured:qbittorrent"),
-                )
-        self.assertEqual(failure.exception.code, "provider_unavailable")
-        self.assertFalse(failure.exception.external_write_possible)
+        client.list_torrents.return_value = [SimpleNamespace(hash="a" * 40, name="测试任务", size=123, added_on=1)]
+        with patch.object(qb_control.config, "get_many", return_value={}), patch.object(qb_control, "configured_qb_client", return_value=client):
+            snapshot = qb_control.prepare_qb_control("delete", ["a" * 40])
+            with patch.object(db, "cancel_qb_download_tracking", side_effect=sqlite3.OperationalError("locked")):
+                with self.assertRaises(QBControlSafetyUnavailable):
+                    qb_control.execute_qb_control(snapshot)
         client.delete_torrents.assert_not_called()
-        get_download_request_result_12 = db.get_download_request(request_id)
-        assert get_download_request_result_12 is not None
-        self.assertEqual(get_download_request_result_12["qb_status"], "downloading")
+        request = db.get_download_request(request_id)
+        assert request is not None
+        self.assertEqual(request["qb_status"], "downloading")

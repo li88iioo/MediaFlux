@@ -179,7 +179,7 @@ async def guarded_state_call(
 ) -> Any:
     """先在当前 task 验证持锁权，再进入线程；取消不能先于 DB 事务放锁。"""
     with session_scope_guard(owner, session_id, kind=kind):
-        return await _run_worker(call, args, complete_on_cancel or _effect_active())
+        return await run_state_worker(call, args, complete_on_cancel=complete_on_cancel)
 
 
 def _effect_active() -> bool:
@@ -191,7 +191,7 @@ def _effect_active() -> bool:
 async def session_io(call: Callable[..., Any], *args: Any) -> Any:
     """确认持有者的持久化收尾不可被请求取消打断；普通读请求仍可取消。"""
     if _effect_active():
-        return await _run_worker(call, args, True)
+        return await run_state_worker(call, args, complete_on_cancel=True)
     return await asyncio.to_thread(call, *args)
 
 
@@ -203,11 +203,21 @@ class _CancelledWorkerResult(asyncio.CancelledError):
         self.result = result
 
 
-async def _run_worker(call: Callable[..., Any], args: tuple[Any, ...], complete_on_cancel: bool) -> Any:
+async def run_state_worker(call: Callable[..., Any], args: tuple[Any, ...], *, complete_on_cancel: bool = False,
+                           scope: tuple[str, str] | None = None) -> Any:
+    context = copy_context()
+    held = _held_scope.get()
+    key = _scope_key(*scope) if scope is not None else None
+    complete_on_cancel = complete_on_cancel or (_effect_active() and (key is None or (held is not None and held.key == key)))
+    if held is not None and (not held.active or held.pid != os.getpid() or held.task is not _task()):
+        if held.active and held.pid == os.getpid() and held.key == key:
+            raise SessionBusyError("session operation is executing")
+        # 子Task会复制ContextVar，但不能把父Task的重入权带进_task=None的线程。
+        context.run(_held_scope.set, None)
     # 使用 executor Future 而非额外 Task：事件循环 shutdown 的全 Task
     # 取消不能把仍在执行的同步线程误判为结束，进而提前释放会话文件锁。
     operation = asyncio.get_running_loop().run_in_executor(
-        None, partial(copy_context().run, call, *args),
+        None, partial(context.run, call, *args),
     )
     cancelled = False
     while True:

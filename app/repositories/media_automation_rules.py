@@ -81,7 +81,7 @@ def list_rules(owner_digest: str, *, kind: str = "") -> list[dict[str, Any]]:
         params.append(kind)
     with db.get_conn() as conn:
         rows = conn.execute(
-            f"SELECT * FROM media_automation_rules WHERE {where} ORDER BY created_at,id LIMIT 100",
+            f"SELECT * FROM media_automation_rules WHERE {where} ORDER BY created_at,id",
             params,
         ).fetchall()
     return [_row(row) for row in rows]

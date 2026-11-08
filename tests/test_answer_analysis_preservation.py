@@ -17,13 +17,13 @@ PARAPHRASE = (
 @pytest.mark.parametrize('unresolved,foreign', [(False, False), (True, False), (False, True)])
 def test_ingest_analysis_is_not_limited_to_one_literal_sentence(monkeypatch, unresolved, foreign):
     monkeypatch.setattr(ingest, 'EXPLANATION', PARAPHRASE)
-    ingest.test_ingest_followup_explanation(unresolved, foreign)
+    ingest.test_native_url_followup_explanation(unresolved, foreign)
 
 
 def test_long_confirmed_analysis_survives_cold_public_history(monkeypatch):
     body = PARAPHRASE + '这里的观察仅描述本地记录，后续仍需核对实际媒体可见性。' * 30 + '最后建议保留当前请求，不重复创建下载。'
     monkeypatch.setattr(ingest, 'EXPLANATION', body)
-    ingest.test_ingest_followup_explanation(True, False)
+    ingest.test_native_url_followup_explanation(True, False)
 
 
 @pytest.mark.parametrize('partial', [False, True])

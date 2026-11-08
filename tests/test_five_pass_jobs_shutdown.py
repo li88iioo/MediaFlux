@@ -7,8 +7,8 @@ import json
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.library.patrol_progress import empty_patrol_projection
-from app.agent.models import ToolResult
+from app.modules.library_patrol import empty_patrol_projection
+from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
@@ -31,7 +31,7 @@ class DurableJobsShutdownTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _result():
-        return ToolResult(True, "up_to_date", "已检查", data={
+        return EpisodeAuditResult(True, "up_to_date", "已检查", data={
             **empty_patrol_projection(as_of=_AS_OF),
             "checked_series_count": 1, "mapped_series_count": 1, "up_to_date_count": 1,
             "continuation_pending": False, "last_processed_tmdb_id": "", "stalled_tmdb_id": "",

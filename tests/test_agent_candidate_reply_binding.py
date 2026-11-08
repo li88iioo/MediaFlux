@@ -1,5 +1,6 @@
 """Signed Telegram candidate cards retain their validated resource binding."""
 import asyncio
+import json
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
@@ -61,7 +62,7 @@ def test_signed_candidate_binding_reaches_current_model_message(store, monkeypat
         )
     assert result.status == 'success', result
     assert len(model.requests) == 1
-    expected = '已校验的回复批次，仅可从该引用解析候选编号：' + view['ref']
+    expected = '已校验的回复候选批次，仅可选择这些真实 result_ids：' + json.dumps([item['result_id'] for item in view['items']], ensure_ascii=False)
     last_user = next(m.content for m in reversed(model.requests[0].messages) if m.role == 'user')
     assert last_user.count(expected) == 1, {'current_message': last_user, 'expected_binding': expected}
     # Reopen SQLite independently: body capability is not the resource capability.
@@ -78,13 +79,13 @@ def test_signed_candidate_binding_reaches_current_model_message(store, monkeypat
         assert not row.get('reply_context')
 
 
-@pytest.mark.parametrize('change', ['query_only', 'search_id', 'candidates', 'private_items'])
-def test_reply_bound_batch_allows_refinement_token_but_not_rebinding(store, change):
+@pytest.mark.parametrize('change', ['refined', 'foreign_ids', 'invalid_private_snapshot'])
+def test_reply_bound_native_ids_cannot_rebind_the_signed_batch(store, change):
     from copy import deepcopy
     from dataclasses import replace
 
     from app.agent.errors import ToolPipelineError
-    from tests.test_agent_resource_batch import _prepare_batch
+    from tests.support import _prepare_batch
 
     async def exercise():
         _, pipeline, states = ux._runtime(store)
@@ -93,36 +94,33 @@ def test_reply_bound_batch_allows_refinement_token_but_not_rebinding(store, chan
         original['_query_arguments'] = {'title': 'Example', 'resolution': '2160p'}
         bound = await store.put(owner=ux.OWNER, session_id=ux.SESSION, kind='resource_candidates', value=original, ttl_seconds=900)
         context = replace(context, resource_candidate_ref=bound.ref)
-        refined = await pipeline.execute('indexer.present_candidates', {
-            'resource_candidates_ref': bound.ref, 'positions': [1, 2], 'exclude_hdr': True,
-        }, context=context)
-        new_ref = refined.outcome.public_content['reference_arguments']['resource_candidates_ref']
+        from tests.resource_presentation_test_harness import present
+        refined = await present(pipeline, context, [item['result_id'] for item in original['candidates']], exclude_hdr=True)
+        new_ref = refined.outcome.public_content['candidate_view']['ref']
         assert new_ref != bound.ref
         value = await store.resolve(new_ref, owner=ux.OWNER, session_id=ux.SESSION, expected_kind='resource_candidates')
         assert value['_query_arguments']['exclude_hdr'] is True
         assert value['candidates'] == original['candidates'] and value['search_id'] == original['search_id']
-        if change != 'query_only':
+        ids = [item['result_id'] for item in original['candidates']]
+        if change == 'foreign_ids':
+            ids[0] = 'foreign-resource-id'
+        elif change == 'invalid_private_snapshot':
             value = deepcopy(value)
-            if change == 'search_id':
-                value['search_id'] = 'rs_' + 'z' * 16
-            elif change == 'candidates':
-                value['candidates'][0]['title'] = 'Different resource'
-            else:
-                value['_private_items'] = []
+            value['_private_items'] = []
             changed = await store.put(owner=ux.OWNER, session_id=ux.SESSION, kind='resource_candidates', value=value, ttl_seconds=900)
-            new_ref = changed.ref
-        intent = {'source_type': 'resource_candidates', 'resource_candidates_ref': new_ref, 'positions': [1, 2], 'target': 'guangya'}
-        with patch('app.agent.domains.resources.candidate_actions.prepare_submit_resource_batch', side_effect=_prepare_batch) as prepare:
-            if change == 'query_only':
-                # 只预检真实业务链，未确认前不执行下载；冻结的仍是原批次两个真实ID。
-                result = await pipeline.execute('ingest.submit', intent, context=context)
+            context = replace(context, resource_candidate_ref=changed.ref)
+        with patch('app.indexers.downloads.preview_indexer_download_batch', side_effect=_prepare_batch) as prepare:
+            intent = {'result_ids': ids, 'target': 'guangya'}
+            if change == 'refined':
+                result = await pipeline.execute('resources.download', intent, context=context)
                 assert result.effect_plan is not None
-                assert prepare.call_args.args[0]['result_ids'] == [item['result_id'] for item in original['candidates']]
-                assert result.effect_plan.arguments['resource_candidates_ref'] == new_ref
+                assert prepare.call_args.args[1] == ids
+                assert dict(result.effect_plan.arguments) == intent
+                assert result.effect_plan.metadata['resource_selection']['ref'] == bound.ref
             else:
                 with pytest.raises(ToolPipelineError) as error:
-                    await pipeline.execute('ingest.submit', intent, context=context)
-                assert error.value.code == 'candidate_scope_mismatch'
+                    await pipeline.execute('resources.download', intent, context=context)
+                assert error.value.code == ('candidate_scope_mismatch' if change == 'foreign_ids' else 'reference_invalid')
                 prepare.assert_not_called()
         assert (await store.resolve(bound.ref, owner=ux.OWNER, session_id=ux.SESSION, expected_kind='resource_candidates')) == original
     asyncio.run(exercise())

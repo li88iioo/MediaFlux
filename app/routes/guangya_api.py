@@ -392,68 +392,11 @@ def organize_preview(request: Request, data: dict | None = Body(default=None)):
     except (TypeError, ValueError):
         return JSONResponse({"error": "预览数量上限必须是 1-1000 的整数"}, status_code=400)
     try:
-        from app.modules.organize import Organizer
-
-        all_plans = []
-        aggregate: dict[str, int] = {}
-        remaining = max_files
-        protected_source_ids = {
-            (source.get("id") or "").strip()
-            for source in sources
-            if (source.get("id") or "").strip()
-        }
-        for source in sources:
-            if max_files and remaining <= 0:
-                break
-            source_rules = rules.for_source(source.get("id") or "")
-            organizer = Organizer()
-            try:
-                organizer._validate_target_outside_source(
-                    source["id"], source_rules.target_dir_id
-                )
-                plans, stats = organizer.organize(
-                    source["id"],
-                    source_rules,
-                    dry_run=True,
-                    max_files=remaining if max_files else 0,
-                    protected_source_ids=protected_source_ids,
-                )
-            finally:
-                organizer.close()
-            for plan in plans:
-                all_plans.append((source, plan))
-            for key, value in stats.items():
-                if isinstance(value, int):
-                    aggregate[key] = aggregate.get(key, 0) + value
-            if max_files:
-                remaining -= int(stats.get("total", 0))
-        return {
-            "stats": aggregate,
-            "plans": [
-                {
-                    "source_name": source["name"],
-                    "action": p.action,
-                    "original_name": p.original_name,
-                    "original_path": p.original_path,
-                    "size": p.size,
-                    "title": p.match.title if p.match else "",
-                    "year": p.match.year if p.match else "",
-                    "tmdb_id": p.match.tmdb_id if p.match else "",
-                    "confidence": p.match.confidence if p.match else 0,
-                    "main_category": p.main_category,
-                    "region": p.region,
-                    "new_name": p.new_name,
-                    "base_name": p.base_name,
-                    "variant_label": p.variant_label,
-                    "variant_suffix": p.variant_suffix,
-                    "conflict_decision": p.conflict_decision,
-                    "conflict_note": p.conflict_note,
-                    "target_path": p.target_path,
-                    "note": p.note,
-                }
-                for source, p in all_plans
-            ],
-        }
+        from app.modules.organize_service import preview_sources
+        result = preview_sources(sources, rules, max_files=max_files)
+        return {"stats": result["stats"], "plans": [
+            {key: value for key, value in plan.items() if key != "source_id"}
+            for plan in result["plans"]]}
     except DirectoryScrapePublicError as exc:
         return JSONResponse(
             {"error": public_error_message(exc)},
@@ -501,9 +444,9 @@ def organize_status(request: Request, task_id: str = ""):
 @router.post("/organize/stop")
 def organize_stop(request: Request):
     require_api_login(request)
-    from app.modules.organize_tasks import get_organize_manager
+    from app.modules.organize_service import stop
 
-    result = get_organize_manager().stop()
+    result = stop()
     return JSONResponse(result, status_code=202 if result.get("ok") else 409)
 
 

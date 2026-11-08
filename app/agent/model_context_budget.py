@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, NoReturn
 
@@ -46,7 +46,7 @@ def decode_tool_content(content: str) -> dict[str, Any]:
     if separator:
         for line in ("opaque_refs=" + suffix).splitlines():
             key, _, raw = line.partition("=")
-            if key in {"opaque_refs", "reference_arguments", "candidate_numbers", "recommended_ingest_arguments"}:
+            if key in {"opaque_refs", "reference_arguments", "candidate_numbers", "recommended_ingest_arguments", "recommended_download_arguments"}:
                 try:
                     payload[key] = json.loads(raw)
                 except ValueError:
@@ -138,10 +138,9 @@ def compact_tool_content(
     tool_name, not any field inside content. No model-visible magic marker grants trust.
     """
     payload = decode_tool_content(content)
-    # The built-in reader has one catalog-published alias. Match exact identities,
-    # not a reversible spelling heuristic (nor payload.read_tool/page-like fields).
+    # 仅恢复旧持久历史中的分页协议；已无对应可执行工具，不按业务字段推断协议身份。
     result_page = result_page or tool_name in ("agent.read_result", "agent__read_result")
-    protocol_keys = {"result_handle", "read_tool", "truncated", "truncation"}
+    protocol_keys = {"result_handle", "read_tool", "read_method", "truncated", "truncation"}
     if trusted:
         _validate_result_metadata(payload, result_page=result_page)
     elif result_page:
@@ -149,7 +148,7 @@ def compact_tool_content(
     collisions = {} if trusted else {key: payload[key] for key in protocol_keys & payload.keys()}
     if len(content) <= maximum and not collisions:
         return content
-    protected = {"ok", "status", "code", "result_handle", "read_tool"}
+    protected = {"ok", "status", "code", "result_handle", "read_tool", "read_method"}
     prior = {row["path"]: dict(row) for row in payload.get("truncation", [])} if trusted else {}
     omitted = dict(prior)
     # Reader identity comes from the executor/message tool_name, never business fields.
@@ -235,7 +234,7 @@ def compact_tool_content(
 
     def encode() -> str:
         current = {source_path(path): measure(value)[1] for _, _, path, value in fields()}
-        current[root] = len(page["items"]) if page is not None else len(payload.keys() - {"result_handle", "read_tool", "truncated", "truncation"})
+        current[root] = len(page["items"]) if page is not None else len(payload.keys() - {"result_handle", "read_tool", "read_method", "truncated", "truncation"})
         for path in list(omitted):
             ancestor = path
             while len(ancestor) > RESULT_PATH_MAX:
@@ -316,6 +315,10 @@ def _compact_chain(messages: Sequence[Any], *, max_tool_chars: int) -> list[Any]
     result = []
     for message in messages:
         if message.role == "tool":
+            if message.tool_name in {"agent.run_code", "agent__run_code"}:
+                # 终端事实由输出文件承接，不走业务快照截断；超窗仍按原整组预算处理。
+                result.append(message)
+                continue
             content = compact_tool_content(
                 message.content, maximum=max_tool_chars, trusted=True,
                 tool_name=message.tool_name,
@@ -324,6 +327,63 @@ def _compact_chain(messages: Sequence[Any], *, max_tool_chars: int) -> list[Any]
                 message = replace(message, content=content)
         result.append(message)
     return result
+
+
+def archive_native_output(
+    message: Any, *, output_available: Callable[[str], bool] | None,
+    preview_chars: int | None = None,
+) -> Any:
+    """生成可回读的终端投影；最新未消费输出保留有界首尾，历史仍归档正文。"""
+    if (output_available is None or message.role != "tool"
+            or message.tool_name not in {"agent.run_code", "agent__run_code"}
+            or message.effect_plan_id or message.completion_receipt_id):
+        return message
+    try:
+        payload = json.loads(message.content)
+    except (ValueError, TypeError):
+        return message
+    if (not isinstance(payload, dict) or payload.get("approval")
+            or payload.get("status") == "approval_required" or payload.get("truncated")
+            or payload.get("truncation")):
+        return message
+    data = payload.get("data")
+    if (not isinstance(data, dict) or type(data.get("exit_code")) is not int
+            or type(data.get("timed_out")) is not bool or data.get("working_directory") != "/work"
+            or not isinstance(data.get("sdk_calls"), list)
+            or any(type(data.get(f"{stream}_truncated")) is not bool for stream in ("stdout", "stderr"))):
+        return message
+    stdout_path, stderr_path = data.get("stdout_path"), data.get("stderr_path")
+    if not isinstance(stdout_path, str) or not isinstance(stderr_path, str):
+        return message
+    if (not re.fullmatch(r"/output/[0-9a-f]{32}\.stdout", stdout_path)
+            or stderr_path != stdout_path.removesuffix(".stdout") + ".stderr"
+            or not all(output_available(path) for path in (stdout_path, stderr_path))):
+        return message
+    if payload.get("output_archived") is True and "stdout" not in data and "stderr" not in data:
+        return message
+    if not all(isinstance(data.get(stream), str) for stream in ("stdout", "stderr")):
+        return message
+    if preview_chars is None:
+        for stream in ("stdout", "stderr"):
+            data.pop(stream)
+        payload.pop("result_handle", None)
+        payload.pop("read_tool", None)
+        payload.pop("read_method", None)
+        payload["output_archived"] = True
+    else:
+        if all(len(data[stream]) <= preview_chars for stream in ("stdout", "stderr")):
+            return message
+        for stream in ("stdout", "stderr"):
+            text = data[stream]
+            if len(text) <= preview_chars:
+                continue
+            gap = f"\n[中间输出已省略；完整输出见 {data[stream + '_path']}]\n"
+            head = (preview_chars - len(gap)) // 2
+            data[stream] = text[:head] + gap + text[-(preview_chars - len(gap) - head):]
+            data[stream + "_truncated"] = True
+    payload["details_omitted"] = True
+    archived = replace(message, content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return archived if estimated_tokens(archived.to_dict()) < estimated_tokens(message.to_dict()) else message
 
 
 def _compact_legacy_history(messages: Sequence[Any]) -> list[Any]:
@@ -369,7 +429,9 @@ def _native_history(messages: Sequence[Any], *, reserved_ids: set[str] | None = 
     return result
 
 
-def protocol_history_groups(messages: Sequence[Any], *, history_end: int):
+def protocol_history_groups(
+    messages: Sequence[Any], *, history_end: int,
+):
     """Select whole user groups by native identity only, before any budget loss."""
     split_at = max(0, min(history_end, len(messages)))
     history = list(messages[:split_at])
@@ -404,26 +466,29 @@ def protocol_history_groups(messages: Sequence[Any], *, history_end: int):
     return list(reversed(unique_groups)), current, reserved_ids
 
 
-def protocol_history_baseline(messages: Sequence[Any], *, history_end: int) -> list[Any]:
-    """Uncompacted completeness obligations; budget eviction is never exempted."""
-    groups, current, _ = protocol_history_groups(messages, history_end=history_end)
-    return [message for group in groups for message in group] + current
-
-
 def bounded_model_messages(
     messages: Sequence[Any],
     *,
     history_end: int,
+    consumed_end: int | None = None,
     tool_definitions: Sequence[Mapping[str, Any]],
     system_prompt: str,
     context_window_tokens: int,
     output_tokens: int,
     conservative: bool = False,
+    output_available: Callable[[str], bool] | None = None,
 ) -> tuple[Any, ...]:
     """保留最新完整回合，裁剪旧历史，并硬性阻止超窗口 Provider 请求。"""
-    groups, current, reserved_ids = protocol_history_groups(messages, history_end=history_end)
-    groups = [_compact_legacy_history(group) for group in groups]
-    history = [message for group in groups for message in group]
+    groups, current, reserved_ids = protocol_history_groups(
+        messages, history_end=history_end,
+    )
+    history = _native_history(
+        [message for group in groups for message in group], reserved_ids=reserved_ids)
+    # 先统一协议身份；后续只改变正文视图或淘汰整组，不重排原生签名链。
+    offset = 0
+    for index, group in enumerate(groups):
+        groups[index] = history[offset:offset + len(group)]
+        offset += len(group)
     estimate = conservative_tokens if conservative else estimated_tokens
     message_budget = max(
         0,
@@ -437,11 +502,51 @@ def bounded_model_messages(
     def cost(items: Sequence[Any]) -> int:
         return sum(8 + estimate(item.to_dict()) for item in items)
 
+    total_cost = cost(history) + cost(current)
+    if total_cost <= message_budget:
+        # 已结束回合的大段终端输出不随每次追问重复发送。只替换确有完整
+        # 工作区文件的正文；原话、终答、小结果和当前回合仍全文保留。
+        history = [
+            archive_native_output(message, output_available=output_available)
+            if len(message.content) > 16_384 else message
+            for message in history
+        ]
+        return tuple(history + current)
+
+    # 仅超窗才按时间顺序归档已消费结果；最新批次先保留正文。
+    split_at = max(0, min(history_end, len(messages)))
+    consumed = split_at if consumed_end is None else max(split_at, min(consumed_end, len(messages)))
+    for group in (*groups, current):
+        eligible = consumed - split_at if group is current else len(group)
+        for index in range(eligible):
+            original = group[index]
+            archived = archive_native_output(original, output_available=output_available)
+            saving = cost([original]) - cost([archived])
+            if saving <= 0:
+                continue
+            group[index] = archived
+            total_cost -= saving
+            if total_cost <= message_budget:
+                return tuple([message for history_group in groups for message in history_group] + current)
+
+    groups = [_compact_legacy_history(group) for group in groups]
     current_cost = cost(current)
     for maximum in (1_200, 400):
         if current_cost <= message_budget:
             break
         current = _compact_chain(current, max_tool_chars=maximum)
+        current_cost = cost(current)
+    # 当前链本身仍超窗时，给最新终端结果保留首尾及完整路径，允许下一轮读文件恢复。
+    # 复用同一文件/回执校验；原消息与历史归档策略保持不变，文件不可用时不丢正文。
+    originals = current
+    for maximum in (2_048, 512):
+        if current_cost <= message_budget:
+            break
+        current = [
+            archive_native_output(message, output_available=output_available, preview_chars=maximum)
+            if index >= consumed - split_at else message
+            for index, message in enumerate(originals)
+        ]
         current_cost = cost(current)
     if current_cost > message_budget:
         from app.agent.errors import ToolPipelineError
@@ -451,13 +556,13 @@ def bounded_model_messages(
             code="context_budget_exceeded",
         )
     remaining = max(0, message_budget - current_cost)
-    history_view = _native_history(history, reserved_ids=reserved_ids)
+    history_view = [message for group in groups for message in group]
     if cost(history_view) <= remaining:
         return tuple(history_view + current)
 
     kept: list[list[Any]] = []
     for group in reversed(groups):
-        candidate, candidate_cost = group, cost(_native_history(group, reserved_ids=reserved_ids))
+        candidate, candidate_cost = group, cost(group)
         for maximum in (1_200, 400):
             if candidate_cost <= remaining or kept:
                 break
@@ -469,13 +574,11 @@ def bounded_model_messages(
                 if exc.code != "context_budget_exceeded":
                     raise
                 break  # 不可压缩的旧整组留在存储中，不阻塞当前请求。
-            candidate_cost = cost(_native_history(candidate, reserved_ids=reserved_ids))
+            candidate_cost = cost(candidate)
         if candidate_cost > remaining:
             # 历史整组超出窗口时停止装载，不让旧调用锁死新问题。
             # Session 的历史索引保留遗漏标记；历史本身不授予写操作权限。
             break
         kept.append(candidate)
         remaining -= candidate_cost
-    return tuple(
-        _native_history([message for group in reversed(kept) for message in group], reserved_ids=reserved_ids) + current
-    )
+    return tuple([message for group in reversed(kept) for message in group] + current)

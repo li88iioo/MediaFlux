@@ -8,6 +8,7 @@ from copy import deepcopy
 from hashlib import sha256
 from typing import Any, Protocol
 
+from app.agent.errors import ToolPipelineError
 from app.agent.model_context_budget import compact_tool_content
 
 from .conversation_codec import PendingText, conversation_cost, json_text
@@ -23,26 +24,51 @@ class ConversationState(Protocol):
 def retain_conversation(
     conversation: Sequence[Mapping[str, Any]], *, maximum_bytes: int = 160 * 1024,
     _required_from: int | None = None,
+    _receipt_plan_id: str = "",
 ) -> list[dict[str, Any]]:
     """按实际存储预算保留完整用户回合，不因80条短消息删除原始条件。"""
     cost = conversation_cost
 
     original_bytes = cost(conversation)
+    if original_bytes > maximum_bytes and any(row.get("activities") for row in conversation):
+        # 展示过程是可丢弃的附加信息，不能挤掉原始请求、工具结果或执行回执。
+        conversation = [{key: value for key, value in row.items() if key != "activities"}
+                        for row in conversation]
+        original_bytes = cost(conversation)
     if original_bytes <= maximum_bytes:
         return [dict(row) for row in conversation]
     ratio = maximum_bytes / original_bytes * 0.75
+    required_end = len(conversation)
+    if _receipt_plan_id:
+        receipt_indices = [i for i, row in enumerate(conversation)
+                           if row.get("completion_receipt_id") == _receipt_plan_id]
+        if not receipt_indices:
+            raise HistoryCapacityError("confirmed execution receipt is unavailable")
+        required_end = receipt_indices[-1] + 1
     turns: list[list[dict[str, Any]]] = []
     required_rows: set[int] = set()
     for index, item in enumerate(conversation):
         row = deepcopy(dict(item))
-        if _required_from is not None and index >= _required_from and (
-            row.get("tool_calls") or row.get("role") == "tool" or row.get("reply_context", {}).get("reference_handle")
+        if _required_from is not None and _required_from <= index < required_end and (
+            row.get("tool_calls") or row.get("role") == "tool" or row.get("completion_receipt_id")
+            or row.get("reply_context", {}).get("reference_handle")
         ):
             required_rows.add(id(row))
+        if _receipt_plan_id and (
+            row.get("completion_receipt_id") == _receipt_plan_id
+            or (row.get("role") == "tool" and row.get("effect_plan_id") == _receipt_plan_id)
+            or isinstance(row.get("content"), PendingText)
+        ):
+            required_rows.add(id(row))  # 目标回执及未结束调用的配对不能作为诊断淘汰。
         if row.get("role") == "tool" and not isinstance(row.get("content"), PendingText):
             content = str(row.get("content") or "")
-            row["content"] = compact_tool_content(content, maximum=max(512, int(len(content) * ratio)), tool_name=row.get("tool_name", ""), trusted=True)
-        elif row.get("role") == "assistant" and len(str(row.get("content") or "")) > 8000:
+            try:
+                row["content"] = compact_tool_content(content, maximum=max(512, int(len(content) * ratio)), tool_name=row.get("tool_name", ""), trusted=True)
+            except ToolPipelineError as exc:
+                if exc.code != "context_budget_exceeded" or index < required_end:
+                    raise
+                # 不可压缩的已完成诊断交给整组保留规则淘汰，不遮蔽之前的写入回执。
+        elif row.get("role") == "assistant" and not row.get("completion_receipt_id") and len(str(row.get("content") or "")) > 8000:
             row["content"] = str(row["content"])[:8000] + "\n[历史长文本已截断]"
         if row.get("role") == "user" or not turns:
             turns.append([])
@@ -112,16 +138,20 @@ def historical_user_sources(state: ConversationState) -> tuple[str, ...]:
     ]))
 
 
-def _encode_history_memory(memory: dict[str, Any]) -> str:
-    # 观察只作旧结果索引；用户原话/旧摘要不能为凑预算而悄悄截断。
-    observations = memory.setdefault("observations", [])
-    while len(json_text(memory)) > 8_000 and observations:
-        observations.pop(0)
-        memory["observations_omitted"] = True
-    text = json_text(memory)
-    if len(text) > 8_000:
-        raise HistoryCapacityError("historical user constraints exceed memory capacity")
-    return text
+def _user_event_order(
+    state: ConversationState, original: Sequence[Mapping[str, Any]], memory: Mapping[str, Any],
+) -> dict[str, int]:
+    """沿用已落盘的事件序号；新事件只按完整原始 user 行顺序分配，早于任何裁剪。"""
+    previous = [*memory["requests"], *(row for row in state.conversation if row.get("role") == "user")]
+    order = {row["history_id"]: row["history_order"] for row in previous
+             if row.get("history_id") and type(row.get("history_order")) is int and row["history_order"] >= 0}
+    next_order = max(order.values(), default=-1) + 1
+    for row in original:
+        event_id = row.get("history_id")
+        if row.get("role") == "user" and event_id and event_id not in order:
+            order[event_id] = next_order
+            next_order += 1
+    return order
 
 
 def preserve_history(
@@ -130,6 +160,7 @@ def preserve_history(
 ) -> dict[str, Any]:
     """落盘与模型窗口共用的来源收敛：不生成目标、授权或完成结论。"""
     memory = deepcopy(dict(memory)) if memory is not None else history_memory(state)
+    event_order = _user_event_order(state, original, memory)
     known_events = {row.get("history_id") for row in memory["requests"]}
     kept_users = {row.get("history_id") for row in retained if row.get("role") == "user"}
     kept_tools = {json_text(row) for row in retained if row.get("role") == "tool"}
@@ -161,6 +192,11 @@ def preserve_history(
                 "result_handle": str(result.get("result_handle") or "")[:200],
                 "details_omitted": True,
             }
+    for row in memory["requests"]:
+        if row.get("history_id") in event_order:
+            row["history_order"] = event_order[row["history_id"]]
+    # 无 ID 的旧来源不推断时序；已知事件按原始序号排列，与淘汰先后、正文无关。
+    memory["requests"].sort(key=lambda row: event_order.get(row.get("history_id"), -1))
     memory["observations"] = list(observations.values())[-12:]
     if len(observations) > 12:
         memory["observations_omitted"] = True
@@ -174,11 +210,16 @@ def commit_conversation(
     updates: Sequence[StateUpdate] = (), *, receipt_metadata: Mapping[str, Any] | None = None,
 ) -> None:
     # Resolve the executor's positional boundary, not equal call IDs in old turns.
-    start = next((u.current_start for u in updates if type(u) is _ExecutionCapacity), None)
+    execution = next((u for u in updates if type(u) is _ExecutionCapacity), None)
+    start = execution.current_start if execution else None
     merged = merge_effect_receipts(conversation, state.metadata if receipt_metadata is None else receipt_metadata)
     for row in merged:
         if row.get("role") == "user" and not row.get("history_id"):
             row["history_id"] = secrets.token_hex(8)
+    event_order = _user_event_order(state, merged, history_memory(state))
+    for row in merged:
+        if row.get("role") == "user":
+            row["history_order"] = event_order[row["history_id"]]
     # 取消按钮可在同一generation的只读期间到达；迟到检查点不能复活旧预览。
     cancelled = {(row.get("effect_plan_id"), row.get("tool_call_id")): row["content"]
                  for row in state.conversation if row.get("role") == "tool" and row.get("effect_cancelled") is True}
@@ -192,10 +233,11 @@ def commit_conversation(
         if start >= len(conversation) or conversation[start].get("role") != "user" or user_ordinal >= len(users):
             raise HistoryCapacityError("current execution boundary is unavailable")
         start = users[user_ordinal]
-    retained = retain_conversation(merged, _required_from=start)
+    retained = retain_conversation(merged, _required_from=start,
+                                   _receipt_plan_id=execution.receipt_plan_id if execution else "")
     if retained != merged:
         memory = preserve_history(state, merged, retained)
-        state.summary = _encode_history_memory(memory)
+        state.summary = json_text(memory)
         state.metadata["history_memory_version"] = 1
     state.conversation = retained
 

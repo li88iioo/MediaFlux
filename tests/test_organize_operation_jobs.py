@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -53,6 +53,78 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
             payload={"version": 1},
             dedupe_key=dedupe,
         )
+
+    def test_public_operation_query_rejects_missing_owner_and_non_public_ids(self) -> None:
+        from app.modules.organize_tasks import get_organize_operation_status
+
+        reference = organize_operation_public_ref("a" * 32)
+        with patch("app.modules.organize_tasks.get_organize_manager") as manager:
+            for ref, owner in ((reference, ""), (reference, "  "), (reference, None),
+                               ("", "owner"), ("a" * 32, "owner"), ("cloud-task-1", "owner"),
+                               (None, "owner"), (reference + "x", "owner")):
+                with self.subTest(reference=ref, owner=owner), self.assertRaises(ValueError):
+                    Mock(wraps=get_organize_operation_status)(ref, owner=owner)
+            manager.assert_not_called()
+
+    def test_public_operation_query_keeps_owner_bound_receipts_across_restart(self) -> None:
+        from app.modules.organize_tasks import get_organize_operation_status
+
+        created, _ = self._enqueue()
+        job_id = str(created["job_id"])
+        reference = organize_operation_public_ref(job_id)
+        manager = OrganizeTaskManager()
+        claimed = None
+        for phase in ("queued", "running"):
+            if phase == "running":
+                claimed = claim_organize_operation_job(job_id)
+                assert claimed is not None
+            with (patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
+                  patch.object(manager, "status", return_value={})):
+                public = get_organize_operation_status(reference.lower(), owner="owner-durable-test")
+            self.assertIs(type(public), dict)
+            self.assertTrue(public["data"]["found"])
+            self.assertEqual(public["data"]["task"]["operation_ref"], reference)
+            self.assertEqual(public["data"]["task"]["status"], phase)
+            self.assertEqual(public["data"]["task"]["stats"], {})
+
+        assert claimed is not None
+        self.assertTrue(finish_organize_operation_job(
+            job_id, expected_lease_generation=int(claimed["lease_generation"]), status="partial",
+            result={"stats": {"total": 2, "moved": 1, "verification_failed": 1, "private": 9},
+                    "copy_tasks": {"1": "private-copy-task"},
+                    "operation_items": [
+                        {"position": 1, "operation": "move", "status": "completed",
+                         "completed_actions": ["move"], "file_id": "private-file"},
+                        {"position": 2, "operation": "move", "status": "unknown",
+                         "completed_actions": [], "reason": "write_outcome_unknown"}]},
+            error="private-path token=private-secret",
+        ))
+        manager._task = {"id": job_id, "durable": True, "status": "running",
+                         "owner_digest": claimed["owner_digest"]}
+        for current in (manager, OrganizeTaskManager()):
+            with (patch("app.modules.organize_tasks.get_organize_manager", return_value=current),
+                  patch.object(current, "status", return_value={})):
+                public = get_organize_operation_status(reference, owner="owner-durable-test")
+            self.assertFalse(public["ok"])
+            self.assertEqual(public["status"], "attention")
+            task = public["data"]["task"]
+            self.assertEqual(task["status"], "partial")
+            self.assertEqual(task["stats"], {"total": 2, "moved": 1, "verification_failed": 1})
+            self.assertEqual([item["status"] for item in task["operation_items"]], ["completed", "unknown"])
+            self.assertIn("请勿直接重复提交", public["error"])
+            for private in (job_id, "owner_digest", "payload", "private", "copy_tasks", "file_id"):
+                self.assertNotIn(private, json.dumps(public))
+
+        with (patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
+              patch.object(manager, "status", side_effect=AssertionError("不能回退整体概览"))):
+            for ref, owner in ((reference, "other-owner"),
+                               (organize_operation_public_ref("f" * 32), "owner-durable-test")):
+                public = get_organize_operation_status(ref, owner=owner)
+                self.assertEqual(public["data"], {"operation_ref": ref, "found": False})
+                self.assertFalse(public["ok"])
+            with db.get_conn() as conn:
+                conn.execute("DELETE FROM organize_operation_jobs WHERE job_id=?", (job_id,))
+            self.assertFalse(get_organize_operation_status(reference, owner="owner-durable-test")["data"]["found"])
 
     def test_non_durable_task_results_still_use_organize_counters(self) -> None:
         manager = OrganizeTaskManager()

@@ -1,22 +1,19 @@
 """Media Agent RSS 失败分类与安全重试回归。"""
 
 from __future__ import annotations
-from typing import cast
-from urllib3.connection import HTTPConnection
-from urllib3.connectionpool import ConnectionPool
 
 import json
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import requests
+from urllib3.connection import HTTPConnection
+from urllib3.connectionpool import ConnectionPool
 from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 
 from app import database as db
-from app.agent.domains.subscriptions.rss_retry_actions import (
-    prepare_rss_failure_retry,
-    retry_failed_rss_confirmed,
-)
 from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
+from app.modules import rss_delivery
 from app.modules.rss import RSSEngine
 from tests.support import IsolatedDatabaseTestCase
 
@@ -30,16 +27,19 @@ def _clear_rss() -> None:
         conn.execute("DELETE FROM rss_items")
 
 
+
 class _Response:
     def __init__(self, status: int, text: str = "", payload=None):
         self.status_code = status
         self.text = text
         self._payload = payload
 
+
     def json(self):
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
+
 
 
 class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
@@ -61,8 +61,10 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         )
         self.runtime_patcher.start()
 
+
     def tearDown(self):
         self.runtime_patcher.stop()
+
 
     @staticmethod
     def _subscription(name: str = "Private RSS", method: str = "qb") -> int:
@@ -72,6 +74,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             download_method=method,
             qb_save_path="/private/subscription/path",
         )
+
 
     @staticmethod
     def _entry(sub_id: int, index: int, *, payload: str | None = None) -> int:
@@ -89,12 +92,14 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         assert entry_id is not None
         return entry_id
 
+
     def _failed(
         self, sub_id: int, index: int, code="qb_unavailable", retryable=True
     ) -> int:
         entry_id = self._entry(sub_id, index)
         db.record_rss_entry_failure(entry_id, code, retryable)
         return entry_id
+
 
     def test_qb_add_detailed_classifies_http_and_transport_failures(self):
         cases = (
@@ -127,6 +132,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             success.add_torrent_detailed(urls="magnet:?xt=test"), TorrentAddResult(True)
         )
 
+
     def test_qb_login_failure_is_classified_without_response_body_leak(self):
         client = QBittorrentClient(
             "http://qb.internal:8080", username="u", password="secret"
@@ -140,6 +146,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         rendered = repr(warning.call_args_list)
         self.assertNotIn("PRIVATESECRET", rendered)
         self.assertNotIn("passkey", rendered)
+
 
     def test_qb_login_timeout_is_safe_to_retry_before_torrent_submission(self):
         client = QBittorrentClient(
@@ -155,6 +162,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             client._session.post.call_args.args[0].endswith("/api/v2/auth/login")
         )
 
+
     def test_preview_selects_retryable_failed_qb_only_and_is_sanitized(self):
         qb_sub = self._subscription()
         gy_sub = self._subscription("GuangYa RSS", "guangya")
@@ -165,12 +173,12 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         with patch(
             "app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed"
         ) as add:
-            result, _context = prepare_rss_failure_retry({"limit": 2})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["selected_count"], 2)
-        self.assertFalse(result.data["has_more"])
+            result, _context = rss_delivery.prepare("retry", {"limit": 2})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["selected_count"], 2)
+        self.assertFalse(result["data"]["has_more"])
         add.assert_not_called()
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+        serialized = json.dumps(result, ensure_ascii=False)
         for secret in (
             "Private Episode",
             "secret-guid",
@@ -183,6 +191,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "qb_unavailable",
         ):
             self.assertNotIn(secret, serialized)
+
 
     def test_database_claim_is_all_or_nothing_and_increments_retry_count(self):
         sub_id = self._subscription()
@@ -221,6 +230,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             self.assertEqual(row["failure_code"], "")
             self.assertEqual(row["failure_retryable"], 0)
 
+
     def test_retry_snapshot_enforces_rate_limit_cooldown_and_attempt_cap(self):
         sub_id = self._subscription()
         rate_limited = self._failed(sub_id, 1, "qb_rate_limited", True)
@@ -238,6 +248,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         rows = db.get_retryable_failed_rss_snapshot(default_method="qb", limit=10)
         self.assertEqual([row["id"] for row in rows], [rate_limited])
 
+
     def test_unknown_retry_requires_qb_review_before_another_attempt(self):
         sub_id = self._subscription()
         self._failed(sub_id, 1)
@@ -250,21 +261,22 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "failed": 1,
             "outcome_unknown": 1,
         }
-        fingerprint = prepare_rss_failure_retry({"limit": 1})[1]
+        fingerprint = rss_delivery.prepare("retry", {"limit": 1})[1]
         with patch.object(
             RSSEngine, "submit_snapshot", return_value=raw
         ) as submit:
-            result = retry_failed_rss_confirmed({"limit": 1}, fingerprint)
+            result = rss_delivery.execute("retry", {"limit": 1}, fingerprint)
         self.assertIs(
             submit.call_args.kwargs["claim"],
             db.claim_retryable_failed_rss_entries,
         )
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "review_required")
-        self.assertEqual(result.data["outcome_unknown"], 1)
-        self.assertIn("待核对 1", result.summary)
-        assert result.error is not None
-        self.assertIn("勿直接重试", result.error)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "review_required")
+        self.assertEqual(result["data"]["outcome_unknown"], 1)
+        self.assertIn("待核对 1", result["summary"])
+        assert result["error"] is not None
+        self.assertIn("勿直接重试", result["error"])
+
 
     def test_mixed_unknown_retry_reports_all_three_outcomes(self):
         sub_id = self._subscription()
@@ -279,15 +291,16 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "failed": 2,
             "outcome_unknown": 1,
         }
-        fingerprint = prepare_rss_failure_retry({"limit": 3})[1]
+        fingerprint = rss_delivery.prepare("retry", {"limit": 3})[1]
         with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
-            result = retry_failed_rss_confirmed({"limit": 3}, fingerprint)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "partial")
-        self.assertIn("成功 1", result.summary)
-        self.assertIn("待核对 1", result.summary)
-        self.assertIn("确认失败 1", result.summary)
-        self.assertIn("勿直接重复提交", result.suggestions[0])
+            result = rss_delivery.execute("retry", {"limit": 3}, fingerprint)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("成功 1", result["summary"])
+        self.assertIn("待核对 1", result["summary"])
+        self.assertIn("确认失败 1", result["summary"])
+        self.assertIn("勿直接重复提交", result["suggestions"][0])
+
 
     def test_pending_retry_is_in_progress_and_not_failed(self):
         sub_id = self._subscription()
@@ -301,14 +314,15 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "failed": 0,
             "pending": 1,
         }
-        fingerprint = prepare_rss_failure_retry({"limit": 1})[1]
+        fingerprint = rss_delivery.prepare("retry", {"limit": 1})[1]
         with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
-            result = retry_failed_rss_confirmed({"limit": 1}, fingerprint)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "in_progress")
-        self.assertEqual(result.data["pending"], 1)
-        self.assertIn("成功 0，提交中 1，失败 0，待核对 0", result.summary)
-        self.assertEqual(result.error, "")
+            result = rss_delivery.execute("retry", {"limit": 1}, fingerprint)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "in_progress")
+        self.assertEqual(result["data"]["pending"], 1)
+        self.assertIn("成功 0，提交中 1，失败 0，待核对 0", result["summary"])
+        self.assertEqual(result["error"], "")
+
 
     def test_pending_retry_mixed_with_failure_is_partial_but_not_ok(self):
         sub_id = self._subscription()
@@ -323,13 +337,14 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "failed": 1,
             "pending": 1,
         }
-        fingerprint = prepare_rss_failure_retry({"limit": 2})[1]
+        fingerprint = rss_delivery.prepare("retry", {"limit": 2})[1]
         with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
-            result = retry_failed_rss_confirmed({"limit": 2}, fingerprint)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.data["pending"], 1)
-        self.assertIn("成功 0，提交中 1，失败 1，待核对 0", result.summary)
+            result = rss_delivery.execute("retry", {"limit": 2}, fingerprint)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["pending"], 1)
+        self.assertIn("成功 0，提交中 1，失败 1，待核对 0", result["summary"])
+
 
     def test_retry_engine_propagates_unknown_outcome_count(self):
         sub_id = self._subscription()
@@ -358,6 +373,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         assert row is not None
         self.assertEqual(row["failure_code"], "qb_outcome_unknown")
         self.assertEqual(row["failure_retryable"], 0)
+
 
     def test_engine_records_retry_result_and_preserves_aggregate_contract(self):
         sub_id = self._subscription()
@@ -397,26 +413,27 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         assert get_rss_entry_result_3 is not None
         self.assertEqual(get_rss_entry_result_3["status"], "downloaded")
 
+
     def test_cloud_retry_needs_no_qb_and_rejects_duplicate_confirmation(self):
-        from app.agent.errors import AgentToolError
         from app.modules import download_dispatcher as dispatcher
+        from app.modules.rss_subscriptions import RSSSubscriptionError
 
         sub = self._subscription("Cloud", "guangya")
         db.update_rss_subscription(sub, {"gy_target_dir": "chosen-cloud", "gy_target_dir_name": "Chosen"})
         entry = self._failed(sub, 400, "guangya_manifest_unavailable", True)
         with patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=({"default_method": "qb"}, "未配置 qBittorrent 地址")):
-            preview, fingerprint = prepare_rss_failure_retry({"limit": 10})
-            self.assertTrue(preview.ok, preview)
-            self.assertEqual(preview.data["target"], "guangya")
+            preview, fingerprint = rss_delivery.prepare("retry", {"limit": 10})
+            self.assertTrue(preview["ok"], preview)
+            self.assertEqual(preview["data"]["target"], "guangya")
             with patch.object(dispatcher, "_submit_guangya", return_value={"ok": True, "task_id": "cloud-accepted"}) as gy, patch.object(dispatcher, "_submit_qb") as qb:
-                result = retry_failed_rss_confirmed({"limit": 10}, fingerprint)
-                self.assertTrue(result.ok, result)
-                self.assertEqual(result.data["submitted"], 1)
+                result = rss_delivery.execute("retry", {"limit": 10}, fingerprint)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["data"]["submitted"], 1)
                 gy.assert_called_once()
                 self.assertEqual(gy.call_args.kwargs["target_dir_id"], "chosen-cloud")
                 qb.assert_not_called()
-                with self.assertRaises(AgentToolError):
-                    retry_failed_rss_confirmed({"limit": 10}, fingerprint)
+                with self.assertRaises(RSSSubscriptionError):
+                    rss_delivery.execute("retry", {"limit": 10}, fingerprint)
                 self.assertEqual(gy.call_count, 1)
         get_rss_entry_result_4 = db.get_rss_entry(entry)
         assert get_rss_entry_result_4 is not None
@@ -425,6 +442,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         assert get_rss_entry_result_5 is not None
         self.assertEqual(get_rss_entry_result_5["retry_count"], 1)
 
+
     def test_mixed_retry_keeps_each_backend_and_does_not_leak_snapshot(self):
         from app.modules import download_dispatcher as dispatcher
 
@@ -432,45 +450,47 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         gy_sub = self._subscription("Cloud", "guangya")
         first = self._failed(qb_sub, 401)
         second = self._failed(gy_sub, 402, "guangya_unavailable", True)
-        preview, fingerprint = prepare_rss_failure_retry({"limit": 10})
-        self.assertEqual(preview.data["target"], "both")
-        self.assertEqual(preview.data["selected_count"], 2)
+        preview, fingerprint = rss_delivery.prepare("retry", {"limit": 10})
+        self.assertEqual(preview["data"]["target"], "both")
+        self.assertEqual(preview["data"]["selected_count"], 2)
         with patch.object(dispatcher, "_submit_guangya", return_value={"ok": True, "task_id": "gy"}) as gy, patch.object(dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "qb"}) as qb:
-            result = retry_failed_rss_confirmed({"limit": 10}, fingerprint)
+            result = rss_delivery.execute("retry", {"limit": 10}, fingerprint)
         gy.assert_called_once()
         qb.assert_called_once()
-        self.assertEqual(result.data["submitted"], 2)
+        self.assertEqual(result["data"]["submitted"], 2)
         for entry_id in (first, second):
             entry = db.get_rss_entry(entry_id)
             assert entry is not None
             self.assertEqual(entry["status"], "downloaded")
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
+        serialized = json.dumps(result, ensure_ascii=False)
         for private in ("PRIVATESECRET", "private/subscription", "cloud_rules", "QB_SECRET", "torrent_url"):
             self.assertNotIn(private, serialized)
+
 
     def test_cloud_directory_or_rules_change_invalidates_confirmation(self):
         from dataclasses import replace
 
-        from app.agent.errors import AgentToolError
         from app.modules import download_dispatcher as dispatcher
         from app.modules.offline import OfflineRules
+        from app.modules.rss_subscriptions import RSSSubscriptionError
 
         sub = self._subscription("Cloud", "guangya")
         entry = self._failed(sub, 403, "guangya_manifest_unavailable", True)
-        _, fingerprint = prepare_rss_failure_retry({"limit": 10})
+        _, fingerprint = rss_delivery.prepare("retry", {"limit": 10})
         db.update_rss_subscription(sub, {"gy_target_dir": "changed"})
         with patch.object(dispatcher, "_submit_guangya") as submit:
-            with self.assertRaises(AgentToolError):
-                retry_failed_rss_confirmed({"limit": 10}, fingerprint)
-            _, fingerprint = prepare_rss_failure_retry({"limit": 10})
+            with self.assertRaises(RSSSubscriptionError):
+                rss_delivery.execute("retry", {"limit": 10}, fingerprint)
+            _, fingerprint = rss_delivery.prepare("retry", {"limit": 10})
             rules = replace(OfflineRules.from_config(), target_dir_id="changed-default")
             with patch.object(OfflineRules, "from_config", return_value=rules):
-                with self.assertRaises(AgentToolError):
-                    retry_failed_rss_confirmed({"limit": 10}, fingerprint)
+                with self.assertRaises(RSSSubscriptionError):
+                    rss_delivery.execute("retry", {"limit": 10}, fingerprint)
             submit.assert_not_called()
         get_rss_entry_result_6 = db.get_rss_entry(entry)
         assert get_rss_entry_result_6 is not None
         self.assertEqual(get_rss_entry_result_6["status"], "failed")
+
 
     def test_cloud_unknown_receipt_overrides_even_retryable_failure_marker(self):
         for receipt in ({"task_ids": ["accepted"]}, {"partial_success": True}, {"outcome_unknown": True}):
@@ -483,6 +503,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
                 self.assertEqual(code, "guangya_outcome_unknown")
                 self.assertFalse(retryable)
                 self.assertTrue(review)
+
 
     def test_web_batch_retries_safe_cloud_failure_and_keeps_unknown_untouched(self):
         from app.modules import download_dispatcher as dispatcher
@@ -502,6 +523,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         assert get_rss_entry_result_8 is not None
         self.assertEqual(get_rss_entry_result_8["status"], "downloaded")
 
+
     def test_cloud_manual_and_agent_retry_share_cooldown_and_attempt_cap(self):
         from app.modules import download_dispatcher as dispatcher
 
@@ -519,14 +541,12 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             conn.execute("UPDATE rss_entries SET failed_at=datetime('now','localtime','-61 seconds') WHERE id=?", (limited,))
         self.assertEqual([row["id"] for row in db.get_retryable_failed_rss_snapshot()], [limited])
 
+
     def test_cloud_retry_reason_is_readable_without_raw_errors(self):
-        from app.agent.domains.subscriptions.rss_entry_actions import (
-            list_rss_entry_summaries,
-        )
 
         sub = self._subscription("Cloud", "guangya")
         self._failed(sub, 408, "guangya_manifest_unavailable", True)
-        result = list_rss_entry_summaries({"status": "failed", "limit": 10})
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["entries"][0]["failure_code"], "光鸭暂未取得文件清单")
-        self.assertTrue(result.data["entries"][0]["failure_retryable"])
+        result = rss_delivery.entries(status="failed", limit=10)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["items"][0]["failure_label"], "光鸭暂未取得文件清单")
+        self.assertTrue(result["data"]["items"][0]["failure_retryable"])

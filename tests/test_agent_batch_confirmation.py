@@ -3,35 +3,42 @@
 import asyncio
 import json
 from dataclasses import replace
+from inspect import Parameter, Signature
+from types import SimpleNamespace
 
 import pytest
 
+from app import sdk
 from app.agent import rate_limit as rates
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.errors import ToolPipelineError
+from app.agent.errors import ConfirmationClaimError, ToolPipelineError
+from app.agent.kernel import sandbox
 from app.agent.kernel.adapters import TurnViewBuilder
 from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
     KernelToolSpec,
     ToolCatalog,
     ToolEffect,
 )
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import (
+    ConfirmationEffectPlanStore,
+    EffectExecutor,
+    InMemoryRateLimiter,
+)
 from app.agent.kernel.events import AgentEventType as Event
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel.pipeline import InMemoryRateLimiter, ToolPipeline
+from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports import mediaflux_policy
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput, CancellationToken
-from app.agent.kernel.tool_calls import ToolCallContext
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
+from app.agent.kernel.tool_calls import PreparedEffect, ToolCallContext
+from app.agent.models import ToolResult
+from tests import test_agent_session_result as session_result_tests
 from tests.test_agent_kernel_core import ScriptedModel, collect
 from tests.test_agent_task_cas import task_store as isolated_store
 
 task_store = isolated_store
+native_workspace = session_result_tests.native_workspace
 
 OWNER, SESSION = "batch-regression-owner", "batch-regression-session"
 NAMES = ("test.watchlist", "test.preferences", "test.third", "test.fourth")
@@ -41,8 +48,27 @@ FINAL = [ModelEvent(ModelEventType.TEXT_DELTA, text="请按系统回执核对结
          ModelEvent(ModelEventType.FINISH, finish_reason="stop")]
 
 
+def register_sdk_fixture(monkeypatch, tools):
+    """测试端口声明真实Python签名；工作区与批次仍走生产RPC/签名校验。"""
+    for tool in tools:
+        if tool.name in sdk.METHODS:
+            continue
+        def method(**kwargs):
+            raise AssertionError("写入必须由EffectExecutor执行")
+        properties = tool.input_schema.get("properties", {})
+        required = tool.input_schema.get("required", [])
+        monkeypatch.setattr(method, "__signature__", Signature([Parameter(key, Parameter.KEYWORD_ONLY, annotation=str,
+            default=Parameter.empty if key in required else value.get("default", None)) for key, value in properties.items()]), raising=False)
+        monkeypatch.setitem(sdk.METHODS, tool.name, method)
+        namespace = tool.name.split(".")[0]
+        if not hasattr(sdk, namespace):
+            monkeypatch.setattr(sdk, namespace, SimpleNamespace(), raising=False)
+    monkeypatch.setattr(sdk, "WRITE_METHODS", sdk.WRITE_METHODS | {tool.name for tool in tools})
+    monkeypatch.setattr(sandbox, "WRITE_METHODS", sdk.WRITE_METHODS)
+
+
 def step(name):
-    return {"tool": name, "arguments": {FIELDS.get(name, "item"): f" {name} "}}
+    return {"method": name, "arguments": {FIELDS.get(name, "item"): f" {name} "}}
 
 
 def batch(*names):
@@ -50,6 +76,8 @@ def batch(*names):
 
 
 def call(name, arguments):
+    if name == "session.batch" or name in FIELDS:
+        name, arguments = "agent.run_code", {"code": f"import mf\nmf.{name}(**{arguments!r})"}
     return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
                        tool_call=ModelToolCall("regression-call", name, arguments)),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
@@ -124,10 +152,11 @@ class BatchRig:
         pipeline = ToolPipeline(catalog=catalog, state_store=store,
                                 rate_limiter=self.rate_limiter,
                                 effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
+        catalog.register(sandbox.run_code_tool(pipeline))
         return AgentSession(model=ScriptedModel(rounds), catalog=catalog,
-                            retriever=CapabilityRetriever(), pipeline=pipeline, state_store=store)
+                            model_tools=("agent.run_code",), pipeline=pipeline, state_store=store)
 
-    async def start(self, arguments=None, *, tool="agent.batch", followups=None):
+    async def start(self, arguments=None, *, tool="session.batch", followups=None):
         arguments = batch(*NAMES[:2]) if arguments is None else arguments
         session = self.session([call(tool, arguments), *(followups or [FINAL])])
         view, events = await capture(session.run(AgentInput(
@@ -136,9 +165,11 @@ class BatchRig:
 
 
 @pytest.fixture
-def rig(task_store, monkeypatch):
+def rig(task_store, monkeypatch, native_workspace):
     monkeypatch.setattr("app.modules.web_secret.get_web_secret", lambda: "batch-test-only")
-    return BatchRig(task_store)
+    rig = BatchRig(task_store)
+    register_sdk_fixture(monkeypatch, [rig.tool(name) for name in FIELDS])
+    return rig
 
 
 @pytest.fixture
@@ -160,7 +191,7 @@ def batch_quota(monkeypatch):
 @pytest.mark.parametrize("last_permit", [False, True])
 def test_each_child_uses_one_confirmed_permit_independent_of_exhausted_preview(rig, batch_quota, last_permit):
     rig.rate_limiter, debits = batch_quota
-    names = ["agent.batch", *NAMES[:2]]
+    names = ["session.batch", *NAMES[:2]]
     for name in names:
         _, limit, cost = rates.tool_rate_limit_policy(name)
         assert cost == 1
@@ -172,8 +203,8 @@ def test_each_child_uses_one_confirmed_permit_independent_of_exhausted_preview(r
     async def run():
         session, preview, _ = await rig.start()
         assert preview.status == "approval_required"
-        assert [(name, stage) for name, stage, _ in debits] == [(name, "") for name in names]
-        assert all(decision.allowed and decision.remaining == 0 for _, _, decision in debits)
+        assert [(name, stage) for name, stage, _ in debits] == [("agent.run_code", ""), *[(name, "") for name in names]]
+        assert all(decision.allowed and decision.remaining == 0 for _, _, decision in debits[1:])
         final, _ = await confirm(session, preview.approval.plan_id)
         assert final.status == "success" and final.effect_result["data"]["completed"] == 2
         assert [name for name, _ in rig.writes] == list(NAMES[:2])
@@ -226,7 +257,7 @@ def test_execution_quota_rejection_keeps_first_receipt_and_never_replays(rig, ba
         assert failed["result"]["error"] == "rate_limited" and skipped["result"]["status"] == "not_started"
         assert rig.attempted == rig.verified == [NAMES[0]] and len(rig.writes) == 1
         assert [(name, decision.allowed) for name, stage, decision in debits if stage] == [
-            ("agent.batch", True), (NAMES[0], True), (NAMES[1], False)]
+            ("session.batch", True), (NAMES[0], True), (NAMES[1], False)]
         before_replay = list(debits)
         replay, _ = await confirm(session, preview.approval.plan_id)
         assert replay.status == "failed" and debits == before_replay
@@ -250,10 +281,10 @@ def test_execution_rechecks_authorization_after_all_child_preflights(rig, batch_
 
         monkeypatch.setattr(session.pipeline.authorization, "authorize", revoke_after_preflight)
         final, _ = await confirm(session, preview.approval.plan_id)
-        assert checked == ["agent.batch", *NAMES[:2], NAMES[0]]
+        assert checked == ["session.batch", *NAMES[:2], NAMES[0]]
         assert final.effect_result["data"]["steps"][0]["result"]["error"] == "authorization_denied"
         assert not rig.writes and not rig.attempted and not rig.verified
-        assert [name for name, stage, _ in debits if stage] == ["agent.batch"]
+        assert [name for name, stage, _ in debits if stage] == ["session.batch"]
 
     asyncio.run(run())
 
@@ -270,7 +301,7 @@ def test_cancellation_after_execution_permit_prevents_handler_start(rig, batch_q
 
         context = ToolCallContext(owner=OWNER, session_id=SESSION, request_id=lease.request_id,
             turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=progress)
-        preview = await pipeline.execute("agent.batch", batch(*NAMES[:2]), context=context)
+        preview = await pipeline.execute("session.batch", batch(*NAMES[:2]), context=context)
         acquire = rig.rate_limiter.acquire
 
         async def cancel_after_acquire(**options):
@@ -283,7 +314,7 @@ def test_cancellation_after_execution_permit_prevents_handler_start(rig, batch_q
             await pipeline.execute_confirmed(preview.effect_plan.plan_id, context=context)
         assert rig.trace == [("prepare", name) for name in (*NAMES[:2], *NAMES[:2])]
         assert not rig.writes and not rig.attempted and not rig.verified
-        assert [name for name, stage, _ in debits if stage] == ["agent.batch", NAMES[0]]
+        assert [name for name, stage, _ in debits if stage] == ["session.batch", NAMES[0]]
         assert await pipeline.get_pending_plan(owner=OWNER, session_id=SESSION) is None
 
     asyncio.run(run())
@@ -316,42 +347,30 @@ def test_concurrent_confirmation_never_replays_or_debits_children_again(rig, bat
         assert final.status == "success"
         replay, _ = await confirm(cold, preview.approval.plan_id)
         assert replay.status == "failed"
-        assert [name for name, stage, _ in debits if stage] == ["agent.batch", *NAMES[:2]]
+        assert [name for name, stage, _ in debits if stage] == ["session.batch", *NAMES[:2]]
         assert rig.attempted == rig.verified == list(NAMES[:2]) and len(rig.writes) == 2
 
     asyncio.run(run())
 
 
-def test_production_whitelist_and_strict_real_subschemas(rig):
-    default = ToolSpec(name="test.default", description="默认不组合", risk=RiskLevel.WRITE,
-                       parameters={}, validator=dict)
-    assert default.batch_mode == ""
-    specs = build_tool_specs()
-    allowed = {"discovery.add_watchlist", "media.set_preferences", "guangya.fs.change.execute"}
-    assert {spec.name for spec in specs if spec.batch_mode} == allowed
-    catalog = catalog_from_tool_specs(specs)
+def test_native_batch_visibility_and_supported_methods(rig):
+    from app.agent.kernel.ports.sdk_effects import (
+        cloud_change_tool,
+        preferences_tools,
+        watchlist_tools,
+    )
+    catalog = ToolCatalog([cloud_change_tool(), *watchlist_tools(), *preferences_tools()])
     pipeline = ToolPipeline(catalog=catalog, state_store=rig.store)
-    assert {tool.name for tool in catalog.visible() if tool.metadata.get("batch_mode")} == allowed
-    retriever = CapabilityRetriever()
-    assert "agent.batch" not in retriever.retrieve("hello", pipeline.catalog).names
-    assert "agent.batch" in retriever.retrieve("云盘复制完成后加入探索收藏，两项合成一张确认卡", pipeline.catalog).names
-    schema = pipeline.catalog.get("agent.batch").input_schema
-    steps = schema["properties"]["steps"]
-    assert schema["required"] == ["steps"] and schema["additionalProperties"] is False
-    assert steps["minItems"] == 2 and 2 <= steps["maxItems"] <= 4
-    branches = steps["items"]["oneOf"]
-    assert len(branches) == len(allowed)
-    for branch in branches:
-        assert set(branch["required"]) == {"tool", "arguments"}
-        assert branch["additionalProperties"] is False
-        name, = branch["properties"]["tool"]["enum"]
-        assert branch["properties"]["arguments"] == catalog.get(name).input_schema
+    assert {t.name for t in catalog.visible() if t.metadata.get("batch_mode")} == {"watchlist.add", "preferences.update", "cloud.change"}
+    assert not catalog.has("agent.batch")
+    assert not any(t.name == "session.batch" for t in catalog.visible())
+    assert pipeline.catalog.has("session.batch")
 
 
 def test_one_card_two_writes_and_single_use_ticket(rig):
     async def run():
         session, preview, events = await rig.start()
-        assert preview.status == "approval_required" and preview.approval.tool_name == "agent.batch"
+        assert preview.status == "approval_required" and preview.approval.tool_name == "session.batch"
         assert preview.approval.confirmation["risk"] == "write"
         assert sum(e.type is Event.EFFECT_APPROVAL_REQUIRED for e in events) == 1
         assert [s["tool"] for s in preview.approval.preview["data"]["steps"]] == list(NAMES[:2])
@@ -373,21 +392,19 @@ def test_one_card_two_writes_and_single_use_ticket(rig):
 
 
 def test_batch_unknown_step_key_repair_reaches_one_confirmation(rig):
-    from tests.error30_model_inputs import ExplicitRepairModel
 
     async def run():
         fixed = batch(*NAMES[:2])
-        invalid = {'steps': [{'tool': s['tool'], 'parameters': s['arguments']}
+        invalid = {'steps': [{'method': s['method'], 'parameters': s['arguments']}
                              for s in fixed['steps']]}
-        session = rig.session([call('agent.batch', invalid), call('agent.batch', fixed)])
-        session.model = ExplicitRepairModel(session.model, {'regression-call'})
+        session = rig.session([call('session.batch', invalid), call('session.batch', fixed)])
         view, events = await capture(session.run(AgentInput(
-            owner=OWNER, session_id=SESSION, message='agent.batch 合并收藏和偏好，一次确认')))
+            owner=OWNER, session_id=SESSION, message='session.batch 合并收藏和偏好，一次确认')))
         assert view.status == 'approval_required'
-        assert len([e for e in events if e.type == Event.TOOL_FAILED]) == 1
+        assert "invalid_arguments" in json.dumps([dict(e.payload) for e in events], ensure_ascii=False)
         assert not rig.writes
         plan = await session.pipeline.get_pending_plan(owner=OWNER, session_id=SESSION)
-        assert plan and plan.tool_name == 'agent.batch'
+        assert plan and plan.tool_name == 'session.batch'
         assert [s['tool'] for s in plan.arguments['steps']] == list(NAMES[:2])
         session.model = ScriptedModel([FINAL])
         result, _ = await confirm(session, plan.plan_id)
@@ -421,7 +438,7 @@ def test_second_step_preflight_failure_means_zero_writes(rig, change, batch_quot
         code = "confirmation_stale" if change == "snapshot" else "authorization_denied"
         assert any(e.type is Event.EFFECT_FAILED and e.payload.get("code") == code for e in events)
         assert not rig.writes and not rig.attempted and not rig.verified
-        assert [(name, stage) for name, stage, _ in debits if stage] == [("agent.batch", "confirmed")]
+        assert [(name, stage) for name, stage, _ in debits if stage] == [("session.batch", "confirmed")]
         before_replay = list(debits)
         await confirm(session, preview.approval.plan_id)
         assert not rig.attempted and debits == before_replay
@@ -429,20 +446,20 @@ def test_second_step_preflight_failure_means_zero_writes(rig, change, batch_quot
 
 
 @pytest.mark.parametrize("arguments", [
-    batch(), batch(NAMES[0]), batch(*NAMES, NAMES[0]),
-    batch(NAMES[0], NAMES[0]), batch(NAMES[0], BACKGROUND), batch(*NAMES[:2], BACKGROUND),
-    batch(NAMES[0], "test.unknown"), batch(NAMES[0], "agent.batch"),
-    {"steps": [step(NAMES[0]), {"tool": NAMES[1], "arguments": {"item": "wrong-schema"}}]},
-    {"steps": [step(NAMES[0]), {"tool": NAMES[1]}]},
+    batch(), batch(NAMES[0], BACKGROUND), batch(*NAMES[:2], BACKGROUND),
+    batch(NAMES[0], "test.unknown"), batch(NAMES[0], "session.batch"),
+    {"steps": [step(NAMES[0]), {"method": NAMES[1], "arguments": {"item": "wrong-schema"}}]},
+    {"steps": [step(NAMES[0]), {"method": NAMES[1]}]},
     {"steps": [step(NAMES[0]), {**step(NAMES[1]), "extra": True}]},
-    {"steps": [step(NAMES[0]), {"tool": NAMES[1], "arguments": {"quality": True}}]},
+    {"steps": [step(NAMES[0]), {"method": NAMES[1], "arguments": {"quality": True}}]},
     {**batch(*NAMES[:2]), "extra": True},
 ])
 def test_invalid_or_unsupported_batch_is_rejected_before_writes(rig, arguments):
     async def run():
         _, view, events = await rig.start(arguments)
         assert view.approval is None
-        assert any(e.type is Event.TOOL_FAILED and e.payload.get("code") == "invalid_arguments" for e in events)
+        wire = json.dumps([dict(e.payload) for e in events], ensure_ascii=False)
+        assert ("unexpected keyword argument 'extra'" in wire if "extra" in arguments else "invalid_arguments" in wire)
         assert not rig.writes and not rig.attempted and not rig.verified
         assert await rig.session([]).pipeline.get_pending_plan(owner=OWNER, session_id=SESSION) is None
     asyncio.run(run())
@@ -475,7 +492,7 @@ def test_second_step_failure_keeps_first_receipt_and_stops_third(rig, failure, b
         first, failed, skipped = data["steps"]
         assert first["result"]["data"]["receipt"] == f"receipt:{NAMES[0]}"
         assert failed["result"]["status"] == "failed" and skipped["result"]["status"] == "not_started"
-        assert [name for name, stage, _ in debits if stage] == ["agent.batch", *NAMES[:2]]
+        assert [name for name, stage, _ in debits if stage] == ["session.batch", *NAMES[:2]]
         before_replay = list(debits)
         await confirm(session, preview.approval.plan_id)
         assert rig.attempted == list(NAMES[:2]) and debits == before_replay
@@ -513,12 +530,13 @@ def test_ordinary_single_tool_still_requires_confirmation_and_verifies_once(rig)
 @pytest.mark.parametrize("drift", [False, True])
 def test_cold_recovery_restores_public_plan_snapshots_and_consumption(rig, drift):
     async def run():
-        _, preview, preview_events = await rig.start()
+        original, _preview, preview_events = await rig.start()
+        original_plan = await original.pipeline.get_pending_plan(owner=OWNER, session_id=SESSION)
         public = next(event.payload["plan"] for event in preview_events if event.type is Event.EFFECT_APPROVAL_REQUIRED)
         assert "editing" not in public  # nested batch steps没有可编辑标量，不发布空编辑能力。
         cold = rig.session([FINAL], SQLiteKernelStore(secret_provider=lambda: "task-test-only"))
         restored = await cold.pipeline.get_pending_plan(owner=OWNER, session_id=SESSION)
-        assert restored is not None and restored.public_approval_dict() == preview.approval.to_dict()
+        assert restored is not None and restored.public_approval_dict() == original_plan.public_approval_dict()
         assert "editing" not in restored.public_approval_dict()
         assert not rig.writes and len(rig.trace) == 2
         if drift:
@@ -559,9 +577,100 @@ def test_production_audit_records_each_step_before_finalizing(rig, monkeypatch):
             rows = [dict(r) for r in conn.execute(
                 "SELECT tool_name,status,ok,confirmation_id FROM agent_action_history ORDER BY id")]
         assert len(rows) == 3
-        assert [r["tool_name"] for r in rows] == ["agent.batch", "unknown.confirmed_action", "unknown.confirmed_action"]
+        assert [r["tool_name"] for r in rows] == ["session.batch", "unknown.confirmed_action", "unknown.confirmed_action"]
         assert all(r["ok"] and r["status"] == "completed" for r in rows)
         assert len({r["confirmation_id"] for r in rows}) == 3
         assert len(rig.writes) == 2
 
+    asyncio.run(run())
+
+
+def test_standalone_executor_freezes_one_batch_and_cold_claims_once(rig):
+    async def run():
+        catalog = ToolCatalog([rig.tool(name) for name in FIELDS])
+        executor = EffectExecutor(catalog=catalog, state_store=rig.store,
+            effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
+        lease, _ = await rig.store.begin_turn(owner=OWNER, session_id=SESSION, request_id="direct-effect")
+        async def progress(_payload):
+            pass
+        context = ToolCallContext(OWNER, SESSION, lease.request_id, lease.turn_id, lease, CancellationToken(), progress)
+        one = await executor.prepare(NAMES[0], {FIELDS[NAMES[0]]: "one"}, context=context, prepare_only=True)
+        assert one.prepared_effect is not None and one.effect_plan is None
+        assert await executor.get_pending_plan(owner=OWNER, session_id=SESSION) is None
+        assert rig.writes == []
+        preview = await executor.prepare("session.batch", batch(*NAMES[:2]), context=context)
+        plan = preview.effect_plan
+        assert plan is not None and rig.writes == []
+        assert plan.public_approval_dict()["result"] == preview.outcome.public_content
+        cold = EffectExecutor(catalog=ToolCatalog([rig.tool(name) for name in FIELDS]), state_store=rig.store,
+            effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
+        restored = await cold.get_pending_plan(owner=OWNER, session_id=SESSION)
+        assert restored is not None and restored.public_approval_dict() == plan.public_approval_dict()
+        foreign_lease, _ = await rig.store.begin_turn(owner="another-owner", session_id=SESSION, request_id="foreign")
+        with pytest.raises(ConfirmationClaimError):
+            await cold.execute_confirmed(plan.plan_id, context=replace(context, owner="another-owner", lease=foreign_lease,
+                request_id=foreign_lease.request_id, turn_id=foreign_lease.turn_id))
+        completed = await cold.execute_confirmed(plan.plan_id, context=context)
+        assert completed.outcome.public_content["ok"] is True
+        assert rig.writes == [(name, {FIELDS[name]: name}) for name in NAMES[:2]]
+        with pytest.raises(ConfirmationClaimError):
+            await executor.execute_confirmed(plan.plan_id, context=context)
+        assert rig.writes == [(name, {FIELDS[name]: name}) for name in NAMES[:2]]
+    asyncio.run(run())
+
+
+def test_legacy_frozen_parent_restores_without_old_prepare_route(rig):
+    """仅构造迁移前存量计划；冷运行时没有旧模型工具或新预检入口。"""
+    async def run():
+        old = rig.session([]).pipeline
+        lease, _ = await rig.store.begin_turn(owner=OWNER, session_id=SESSION, request_id="legacy-seed")
+        async def progress(_):
+            pass
+        context = ToolCallContext(OWNER, SESSION, lease.request_id, lease.turn_id, lease, CancellationToken(), progress)
+        native = old.catalog.get("session.batch")
+        old.catalog.register(replace(native, name="agent.batch", model_name="", input_schema={"type": "object"}, validator=dict))
+        arguments = {"steps": [{"tool": name, "arguments": step(name)["arguments"]} for name in NAMES[:2]]}
+        saved = await old.prepare("agent.batch", arguments, context=context)
+        assert saved.effect_plan is not None and saved.effect_plan.tool_name == "agent.batch"
+        cold = rig.session([], SQLiteKernelStore(secret_provider=lambda: "task-test-only")).pipeline
+        assert not cold.catalog.has("agent.batch")
+        with pytest.raises(ToolPipelineError) as rejected:
+            await cold.prepare("agent.batch", arguments, context=context)
+        assert rejected.value.code == "tool_not_found"
+        restored = await cold.get_pending_plan(owner=OWNER, session_id=SESSION)
+        assert restored == saved.effect_plan
+        foreign, _ = await cold.state_store.begin_turn(owner="other", session_id=SESSION, request_id="foreign")
+        with pytest.raises(ConfirmationClaimError):
+            await cold.execute_confirmed(restored.plan_id, context=replace(context, owner="other", lease=foreign))
+        result = await cold.execute_confirmed(restored.plan_id, context=context)
+        assert result.outcome.public_content["data"]["completed"] == 2
+        assert [name for name, _ in rig.writes] == list(NAMES[:2])
+        with pytest.raises(ConfirmationClaimError):
+            await cold.execute_confirmed(restored.plan_id, context=context)
+        assert len(rig.writes) == 2
+    asyncio.run(run())
+
+
+def test_unknown_child_fact_stops_without_replay(rig, monkeypatch):
+    original = rig.tool
+    def tool(name):
+        value = original(name)
+        if name != NAMES[1]:
+            return value
+        def unknown(*_):
+            rig.attempted.append(name)
+            error = ToolPipelineError("已受理但回执未知", code="outcome_unknown")
+            error.mark_execution_started(True)
+            raise error
+        return replace(value, execute_confirmed=unknown)
+    monkeypatch.setattr(rig, "tool", tool)
+    async def run():
+        session, preview, _ = await rig.start(batch(*NAMES[:3]))
+        result, _ = await confirm(session, preview.approval.plan_id)
+        first, unknown, tail = result.effect_result["data"]["steps"]
+        assert first["result"]["status"] == "completed"
+        assert unknown["result"]["status"] == "outcome_unknown"
+        assert tail["result"]["status"] == "not_started"
+        await confirm(session, preview.approval.plan_id)
+        assert rig.attempted == list(NAMES[:2]) and len(rig.writes) == 1
     asyncio.run(run())

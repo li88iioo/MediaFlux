@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import unicodedata
 from contextlib import closing
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -346,13 +347,16 @@ def record_hit(entry_id: int, *, success: bool | None = None) -> None:
         logger.debug("识别知识命中统计写入失败 type=%s", type(exc).__name__)
 
 
-def list_entries(*, keyword: str = "", knowledge_type: str = "", limit: int = 300) -> dict[str, Any]:
+def list_entries(*, keyword: str = "", knowledge_type: str = "", limit: int = 300,
+                 offset: int = 0) -> dict[str, Any]:
     ensure_seed_knowledge()
     keyword = (keyword or "").strip()[:160]
     knowledge_type = (knowledge_type or "").strip()
     if knowledge_type and knowledge_type not in _ALLOWED_TYPES:
         raise ValueError("知识类型无效")
     limit = max(1, min((limit or 300), 500))
+    if type(offset) is not int or offset < 0:
+        raise ValueError("分页偏移必须是非负整数")
     where: list[str] = []
     values: list[Any] = []
     if knowledge_type:
@@ -364,10 +368,12 @@ def list_entries(*, keyword: str = "", knowledge_type: str = "", limit: int = 30
         values.extend([pattern, pattern])
     clause = f" WHERE {' AND '.join(where)}" if where else ""
     with get_conn() as conn:
+        conn.execute("BEGIN")
+        total = conn.execute(f"SELECT COUNT(*) FROM recognition_knowledge{clause}", values).fetchone()[0]
         rows = conn.execute(
             f"SELECT * FROM recognition_knowledge{clause} "
-            "ORDER BY disabled ASC, source='user' DESC, source='learned' DESC, updated_at DESC LIMIT ?",
-            (*values, limit),
+            "ORDER BY disabled ASC, source='user' DESC, source='learned' DESC, updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*values, limit, offset),
         ).fetchall()
         summary_row = conn.execute(
             """
@@ -383,6 +389,9 @@ def list_entries(*, keyword: str = "", knowledge_type: str = "", limit: int = 30
     return {
         "items": [_row_dict(row) for row in rows],
         "summary": {key: int(summary_row[key] or 0) for key in summary_row.keys()},
+        "total": total, "offset": offset, "limit": limit,
+        "has_more": offset + len(rows) < total,
+        "next_offset": offset + len(rows) if offset + len(rows) < total else None,
     }
 
 
@@ -407,7 +416,37 @@ def _assert_no_alias_collision(
         raise ValueError(f"识别名称已被词条「{collision['canonical_value']}」使用")
 
 
-def create_entry(data: dict[str, Any]) -> dict[str, Any]:
+class KnowledgeConflict(ValueError):
+    """确认的业务行已改变，未执行写入。"""
+
+
+def entry_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
+    """业务版本不包含命中计数及其更新时间，避免统计写入使人工确认失效。"""
+    return {key: value for key, value in entry.items()
+            if key not in {"hit_count", "success_count", "conflict_count", "updated_at"}}
+
+
+def prepare_entry(operation: str, data: dict[str, Any], *, entry_id: int | None = None) -> dict[str, Any]:
+    """CRUD 的只读预检；最终校验仍在各自写事务内完成。"""
+    if operation not in {"create", "update", "delete"}:
+        raise ValueError("识别知识操作无效")
+    current = get_entry(entry_id) if entry_id is not None else None
+    if operation != "create" and current is None:
+        raise ValueError("识别知识不存在")
+    if operation == "delete":
+        assert current is not None
+        if current["source"] == "builtin":
+            raise ValueError("内置知识不能删除，可以将其停用")
+    else:
+        ensure_seed_knowledge()
+        normalized = _validate_values(data, existing=current)
+        with get_conn() as conn:
+            _assert_no_alias_collision(normalized["knowledge_type"], normalized["aliases"],
+                                       conn=conn, exclude_id=entry_id)
+    return {"before": current, "snapshot": entry_snapshot(current or {})}
+
+
+def create_entry(data: dict[str, Any], *, check_write: Callable[[Any], None] | None = None) -> dict[str, Any]:
     ensure_seed_knowledge()
     normalized = _validate_values({**data, "source": data.get("source") or "user"})
     timestamp = now()
@@ -417,6 +456,8 @@ def create_entry(data: dict[str, Any]) -> dict[str, Any]:
             _assert_no_alias_collision(
                 normalized["knowledge_type"], normalized["aliases"], conn=conn
             )
+            if check_write:
+                check_write(conn)
             cursor = conn.execute(
                 """
                 INSERT INTO recognition_knowledge(
@@ -443,7 +484,8 @@ def create_entry(data: dict[str, Any]) -> dict[str, Any]:
     return get_entry(entry_id) or {}
 
 
-def update_entry(entry_id: int, data: dict[str, Any]) -> dict[str, Any]:
+def update_entry(entry_id: int, data: dict[str, Any], *, expected_snapshot: dict | None = None,
+                 check_write: Callable[[Any], None] | None = None) -> dict[str, Any]:
     ensure_seed_knowledge()
     timestamp = now()
     try:
@@ -452,14 +494,20 @@ def update_entry(entry_id: int, data: dict[str, Any]) -> dict[str, Any]:
             row = conn.execute(
                 "SELECT * FROM recognition_knowledge WHERE id=?", (entry_id,)
             ).fetchone()
+            existing = _row_dict(row) if row else {}
+            if expected_snapshot is not None and entry_snapshot(existing) != expected_snapshot:
+                raise KnowledgeConflict("识别知识已变化，请重新预检")
             if not row:
                 raise ValueError("识别知识不存在")
-            existing = _row_dict(row)
             normalized = _validate_values(data, existing=existing)
+            if "confidence" not in data:
+                normalized["confidence"] = existing["confidence"]
             _assert_no_alias_collision(
                 normalized["knowledge_type"], normalized["aliases"],
                 conn=conn, exclude_id=entry_id,
             )
+            if check_write:
+                check_write(conn)
             conn.execute(
                 """
                 UPDATE recognition_knowledge SET
@@ -483,13 +531,21 @@ def update_entry(entry_id: int, data: dict[str, Any]) -> dict[str, Any]:
     return get_entry(entry_id) or {}
 
 
-def delete_entry(entry_id: int) -> bool:
-    existing = get_entry(entry_id)
-    if not existing:
-        return False
-    if existing["source"] == "builtin":
-        raise ValueError("内置知识不能删除，可以将其停用")
+def delete_entry(entry_id: int, *, expected_snapshot: dict | None = None,
+                 check_write: Callable[[Any], None] | None = None) -> bool:
+    ensure_seed_knowledge()
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM recognition_knowledge WHERE id=?", (entry_id,)).fetchone()
+        existing = _row_dict(row) if row else {}
+        if expected_snapshot is not None and entry_snapshot(existing) != expected_snapshot:
+            raise KnowledgeConflict("识别知识已变化，请重新预检")
+        if not existing:
+            return False
+        if existing["source"] == "builtin":
+            raise ValueError("内置知识不能删除，可以将其停用")
+        if check_write:
+            check_write(conn)
         cursor = conn.execute("DELETE FROM recognition_knowledge WHERE id=?", (entry_id,))
     _invalidate_cache()
     return cursor.rowcount == 1

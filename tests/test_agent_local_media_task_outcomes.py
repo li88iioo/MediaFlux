@@ -8,12 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from app import database as db
-from app.agent.domain_catalog import DomainActions
-from app.agent.domains.local_media.task_arguments import (
-    local_media_task_summaries_arguments,
-)
-from app.agent.errors import AgentToolError
+from app import database as db, sdk
+from app.modules.local_media_tasks import local_tasks, local_task
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.models import ToolContext, ToolResult
 from app.modules.local_media_outcomes import local_media_task_outcome
@@ -71,7 +67,6 @@ def test_task_outcome_only_retains_basename_and_bounded_names():
 
 class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
     def setUp(self):
-        self._domain_actions = DomainActions()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM local_media_operation_steps")
             conn.execute("DELETE FROM local_media_task_items")
@@ -123,10 +118,8 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
         return task_id
 
     def _list(self, **arguments):
-        return self._domain_actions.local_media.list_local_media_task_summaries(
-            local_media_task_summaries_arguments(arguments),
-            ToolContext(owner="owner-a", session_id="session-a"),
-        )
+        result = local_tasks(**arguments)
+        return ToolResult(True, result["status"], "本地任务事实", data=result)
 
     def _scan(self, task_ids, outcomes=None):
         return {
@@ -158,11 +151,11 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
                 if outcome == "preview_only":
                     db.update_local_media_task(task_id, warning="仅预览模式：未移动文件", owner="admin")
                 accepted = ToolResult(True, "accepted", "任务已重新排队",
-                    data={"task_number": 1}, model_data={"task_number": 1}, effect_metadata={
+                    data={"task_id": task_id}, model_data={"task_id": task_id}, effect_metadata={
                         "completion": {"kind": "local_media_task", "task_id": task_id,
-                            "task_number": 1, "operation": "retry"}})
+                            "operation": "retry"}})
                 result = asyncio.run(wait_for_effect_completion(accepted,
-                    tool="local_media.retry_task", context=ToolContext(), timeout_seconds=0))
+                    tool="local.retry", context=ToolContext(), timeout_seconds=0))
                 expected = {"file_outcome": outcome, "video_count": len(actions),
                     "archived_video_count": archived, "skipped_video_count": skipped,
                     "unknown_video_count": unknown}
@@ -180,12 +173,12 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
                     self.assertIn(f"冲突跳过 {skipped} 个视频", result.summary)
                 if not ok:
                     self.assertTrue(result.error)
-                self.assertNotIn("/private/", repr(result.to_dict()))
+                self.assertEqual(result.data["task_id"], task_id)
 
     def test_list_exposes_safe_original_name_and_conflict_result(self):
         self._task()
         result = self._list(scope="history")
-        item = result.data["tasks"][0]
+        item = result.data["items"][0]
         assert item["original_filename"] == "本集.mkv"
         assert item["status"] == "completed"
         assert item["file_outcome"] == "conflict_skipped"
@@ -193,8 +186,9 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
         assert item["skipped_video_count"] == 1
         assert item["updated_at"] == "2026-09-12 14:22:00"
         assert item["completed_at"] == "2026-09-12 14:22:00"
-        for secret in ("PRIVATE-HASH", "PRIVATE-ERROR", "/private/", "task_id"):
-            assert secret not in repr(result.data)
+        assert item["error"] == "PRIVATE-ERROR"
+        assert item["content_path"] == "/private/downloads/本集.mkv"
+        assert item["task_id"] == item["id"]
 
     def test_latest_scan_uses_only_its_members(self):
         old = self._task(name="昨天入库.mkv", action="move")
@@ -205,14 +199,13 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
             return_value=self._scan([current, waiting]),
         ):
             result = self._list(scope="latest_scan")
-        assert len(result.data["tasks"]) == 2
+        assert len(result.data["items"]) == 2
         assert result.data["scan_ref"] == "LM900"
-        assert {item["original_filename"] for item in result.data["tasks"]} == {
+        assert {item["original_filename"] for item in result.data["items"]} == {
             "本次冲突.mkv",
             "本次待确认.mkv",
         }
-        assert result.data["tasks"][0]["task_number"] == 1
-        assert result.data["tasks"][0]["task_number"] != current
+        assert result.data["items"][0]["task_id"] == current
         assert old != current
 
     def test_missing_scan_does_not_fall_back_to_history(self):
@@ -223,7 +216,7 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
         ):
             result = self._list(scope="latest_scan")
         assert result.status == "not_recorded"
-        assert result.data["tasks"] == []
+        assert result.data["items"] == []
         assert result.data["scan_recorded"] is False
 
     def test_deleted_scan_member_is_not_replaced_with_unrelated_history(self):
@@ -256,7 +249,7 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
             return_value=self._scan([task_id], [snapshot]),
         ):
             result = self._list(scope="skipped", scan_ref="LM900")
-        item = result.data["tasks"][0]
+        item = result.data["items"][0]
         assert item["status"] == "completed"
         assert item["current_status"] == "requires_manual"
         assert item["file_outcome"] == "conflict_skipped"
@@ -280,7 +273,7 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
             return_value=self._scan([task_id], [snapshot]),
         ):
             result = self._list(scope="latest_scan")
-        item = result.data["tasks"][0]
+        item = result.data["items"][0]
         assert item["status"] == "requires_manual"
         assert item["current_status"] == "failed"
         assert item["reason_code"] == "manual_match_required"
@@ -299,16 +292,16 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
                 status="planned",
             )
         result = self._list(scope="history", limit=1)
-        assert result.data["tasks"][0]["original_filename"] == "老ID最近更新.mkv"
+        assert result.data["items"][0]["original_filename"] == "老ID最近更新.mkv"
         all_result = self._list(scope="all", limit=1)
-        assert all_result.data["tasks"][0]["original_filename"] == "老ID最近更新.mkv"
+        assert all_result.data["items"][0]["original_filename"] == "老ID最近更新.mkv"
 
     def test_skipped_scope_uses_video_actions_not_rss_or_task_status(self):
         self._task(name="确实归档.mkv", action="move")
         self._task(name="冲突跳过.mkv", action="skip")
         self._task(name="尚未执行.mkv", status="planned", action="skip")
         result = self._list(scope="skipped")
-        assert [item["original_filename"] for item in result.data["tasks"]] == [
+        assert [item["original_filename"] for item in result.data["items"]] == [
             "冲突跳过.mkv"
         ]
 
@@ -342,57 +335,57 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
                 limit=20,
                 offset=first.data["next_offset"],
             )
-        assert first.data["total"] == 20
-        assert first.data["total_kind"] == "page_count"
-        assert first.data["matched_total"] == 25
+        assert first.data["total"] == 25
+        assert first.data["returned"] == 20
         assert first.data["has_more"]
         assert first.data["next_offset"] == 20
-        assert second.data["total"] == 5
-        assert second.data["matched_total"] == 25
+        assert second.data["total"] == 25
+        assert second.data["returned"] == 5
         assert second.data["missing_task_count"] == 1
         assert second.data["has_more"] is False
         assert second.data["next_offset"] is None
         names = {
             item["original_filename"]
-            for item in [*first.data["tasks"], *second.data["tasks"]]
+            for item in [*first.data["items"], *second.data["items"]]
         }
         assert len(names) == 25
-        item = second.data["tasks"][0]
-        assert item["task_number"] == 1
+        item = second.data["items"][0]
+        assert item["task_id"] == task_ids[20]
         assert item["status"] == "completed"
         assert item["current_status"] == "requires_manual"
         assert item["file_outcome"] == "conflict_skipped"
         assert item["can_inspect"]
-        _, selected_task = self._domain_actions.local_media._current_task("owner-a", "session-a", 1)
-        assert selected_task.id == task_ids[20]
-        assert selected_task.status == "requires_manual"
+        selected = local_task(item["task_id"])["task"]
+        assert selected["id"] == task_ids[20] and selected["status"] == "requires_manual"
 
     def test_history_pagination_uses_limit_plus_one_without_claiming_global_total(self):
         for index in range(25):
             self._task(name=f"历史分页-{index}.mkv")
         first = self._list(scope="history", limit=20)
         second = self._list(scope="history", limit=20, offset=first.data["next_offset"])
-        assert first.data["total"] == 20
+        assert first.data["total"] == 25
+        assert first.data["returned"] == 20
         assert first.data["has_more"]
         assert "matched_total" not in first.data
-        assert second.data["total"] == 5
+        assert second.data["total"] == 25
+        assert second.data["returned"] == 5
         assert second.data["has_more"] is False
         assert second.data["next_offset"] is None
         assert (
             len(
                 {
                     item["original_filename"]
-                    for item in [*first.data["tasks"], *second.data["tasks"]]
+                    for item in [*first.data["items"], *second.data["items"]]
                 }
             )
             == 25
         )
 
     def test_offset_validator_rejects_invalid_offsets(self):
-        for value in (True, -1, "20", 2_147_483_648):
-            with pytest.raises(AgentToolError):
-                local_media_task_summaries_arguments({"offset": value})
+        for value in (True, -1, "20"):
+            with pytest.raises(ValueError):
+                local_tasks(**sdk.prepare_sdk_method("local.tasks", {"offset": value}, owner="test"))
 
     def test_scan_ref_validator_rejects_paths(self):
-        with pytest.raises(AgentToolError):
-            local_media_task_summaries_arguments({"scan_ref": "/private/LM900"})
+        with pytest.raises(ValueError):
+            local_tasks(scan_ref="/private/LM900")

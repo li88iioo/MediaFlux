@@ -27,15 +27,19 @@ class AgentShellBrowserCase(InitializedWebTestCase):
 
         db.init_db()
         case = page_support.AgentPageTests('test_authenticated_agent_renders_stable_semantic_shell')
-        case.setUp()
         try:
-            case._login()
-            response = case.client.get('/agent', follow_redirects=False)
-            if response.status_code != 200:
-                raise AssertionError(f'Agent 页面夹具加载失败: {response.status_code}')
-            cls.html = response.text
+            case.setUp()
+            try:
+                case._login()
+                response = case.client.get('/agent', follow_redirects=False)
+                if response.status_code != 200:
+                    raise AssertionError(f'Agent 页面夹具加载失败: {response.status_code}')
+                cls.html = response.text
+            finally:
+                case.tearDown()
         finally:
-            case.tearDown()
+            if not case.doCleanups():
+                raise AssertionError('页面夹具注册清理失败')
         browser_support.AgentKernelBrowserTests.setUpClass.__func__(cls)
         cls.static_root = Path(os.getenv('MEDIAFLUX_BROWSER_STATIC_ROOT') or browser_support.ROOT / 'app/static').resolve()
 

@@ -3,9 +3,9 @@
 import json
 from unittest.mock import patch
 
-from app import config
+from app import config, sdk
 from app import database as db
-from app.agent.action_history import action_history_owner_digest
+from app.database import media_owner_digest
 from app.agent.errors import AgentToolError
 from app.agent.owner_routes import web_kernel_owner
 from app.repositories.media_experience import get_media_preferences
@@ -28,24 +28,24 @@ class ClosureKernelTests(InitializedWebTestCase):
         self,
     ):
         owner = "test-closure-owner"
-        digest = action_history_owner_digest(owner)
+        digest = media_owner_digest(owner)
         plan = self.kernel.prepare(
-            "media.set_preferences", {"preferred_download_target": "qb"}, owner=owner
+            "preferences.update", {"preferred_download_target": "qb"}, owner=owner
         )
         self.assertFalse(get_media_preferences(digest)["explicit"])
         result = self.kernel.confirm(plan["action_plan"]["plan_id"], owner=owner)
         self.assertTrue(result["result"]["ok"])
-        reference = result["result"]["reference_arguments"]["undo_receipt_ref"]
+        receipt = result["result"]["data"]["receipt_id"]
         self.assertNotIn("compensation_after", json.dumps(result))
         self.assertNotIn("revision_token", json.dumps(result))
         with self.assertRaises(AgentToolError):
             self.kernel.prepare(
-                "action.undo.execute",
-                {"undo_receipt_ref": reference},
+                "activity.undo",
+                {"receipt_id": receipt},
                 owner="another-owner",
             )
         undo = self.kernel.prepare(
-            "action.undo.execute", {"undo_receipt_ref": reference}, owner=owner
+            "activity.undo", {"receipt_id": receipt}, owner=owner
         )
         self.assertEqual(
             get_media_preferences(digest)["preferred_download_target"], "qb"
@@ -56,7 +56,7 @@ class ClosureKernelTests(InitializedWebTestCase):
         with self.assertRaises(AgentToolError):
             self.kernel.confirm(undo["action_plan"]["plan_id"], owner=owner)
 
-    def test_activity_selection_follow_and_stop_use_same_confirmation_path(self):
+    def test_activity_id_follow_and_stop_use_same_confirmation_path(self):
         owner = web_kernel_owner("follow-kernel-owner")
         request_id, _ = db.create_download_request(
             "kernel-follow", "magnet", title="下载纵切示例"
@@ -74,19 +74,14 @@ class ClosureKernelTests(InitializedWebTestCase):
                 ),
             ),
         ):
-            found = self.kernel.invoke(
-                "activity.search", {"query": "下载纵切示例"}, owner=owner
-            )
-            reference = found["result"]["reference_arguments"]["activity_selection_ref"]
-            timeline = self.kernel.invoke(
-                "activity.timeline", {"activity_selection_ref": reference}, owner=owner
-            )
-            self.assertEqual(
-                timeline["result"]["data"]["freshness"], "persisted_snapshot"
-            )
+            found = sdk.activity.search("下载纵切示例")
+            selected = found["items"][0]
+            self.assertEqual(selected["id"], request_id)
+            timeline = sdk.activity.timeline(selected["kind"], selected["id"])
+            self.assertEqual(timeline["data"]["freshness"], "persisted_snapshot")
             prepared = self.kernel.prepare(
                 "activity.follow",
-                {"activity_selection_ref": reference, "hours": 2},
+                {"kind": "download", "identifier": request_id, "hours": 2},
                 owner=owner,
             )
             with db.get_conn() as conn:

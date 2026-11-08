@@ -14,11 +14,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.public_safety import public_tool_label
 from app.agent.public_view import format_partial_progress, public_conversation_messages
 from tests.support import isolated_test_database
-from tests.test_agent_kernel_core import (
-    AgentInput, AgentSession, CapabilityRetriever, KernelToolSpec, ModelEvent,
-    ModelEventType, ModelToolCall, ScriptedModel, ToolCatalog, ToolEffect,
-    ToolPipeline, ToolPipelineError, consume_events,
-)
+from tests.test_agent_kernel_core import AgentInput, AgentSession, KernelToolSpec, ModelEvent, ModelEventType, ModelToolCall, ScriptedModel, ToolCatalog, ToolEffect, ToolPipeline, ToolPipelineError, consume_events
 
 
 @pytest.fixture
@@ -160,7 +156,7 @@ def test_native_read_analysis_survives_sqlite_cold_public_history(saved_read, mo
             effect=ToolEffect.READ, read=read,
         )])
         store = SQLiteKernelStore(secret_provider=lambda: "partial-read-offline")
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store, journal=store)
         final = await consume_events(session.run(AgentInput(
             message=saved_read["request_text"], owner="offline", session_id="read-analysis")))
@@ -173,7 +169,7 @@ def test_native_read_analysis_survives_sqlite_cold_public_history(saved_read, mo
         events = await cold_store.list_events(owner="offline", session_id="read-analysis")
         terminal = [event for event in events if event["type"] == "turn.completed"][-1]
         assert terminal["payload"]["status"] == "partial"
-        assert terminal["payload"]["finish_reason"] == ("rate_limited" if with_analysis else "empty_model_response")
+        assert terminal["payload"]["finish_reason"] == ("end_turn" if with_analysis else "empty_model_response")
         assert sum(event["type"] == "tool.completed" for event in events) == 8
         failures = [event for event in events if event["type"] == "tool.failed"]
         assert len(failures) == 5 and all(event["payload"]["code"] == "rate_limited" for event in failures)
@@ -182,7 +178,7 @@ def test_native_read_analysis_survives_sqlite_cold_public_history(saved_read, mo
         assert cold.conversation[-1]["content"] == restored[-1]["content"] == final.answer
         for answer in (final.answer, restored[-1]["content"]):
             if with_analysis:
-                assert_verified_analysis(answer)
+                assert answer == body
             else:
                 assert_partial_read(answer)
                 assert "测试收藏241" in answer and "测试收藏230" in answer

@@ -262,20 +262,30 @@ def infer_media_source(value: object) -> str:
 def infer_dynamic_ranges(value: object) -> tuple[str, ...]:
     """保留发布名明确声明的组合格式；没有标签不等于 SDR。"""
     lowered = str(value or "").casefold()
-    compact = re.sub(r"[^a-z0-9+]", "", lowered)
+
+    def tagged(pattern):
+        return re.search(rf"(?<![a-z0-9])(?:{pattern})(?![a-z0-9])", lowered)
+
     ranges = []
-    if "dolbyvision" in compact or "dovi" in compact or re.search(r"(?:^|[._ /-])dv(?:[._ /-]|$)", lowered):
+    if tagged(r"dolby[ ._-]*vision|do[ ._-]*vi|dv|杜比视界"):
         ranges.append("DoVi")
-    if "hdr10+" in lowered or "hdr10plus" in compact:
+    if tagged(r"hdr[ ._-]*10[ ._-]*(?:\+|plus)"):
         ranges.append("HDR10+")
-    elif "hdr10" in compact:
+    elif tagged(r"hdr[ ._-]*10"):
         ranges.append("HDR10")
-    elif re.search(r"(?:^|[._ /-])hdr(?:[._ /-]|$)", lowered):
+    elif tagged("hdr"):
         ranges.append("HDR")
     for tag in ("HLG", "SDR"):
-        if re.search(rf"(?:^|[._ /-]){tag.lower()}(?:[._ /-]|$)", lowered):
+        if tagged(tag.lower()):
             ranges.append(tag)
     return tuple(ranges)
+
+
+def release_dynamic_range_evidence(value: object) -> dict[str, object]:
+    """公开发布标题的动态范围声明；缺失为未知，不代表媒体流核验。"""
+    ranges = infer_dynamic_ranges(value)
+    return {"basis": "release_title_only", "stream_verified": False,
+            "dynamic_range": ranges[0] if ranges else None, "dynamic_ranges": list(ranges)}
 
 
 def infer_media_profile(value: object) -> MediaProfile:

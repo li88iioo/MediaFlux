@@ -12,6 +12,7 @@ from unittest.mock import patch
 from app import database
 from app.discovery.cache import DiscoveryCache
 from app.discovery.models import DiscoveryPage, MediaCard, ProviderHealth
+from app.repositories import discovery as discovery_repository
 
 
 class DiscoveryModelTests(unittest.TestCase):
@@ -44,6 +45,9 @@ class DiscoveryModelTests(unittest.TestCase):
         self.assertIsNone(card.number_of_seasons)
         self.assertIsNone(card.number_of_episodes)
         self.assertIsNone(card.seasons)
+        self.assertIsNone(card.origin_country)
+        self.assertIsNone(card.original_language)
+        self.assertIsNone(card.genre_ids)
 
     def test_cached_page_normalizes_json_scalars_without_mutating_payload(self):
         payload = json.loads('''{
@@ -197,6 +201,50 @@ class DiscoveryDatabaseTests(unittest.TestCase):
                 self.assertEqual((row["tmdb_id"], row["confirmed"]), ("550", 1))
 
 
+    def test_watchlist_conditions_cover_hidden_metadata_and_recreated_rows(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch("app.database.DB_PATH", Path(root) / "discovery.db"):
+                database.init_db()
+                number = discovery_repository.add_media_watchlist(
+                    "tmdb", "42", "tv", "Original", "2026", "poster", expected_absent=True,
+                )
+                self.assertIsNotNone(number)
+                snapshot = discovery_repository.media_watchlist_snapshot(database.get_media_watchlist_by_id(number))
+                self.assertIsNone(discovery_repository.add_media_watchlist(
+                    "tmdb", "42", "tv", "Overwrite", expected_absent=True,
+                ))
+                saved = database.get_media_watchlist_by_id(number)
+                assert saved is not None
+                self.assertEqual(saved["title"], "Original")
+                with database.get_conn() as conn:
+                    conn.execute("UPDATE media_watchlist SET poster_key=? WHERE id=?", ("new-poster", number))
+                self.assertFalse(discovery_repository.delete_media_watchlist(
+                    "tmdb", "42", "tv", expected_snapshot=snapshot,
+                ))
+                current = discovery_repository.media_watchlist_snapshot(database.get_media_watchlist_by_id(number))
+                with database.get_conn() as conn:
+                    conn.execute("UPDATE media_watchlist SET external_id='43' WHERE id=?", (number,))
+                self.assertFalse(discovery_repository.delete_media_watchlist(
+                    "tmdb", "43", "tv", expected_snapshot=current,
+                ))
+                with database.get_conn() as conn:
+                    conn.execute("UPDATE media_watchlist SET external_id='42' WHERE id=?", (number,))
+                self.assertTrue(database.delete_media_watchlist("tmdb", "42", "tv"))
+                replacement = discovery_repository.add_media_watchlist("tmdb", "42", "tv", "Original", "2026", "poster")
+                assert replacement is not None
+                self.assertNotEqual(replacement, number)
+                self.assertFalse(discovery_repository.delete_media_watchlist(
+                    "tmdb", "42", "tv", expected_snapshot=snapshot,
+                ))
+                current = discovery_repository.media_watchlist_snapshot(database.get_media_watchlist_by_id(replacement))
+                self.assertTrue(discovery_repository.delete_media_watchlist(
+                    "tmdb", "42", "tv", expected_snapshot=current,
+                ))
+                self.assertFalse(discovery_repository.delete_media_watchlist(
+                    "tmdb", "42", "tv", expected_snapshot=current,
+                ))
+
+
 class DiscoveryCacheTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -235,9 +283,13 @@ class DiscoveryCacheTests(unittest.TestCase):
 
         self.assertEqual(
             self.cache.get_detail_metadata([douban, tmdb]),
-            {douban: {"year": "2026", "release_date": "2026-03-04"}},
+            {douban: {"year": "2026", "release_date": "2026-03-04", "stale": False}},
         )
-        self.now += timedelta(seconds=121)
+        self.now += timedelta(seconds=61)
+        self.assertEqual(self.cache.get_detail_metadata([douban]), {
+            douban: {"year": "2026", "release_date": "2026-03-04", "stale": True},
+        })
+        self.now += timedelta(seconds=60)
         self.assertEqual(self.cache.get_detail_metadata([douban]), {})
 
     def test_detail_metadata_ignores_malformed_or_mismatched_cache_payload(self):

@@ -12,8 +12,8 @@ class WorkspaceHandoffBrowserTests(AgentShellBrowserCase):
             window.__kernelConfig.queryDelayMs = 60;
             window.__kernelConfig.queryEvents = [
                 {type: 'turn.started', payload: {channel: 'web', generation: 1}},
-                {type: 'tool.started', payload: {tool: 'downloads.diagnose_queue', call_id: 'read-1', effect: 'read'}},
-                {type: 'tool.completed', payload: {tool: 'downloads.diagnose_queue', call_id: 'read-1', result: {ok: true, summary: '检查完成'}}},
+                {type: 'tool.started', payload: {tool: 'downloads.diagnose', call_id: 'read-1', effect: 'read'}},
+                {type: 'tool.completed', payload: {tool: 'downloads.diagnose', call_id: 'read-1', result: {ok: true, summary: '检查完成'}}},
                 {type: 'turn.completed', payload: {status: 'success', answer: '当前队列检查完成。'}},
             ];
             window.__handoffBodies = [];

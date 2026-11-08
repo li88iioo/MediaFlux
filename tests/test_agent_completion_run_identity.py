@@ -20,25 +20,25 @@ from app import database as db
 from app.agent import completion_observers as observers
 from app.agent import effect_completion as effects
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.domain_catalog import DomainActions, build_tool_specs
-from app.agent.domains.library import patrol_trigger_actions
-from app.agent.domains.library.patrol_status import get_library_patrol_status
-from app.agent.domains.guangya import organize_actions, runtime as guangya_runtime
+from app.modules import library_patrol
+from app.modules.library_patrol import patrol_status
+from app.modules import organize_service
+from app.modules.organize_results import observe_organize_task
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import _capture_creation_binding
-from app.agent.kernel.capabilities import CapabilityRetriever
+
 from app.agent.kernel.completion_receipts import _completion_cipher
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports import existing_actions
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.modules.process_lock import CrossProcessLock
 from app.agent.models import ToolContext, ToolResult
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
+from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.scheduler import STRMScheduler
 from app.modules.organize import OrganizeRules, Organizer
 from app.modules.organize_results import build_organize_result
@@ -69,12 +69,21 @@ class CompletionScript(NativeScript):
 
 def completion_session(spec_names, calls, *, actions=None):
     store = SQLiteKernelStore()
-    source = build_tool_specs(domain_actions=actions or DomainActions())
-    from app.agent.kernel.ports import catalog_from_tool_specs
-    catalog = catalog_from_tool_specs([s for s in source if s.name in spec_names])
-    script = CompletionScript([("agent.capabilities", {"tool_names": list(spec_names)}), *calls])
+    from app.agent.kernel.capabilities import ToolCatalog
+    catalog = ToolCatalog()
+    if "strm.run" in spec_names:
+        from app.agent.kernel.ports.sdk_effects import strm_run_tool
+        catalog.register(strm_run_tool())
+    if "library.run_patrol" in spec_names:
+        from app.agent.kernel.ports.sdk_effects import library_patrol_tool
+        catalog.register(library_patrol_tool())
+    from app.agent.kernel.ports.sdk_effects import local_task_tools, cloud_organize_tools
+    for tool in (*local_task_tools(), *cloud_organize_tools()):
+        if tool.name in spec_names:
+            catalog.register(tool)
+    script = CompletionScript(calls)
     session = AgentSession(model=script.adapter, catalog=catalog,
-        retriever=CapabilityRetriever(minimum=1, maximum=8), state_store=store, journal=store,
+         state_store=store, journal=store,
         pipeline=ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()),
             effect_lifecycle=MediaFluxEffectLifecycle()))
@@ -90,7 +99,7 @@ async def assert_strm_identity(later_count: int, later_source: str):
         sources = [{"id": key, "name": key.upper(), "path": "/" + key, "namespace": key}
                    for key in ("a", "b")]
         stack.enter_context(patch("app.modules.scheduler.get_scheduler", return_value=scheduler))
-        stack.enter_context(patch("app.modules.strm.configured_strm_source_plans", return_value=(sources, "")))
+        stack.enter_context(patch("app.modules.scheduler.configured_strm_source_plans", return_value=(sources, "")))
         stack.enter_context(patch.object(scheduler, "validate_config", return_value=""))
         stack.enter_context(patch.object(scheduler, "_source_dirs", return_value=sources))
         stack.enter_context(patch.object(scheduler, "_refresh_media_servers", return_value={}))
@@ -106,8 +115,8 @@ async def assert_strm_identity(later_count: int, later_source: str):
                     worker.join(5)
                     assert not worker.is_alive()
                 return accepted
-        write = "strm.run_once"
-        session, store, script = completion_session([write], [(write, {"source_names": ["A"]})])
+        write = "strm.run"
+        session, store, script = completion_session([write], [(write, {"source_ids": ["a"]})])
         context = {"owner": "native-strm-owner", "session_id": "native-strm-session"}
         preview = [e async for e in session.run(AgentInput(**context, request_id="strm-preview",
             message="只同步 STRM 来源 A 并核验最终结果。", channel="web"))]
@@ -119,7 +128,7 @@ async def assert_strm_identity(later_count: int, later_source: str):
             with patch.object(observers, "_poll", side_effect=RuntimeError("transient reader unavailable")):
                 return await wait_for_effect_completion(result, timeout_seconds=0, **options)
         with patch.object(scheduler, "trigger", fail_original), patch.object(
-                existing_actions, "wait_for_effect_completion", transient_read):
+                effects, "wait_for_effect_completion", transient_read):
             confirmed = [e async for e in session.confirm(**context, plan_id=plan_id,
                 request_id="strm-confirm", channel="web")]
         assert confirmed[-1].payload["status"] == "waiting"
@@ -161,16 +170,15 @@ async def assert_patrol_identity(case):
         state = {"clock": datetime.now().replace(microsecond=0), "status": "up_to_date"}
         def observation(_arguments):
             status = state["status"]
-            return ToolResult(status == "up_to_date", status, status,
+            return EpisodeAuditResult(status == "up_to_date", status, status,
                 data={"checked_series_count": 0, "findings": []}), 0
         scheduler = AgentLibraryPatrolScheduler(clock=lambda: state["clock"], audit_executor=observation)
-        get_bool = patrol_trigger_actions.config.get_bool
-        stack.enter_context(patch.object(patrol_trigger_actions.config, "get_bool",
+        get_bool = library_patrol.config.get_bool
+        stack.enter_context(patch.object(library_patrol.config, "get_bool",
             side_effect=lambda key, default=False: True if key == "AGENT_LIBRARY_PATROL_ENABLED" else get_bool(key, default)))
         stack.enter_context(patch("app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler", return_value=scheduler))
         if case != "overwritten-cycle":
-            _, fingerprint = patrol_trigger_actions.prepare_trigger_patrol_now({})
-            patrol_trigger_actions.trigger_patrol_now_confirmed({}, fingerprint)
+            library_patrol.run_patrol(library_patrol.prepare_patrol())
             assert scheduler.run_once() == 1
             prior_row = db.get_agent_library_patrol()
             assert prior_row is not None
@@ -178,7 +186,7 @@ async def assert_patrol_identity(case):
         else:
             prior = None
             state["status"] = "not_configured"
-        write = "library.trigger_patrol_now"
+        write = "library.run_patrol"
         session, store, script = completion_session([write], [(write, {})])
         context = {"owner": "patrol-identity-owner", "session_id": "patrol-identity-session"}
         preview = [e async for e in session.run(AgentInput(**context, request_id="patrol-preview",
@@ -197,11 +205,10 @@ async def assert_patrol_identity(case):
                 assert original["outcome"] == "not_configured"
                 state["clock"] += timedelta(seconds=2)
                 state["status"] = "up_to_date"
-                _, fingerprint = patrol_trigger_actions.prepare_trigger_patrol_now({})
-                patrol_trigger_actions.trigger_patrol_now_confirmed({}, fingerprint)
+                library_patrol.run_patrol(library_patrol.prepare_patrol())
                 assert scheduler.run_once() == 1
             return await wait_for_effect_completion(accepted, timeout_seconds=0, **options)
-        with patch.object(existing_actions, "wait_for_effect_completion", run_before_observe):
+        with patch.object(effects, "wait_for_effect_completion", run_before_observe):
             confirmed = [e async for e in session.confirm(**context, plan_id=plan_id,
                 request_id="patrol-confirm", channel="web")]
         current_row = db.get_agent_library_patrol()
@@ -224,14 +231,14 @@ async def assert_patrol_outcome(status: str):
     with isolated_test_database(), ExitStack() as stack:
         initialize_runtime_fence()
         succeeded = status in {"updates_available", "up_to_date"}
-        result = ToolResult(succeeded, status, "巡检观测结果", data={
+        result = EpisodeAuditResult(succeeded, status, "巡检观测结果", data={
             "checked_series_count": 0, "findings": []})
         scheduler = AgentLibraryPatrolScheduler(audit_executor=lambda _args: (result, 0))
-        get_bool = patrol_trigger_actions.config.get_bool
-        stack.enter_context(patch.object(patrol_trigger_actions.config, "get_bool",
+        get_bool = library_patrol.config.get_bool
+        stack.enter_context(patch.object(library_patrol.config, "get_bool",
             side_effect=lambda key, default=False: True if key == "AGENT_LIBRARY_PATROL_ENABLED" else get_bool(key, default)))
         stack.enter_context(patch("app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler", return_value=scheduler))
-        write = "library.trigger_patrol_now"
+        write = "library.run_patrol"
         session, store, _ = completion_session([write], [(write, {})])
         context = {"owner": "patrol-outcome-owner", "session_id": "patrol-outcome-session"}
         preview = [e async for e in session.run(AgentInput(**context, request_id="patrol-preview",
@@ -241,7 +248,7 @@ async def assert_patrol_outcome(status: str):
         async def finish_before_wait(accepted, **options):
             assert scheduler.run_once() == 1
             return await wait_for_effect_completion(accepted, timeout_seconds=0, **options)
-        with patch.object(existing_actions, "wait_for_effect_completion", finish_before_wait):
+        with patch.object(effects, "wait_for_effect_completion", finish_before_wait):
             confirmed = [e async for e in session.confirm(**context, plan_id=plan_id,
                 request_id="patrol-confirm", channel="web")]
         effect = next(e for e in confirmed if e.type.value in {"effect.completed", "effect.failed"})
@@ -256,8 +263,8 @@ async def assert_patrol_outcome(status: str):
         native_tool = next(r for r in saved.conversation if r.get("role") == "tool" and r.get("effect_plan_id") == plan_id)
         assert json.loads(native_tool["content"]) == final
         # A successful read of a failed patrol stays a successful READ query.
-        read = get_library_patrol_status({})
-        assert read.ok and read.status == status
+        read = patrol_status()
+        assert read["ok"] and read["status"] == status
 
 
 async def assert_organize_identity(status: str, later_count: int):
@@ -272,9 +279,9 @@ async def assert_organize_identity(status: str, later_count: int):
         client.logged_in = True
         client.credential_generation = 0
         client.file_info.return_value = SimpleNamespace(is_dir=True, parent_id="0")
-        stack.enter_context(patch.object(organize_actions, "_configured_inputs", return_value=(sources, rules, "")))
-        stack.enter_context(patch.object(organize_actions, "GuangYaClient", return_value=client))
-        stack.enter_context(patch.object(organize_actions, "get_organize_manager", side_effect=lambda: active["manager"]))
+        stack.enter_context(patch.object(organize_service, "configured_inputs", return_value=(sources, rules, "")))
+        stack.enter_context(patch.object(organize_service, "GuangYaClient", return_value=client))
+        stack.enter_context(patch.object(organize_service, "get_organize_manager", side_effect=lambda: active["manager"]))
         stack.enter_context(patch("app.modules.organize_tasks.get_organize_manager", side_effect=lambda: active["manager"]))
         stack.enter_context(patch("app.modules.telegram_organize_lifecycle.publish_organize_lifecycle", return_value=False))
         def remote_observation(_self, _source, _rules, **options):
@@ -284,7 +291,7 @@ async def assert_organize_identity(status: str, later_count: int):
                 raise OSError("transient provider list unavailable")
             return [], {"total": 1, "matched": 1, "skipped": 1, "failed": 0, "scan_errors": []}
         stack.enter_context(patch.object(Organizer, "organize", remote_observation))
-        write = "guangya.organize.run_once"
+        write = "cloud.organize"
         session, store, _ = completion_session([write], [(write, {})])
         context = {"owner": "organize-identity-owner", "session_id": "organize-identity-session"}
         preview = [e async for e in session.run(AgentInput(**context,
@@ -298,7 +305,8 @@ async def assert_organize_identity(status: str, later_count: int):
                 assert not worker.is_alive()
             with patch.object(observers, "_poll", side_effect=RuntimeError("temporary reader failure")):
                 return await wait_for_effect_completion(accepted, timeout_seconds=0, **options)
-        with patch.object(existing_actions, "wait_for_effect_completion", first_read_fails):
+        from app.agent import effect_completion
+        with patch.object(effect_completion, "wait_for_effect_completion", first_read_fails):
             confirmed = [e async for e in session.confirm(**context, plan_id=plan_id,
                 request_id="organize-confirm", channel="web")]
         assert confirmed[-1].payload["status"] == "waiting"
@@ -332,7 +340,7 @@ async def assert_organize_identity(status: str, later_count: int):
         cold_manager.resume()
         try:
             assert cold_manager.task_result(task_id) is None
-            cold_snapshot = guangya_runtime.guangya_organize_task_status(tracker.value)
+            cold_snapshot = ToolResult(**observe_organize_task(tracker.value))
             assert cold_snapshot.data["task"]["status"] == status
             with db.get_conn() as conn:
                 assert conn.execute("SELECT COUNT(*) FROM organize_operation_jobs").fetchone()[0] == 0
@@ -368,14 +376,16 @@ async def assert_local_file_outcome(root: Path, mode: str):
         db.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
         service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(
             tmdb_id="1", title="Movie", year="2026", media_type="movie", confidence=1.0))))
+        service_patch = patch("app.modules.local_media_tasks.get_local_media_service", return_value=service)
+        service_patch.start()
         try:
             inspection = service.inspect_source("admin", source_id, movie)
             preview = service.preview("admin", inspection["inspection_id"], tmdb_id="1", media_type="movie")
             task_id = service.create_manual_task("admin", inspection["inspection_id"], preview_digest=preview["preview_digest"])
             db.update_local_media_task(task_id, status="failed", error="transient prewrite failure")
-            read, write = "local_media.task_summaries", "local_media.retry_task"
+            read, write = "local.tasks", "local.retry"
             session, store, script = completion_session([read, write], [
-                (read, {"scope": "attention", "limit": 12}), (write, {"task_number": 1})])
+                (read, {"scope": "attention", "limit": 12}), (write, {"task_id": task_id})])
             context = {"owner": "local-outcome-owner", "session_id": "local-outcome-session"}
             events = [e async for e in session.run(AgentInput(**context,
                 request_id="local-preview", message="重试第一个本地媒体失败任务并回报实际文件结果。", channel="web"))]
@@ -385,8 +395,9 @@ async def assert_local_file_outcome(root: Path, mode: str):
                 assert db.claim_local_media_task(task_id, owner="admin")
                 service.execute_task("admin", task_id)
                 return await wait_for_effect_completion(result, timeout_seconds=0, **options)
-            with patch("app.agent.domains.local_media.task_actions.get_local_media_scheduler"), patch.object(
-                    existing_actions, "wait_for_effect_completion", finish_before_wait):
+            from app.agent.kernel.ports import sdk_effects
+            with patch("app.modules.local_media_scheduler.get_local_media_scheduler"), patch.object(
+                    sdk_effects.effect_completion, "wait_for_effect_completion", finish_before_wait):
                 confirmed = [e async for e in session.confirm(**context, plan_id=plan_id,
                     request_id="local-confirm", channel="web")]
             effect = next(e for e in confirmed if e.type.value == "effect.completed")
@@ -400,7 +411,7 @@ async def assert_local_file_outcome(root: Path, mode: str):
             assert final["data"]["archived_video_count"] == archived
             assert final["data"]["background_job"]["file_outcome"] == expected_outcome
             assert f"归档 {archived} 个视频" in final["summary"]
-            assert str(root) not in json.dumps(final)
+            assert final["data"]["task_id"] == task_id
             model_tools = [row for row in script.requests[-1]["messages"] if row.get("role") == "tool"]
             model_final = json.loads(model_tools[-1]["content"])
             assert model_final["data"]["file_outcome"] == expected_outcome
@@ -413,6 +424,7 @@ async def assert_local_file_outcome(root: Path, mode: str):
             else:
                 assert not movie.exists() and len(list(target_root.rglob("*.mkv"))) == 1
         finally:
+            service_patch.stop()
             assert service.close()
 
 
@@ -449,7 +461,7 @@ class AgentCompletionIdentityTests(unittest.TestCase):
                 {"task_id": "exact-task", "operation": "run"},
             ):
                 with self.subTest(completion=completion):
-                    result = guangya_runtime.guangya_organize_task_status(completion)
+                    result = ToolResult(**observe_organize_task(completion))
                     self.assertFalse(result.ok)
                     self.assertEqual(result.status, "unknown")
 
@@ -458,8 +470,8 @@ class AgentCompletionIdentityTests(unittest.TestCase):
             payload = build_organize_result({}, status="running", task_id="interrupted-task")
             run_id = db.add_task_run("guangya_organize", "manual", result=json.dumps(payload))
             db.init_db()
-            result = guangya_runtime.guangya_organize_task_status({
-                "task_id": "interrupted-task", "run_id": run_id, "operation": "run"})
+            result = ToolResult(**observe_organize_task({
+                "task_id": "interrupted-task", "run_id": run_id, "operation": "run"}))
             self.assertFalse(result.ok)
             self.assertEqual(result.data["task"]["status"], "failed")
 

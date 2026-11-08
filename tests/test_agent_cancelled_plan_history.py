@@ -17,12 +17,7 @@ import pytest
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import consume_events
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.model import ModelEvent, ModelToolCall
@@ -260,7 +255,6 @@ def test_late_ordinary_read_checkpoint_keeps_same_generation_cancellation(runtim
             effect=ToolEffect.READ, read=read,
         )
         runtime.catalog.register(tool)
-        runtime.session.retriever = CapabilityRetriever(minimum=2, maximum=2)
         plan_id = await preview(runtime)
         runtime.once_call = True
         runtime.call_name, runtime.call_arguments = tool.model_name, "{}"

@@ -10,10 +10,9 @@ from app.agent.errors import ToolPipelineError
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput, CancellationToken, PublicationLease
 from app.agent.kernel.tool_calls import ToolCallContext
@@ -23,6 +22,7 @@ from tests.test_agent_read_wait_lifecycle import (
     OWNER,
     Quota,
     WaitScript,
+    build_wait_runtime,
     parked_runtime,
 )
 from tests.test_agent_read_wait_lifecycle import (
@@ -118,7 +118,7 @@ def test_real_authorization_changes_block_wait_stream(tg_config, change):
     clock = [100]
     owner, sid = 'tg:v1:-100123\x1f7', 'actual-tg'
     script = WaitScript()
-    runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
+    runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
     runtime.session.continuation_binding = _capture_creation_binding()
     runtime.session.pipeline.rate_limiter = Quota()
 
@@ -174,7 +174,7 @@ def test_legacy_policy_absence_never_infers_telegram_authority(tg_config, telegr
         sid = 'legacy-policy'
         script = WaitScript()
         store = SQLiteKernelStore(clock=lambda: clock[0])
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=store)
+        runtime = build_wait_runtime(model=script.adapter, store=store)
         runtime.session.continuation_binding = _capture_creation_binding()
         runtime.session.pipeline.rate_limiter = Quota()
         write = store._write_state

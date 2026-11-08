@@ -1,6 +1,6 @@
 # Media Agent：架构、配置与使用实战
 
-> 核对日期：2026-09-14。本文描述当前 `main` 的实现，不是未来架构提案。完整工具名称、风险等级和 Provider 操作见 [Agent 工具与能力参考](09_Agent工具与能力参考.md)。
+> 核对日期：2026-11-06。本文描述当前源码的实现；实际部署能力取决于镜像版本。完整 SDK 方法、风险等级和操作边界见 [Agent 工具与能力参考](09_Agent工具与能力参考.md)。
 >
 > **工具已注册 ≠ 外部服务已配置 ≠ 本次请求一定成功。** 模型负责理解和选择，真实结果由领域服务提供；写入受后端确认机制约束。
 
@@ -18,7 +18,17 @@ Media Agent 是现有媒体业务的自然语言入口，不是第二套下载�
 - 浏览光鸭目录，规划复制、移动、改名或移入回收站；查询回收站和分享，生成高风险操作预览。
 - 查询运行活动、跟踪任务、检查可撤销范围，或按单独授权复核识别候选。
 
-它**不是**向模型开放任意 Shell、任意本地文件读写、任意 HTTP 请求或完整第三方管理 API。工具和 Provider 操作都有明确范围。
+模型可以在会话工作区运行普通 Python 或 Shell（`agent.run_code`），使用标准库、子进程和文件完成分页、筛选、统计。`/work` 的资料跨调用保留；超出展示长度的 stdout/stderr 保存为文件，可以继续读取。脚本失败会返回实际退出码和错误，模型可直接修正重试。
+
+业务调用使用 `from mf import watchlist, library, media, resources` 或 `mf --help`，直接复用 MediaFlux 服务。脚本可查询媒体、完整排期、资源、云盘和运行活动，也可调用收藏修改、批量下载与云盘文件变更；远端写入经过同一套预检和确认。脚本遇到确认卡时结束，确认后只执行卡中的操作，不重放脚本。
+
+`/skills` 提供内置流程文档。当前任务资料保存到 `/work`；已验证、可复用的方法使用 `mf.skills.save` 保存，下一会话可通过 `list/get` 查阅，`restore` 可恢复历史版本。更新时传入读取的 `revision`，避免覆盖并发修改。普通会话重置会清理工作文件但保留长期技能；技能按身份隔离，正文按需读取。主机凭据和正式媒体目录不会挂进工作区，工作区也没有任意网络访问权。
+
+源码开发与 Docker 部署使用同一套 Bubblewrap 隔离子进程：源码可由普通用户执行 `python mediaflux.py start`，生产仍只有一个 MediaFlux 容器，不启动额外 Agent 服务、不调用 Docker API。Linux 需安装 `bubblewrap`、`libseccomp2` 并允许用户命名空间；Docker 使用仓库 Compose 中的沙箱配置。主进程无需 root，模型代码在独立用户、PID、文件和网络命名空间内运行，丢弃全部 capabilities，再应用 seccomp 与资源限制。SDK 使用私有请求/响应文件，工作区原有 `/work`、`/output`、`/skills` 路径保持。
+
+运行依赖或系统权限不足时，Agent 会在模型调用前说明原因，不退回无隔离执行。可运行 `python tools/agent_doctor.py --json` 检查实际隔离进程能否启动；该检查不调用模型或业务服务。旧 root 执行器生成的工作资料与完整输出保留，只退役旧运行文件；切换服务账户前需由管理员迁移 MediaFlux 自有数据目录的所有权。不同 NAS 内核与宿主安全策略仍需实际验证，不能仅凭版本号保证可用。单次命令默认 120 秒、最长 600 秒，停止会清理整棵执行进程树；SDK 请求上限 4 MiB，响应保持完整。
+
+排错时，Web 登录身份还可使用只读诊断：在运维表上执行受限 SELECT（凭据列与私有会话表不可读）并检索最近 14 天运行日志。
 
 ## 2. 启用与配置
 
@@ -40,6 +50,7 @@ Media Agent 是现有媒体业务的自然语言入口，不是第二套下载�
 | `AGENT_LLM_PROTOCOL` | `auto`、`responses`、`chat_completions` 或 `anthropic_messages` |
 | `AGENT_LLM_CONTEXT_WINDOW_TOKENS` | 默认 `128000`，可配置范围 `16384`–`2000000`；不是要求模型输出这么多 Token |
 | `AGENT_LLM_TIMEOUT_SECONDS` | 模型请求超时配置；不是下载或整理后台任务的总时限 |
+| `AGENT_LLM_REASONING_EFFORT` | 推理强度，默认留空不发送；多步查询与规划建议设为 `medium` 或 `high`。思考 Token 计入输出额度并增加耗时，模型不支持时连接测试的工具调用项会失败 |
 | `TG_AGENT_ENABLED` | Telegram 侧 Agent 开关；还需要 Bot 配置及身份授权 |
 
 `auto` 模式的协议尝试不等于另起一个业务路由器。无论使用哪种模型协议，业务决策仍在同一个 Kernel 工具循环中。
@@ -72,8 +83,8 @@ Kernel Transport
     ▼
 AgentSession ───────── SessionState / ReferenceStore
     │                     会话、候选引用、待确认计划、发布代次
-    ├─ CapabilityRetriever / 动态工具发现
-    │      从目录取相关工具，不替模型裁决业务意图
+    ├─ bootstrap 显式模型入口
+    │      仅 run_code；业务与会话控制使用 SDK，按需查阅 Skills
     ├─ ModelAdapter
     │      统一模型协议与流式事件
     └─ ToolPipeline
@@ -107,21 +118,23 @@ MODEL → TOOL → MODEL → TOOL → … → FINAL
                   └→ APPROVAL_REQUIRED：停止本轮，等待明确确认
 ```
 
-- 初始工具召回通常为 **6–10 项**，不是把所有工具 Schema 一次发给模型。
-- 窗口保留 `agent.capabilities`，并提供当前授权范围内的紧凑能力索引；词法未召回不等于能力不存在。模型按需加载 Schema，索引不授予执行权限，也不代表后端健康。
-- 动态业务窗口与初始召回数量独立，默认 **24 项**、硬上限 **32 项**；每回合最多 **8 个不同的发现请求**，发现调用另受总次数上限约束，不占业务调用额度。不能在同一批次发现后猜测调用尚未加载的 Schema。
-- 模型轮次固定硬上限 **32**，不再要求成功 READ 才增加轮次；默认业务工具总尝试上限 **64 次**，其中写工具尝试最多 **16 次**。写入仍需原有授权，历史任务保留其累计预算。增加上下文窗口不等于无限调用。
-- 复杂查询应优先使用批量能力：存在性核对用 `library.batch_presence`，多部更新核对用 `library.check_updates`（每批最多 20 部、最多 3 部并发），不必先逐部搜索身份。
+- bootstrap 只向普通生产模型提供 `agent.run_code`；会话控制通过工作区 `session.*` SDK 使用，不发送业务写入 Schema 或完整能力索引。
+- 业务能力通过工作区 `mf --help`、SDK methods 和按需读取的 Skills 查找，工具未出现在模型首轮不表示 SDK 没有该能力。所有 SDK 写入仍由原 EffectExecutor 预检、冻结和确认。
+- 自定义小目录和专用 research 工具集按显式配置保留原功能；宿主固定的只读接力不扩展模型工具集。
+- `SessionLimits` 的模型轮次与工具总次数默认均为 `None`；**32轮不是默认硬上限**。显式限制可设1–32轮、1–128次工具调用，写调用限制字段默认16；默认还受累计估算 **1,000,000 Token**、**900活跃秒**及业务限流约束。模型请求按上下文估算加输出额度预留扣减，失败和取消不退还，不等于实际账单。
+- `agent.run_code` 提供真实隔离 Python/Shell 工作区，可 import SDK、保存完整结果并跨轮读取。业务读取沿原生 RPC，确认参数与持久状态由宿主保存；进程退出不等于业务写入完成。
+- 复杂查询应优先使用批量能力：存在性核对用 `library.presence(items)`（SDK），多部更新核对用 `library.updates`（SDK）（最多3部并发，返回完整逐项结果），不必先逐部搜索身份。
 - 工具预算不足或模型轮次用完时，保留已完成事实并返回“部分完成”，可在同一会话回复“继续”；未执行的工具不会被当作完成，也不会自动扩大预算。
 
-多部缺集接着找资源时，使用 `library.search_missing_season_resources.items` 一次检索，避免逐部搜索后只剩最后一部候选卡。每批最多 12 部/季，默认每部覆盖 20 个缺集，显式 `episodes` 最多 100 集；先共享单季搜索结果，仅对尚无匹配的集精确补查。每季最多 6 次、整批最多 24 次搜索且共用 45 秒期限，未完成范围明确返回，不等于全网无资源。输出一份保留整批候选的统一快照；资源候选业务容量统一为 50 项，不以推荐摘要或模型展示预算截断。卡片显示作品名称和全局编号，明确保留未覆盖项。模型和卡片使用相同推荐位置集合生成整批预检；只有人工确认才提交。发布组季集与 TMDB 不同且无可靠映射时，不会猜测偏移后自动选中。旧搜索快照不会自动拼接，更新后请重新检索这批缺集。
+缺集资源通过原生 `resources.search_missing(items=[...])` 检索。每项包含 query/season，可选 tmdb_id/library_name/episodes；单集使用 `episodes=[n]`，最多12部/季。默认每部覆盖20个缺集，显式集号最多100个；共享单季搜索后按需精确补查，单季最多6次、整批最多24次请求，共用45秒期限。结果保留完整来源页、site_statuses/next_page、错误及 remaining_episodes；page/sites可继续指定来源页。候选事实不因推荐摘要或旧候选卡50项容量二次截断。返回真实 result_ids 和完整 verification_targets，供现有 `resources.download` 冻结整批预检、确认后提交；一个整季包可关联多集。缺集事实、资源标题匹配、下载受理与入库可见分别记录。`resources.missing_workflows(limit, offset)` 按当前用户读取持久进度与真实下载 request_id；可用 `activity.timeline("download", request_id)` 查看后续阶段。
 
-这些是调用预算，不代表模型每次都必须调用工具。普通对话可以直接回答；涉及当前库存、最新排期或执行状态时，应以本轮工具证据为准。
+这些是成本与执行边界，不要求模型每次都调用工具。普通查询、思路和步骤可直接处理或保存到 `/work`，不必建立持久任务。只有需要跨回合恢复或严格证据验收时，才使用 `session.task()`、`session.start_task(...)`、`session.revise_task(...)`、`session.checkpoint_task(...)`、`session.cancel_task(source)`；宿主绑定身份与版本，任务检查点必须关联真实证据，不授予业务写权。涉及当前库存、最新排期或执行状态时，应以实际 SDK 结果为准。
 
 ### 3.3 会话、引用与持久化
 
-- 上层按 `owner + session_id` 隔离会话，资源候选和任务通过带类型、有效期的 opaque ref 传递。
-- 内部主键、私有下载链接、凭据及执行快照由服务端管理，不要求模型自己保管或拼接。
+- **长期记忆**：对 Agent 说“记住我的动漫库叫 Anime”“以后别推荐韩剧”，它会用 `preferences.update(memory_notes=[...])` 生成确认卡，保留此前仍有效的备忘；确认后，这些备忘与偏离默认值的媒体偏好会在同一身份的每轮对话中作为用户数据带入上下文（不是指令、不授予写权限，当前请求优先）。网页、RSS 等外部内容不能绕过确认写入记忆。
+- 上层按 `owner + session_id` 隔离会话；SDK 使用实际返回的文件、资源、媒体条目、订阅和任务 ID，不把界面序号或通用会话句柄当成业务 ID。
+- 私有下载链接、凭据及执行快照由服务端管理。`result_handle` 仅供 `session.result` 读取已保存的原结果；候选卡选择凭证由宿主绑定搜索批并转成真实 `result_ids`。
 - 确认结果会作为脱敏执行事实回写上下文，便于续问“刚才的下载到哪里了”。
 - generation / publication lease 控制迟到结果：被新请求取代的旧回合不能覆盖新会话状态。
 - 已确认写入受到额外保护；停止聊天流不等于撤销已被 Provider 接受的写入。
@@ -206,21 +219,21 @@ Web 与 Telegram 分别管理自己的会话历史与确认计划。TG 私聊话
 | “最近看过什么？从库里推荐没看过的轻松动画，给我打开链接。” | 最近播放不是继续观看；使用本地推荐及用户观看状态，链接来自已核验的媒体对象 |
 | “把某位导演的电影按年份列出，标出库里缺的。” | 先查片单，再批量核对；不要把未完整获取的片单说成全部作品 |
 | “媒体库里的这十部国漫都有更新吗？再检查一下刚才那些。” | 一次批量核对库存与 TMDB 已播季集，默认重新读取；同一会话可沿用片单。失败、歧义与截断逐部保留，不能当成无更新 |
-| “今天腾讯、爱奇艺、优酷有哪些动漫更新？” | 使用 `discovery.anime_calendar`；按排期事件返回，区分节目数、会员/免费进度和数据不可用 |
-| “查 Bangumi 本周放送表。” | 显式使用 `bangumi.calendar`，不混同三平台追漫排期 |
+| “今天腾讯、爱奇艺、优酷有哪些动漫更新？” | 使用 SDK `media.calendar()` 读取完整周表，再按日期筛选；保留会员/免费事件与来源不可用状态 |
+| “查 Bangumi 本周放送表。” | 使用 SDK `media.catalog("bangumi", "calendar", "tv")` 并按 `has_more` 续页，不混同三平台排期 |
 | “搜索这部剧的 4K 资源，有的话下载到光鸭。” | 搜索 → 候选集合 → 选择版本 → 接入预检 → 确认 → 提交；搜索结果本身不代表已经下载 |
-| “就要第 1、3 个，推到 qB。” | 使用当前会话候选引用或界面选择，不把其他会话的序号拿来提交 |
+| “就要第 1、3 个，推到 qB。” | 使用当前候选卡批选，或将同一搜索批的真实 `result_ids` 交给 `resources.download` 预检；界面序号不是 SDK 资源 ID |
 | “把这个 RSS 加进去，6 小时刷新、仅订阅、先不启用。” | 创建 RSS 规则，检查确认卡中的策略；不要创建成媒体追更订阅 |
-| “我订阅了哪些 RSS？哪些剧集在追更？” | 分别查询 `rss.subscription_summaries` 和 `media.subscription_summaries` |
-| “只列出光鸭 /电视剧 下的子目录，不要整理。” | `guangya.fs.query` 的浏览能力；不应以刮削或垃圾清理预览代替列目录 |
+| “我订阅了哪些 RSS？哪些剧集在追更？” | 分别查询 `rss.subscriptions` 和 `subscriptions.list` |
+| “只列出光鸭 /电视剧 下的子目录，不要整理。” | SDK `cloud.list(parent_id="真实目录ID", kinds=["directory"])` 的浏览能力；不应以刮削或垃圾清理预览代替列目录 |
 | “把这几集建一个目录，按核对后的季集号改名。” | 目录观察 → 元数据/季集核对 → 文件变更冻结预览；用户确认后执行，不等于直接启动刮削入库 |
-| “NFO 同步已经关闭，把等待中的伴随元数据任务取消。” | 先查 `strm.metadata.status`，再预检取消等待队列；不能把 `queued` 数量误读成正在运行 |
+| “NFO 同步已经关闭，把等待中的伴随元数据任务取消。” | 先查 `strm.metadata_status`，再预检取消等待队列；不能把 `queued` 数量误读成正在运行 |
 
 媒体库返回的 `open_url` 是详情/打开链接，不保证唤起第三方 App，也不是带凭据的永久播放直链。优先使用与该服务器匹配且运行中的反代地址，否则回退到合法的原媒体服务器页面地址；不能确认 URL 安全可用时省略，不编造链接。
 
 三平台追漫日历只使用现有 `CalendarService` 的来源、缓存和已收录排期。当前周之外、来源失败、旧缓存、首次加载及真实无匹配需要分别解释，不拿模型记忆补造某日排期。
 
-更新核对中的“最新本地季集”不等于“已收录多少集”；缺洞、跨季与特别篇不能直接用总数量换算。`library.check_updates` 对照的是 Jellyfin / Emby 当前库存与 TMDB 已播记录，结果带检查时间；它不表示已检索资源站，更不证明“全网没有新资源”。需要可下载版本时，继续使用现有资源检索，并保留失败站点和季集映射不明确的状态。
+更新核对中的“最新本地季集”不等于“已收录多少集”；缺洞、跨季与特别篇不能直接用总数量换算。`library.updates`（SDK） 对照的是 Jellyfin / Emby 当前库存与 TMDB 已播记录，结果带检查时间；它不表示已检索资源站，更不证明“全网没有新资源”。需要可下载版本时，继续使用现有资源检索，并保留失败站点和季集映射不明确的状态。
 
 ## 7. 主动识别复核：不是放开所有自动写入
 
@@ -248,7 +261,7 @@ Web 与 Telegram 分别管理自己的会话历史与确认计划。TG 私聊话
 
 | 现象 | 先检查什么 |
 |---|---|
-| 模型说“没有挂载这个工具” | 让它通过 `agent.capabilities` 检查相关能力；工具存在、当前窗口已加载、服务可用是三件事 |
+| 模型说“没有挂载这个工具” | 让它在工作区查阅 `mf --help`、SDK 方法和 Skills，并依据真实调用错误判断配置与可用性 |
 | “我有多少动漫”只得到全库数 | 是否先确定对应媒体库，再使用按库计数；不能拿全库剧集数充当动漫库数量 |
 | 演员、排期或新片回答明显过时 | 看是否真的查询了元数据/日历/网页；缺少数据应保留未知，不用模型记忆冒充实时核验 |
 | RSS 创建后看不到 | 对照确认结果和 RSS 规则列表；区分“已生成计划”“已创建规则”“媒体追更”三种状态 |
@@ -258,7 +271,7 @@ Web 与 Telegram 分别管理自己的会话历史与确认计划。TG 私聊话
 | 元数据队列很大但 `running=0` | 同时检查开关、队列状态与消费者状态，不能仅凭排队数量判断负载 |
 | 操作超时但文件可能已改变 | 查活动时间线、任务状态及真实目录；结果未知时不要重复提交 |
 | 停止后任务仍运行 | 区分停止 Agent 回合、取消待确认计划和停止已受理业务任务；已发生写入不能靠取消聊天撤销 |
-| 想回退已完成操作 | 先用 `action.undo.inspect` 检查支持范围；并非所有写入都有自动回滚 |
+| 想回退已完成操作 | 先用 SDK `activity.inspect_undo(log_id)` 检查真实整理日志，确认后用 `activity.undo(receipt_id)` 回退；并非所有写入都有自动回滚 |
 
 不需要恢复旧工具直调接口来排查。旧 `/api/agent/tools/{tool_name}`、`/api/agent/workspace-actions/invoke` 和 `/api/agent/actions/{tool_name}/prepare` 不属于当前公开接口。
 
@@ -278,17 +291,17 @@ python tools/agent_doctor.py --json
 | [`kernel/session.py`](../../app/agent/kernel/session.py)、[`kernel/turn.py`](../../app/agent/kernel/turn.py) | 会话入口、回合准入、取消、发布与终态收束 |
 | [`kernel/model_rounds.py`](../../app/agent/kernel/model_rounds.py)、[`kernel/tool_batches.py`](../../app/agent/kernel/tool_batches.py) | 唯一模型循环、上下文预算、工具批次执行 |
 | [`kernel/turn_history.py`](../../app/agent/kernel/turn_history.py)、[`kernel/conversation_context.py`](../../app/agent/kernel/conversation_context.py) | 检查点、可信回执与消息编解码 |
-| [`kernel/capabilities.py`](../../app/agent/kernel/capabilities.py)、[`kernel/discovery.py`](../../app/agent/kernel/discovery.py) | 初始召回与运行时工具发现 |
+| [`kernel/capabilities.py`](../../app/agent/kernel/capabilities.py)、[`kernel/bootstrap.py`](../../app/agent/kernel/bootstrap.py) | 内部执行目录与宿主显式模型入口 |
 | [`kernel/provider_model.py`](../../app/agent/kernel/provider_model.py) | 模型协议与流式结果适配 |
 | [`kernel/pipeline.py`](../../app/agent/kernel/pipeline.py)、[`kernel/effects.py`](../../app/agent/kernel/effects.py) | 工具生命周期、冻结、确认与执行边界 |
 | [`kernel/persistence.py`](../../app/agent/kernel/persistence.py)、[`kernel/state.py`](../../app/agent/kernel/state.py) | 会话、引用、事件与发布代次 |
-| [`kernel/ports/`](../../app/agent/kernel/ports/) | 领域 Action 与 Kernel 的适配、授权和完成后置处理 |
-| [`domains/`](../../app/agent/domains/)、[`domain_catalog/catalog.py`](../../app/agent/domain_catalog/catalog.py) | 各领域实现与工具声明相邻，组合入口显式装配 runtime 依赖 |
+| [`kernel/ports/`](../../app/agent/kernel/ports/) | SDK 写入确认、资源呈现与公共业务边界 |
+| [`domains/`](../../app/agent/domains/)、[`app/sdk.py`](../../app/sdk.py) | 公共业务、SDK 方法与宿主确认执行的组合 |
 | [`clients/http.py`](../../app/clients/http.py) | Provider 与索引器共用的 HTTP 客户端、流限额和超时 |
-| [`provider_operations.py`](../../app/agent/provider_operations.py) | Jellyfin/Emby/qB 的受控 Provider 操作目录 |
+| [`kernel/session_service.py`](../../app/agent/kernel/session_service.py) | 宿主绑定的结果归档、确认卡控制与可选持久验收任务 |
 | [`agent_api.py`](../../app/routes/agent_api.py)、[`agent_adapter.py`](../../app/bot/agent_adapter.py) | Web 与 Telegram 入口和展示 |
 
-新增能力时先复用领域 service/action，再声明 Schema、风险和适用条件，接入同一 Pipeline。不要新增一组自然语言正则路由、专用第二循环或绕过确认的工具 HTTP 接口。
+新增能力先复用公共服务，在 `app/sdk.py` 声明真实签名并加入 `METHODS`；业务写入再加入 `WRITE_METHODS` 和 bootstrap 的内部执行目录，沿原 EffectExecutor 冻结与确认。不要向普通生产模型添加业务工具 Schema、自然语言正则路由、专用第二循环或绕过确认的 HTTP 接口。
 
 当前 Web 入口主要包括：
 

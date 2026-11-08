@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from app import database as db
@@ -321,6 +322,35 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["pending_total"], 1)
 
+    def test_subscription_update_cannot_override_url_target(self):
+        from app.routes import rss_api
+        selected = db.add_rss_subscription("selected", "https://example.invalid/selected")
+        other = db.add_rss_subscription("other", "https://example.invalid/other")
+        with patch.object(rss_api, "require_api_login"), patch("app.modules.rss_subscriptions.wake_rss_scheduler"):
+            result = rss_api.update_sub(selected, Request({"type": "http"}), {"subscription_id": other, "name": "wrong"})
+        self.assertEqual(result.status_code, 400)
+        selected_row = db.get_rss_subscription(selected)
+        other_row = db.get_rss_subscription(other)
+        assert selected_row is not None and other_row is not None
+        self.assertEqual(selected_row["name"], "selected")
+        self.assertEqual(other_row["name"], "other")
+
+    def test_subscription_api_does_not_report_unknown_write_as_success(self):
+        from app.routes import rss_api
+        sid = db.add_rss_subscription("existing", "https://example.invalid/existing")
+        unknown = {"ok": False, "status": "outcome_unknown", "summary": "写入结果无法核验", "error": "先查询状态，不要重复提交", "data": {"subscription_id": sid}}
+        with patch.object(rss_api, "require_api_login"), patch.object(rss_api, "apply_change", return_value=unknown):
+            for operation in (
+                lambda: rss_api.create_sub(Request({"type": "http"}), {"name": "new", "urls": "https://example.invalid/new"}),
+                lambda: rss_api.update_sub(sid, Request({"type": "http"}), {"name": "new"}),
+                lambda: rss_api.delete_sub(sid, Request({"type": "http"})),
+            ):
+                with self.subTest(operation=operation):
+                    result = operation()
+                    self.assertEqual(result.status_code, 503)
+                    self.assertNotIn('"success":true', bytes(result.body).decode())
+                    self.assertIn("先查询状态", bytes(result.body).decode())
+
     def test_long_refresh_intervals_roundtrip_and_due_boundaries(self) -> None:
         with TestClient(create_app(start_background=False)) as client:
             csrf = self._csrf(client.get("/login").text)
@@ -329,7 +359,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             }, follow_redirects=False)
             self.assertEqual(login.status_code, 302)
             headers = {"X-CSRF-Token": self._csrf(client.get("/rss").text)}
-            with patch("app.routes.rss_api.wake_rss_scheduler"):
+            with patch("app.modules.rss_subscriptions.wake_rss_scheduler"):
                 for initial, updated in ((720, 1440), (1440, 720)):
                     with self.subTest(initial=initial, updated=updated):
                         created = client.post("/api/rss/subscriptions", headers=headers, json={
@@ -367,7 +397,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             self.assertEqual(logged_in.status_code, 302)
             csrf = self._csrf(client.get("/rss").text)
             headers = {"X-CSRF-Token": csrf}
-            with patch("app.routes.rss_api.wake_rss_scheduler") as wake_scheduler:
+            with patch("app.modules.rss_subscriptions.wake_rss_scheduler") as wake_scheduler:
                 paused = client.put(
                     f"/api/rss/subscriptions/{subscription_id}",
                     json={"enabled": False},
@@ -438,7 +468,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(logged_in.status_code, 302)
             headers = {"X-CSRF-Token": self._csrf(client.get("/rss").text)}
-            with patch("app.routes.rss_api.wake_rss_scheduler"):
+            with patch("app.modules.rss_subscriptions.wake_rss_scheduler"):
                 rejected_create = client.post(
                     "/api/rss/subscriptions",
                     headers=headers,

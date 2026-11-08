@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import secrets
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any, Protocol
 
 from app.concurrency import CrossLoopAsyncLock
@@ -56,6 +59,41 @@ class ReferenceStore(Protocol):
     ) -> float:
         """读取已校验引用的剩余 TTL，换算成当前进程的 monotonic 截止。"""
         ...
+
+
+# 限制原始 JSON 字符数，不代表解码后的严格堆内存上限。
+_RESULT_CACHE_CHARS = 8 * 1024 * 1024
+
+
+class ResultSnapshotReader:
+    """工作区共用的单份结果读取缓存；引用仍由调用方按当前会话校验。"""
+
+    def __init__(self, store: ReferenceStore):
+        self.store = store
+        self._cache = None
+        self._lock = asyncio.Lock()
+
+    async def read(self, handle, manifest, *, owner, session_id):
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("parts"), list) or not manifest["parts"]:
+            raise ReferenceError("invalid result manifest")
+        key = (owner, session_id, handle, tuple(manifest["parts"]))
+        async with self._lock:
+            cached = self._cache
+            if cached is not None and cached[0] == key and monotonic() < cached[1]:
+                return cached[2], True
+            self._cache = cached = None
+            scope = {"owner": owner, "session_id": session_id}
+            parts = []
+            deadline = float("inf")
+            for part in manifest["parts"]:
+                parts.append(await self.store.resolve(part, **scope, expected_kind="tool_result_part"))
+                deadline = min(deadline, await self.store.deadline(part, **scope, expected_kind="tool_result_part"))
+            content = "".join(parts)
+            node = json.loads(content)
+            cacheable = len(content) <= _RESULT_CACHE_CHARS
+            if cacheable:
+                self._cache = (key, deadline, node)
+            return node, cacheable
 
 
 class InMemoryReferenceStore:

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 import requests
@@ -47,6 +49,12 @@ class DiscoverySearchResult:
     providers_attempted: tuple[str, ...]
     providers_succeeded: tuple[str, ...]
     errors: tuple[dict[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        partial = bool(self.errors and self.providers_succeeded)
+        status = ("partial" if partial else "success" if self.items else "empty") if self.providers_succeeded else "unavailable"
+        return {**asdict(self), "items": [card.to_dict() for card in self.items],
+                "ok": bool(self.providers_succeeded), "status": status, "partial": partial}
 
 
 class TMDBSearchProvider:
@@ -277,15 +285,22 @@ class DiscoverySearchService:
         return names
 
     def _normalize(self, query: str, page: int, provider_names: list[str] | tuple[str, ...] | None):
+        if not isinstance(query, str):
+            raise ValueError("搜索关键词必须是字符串")
         normalized_query = unicodedata.normalize("NFKC", (query or "")).strip()
         has_control = any(unicodedata.category(char).startswith("C") for char in normalized_query)
         if not normalized_query or len(normalized_query) > 120 or has_control or _CONTROL_RE.search(normalized_query):
             raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
 
-        if page < 1 or page > 100:
+        if type(page) is not int or page < 1 or page > 100:
             raise ValueError("页码必须在 1 到 100 之间")
         enabled = self._enabled_names()
-        selected = list(provider_names or enabled)
+        if provider_names is not None and (
+            not isinstance(provider_names, (list, tuple)) or not provider_names
+            or len(provider_names) > 3 or not all(isinstance(name, str) for name in provider_names)
+        ):
+            raise ValueError("providers 必须选择 1 到 3 个来源")
+        selected = list(provider_names if provider_names is not None else enabled)
         selected = list(dict.fromkeys((name or "").strip().lower() for name in selected if (name or "").strip()))
         if not selected:
             raise ValueError("至少选择一个搜索来源")
@@ -304,8 +319,32 @@ class DiscoverySearchService:
         provider_names: list[str] | tuple[str, ...] | None = None,
         *,
         timeout_seconds: float | None = None,
+        media_type: str = "",
+        year: str = "",
+        region: str = "",
+        genre: str = "",
+        cancelled: Callable[[], bool] | None = None,
     ) -> DiscoverySearchResult:
         query, page, selected = self._normalize(query, page, provider_names)
+        if isinstance(media_type, str):
+            media_type = media_type.strip().lower()
+        if isinstance(year, str):
+            year = year.strip()
+        if media_type not in {"", "movie", "tv"}:
+            raise ValueError("media_type 必须是 movie 或 tv")
+        if not isinstance(year, str) or (year and not re.fullmatch(r"(?:19|20)[0-9]{2}", year)):
+            raise ValueError("year 必须是 1900 到 2099 的四位年份")
+        for value in (region, genre):
+            if not isinstance(value, str) or any(unicodedata.category(char).startswith("C") for char in value):
+                raise ValueError("地区和题材必须是可见文本")
+        # 类型/年份精确过滤；地区/题材只作关键词，不能宣称硬性筛选。
+        folded = query.casefold()
+        suffixes = [unicodedata.normalize("NFKC", value).strip() for value in (region, genre)]
+        query = " ".join([query, *(value for value in suffixes if value and value.casefold() not in folded)])
+        if len(query) > 120:
+            raise ValueError("片名与地区/题材关键词合计不能超过 120 个字符")
+        if cancelled and cancelled():
+            raise RuntimeError("搜索已取消")
         attempted = tuple(selected)
         succeeded: list[str] = []
         errors_by_name: dict[str, dict[str, Any]] = {}
@@ -341,7 +380,18 @@ class DiscoverySearchService:
                 "retry_after": 0,
             }
         budget = None if timeout_seconds is None else max(0.1, float(timeout_seconds))
-        done, pending = wait(tuple(future_map), timeout=budget)
+        deadline = None if budget is None else time.monotonic() + budget
+        pending = set(future_map)
+        while pending:
+            if cancelled and cancelled():
+                for future in pending:
+                    future.cancel()
+                raise RuntimeError("搜索已取消")
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            _, pending = wait(pending, timeout=min(0.05, remaining) if remaining is not None else (0.05 if cancelled else None))
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+        done = set(future_map) - pending
         for future in pending:
             name = future_map[future]
             future.cancel()
@@ -377,7 +427,8 @@ class DiscoverySearchService:
         items: list[MediaCard] = []
         for name in selected:
             for card in items_by_name.get(name, []):
-                if card.stable_id in seen:
+                if (card.stable_id in seen or (media_type and card.media_type != media_type)
+                        or (year and card.year.strip() != year)):
                     continue
                 seen.add(card.stable_id)
                 items.append(card)

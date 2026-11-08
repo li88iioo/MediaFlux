@@ -5,23 +5,24 @@ import asyncio
 import json
 import threading
 import time
+from dataclasses import asdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
 
 from app import database as db
-from app.agent.domains.library.patrol_progress import (
+from app.modules.library_patrol import (
     finalize_patrol_progress,
     load_patrol_progress,
     merge_patrol_progress,
 )
-from app.agent.domains.library.patrol_status import build_persisted_patrol_projection
+from app.modules.library_patrol import build_persisted_patrol_projection
 from app.agent.feature_gate import (
     agent_runtime_generation_is_current,
     current_agent_runtime_generation,
 )
-from app.agent.models import ToolResult
 from app.logger import get_logger
+from app.modules.episode_audit import EpisodeAuditResult, audit_library_episodes_batch
 
 logger = get_logger(__name__)
 
@@ -37,7 +38,7 @@ class AgentJobsScheduler:
     def __init__(
         self,
         *,
-        audit_executor: Callable[[dict[str, Any]], ToolResult] | None = None,
+        audit_executor: Callable[[dict[str, Any]], EpisodeAuditResult] | None = None,
         interval: float = 2.0,
         clock: Callable[[], datetime] | None = None,
         continuation_runtime_factory: Callable | None = None,
@@ -164,7 +165,7 @@ class AgentJobsScheduler:
                 next_run_at=current,
             )
             return
-        if not isinstance(result, ToolResult):
+        if not isinstance(result, EpisodeAuditResult):
             raise TypeError("InvalidAgentJobResult")
         if not result.ok and result.status == "not_configured":
             self._fail_terminal(
@@ -179,7 +180,7 @@ class AgentJobsScheduler:
         if not result.ok and result.status != "inconclusive":
             self._retry(job, error_code="AgentJobResultFailed")
             return
-        current_projection = build_persisted_patrol_projection(result)
+        current_projection = build_persisted_patrol_projection(asdict(result))
         merged = merge_patrol_progress(previous, current_projection)
 
         # 取消采用协作式语义：当前有界批次完成后，不再继续下一批。
@@ -277,7 +278,7 @@ class AgentJobsScheduler:
 
     @staticmethod
     def _next_cursor(
-        result: ToolResult,
+        result: EpisodeAuditResult,
         *,
         current_cursor: str,
         stored_stalls: int,
@@ -427,11 +428,7 @@ class AgentJobsScheduler:
         return f"已检查 {checked} 部剧集，暂未发现已播缺集"
 
     @staticmethod
-    def _default_audit_executor(arguments: dict[str, Any]) -> ToolResult:
-        from app.agent.domains.library.library_episode_audit import (
-            audit_library_episodes_batch,
-        )
-
+    def _default_audit_executor(arguments: dict[str, Any]) -> EpisodeAuditResult:
         return audit_library_episodes_batch(arguments)
 
     @staticmethod

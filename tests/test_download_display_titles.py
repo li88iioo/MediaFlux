@@ -376,15 +376,12 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         )
         row = db.get_download_request(request_id)
 
-        from app.agent.domains.downloads import actions as download_actions
+        from app import sdk
         from app.routes import downloads_api
 
         self.assertEqual(downloads_api._attention_json(row)["title"], "公开展示标题")
-        # Agent 的公开 DTO 对标题使用同一展示投影，并经过公开文本安全清洗。
-        self.assertEqual(
-            download_actions._safe_title(download_actions.download_display_title(row)),
-            "公开展示标题",
-        )
+        # 原生 Agent 读取入口沿同一展示投影，不能恢复已退役的 actions。
+        self.assertEqual(sdk.downloads.requests(scope="attention")["items"][0]["title"], "公开展示标题")
 
 
 if __name__ == "__main__":

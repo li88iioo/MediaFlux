@@ -1,20 +1,19 @@
+"""公共补偿业务：真实偏好事务、历史载荷与组织执行器状态。"""
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from app import database as db
-from app.agent.action_history import action_history_owner_digest
-from app.agent.domains.activity.undo import (
-    attach_undo_receipt,
-    compensation_candidate,
-    execute_undo,
-    inspect_undo,
-    prepare_undo,
+from app.database import media_owner_digest
+from app.modules.activity_undo import (
+    execute_undo, inspect_undo, preference_compensation, preference_undo_receipt, prepare_undo,
 )
-from app.agent.domains.subscriptions.consumption_actions import (
-    prepare_set_preferences,
-    set_preferences_confirmed,
+from app.modules.media_preferences import (
+    apply_media_preferences_change, media_preferences_preview, prepare_media_preferences_change,
 )
-from app.agent.models import ToolContext, ToolResult
 from app.repositories.media_experience import get_media_preferences
+from app.repositories import agent_compensations as receipts
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -23,132 +22,97 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM agent_compensations")
             conn.execute("DELETE FROM agent_media_preferences")
-        self.context = ToolContext(owner="undo-test", session_id="session")
+        self.context = SimpleNamespace(owner="undo-test", session_id="session")
+
+    def write_preferences(self, updates):
+        digest = media_owner_digest(self.context.owner)
+        prepared = prepare_media_preferences_change(digest, updates)
+        candidate = preference_compensation("preferences.update", updates, {"data": media_preferences_preview(prepared)})
+        after = apply_media_preferences_change(digest, updates, expected_fingerprint=prepared["fingerprint"])
+        self.assertIsNotNone(after)
+        return after, candidate
 
     def forward(self):
-        args = {"preferred_download_target": "qb"}
-        preview, expected = prepare_set_preferences(args, self.context)
-        candidate = compensation_candidate(
-            "media.set_preferences", args, preview.to_dict()
-        )
-        result = set_preferences_confirmed(args, expected, self.context)
-        attach_undo_receipt(result, candidate, key="receipt-test", context=self.context)
-        return {"undo_receipt": result.references[0].value}
+        after, candidate = self.write_preferences({"preferred_download_target": "qb"})
+        receipt = preference_undo_receipt(candidate, after, key="receipt-test", owner=self.context.owner)
+        assert receipt is not None
+        return receipt
 
     def test_settings_can_be_undone_once_and_restore_implicit_defaults(self):
-        arguments = self.forward()
-        before = get_media_preferences(action_history_owner_digest(self.context.owner))
-        self.assertEqual(before["preferred_download_target"], "qb")
-        _, frozen = prepare_undo(arguments, self.context)
-        result = execute_undo(arguments, frozen, self.context)
-        self.assertTrue(result.ok)
-        after = get_media_preferences(action_history_owner_digest(self.context.owner))
-        self.assertFalse(after["explicit"])
+        receipt = self.forward()
+        self.assertEqual(get_media_preferences(media_owner_digest(self.context.owner))["preferred_download_target"], "qb")
+        prepared = prepare_undo(receipt, owner=self.context.owner)
+        self.assertTrue(execute_undo(receipt, expected_fingerprint=prepared["fingerprint"], owner=self.context.owner)["ok"])
+        self.assertFalse(get_media_preferences(media_owner_digest(self.context.owner))["explicit"])
         with self.assertRaises(ValueError):
-            prepare_undo(arguments, self.context)
+            prepare_undo(receipt, owner=self.context.owner)
 
     def test_intervening_changes_make_receipt_stale(self):
-        arguments = self.forward()
-        args = {"preferred_download_target": "both"}
-        _, expected = prepare_set_preferences(args, self.context)
-        set_preferences_confirmed(args, expected, self.context)
+        receipt = self.forward()
+        self.write_preferences({"preferred_download_target": "both"})
         with self.assertRaises(ValueError):
-            prepare_undo(arguments, self.context)
-        self.assertEqual(
-            get_media_preferences(action_history_owner_digest(self.context.owner))[
-                "preferred_download_target"
-            ],
-            "both",
-        )
+            prepare_undo(receipt, owner=self.context.owner)
+        self.assertEqual(get_media_preferences(media_owner_digest(self.context.owner))["preferred_download_target"], "both")
 
     def test_owner_cannot_consume_another_owners_receipt(self):
-        arguments = self.forward()
+        receipt = self.forward()
         with self.assertRaises(ValueError):
-            prepare_undo(arguments, ToolContext(owner="other", session_id="session"))
+            prepare_undo(receipt, owner="other")
 
-    def test_mutating_frozen_payload_is_rejected(self):
-        arguments = self.forward()
-        _, expected = prepare_undo(arguments, self.context)
-        arguments["undo_receipt"]["receipt_id"] = "unknown-receipt"
+    def test_stored_legacy_preference_payloads_use_shared_business_without_old_handlers(self):
+        for explicit in (False, True):
+            for prefix in ("media", "preferences"):
+                with self.subTest(explicit=explicit, prefix=prefix):
+                    with db.get_conn() as conn:
+                        conn.execute("DELETE FROM agent_media_preferences")
+                        conn.execute("DELETE FROM agent_compensations")
+                    if explicit:
+                        self.write_preferences({"preferred_download_target": "guangya", "memory_notes": ["保留备忘"]})
+                    after, candidate = self.write_preferences({"preferred_download_target": "qb"})
+                    from app.modules.media_preferences import snapshot_media_preferences_change
+                    assert candidate is not None
+                    updates = candidate["updates"]
+                    payload = {"receipt_id": "historical", "expected": snapshot_media_preferences_change(after, updates)["fingerprint"]}
+                    payload.update(kind="setting", tool=(f"{prefix}.set_preferences" if explicit else f"{prefix}.clear_preferences")
+                                   if prefix == "media" else ("preferences.update" if explicit else "preferences.clear"),
+                                   arguments=updates or {})
+                    receipt = receipts.create("historical", media_owner_digest(self.context.owner), payload=payload)
+                    prepared = prepare_undo(receipt, owner=self.context.owner)
+                    self.assertTrue(execute_undo(receipt, expected_fingerprint=prepared["fingerprint"], owner=self.context.owner)["ok"])
+                    restored = get_media_preferences(media_owner_digest(self.context.owner))
+                    self.assertEqual(restored["explicit"], explicit)
+                    self.assertEqual(restored["preferred_download_target"], "guangya")
+                    self.assertEqual(restored["memory_notes"], ["保留备忘"] if explicit else [])
+
+    def test_unknown_receipt_cannot_replace_frozen_receipt(self):
+        receipt = self.forward()
+        expected = prepare_undo(receipt, owner=self.context.owner)["fingerprint"]
+        receipt = "unknown-receipt"
         with self.assertRaises(ValueError):
-            execute_undo(arguments, expected, self.context)
+            execute_undo(receipt, expected_fingerprint=expected, owner=self.context.owner)
 
     def test_unsupported_irreversible_tools_do_not_issue_compensation(self):
-        for name in (
-            "ingest.submit",
-            "guangya.recycle.clear",
-            "rss.delete_subscription",
-        ):
-            self.assertIsNone(compensation_candidate(name, {}, {}))
-        result = inspect_undo(
-            {"activity_selection": {"items": [{"kind": "download", "id": 1}]}},
-            self.context,
-        )
-        self.assertFalse(result.data["reversible"])
-        self.assertFalse(result.references)
-
-    def test_incomplete_result_does_not_offer_undo(self):
-        result = ToolResult(True, "accepted", "已接收")
-        attach_undo_receipt(
-            result, {"tool": "media.set_preferences"}, key="a", context=self.context
-        )
-        self.assertFalse(result.references)
+        for name in ("ingest.submit", "guangya.recycle.clear", "rss.delete_subscription", "preferences.clear"):
+            self.assertIsNone(preference_compensation(name, {}, {}))
 
     def test_newer_write_before_receipt_creation_is_not_captured_as_our_write(self):
-        args = {"preferred_download_target": "qb"}
-        preview, expected = prepare_set_preferences(args, self.context)
-        candidate = compensation_candidate(
-            "media.set_preferences", args, preview.to_dict()
-        )
-        original_result = set_preferences_confirmed(args, expected, self.context)
-        other_args = {"preferred_download_target": "both"}
-        _, other_expected = prepare_set_preferences(other_args, self.context)
-        set_preferences_confirmed(other_args, other_expected, self.context)
-        attach_undo_receipt(
-            original_result, candidate, key="late-receipt", context=self.context
-        )
-        self.assertFalse(original_result.references)
-        self.assertEqual(
-            get_media_preferences(action_history_owner_digest(self.context.owner))[
-                "preferred_download_target"
-            ],
-            "both",
-        )
+        after, candidate = self.write_preferences({"preferred_download_target": "qb"})
+        self.write_preferences({"preferred_download_target": "both"})
+        self.assertIsNone(preference_undo_receipt(candidate, after, key="late-receipt", owner=self.context.owner))
+        self.assertEqual(get_media_preferences(media_owner_digest(self.context.owner))["preferred_download_target"], "both")
 
     def test_missing_transactional_after_snapshot_does_not_issue_receipt(self):
-        args = {"preferred_download_target": "qb"}
-        preview, expected = prepare_set_preferences(args, self.context)
-        candidate = compensation_candidate(
-            "media.set_preferences", args, preview.to_dict()
-        )
-        result = set_preferences_confirmed(args, expected, self.context)
-        result.effect_metadata.clear()
-        attach_undo_receipt(result, candidate, key="no-proof", context=self.context)
-        self.assertFalse(result.references)
+        _, candidate = self.write_preferences({"preferred_download_target": "qb"})
+        self.assertIsNone(preference_undo_receipt(candidate, None, key="no-proof", owner=self.context.owner))
 
     def organize_receipt(self):
-        from unittest.mock import patch
-
-        from app.repositories import agent_compensations as receipts
-
         value = {"title": "示例", "version": 1, "changes": [], "affected": 1}
-        receipts.create(
-            "organize-receipt", action_history_owner_digest(self.context.owner)
-        )
-        args = {
-            "undo_receipt": {
-                "kind": "organize",
-                "receipt_id": "organize-receipt",
-                "target": {"kind": "organize", "id": 1},
-                "expected": "version-one",
-                "version": 1,
-            }
-        }
-        with patch(
-            "app.agent.domains.activity.undo._organize_state", return_value=(value, "version-one")
-        ):
-            _, expected = prepare_undo(args, self.context)
-        return value, args, expected
+        # 组织快照只来自当前真实日志，不假设旧 target 已迁入账本。
+        receipt = receipts.create("organize-receipt", media_owner_digest(self.context.owner), payload={"kind": "organize",
+                               "log_id": 1, "expected": "version-one", "version": 1})
+        with patch("app.modules.activity_undo._organize_state", return_value=(value, "version-one")):
+            expected = prepare_undo(receipt, owner=self.context.owner)["fingerprint"]
+        return value, receipt, expected
 
     def test_organize_second_read_cannot_adopt_new_unapproved_version(self):
         from unittest.mock import patch
@@ -157,7 +121,7 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         second = {**first, "version": 2}
         with (
             patch(
-                "app.agent.domains.activity.undo._organize_state",
+                "app.modules.activity_undo._organize_state",
                 side_effect=[(first, "version-one"), (second, "version-two")],
             ),
             patch(
@@ -166,7 +130,7 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
             patch("app.modules.organize_tasks.get_organize_manager") as manager,
             self.assertRaises(ValueError),
         ):
-            execute_undo(args, token, self.context)
+            execute_undo(args, expected_fingerprint=token, owner=self.context.owner)
         service.assert_not_called()
         manager.assert_not_called()
 
@@ -177,11 +141,11 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         first, args, token = self.organize_receipt()
         with (
             patch(
-                "app.agent.domains.activity.undo._organize_state",
+                "app.modules.activity_undo._organize_state",
                 return_value=(first, "version-one"),
             ),
             patch(
-                "app.agent.domains.activity.undo.receipts.claim",
+                "app.modules.activity_undo.receipts.claim",
                 side_effect=sqlite3.OperationalError("busy"),
             ),
             patch(
@@ -189,7 +153,7 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
             ) as service,
             self.assertRaises(sqlite3.OperationalError),
         ):
-            execute_undo(args, token, self.context)
+            execute_undo(args, expected_fingerprint=token, owner=self.context.owner)
         service.assert_not_called()
 
     def test_queued_organize_uses_frozen_version_and_closes_service(self):
@@ -205,7 +169,7 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         )
         with (
             patch(
-                "app.agent.domains.activity.undo._organize_state",
+                "app.modules.activity_undo._organize_state",
                 return_value=(first, "version-one"),
             ),
             patch(
@@ -216,16 +180,10 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
                 "app.modules.organize_tasks.get_organize_manager", return_value=manager
             ),
         ):
-            result = execute_undo(args, token, self.context)
-            self.assertEqual(result.status, "accepted")
-            self.assertEqual(
-                result.effect_metadata["completion"],
-                {
-                    "kind": "guangya_organize_task",
-                    "task_id": "private-undo-task",
-                    "operation": "undo",
-                },
-            )
+            result = execute_undo(args, expected_fingerprint=token, owner=self.context.owner)
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(result["data"]["task_id"], "private-undo-task")
+            self.assertEqual(result["data"]["log_id"], 1)
             client.revert_latest.assert_not_called()
             callbacks[0]()
             client.revert_latest.assert_called_once_with(1, "undo-organize-receipt", 1)
@@ -238,40 +196,42 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         from app.repositories import agent_compensations as receipts
 
         public = {"title": "示例", "version": 1, "changes": [], "affected": 1}
-        selection = {"activity_selection": {"items": [{"kind": "organize", "id": 1}]}}
+
         manager = OrganizeTaskManager()
         self.addCleanup(manager.shutdown, timeout=2)
         unused, worker_client = Mock(), Mock()
         worker_client.revert_latest.return_value = {"success": True}
-        digest = action_history_owner_digest(self.context.owner)
+        digest = media_owner_digest(self.context.owner)
         with (
-            patch("app.agent.domains.activity.undo._organize_state", return_value=(public, "version-one")),
+            patch("app.modules.activity_undo._organize_state", return_value=(public, "version-one")),
             patch("app.modules.organize_correction.OrganizeCorrectionService", side_effect=[unused, worker_client]),
             patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
         ):
-            receipt = inspect_undo(selection, self.context).references[0].value
-            arguments = {"undo_receipt": receipt}
-            _, expected = prepare_undo(arguments, self.context)
+            receipt = inspect_undo(1, owner=self.context.owner)["data"]["receipt_id"]
+            arguments = receipt
+            expected = prepare_undo(arguments, owner=self.context.owner)["fingerprint"]
             self.assertTrue(manager._lock.acquire(blocking=False))
             try:
-                rejected = execute_undo(arguments, expected, self.context)
+                rejected = execute_undo(arguments, expected_fingerprint=expected, owner=self.context.owner)
             finally:
                 manager._lock.release()
-            self.assertEqual(rejected.status, "busy")
+            self.assertEqual(rejected["status"], "busy")
             unused.revert_latest.assert_not_called()
             unused.close.assert_called_once()
-            self.assertEqual(receipts.state(receipt["receipt_id"], digest), "available")
-            fresh_receipt = inspect_undo(selection, self.context).references[0].value
-            self.assertEqual(receipt["receipt_id"], fresh_receipt["receipt_id"])
-            _, expected = prepare_undo({"undo_receipt": fresh_receipt}, self.context)
-            accepted = execute_undo({"undo_receipt": fresh_receipt}, expected, self.context)
-            self.assertEqual(accepted.status, "accepted")
+            self.assertEqual(receipts.state(receipt, digest), "available")
+            fresh_receipt = inspect_undo(1, owner=self.context.owner)["data"]["receipt_id"]
+            self.assertEqual(receipt, fresh_receipt)
+            expected = prepare_undo(fresh_receipt, owner=self.context.owner)["fingerprint"]
+            accepted = execute_undo(arguments, expected_fingerprint=expected, owner=self.context.owner)
+            self.assertEqual(accepted["status"], "accepted")
             self.assertTrue(manager.shutdown(timeout=2))
             worker_client.revert_latest.assert_called_once()
             worker_client.close.assert_called_once()
-            self.assertEqual(receipts.state(receipt["receipt_id"], digest), "completed")
+            self.assertEqual(receipts.state(receipt, digest), "completed")
             with self.assertRaises(ValueError):
-                prepare_undo(arguments, self.context)
+                prepare_undo(arguments, owner=self.context.owner)
+            with self.assertRaises(ValueError):
+                prepare_undo(fresh_receipt, owner=self.context.owner)
 
     def test_explicit_organize_admission_rejection_keeps_receipt_available(self):
         from unittest.mock import Mock, patch
@@ -280,10 +240,10 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         from app.repositories import agent_compensations as receipts
 
         public = {"title": "示例", "version": 1, "changes": [], "affected": 1}
-        selection = {"activity_selection": {"items": [{"kind": "organize", "id": 1}]}}
+
         for rejection in ("shutdown", "thread_start_failed"):
             with self.subTest(rejection=rejection):
-                context = ToolContext(owner=self.context.owner, session_id=rejection)
+                context = SimpleNamespace(owner=self.context.owner + rejection, session_id=rejection)
                 manager, client = OrganizeTaskManager(), Mock()
                 self.addCleanup(manager.shutdown, timeout=2)
                 if rejection == "shutdown":
@@ -291,18 +251,18 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
                 thread = Mock()
                 thread.start.side_effect = RuntimeError("cannot start")
                 with (
-                    patch("app.agent.domains.activity.undo._organize_state", return_value=(public, "version-one")),
+                    patch("app.modules.activity_undo._organize_state", return_value=(public, "version-one")),
                     patch("app.modules.organize_correction.OrganizeCorrectionService", return_value=client),
                     patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
                     patch("app.modules.organize_tasks.threading.Thread", return_value=thread),
                 ):
-                    receipt = inspect_undo(selection, context).references[0].value
-                    arguments = {"undo_receipt": receipt}
-                    _, expected = prepare_undo(arguments, context)
-                    result = execute_undo(arguments, expected, context)
-                    self.assertEqual(result.status, "busy")
-                    self.assertEqual(receipts.state(receipt["receipt_id"], action_history_owner_digest(context.owner)), "available")
-                    prepare_undo(arguments, context)
+                    receipt = inspect_undo(1, owner=context.owner)["data"]["receipt_id"]
+                    arguments = receipt
+                    expected = prepare_undo(arguments, owner=context.owner)["fingerprint"]
+                    result = execute_undo(arguments, expected_fingerprint=expected, owner=context.owner)
+                    self.assertEqual(result["status"], "busy")
+                    self.assertEqual(receipts.state(receipt, media_owner_digest(context.owner)), "available")
+                    prepare_undo(arguments, owner=context.owner)
                 client.revert_latest.assert_not_called()
                 client.close.assert_called_once()
 
@@ -315,15 +275,15 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         manager = Mock()
         manager.start_operation.side_effect = RuntimeError("admission response lost")
         with (
-            patch("app.agent.domains.activity.undo._organize_state", return_value=(public, "version-one")),
+            patch("app.modules.activity_undo._organize_state", return_value=(public, "version-one")),
             patch("app.modules.organize_correction.OrganizeCorrectionService"),
             patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
             self.assertRaises(RuntimeError),
         ):
-            execute_undo(arguments, expected, self.context)
-        self.assertEqual(receipts.state("organize-receipt", action_history_owner_digest(self.context.owner)), "outcome_unknown")
+            execute_undo(arguments, expected_fingerprint=expected, owner=self.context.owner)
+        self.assertEqual(receipts.state("organize-receipt", media_owner_digest(self.context.owner)), "outcome_unknown")
         with self.assertRaises(ValueError):
-            prepare_undo(arguments, self.context)
+            prepare_undo(arguments, owner=self.context.owner)
 
     def test_accepted_callback_failure_stays_closed_to_retries(self):
         from unittest.mock import Mock, patch
@@ -331,10 +291,10 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         from app.repositories import agent_compensations as receipts
 
         public = {"title": "示例", "version": 1, "changes": [], "affected": 1}
-        selection = {"activity_selection": {"items": [{"kind": "organize", "id": 1}]}}
+
         for raises in (False, True):
             with self.subTest(raises=raises):
-                context = ToolContext(owner=self.context.owner, session_id=f"failed-{raises}")
+                context = SimpleNamespace(owner=self.context.owner + str(raises), session_id=f"failed-{raises}")
                 manager, client, callbacks = Mock(), Mock(), []
                 client.revert_latest.return_value = {"success": False}
                 if raises:
@@ -343,37 +303,37 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
                     callbacks.append(callback) or {"ok": True, "task_id": "private-task"}
                 )
                 with (
-                    patch("app.agent.domains.activity.undo._organize_state", return_value=(public, "version-one")),
+                    patch("app.modules.activity_undo._organize_state", return_value=(public, "version-one")),
                     patch("app.modules.organize_correction.OrganizeCorrectionService", return_value=client),
                     patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
                 ):
-                    receipt = inspect_undo(selection, context).references[0].value
-                    arguments = {"undo_receipt": receipt}
-                    _, expected = prepare_undo(arguments, context)
-                    self.assertEqual(execute_undo(arguments, expected, context).status, "accepted")
+                    receipt = inspect_undo(1, owner=context.owner)["data"]["receipt_id"]
+                    arguments = receipt
+                    expected = prepare_undo(arguments, owner=context.owner)["fingerprint"]
+                    self.assertEqual(execute_undo(arguments, expected_fingerprint=expected, owner=context.owner)["status"], "accepted")
                     if raises:
                         with self.assertRaises(OSError):
                             callbacks[0]()
                     else:
                         callbacks[0]()
-                    self.assertEqual(receipts.state(receipt["receipt_id"], action_history_owner_digest(context.owner)), "outcome_unknown")
+                    self.assertEqual(receipts.state(receipt, media_owner_digest(context.owner)), "outcome_unknown")
                     with self.assertRaises(ValueError):
-                        prepare_undo(arguments, context)
+                        prepare_undo(arguments, owner=context.owner)
                 client.revert_latest.assert_called_once()
                 client.close.assert_called_once()
 
     def test_unaccepted_release_cannot_reopen_settled_or_other_owner_receipts(self):
         from app.repositories import agent_compensations as receipts
 
-        digest = action_history_owner_digest(self.context.owner)
+        digest = media_owner_digest(self.context.owner)
         for completed in (False, True):
             key = f"settled-{completed}"
-            receipts.create(key, digest)
+            receipts.create(key, digest, payload={"kind": "organize", "expected": key})
             self.assertTrue(receipts.claim(key, digest))
             self.assertFalse(receipts.claim(key, digest))
             self.assertFalse(receipts.release_unaccepted(key, "other-owner"))
             self.assertEqual(receipts.state(key, digest), "executing")
             receipts.finish(key, digest, completed=completed)
             self.assertFalse(receipts.release_unaccepted(key, digest))
-            receipts.create(key, digest)
+            receipts.create(key, digest, payload={"kind": "organize", "expected": key})
             self.assertFalse(receipts.claim(key, digest))

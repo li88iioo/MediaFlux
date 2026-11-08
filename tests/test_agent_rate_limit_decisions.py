@@ -20,19 +20,18 @@ import pytest
 
 from app import database as db
 from app.agent import rate_limit as rates
-from app.agent.domain_catalog import build_tool_specs
 from app.agent.errors import ToolPipelineError, ToolRateLimitError
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.conversation_context import tool_error_message
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports import mediaflux_policy as policy
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
 from app.agent.kernel.ports.mediaflux_policy import MediaFluxToolRateLimiter
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.agent.rate_limit import AgentRateLimiter
 from tests.support import isolated_test_database
+from tests.test_agent_kernel_core import read_tool
 
 
 @pytest.fixture(autouse=True)
@@ -59,8 +58,9 @@ def test_rate_limit_error_has_one_contract_owner_without_port_alias():
     assert not hasattr(policy, "ToolRateLimitError")
 
 
-def test_real_pipeline_shared_owner_and_retry_payload():
-    tool=catalog_from_tool_specs(build_tool_specs()).get('provider.query')
+def test_real_pipeline_shared_owner_and_retry_payload(monkeypatch):
+    tool = read_tool("fixture.read")
+    monkeypatch.setitem(rates._TOOL_RATE_LIMITS, tool.name, 8)
     calls=[]
     def read(args,ctx):
         calls.append((ctx.owner,ctx.session_id));return {'ok':True,'summary':'offline fixture'}
@@ -68,16 +68,16 @@ def test_real_pipeline_shared_owner_and_retry_payload():
     async def go():
         store=InMemorySessionStateStore()
         pipeline=ToolPipeline(catalog=ToolCatalog([replace(tool,read=read)]),state_store=store,rate_limiter=MediaFluxToolRateLimiter())
-        async def query(owner='owner-a',session='s1',operation='media.system.info',cancel=False):
+        async def query(owner='owner-a',session='s1',operation='list',cancel=False,arguments=None):
             lease,_=await store.begin_turn(owner=owner,session_id=session,request_id=str(len(calls)))
             token=CancellationToken()
             if cancel:token.cancel()
             ctx=ToolCallContext(owner=owner,session_id=session,request_id=lease.request_id,turn_id=lease.turn_id,lease=lease,cancellation=token,report_progress=progress)
-            return await pipeline.execute(tool.model_name,{'profile_ref':'qb:default' if operation.startswith('qb.') else 'media:1','operation':operation,'arguments':{}},context=ctx)
+            return await pipeline.execute(tool.model_name,{},context=ctx)
         for i in range(8):await query(session='s1' if i%2 else 's2')
         with pytest.raises(ToolPipelineError) as exc:await query(session='s3')
         assert exc.value.code=='rate_limited' and len(calls)==8
-        await query(owner='owner-b');await query(operation='qb.app.version')
+        await query(owner='owner-b');await query(owner='owner-c',operation='list')
         assert len(calls)==10
         with pytest.raises(asyncio.CancelledError):await query(owner='cancelled-owner',cancel=True)
         assert len(calls)==10
@@ -94,12 +94,7 @@ def test_real_pipeline_shared_owner_and_retry_payload():
         assert isinstance(exc.value,ToolRateLimitError)
     limiter=AgentRateLimiter(shared=True)
     limiter.reset()
-    from app.agent.provider_actions import get_provider_gateway
-    from app.agent.provider_models import ProviderProfileView
-    profiles = [ProviderProfileView('media:1', 'media', 'offline', 'online'),
-                ProviderProfileView('qb:default', 'qbittorrent', 'offline', 'online')]
-    with patch('app.agent.rate_limit.time.time',return_value=120.0), \
-         patch.object(get_provider_gateway(), 'profiles', side_effect=lambda provider='': [p for p in profiles if not provider or p.provider==provider]):
+    with patch('app.agent.rate_limit.time.time',return_value=120.0):
         asyncio.run(go())
 
 
@@ -204,10 +199,10 @@ def test_authoritative_cost_and_bool_wrapper_same_bucket():
     limiter=AgentRateLimiter(shared=True,wall_clock=lambda:120.0);limiter.reset()
     async def go():
         port=policy.MediaFluxToolRateLimiter()
-        await port.acquire(owner='cost-owner',tool_name='media.subscription_updates',cost=999,arguments={})
-        assert rates.allow_agent_tool('cost-owner','media.subscription_updates') is True
+        await port.acquire(owner='cost-owner',tool_name='subscriptions.check_updates',cost=999,arguments={})
+        assert rates.allow_agent_tool('cost-owner','subscriptions.check_updates') is True
         with pytest.raises(ToolRateLimitError) as raised:
-            await port.acquire(owner='cost-owner',tool_name='media.subscription_updates',cost=0,arguments={})
+            await port.acquire(owner='cost-owner',tool_name='subscriptions.check_updates',cost=0,arguments={})
         assert dict(raised.value.rate_limit)=={'limit':4,'cost':2,'remaining':0,'retry_after_seconds':90.0,'retry_at_epoch':210.0,'reason':'quota'}
         with pytest.raises(AttributeError):setattr(raised.value, 'rate_limit', {})
         with db.get_conn() as conn:
@@ -217,16 +212,6 @@ def test_authoritative_cost_and_bool_wrapper_same_bucket():
     with patch.object(rates,'agent_rate_limiter',limiter):asyncio.run(go())
 
 
-def test_unknown_provider_does_not_create_a_bucket():
-    limiter=AgentRateLimiter(shared=True,wall_clock=lambda:120.0);limiter.reset()
-    async def go():
-        with pytest.raises(policy.ToolPipelineError) as raised:
-            await policy.MediaFluxToolRateLimiter().acquire(owner='owner',tool_name='provider.query',cost=1,arguments={'operation':'media.operation.not_registered'})
-        assert raised.value.code=='invalid_arguments'
-        assert raised.value.argument_schemas is not None
-        assert 'operation' in raised.value.argument_schemas
-        assert rows()==[]
-    with patch.object(rates,'agent_rate_limiter',limiter):asyncio.run(go())
 
 
 def test_cancel_during_atomic_worker_does_not_refund_or_replay():
@@ -239,7 +224,7 @@ def test_cancel_during_atomic_worker_does_not_refund_or_replay():
         try:return real(*args,**kwargs)
         finally:finished.set()
     async def go():
-        task=asyncio.create_task(policy.MediaFluxToolRateLimiter().acquire(owner='cancel-owner',tool_name='web.read',cost=1,arguments={}))
+        task=asyncio.create_task(policy.MediaFluxToolRateLimiter().acquire(owner='cancel-owner',tool_name='fixture.lookup',cost=1,arguments={}))
         assert await asyncio.to_thread(entered.wait,5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):await task
@@ -253,8 +238,8 @@ def test_cancel_during_atomic_worker_does_not_refund_or_replay():
 
 
 @pytest.mark.parametrize('denial', ['quota', 'capacity', 'clock_anomaly'])
-@pytest.mark.parametrize(('tool_name', 'limit', 'retry_wait'), [('web.search', 6, 70.0), ('web.read', 12, 65.0)])
-def test_real_port_public_values_are_immutable_json_scalars(denial, tool_name, limit, retry_wait):
+def test_real_port_public_values_are_immutable_json_scalars(denial):
+    tool_name, limit, retry_wait = "fixture.lookup", 30, 62.0
     wall=[120.0]
     limiter=rates.AgentRateLimiter(shared=True,wall_clock=lambda:wall[0],max_keys=1)
     limiter.reset()
@@ -299,14 +284,14 @@ def test_real_decision_and_bool_wrapper_share_exact_single_consumption():
     limiter=rates.AgentRateLimiter(shared=True,wall_clock=lambda:120.0)
     limiter.reset()
     with patch.object(rates,'agent_rate_limiter',limiter):
-        first=rates.consume_agent_tool('owner','media.subscription_updates')
+        first=rates.consume_agent_tool('owner','subscriptions.check_updates')
         assert first.allowed is True and first.remaining==2 and first.cost==2
         with pytest.raises(FrozenInstanceError):setattr(first, 'remaining', 999)
-        assert rates.allow_agent_tool('owner','media.subscription_updates') is True
-        denied=rates.consume_agent_tool('owner','media.subscription_updates')
+        assert rates.allow_agent_tool('owner','subscriptions.check_updates') is True
+        denied=rates.consume_agent_tool('owner','subscriptions.check_updates')
         assert denied.allowed is False and denied.remaining==0
         assert denied.retry_after_seconds==90.0 and denied.retry_at_epoch==210.0
-        assert rates.allow_agent_tool('owner','media.subscription_updates') is False
+        assert rates.allow_agent_tool('owner','subscriptions.check_updates') is False
         with db.get_conn() as conn:
             rows=conn.execute('SELECT count,previous_count FROM agent_rate_limit_buckets').fetchall()
         assert [tuple(row) for row in rows]==[(4,0)]
@@ -355,108 +340,3 @@ def test_failed_permit_rolls_back_cleanup_and_releases_writer_lock():
     with db.get_conn() as conn:
         assert tuple(conn.execute('SELECT count,previous_count,window_start FROM agent_rate_limit_buckets').fetchone())==(1,0,240)
     print('ROLLBACK: expired cleanup rolled back on failure; reopened transaction admitted exactly once')
-
-
-def test_local_watchlist_reads_share_existing_default_budget_across_workers_without_writes():
-    tool = catalog_from_tool_specs(build_tool_specs()).get('discovery.watchlist_summaries')
-    assert rates.tool_rate_limit_policy(tool.name) == ('discovery-watchlist-read', 30, 1)
-    assert tool.read is not None
-    db.add_media_watchlist('tmdb', 'rate-fixture', 'movie', '本地收藏', '2026', 'PRIVATE_POSTER_KEY')
-    get_media_watchlist_result = db.get_media_watchlist('tmdb', 'rate-fixture', 'movie')
-    assert get_media_watchlist_result is not None
-    number = int(get_media_watchlist_result['id'])
-    variants = (
-        {}, {'mode': 'list'}, {'before_number': number}, {'mode': 'statistics'},
-        {'watchlist_number': number}, {'watchlist_number': number + 1},
-    )
-    calls = []
-    watched_tables = (
-        'media_watchlist', 'media_subscriptions', 'media_subscription_candidates',
-        'media_subscription_runs', 'media_download_admissions', 'agent_action_history',
-    )
-
-    def domain_snapshot():
-        with db.get_conn() as conn:
-            return {table: [tuple(row) for row in conn.execute(f'SELECT * FROM {table} ORDER BY id')]
-                    for table in watched_tables}
-
-    before = domain_snapshot()
-
-    def read(arguments, context):
-        calls.append((context.owner, context.session_id, dict(arguments)))
-        return tool.read(arguments, context)
-
-    async def progress(_payload):
-        pass
-
-    async def exercise():
-        store = InMemorySessionStateStore()
-
-        async def query(index, arguments, owner='watchlist-owner'):
-            # 重建pipeline/limiter且切换会话与模型别名，仍使用唯一工具身份桶。
-            pipeline = ToolPipeline(
-                catalog=ToolCatalog([replace(tool, read=read)]), state_store=store,
-                rate_limiter=MediaFluxToolRateLimiter(),
-            )
-            session_id = f'watchlist-session-{index}'
-            lease, _ = await store.begin_turn(owner=owner, session_id=session_id, request_id=str(index))
-            context = ToolCallContext(
-                owner=owner, session_id=session_id, request_id=lease.request_id,
-                turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(),
-                report_progress=progress,
-            )
-            limiter = AgentRateLimiter(shared=True, wall_clock=lambda: 120.0)
-            with patch.object(rates, 'agent_rate_limiter', limiter):
-                return await pipeline.execute(
-                    tool.model_name if index % 2 else tool.name, arguments, context=context,
-                )
-
-        for index in range(30):
-            result = await query(index, variants[index % len(variants)])
-            assert result.tool.name == 'discovery.watchlist_summaries'
-            assert result.outcome.public_content['ok'] is True
-            assert result.effect_plan is None
-        assert len(calls) == 30
-        buckets = rows()
-        for index, arguments in enumerate(variants, start=30):
-            with pytest.raises(ToolPipelineError) as raised:
-                await query(index, arguments)
-            assert raised.value.code == 'rate_limited'
-            assert isinstance(raised.value, ToolRateLimitError)
-            assert raised.value.rate_limit['reason'] == 'quota'
-            assert raised.value.rate_limit['limit'] == 30
-            assert raised.value.rate_limit['remaining'] == 0
-            assert rows() == buckets
-        assert len(calls) == 30  # 拒绝发生在真实只读handler之前。
-        other = await query(36, {'watchlist_number': number}, owner='other-owner')
-        assert other.effect_plan is None and other.outcome.public_content['data']['count'] == 1
-        assert len(calls) == 31
-
-    with patch('app.agent.domains.discovery.watchlist_actions.config.get_bool', return_value=True):
-        asyncio.run(exercise())
-    assert domain_snapshot() == before  # 限流桶可写，但收藏、订阅、下载及动作历史不变。
-    with db.get_conn() as conn:
-        counts = conn.execute('SELECT count,previous_count FROM agent_rate_limit_buckets ORDER BY count').fetchall()
-    assert [tuple(row) for row in counts] == [(1, 0), (30, 0)]
-    # 放宽的是纯本地收藏读取特例，外部搜索及写入没有改额度。
-    assert rates.tool_rate_limit_policy('discovery.search')[1] == 6
-    assert rates.tool_rate_limit_policy('discovery.add_watchlist')[1] == 4
-    assert rates.tool_rate_limit_policy('discovery.remove_watchlist')[1] == 4
-
-
-def test_real_port_search_and_local_read_have_independent_budgets():
-    limiter = rates.AgentRateLimiter(shared=True, wall_clock=lambda: 120.0)
-    limiter.reset()
-
-    async def exercise():
-        port = policy.MediaFluxToolRateLimiter()
-        for tool, limit in (("web.search", 6), ("web.read", 12)):
-            for _ in range(limit):
-                assert await port.acquire(owner="independent-web", tool_name=tool, cost=1, arguments={}) is None
-            with pytest.raises(ToolRateLimitError) as caught:
-                await port.acquire(owner="independent-web", tool_name=tool, cost=1, arguments={})
-            assert caught.value.rate_limit["reason"] == "quota"
-            assert caught.value.rate_limit["limit"] == limit
-
-    with patch.object(rates, "agent_rate_limiter", limiter):
-        asyncio.run(exercise())

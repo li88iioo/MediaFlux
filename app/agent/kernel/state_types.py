@@ -43,6 +43,7 @@ class AgentInput:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     delivery_route: Mapping[str, Any] = field(default_factory=dict)
     initial_read_tool: str = ""  # 服务端固定接力；整个回合仅允许 READ，不是 quota 恢复。
+    initial_read_arguments: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         message = (self.message or "").strip()
@@ -60,6 +61,10 @@ class AgentInput:
             raise ValueError("message is too long")
         if not isinstance(self.initial_read_tool, str):
             raise ValueError("initial_read_tool must be a string")
+        if not isinstance(self.initial_read_arguments, Mapping):
+            raise ValueError("initial_read_arguments must be a mapping")
+        if self.initial_read_arguments and not self.initial_read_tool.strip():
+            raise ValueError("read arguments require a handoff tool")
         if self.initial_read_tool.strip() and "selection" in self.metadata:
             raise ValueError("read handoff cannot include selection")
         object.__setattr__(self, "message", message)
@@ -71,6 +76,7 @@ class AgentInput:
         object.__setattr__(self, "metadata", deepcopy(dict(self.metadata)))
         object.__setattr__(self, "delivery_route", deepcopy(dict(self.delivery_route)))
         object.__setattr__(self, "initial_read_tool", self.initial_read_tool.strip())
+        object.__setattr__(self, "initial_read_arguments", deepcopy(dict(self.initial_read_arguments)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +134,7 @@ class _ExecutionCapacity(StateUpdate):
     """Executor-only stage update; never reconstructed from business JSON."""
 
     current_start: int | None = None
+    receipt_plan_id: str = ""  # 只读诊断可裁剪；该回执及此前执行事实仍须完整保留。
 
 
 class HistoryCapacityError(KernelStateError):

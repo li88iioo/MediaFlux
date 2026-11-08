@@ -6,10 +6,13 @@ POSIX、Windows 盘符或 UNC 路径访问同一目录。本模块提供显式�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable, TypedDict
+from typing import Any, Iterable, TypedDict
 
 from app import config
 from app.logger import get_logger
@@ -22,7 +25,7 @@ from app.modules.local_path_mapping import (
 logger = get_logger(__name__)
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:/")
-_CONFIG_KEYS = {
+MAPPING_CONFIG = {
     "jellyfin": (
         "JELLYFIN_PATH_MAPPINGS",
         "JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK",
@@ -208,6 +211,121 @@ def encode_media_server_path_mappings(raw: object) -> str:
     ) if mappings else ""
 
 
+@contextmanager
+def mapping_write_guard() -> Generator[None, None, None]:
+    """Web 组合保存与单条 CRUD 统一先取配置锁，再取映射锁。"""
+    from app.modules.process_lock import CrossProcessLock
+
+    with config.runtime_config_read_guard():
+        lock = CrossProcessLock("media-library-mappings")
+        if not lock.acquire():
+            raise RuntimeError("媒体库映射正在由其他请求保存")
+        try:
+            yield
+        finally:
+            lock.release()
+
+
+def mapping_updates(raw: object) -> dict[str, str]:
+    """Web 批量保存与单条 CRUD 共用校验、部署覆盖和规范编码。"""
+    if not isinstance(raw, dict):
+        raise MediaServerPathMappingError("strm_mappings 必须是对象")
+    if set(raw) - set(MAPPING_CONFIG):
+        raise MediaServerPathMappingError("包含无效媒体服务器类型")
+    updates = {}
+    for server, mappings in raw.items():
+        key = MAPPING_CONFIG[server][0]
+        if config.has_external_override(key):
+            raise MediaServerPathMappingError(f"{server} 路径映射由部署环境管理，不能修改")
+        updates[key] = encode_media_server_path_mappings(json.dumps(mappings, ensure_ascii=False))
+    return updates
+
+
+def _mapping_state(server: str) -> tuple[bytes | None, list[dict[str, str]]]:
+    if server not in MAPPING_CONFIG:
+        raise MediaServerPathMappingError("server 仅支持 jellyfin 或 emby")
+    key = MAPPING_CONFIG[server][0]
+    raw, values = config.read_env_snapshot(config.ENV_FILE)
+    value = config.get(key, "") if config.has_external_override(key) else values.get(key, "")
+    items = [{"local": item.local_prefix, "server": item.server_prefix}
+             for item in parse_media_server_path_mappings(value)]
+    return raw, items
+
+
+def list_path_mappings(server: str) -> dict[str, Any]:
+    """完整读取配置路径对，不探测上游或枚举媒体。"""
+    with config.runtime_config_read_guard():
+        _, items = _mapping_state(server)
+        return {"server": server, "items": items, "count": len(items),
+                "managed_by_environment": config.has_external_override(MAPPING_CONFIG[server][0])}
+
+
+class MappingSnapshotChanged(MediaServerPathMappingError):
+    """确认快照或文件 CAS 已失效，未提交映射。"""
+
+
+def prepare_path_mapping_change(operation: str, server: str, local_path: str, *,
+                                server_path: str | None = None, new_local_path: str | None = None) -> dict[str, Any]:
+    """以服务器和自然路径键定位，不依赖列表顺序；快照只含路径事实和文件摘要。"""
+    with config.runtime_config_read_guard():
+        raw, before = _mapping_state(server)
+        modified = [dict(item) for item in before]
+        if operation == "create":
+            if server_path is None:
+                raise MediaServerPathMappingError("新增映射必须提供服务器路径")
+            modified.append({"local": local_path, "server": server_path})
+        elif operation in {"update", "delete"}:
+            key = media_server_path_key(local_path)
+            selected = next((item for item in modified if media_server_path_key(item["local"]) == key), None)
+            if selected is None:
+                raise MediaServerPathMappingError("路径映射不存在")
+            if operation == "delete":
+                modified.remove(selected)
+            else:
+                if server_path is None and new_local_path is None:
+                    raise MediaServerPathMappingError("至少提供一个需要修改的映射路径")
+                if new_local_path is not None:
+                    selected["local"] = new_local_path
+                if server_path is not None:
+                    selected["server"] = server_path
+        else:
+            raise MediaServerPathMappingError("路径映射操作无效")
+        updates = mapping_updates({server: modified})
+        encoded = updates[MAPPING_CONFIG[server][0]]
+        snapshot = {"operation": operation, "server": server, "before": before,
+                    "after": json.loads(encoded or "[]"), "file_sha256": hashlib.sha256(raw or b"").hexdigest()}
+        fingerprint = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        return {**snapshot, "fingerprint": fingerprint}
+
+
+def apply_path_mapping_change(operation: str, server: str, local_path: str, *, expected_fingerprint: str,
+                              server_path: str | None = None, new_local_path: str | None = None,
+                              check_cancelled: Callable[[], None] | None = None) -> dict[str, Any]:
+    """在共享锁中重算确认事实，并交给原配置发布器做文件 CAS 与运行态发布。"""
+    with mapping_write_guard():
+        raw, _ = config.read_env_snapshot(config.ENV_FILE)
+        try:
+            prepared = prepare_path_mapping_change(operation, server, local_path,
+                server_path=server_path, new_local_path=new_local_path)
+        except ValueError as exc:
+            raise MappingSnapshotChanged("路径映射已变化，请重新预检") from exc
+        if (prepared["fingerprint"] != expected_fingerprint
+                or prepared["file_sha256"] != hashlib.sha256(raw or b"").hexdigest()):
+            raise MappingSnapshotChanged("路径映射配置已变化，请重新预检")
+        updates = mapping_updates({server: prepared["after"]})
+        if check_cancelled:
+            check_cancelled()
+        try:
+            config.update_runtime_env_file(config.ENV_FILE, updates, expected=raw)
+        except (config.ConcurrentConfigUpdateError, config.ExternalConfigOverrideError) as exc:
+            raise MappingSnapshotChanged("路径映射被其它设置更新，请重新预检") from exc
+        current = list_path_mappings(server)
+        ok = current["items"] == prepared["after"]
+        return {"ok": ok, "status": "completed" if ok else "outcome_unknown",
+                "summary": "媒体库路径映射已保存并回读核对" if ok else "路径映射保存结果待核验",
+                "data": {**current, "operation": operation, "verified": ok}}
+
+
 def apply_media_server_path_mapping(
     raw_path: str,
     mappings: Iterable[MediaServerPathMapping],
@@ -249,7 +367,7 @@ def configured_media_server_refresh_options(server_type: str) -> MediaServerRefr
     """读取指定媒体服务器的路径映射和全局刷新降级策略。"""
     normalized = (server_type or "").strip().lower()
     try:
-        mapping_key, fallback_key = _CONFIG_KEYS[normalized]
+        mapping_key, fallback_key = MAPPING_CONFIG[normalized]
     except KeyError as exc:
         raise ValueError("媒体服务器类型无效") from exc
     try:

@@ -10,6 +10,7 @@ from app import config
 from app.discovery.calendar.models import SourceUnavailable
 from app.discovery.calendar.service import get_calendar_service
 from app.discovery.models import MediaCard, ProviderError
+from app.discovery.registry import FILTER_QUERY_KEYS
 from app.discovery.search import get_discovery_search_service
 from app.discovery.service import get_discovery_service, project_watchlist_state
 from app.routes.discovery_image import decode_poster_token, encode_poster_token
@@ -23,7 +24,6 @@ def _require_discovery_enabled() -> None:
 
 router = APIRouter(prefix="/api/discovery", dependencies=[Depends(_require_discovery_enabled)])
 _BASE_QUERY_KEYS = {"provider", "category", "media_type", "page"}
-_FILTER_QUERY_KEYS = {"with_genres", "with_original_language", "sort_by", "sort", "tags", "weekday"}
 _PROVIDERS = {"tmdb", "douban", "bangumi"}
 _MEDIA_TYPES = {"movie", "tv"}
 _PROVIDER_MEDIA_TYPES = {
@@ -148,7 +148,7 @@ def items(
     media_type: str = Query(default=""), page: str = Query(default="1"),
 ):
     require_api_login(request)
-    unknown = set(request.query_params.keys()) - _BASE_QUERY_KEYS - _FILTER_QUERY_KEYS
+    unknown = set(request.query_params.keys()) - _BASE_QUERY_KEYS - FILTER_QUERY_KEYS
     if unknown:
         return api_error(f"包含不支持的查询参数: {', '.join(sorted(unknown))}", 400)
     if any(len(value) > limit for value, limit in ((provider, 32), (category, 64), (media_type, 16))):
@@ -157,7 +157,7 @@ def items(
         page_number = int(page)
     except (TypeError, ValueError):
         return api_error("页码无效", 400)
-    filters = {key: value for key in _FILTER_QUERY_KEYS if (value := request.query_params.get(key)) not in (None, "")}
+    filters = {key: value for key in FILTER_QUERY_KEYS if (value := request.query_params.get(key)) not in (None, "")}
     try:
         result = get_discovery_service().list_items(provider, category, media_type, page_number, filters)
         return api_response(_page_payload(result))
@@ -351,6 +351,8 @@ def _calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
         return card
     return {
         **snapshot,
+        # Web 继续轮询可选补全；SDK 使用公共服务独立的排期刷新状态。
+        "refreshing": snapshot["refreshing"] or snapshot.get("metadata_pending", False),
         "days": [{**day, "items": [card_payload(card) for card in day["items"]
                                   if card.get("category") == "animation"]} for day in snapshot["days"]],
         "unscheduled": [card_payload(card) for card in snapshot.get("unscheduled", [])

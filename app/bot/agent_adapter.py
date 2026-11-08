@@ -254,6 +254,8 @@ def _safe_text(value: object, *, limit: int = _MAX_MESSAGE) -> str:
 
 
 def _tool_progress(tool_name: object) -> str:
+    if tool_name == "agent.run_code":
+        return "处理中"
     prefix = str(tool_name or "").partition(".")[0].casefold()
     return _TOOL_PROGRESS_LABELS.get(prefix, "正在调用项目能力")
 
@@ -458,7 +460,7 @@ class _TelegramEventObserver:
         self.active_tool = ""
         self.stream_display_enabled = True
         self._display_text = ""
-        self._status = "正在理解任务…"
+        self._status = "思考中…"
         self._changed = asyncio.Event()
         self._closing = asyncio.Event()
         self._sender: asyncio.Task[None] | None = None
@@ -490,7 +492,7 @@ class _TelegramEventObserver:
         if event.type is AgentEventType.MODEL_STARTED:
             self.model_round = _positive_int(event.payload.get("round"))
             self.model_text = ""
-            self._status = "正在整理执行结果…" if event.payload.get("phase") == "confirmed_synthesis" else "正在规划下一步…"
+            self._status = "正在整理结果…" if event.payload.get("phase") == "confirmed_synthesis" else "思考中…"
         elif event.type is AgentEventType.MODEL_DELTA:
             if not self.stream_display_enabled:
                 return
@@ -506,13 +508,15 @@ class _TelegramEventObserver:
             self._status = "正在输出…"
         else:
             text = {
-                AgentEventType.CAPABILITIES_SELECTED: "正在理解任务…",
+                AgentEventType.CAPABILITIES_SELECTED: "思考中…",
                 AgentEventType.TOOL_COMPLETED: "正在整理查询结果…",
                 AgentEventType.TOOL_FAILED: "当前方法不可用，正在调整方案…",
-                AgentEventType.EFFECT_PREVIEW_STARTED: "正在生成安全变更预览…",
+                AgentEventType.EFFECT_PREVIEW_STARTED: "正在准备操作预览…",
                 AgentEventType.EFFECT_COMPLETED: "正在校验执行结果…",
                 AgentEventType.EFFECT_FAILED: "执行未完成，正在整理结果…",
             }.get(event.type, "")
+            if event.type is AgentEventType.TOOL_COMPLETED and event.payload.get("tool") == "agent.run_code":
+                return  # 代码退出不应覆盖 SDK 的真实业务进度。
             if event.type is AgentEventType.MODEL_TOOL_CALL:
                 self.model_text = ""
                 self.active_tool = str(event.payload.get("tool") or "")
@@ -521,9 +525,18 @@ class _TelegramEventObserver:
                 self.active_tool = str(event.payload.get("tool") or self.active_tool)
                 text = "正在执行已确认操作…" if event.payload.get("kind") == "confirmed_effect" else _tool_progress(self.active_tool) + "…"
             elif event.type is AgentEventType.TOOL_PROGRESS:
-                text = (_safe_text(event.payload.get("summary"), limit=240)
-                        if event.payload.get("phase") == "background_job" else "")
-                text = text or _tool_progress(event.payload.get("tool") or self.active_tool) + "…"
+                activity = event.payload.get("activity")
+                if isinstance(activity, Mapping) and activity.get("kind") == "tool":
+                    state = {"running": "进行中", "completed": "已完成", "failed": "未完成", "approval_required": "等待确认"}.get(str(activity.get("status") or ""))
+                    label = sanitize_public_text(activity.get("label"), limit=80)
+                    if not state or not label:
+                        return
+                    summary = sanitize_public_text(activity.get("summary"), limit=200)
+                    text = f"{label} · {state}" + (f"\n{summary}" if summary else "")
+                elif event.payload.get("phase") == "background_job":
+                    text = _safe_text(event.payload.get("summary"), limit=240)
+                else:
+                    return  # 心跳、代码内部状态不覆盖已经展示的业务动作。
             if not text:
                 return
             self._status = text
@@ -549,7 +562,7 @@ class _TelegramEventObserver:
             interval = _STREAM_DRAFT_INTERVAL_SECONDS if mode in {"draft", "rich_draft"} else _STREAM_EDIT_INTERVAL_SECONDS
             next_send_at = time.monotonic() + interval
             rendered = (_render_stream_preview(self._display_text, status=self._status)
-                        if self._display_text else f"<b>Media Agent</b>\n{html.escape(self._status)}")
+                        if self._display_text else html.escape(self._status))
             if rendered == last_rendered:
                 continue
             try:
@@ -785,7 +798,7 @@ def _execute_query(
         source_message=source,
         timeout_seconds=300,
         prefer_persistent_message=True,
-    ).begin("<b>Media Agent</b>\n正在理解任务…")
+    ).begin("思考中…")
     observer = _TelegramEventObserver(progress)
     try:
         view = asyncio.run(observer.consume(
@@ -1028,7 +1041,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
     )
     progress = _ExistingMessageProgress(bot, call.message)
     if plan_verified:
-        progress.update("<b>Media Agent</b>\n正在核对确认计划，确认接管后将继续显示执行进度…")
+        progress.update("正在核对确认计划…")
     observer = _TelegramEventObserver(progress)
     try:
         view = asyncio.run(observer.consume(

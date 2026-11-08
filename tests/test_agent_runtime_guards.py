@@ -9,7 +9,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from app.agent.async_bridge import AsyncBridgeUnavailable, run_awaitable_sync
+from app.concurrency import AsyncBridgeUnavailable, run_awaitable_sync
 from app.agent.feature_gate import (
     AgentRuntimeDisabled,
     agent_runtime_admission,

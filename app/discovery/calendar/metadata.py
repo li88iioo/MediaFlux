@@ -36,7 +36,7 @@ def _title_key(value: str) -> str:
 def _empty(status="unmatched") -> dict:
     return {"tmdb_id": "", "douban_id": "", "poster_key": "", "poster_provider": "",
             "tmdb_poster_key": "", "douban_poster_key": "", "rating": None,
-            "rating_source": "", "overview": "", "mapping_status": status}
+            "rating_source": "", "overview": "", "origin_country": None, "mapping_status": status}
 
 
 def _douban_poster_key(value):
@@ -67,7 +67,7 @@ def _component(profile, provider):
         if key in profile:
             result[key] = profile[key]
     if provider == "tmdb":
-        for key in ("rating", "rating_source", "overview"):
+        for key in ("rating", "rating_source", "overview", "origin_country"):
             result[key] = profile.get(key, result[key])
     return result
 
@@ -217,7 +217,7 @@ class CalendarMetadata:
                 profile[field] = component.get(field, "")
             profile[f"_{provider}_year"] = component.get(f"_{provider}_year", "")
             profile[f"_{provider}_complete"] = completed[provider]
-        profile.update({key: tmdb.get(key, profile[key]) for key in ("rating", "rating_source", "overview")})
+        profile.update({key: tmdb.get(key, profile[key]) for key in ("rating", "rating_source", "overview", "origin_country")})
         if profile["tmdb_poster_key"]:
             profile.update(poster_key=profile["tmdb_poster_key"], poster_provider="tmdb")
         elif profile["douban_poster_key"]:
@@ -290,10 +290,16 @@ class CalendarMetadata:
             rating = None
         overview = raw.get("overview")
         year = raw.get("first_air_date", "")[:4]
+        # 仅采信上游产地代码；缺失或无效时保持未知，不从语言和标题推断。
+        countries = raw.get("origin_country")
+        if (not isinstance(countries, list) or not countries
+                or any(not isinstance(country, str) or not re.fullmatch(r"[A-Z]{2}", country) for country in countries)):
+            countries = None
         return {**_empty("matched"), "tmdb_id": str(raw["id"]), "poster_key": poster,
                 "tmdb_poster_key": poster, "poster_provider": "tmdb" if poster else "",
                 "rating": rating, "rating_source": "tmdb" if rating is not None else "",
                 "overview": overview[:2000] if isinstance(overview, str) else "",
+                "origin_country": countries,
                 "_tmdb_year": year if _YEAR.fullmatch(year) else ""}
 
     async def _search_douban_profile(self, client, entry, year, deadline):

@@ -1,0 +1,1 @@
+{"id":"undo_inspection","version":2,"split":"holdout","messages":["我想看看有哪些操作能撤回来，先帮我检查一下最近那条可撤销操作，只检查别执行。"],"rubric":{"kind":"undo_inspection"}}

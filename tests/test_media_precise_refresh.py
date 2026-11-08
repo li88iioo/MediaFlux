@@ -10,13 +10,151 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from app.clients.base import MediaLibraryEnumerationTooLarge
+import requests
+
+from app.clients.base import MediaLibraryEnumerationTooLarge, media_refresh_parameters
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.modules.media_refresh import MAX_REFRESH_TARGETS, plan_refresh_targets
 from app.modules.media_server_path_mapping import MediaServerPathMapping
 
 ROOT = "/data/strm/光鸭云盘"
+
+
+class MediaLibraryRefreshRequestTests(unittest.TestCase):
+    """刷新预检与真实客户端共用参数契约，所有 HTTP 写入均由桩接管。"""
+
+    _CLIENT_TYPES = {"jellyfin": JellyfinClient, "emby": EmbyClient}
+
+    def _assert_request(self, server, expected, **options):
+        self.assertEqual(media_refresh_parameters(
+            mode=options.get("mode", "scan"), replace_images=options.get("replace_images", False),
+            regenerate_trickplay=options.get("regenerate_trickplay", False),
+            server=server,
+        ), expected)
+        response = Mock()
+        headers = {"Authorization": 'MediaBrowser Token="token"', "Accept": "application/json"}
+        if server == "emby":
+            headers["X-Emby-Token"] = "token"
+        with self._CLIENT_TYPES[server]("http://media.invalid/", "token") as client:
+            with patch.object(client._session, "post", return_value=response) as post:
+                self.assertTrue(client.refresh_library("library-id", **options))
+                post.assert_called_once_with(
+                    "http://media.invalid/Items/library-id/Refresh",
+                    headers=headers, params=expected, timeout=15,
+                )
+        response.raise_for_status.assert_called_once_with()
+
+    def _assert_rejected(self, server, options, message):
+        with self.assertRaisesRegex(ValueError, message):
+            media_refresh_parameters(
+                mode=options.get("mode", "scan"), replace_images=options.get("replace_images", False),
+                regenerate_trickplay=options.get("regenerate_trickplay", False),
+                server=server,
+            )
+        with self._CLIENT_TYPES[server]("http://media.invalid", "token") as client:
+            with patch.object(client, "_headers") as headers, patch.object(client._session, "post") as post:
+                with self.assertRaisesRegex(ValueError, message):
+                    client.refresh_library("library-id", **options)
+                headers.assert_not_called()
+                post.assert_not_called()
+
+    def test_default_scan_preserves_existing_requests(self):
+        expected = {
+            "jellyfin": {
+                "metadataRefreshMode": "Default", "imageRefreshMode": "None",
+                "replaceAllMetadata": "false", "replaceAllImages": "false",
+                "regenerateTrickplay": "false",
+            },
+            "emby": {
+                "Recursive": "true", "MetadataRefreshMode": "Default",
+                "ImageRefreshMode": "None", "ReplaceAllMetadata": "false",
+                "ReplaceAllImages": "false",
+            },
+        }
+        for server, params in expected.items():
+            for options in ({}, {"mode": "scan"}):
+                with self.subTest(server=server, options=options):
+                    self._assert_request(server, params, **options)
+
+    def test_jellyfin_metadata_and_image_options_are_independent(self):
+        for mode, replace_metadata in (("missing", "false"), ("replace", "true")):
+            for images, trickplay in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(mode=mode, images=images, trickplay=trickplay):
+                    self._assert_request("jellyfin", {
+                        "metadataRefreshMode": "FullRefresh", "imageRefreshMode": "FullRefresh",
+                        "replaceAllMetadata": replace_metadata,
+                        "replaceAllImages": "true" if images else "false",
+                        "regenerateTrickplay": "true" if trickplay else "false",
+                    }, mode=mode, replace_images=images, regenerate_trickplay=trickplay)
+
+    def test_emby_metadata_and_image_options_preserve_recursive_refresh(self):
+        for mode, replace_metadata in (("missing", "false"), ("replace", "true")):
+            for images in (False, True):
+                with self.subTest(mode=mode, images=images):
+                    self._assert_request("emby", {
+                        "Recursive": "true", "MetadataRefreshMode": "FullRefresh",
+                        "ImageRefreshMode": "FullRefresh", "ReplaceAllMetadata": replace_metadata,
+                        "ReplaceAllImages": "true" if images else "false",
+                    }, mode=mode, replace_images=images)
+
+    def test_invalid_modes_and_non_boolean_options_raise_before_network(self):
+        cases = (
+            ({"mode": "all"}, "mode"),
+            ({"mode": None}, "mode"),
+            ({"mode": []}, "mode"),
+            ({"replace_images": "false"}, "bool"),
+            ({"replace_images": 1}, "bool"),
+            ({"regenerate_trickplay": "true"}, "bool"),
+            ({"regenerate_trickplay": 0}, "bool"),
+        )
+        for server in self._CLIENT_TYPES:
+            for options, message in cases:
+                with self.subTest(server=server, options=options):
+                    self._assert_rejected(server, options, message)
+
+    def test_scan_rejects_image_and_trickplay_replacement(self):
+        for server in self._CLIENT_TYPES:
+            for options in (
+                {"replace_images": True},
+                {"regenerate_trickplay": True},
+                {"replace_images": True, "regenerate_trickplay": True},
+            ):
+                with self.subTest(server=server, options=options):
+                    self._assert_rejected(server, options, "scan|Emby")
+
+    def test_emby_rejects_trickplay_for_metadata_refresh(self):
+        for mode in ("missing", "replace"):
+            with self.subTest(mode=mode):
+                self._assert_rejected("emby", {
+                    "mode": mode, "regenerate_trickplay": True,
+                }, "Emby.*regenerate_trickplay")
+
+    def test_parameter_helper_defaults_to_jellyfin_and_rejects_unknown_server(self):
+        self.assertEqual(media_refresh_parameters("scan", False, False), {
+            "metadataRefreshMode": "Default", "imageRefreshMode": "None",
+            "replaceAllMetadata": "false", "replaceAllImages": "false",
+            "regenerateTrickplay": "false",
+        })
+        with self.assertRaisesRegex(ValueError, "server"):
+            media_refresh_parameters("scan", False, False, server="unknown")
+
+    def test_network_and_http_failures_keep_false_result(self):
+        for server, client_type in self._CLIENT_TYPES.items():
+            for failure in ("network", "http"):
+                with self.subTest(server=server, failure=failure), client_type("http://media.invalid", "token") as client:
+                    response = Mock()
+                    with patch.object(client._session, "post", return_value=response) as post:
+                        if failure == "network":
+                            post.side_effect = requests.Timeout("offline")
+                        else:
+                            response.raise_for_status.side_effect = requests.HTTPError("server error")
+                        self.assertFalse(client.refresh_library("library-id"))
+                        post.assert_called_once()
+                        if failure == "network":
+                            response.raise_for_status.assert_not_called()
+                        else:
+                            response.raise_for_status.assert_called_once_with()
 
 
 class RefreshTargetPlanningTests(unittest.TestCase):

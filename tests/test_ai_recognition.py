@@ -375,7 +375,7 @@ class AIRecognitionClientTests(unittest.TestCase):
                 )
 
     def test_production_client_checks_sync_bridge_before_request_budget(self):
-        from app.agent.async_bridge import AsyncBridgeUnavailable
+        from app.concurrency import AsyncBridgeUnavailable
         from app.clients.ai_recognition import (
             AIRecognitionClient,
             AIRecognitionError,

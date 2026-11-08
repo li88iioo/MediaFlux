@@ -11,6 +11,22 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, overload
 
 
+def strm_failure_selection(ids: list[int], *, status: str = "all") -> list[dict]:
+    """在同一个读事务中分批读取明确 ID；不受列表默认页长或 SQLite 参数数限制。"""
+    selected: list[dict] = []
+    with db.get_conn() as conn:
+        conn.execute("BEGIN")
+        for offset in range(0, len(ids), 500):
+            batch = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            selected.extend(dict(row) for row in conn.execute(
+                f"SELECT * FROM strm_failures WHERE id IN ({placeholders})"
+                + (" AND status=?" if status != "all" else ""),
+                [*batch, status] if status != "all" else batch,
+            ).fetchall())
+    return sorted(selected, key=lambda row: row["id"], reverse=True)
+
+
 @dataclass(frozen=True)
 class StrmRefreshPolicy:
     """本轮固定的刷新策略；索引提交与既有 outbox 共用一个事务。"""

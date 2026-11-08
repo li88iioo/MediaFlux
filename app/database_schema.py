@@ -346,12 +346,7 @@ CREATE INDEX IF NOT EXISTS idx_download_request_keys_request
 
 CREATE TABLE IF NOT EXISTS agent_download_verifications (
     request_id INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    tmdb_id TEXT NOT NULL,
-    season INTEGER NOT NULL,
-    episode INTEGER NOT NULL,
-    as_of TEXT NOT NULL,
-    library_name TEXT NOT NULL DEFAULT '',
+    targets_json TEXT NOT NULL DEFAULT '[]',
     owner TEXT NOT NULL DEFAULT '',
     chat_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending'
@@ -720,7 +715,9 @@ CREATE TABLE IF NOT EXISTS agent_compensations (
     owner_digest TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'available'
         CHECK(state IN ('available','executing','completed','outcome_unknown')),
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_agent_compensations_owner ON agent_compensations(owner_digest,updated_at);
 
@@ -1448,6 +1445,18 @@ CREATE TABLE IF NOT EXISTS agent_kernel_events (
 CREATE INDEX IF NOT EXISTS idx_agent_kernel_events_session
     ON agent_kernel_events(owner_digest, session_digest, created_at, sequence);
 
+CREATE TABLE IF NOT EXISTS agent_skill_revisions (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_digest TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    content TEXT NOT NULL,
+    restored_from INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_skill_revisions_owner_name
+    ON agent_skill_revisions(owner_digest, name, revision);
+
 CREATE TABLE IF NOT EXISTS agent_action_leases (
     lease_key TEXT PRIMARY KEY,
     lease_token TEXT NOT NULL,
@@ -1481,8 +1490,7 @@ CREATE TABLE IF NOT EXISTS agent_missing_media_workflows (
     workflow_id TEXT PRIMARY KEY,
     owner_digest TEXT NOT NULL,
     source_tool TEXT NOT NULL
-        CHECK(source_tool IN ('library.search_missing_episode_resources',
-                              'library.search_missing_season_resources')),
+        CHECK(source_tool = 'resources.search_missing'),
     title TEXT NOT NULL,
     tmdb_id TEXT NOT NULL,
     season INTEGER NOT NULL CHECK(season BETWEEN 1 AND 100),

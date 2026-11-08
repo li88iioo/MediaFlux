@@ -4,29 +4,14 @@ import asyncio
 import pytest
 
 # Fixture migration: real GuangYa status producer, not arbitrary ready semantics.
-from app.agent.domains.guangya.runtime import _project_guangya_status
+from app.modules.organize_results import project_organize_status
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.public_view import format_partial_progress, public_conversation_messages
 from tests.support import isolated_test_database
-from tests.test_agent_kernel_core import (
-    AgentInput,
-    AgentSession,
-    CapabilityRetriever,
-    KernelToolSpec,
-    ModelEvent,
-    ModelEventType,
-    ModelToolCall,
-    PreparedEffect,
-    ScriptedModel,
-    ToolCatalog,
-    ToolEffect,
-    ToolPipeline,
-    ToolPipelineError,
-    consume_events,
-)
+from tests.test_agent_kernel_core import AgentInput, AgentSession, KernelToolSpec, ModelEvent, ModelEventType, ModelToolCall, PreparedEffect, ScriptedModel, ToolCatalog, ToolEffect, ToolPipeline, ToolPipelineError, consume_events
 
 EXPLANATION = "文件变更共5项，已完成3项，仍有2项未确认完成。第4项因前置条件未满足而受阻。"
-READ_RESULT = _project_guangya_status({
+READ_RESULT = project_organize_status({
     "status": "running", "stats": {"total": 5},
     "operation_items": [
         {"position": i, "label": f"文件{i}", "operation": "move",
@@ -35,7 +20,7 @@ READ_RESULT = _project_guangya_status({
          **({"reason": "precondition_failed"} if i == 4 else {})}
         for i in range(1, 6)
     ],
-}, overview={}).to_dict()
+}, overview={})
 READ_RESULT["data"].update(scope_note="仅核验目标目录", private_id="PRIVATE-ID32-DO-NOT-PUBLISH")
 
 
@@ -98,7 +83,7 @@ def test_submitted_read_model_synthesis_survives_cold_public_consumption(unresol
         ])
         catalog = ToolCatalog([write, read, blocked_read])
         store = SQLiteKernelStore(secret_provider=lambda: "answer-completion-fixture")
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
         preview = await consume_events(session.run(AgentInput(message="提交任务并核验目录", owner="o", session_id="s")))
         assert preview.approval is not None

@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
 from app.clients.qbittorrent import TorrentAddResult
+from app.indexers import downloads
 from app.modules import download_dispatcher as dispatcher
 from tests.support import isolated_test_database
 
@@ -22,6 +25,91 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         self.serial += 1
         request_id, _ = db.create_download_request('single-track-'+str(self.serial), 'magnet', title='统一分发', source_value='magnet:?xt=urn:btih:'+'a'*40)
         return request_id
+
+    def test_url_preview_is_read_only_and_changed_identity_never_dispatches(self):
+        url = 'magnet:?xt=urn:btih:' + 'b' * 40 + '&dn=Example'
+        with patch.dict(os.environ, {'QB_URL': 'http://qb.invalid'}), \
+             patch.object(dispatcher, '_submit_qb') as backend:
+            preview, frozen = downloads.preview_download_url(url, 'qb')
+            self.assertEqual(preview['title'], 'Example')
+            self.assertNotIn('magnet:', json.dumps(preview))
+            changed = 'magnet:?xt=urn:btih:' + 'c' * 40
+            with self.assertRaises(downloads.DownloadSnapshotChanged):
+                downloads.submit_download_url(changed, 'qb', origin='agent', expected_snapshot=frozen)
+            backend.assert_not_called()
+            with db.get_conn() as conn:
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM download_requests').fetchone()[0], 0)
+
+    def test_url_submit_preserves_partial_request_without_implicit_retry(self):
+        url = 'magnet:?xt=urn:btih:' + 'c' * 40 + '&dn=Example'
+        with patch.dict(os.environ, {'QB_URL': 'http://qb.invalid'}), \
+             patch.object(downloads, 'GuangYaClient') as factory, \
+             patch('socket.socket.connect', side_effect=AssertionError('no real download')), \
+             patch.object(dispatcher, '_submit_qb', return_value={'ok': True, 'task_id': 'd' * 40}) as qb, \
+             patch.object(dispatcher, '_submit_guangya', return_value={'ok': False, 'error': 'token=secret'}) as gy:
+            factory.return_value.logged_in = True
+            _, frozen = downloads.preview_download_url(url, 'both')
+            first = downloads.submit_download_url(url, 'both', origin='agent', expected_snapshot=frozen)
+            db.init_db()
+            retry = downloads.submit_download_url(url, 'both', origin='agent', expected_snapshot=frozen)
+            _, qb_snapshot = downloads.preview_download_url(url, 'qb')
+            duplicate = downloads.submit_download_url(url, 'qb', origin='agent', expected_snapshot=qb_snapshot)
+        qb.assert_called_once()
+        gy.assert_called_once()
+        self.assertEqual(first['status'], 'partial')
+        self.assertEqual(first['succeeded'], ['qb'])
+        self.assertEqual(first['failed'], ['guangya'])
+        self.assertEqual(retry['request_id'], first['request_id'])
+        self.assertTrue(retry['duplicate'])
+        self.assertEqual(retry['failed'], [])
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['request_id'], first['request_id'])
+        self.assertNotIn('token=secret', json.dumps(first))
+        row = db.get_download_request(first['request_id'])
+        assert row is not None
+        self.assertEqual((row['qb_status'], row['gy_status']), ('submitted', 'failed'))
+
+    def test_url_preview_rejects_share_and_plain_page_without_backend_access(self):
+        with patch.object(downloads, 'GuangYaClient') as client:
+            for url in ('https://example.com/', 'https://guangyapan.com/s/test-share', 'magnet:?dn=missing'):
+                with self.subTest(url=url), self.assertRaises(ValueError):
+                    downloads.preview_download_url(url, 'guangya')
+        client.assert_not_called()
+
+    def test_url_terminal_request_allows_new_confirmed_submission(self):
+        for serial, status in enumerate(('completed', 'failed', 'cancelled'), 1):
+            with self.subTest(status=status), patch.dict(os.environ, {'QB_URL': 'http://qb.invalid'}), \
+                 patch.object(dispatcher, '_submit_qb', return_value={'ok': True}) as qb:
+                url = f'magnet:?xt=urn:btih:{serial:040x}'
+                old = dispatcher.create_request(dispatcher.normalize_download_url(url), '', '', origin='agent')
+                db.update_download_request(old['id'], targets='qb', status=status, qb_status=status)
+                db.init_db()
+                fresh = downloads.submit_download_url(url, 'qb', origin='agent')
+                duplicate = downloads.submit_download_url(url, 'qb', origin='agent')
+                self.assertTrue(fresh['created'])
+                self.assertNotEqual(fresh['request_id'], old['id'])
+                prior = db.get_download_request(old['id'])
+                assert prior is not None
+                self.assertEqual(prior['status'], status)
+                self.assertTrue(duplicate['duplicate'])
+                self.assertEqual(duplicate['request_id'], fresh['request_id'])
+                qb.assert_called_once()
+
+    def test_url_http_keeps_dispatcher_input_without_indexer_prefetch(self):
+        url = 'https://fixture.invalid/download/Show.torrent?passkey=secret'
+        with patch.dict(os.environ, {'QB_URL': 'http://qb.invalid'}), \
+             patch.object(downloads, 'GuangYaClient') as client, \
+             patch.object(downloads, 'prepare_download_input', side_effect=AssertionError('direct URL must not prefetch')), \
+             patch.object(dispatcher, '_submit_qb', return_value={'ok': True}) as qb, \
+             patch.object(dispatcher, '_submit_guangya', return_value={'ok': True}) as gy:
+            client.return_value.logged_in = True
+            result = downloads.submit_download_url(url, 'both', origin='agent')
+        self.assertEqual(result['status'], 'submitted')
+        row = db.get_download_request(result['request_id'])
+        assert row is not None
+        self.assertEqual((row['kind'], row['source_value'], row['torrent_data']), ('http', url, None))
+        qb.assert_called_once()
+        gy.assert_called_once()
 
     def test_entrypoints_only_claim_then_delegate_and_never_submit_directly(self):
         for function in (dispatcher.dispatch_request, dispatcher.dispatch_missing_targets):

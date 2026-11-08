@@ -214,6 +214,32 @@ def create_local_media_source(
         return cur.lastrowid
 
 
+class LocalMediaSourceChanged(ValueError):
+    """确认后来源配置或归档映射发生变化。"""
+
+
+class LocalMediaSourceCancelled(RuntimeError):
+    """来源操作在事务写入前取消。"""
+
+
+def local_media_source_snapshot(conn, source_id: int | None, *, owner: str = "admin") -> dict:
+    if source_id is None:
+        return {"existing": [dict(row) for row in conn.execute(
+            "SELECT id,name,local_root FROM local_media_sources WHERE owner=? ORDER BY id", (owner,),
+        ).fetchall()]}
+    row = conn.execute("SELECT * FROM local_media_sources WHERE id=? AND owner=?", (source_id, owner)).fetchone()
+    targets = conn.execute("SELECT * FROM local_library_targets WHERE source_id=? AND owner=? ORDER BY category,id",
+                           (source_id, owner)).fetchall()
+    return {"source": dict(row) if row is not None else None, "targets": [dict(target) for target in targets]}
+
+
+def _check_source_snapshot(conn, source_id, owner, expected, cancelled=None) -> None:
+    if expected is not None and local_media_source_snapshot(conn, source_id, owner=owner) != expected:
+        raise LocalMediaSourceChanged("来源配置或归档目标已变化，请重新预检")
+    if cancelled is not None and cancelled():
+        raise LocalMediaSourceCancelled("来源操作已取消")
+
+
 def save_local_media_source_bundle(
     *,
     source_id: int | None = None,
@@ -231,6 +257,8 @@ def save_local_media_source_bundle(
     stable_seconds: int | None = None,
     scan_enabled: bool | None = None,
     scan_interval_minutes: int | None = None,
+    expected_snapshot: dict | None = None,
+    cancelled=None,
 ) -> int:
     """在单个事务内保存来源与全部分类目标。"""
     from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
@@ -289,6 +317,7 @@ def save_local_media_source_bundle(
     timestamp = db.now()
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        _check_source_snapshot(conn, source_id, safe_owner, expected_snapshot, cancelled)
         if source_id is None:
             cur = conn.execute(
                 "INSERT INTO local_media_sources(owner,name,qb_profile,qb_path_prefix,local_root,"
@@ -618,6 +647,8 @@ def create_local_media_task(
     owner: str = "admin",
     trigger: str = "qb_completed",
     operation_token: str = "",
+    expected_source_snapshot: dict | None = None,
+    cancelled=None,
 ) -> int:
     import uuid
 
@@ -633,6 +664,7 @@ def create_local_media_task(
     token = (operation_token or uuid.uuid4().hex)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        _check_source_snapshot(conn, source_id, safe_owner, expected_source_snapshot, cancelled)
         source = conn.execute(
             "SELECT id FROM local_media_sources WHERE id=? AND owner=?",
             (source_id, safe_owner),
@@ -1057,96 +1089,6 @@ def get_local_media_diagnostic_summary(
                 "manual",
             ),
         ),
-    }
-
-
-def _local_media_age_bucket_sql(timestamp_expression: str) -> str:
-    return (
-        "CASE "
-        f"WHEN {timestamp_expression}='' THEN 'unknown' "
-        f"WHEN datetime({timestamp_expression}) >= datetime('now','-1 hour') THEN 'under_1h' "
-        f"WHEN datetime({timestamp_expression}) >= datetime('now','-1 day') THEN '1h_to_24h' "
-        f"WHEN datetime({timestamp_expression}) >= datetime('now','-7 days') THEN '1d_to_7d' "
-        "ELSE 'over_7d' END"
-    )
-
-
-def get_local_media_review_queue_summary(*, owner: str = "admin") -> dict[str, Any]:
-    """聚合待人工确认队列；只返回数量、触发来源和年龄分桶。"""
-    safe_owner = _local_media_owner(owner)
-    age_sql = _local_media_age_bucket_sql(
-        "COALESCE(NULLIF(updated_at,''),created_at,'')"
-    )
-    with db.get_conn() as conn:
-        total = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM local_media_tasks WHERE owner=? AND status='requires_manual'",
-                (safe_owner,),
-            ).fetchone()[0]
-        )
-        trigger_rows = conn.execute(
-            "SELECT trigger,COUNT(*) AS count FROM local_media_tasks "
-            "WHERE owner=? AND status='requires_manual' GROUP BY trigger",
-            (safe_owner,),
-        ).fetchall()
-        age_rows = conn.execute(
-            f"SELECT {age_sql} AS age_bucket,COUNT(*) AS count FROM local_media_tasks "
-            "WHERE owner=? AND status='requires_manual' GROUP BY age_bucket",
-            (safe_owner,),
-        ).fetchall()
-    return {
-        "total": total,
-        "by_trigger": {
-            str(row["trigger"] or "unknown"): int(row["count"] or 0)
-            for row in trigger_rows
-        },
-        "age_buckets": {
-            str(row["age_bucket"]): int(row["count"] or 0) for row in age_rows
-        },
-    }
-
-
-def get_local_media_history_summary(*, owner: str = "admin") -> dict[str, Any]:
-    """聚合本地媒体终态历史；不读取标题、路径、标识或错误正文。"""
-    safe_owner = _local_media_owner(owner)
-    timestamp_expression = (
-        "COALESCE(NULLIF(completed_at,''),NULLIF(updated_at,''),created_at,'')"
-    )
-    age_sql = _local_media_age_bucket_sql(timestamp_expression)
-    with db.get_conn() as conn:
-        total = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM local_media_tasks WHERE owner=? AND status IN ('completed','failed')",
-                (safe_owner,),
-            ).fetchone()[0]
-        )
-        status_rows = conn.execute(
-            "SELECT status,COUNT(*) AS count FROM local_media_tasks "
-            "WHERE owner=? AND status IN ('completed','failed') GROUP BY status",
-            (safe_owner,),
-        ).fetchall()
-        trigger_rows = conn.execute(
-            "SELECT trigger,COUNT(*) AS count FROM local_media_tasks "
-            "WHERE owner=? AND status IN ('completed','failed') GROUP BY trigger",
-            (safe_owner,),
-        ).fetchall()
-        age_rows = conn.execute(
-            f"SELECT {age_sql} AS age_bucket,COUNT(*) AS count FROM local_media_tasks "
-            "WHERE owner=? AND status IN ('completed','failed') GROUP BY age_bucket",
-            (safe_owner,),
-        ).fetchall()
-    return {
-        "total": total,
-        "by_status": {
-            str(row["status"]): int(row["count"] or 0) for row in status_rows
-        },
-        "by_trigger": {
-            str(row["trigger"] or "unknown"): int(row["count"] or 0)
-            for row in trigger_rows
-        },
-        "age_buckets": {
-            str(row["age_bucket"]): int(row["count"] or 0) for row in age_rows
-        },
     }
 
 
@@ -1651,10 +1593,12 @@ def update_local_media_source(
         return cur.rowcount == 1
 
 
-def delete_local_media_source(source_id: int, *, owner: str = "admin") -> bool:
+def delete_local_media_source(source_id: int, *, owner: str = "admin", expected_snapshot: dict | None = None,
+                              cancelled=None) -> bool:
     safe_owner = _local_media_owner(owner)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        _check_source_snapshot(conn, source_id, safe_owner, expected_snapshot, cancelled)
         if _local_media_source_has_active_task(
             conn,
             source_id=source_id,
@@ -1682,6 +1626,8 @@ def reset_local_media_task(
     confirm_interrupted_write: bool = False,
     expected_version: int | None = None,
     expected_status: str | None = None,
+    expected_snapshot: dict | None = None,
+    cancelled=None,
 ) -> bool:
     """统一重试事务；Web 显式核验与 Agent 版本条件共用同一状态重置。"""
     from app.modules.local_media_models import renew_local_media_operation_token
@@ -1768,6 +1714,10 @@ def reset_local_media_task(
     params.extend([task_id, safe_owner])
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if expected_snapshot is not None and local_media_task_snapshot(conn, task_id, owner=safe_owner) != expected_snapshot:
+            raise LocalMediaTaskChanged("任务、来源或归档配置已变化，请重新预检")
+        if cancelled is not None and cancelled():
+            raise LocalMediaTaskCancelled("本地任务重试已取消")
         current = conn.execute(
             "SELECT status,error,version,operation_token FROM local_media_tasks WHERE id=? AND owner=?",
             (task_id, safe_owner),
@@ -1797,6 +1747,49 @@ def reset_local_media_task(
             (task_id,),
         )
         return True
+
+
+class LocalMediaTaskChanged(ValueError):
+    """任务确认后持久业务事实发生变化。"""
+
+
+class LocalMediaTaskCancelled(RuntimeError):
+    """任务重试在原事务写入前取消。"""
+
+
+def local_media_task_snapshot(conn, task_id: int, *, owner: str = "admin") -> dict:
+    row = conn.execute("SELECT * FROM local_media_tasks WHERE id=? AND owner=?", (task_id, owner)).fetchone()
+    if row is None:
+        raise LookupError("本地媒体任务不存在")
+    return {"task": dict(row), "source": local_media_source_snapshot(conn, row["source_id"], owner=owner),
+            "items": [dict(item) for item in conn.execute(
+                "SELECT * FROM local_media_task_items WHERE task_id=? AND owner=? ORDER BY id", (task_id, owner))],
+            "steps": [dict(item) for item in conn.execute(
+                "SELECT s.* FROM local_media_operation_steps s JOIN local_media_tasks t ON t.id=s.task_id "
+                "WHERE s.task_id=? AND t.owner=? ORDER BY s.id", (task_id, owner))]}
+
+
+def local_media_task_page(*, statuses: set[str], skipped: bool = False, source_id: int | None = None,
+                          limit: int = 100, offset: int = 0, owner: str = "admin") -> tuple[list[dict], int]:
+    """先按状态/文件事实过滤，再在同一读取快照计数和分页。"""
+    sql = " FROM local_media_tasks t WHERE t.owner=?"
+    params: list[object] = [_local_media_owner(owner)]
+    if statuses:
+        sql += " AND t.status IN (" + ",".join("?" for _ in statuses) + ")"
+        params.extend(sorted(statuses))
+    if source_id is not None:
+        sql += " AND t.source_id=?"
+        params.append(source_id)
+    if skipped:
+        sql += (" AND EXISTS (SELECT 1 FROM local_media_task_items i WHERE i.task_id=t.id"
+                " AND i.owner=t.owner AND i.role='video' AND i.action='skip')"
+                " AND t.warning NOT LIKE '%仅预览模式：未移动文件%'")
+    with db.get_conn() as conn:
+        conn.execute("BEGIN")
+        total = conn.execute("SELECT COUNT(*)" + sql, params).fetchone()[0]
+        rows = conn.execute("SELECT t.*" + sql + " ORDER BY COALESCE(NULLIF(t.updated_at,''),t.created_at) DESC,t.id DESC LIMIT ? OFFSET ?",
+                            [*params, limit, offset]).fetchall()
+    return [dict(row) for row in rows], total
 
 
 def reset_local_media_task_if_current(

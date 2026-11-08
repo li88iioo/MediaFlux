@@ -1,6 +1,7 @@
 """LLM Provider 四协议公共适配测试。"""
 from __future__ import annotations
 
+import json
 import unittest
 from typing import Any
 
@@ -39,8 +40,9 @@ class LLMProviderProtocolTests(unittest.TestCase):
                         "input_tokens": 12,
                         "output_tokens": 3,
                         "total_tokens": 15,
-                        "input_token_details": {"cached_tokens": 2},
-                        "output_token_details": {"reasoning_tokens": 1},
+                        # 与真实网关返回一致（2026-11-04 实测 gemini-3.8-flash via Responses）。
+                        "input_tokens_details": {"cached_tokens": 2},
+                        "output_tokens_details": {"reasoning_tokens": 1},
                     }
                 },
             ),
@@ -323,9 +325,59 @@ class LLMProviderProtocolTests(unittest.TestCase):
             protocol="anthropic_messages", model="model", system_prompt="system",
             history=anthropic_history, tools=tools, max_tokens=400,
         )
-        self.assertEqual(anthropic["system"], "system")
-        self.assertEqual(anthropic["messages"], anthropic_history)
+        ephemeral = {"type": "ephemeral"}
+        self.assertEqual(anthropic["system"], [{"type": "text", "text": "system", "cache_control": ephemeral}])
+        self.assertEqual(anthropic["messages"], [
+            {"role": "user", "content": [{"type": "text", "text": "user", "cache_control": ephemeral}]},
+        ])
+        # 断点只写入请求体，不回写调用方持有的历史。
+        self.assertEqual(anthropic_history, [{"role": "user", "content": "user"}])
         self.assertNotIn("stream", anthropic)
+
+    def test_anthropic_cache_breakpoints_follow_stable_head_and_latest_input(self):
+        ephemeral = {"type": "ephemeral"}
+        result = {"type": "tool_result", "tool_use_id": "call-1", "content": "{}"}
+        history = [
+            {"role": "user", "content": "find"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call-1", "name": "x", "input": {}}]},
+            {"role": "user", "content": [result]},
+        ]
+        body = native_tool_request_body(
+            protocol="anthropic_messages", model="model", system_prompt="HEAD\nTAIL",
+            history=history, tools=[], max_tokens=400, stable_system_chars=4,
+        )
+        self.assertEqual(body["system"], [
+            {"type": "text", "text": "HEAD", "cache_control": ephemeral},
+            {"type": "text", "text": "\nTAIL"},
+        ])
+        self.assertEqual(body["messages"][:2], history[:2])
+        self.assertEqual(body["messages"][2]["content"], [{**result, "cache_control": ephemeral}])
+        self.assertNotIn("cache_control", result)
+        for stable_chars, system in ((0, "HEAD\nTAIL"), (99, "HEAD\nTAIL"), (4, "HEAD\n  ")):
+            with self.subTest(stable_chars=stable_chars, system=system):
+                body = native_tool_request_body(
+                    protocol="anthropic_messages", model="model", system_prompt=system,
+                    history=history, tools=[], max_tokens=400, stable_system_chars=stable_chars,
+                )
+                # 无可用拆分或尾部为空白时整段作为一个缓存块，不发送空文本块。
+                expected = system if stable_chars == 0 or stable_chars >= len(system) else "HEAD"
+                self.assertEqual(body["system"], [{"type": "text", "text": expected, "cache_control": ephemeral}])
+        for tail in ({"role": "assistant", "content": "draft"}, {"role": "user", "content": "  "},
+                     {"role": "user", "content": [{"type": "image", "source": {}}]}):
+            with self.subTest(tail=tail):
+                body = native_tool_request_body(
+                    protocol="anthropic_messages", model="model", system_prompt="",
+                    history=[tail], tools=[], max_tokens=400,
+                )
+                self.assertEqual(body["messages"], [tail])
+                self.assertEqual(body["system"], "")
+        for protocol in ("responses", "chat_completions"):
+            with self.subTest(protocol=protocol):
+                body = native_tool_request_body(
+                    protocol=protocol, model="model", system_prompt="HEAD\nTAIL",
+                    history=[], tools=[], max_tokens=400, stable_system_chars=4,
+                )
+                self.assertNotIn("cache_control", json.dumps(body))
 
     def test_native_parallel_tool_permission_requires_true_and_tools(self):
         cases: list[dict[str, Any]] = [
@@ -388,7 +440,7 @@ class LLMProviderProtocolTests(unittest.TestCase):
                     "id": "call_2",
                     "type": "function",
                     "function": {
-                        "name": "mf_downloads_diagnose_queue",
+                        "name": "mf_downloads_diagnose",
                         "arguments": '{"limit":5}',
                     },
                 }],

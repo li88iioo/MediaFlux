@@ -1,9 +1,7 @@
 """媒体服务器、STRM 与本地归档路径映射的统一管理 API。"""
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +20,16 @@ from app.modules.local_path_mapping import (
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
     MediaServerPathMappingError,
-    encode_media_server_path_mappings,
+    MAPPING_CONFIG,
+    list_path_mappings,
+    mapping_updates,
+    mapping_write_guard,
     media_server_path_is_within,
-    parse_media_server_path_mappings,
 )
 from app.modules.media_server_profiles import (
     MediaServerProfile,
     list_configured_profiles,
 )
-from app.modules.process_lock import CrossProcessLock
 from app.modules.strm import (
     STRM_SUBDIR,
     parse_strm_sources,
@@ -52,22 +51,6 @@ _CATEGORY_LABELS = {
     "concert": "演唱会",
     "kids": "儿童节目",
 }
-_MAPPING_CONFIG = {
-    "jellyfin": ("JELLYFIN_PATH_MAPPINGS", "JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK"),
-    "emby": ("EMBY_PATH_MAPPINGS", "EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK"),
-}
-_MAPPING_SAVE_LOCK = CrossProcessLock("media-library-mappings")
-
-
-@contextmanager
-def _mapping_save_guard():
-    """串行化 SQLite 与 user.env 的组合更新，避免并发回滚互相覆盖。"""
-    if not _MAPPING_SAVE_LOCK.acquire():  # blocking=True 正常不会返回 False
-        raise RuntimeError("媒体库映射正在由其他请求保存")
-    try:
-        yield
-    finally:
-        _MAPPING_SAVE_LOCK.release()
 
 
 def _client_for(profile: MediaServerProfile):
@@ -98,15 +81,10 @@ def _library_payload(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _mapping_payload(provider: str) -> tuple[list[dict[str, str]], str]:
-    mapping_key, _fallback_key = _MAPPING_CONFIG[provider]
     try:
-        mappings = parse_media_server_path_mappings(config.get(mapping_key, ""))
+        return list_path_mappings(provider)["items"], ""
     except MediaServerPathMappingError as exc:
         return [], str(exc)
-    return [
-        {"local": item.local_prefix, "server": item.server_prefix}
-        for item in mappings
-    ], ""
 
 
 def _probe_profile(profile: MediaServerProfile) -> tuple[str, list[dict[str, Any]], str]:
@@ -310,7 +288,7 @@ def media_library_overview(request: Request):
 
     servers: list[dict[str, Any]] = []
     for profile in profiles:
-        mapping_key, fallback_key = _MAPPING_CONFIG[profile.server_type]
+        mapping_key, fallback_key = MAPPING_CONFIG[profile.server_type]
         mappings, mapping_error = _mapping_payload(profile.server_type)
         libraries, library_error = probes.get(profile.server_type, ([], "媒体库读取失败"))
         servers.append({
@@ -422,23 +400,6 @@ def _validated_local_bindings(raw: object) -> list[dict[str, Any]]:
     return normalized
 
 
-def _validated_strm_mapping_updates(raw: object) -> dict[str, str]:
-    if not isinstance(raw, dict):
-        raise ValueError("strm_mappings 必须是对象")
-    unknown = sorted(set(raw) - set(_MAPPING_CONFIG))
-    if unknown:
-        raise ValueError(f"包含无效媒体服务器类型: {', '.join(unknown[:3])}")
-    updates: dict[str, str] = {}
-    for provider, mappings in raw.items():
-        mapping_key, _fallback_key = _MAPPING_CONFIG[provider]
-        if config.has_external_override(mapping_key):
-            raise ValueError(f"{provider} 路径映射由部署环境管理，不能在页面修改")
-        updates[mapping_key] = encode_media_server_path_mappings(
-            json.dumps(mappings, ensure_ascii=False)
-        )
-    return updates
-
-
 @router.post("/mappings")
 def save_media_library_mappings(request: Request, data: dict | None = Body(default=None)):
     """统一保存 STRM 路径映射和本地归档绑定。"""
@@ -447,9 +408,9 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
     if not isinstance(payload, dict):
         return api_error("映射配置必须是 JSON 对象", 400)
     try:
-        with _mapping_save_guard():
+        with mapping_write_guard():
             local_bindings = _validated_local_bindings(payload.get("local_bindings", []))
-            strm_updates = _validated_strm_mapping_updates(payload.get("strm_mappings", {}))
+            strm_updates = mapping_updates(payload.get("strm_mappings", {}))
             previous_bindings = [
                 {
                     "source_id": item["source_id"],
@@ -495,7 +456,7 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
     payload = data or {}
     try:
         provider = _required_text(payload, "provider", "媒体服务器类型").lower()
-        if provider not in _MAPPING_CONFIG:
+        if provider not in MAPPING_CONFIG:
             raise ValueError("媒体服务器类型无效")
         local_path = _required_text(payload, "local_path", "MediaFlux 路径")
         server_path = _required_text(payload, "server_path", "媒体服务器路径")

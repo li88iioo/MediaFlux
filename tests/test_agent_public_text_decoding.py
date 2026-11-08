@@ -11,17 +11,12 @@ import pytest
 
 from app import database as db
 from app.agent.kernel.adapters import TurnViewBuilder, iter_ndjson
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.events import AgentEvent, AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.projection import DefaultProjector
-from app.agent.kernel.session import AgentSession
+from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolResult
 from app.agent.public_safety import (
@@ -33,7 +28,7 @@ from app.agent.public_view import public_conversation_messages
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
 
 SUMMARY = "稍后重试即可"
-PREFIX = "仍有工具调用受到频率限制："
+FALLBACK = "工具调用未取得完整结果。"
 PRIVATE = {
     "path": "／srv／private／S1PATHCANARY",
     "url": "ｈｔｔｐｓ：／／private.invalid／S1URLCANARY",
@@ -73,61 +68,47 @@ def store(tmp_path):
 def reply(protocol, *, name="", index=0):
     cid, args = f"call-{index}", {"ref": "healthy" if index else "limited"}
     if protocol == "chat_completions":
-        message = {"content": "核验完毕。"}
+        message = {"content": ""}
         if name:
             message = {"tool_calls": [{"type": "function", "id": cid, "function": {"name": name, "arguments": encode(args)}}]}
         body = {"choices": [{"message": message, "finish_reason": "tool_calls" if name else "stop"}]}
     elif protocol == "responses":
         item = {"type": "function_call", "id": f"item-{index}", "call_id": cid, "name": name, "arguments": encode(args)} if name else {
-            "type": "message", "content": [{"type": "output_text", "text": "核验完毕。"}],
+            "type": "message", "content": [{"type": "output_text", "text": ""}],
         }
         body = {"status": "completed", "output": [item]}
     else:
-        item = {"type": "tool_use", "id": cid, "name": name, "input": args} if name else {"type": "text", "text": "核验完毕。"}
+        item = {"type": "tool_use", "id": cid, "name": name, "input": args} if name else {"type": "text", "text": ""}
         body = {"content": [item], "stop_reason": "tool_use" if name else "end_turn"}
     return encode(body).encode(), "application/json"
 
 
 async def assert_scoped_snapshot(pipeline, handle, expected, *, owner, session_id):
-    """Read the actual registered continuation API, including paged leaves."""
-    from types import SimpleNamespace
+    """真实会话快照全文读取；路径选择不改变原节点类型。"""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
 
     from app.agent.errors import ToolPipelineError
-
-    reader = pipeline.catalog.get("agent.read_result").read
-    context = SimpleNamespace(owner=owner, session_id=session_id)
-    for wrong in (SimpleNamespace(owner=owner + "-other", session_id=session_id),
-                  SimpleNamespace(owner=owner, session_id=session_id + "-other")):
+    from app.agent.kernel.session_service import SessionService
+    from app.agent.kernel.state_types import CancellationToken
+    from app.agent.kernel.tool_calls import ToolCallContext
+    lease, _ = await pipeline.state_store.begin_turn(owner=owner, session_id=session_id, request_id="snapshot-read")
+    context = ToolCallContext(owner=owner, session_id=session_id, request_id=lease.request_id,
+        turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
+    for wrong in (replace(context, owner=owner + "-other"), replace(context, session_id=session_id + "-other")):
         with pytest.raises(ToolPipelineError) as denied:
-            await reader({"handle": handle, "path": ""}, wrong)
+            await SessionService(pipeline, wrong).result(handle)
         assert denied.value.code == "reference_invalid"
 
     async def check(path, value):
-        offset, items = 0, "" if isinstance(value, str) else []
-        while True:
-            result = await reader({"handle": handle, "path": path, "offset": offset, "limit": 1000}, context)
-            page = json.loads(result.model_content)
-            assert page["result_handle"] == handle and page["read_tool"] == "agent.read_result"
-            assert page["ok"] is True and page["status"] == "success"
-            data = page["data"]
-            total = len(value) if isinstance(value, (dict, list, str)) else 1
-            assert data["path"] == path and data["offset"] == offset
-            assert data["kind"] == type(value).__name__ and data["total"] == total
-            if page.get("truncated"):
-                assert isinstance(value, (dict, list)), (path, page)
-                children = value.items() if isinstance(value, dict) else enumerate(value)
-                for key, child in children:
-                    await check(path + "/" + str(key).replace("~", "~0").replace("/", "~1"), child)
-                return
-            assert data["returned"] == len(data["items"])
-            items += data["items"]
-            if not data["has_more"]:
-                assert data["next_offset"] is None
-                break
-            assert data["next_offset"] == offset + data["returned"] > offset
-            offset = data["next_offset"]
-        actual = {item["key"]: item["value"] for item in items} if isinstance(value, dict) else items
-        assert actual == (value if isinstance(value, (dict, list, str)) else [value])
+        result = await SessionService(pipeline, context).result(handle, path)
+        assert result["result_handle"] == handle
+        assert result["ok"] is True and result["status"] == "snapshot"
+        assert result["data"] == value
+        if isinstance(value, (dict, list)):
+            children = value.items() if isinstance(value, dict) else enumerate(value)
+            for key, child in children:
+                await check(path + "/" + str(key).replace("~", "~0").replace("/", "~1"), child)
 
     await check("", expected)
 
@@ -153,13 +134,14 @@ async def observe(store, error, protocol, mixed):
     replies = [reply(protocol, name=tool.model_name)]
     if mixed:
         replies.append(reply(protocol, name=tool.model_name, index=1))
-    replies.append(reply(protocol))
     wire = Wire(protocol, replies)
     # Exercise the sanitizer's input boundary, not the independent DTO compactor.
     projector = DefaultProjector(max_model_chars=100_000)
     session = AgentSession(
-        model=wire.adapter, catalog=catalog, retriever=CapabilityRetriever(minimum=1, maximum=1),
+        model=wire.adapter, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=store, projector=projector), state_store=store, journal=store,
+        # 工具错误投影在真实预算中断验证；正常模型链接与路径不走该净化器。
+        limits=SessionLimits(max_model_rounds=len(replies)),
     )
     emitted = [event async for event in session.run(AgentInput(message="核验并如实交付", owner="decoding-owner", session_id="decoding"))]
     assert calls == [{"ref": "limited"}] + ([{"ref": "healthy"}] if mixed else [])
@@ -177,7 +159,7 @@ async def observe(store, error, protocol, mixed):
     if "result_handle" in audit:
         handle = audit["result_handle"]
         assert handle.startswith("ref_")
-        assert audit == {**value.to_dict(), "refs": [], "result_handle": handle, "read_tool": "agent.read_result"}
+        assert audit == {**value.to_dict(), "refs": [], "result_handle": handle, "read_method": "session.result"}
         # The raw journal remains exact; the snapshot is the complete model-safe DTO.
         from app.agent.kernel.projection import _model_safe
         await assert_scoped_snapshot(session.pipeline, handle, _model_safe(value.to_model_dict()),
@@ -185,7 +167,7 @@ async def observe(store, error, protocol, mixed):
     else:
         assert audit == value.to_dict()
     assert not any(event["type"] == "tool.failed" for event in journal)
-    assert "已有工具返回真实频率限制" in encode(wire.requests[-1])
+    assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
     events = [AgentEvent(type=AgentEventType(event["type"]), sequence=event["sequence"], request_id=event["request_id"], session_id=event["session_id"], turn_id=event["turn_id"], occurred_at=event["occurred_at"], event_id=event["event_id"], payload=event["payload"]) for event in journal]
     builder = TurnViewBuilder()
     for event in events:
@@ -233,7 +215,7 @@ def test_nested_private_errors_never_fall_back_to_summary(store, protocol, mixed
     if mixed:
         assert "未完成的查询：" not in text
     else:
-        assert text == PREFIX
+        assert text == FALLBACK
         assert "CANARY" not in encode([view["error"], terminal])
 
 
@@ -246,7 +228,7 @@ def test_full_input_is_checked_before_terminal_truncation(store, mixed, length):
     text = final["answer"] if mixed else final["message"]
     assert "a" not in text and "CANARY" not in text and SUMMARY not in text
     if not mixed:
-        assert text == PREFIX
+        assert text == FALLBACK
 
 
 SAFE = [
@@ -273,7 +255,7 @@ def test_safe_terminal_controls(store, raw, expected, mixed):
     if mixed:
         assert "未完成的查询：" + expected in final["answer"]
     else:
-        assert final["message"] == PREFIX + expected
+        assert final["message"] == expected
 
 
 @pytest.mark.parametrize("length", [65535, 65536, 65537])
@@ -328,7 +310,7 @@ def test_public_explanation_preserves_whole_business_names(name):
     assert sanitize_public_text(f"请使用 {name} 核对名称") == f"请使用 {name} 核对名称"
 
 
-@pytest.mark.parametrize("name", ["guangya.fs.query", "guangya__fs__query"])
+@pytest.mark.parametrize("name", ["cloud.list", "cloud__list"])
 def test_native_and_domain_tool_names_share_public_label(name):
     from app.agent.public_safety import public_tool_label
     assert public_tool_label(name) == "光鸭文件查询"

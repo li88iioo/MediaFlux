@@ -1382,13 +1382,16 @@ def _strip_known_episode_suffix(
 
 
 def parse_release_position(
-    value: str, *, tv_episode_mapping_context: bool = False
+    value: str, *, tv_episode_mapping_context: bool = False,
+    infer_unnumbered_special: bool = True,
 ) -> dict[str, int | None]:
     """从发布标题中提取可安全展示/排序的季集位置，不发起任何网络请求。
 
     ``tv_episode_mapping_context`` 只由显式 TV 批量映射链启用，用于接受
     ``Title 014`` 这种普通空格末尾集号，并保留显式源 E00，不能在用户
     指定映射前先改写成 S00E01；默认关闭，不改变自动识别契约。
+    资源站核对设置 ``infer_unnumbered_special=False``：无编号特别篇保留未知，
+    不能把整理时的默认槽位当作发布标题已证明的集号。
     """
     name = _strip_explicit_tmdb_markers(value or "")
     # 资源站发布标题不一定带文件扩展名，发布组本身却可能包含点号，
@@ -1422,8 +1425,8 @@ def parse_release_position(
         if 1 <= start <= end <= 500:
             season, episode, episode_end = 0, start, end
     elif fractional is None and not (tv_episode_mapping_context and episode == 0):
-        special_episode = _extract_special_episode(stem)
-        if special_episode is not None:
+        special_episode = _extract_special_episode(stem, default_episode=1 if infer_unnumbered_special else None)
+        if special_episode is not None or _SPECIAL_EPISODE_TOKEN.search(stem):
             season, episode = 0, special_episode
 
     match = _RELEASE_EPISODE_RANGE.search(stem)
@@ -5044,6 +5047,8 @@ class TMDBScraper:
     @staticmethod
     def parse_resource_tags(filename: str) -> dict[str, str]:
         """仅从文件名中提取可验证的发布规格，不猜测缺失信息。"""
+        from app.modules.media_probe import infer_dynamic_ranges
+
         raw = (filename or "")
         text = re.sub(r"[\[\]【】()（）]", " ", raw)
 
@@ -5079,27 +5084,33 @@ class TMDBScraper:
             (r"(?:h[ ._-]?264|avc|x264)", "H.264"),
             (r"(?:^|[._ -])av1(?:[._ -]|$)", "AV1"),
         ))
-        effects = []
-        for pattern, label in (
-            (r"hdr10\+|hdr10plus", "HDR10+"),
-            (r"(?:^|[._ -])hdr10(?:[._ -]|$)", "HDR10"),
-            (r"(?:dovi|dolby[ ._-]?vision)", "DoVi"),
-            (r"(?:^|[._ -])hdr(?:[._ -]|$)", "HDR"),
+        effects = infer_dynamic_ranges(text)
+        audio_tracks: dict[str, list[str]] = {label: [] for label in ("DDP", "DD", "AAC")}
+        # 编码与声道必须相邻且完整；拒绝把年份、视频编码或版本数字链截成声道。
+        for audio_match in re.finditer(
+            r"(?<![a-z0-9])(?P<codec>ddp|e[ ._-]*ac[ ._-]*3|dd|ac[ ._-]*3|aac)"
+            r"(?:[ ._-]*(?P<channels>[1-8][ ._-]+[01]|51|71)(?![._-]\d+(?:[._ -]|$)))?"
+            r"(?![a-z0-9])", text, re.IGNORECASE,
         ):
-            if re.search(pattern, text, re.IGNORECASE) and label not in effects:
-                effects.append(label)
-        audio = []
+            codec = re.sub(r"[ ._-]+", "", audio_match["codec"]).lower()
+            label = {"ddp": "DDP", "eac3": "DDP", "dd": "DD", "ac3": "DD", "aac": "AAC"}[codec]
+            channels = re.sub(r"[ ._-]+", ".", audio_match["channels"] or "")
+            if channels in {"51", "71"}:
+                if label != "DDP":
+                    continue
+                channels = ".".join(channels)
+            track = f"{label} {channels}".rstrip()
+            if track not in audio_tracks[label]:
+                audio_tracks[label].append(track)
+        audio = audio_tracks["DDP"] + audio_tracks["DD"]
         for pattern, label in (
-            (r"(?:ddp|eac3)[ ._-]?7[ ._-]?1", "DDP 7.1"),
-            (r"(?:ddp|eac3)[ ._-]?5[ ._-]?1", "DDP 5.1"),
-            (r"(?:^|[._ -])(?:ddp|eac3)(?:[._ -]|$)", "DDP"),
             (r"(?:^|[._ -])atmos(?:[._ -]|$)", "Atmos"),
             (r"truehd", "TrueHD"),
             (r"dts[ ._-]?(?:hd|ma)", "DTS-HD MA"),
-            (r"(?:^|[._ -])aac(?:[._ -]|$)", "AAC"),
         ):
             if re.search(pattern, text, re.IGNORECASE) and label not in audio:
                 audio.append(label)
+        audio.extend(audio_tracks["AAC"])
         stem = raw.rsplit(".", 1)[0]
         release_group_match = _tail_release_group(stem)
         release_group = release_group_match[0] if release_group_match else ""
@@ -6460,9 +6471,9 @@ class TMDBScraper:
 
     @staticmethod
     def _shared_ai_endpoint_is_valid(api_url: str) -> bool:
-        """复用 Media Agent 连接时沿用其公共 HTTPS 安全边界。"""
+        """复用 Media Agent 管理员配置的模型端点。"""
         try:
-            normalize_provider_location(api_url, https_only=True, public_only=True)
+            normalize_provider_location(api_url)
         except ValueError:
             return False
         return True
@@ -6486,9 +6497,7 @@ class TMDBScraper:
     def _ai_client_fingerprint(client_key: AIClientKey) -> str:
         protocol = client_key[5] if len(client_key) > 5 else "auto"
         try:
-            base_url = normalize_provider_location(
-                client_key[0], https_only=True, public_only=True
-            ).base_url
+            base_url = normalize_provider_location(client_key[0]).base_url
         except ValueError:
             base_url = (client_key[0] or "").strip()
         return provider_fingerprint(

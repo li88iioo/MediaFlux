@@ -1,17 +1,16 @@
 """Property-count ingress and stale preview exclusion regressions."""
 
 from typing import cast
-from app.agent.kernel.pipeline import AuthorizationPolicy
+from app.agent.kernel.effects import AuthorizationPolicy
 import asyncio
 from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
 
-from app.agent.domains.system.capability_actions import CAPABILITY_PARAMETERS
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session_guard import session_scope_guard
@@ -26,14 +25,6 @@ from tests.support import isolated_test_database
 from tests.test_agent_schema_composition import execute
 
 
-@pytest.mark.parametrize("arguments", [
-    {}, {"query": "status"}, {"queries": ["status", "library"]},
-    {"tool_names": ["library.status"]}, {"catalog": {}},
-])
-def test_capability_single_selector_remains_valid(arguments):
-    trace = []
-    assert asyncio.run(execute(CAPABILITY_PARAMETERS, arguments, trace)).arguments == arguments
-    assert trace == [("validate", arguments), ("read", arguments)]
 
 
 @pytest.mark.parametrize("schema,value,valid", [

@@ -19,7 +19,7 @@ from app.agent.kernel.state_types import (
 CALLBACK_RE = re.compile(
     r"^agk:s:(?:(?P<route>[A-Za-z0-9_-]{8,16}):)?"
     r"(?P<handle>ref_[A-Za-z0-9_-]{24}):"
-    r"(?P<action>i(?:[1-9]|1[0-2])|t(?:qb|guangya|both)|[epr])$"
+    r"(?P<action>i(?:[1-9]|[1-4][0-9]|50)|t(?:qb|guangya|both)|[epr])$"
 )
 _DRAFT_KIND = "ux_telegram_candidate"
 
@@ -103,6 +103,9 @@ def render(
     lines = ["<b>资源推荐与批选</b>" if recommended else "<b>资源搜索与批选</b>"]
     if not recommended:
         lines.append("请选择需要的版本，再预览下载。")
+    coverage_notice = str(view.get("coverage_notice") or "").strip()
+    if coverage_notice:
+        lines.append(html.escape(coverage_notice))
     items = view["items"] if draft["expanded"] else [item for item in view["items"] if item["position"] in selected]
     for item in items:
         description = _short(item)

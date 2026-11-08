@@ -8,9 +8,11 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from app.clients.base import MediaItem
+from app import services
+from app.clients.base import MediaItem, MediaServerClient
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
+from app.modules.media_server_profiles import MediaServerProfile
 
 
 class MediaRuntimeTests(unittest.TestCase):
@@ -75,6 +77,120 @@ class MediaRuntimeTests(unittest.TestCase):
 
 
 class DashboardMediaCountTests(unittest.TestCase):
+    def test_public_counts_preserve_partial_sources_and_real_empty_counts(self):
+        profiles = [MediaServerProfile(f"configured:{kind}", kind, kind.title(),
+                    f"http://{kind}.invalid", "private-token", True, "configured-viewer")
+                    for kind in ("jellyfin", "emby")]
+        counts = {"total_items": 7, "movie_count": 2, "series_count": 1, "episode_count": 5}
+        for failed, empty in ((None, False), (requests.Timeout("private-token"), False),
+                              (RuntimeError("private-token"), False), (None, True)):
+            with self.subTest(failed=failed, empty=empty), ExitStack() as stack:
+                stack.enter_context(patch("app.services.list_configured_profiles", return_value=profiles))
+                returned = dict.fromkeys(counts, 0) if empty else counts
+                stack.enter_context(patch.object(JellyfinClient, "get_media_counts", return_value=returned))
+                stack.enter_context(patch.object(EmbyClient, "get_media_counts",
+                    side_effect=failed, return_value=returned))
+                closes = [stack.enter_context(patch.object(cls, "close")) for cls in (JellyfinClient, EmbyClient)]
+                # 公共入口只能调用原计数方法，不能额外枚举媒体或请求看板。
+                stack.enter_context(patch("requests.Session.get", side_effect=AssertionError("unexpected HTTP")))
+                result = services.get_library_counts()
+                data = result["data"]
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["status"], "partial" if failed else "success")
+                self.assertEqual(data["known_counts"], {key: value * (1 if failed else 2) for key, value in returned.items()})
+                self.assertEqual(data["counts"], dict.fromkeys(counts) if failed else data["known_counts"])
+                self.assertEqual(data["count_scope"], "server_records_sum_not_deduplicated")
+                self.assertEqual([row["status"] for row in data["sources"]],
+                                 ["success", "unavailable" if failed else "success"])
+                self.assertNotIn("private-token", str(result))
+                for close in closes:
+                    close.assert_called_once()
+
+    def test_public_counts_keep_known_total_when_one_source_lacks_category_counts(self):
+        profiles = [MediaServerProfile(f"configured:{kind}", kind, kind.title(),
+                    f"http://{kind}.invalid", "private-token", True, "configured-viewer")
+                    for kind in ("jellyfin", "emby")]
+        calls = []
+        def request(client, path, params=None, **_kwargs):
+            calls.append((type(client).__name__, path, params))
+            if path == "/Items/Counts":
+                self.assertEqual(params, {"userId": "configured-viewer"})
+                if isinstance(client, EmbyClient):
+                    response = requests.Response()
+                    response.status_code = 404
+                    raise requests.HTTPError("unsupported", response=response)
+                return {"MovieCount": 3, "SeriesCount": 0, "EpisodeCount": 7}
+            self.assertEqual(path, "/Users/configured-viewer/Items")
+            assert params is not None
+            self.assertEqual(params["Limit"], 0)
+            return {"TotalRecordCount": 10}
+        with patch("app.services.list_configured_profiles", return_value=profiles), \
+             patch.object(JellyfinClient, "_request", request), patch.object(EmbyClient, "_request", request):
+            result = services.get_library_counts()
+        self.assertEqual(len(calls), 4)  # 每源仅原有 total + counts，无 native 额外 HTTP。
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["counts"], {
+            "total_items": 20, "movie_count": None, "series_count": None, "episode_count": None,
+        })
+        self.assertEqual(result["data"]["known_counts"], {
+            "total_items": 20, "movie_count": 3, "series_count": 0, "episode_count": 7,
+        })
+        self.assertEqual([source["status"] for source in result["data"]["sources"]], ["success", "partial"])
+
+    def test_public_library_counts_bind_real_library_and_configured_user(self):
+        for cls, kind in ((JellyfinClient, "jellyfin"), (EmbyClient, "emby")):
+            for library_id in ("anime-library", "not-this-server"):
+                with self.subTest(kind=kind, library_id=library_id), ExitStack() as stack:
+                    profile = MediaServerProfile(f"configured:{kind}", kind, kind.title(),
+                        "http://media.invalid", "private-token", True, "configured-viewer")
+                    stack.enter_context(patch("app.services.list_configured_profiles", return_value=[profile]))
+                    calls = []
+                    def request(_client, path, params=None, **_kwargs):
+                        if path == "/System/Info/Public":
+                            return {"ProductName": "Emby"}
+                        if path.startswith("/Library/VirtualFolders"):
+                            return [{"ItemId": "anime-library", "Name": "动漫", "Locations": ["/private/library"]}]
+                        calls.append((path, params))
+                        self.assertEqual(path, "/Users/configured-viewer/Items")
+                        assert params is not None
+                        self.assertEqual(params["ParentId"], "anime-library")
+                        self.assertEqual(params["Recursive"], "true")
+                        self.assertEqual(params["Limit"], 0)
+                        return {"TotalRecordCount": 9 if params["IncludeItemTypes"] == "Series" else 0}
+                    stack.enter_context(patch.object(cls, "_request", request))
+                    close = stack.enter_context(patch.object(cls, "close"))
+                    result = services.get_library_counts(kind, library_id)
+                    self.assertEqual(result["status"], "success" if library_id == "anime-library" else "not_found")
+                    self.assertEqual(len(calls), 4 if library_id == "anime-library" else 0)
+                    self.assertEqual(result["data"]["library_id"], library_id)
+                    self.assertEqual(result["data"]["sources"][0]["user_selection"], "configured")
+                    self.assertEqual(result["data"]["counts"]["series_count"], 9 if calls else None)
+                    self.assertNotIn("/private/library", str(result))
+                    self.assertNotIn("private-token", str(result))
+                    close.assert_called_once()
+
+    def test_public_counts_require_explicit_server_for_library_before_client(self):
+        with patch("app.services.list_configured_profiles", side_effect=AssertionError("invalid input opened client")):
+            for server, library_id in (("invented", ""), ("all", "id"), ("emby", "\n"),
+                                       ("emby", "x" * 257), ("emby", None), (False, "")):
+                with self.subTest(server=server, library_id=library_id), self.assertRaises(ValueError):
+                    Mock(wraps=services.get_library_counts)(server, library_id)
+
+    def test_public_counts_do_not_open_disabled_or_incomplete_sources(self):
+        disabled = MediaServerProfile("configured:jellyfin", "jellyfin", "Jellyfin",
+                                     "http://private.invalid", "private-token", False)
+        incomplete = MediaServerProfile("configured:emby", "emby", "Emby", "", "", True)
+        with patch("app.services.list_configured_profiles", return_value=[disabled, incomplete]), \
+             patch.object(MediaServerProfile, "create_client", side_effect=AssertionError("not configured")):
+            for server in ("all", "jellyfin"):
+                result = services.get_library_counts(server)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], "not_configured")
+                self.assertIsNone(result["data"]["counts"]["total_items"])
+        with patch("app.services.list_configured_profiles", return_value=[disabled]):
+            self.assertEqual(services.get_library_counts()["data"]["sources"], [])
+
     def test_total_items_counts_only_user_visible_playable_media(self):
         expected_params = {
             "Recursive": "true",
@@ -146,10 +262,11 @@ class DashboardMediaCountTests(unittest.TestCase):
         client._total_items = Mock(return_value=3200)
         expected = {
             "total_items": 3200,
-            "movie_count": 0,
-            "series_count": 0,
-            "episode_count": 0,
+            "movie_count": None,
+            "series_count": None,
+            "episode_count": None,
         }
+        self.assertEqual(MediaServerClient.get_media_counts(client), expected)
         for status_code in (404, 405, 501):
             with self.subTest(status_code=status_code):
                 response = requests.Response()
@@ -160,6 +277,14 @@ class DashboardMediaCountTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(client.get_media_counts(), expected)
+                profile = MediaServerProfile("configured:emby", "emby", "Emby", client.url, "fixture", True)
+                with patch("app.services.list_configured_profiles", return_value=[profile]), \
+                     patch.object(MediaServerProfile, "create_client", return_value=client):
+                    result = services.get_library_counts("emby")
+                self.assertEqual(result["status"], "partial")
+                self.assertEqual(result["data"]["counts"], expected)
+                self.assertEqual(result["data"]["known_counts"], expected)
+                self.assertEqual(client._request.call_count, 2)
 
     def test_library_media_counts_are_scoped_to_selected_library_and_user(self):
         expected = {

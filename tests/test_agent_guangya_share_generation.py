@@ -1,203 +1,116 @@
-"""分享创建、撤销在确认复核后切换凭据时必须停止写入。"""
-
+"""分享公共客户端冻结真实对象，写前世代校验与写后受理语义保持。"""
 from __future__ import annotations
 
-import unittest
 from copy import deepcopy
-from functools import partial
-from unittest import mock
+from typing import Any
+from unittest.mock import Mock
 
-from app.agent.domains.guangya import share_actions as actions
-from app.agent.domains.guangya.workspace_actions import GuangyaWorkspaceActions
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext
-from app.clients.guangya import GuangYaFile
+import pytest
+
+from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaShareError
 
 
-class _ShareClient:
+class ShareClient(GuangYaClient):
     logged_in = True
+    credential_generation = 9
 
-    def __init__(
-        self,
-        generation: int,
-        *,
-        fail_verification: bool = False,
-        omit_created_handle: bool = False,
-    ) -> None:
+    def __init__(self, generation=9):
         self.credential_generation = generation
-        self.file = GuangYaFile(
-            "file-1", "测试目录", True, parent_id="0", etag="test-etag"
-        )
-        self.shares = [
-            {"id": "20001", "shareId": "existing-share", "title": "测试分享", "status": "active"}
-        ]
-        self.writes: list[tuple[str, tuple[str, ...]]] = []
-        self.closed = False
-        self.fail_verification = fail_verification
-        self.omit_created_handle = omit_created_handle
+        self.files = [GuangYaFile("file-1", "测试目录", True, parent_id="0", etag="etag-1")]
+        self.shares = [{"id": str(20001 + i), "shareId": f"public-link-{i}", "title": "同名分享",
+                        "status": "active", "updateTime": "t1", "fileCount": 1} for i in range(2)]
+        self.writes = []
+        self.closed = 0
+        self.create_response: dict[str, Any] = {"code": 200, "data": {"shareId": "created-share", "code": "AB12"}}
+        self.read_failure = False
 
     def file_info(self, file_id):
-        return deepcopy(self.file) if file_id == self.file.file_id else None
+        return deepcopy(next((item for item in self.files if item.file_id == file_id), None))
 
-    def list_user_shares(self, **_kwargs):
-        if self.writes and self.fail_verification:
-            raise RuntimeError("模拟写后回读暂不可用")
+    def list_user_shares(self, **kwargs):
+        if self.read_failure:
+            raise RuntimeError("private-provider-error")
         return deepcopy(self.shares)
 
-    def create_user_share(self, file_ids, **_kwargs):
-        self.writes.append(("create", tuple(file_ids)))
-        if self.omit_created_handle:
-            return {"code": 200, "msg": "操作成功"}
-        return {"code": 200, "data": {"shareId": "created-share"}}
+    def create_user_share(self, file_ids, **kwargs):
+        self.writes.append(("create", file_ids, kwargs))
+        return deepcopy(self.create_response)
 
     def delete_user_shares(self, share_ids):
-        self.writes.append(("revoke", tuple(share_ids)))
+        self.writes.append(("revoke", share_ids))
         self.shares = [item for item in self.shares if item["id"] not in share_ids]
         return True
 
     def close(self):
-        self.closed = True
+        self.closed += 1
         return True
 
 
-class GuangYaShareGenerationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.workspace_actions = GuangyaWorkspaceActions()
-        self.context = ToolContext(owner="generation-test", session_id="session")
-        self.generation = 9
-        self.observation_ref = "OBS" + "A" * 32
-        self.object_ref = "OBJ" + "B" * 24
-        self.entry = {
-            "file_id": "file-1",
-            "parent_id": "0",
-            "name": "测试目录",
-            "is_dir": True,
-            "size": 0,
-            "etag": "test-etag",
-            "updated_at": 0,
-        }
-        self.enterContext(mock.patch.object(
-            actions,
-            "load_directory_observation",
-            side_effect=lambda *_args, **_kwargs: {
-                "plan_id": "a" * 32, "credential_generation": self.generation,
-                "entries": [{**self.entry, "handle": self.object_ref}],
-            },
-        ))
-
-    def _arguments(self, operation: str):
-        if operation == "create":
-            return actions.guangya_share_create_arguments({
-                "observation_ref": self.observation_ref,
-                "object_refs": [self.object_ref],
-            })
-        return {
-            "guangya_shares_ref": "ref_generation_test",
-            "indices": [1],
-            "guangya_shares": {
-                "credential_generation": self.generation,
-                "page": 1,
-                "page_size": 50,
-                "items": [actions._share_snapshot(_ShareClient(self.generation).shares[0])],
-            },
-        }
-
-    def _handlers(self, operation: str):
-        if operation == "create":
-            return (
-                partial(actions.prepare_create_guangya_share, workspace_actions=self.workspace_actions),
-                partial(actions.execute_create_guangya_share, workspace_actions=self.workspace_actions),
-            )
-        return actions.prepare_revoke_guangya_shares, actions.execute_revoke_guangya_shares
-
-    def _assert_generation_change_blocked(self, operation: str) -> None:
-        clients = [_ShareClient(9), _ShareClient(9), _ShareClient(10)]
-        arguments = self._arguments(operation)
-        prepare, execute = self._handlers(operation)
-        with mock.patch.object(actions, "GuangYaClient", side_effect=clients) as factory:
-            _preview, fingerprint = prepare(arguments, self.context)
-            with self.assertRaises(AgentToolError) as caught:
-                execute(arguments, fingerprint, self.context)
-
-        self.assertEqual(caught.exception.code, "confirmation_stale")
-        self.assertEqual(factory.call_count, 3)
-        self.assertTrue(all(not client.writes for client in clients))
-        self.assertTrue(all(client.closed for client in clients))
-        self.assertEqual(clients[-1].shares[0]["shareId"], "existing-share")
-
-    def test_create_rejects_generation_change_when_write_client_is_created(self) -> None:
-        self._assert_generation_change_blocked("create")
-
-    def test_revoke_rejects_generation_change_when_write_client_is_created(self) -> None:
-        self._assert_generation_change_blocked("revoke")
-
-    def _assert_same_generation_succeeds(self, operation: str) -> None:
-        for generation in (0, 9):
-            with self.subTest(generation=generation):
-                self.generation = generation
-                clients = [_ShareClient(generation) for _ in range(3)]
-                arguments = self._arguments(operation)
-                prepare, execute = self._handlers(operation)
-                with mock.patch.object(actions, "GuangYaClient", side_effect=clients):
-                    preview, fingerprint = prepare(arguments, self.context)
-                    result = execute(arguments, fingerprint, self.context)
-
-                self.assertEqual(result.status, "completed")
-                self.assertTrue(result.data["verified"])
-                self.assertFalse(result.data["verification_pending"])
-                self.assertNotIn("credential_generation", str(preview.to_dict()))
-                self.assertNotIn("credential_generation", str(result.to_dict()))
-                expected_id = "file-1" if operation == "create" else "20001"
-                self.assertEqual(clients[-1].writes, [(operation, (expected_id,))])
-                self.assertTrue(all(not client.writes for client in clients[:-1]))
-                self.assertTrue(all(client.closed for client in clients))
-
-    def test_create_keeps_same_generation_success_including_zero(self) -> None:
-        self._assert_same_generation_succeeds("create")
-
-    def test_revoke_keeps_same_generation_success_including_zero(self) -> None:
-        self._assert_same_generation_succeeds("revoke")
-
-    def test_revoke_preserves_accepted_result_when_readback_fails(self) -> None:
-        clients = [
-            _ShareClient(9), _ShareClient(9), _ShareClient(9, fail_verification=True)
-        ]
-        arguments = self._arguments("revoke")
-        with mock.patch.object(actions, "GuangYaClient", side_effect=clients):
-            _preview, fingerprint = actions.prepare_revoke_guangya_shares(
-                arguments, self.context
-            )
-            result = actions.execute_revoke_guangya_shares(
-                arguments, fingerprint, self.context
-            )
-
-        self.assertEqual(result.status, "accepted")
-        self.assertFalse(result.data["verified"])
-        self.assertTrue(result.data["verification_pending"])
-        self.assertNotIn("credential_generation", str(result.to_dict()))
-        self.assertEqual(len(clients[-1].writes), 1)
-        self.assertTrue(clients[-1].closed)
-
-    def test_create_preserves_accepted_result_without_verifiable_handle(self) -> None:
-        clients = [
-            _ShareClient(9), _ShareClient(9), _ShareClient(9, omit_created_handle=True)
-        ]
-        arguments = self._arguments("create")
-        with mock.patch.object(actions, "GuangYaClient", side_effect=clients):
-            _preview, fingerprint = actions.prepare_create_guangya_share(
-                arguments, self.context
-            , workspace_actions=self.workspace_actions)
-            result = actions.execute_create_guangya_share(
-                arguments, fingerprint, self.context
-            , workspace_actions=self.workspace_actions)
-
-        self.assertEqual(result.status, "accepted")
-        self.assertFalse(result.data["verified"])
-        self.assertTrue(result.data["verification_pending"])
-        self.assertNotIn("credential_generation", str(result.to_dict()))
-        self.assertEqual(len(clients[-1].writes), 1)
-        self.assertTrue(clients[-1].closed)
+@pytest.mark.parametrize("generation", [0, 9])
+@pytest.mark.parametrize("revoke", [False, True])
+def test_same_generation_including_zero_uses_only_frozen_ids(generation, revoke):
+    client = ShareClient(generation)
+    snapshot = client.prepare_user_share_revoke(["20002"]) if revoke else client.prepare_user_share(["file-1"])
+    if revoke:
+        client.shares.reverse()
+    result = client.submit_prepared_user_share(snapshot, revoke=revoke)
+    assert result["status"] == "completed" and result["verified"]
+    assert client.writes[0][1] == (["20002"] if revoke else ["file-1"])
+    assert "credential_generation" not in result
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("revoke", [False, True])
+@pytest.mark.parametrize("point", ["before_read", "during_read", "before_write"])
+def test_generation_changes_fail_before_provider_write(revoke, point):
+    client = ShareClient()
+    snapshot = client.prepare_user_share_revoke(["20001"]) if revoke else client.prepare_user_share(["file-1"])
+    if point == "before_read":
+        client.credential_generation += 1
+    elif point == "during_read":
+        method = "list_user_shares" if revoke else "file_info"
+        original = getattr(client, method)
+        def changed(*args, **kwargs):
+            result = original(*args, **kwargs)
+            client.credential_generation += 1
+            return result
+        setattr(client, method, changed)
+    def cancel_check():
+        if point == "before_write":
+            client.credential_generation += 1
+    with pytest.raises(GuangYaShareError) as error:
+        client.submit_prepared_user_share(snapshot, revoke=revoke, cancel_check=cancel_check)
+    assert error.value.code == "confirmation_stale" and client.writes == []
+
+
+@pytest.mark.parametrize("revoke", [False, True])
+def test_accepted_is_retained_without_verifiable_result(revoke):
+    client = ShareClient()
+    snapshot = client.prepare_user_share_revoke(["20001"]) if revoke else client.prepare_user_share(["file-1"])
+    if revoke:
+        original = client.delete_user_shares
+        def accepted(share_ids):
+            original(share_ids)
+            client.read_failure = True
+            return True
+        client.delete_user_shares = accepted
+    else:
+        client.create_response = {"code": 200, "msg": "操作成功"}
+    result = client.submit_prepared_user_share(snapshot, revoke=revoke)
+    assert result["status"] == "accepted" and result["verification_pending"] and not result["verified"]
+    assert len(client.writes) == 1 and "private-provider-error" not in str(result)
+
+
+@pytest.mark.parametrize("arguments", [
+    {"file_ids": []}, {"file_ids": ["file-1"] * 101}, {"file_ids": [True]},
+    {"file_ids": [""]}, {"file_ids": ["file-1"], "title": "a" * 181},
+    {"file_ids": ["file-1"], "expires_days": True}, {"file_ids": ["file-1"], "expires_days": 3651},
+    {"file_ids": ["file-1"], "access_code": "<script>"}, {"file_ids": ["file-1"], "auto_access_code": 1},
+    {"file_ids": ["file-1"], "allow_download": 0}, {"file_ids": ["file-1"], "max_restore_count": -1},
+])
+def test_invalid_share_policy_never_reaches_provider(arguments):
+    client = ShareClient()
+    client.file_info = Mock(side_effect=AssertionError("invalid input reached Provider"))
+    with pytest.raises(GuangYaShareError):
+        client.prepare_user_share(**arguments)
+    client.file_info.assert_not_called()
+    assert client.writes == []

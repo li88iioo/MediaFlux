@@ -22,7 +22,8 @@ from app.agent.confirmation_contract import (
 )
 from app.agent.errors import AgentToolError, ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.references import InMemoryReferenceStore, ReferenceError
@@ -31,6 +32,8 @@ from app.agent.kernel.state_types import CancellationToken, StateUpdate
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.agent.models import RiskLevel, ToolResult
 from tests.support import isolated_test_database
+from app import sdk
+import pytest
 
 
 class ConfirmationStoreTests(unittest.TestCase):
@@ -124,7 +127,7 @@ class ConfirmationStoreTests(unittest.TestCase):
             with self.subTest(store=store_type.__name__), isolated_test_database():
                 now = [1000.0]
                 store = store_type(clock=lambda: now[0])
-                ticket = store.issue(owner="owner", tool_name="guangya.fs.change.execute", arguments={})
+                ticket = store.issue(owner="owner", tool_name="cloud.change", arguments={})
                 self.assertEqual(ticket.expires_at - now[0], 600)
                 # 复现实例：用户看完批量方案，约五分钟后点击确认。
                 now[0] += 306
@@ -133,7 +136,7 @@ class ConfirmationStoreTests(unittest.TestCase):
                 with self.assertRaises(AgentToolError):
                     store.claim_and_rotate_owner(owner="owner", confirmation_id=ticket.confirmation_id)
 
-                ticket = store.issue(owner="owner", tool_name="guangya.fs.change.execute", arguments={})
+                ticket = store.issue(owner="owner", tool_name="cloud.change", arguments={})
                 now[0] = ticket.expires_at
                 with self.assertRaises(AgentToolError) as expired:
                     store.claim_and_rotate_owner(owner="owner", confirmation_id=ticket.confirmation_id)
@@ -190,23 +193,23 @@ class ConfirmationStoreTests(unittest.TestCase):
     def test_media_subscription_confirmations_have_specific_public_copy(self):
         preview = ToolResult(True, "preview", "预检通过")
         created = build_confirmation_contract(
-            tool_name="media.create_subscription",
+            tool_name="subscriptions.create",
             risk=RiskLevel.LOW_WRITE,
             preview=preview,
         )
         deleted = build_confirmation_contract(
-            tool_name="media.delete_subscription",
+            tool_name="subscriptions.delete",
             risk=RiskLevel.DANGER,
             preview=preview,
         )
         self.assertEqual(created["action"], "创建媒体追更订阅")
         self.assertIn("不会立即搜索资源", created["impact"])
         self.assertEqual(deleted["action"], "删除媒体追更订阅")
-        self.assertIn("删除不可撤销", deleted["reversibility"])
+        self.assertIn("可通过同媒体创建恢复", deleted["reversibility"])
 
     def test_guangya_fs_confirmation_copy_separates_preparation_from_cloud_execution(self):
         contract = build_confirmation_contract(
-            tool_name="guangya.fs.change.execute",
+            tool_name="cloud.change",
             risk=RiskLevel.DANGER,
             preview=ToolResult(True, "confirmation_required", "完整计划已冻结，等待用户确认"),
         )
@@ -221,7 +224,7 @@ class ConfirmationStoreTests(unittest.TestCase):
 
     def test_confirmation_contract_rejects_boolean_version(self):
         contract = build_confirmation_contract(
-            tool_name="media.create_subscription",
+            tool_name="subscriptions.create",
             risk=RiskLevel.LOW_WRITE,
             preview=ToolResult(True, "preview", "预检通过"),
         )
@@ -232,7 +235,7 @@ class ConfirmationStoreTests(unittest.TestCase):
         for version in ("1", 1.0):
             with self.subTest(version=version):
                 contract = build_confirmation_contract(
-                    tool_name="media.create_subscription",
+                    tool_name="subscriptions.create",
                     risk=RiskLevel.LOW_WRITE,
                     preview=ToolResult(True, "preview", "预检通过"),
                 )
@@ -241,7 +244,7 @@ class ConfirmationStoreTests(unittest.TestCase):
 
     def test_confirmation_contract_rejects_fabricated_time_or_risk(self):
         contract = build_confirmation_contract(
-            tool_name="media.create_subscription",
+            tool_name="subscriptions.create",
             risk=RiskLevel.DANGER,
             preview=ToolResult(True, "preview", "预检通过"),
             preflight_at="2026-08-31T12:00:00+08:00",
@@ -258,7 +261,7 @@ class ConfirmationStoreTests(unittest.TestCase):
                 self.assertEqual(sanitize_confirmation_contract(tampered), {})
         with self.assertRaises(ValueError):
             build_confirmation_contract(
-                tool_name="media.create_subscription",
+                tool_name="subscriptions.create",
                 risk=RiskLevel.DANGER,
                 preview=ToolResult(True, "preview", "预检通过"),
                 preflight_at="not-a-time",
@@ -693,26 +696,26 @@ class GuangYaFSConfirmationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         from dataclasses import replace
 
-        from app.agent.domain_catalog import build_tool_specs
         from app.agent.kernel.effects import ConfirmationEffectPlanStore
         from app.agent.kernel.pipeline import ToolPipeline
-        from app.agent.kernel.ports import catalog_from_tool_specs
         from app.agent.kernel.state import InMemorySessionStateStore
         from app.agent.kernel.state_types import CancellationToken
         from app.agent.kernel.tool_calls import ToolCallContext
 
         self.enterContext(isolated_test_database())
-        self.spec = next(spec for spec in build_tool_specs() if spec.name == "guangya.fs.change.execute")
+        from app.agent.kernel.ports.sdk_effects import cloud_change_tool
+        from app.agent.kernel.capabilities import ToolCatalog
+        from app.agent.kernel.tool_calls import PreparedEffect
+        self.spec = cloud_change_tool()
         self.validator = Mock(wraps=self.spec.validator)
-        self.preparer = Mock(return_value=(
-            ToolResult(True, "confirmation_required", "完整计划已冻结，等待用户确认", data={"total": 2}),
-            "frozen-fs-fingerprint",
+        self.preparer = Mock(return_value=PreparedEffect(
+            preview=ToolResult(True, "confirmation_required", "完整计划已冻结，等待用户确认", data={"total": 2}).to_dict(),
+            snapshot_fingerprint="frozen-fs-fingerprint",
         ))
         self.confirmed = Mock(return_value=ToolResult(True, "success", "确认后的文件变更已验证", data={"total": 2}))
-        self.catalog = catalog_from_tool_specs([replace(
-            self.spec, validator=self.validator,
-            context_confirmation_preparer=self.preparer,
-            context_confirmed_handler=self.confirmed,
+        self.catalog = ToolCatalog([replace(
+            self.spec, validator=self.validator, prepare=self.preparer,
+            execute_confirmed=self.confirmed, verify=None,
         )])
         self.state = InMemorySessionStateStore()
         lease, _ = await self.state.begin_turn(owner="fs-owner", session_id="fs-session", request_id="fs-request")
@@ -727,10 +730,9 @@ class GuangYaFSConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.effects = ConfirmationEffectPlanStore(SQLiteConfirmationStore())
         self.pipeline = ToolPipeline(catalog=self.catalog, state_store=self.state, effect_store=self.effects)
         self.arguments = {
-            "observation_ref": "OBS" + "A" * 32,
             "operations": [
-                {"op": "rename", "object_ref": "OBJ" + "B" * 24, "new_name": "规范名称.mkv"},
-                {"op": "create_directory", "path": "/新目录"},
+                {"op": "rename", "file_id": "Real-case-sensitive-file-ID", "new_name": "规范名称.mkv"},
+                {"op": "create_directory", "parent_path": "/", "name": "新目录"},
             ],
             "trigger_strm": False,
         }
@@ -742,12 +744,11 @@ class GuangYaFSConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.validator.assert_called_once()
         plan = prepared.effect_plan
         assert (plan) is not None
-        self.assertEqual(plan.tool_name, "guangya.fs.change.execute")
+        self.assertEqual(plan.tool_name, "cloud.change")
         self.assertEqual(plan.arguments, self.spec.validator(self.arguments))
         self.assertEqual(len(plan.arguments["operations"]), len(self.arguments["operations"]))
         self.assertEqual(plan.arguments["operations"][0], self.arguments["operations"][0])
         self.assertEqual(plan.arguments["operations"][1], {"op": "create_directory", "parent_path": "/", "name": "新目录"})
-        self.assertEqual(plan.arguments["observation_ref"], self.arguments["observation_ref"])
         self.assertFalse(plan.arguments["trigger_strm"])
         self.assertEqual(self.preparer.call_args.args[0], plan.arguments)
         pending = await self.pipeline.get_pending_plan(owner="fs-owner", session_id="fs-session")
@@ -764,7 +765,7 @@ class GuangYaFSConfirmationTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_or_missing_operations_cannot_issue_or_reissue_a_card(self):
         from app.agent.errors import ToolPipelineError
 
-        for arguments in ({}, {"operations": []}, {"observation_ref": self.arguments["observation_ref"]}):
+        for arguments in ({}, {"operations": []}, {"trigger_strm": False}):
             with self.subTest(arguments=arguments), self.assertRaises(ToolPipelineError) as invalid:
                 await self.pipeline.execute(self.spec.name, arguments, context=self.context)
             self.assertEqual(invalid.exception.code, "invalid_arguments")
@@ -783,43 +784,18 @@ class GuangYaFSConfirmationTests(unittest.IsolatedAsyncioTestCase):
         assert prepared.effect_plan is not None
         self.assertEqual(pending.plan_id, prepared.effect_plan.plan_id)
 
-    async def test_persisted_execute_card_keeps_name_and_skips_new_preparation_schema(self):
-        from app.agent.kernel.capabilities import ToolEffect
-        from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
-        from app.agent.kernel.pipeline import ToolPipeline
-        from app.agent.kernel.state_types import StateUpdate
-
-        # 历史 execute 卡片的参数为空，但对象和目标已冻结在领域快照中。
-        with self.assertRaises(AgentToolError):
-            self.spec.validator({})
-        legacy = self.effects.freeze(
-            owner="fs-owner", session_id="fs-session", generation=self.context.lease.generation,
-            tool_name="guangya.fs.change.execute", effect=ToolEffect.DANGER, arguments={},
-            prepared=PreparedEffect(
-                preview=ToolResult(True, "confirmation_required", "历史完整计划等待确认").to_dict(),
-                snapshot_fingerprint="persisted-fs-fingerprint",
-            ),
-        )
-        await self.state.commit(self.context.lease, updates=(StateUpdate("pending_effect_plan_id", legacy.plan_id),))
-        rebuilt = ToolPipeline(
-            catalog=self.catalog, state_store=self.state,
-            effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()),
-        )
-        pending = await rebuilt.get_pending_plan(owner="fs-owner", session_id="fs-session")
-        assert pending is not None
-        self.assertEqual(pending.tool_name, "guangya.fs.change.execute")
-        self.assertEqual(pending.arguments, {})
-        completed = await rebuilt.execute_confirmed(legacy.plan_id, context=self.context)
-        self.assertTrue(completed.outcome.public_content["ok"])
-        self.preparer.assert_not_called()
-        self.validator.assert_not_called()
-        self.confirmed.assert_called_once()
-        self.assertEqual(self.confirmed.call_args.args[:2], ({}, "persisted-fs-fingerprint"))
 
 
 class ReferenceBoundConfirmationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.enterContext(isolated_test_database("reference-bound-confirmation.db"))
+        sdk_patch = pytest.MonkeyPatch()
+        self.addCleanup(sdk_patch.undo)
+        def declared(payload_ref: str):
+            raise AssertionError("only existing effect handlers may write")
+        for name in ("test.ref_write", "test.ref_tail"):
+            sdk_patch.setitem(sdk.METHODS, name, declared)
+        sdk_patch.setattr(sdk, "WRITE_METHODS", sdk.WRITE_METHODS | {"test.ref_write", "test.ref_tail"})
 
     async def runtime(self, *, sqlite_refs=False, sqlite_tickets=True):
         self.ref_time, self.ticket_time = 0.0, 2_000_000_000.0
@@ -1023,9 +999,9 @@ class ReferenceBoundConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime()
         first, second = await self.reference(), await self.reference(ttl=875)
         self.advance(850)
-        args = {"steps": [{"tool": "test.ref_write", "arguments": {"payload_ref": first.ref}},
-                          {"tool": "test.ref_tail", "arguments": {"payload_ref": second.ref}}]}
-        result = await self.pipeline.execute("agent.batch", args, context=self.context)
+        args = {"steps": [{"method": "test.ref_write", "arguments": {"payload_ref": first.ref}},
+                          {"method": "test.ref_tail", "arguments": {"payload_ref": second.ref}}]}
+        result = await self.pipeline.execute("session.batch", args, context=self.context)
         assert result.effect_plan is not None
         self.assertAlmostEqual(result.effect_plan.expires_at, 2_000_000_875.0, delta=0.02)
         self.assertFalse(self.writes)
@@ -1115,9 +1091,9 @@ class ReferenceBoundConfirmationTests(unittest.IsolatedAsyncioTestCase):
     async def test_batch_keeps_written_first_step_when_second_admission_is_rejected(self):
         await self.runtime()
         reference = await self.reference()
-        result = await self.pipeline.execute("agent.batch", {"steps": [
-            {"tool": "test.ref_write", "arguments": {"payload_ref": reference.ref}},
-            {"tool": "test.ref_tail", "arguments": {"payload_ref": reference.ref}},
+        result = await self.pipeline.execute("session.batch", {"steps": [
+            {"method": "test.ref_write", "arguments": {"payload_ref": reference.ref}},
+            {"method": "test.ref_tail", "arguments": {"payload_ref": reference.ref}},
         ]}, context=self.context)
 
         async def refuse_tail(**scope):

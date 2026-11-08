@@ -6,8 +6,7 @@ from datetime import datetime
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.subscriptions.consumption_actions import get_today_summary
-from app.agent.models import ToolContext
+from app.modules.media_subscription_notifications import today_summary
 from app.modules import media_automation_rules as automation
 from app.repositories import media_automation_rules as rules
 from tests.support import IsolatedDatabaseTestCase
@@ -45,10 +44,10 @@ class TodaySummaryDeliveryAuditTests(IsolatedDatabaseTestCase):
         }
 
     def test_agent_and_daily_notification_use_the_same_complete_counts(self) -> None:
-        result = get_today_summary({}, ToolContext(owner="audit"))
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["event_count"], 81)
-        self.assertEqual(result.data["downloads"], {"success": 80, "failed": 1})
+        result = today_summary()
+        self.assertEqual(result["event_count"], 81)
+        self.assertEqual(result["event_count"], 81)
+        self.assertEqual(result["downloads"], {"success": 80, "failed": 1})
         delivery = automation._daily_summary(self._rule(), self.clock)
         event = delivery.notification
         assert event is not None
@@ -58,7 +57,7 @@ class TodaySummaryDeliveryAuditTests(IsolatedDatabaseTestCase):
         self.assertIn("失败 1", fields["下载"])
         self.assertIn("全部", str(event.footer))
         self.assertNotIn("每类最多 50", str(event.footer))
-        self.assertLessEqual(len(result.data["content_titles"]), 8)
+        self.assertLessEqual(len(result["content_titles"]), 8)
 
     def test_errors_only_includes_older_failure_without_unrelated_titles(self) -> None:
         delivery = automation._daily_summary(self._rule(True), self.clock)

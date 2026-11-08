@@ -9,7 +9,6 @@ import pytest
 
 from app.clients.guangya import GuangYaFile, GuangYaWriteRejected
 from app.modules import guangya_fs_change as fs
-from app.modules import guangya_workspace as workspace
 from tests.test_agent_guangya_batch_files import _arguments, environment  # noqa: F401
 
 _LIMIT = 200 * 1024 * 1024
@@ -42,23 +41,18 @@ def _file(client, file_id, parent="source", *, name=None, size=_LIMIT):
 
 
 def _plan(env, **rule):
-    client, _repo, actions, context, scope_ref = env
-    observation = workspace.load_directory_observation(
-        actions.workspace.latest_guangya_observation_ref(context.owner, context.session_id),
-        owner=context.owner, session_id=context.session_id,
-    )
-    arguments = _arguments(scope_ref=scope_ref, **rule)
-    return fs.build_fs_change_plan(client, owner=context.owner, session_id=context.session_id,
-                                   observation=observation, operations=arguments["operations"], trigger_strm=False)
+    client, context = env
+    arguments = _arguments(**rule)
+    return fs.build_fs_change_plan(client, owner=context.owner, operations=arguments["operations"], trigger_strm=False)
 
 
 def _run(client, plan):
     fs.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
     job_id = uuid4().hex
-    fs.bind_fs_change_plan_job(plan["plan_id"], owner_digest="digest:owner", expected_fingerprint=plan["fingerprint"],
+    fs.bind_fs_change_plan_job(plan["plan_id"], owner_digest=plan["owner_digest"], expected_fingerprint=plan["fingerprint"],
                                job_id=job_id, queue_until_epoch=10**12)
     return fs.execute_fs_change_plan({"version": 1, "plan_id": plan["plan_id"], "plan_fingerprint": plan["fingerprint"],
-                                      "owner_digest": "digest:owner", "credential_generation": 31, "job_id": job_id},
+                                      "owner_digest": plan["owner_digest"], "credential_generation": 31, "job_id": job_id},
                                      client_factory=lambda: client)
 
 
@@ -214,7 +208,7 @@ def test_two_thousand_objects_fit_one_plan_and_compact_recovery_source(batch_env
         _file(client, f"f{index}")
     plan = _plan(batch_env, target_path="/target")
     assert len(plan["operations"]) == 2000
-    assert len(plan["observation_source"]["baseline"]["selected"]) == 1
+    assert "observation_source" not in plan and "observation_ref" not in plan
     assert fs.load_fs_change_plan(plan["plan_id"], owner="owner")["stats"]["total"] == 2000
 
 

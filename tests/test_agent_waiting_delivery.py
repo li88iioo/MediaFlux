@@ -10,20 +10,21 @@ import pytest
 
 from app import config
 from app import database as db
-from app.agent.model_catalog import provider_channel_fingerprint
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
+from app.agent.model_catalog import provider_channel_fingerprint
 from app.agent.transports import QueryEnvelope
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
+from tests.agent_task_native_helpers import task_function
 from tests.test_agent_read_wait_contract_repair import resumed
 from tests.test_agent_read_wait_entry_exclusions import tg_config as tg_config
 from tests.test_agent_read_wait_lifecycle import (
     GOAL,
     Quota,
     WaitScript,
+    build_wait_runtime,
 )
 from tests.test_agent_read_wait_lifecycle import (
     isolated_database as isolated_database,
@@ -37,7 +38,7 @@ async def park(clock, route):
     config.set_and_save({'TG_AGENT_ENABLED': '1', 'TG_CHAT_ID': '-100123', 'TG_AGENT_ALLOWED_USER_IDS': '7'})
     script = WaitScript()
     script.adapter.settings = replace(script.adapter.settings, telegram_channel=provider_channel_fingerprint(config.get_many(("AGENT_LLM_API_URL", "AGENT_LLM_PROTOCOL", "AGENT_LLM_API_KEY"))))
-    runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
+    runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: clock[0]))
     runtime.session.continuation_binding = _capture_creation_binding()
     runtime.session.pipeline.rate_limiter = Quota()
     agent_input = QueryEnvelope(message=GOAL, owner=OWNER, session_id=SID, request_id='source',
@@ -148,9 +149,8 @@ def test_read_checkpoint_complete_keeps_claim_until_public_terminal(tg_config):
                      if row.get('role') == 'tool' and 'task' in json.loads(row['content'])]
             fact = tasks[-1]['verified_facts'][0]
             return httpx.Response(200, json={'choices': [{'message': {'content': '', 'tool_calls': [{
-                'id': 'checkpoint-complete', 'type': 'function', 'function': {'name': 'agent__task',
-                'arguments': json.dumps({'operation': 'checkpoint', 'evidence_ids': [], 'blockers': [],
-                                         'read_evidence': {'read': fact['evidence_id']}})},
+                'id': 'checkpoint-complete', 'type': 'function', 'function': task_function({'operation': 'checkpoint', 'evidence_ids': [], 'blockers': [],
+                                         'read_evidence': {'read': fact['evidence_id']}}),
             }]}, 'finish_reason': 'tool_calls'}]})
 
     async def run():

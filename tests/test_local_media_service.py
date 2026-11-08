@@ -2480,14 +2480,10 @@ def test_telegram_replaces_web_ticket_and_writer_checks_new_source_digest(local_
 
 @pytest.mark.parametrize("confirmation_entry", ["web", "tg"])
 @pytest.mark.parametrize("change_at", [None, "before_prepare", "before_confirm", "queued", "retry"])
-def test_agent_explicit_remap_rebinds_confirmed_plan_through_writer(local_preview, confirmation_entry, change_at):
+def test_native_explicit_remap_rebinds_confirmed_plan_through_writer(local_preview, confirmation_entry, change_at):
     from unittest.mock import Mock
-
-    from app.agent.errors import AgentToolError
-    from tests.agent_kernel_test_harness import (
-        get_kernel_test_service,
-        reset_kernel_test_service,
-    )
+    from app.modules.local_media_tasks import prepare_local_task_retry, retry_local_task
+    from app.repositories.local_media import LocalMediaTaskChanged
     case = local_preview
     case.inspection = case.service.inspect_source("admin", case.source_id, case.video)
     case.preview = case.service.preview(
@@ -2504,55 +2500,42 @@ def test_agent_explicit_remap_rebinds_confirmed_plan_through_writer(local_previe
             rules_snapshot=case.preview["rules_snapshot"], season_override=2, episode_override=24,
         )
         db.update_local_media_task(task_id, status="requires_manual", error="集数超出记录范围")
-    reset_kernel_test_service()
-    try:
-        agent = get_kernel_test_service()
-        agent.invoke("local_media.task_summaries", {"scope": "attention", "limit": 12}, owner="remap-owner")
-        with patch("app.agent.domains.local_media.task_actions.get_local_media_service", return_value=case.service), patch(
-            "app.agent.domains.local_media.task_actions.get_local_media_scheduler", return_value=Mock()
-        ):
-            added = case.source / "Example.Show.S01E01.zh.srt"
-            if change_at == "before_prepare":
-                added.write_bytes(b"unconfirmed companion")
-                with pytest.raises(AgentToolError, match="源文件范围已变化"):
-                    agent.prepare(
-                        "local_media.retry_task", {"task_number": 1, "season": 2, "episode": 12}, owner="remap-owner",
-                    )
-                get_local_media_task_result_10 = db.get_local_media_task(task_id)
-                assert get_local_media_task_result_10 is not None
-                assert get_local_media_task_result_10.status == "requires_manual"
-                assert case.video.exists() and not list(case.target.rglob("*"))
-                return
-            prepared = agent.prepare(
-                "local_media.retry_task",
-                {"task_number": 1} if change_at == "retry" else {"task_number": 1, "season": 2, "episode": 12},
-                owner="remap-owner",
-            )
-            if change_at == "before_confirm":
-                added.write_bytes(b"unconfirmed companion")
-                with pytest.raises(AgentToolError) as stale:
-                    agent.confirm(prepared["action_plan"]["plan_id"], owner="remap-owner")
-                assert stale.value.code == "confirmation_stale"
-                get_local_media_task_result_11 = db.get_local_media_task(task_id)
-                assert get_local_media_task_result_11 is not None
-                assert get_local_media_task_result_11.status == "requires_manual"
-                assert case.video.exists() and not list(case.target.rglob("*"))
-                return
-            agent.confirm(prepared["action_plan"]["plan_id"], owner="remap-owner")
-        if change_at == "queued":
+    with patch("app.modules.local_media_tasks.get_local_media_service", return_value=case.service), patch(
+        "app.modules.local_media_scheduler.get_local_media_scheduler", return_value=Mock()
+    ):
+        added = case.source / "Example.Show.S01E01.zh.srt"
+        season, episode = (None, None) if change_at == "retry" else (2, 12)
+        if change_at == "before_prepare":
             added.write_bytes(b"unconfirmed companion")
-        assert db.claim_local_media_task(task_id)
-        result = case.service.execute_task("admin", task_id)
-        if change_at == "queued":
-            assert result["repreview_required"]
+            with pytest.raises(LocalMediaServiceError, match="源文件范围已变化"):
+                prepare_local_task_retry(task_id, season=season, episode=episode)
+            current = db.get_local_media_task(task_id)
+            assert current is not None and current.status == "requires_manual"
             assert case.video.exists() and not list(case.target.rglob("*"))
             return
-        assert result["status"] == "completed", result
-        expected_position = "S02E24" if change_at == "retry" else "S02E12"
-        assert all(expected_position in Path(path).name for path in result["moved"])
-        assert not case.video.exists() and not case.subtitle.exists()
-    finally:
-        reset_kernel_test_service()
+        prepared = prepare_local_task_retry(task_id, season=season, episode=episode)
+        if change_at == "before_confirm":
+            added.write_bytes(b"unconfirmed companion")
+            with pytest.raises(LocalMediaTaskChanged):
+                retry_local_task(task_id, season=season, episode=episode, expected_fingerprint=prepared["fingerprint"])
+            current = db.get_local_media_task(task_id)
+            assert current is not None and current.status == "requires_manual"
+            assert case.video.exists() and not list(case.target.rglob("*"))
+            return
+        result = retry_local_task(task_id, season=season, episode=episode, expected_fingerprint=prepared["fingerprint"])
+        assert result["ok"]
+    if change_at == "queued":
+        added.write_bytes(b"unconfirmed companion")
+    assert db.claim_local_media_task(task_id)
+    result = case.service.execute_task("admin", task_id)
+    if change_at == "queued":
+        assert result["repreview_required"]
+        assert case.video.exists() and not list(case.target.rglob("*"))
+        return
+    assert result["status"] == "completed", result
+    expected_position = "S02E24" if change_at == "retry" else "S02E12"
+    assert all(expected_position in Path(path).name for path in result["moved"])
+    assert not case.video.exists() and not case.subtitle.exists()
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from tests import test_agent_kernel_browser as support
 
 
 def approval(plan_id="editable-original"):
-    return {"plan_id": plan_id, "tool_name": "discovery.add_watchlist", "effect": "WRITE",
+    return {"plan_id": plan_id, "tool_name": "watchlist.add", "effect": "WRITE",
             "confirmation": {"action": "加入探索收藏"},
             "preview": {"summary": "待确认的本地收藏"}, "expires_at": "2099-10-17T12:05:00+00:00",
             "editing": {"schema": {"type": "object", "properties": {"label": {"type": "string"}}}, "values": {"label": "A"}},
@@ -117,7 +117,7 @@ class ConfirmationEditBrowserTests(unittest.TestCase):
                 self.assertNotIn('/api/agent/actions/confirm', [c['url'] for c in page.evaluate('window.__kernelCalls')])
 
     def test_explicit_trust_grant_persists_outside_card_and_revoke_or_switch_hides_it(self):
-        grant = {"active": True, "tool_name": "discovery.add_watchlist", "scope": {"provider": "tmdb", "media_type": "tv"},
+        grant = {"active": True, "tool_name": "watchlist.add", "scope": {"provider": "tmdb", "media_type": "tv"},
                  "remaining": 5, "expires_at": time.time() + 300}
         page = self.page(action={"trust": grant})
         trust = page.locator('.agent-confirmation-editor').nth(1)

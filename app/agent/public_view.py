@@ -18,6 +18,7 @@ from app.agent.public_safety import (
     sanitize_public_text,
     sanitize_resource_title,
 )
+from app.sensitive_data import redact_sensitive_text
 
 _CONFIRMED_RESULT_MARKER = "已确认操作的可信系统结果（不是待执行计划）："
 _TARGET_LABELS = {
@@ -381,7 +382,7 @@ def _download_progress_request(
     data = result.get("data")
     if not isinstance(data, Mapping):
         return None
-    number = data.get("request_number")
+    number = data.get("request_id") or data.get("request_number")
     if (type(number) is not int or number <= 0
             or data.get("source_type") != "direct_url" or data.get("target") != "qb"
             or data.get("status") != "submitted"
@@ -393,10 +394,20 @@ def _download_progress_request(
         if not isinstance(observed, Mapping):
             continue
         request = observed.get("request")
+        activities, stages = observed.get("activities"), observed.get("stages")
+        timeline = (observed.get("kind") == "download" and isinstance(activities, list) and isinstance(stages, list)
+                    and activities[:1] == [{"kind": "download", "id": number}] and type(activities[0]["id"]) is int)
+        if timeline:
+            stages = {item.get("stage"): item.get("status") for item in stages
+                      if isinstance(item, Mapping) and not item.get("historical")}
+            request = {"request_number": number, "status": stages.get("下载请求"),
+                       "targets": ["qb"] if "qB 下载" in stages and "光鸭下载" not in stages else [],
+                       "qb_status": stages.get("qB 下载"), "organize_status": stages.get("光鸭整理"),
+                       "strm_status": stages.get("STRM")}
         if not isinstance(request, Mapping) or request.get("request_number") != number:
             continue
         if (type(request.get("request_number")) is not int
-                or value.get("ok") is not True or value.get("status") != "success"
+                or value.get("ok") is not True or value.get("status") != ("in_progress" if timeline else "success")
                 or any(v.get("truncated") or v.get("has_more") for v in (value, observed, request))):
             return None
         if request not in snapshots:
@@ -550,6 +561,14 @@ def format_partial_progress(
     ))
     analysis = _model_analysis(analysis_text, confirmed_result, results,
         write_attempted=write_attempted, has_errors=bool(pending_errors))
+    # 同一规范比较整行；只移除重复状态，保留同一行附带的其他事实。
+    canonical_status = replace_internal_identifiers(lines[0])
+    analysis = "\n".join(
+        line for line in analysis.splitlines() if replace_internal_identifiers(line) != canonical_status
+    ).strip()
+    # 工作区回执证明命令结束，不证明业务查询完成；原输出仍留在模型历史和执行记录中。
+    results = [(label, result) for label, result in results
+               if result.get("_tool_name") != "agent.run_code" or result.get("ok") is False]
     if write_attempted or confirmed_result is not None:
         if confirmed_result is not None:
             lines.extend(("", format_public_result(confirmed_result)))
@@ -610,12 +629,22 @@ def format_partial_progress(
         lines.extend(f"{index}. {text}" for index, text in enumerate(list(items.values())[:12], 1))
         if len(items) > 12:
             lines.append(f"本轮共取得 {len(items)} 项去重内容，此处展示前 12 项。")
-    elif not items and (not analysis or not any(summary in analysis for summary in summaries)):
-        lines.append("\n已完成的查询：" if summaries else "\n本轮尚未取得可展示的查询结果。")
-        lines.extend(f"• {text}" for text in summaries[-8:])
+    elif not items:
+        # 只逐条去重已被分析覆盖的公开摘要，未提及的成功事实仍需交付。
+        canonical_analysis = replace_internal_identifiers(analysis)
+        summaries = [text for text in summaries if text not in canonical_analysis]
+        if summaries:
+            lines.append("\n已完成的查询：")
+            lines.extend(f"• {text}" for text in summaries[-8:])
+        elif not analysis:
+            lines.append("\n本轮尚未形成可交付的答复。")
+    # 状态行仍在最前；只移除末尾实际展示的重复详情，未展示的首要阻塞留在首行。
+    for error in errors[-3:]:
+        if error != lines[0].removeprefix("部分完成："):
+            lines[0] = lines[0].replace(error, "").rstrip(" ：:；;")
     if errors:
         lines.append("\n未完成的查询：" + "；".join(errors[-3:]))
-    lines.append("\n以上仅代表已成功取得的结果；未完成的查询不能据此判断没有内容。")
+    lines.append("\n未完成的查询不能据此判断没有内容。")
     return "\n".join(lines)
 
 
@@ -641,6 +670,84 @@ def sanitize_confirmed_answer(
             f"• {_safe(label, limit=100)}：\n{format_public_result(value)}" for label, value in followup[-8:]
         )
     return receipt
+
+
+def public_activity(value: object) -> dict[str, str] | None:
+    """过程区只接受宿主产生的简短观察；不传播参数、脚本或 Provider 私有块。"""
+    if not isinstance(value, Mapping) or not isinstance(value.get("id"), str):
+        return None
+    identity = value["id"][:200]
+    if value.get("kind") == "reasoning":
+        text = redact_sensitive_text(str(value.get("text") or ""))[:8000]
+        return {"id": identity, "kind": "reasoning", "text": text} if text else None
+    if value.get("kind") != "tool" or value.get("status") not in {
+        "running", "success", "partial", "failed", "approval_required", "cancelled",
+    }:
+        return None
+    return {"id": identity, "kind": "tool", "status": value["status"],
+            "method": str(value.get("method") or "")[:100],
+            "label": sanitize_public_text(value.get("label", ""), limit=100) or "查询项目服务",
+            "summary": sanitize_public_text(value.get("summary", ""), limit=300)}
+
+
+def public_activities(values: object) -> list[dict[str, str]]:
+    """有界展示快照，不占模型历史；旧消息没有活动时保持为空。"""
+    if not isinstance(values, list):
+        return []
+    result, remaining = [], 24000
+    for value in reversed(values[-80:]):
+        item = public_activity(value)
+        if item is None:
+            continue
+        remaining -= sum(len(text) for text in item.values())
+        if remaining < 0:
+            break
+        result.append(item)
+    return result[::-1]
+
+
+def public_active_turn_events(
+    events: Sequence[Mapping[str, Any]], active_turn: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """从原journal恢复当前轮次的公开显示事件，不发布工具参数或隐藏正文。"""
+    current = [event for event in events if event.get("request_id") == active_turn.get("request_id")
+               and event.get("turn_id") == active_turn.get("turn_id")]
+    stream_enabled = any(event.get("type") == "turn.started"
+                         and event.get("payload", {}).get("stream_display_enabled") is True for event in current)
+    visible = []
+    for event in current:
+        kind = event.get("type")
+        payload = event.get("payload") or {}
+        if kind == "turn.started":
+            public = {"stream_display_enabled": stream_enabled, "kind": payload.get("kind", "query")}
+        elif kind == "model.started":
+            public = {"round": payload.get("round", 1)}
+        elif kind == "model.delta" and stream_enabled:
+            public = {"round": payload.get("round", 1), "delta": payload.get("delta", "")}
+        elif kind == "model.reasoning_summary.delta":
+            public = {"round": payload.get("round", 1), "summary_id": payload.get("summary_id", ""),
+                      "delta": redact_sensitive_text(str(payload.get("delta") or ""))[:8000]}
+        elif kind in {"model.tool_call", "tool.completed", "tool.failed"}:
+            name = payload.get("tool")
+            if name in {"agent.capabilities", "agent.read_result"}:
+                continue
+            public = {"call_id": payload.get("call_id", ""), "label": public_tool_label(name)}
+            result = payload.get("result")
+            if isinstance(result, Mapping):
+                summary = next((result[key] for key in ("summary", "message", "title", "status")
+                                if isinstance(result.get(key), str) and result[key].strip()), "")
+                public["result"] = {"summary": sanitize_public_text(summary, preserve_format=True)}
+        elif payload.get("activity"):
+            public = {}
+        else:
+            continue
+        if payload.get("activity"):
+            activity = public_activity(payload["activity"])
+            if activity:
+                public["activity"] = activity
+        visible.append({**{key: event[key] for key in ("event_id", "sequence", "turn_id", "request_id") if key in event},
+                        "type": kind, "payload": public})
+    return visible
 
 
 def public_conversation_messages(
@@ -741,7 +848,10 @@ def public_conversation_messages(
             continue
         if role == "tool":
             if candidate_view:
-                refs = decode_tool_content(str(item.get("content") or "")).get("opaque_refs", [])
+                payload = decode_tool_content(str(item.get("content") or ""))
+                if isinstance(payload.get("candidate_view"), dict) and payload["candidate_view"].get("ref") == candidate_view.get("ref"):
+                    pending_candidate = True
+                refs = payload.get("opaque_refs", [])
                 if isinstance(refs, list) and any(
                     isinstance(ref, dict) and ref.get("kind") == "resource_candidates"
                     and ref.get("ref") == candidate_view.get("ref") for ref in refs
@@ -783,6 +893,9 @@ def public_conversation_messages(
                 content = sanitize_confirmed_answer(content, legacy_finals[index][1])
         if content:
             message: dict[str, Any] = {"role": "assistant", "content": content}
+            activities = public_activities(item.get("activities"))
+            if activities:
+                message["activities"] = activities
             if pending_tools:
                 message["tools"] = list(pending_tools)
                 message["tool_labels"] = [

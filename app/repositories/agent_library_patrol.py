@@ -4,25 +4,39 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Callable
+from typing import Any
+
+
+def _ensure_patrol(conn: sqlite3.Connection, due_at: str, timestamp: str) -> sqlite3.Row:
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_library_patrol("
+        "patrol_key,status,outcome,attempts,lease_generation,next_run_at,"
+        "projection_json,findings_truncated,error_type,created_at,updated_at) "
+        "VALUES('default','pending','',0,0,?,'{}',0,'',?,?)",
+        (due_at, timestamp, timestamp),
+    )
+    row = conn.execute("SELECT * FROM agent_library_patrol WHERE patrol_key='default'").fetchone()
+    assert row is not None
+    return row
 
 
 def ensure_agent_library_patrol(*, next_run_at: str | None = None) -> sqlite3.Row:
     """幂等创建全库缺集巡检单例。"""
     timestamp = db.now()
-    due_at = (next_run_at or timestamp)
     with db.get_conn() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO agent_library_patrol("
-            "patrol_key,status,outcome,attempts,lease_generation,next_run_at,"
-            "projection_json,findings_truncated,error_type,created_at,updated_at) "
-            "VALUES('default','pending','',0,0,?,'{}',0,'',?,?)",
-            (due_at, timestamp, timestamp),
-        )
-        row = conn.execute(
-            "SELECT * FROM agent_library_patrol WHERE patrol_key='default'"
-        ).fetchone()
-    assert row is not None
-    return row
+        return _ensure_patrol(conn, next_run_at or timestamp, timestamp)
+
+
+def patrol_task_state(row: sqlite3.Row | None) -> dict[str, Any]:
+    """确认与原子排队共用同一任务快照，不把最近结果当作运行身份。"""
+    return {
+        "task_status": str(row["status"] or "not_scheduled") if row is not None else "not_scheduled",
+        "next_run_at": str(row["next_run_at"] or "") if row is not None else "",
+        "lease_generation": int(row["lease_generation"] or 0) if row is not None else 0,
+        "last_finished_at": str(row["last_finished_at"] or "") if row is not None else "",
+        "run_id": int(row["cycle_run_id"] or 0) if row is not None else 0,
+    }
 
 
 def _reserve_cycle_run(conn: sqlite3.Connection, row: sqlite3.Row, timestamp: str, trigger_type: str) -> int:
@@ -38,13 +52,20 @@ def _reserve_cycle_run(conn: sqlite3.Connection, row: sqlite3.Row, timestamp: st
     return run_id
 
 
-def trigger_agent_library_patrol(*, next_run_at: str) -> dict[str, int | str | bool]:
+def trigger_agent_library_patrol(
+    *, next_run_at: str, expected_state: dict[str, Any] | None = None,
+    check_cancelled: Callable[[], None] | None = None,
+) -> dict[str, int | str | bool]:
     """原子预留或复用逻辑周期，返回的身份不受后继批次/周期覆盖。"""
-    ensure_agent_library_patrol(next_run_at=next_run_at)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM agent_library_patrol WHERE patrol_key='default'").fetchone()
-        assert row is not None
+        if expected_state is not None and patrol_task_state(row) != expected_state:
+            return {"ok": False, "status": "conflict"}
+        if check_cancelled is not None:
+            check_cancelled()
+        if row is None:
+            row = _ensure_patrol(conn, next_run_at, db.now())
         run_id = _reserve_cycle_run(conn, row, next_run_at, "manual")
         running = row["status"] == "running"
         if not running:

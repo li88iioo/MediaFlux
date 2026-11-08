@@ -1,4 +1,4 @@
-"""服务聚合层：媒体服务器看板、客户端工厂。"""
+"""服务聚合层：媒体服务器看板、库存统计、客户端工厂。"""
 from __future__ import annotations
 
 import logging
@@ -8,23 +8,31 @@ import time
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import groupby
 from typing import Any
+from urllib.parse import urlsplit
 
 from app import database as db
 from app.clients.base import (
     DashboardData,
     MediaIdentityBatch,
+    MediaItem,
     MediaSearchResult,
     MediaServerClient,
+    SeriesSearchResult,
     close_media_server_client,
 )
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
 from app.discovery.models import MediaCard, ProviderError
+from app.discovery.registry import COLLECTION_CATEGORIES, list_filter_definitions, validate_filters
 from app.logger import get_logger, log_throttled
+from app.modules.media_server_profiles import list_configured_profiles
+from app.sensitive_data import contains_sensitive_credential
 
 logger = get_logger(__name__)
 
@@ -420,6 +428,57 @@ def _run_owned_media_source_job(
         close_media_server_client(client)
 
 
+def get_library_counts(server: str = "all", library_id: str = "") -> dict[str, Any]:
+    """按字段保留未知；多源记录数求和，不去重。user_selection 仅说明请求用户选择。"""
+    if server not in ("all", "jellyfin", "emby"):
+        raise ValueError("server 必须是 all / jellyfin / emby")
+    if (not isinstance(library_id, str) or len(library_id) > 256
+            or any(ord(char) < 32 for char in library_id) or (library_id and not library_id.strip())):
+        raise ValueError("媒体库标识无效")
+    library_id = library_id.strip()
+    if library_id and server == "all":
+        raise ValueError("指定 library_id 时必须明确 jellyfin 或 emby")
+    fields = ("total_items", "movie_count", "series_count", "episode_count")
+
+    def read(profile):
+        row = {"server_type": profile.server_type, "server_name": profile.label,
+               "user_selection": "configured" if profile.user_id else "server_default",
+               "status": "not_configured", "counts": dict.fromkeys(fields)}
+        if not profile.enabled or not profile.configured:
+            return row
+        try:
+            with profile.create_client() as client:
+                if library_id and not any(str(folder["id"]) == library_id for folder in client.list_virtual_folders()):
+                    return {**row, "status": "not_found"}
+                raw = client.get_library_media_counts(library_id) if library_id else client.get_media_counts()
+                counts = {key: max(0, value) if (value := raw.get(key)) is not None else None for key in fields}
+                return {**row, "status": "partial" if None in counts.values() else "success", "counts": counts}
+        except Exception as exc:
+            logger.warning("媒体统计读取失败 server=%s type=%s", profile.server_type, type(exc).__name__)
+            return {**row, "status": "unavailable"}
+
+    profiles = [profile for profile in list_configured_profiles()
+                if (profile.enabled if server == "all" else profile.server_type == server)]
+    sources = _run_media_source_jobs([lambda profile=profile: read(profile) for profile in profiles])
+    available = [row for row in sources if row["status"] in {"success", "partial"}]
+    status = "not_configured" if not sources else "unavailable"
+    if available:
+        status = "success" if all(row["status"] == "success" for row in sources) else "partial"
+    elif len({row["status"] for row in sources}) == 1:
+        status = sources[0]["status"]
+    counts, known = {}, {}
+    for key in fields:
+        values = [row["counts"][key] for row in sources if row["counts"][key] is not None]
+        known[key] = sum(values) if values else None
+        counts[key] = known[key] if len(values) == len(sources) else None
+    return {"ok": bool(available), "status": status, "data": {
+        "server": server, "library_id": library_id, "scope": "library" if library_id else "all_libraries",
+        "count_scope": "server_records_sum_not_deduplicated",
+        "counts": counts,
+        "known_counts": known, "sources": sources,
+    }}
+
+
 def _fetch_recent_media(*, limit: int = 72) -> list[dict]:
     """并发聚合所有已配置媒体服务器的最近入库内容。"""
     normalized_limit = max(1, min((limit or 72), 200))
@@ -496,11 +555,12 @@ def get_cached_recent_media_or_stubs(*, limit: int = 72) -> tuple[list[dict], bo
 def _media_search_source_payload(
     server_type: str, server_name: str, web_url: str,
     client: MediaServerClient, query: str, options: dict[str, Any],
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict:
     result = MediaSearchResult(**options)
     error = ""
     try:
-        result = client.search_media(query, **options)
+        result = client.search_media(query, **options, cancelled=cancelled)
     except Exception as exc:
         logger.warning("媒体服务器搜索失败 server=%s type=%s", server_type, type(exc).__name__)
         error = "媒体服务器暂时不可用"
@@ -512,7 +572,8 @@ def _media_search_source_payload(
 
 def search_media_servers(
     query: str, *, limit: int = 8, offset: int = 0,
-    search_by: str = "title", media_type: str = "all", count_only: bool = False,
+    search_by: str = "title", media_type: str = "all", count_only: bool = False, server: str = "all",
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[dict]:
     """并发搜索，offset/limit 按服务器应用；总数是记录数，不跨服务器去重。"""
     normalized_limit = max(1, min((limit or 8), 50))
@@ -522,15 +583,184 @@ def search_media_servers(
     }
     jobs: list[Callable[[], dict]] = []
     for server_type, server_name, web_url, client in _configured_media_sources():
+        if server != "all" and server_type != server:
+            close_media_server_client(client)
+            continue
         jobs.append(
             lambda server_type=server_type, server_name=server_name, web_url=web_url, client=client: _run_owned_media_source_job(
                 client,
                 lambda: _media_search_source_payload(
-                    server_type, server_name, web_url, client, query, options,
+                    server_type, server_name, web_url, client, query, options, cancelled,
                 ),
             )
         )
     return _run_media_source_jobs(jobs)
+
+
+_SEARCH_CACHE_TTL_SECONDS = 15
+_SEARCH_CACHE_MAX_ENTRIES = 128
+_search_cache: dict[tuple[tuple[str, ...], str, int, int, str, str, bool, str], tuple[float, list[dict[str, Any]]]] = {}
+_search_cache_lock = threading.Lock()
+
+
+def _search_sources(
+    query: str, limit: int, *, offset: int = 0, search_by: str = "title",
+    media_type: str = "all", count_only: bool = False, server: str = "all",
+) -> list[dict[str, Any]]:
+    cache_key = (media_server_config_key(), query.casefold(), limit, offset, search_by, media_type, count_only, server)
+    now = time.monotonic()
+    with _search_cache_lock:
+        cached = _search_cache.get(cache_key)
+        if cached and now - cached[0] < _SEARCH_CACHE_TTL_SECONDS:
+            return cached[1]
+    sources = search_media_servers(
+        query, limit=limit, offset=offset, search_by=search_by,
+        media_type=media_type, count_only=count_only, server=server,
+    )
+    with _search_cache_lock:
+        expired = [
+            key
+            for key, value in _search_cache.items()
+            if now - value[0] >= _SEARCH_CACHE_TTL_SECONDS
+        ]
+        for key in expired:
+            _search_cache.pop(key, None)
+        while len(_search_cache) >= _SEARCH_CACHE_MAX_ENTRIES:
+            oldest = min(_search_cache, key=lambda key: _search_cache[key][0])
+            _search_cache.pop(oldest, None)
+        _search_cache[cache_key] = (now, sources)
+    return sources
+
+
+def clear_library_search_cache() -> None:
+    """清空共用媒体库搜索缓存，不重置 Agent 或其他业务状态。"""
+    with _search_cache_lock:
+        _search_cache.clear()
+
+
+def _library_search_url(value: object) -> str:
+    """只公开无凭据的 HTTP(S) 链接或现有媒体图片代理地址。"""
+    raw = str(value or "").strip()
+    if not raw or any(char.isspace() for char in raw) or contains_sensitive_credential(raw):
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        if not parsed.scheme and not parsed.netloc:
+            return raw if parsed.path.startswith("/media-image/") else ""
+        if (parsed.scheme.casefold() in {"http", "https"} and parsed.hostname
+                and parsed.username is None and parsed.password is None
+                and 1 <= (parsed.port or (443 if parsed.scheme.casefold() == "https" else 80)) <= 65535):
+            return raw
+    except ValueError:
+        pass
+    return ""
+
+
+def _library_search_item(item: MediaItem) -> dict[str, Any]:
+    # 显式列出业务字段，避免 dataclass 后续新增私有路径或凭据时自动进入 SDK。
+    return {
+        **{key: getattr(item, key) for key in (
+            "id", "name", "type", "year", "runtime", "date_added", "overview", "tmdb_id",
+            "series_name", "series_id", "season_number", "episode_number", "last_played", "progress",
+        )},
+        "display_name": item.display_name,
+        "genres": list(item.genres or ()),
+        **{key: _library_search_url(getattr(item, key)) for key in (
+            "primary_image", "web_url", "series_web_url",
+        )},
+        "open_url": _library_search_url(item.web_url or item.series_web_url),
+    }
+
+
+def search_library(
+    query: str, *, limit: int = 8, offset: int = 0,
+    search_by: str = "title", media_type: str = "all", count_only: bool = False, server: str = "all",
+) -> dict[str, Any]:
+    """聚合各源搜索页；total_known 仅表示总数可靠，分页进度由 has_more 等字段表达。"""
+    if not isinstance(query, str):
+        raise ValueError("query 必须是字符串")
+    query = unicodedata.normalize("NFKC", query).strip()
+    if not query or len(query) > 120 or any(unicodedata.category(char).startswith("C") for char in query):
+        raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        raise ValueError("limit 必须是 1 到 50 的整数")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset 必须是非负整数")
+    if search_by not in ("title", "actor"):
+        raise ValueError("search_by 必须是 title / actor")
+    if media_type not in ("all", "movie", "series", "episode"):
+        raise ValueError("media_type 必须是 all / movie / series / episode")
+    if type(count_only) is not bool:
+        raise ValueError("count_only 必须是布尔值")
+    if server not in {"all", "jellyfin", "emby"}:
+        raise ValueError("server 必须是 all/jellyfin/emby")
+    sources = _search_sources(query, limit, offset=offset, search_by=search_by,
+                              media_type=media_type, count_only=count_only, **({"server": server} if server != "all" else {}))
+    serialized_sources = []
+    known_total = known_sources = returned = unavailable = 0
+    for source in sources:
+        source_unavailable = bool(source.get("error"))
+        unavailable += int(source_unavailable)
+        items = [] if source_unavailable else [_library_search_item(item) for item in source.get("items", [])]
+        returned += len(items)
+        source_total = source.get("total")
+        if source_unavailable or type(source_total) is not int or source_total < 0:
+            source_total = None
+        else:
+            known_total += source_total
+            known_sources += 1
+        source_match = "found" if items or (source_total or 0) > 0 else "not_found" if source_total == 0 else "unknown"
+        serialized_sources.append({
+            "server_type": source.get("server_type"),
+            "server_name": source.get("server_name"),
+            "web_url": _library_search_url(source.get("web_url")),
+            "status": "unavailable" if source_unavailable else "ready",
+            "match_status": source_match,
+            "total": source_total,
+            "returned": len(items),
+            "has_more": source.get("has_more") if not source_unavailable else None,
+            "offset": source.get("offset", offset),
+            "limit": source.get("limit", limit),
+            "next_offset": source.get("next_offset") if not source_unavailable else None,
+            "total_source": source.get("total_source", "unknown") if not source_unavailable else "unknown",
+            "person_match": source.get("person_match", ""),
+            "included_item_types": deepcopy(source.get("included_item_types", [])),
+            "items": items,
+            "total_known": source_total is not None,
+        })
+    available = len(sources) - unavailable
+    total = known_total if sources and known_sources == len(sources) else None
+    has_more = (
+        True if any(source["has_more"] is True for source in serialized_sources)
+        else False if sources and all(source["has_more"] is False for source in serialized_sources)
+        else None
+    )
+    next_offsets = [source["next_offset"] for source in serialized_sources if type(source["next_offset"]) is int]
+    if not sources:
+        status, match_status = "not_configured", "not_configured"
+    elif not available:
+        status, match_status = "unavailable", "indeterminate"
+    elif returned or known_total:
+        status, match_status = "success" if total is not None else "partial", "found"
+    else:
+        status, match_status = ("empty", "not_found") if total == 0 else ("partial", "indeterminate")
+    episode_titles = search_by == "title" and media_type == "episode"
+    return {
+        "ok": available > 0,
+        "status": status,
+        "data": {
+            "query": query, "offset": offset, "limit": limit, "count_only": count_only,
+            "search_by": search_by, "media_type": media_type,
+            "match_basis": "actor_metadata" if search_by == "actor" else "title_search",
+            "search_scope": "episode_title" if episode_titles else "actor_metadata" if search_by == "actor" else "item_title",
+            "count_scope": "server_records_sum_not_deduplicated", "pagination_scope": "per_server",
+            "total": total, "known_total": known_total, "returned": returned,
+            "has_more": has_more, "next_offset": min(next_offsets, default=None),
+            "match_status": match_status, "sources": serialized_sources,
+            "total_known": total is not None,
+            "available_sources": available, "unavailable_sources": unavailable,
+        },
+    }
 
 
 def _media_identity_source_payload(
@@ -577,14 +807,17 @@ def _media_identity_inventory_source_payload(
     cancelled: Callable[[], bool] | None,
 ) -> dict:
     """一次读取并索引一个媒体源；索引只属于当前请求，不持有客户端。"""
-    try:
-        inventories = {}
-        for media_type in dict.fromkeys(media_types):
-            if (cancelled and cancelled()) or (deadline_at is not None and time.monotonic() >= deadline_at):
-                break
+    inventories = {}
+    error = ""
+    for media_type in dict.fromkeys(media_types):
+        if (cancelled and cancelled()) or (deadline_at is not None and time.monotonic() >= deadline_at):
+            break
+        try:
             options: dict[str, Any] = {"max_items": 5_000, "page_size": 200}
             if deadline_at is not None:
                 options["deadline_at"] = deadline_at
+            if cancelled is not None:
+                options["cancelled"] = cancelled
             inventory = client.list_media_identity_inventory(media_type, **options)
             inventories[media_type] = {
                 "total": inventory.total, "truncated": inventory.truncated, "unmapped": inventory.unmapped,
@@ -593,21 +826,13 @@ def _media_identity_inventory_source_payload(
                     (_normalize_series_identity_title(item.name), (item.year or "").strip())
                     for item in inventory.candidates if not item.tmdb_id and _normalize_series_identity_title(item.name)),
             }
-        return {"server_type": server_type, "server_name": server_name, "status": "ready",
-                "inventories": inventories, "error": ""}
-    except Exception as exc:  # noqa: BLE001 - 隔离单个媒体服务器故障，保留其他来源结果
-        logger.warning(
-            "媒体服务器批量身份审计失败 server=%s type=%s",
-            server_type,
-            type(exc).__name__,
-        )
-        return {
-            "server_type": server_type,
-            "server_name": server_name,
-            "status": "unavailable",
-            "inventories": {},
-            "error": "媒体服务器暂时不可用",
-        }
+        except Exception as exc:  # noqa: BLE001 - 按类型隔离故障，保留同源已完成的库存
+            logger.warning("媒体服务器批量身份审计失败 server=%s media_type=%s type=%s",
+                           server_type, media_type, type(exc).__name__)
+            error = "媒体服务器暂时不可用"
+    status = ("partial" if inventories else "unavailable") if error else "ready"
+    return {"server_type": server_type, "server_name": server_name, "status": status,
+            "inventories": inventories, "error": error}
 
 
 def _complete_series_matches(search, query: str) -> list:
@@ -786,12 +1011,6 @@ def _series_source_payload(
                 candidates=[],
                 library_name=resolved_library_name,
             )
-        if parent_id:
-            title_search = client.search_series_candidates(
-                query, limit=6, parent_id=parent_id
-            )
-        else:
-            title_search = client.search_series_candidates(query, limit=6)
         provider_search = None
         if explicit_tmdb_id:
             provider_search = client.find_series_candidates_by_tmdb(
@@ -807,7 +1026,7 @@ def _series_source_payload(
                     server_name=server_name,
                     client=client,
                     selected_items=provider_matches,
-                    candidates=_public_series_candidates(title_search, provider_search),
+                    candidates=_public_series_candidates(provider_search),
                     status="ready",
                     mapping_status="provider_id",
                     max_episodes=max_episodes,
@@ -816,6 +1035,10 @@ def _series_source_payload(
                     search_truncated=provider_search.truncated,
                 )
 
+        # 有稳定身份时先精确查找；未命中且提供了标题，才进行既有标题回退。
+        title_search = client.search_series_candidates(
+            query, limit=6, **({"parent_id": parent_id} if parent_id else {}),
+        ) if query else SeriesSearchResult()
         candidates = _public_series_candidates(title_search, provider_search)
         # 标题回退不能抹去精确身份枚举尚未完成的事实（别名、多副本均可能漏读）。
         search_truncated = title_search.truncated or bool(provider_search and provider_search.truncated)
@@ -1107,6 +1330,247 @@ def inspect_series_episode_sources(
     return _run_media_source_jobs(jobs)
 
 
+def _series_episode_candidates(sources: list[dict[str, Any]]) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for source in sources:
+        for candidate in source.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            name = str(candidate.get("name") or "").strip()
+            year = str(candidate.get("year") or "").strip()
+            if not name or (name, year) in seen:
+                continue
+            seen.add((name, year))
+            candidates.append({"name": name, "year": year})
+            if len(candidates) >= 8:
+                return candidates
+    return candidates
+
+
+def _series_episode_inventory(source: dict[str, Any]) -> tuple[dict[str, Any], set[tuple[int, int]]]:
+    episodes = {
+        (int(item[0]), int(item[1]))
+        for item in source.get("episodes") or []
+        if isinstance(item, (list, tuple))
+        and len(item) == 2
+        and str(item[0]).isdigit()
+        and str(item[1]).isdigit()
+        and int(item[0]) > 0
+        and int(item[1]) > 0
+    }
+    selected = (
+        source.get("selected") if isinstance(source.get("selected"), dict) else {}
+    )
+    return {
+        "server_type": str(source.get("server_type") or ""),
+        "server_name": str(source.get("server_name") or "媒体服务器"),
+        "library_name": str(source.get("library_name") or ""),
+        "status": str(source.get("status") or "unavailable"),
+        "title": str(selected.get("name") or ""),
+        "year": str(selected.get("year") or ""),
+        "local_episode_count": len(episodes),
+        "season_count": len({season for season, _episode in episodes}),
+        "truncated": bool(source.get("truncated")),
+        "ignored_specials": max(0, int(source.get("ignored_specials", 0) or 0)),
+        "ignored_unknown": max(0, int(source.get("ignored_unknown", 0) or 0)),
+    }, episodes
+
+
+def _series_episode_seasons(episodes: set[tuple[int, int]]) -> list[dict[str, Any]]:
+    seasons: dict[int, list[int]] = {}
+    for season, episode in sorted(episodes):
+        seasons.setdefault(season, []).append(episode)
+    return [
+        {
+            "season": season,
+            "count": len(numbers),
+            "first_episode": min(numbers),
+            "last_episode": max(numbers),
+            # 首末集只表示边界，断号必须保留；每个范围都是实际观察到的闭区间。
+            "episode_ranges": [
+                [run[0][1], run[-1][1]]
+                for _, group in groupby(enumerate(numbers), lambda item: item[1] - item[0])
+                if (run := list(group))
+            ],
+        }
+        for season, numbers in seasons.items()
+    ]
+
+
+def count_series_episodes(
+    query: str = "",
+    *,
+    tmdb_id: str = "",
+    library_name: str = "",
+) -> dict[str, Any]:
+    """汇总本地普通季集库存；返回普通字典，不访问 TMDB 或推断缺集。"""
+    if not isinstance(query, str):
+        raise ValueError("query 必须是字符串")
+    query = unicodedata.normalize("NFKC", query).strip(" ，。！？?、:：")
+    if len(query) > 120:
+        raise ValueError("query 最多 120 个字符")
+    if any(ord(char) < 32 or ord(char) == 127 for char in query):
+        raise ValueError("query 包含不允许的控制字符")
+    if not isinstance(tmdb_id, str):
+        raise ValueError("tmdb_id 必须是字符串")
+    tmdb_id = tmdb_id.strip()
+    if tmdb_id and (
+        not tmdb_id.isascii() or not tmdb_id.isdigit() or not 1 <= len(tmdb_id) <= 10
+    ):
+        raise ValueError("tmdb_id 必须是 1 到 10 位数字")
+    if not query and not tmdb_id:
+        raise ValueError("query 与 tmdb_id 至少提供一项")
+    if library_name is None:
+        library_name = ""
+    if not isinstance(library_name, str):
+        raise ValueError("library_name 必须是字符串")
+    if library_name:
+        library_name = unicodedata.normalize("NFKC", library_name).strip(" ，。！？?、:：")
+        if not library_name or len(library_name) > 80:
+            raise ValueError("library_name 必须是 1 到 80 个字符")
+        if any(ord(char) < 32 or ord(char) == 127 for char in library_name):
+            raise ValueError("library_name 包含不允许的控制字符")
+    found_statuses = {"ready", "unmapped"}
+    inspect_kwargs: dict[str, Any] = {
+        "tmdb_id": tmdb_id,
+        "max_episodes": 2000,
+        "include_specials": False,
+    }
+    if library_name:
+        inspect_kwargs["library_name"] = library_name
+    sources = inspect_series_episode_sources(query, **inspect_kwargs)
+    if not sources:
+        return dict(
+            ok=False,
+            status="not_configured",
+            summary="尚未配置可查询的 Jellyfin 或 Emby 媒体服务器",
+            data={
+                "query": query,
+                "library_name": library_name,
+                "local_episode_count": None,
+                "inventory_complete": False,
+                "matched_source_count": 0,
+                "source_count": 0,
+                "sources": [],
+            },
+            suggestions=["请先在设置中启用并配置 Jellyfin 或 Emby，然后重试。"],
+            error="media_server_not_configured",
+        )
+
+    inventories = [_series_episode_inventory(source) for source in sources]
+    safe_sources = [source for source, _episodes in inventories]
+    matched = [(source, episodes) for source, episodes in inventories if source["status"] in found_statuses]
+    if not matched:
+        statuses = {str(source.get("status") or "unavailable") for source in sources}
+        candidates = _series_episode_candidates(sources)
+        if statuses == {"library_not_found"}:
+            summary = f"没有找到名为「{library_name}」的媒体库"
+            status = "library_not_found"
+            suggestions = ["请核对媒体库名称，或先列出媒体服务器中的媒体库。"]
+        elif "library_ambiguous" in statuses:
+            summary = f"有多个媒体库与「{library_name}」相似，暂时无法确定范围"
+            status = "library_ambiguous"
+            suggestions = ["请使用媒体服务器中显示的完整媒体库名称重试。"]
+        elif statuses == {"not_found"}:
+            scope_label = (
+                f"「{library_name}」媒体库" if library_name else "已配置的媒体库"
+            )
+            summary = f"没有在{scope_label}中找到《{query or 'TMDB ' + tmdb_id}》"
+            status = "not_found"
+            suggestions = ["请尝试官方名称、原始名称，或提供 TMDB ID。"]
+        elif "ambiguous" in statuses or "conflict" in statuses:
+            summary = f"找到多个可能的《{query}》，暂时无法确定要统计哪一部"
+            status = "ambiguous"
+            suggestions = ["请补充首播年份、完整剧名或 TMDB ID。"]
+        else:
+            summary = "媒体服务器当前不可用，暂时无法读取本地集数"
+            status = "unavailable"
+            suggestions = ["请检查 Jellyfin / Emby 连接状态后重试。"]
+        return dict(
+            ok=False,
+            status=status,
+            summary=summary,
+            data={
+                "query": query,
+                "library_name": library_name,
+                "local_episode_count": None,
+                "inventory_complete": False,
+                "matched_source_count": 0,
+                "source_count": len(sources),
+                "candidates": candidates,
+                "sources": safe_sources,
+            },
+            suggestions=suggestions,
+            error=status,
+        )
+
+    episode_union: set[tuple[int, int]] = set()
+    ignored_specials = 0
+    ignored_unknown = 0
+    truncated = False
+    title = query
+    year = ""
+    for source, episodes in matched:
+        title = source["title"] or title
+        year = source["year"] or year
+        ignored_specials += source["ignored_specials"]
+        ignored_unknown += source["ignored_unknown"]
+        truncated = truncated or source["truncated"]
+        episode_union.update(episodes)
+
+    seasons = _series_episode_seasons(episode_union)
+    count = len(episode_union)
+    incomplete = any(
+        source["truncated"] or source["ignored_unknown"]
+        or source["status"] not in found_statuses | {"not_found"}
+        for source in safe_sources
+    )
+    status = "partial" if incomplete else "success"
+    ok = True
+    source_label = matched[0][0]["server_name"]
+    if len(matched) > 1:
+        source_label = f"{len(matched)} 个媒体服务器"
+    summary = f"{source_label} 中《{title}》本地收录 {count} 集"
+    if incomplete:
+        summary += "，但部分来源不可用、有歧义、未完整编号或读取被截断"
+
+    suggestions: list[str] = []
+    if incomplete:
+        suggestions.append(
+            "当前数量是已确认的本地普通集下限；范围仅代表已确认收录，未列出的季集不能据此认定不存在，请核对来源状态。"
+        )
+    elif ignored_specials:
+        suggestions.append(
+            f"默认未计入特别篇（第 0 季），共忽略 {ignored_specials} 项。"
+        )
+
+    return dict(
+        ok=ok,
+        status=status,
+        summary=summary,
+        data={
+            "query": query,
+            "library_name": library_name,
+            "title": title,
+            "year": year,
+            "local_episode_count": count,
+            "inventory_complete": not incomplete,
+            "season_count": len(seasons),
+            "seasons": seasons,
+            "matched_source_count": len(matched),
+            "source_count": len(sources),
+            "ignored_specials": ignored_specials,
+            "ignored_unknown": ignored_unknown,
+            "truncated": truncated,
+            "sources": safe_sources,
+            "count_definition": "Jellyfin / Emby 中已识别季号和集号的本地普通集；跨媒体服务器重复季集号只计一次。",
+        },
+        suggestions=suggestions,
+        error="",
+    )
+
+
 def inspect_media_identity_sources(
     tmdb_id: str, media_type: str, *, identity_batch: MediaIdentityBatch | None = None,
 ) -> list[dict]:
@@ -1144,22 +1608,25 @@ def load_media_identity_snapshot(
 
 def inspect_media_identity_batch(
     identities: list[dict[str, str]], *, snapshot: list[dict] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[dict]:
     """统一身份匹配；独立核验读取新快照，续页显式复用当前请求的快照。"""
     if snapshot is None:
-        snapshot = load_media_identity_snapshot(tuple(dict.fromkeys(item["media_type"] for item in identities)))
+        snapshot = load_media_identity_snapshot(
+            tuple(dict.fromkeys(item["media_type"] for item in identities)), cancelled=cancelled,
+        )
     sources = []
     for source in snapshot:
         results = []
         for identity in identities:
             inventory = source["inventories"].get(identity["media_type"])
             status, match = "indeterminate", "none"
-            if source["status"] == "ready" and inventory is not None:
+            if source["status"] in {"ready", "partial"} and inventory is not None:
                 if identity["tmdb_id"] in inventory["exact_ids"]:
                     status, match = "present", "provider_id"
                 elif (_normalize_series_identity_title(identity.get("title")), (identity.get("year") or "").strip()) in inventory["unmapped_titles"]:
                     status, match = "possible", "title_year"
-                elif not inventory["truncated"]:
+                elif not inventory["truncated"] and (identity.get("title") or not inventory["unmapped"]):
                     status = "missing"
             results.append({"tmdb_id": identity["tmdb_id"], "media_type": identity["media_type"],
                             "status": status, "match": match})
@@ -1233,15 +1700,197 @@ def summarize_media_identity_batch(
     }
 
 
+def _media_presence_text(value: object, *, limit: int) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if any(unicodedata.category(char).startswith("C") for char in normalized):
+        return ""
+    return " ".join(normalized.split())[:limit]
+
+
+def normalize_media_presence_items(raw_items: object) -> list[dict[str, str]]:
+    """从完整媒体条目校验、提取身份；忽略描述与旧库存状态，批量不受展示条数限制。"""
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError("items 必须是非空媒体身份列表")
+    items: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ValueError("媒体身份字段无效")
+        tmdb_id = str(raw.get("tmdb_id") or "").strip()
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", tmdb_id):
+            raise ValueError("tmdb_id 必须是 1 到 10 位正整数")
+        media_type = str(raw.get("media_type") or "").strip().casefold()
+        if media_type not in {"movie", "tv"}:
+            raise ValueError("media_type 仅支持 movie 或 tv")
+        title = _media_presence_text(raw.get("title"), limit=240)
+        if raw.get("title") and not title:
+            raise ValueError("提供 title 时必须是可见文本")
+        year = str(raw.get("year") or "").strip()
+        if year and not re.fullmatch(r"(?:19|20)[0-9]{2}", year):
+            raise ValueError("year 必须是 1900 到 2099 的四位年份")
+        key = (media_type, tmdb_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            {
+                "tmdb_id": tmdb_id,
+                "media_type": media_type,
+                "title": title,
+                "year": year,
+            }
+        )
+    if not items:
+        raise ValueError("items 中没有可核对的唯一媒体身份")
+    return items
+
+
+def batch_library_presence(
+    items: list[dict[str, Any]], *, cancelled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """一次读取每个媒体源/类型的库存，返回可序列化的批量身份核对结果。"""
+    requested = normalize_media_presence_items(items)
+    sources = inspect_media_identity_batch(requested, cancelled=cancelled)
+    if not sources:
+        return dict(
+            ok=False,
+            status="not_configured",
+            summary="没有可核对的媒体服务器",
+            data={"total": len(requested), "items": [], "sources": []},
+            suggestions=["请先在设置中启用并配置 Jellyfin 或 Emby。"],
+            error="没有可核对的媒体服务器。",
+        )
+
+    data = summarize_media_identity_batch(requested, sources)
+    counts = data["counts"]
+    unavailable = sum(
+        1 for source in sources if str(source.get("status") or "") != "ready"
+    )
+    status = (
+        "partial"
+        if unavailable or counts["possible"] or counts["indeterminate"]
+        else "success"
+    )
+    return dict(
+        ok=True,
+        status=status,
+        summary=(
+            f"已批量核对 {data['total']} 部媒体：在库 {counts['present']}、"
+            f"缺失 {counts['missing']}、待确认 {counts['possible']}、"
+            f"无法判断 {counts['indeterminate']}"
+        ),
+        data=data,
+        suggestions=[
+            "present 为精确 TMDB 身份命中；possible 表示同名同年但本地条目缺少 TMDB 映射。"
+        ],
+        error="",
+    )
+
+
+_REGION_COUNTRY_ALIASES = {
+    "美国": "US", "美剧": "US", "英国": "GB", "英剧": "GB",
+    "中国": "CN", "中国大陆": "CN", "国产": "CN", "国产剧": "CN",
+    "中国香港": "HK", "香港": "HK", "中国台湾": "TW", "台湾": "TW",
+    "日本": "JP", "日剧": "JP", "韩国": "KR", "韩剧": "KR",
+    "法国": "FR", "德国": "DE", "印度": "IN", "意大利": "IT", "西班牙": "ES",
+}
+
+
+def _recommendation_filters(normalized: dict[str, Any]) -> dict[str, str]:
+    """把用户语义筛选转换为榜单 Provider 的受控参数。"""
+    provider = str(normalized["provider"])
+    media_type = str(normalized["media_type"])
+    year = str(normalized.get("year") or "")
+    region = str(normalized.get("region") or "")
+    genre = str(normalized.get("genre") or "")
+    # Provider 注册表是唯一的选项来源；公共收集入口仅翻译口语别名，不另养类型目录。
+    options = {
+        field["key"]: {item["label"]: item["value"] for item in field["options"]}
+        for field in list_filter_definitions(provider, media_type)["filters"]
+    }
+    country = _REGION_COUNTRY_ALIASES.get(region, "")
+    if not country and re.fullmatch(r"[A-Za-z]{2}", region):
+        country = region.upper()
+    genre = "动画" if genre == "动漫" else genre
+    filters: dict[str, str] = {}
+    if provider == "tmdb":
+        date = "release_date" if media_type == "movie" else "first_air_date"
+        for field, suffix, day in (("year_from", "gte", "01-01"), ("year_to", "lte", "12-31")):
+            if normalized.get(field):
+                filters[f"{date}.{suffix}"] = f"{normalized[field]}-{day}"
+        if year:
+            filters[
+                "primary_release_year"
+                if media_type == "movie"
+                else "first_air_date_year"
+            ] = year
+        if region and not country:
+            raise ValueError("region 无法转换为明确产地；请使用国家/地区名称或双字母代码，不以语言代替地区")
+        if country:
+            filters["with_origin_country"] = country
+        if media_type == "tv":
+            genre = {
+                "动作": "动作冒险", "冒险": "动作冒险", "科幻": "科幻奇幻",
+                "奇幻": "科幻奇幻", "战争": "战争政治", "历史": "战争政治",
+            }.get(genre, genre)
+        key, value = "with_genres", genre
+    else:
+        if (media_type == "movie" and region) or (media_type == "tv" and genre):
+            raise ValueError("豆瓣推荐接口仅支持电影题材或剧集地区筛选；请改用 tmdb 并保留全部原筛选条件")
+        key = "tags"
+        value = genre if media_type == "movie" else {
+            "CN": "国产剧", "US": "美剧", "GB": "英剧", "JP": "日剧", "KR": "韩剧",
+        }.get(country, region)
+    if value:
+        canonical = options[key].get(value, value)
+        if canonical not in options[key].values():
+            raise ValueError(f"{provider} 不支持该推荐筛选 {value}；可用选项：{'、'.join(options[key])}")
+        filters[key] = canonical
+    return filters
+
+
 def collect_discovery_recommendations(
     service_factory: Callable[[], Any], *, provider: str, media_type: str,
-    page: int, limit: int, filters: dict[str, str], offset: int = 0,
+    page: int, limit: int, filters: dict[str, str] | None = None, offset: int = 0,
     year_from: str = "", year_to: str = "", exclude_library: bool = False,
+    category: str = "", year: str = "", region: str = "", genre: str = "",
     cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """有界收集推荐；共享单页来源和身份核验，不改变探索页的显式分页。"""
+    if not isinstance(provider, str) or not isinstance(media_type, str):
+        raise ValueError("provider 和 media_type 必须是字符串")
+    provider, media_type = provider.strip().lower(), media_type.strip().lower()
+    expected_category = COLLECTION_CATEGORIES.get(provider, "")
+    if provider not in COLLECTION_CATEGORIES or media_type not in {"movie", "tv"}:
+        raise ValueError("推荐仅支持 tmdb/douban 的 movie/tv")
+    if category and category != expected_category:
+        raise ValueError("收集推荐使用 tmdb/discover 或 douban/recommend")
+    category = expected_category
+    if type(page) is not int or not 1 <= page <= 100 or type(limit) is not int or limit < 1:
+        raise ValueError("page 必须在 1 到 100，limit 必须是正整数")
+    if type(offset) is not int or offset < 0 or type(exclude_library) is not bool:
+        raise ValueError("offset 必须是非负整数，exclude_library 必须是布尔值")
+    years = [year, year_from, year_to]
+    if any(not isinstance(value, str) or (value and not re.fullmatch(r"(?:19|20)[0-9]{2}", value)) for value in years):
+        raise ValueError("推荐年份必须是 1900 到 2099 的四位年份")
+    if (year_from or "1900") > (year_to or "2099") or (year and not (year_from or "1900") <= year <= (year_to or "2099")):
+        raise ValueError("推荐年份与范围冲突")
+    if any(not isinstance(value, str) or any(unicodedata.category(char).startswith("C") for char in value) for value in (region, genre)):
+        raise ValueError("地区和题材必须是可见文本")
+    translated = _recommendation_filters({
+        "provider": provider, "media_type": media_type, "year": year,
+        "year_from": year_from, "year_to": year_to,
+        "region": unicodedata.normalize("NFKC", region).strip(),
+        "genre": unicodedata.normalize("NFKC", genre).strip(),
+    })
+    if filters is not None and not isinstance(filters, dict):
+        raise ValueError("filters 必须是对象")
+    raw_filters = filters or {}
+    if any(key in raw_filters and raw_filters[key] != value for key, value in translated.items()):
+        raise ValueError("语义筛选与 filters 冲突")
+    filters = validate_filters(provider, category, media_type, {**raw_filters, **translated})
+    year_from, year_to = year or year_from, year or year_to
     deadline_at = time.monotonic() + 20
-    category = "discover" if provider == "tmdb" else "recommend"
     service = None
     snapshot = None
     cards: list[MediaCard] = []
@@ -1253,6 +1902,8 @@ def collect_discovery_recommendations(
     cached, stale, has_more = True, False, False
     provider_status, error_code = "healthy", ""
     library_check = None
+    checked: list[dict] = []
+    unverified: dict | None = None
 
     def interrupted() -> str:
         if cancelled and cancelled():
@@ -1282,6 +1933,7 @@ def collect_discovery_recommendations(
         if source_page.provider.status != "healthy":
             provider_status = source_page.provider.status
         retry_after = max(retry_after, source_page.provider.retry_after)
+        page_start = len(cards)
         for index, card in enumerate(source_page.items):
             if not isinstance(card, MediaCard) or card.media_type != media_type:
                 continue
@@ -1302,9 +1954,10 @@ def collect_discovery_recommendations(
             positions[key] = (page, index + 1)
         stop_reason = interrupted()
         if exclude_library:
+            new_cards = cards[page_start:]
             identities = [{"tmdb_id": card.tmdb_id, "media_type": card.media_type,
                            "title": card.title, "year": (card.year or "").strip()}
-                          for card in cards if re.fullmatch(r"[1-9][0-9]{0,9}", card.tmdb_id)]
+                          for card in new_cards if re.fullmatch(r"[1-9][0-9]{0,9}", card.tmdb_id)]
             if identities and snapshot is None and not stop_reason:
                 try:
                     snapshot = load_media_identity_snapshot(
@@ -1315,19 +1968,30 @@ def collect_discovery_recommendations(
                     snapshot = []
                 stop_reason = interrupted()
             sources = inspect_media_identity_batch(identities, snapshot=snapshot or []) if identities else []
-            library_check = summarize_media_identity_batch(identities, sources)
-            library_check["unmapped_candidates"] = len(cards) - len(identities)
-            missing = {(item["media_type"], item["tmdb_id"]) for item in library_check["items"]
+            batch_check = summarize_media_identity_batch(identities, sources)
+            checked.extend(batch_check["items"])
+            if identities or library_check is None:
+                library_check = batch_check
+            missing = {(item["media_type"], item["tmdb_id"]) for item in batch_check["items"]
                        if item["library_status"] == "missing"}
-            accepted = [card for card in cards if (card.media_type, card.tmdb_id) in missing]
+            accepted.extend(card for card in new_cards if (card.media_type, card.tmdb_id) in missing)
+            if identities and (not snapshot or any(
+                source["inventories"].get(media_type, {}).get("truncated", True) for source in snapshot
+            )):
+                unverified = next((item for item in batch_check["items"] if item["library_status"] != "present"), None)
         else:
             accepted = cards
-        stop_reason = interrupted() or stop_reason or ("target_reached" if len(accepted) >= limit else
+        stop_reason = interrupted() or stop_reason or ("library_incomplete" if unverified else
+            "target_reached" if len(accepted) >= limit else
             "source_exhausted" if not has_more else "page_limit" if len(pages_read) >= 8 or page >= 100 else "")
         if not stop_reason:
             page += 1
             offset = 0
 
+    if library_check is not None:
+        library_check.update(items=checked, total=len(checked), unmapped_candidates=len(cards) - len(checked),
+                             counts={status: sum(item["library_status"] == status for item in checked)
+                                     for status in library_check["counts"]})
     returned = min(len(accepted), limit)
     next_page = pages_read[-1] + 1 if pages_read else page
     next_offset = offset if not pages_read else 0
@@ -1337,8 +2001,23 @@ def collect_discovery_recommendations(
         last = accepted[returned - 1]
         # 续取必须从最后返回条目的源位置开始，而非跳过已读取但未返回的半页。
         next_page, next_offset = positions[(last.media_type, last.tmdb_id or last.stable_id)]
+    elif unverified:
+        # 库存未读完时继续翻来源页也无法排库；恢复后重查首个未核验候选。
+        next_page, position = positions[(unverified["media_type"], unverified["tmdb_id"])]
+        next_offset, has_more = position - 1, True
+    unresolved = (library_check["counts"]["possible"] + library_check["counts"]["indeterminate"]
+                  + library_check["unmapped_candidates"]) if library_check is not None else 0
+    status = "success" if returned else "empty"
+    if stop_reason == "cancelled":
+        status = "cancelled"
+    elif error_code and not pages_read:
+        status = "unavailable"
+    elif unresolved or (returned < limit and (returned or stop_reason != "source_exhausted")):
+        status = "partial"
     return {
-        "items": accepted[:limit], "total": len(accepted), "returned": returned,
+        "ok": status not in {"cancelled", "unavailable"}, "status": status, "partial": status == "partial",
+        "items": [{**card.to_dict(), **({"library_status": "missing"} if exclude_library else {})}
+                  for card in accepted[:limit]], "total": len(accepted), "returned": returned,
         "has_more": has_more or len(accepted) > limit,
         "cached": bool(pages_read) and cached, "stale": stale,
         "provider_status": provider_status, "retry_after": retry_after,

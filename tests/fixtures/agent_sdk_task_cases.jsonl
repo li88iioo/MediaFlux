@@ -1,0 +1,5 @@
+{"id": "scope_aba", "version": 2, "split": "holdout", "messages": ["只看电视剧媒体库，最近入库的5部剧是什么？单集按剧名合并，不要混入动漫媒体库。只读。", "现在切到动漫媒体库，最近入库的5部动漫是什么？不要混入电视剧媒体库。只读。", "回到最初的电视剧媒体库，只列第一次那5部的名字，不要混入刚才动漫库的结果，也不用重新查。"], "rubric": {"kind": "scope_aba", "scopes": ["电视剧", "动漫", "电视剧"]}}
+{"id": "preview_twenty_cancel", "version": 2, "split": "holdout", "messages": ["搜索《凡人修仙传》的资源，用真实搜索结果前20项生成一张提交到qBittorrent的批量下载预览（序号1到20）；只预览，绝对不要执行任何确认、下载或云盘写入。预览出现后我会直接取消。若真实候选不足20项请如实说明，不要补造资源。"], "rubric": {"kind": "preview_cancel", "count": 20}}
+{"id": "read_missing_query", "version": 2, "split": "holdout", "messages": ["统计媒体库里周星驰参演的电影总数，说明统计口径和来源，只读。"], "rubric": {"kind": "read_recovery", "actor": "周星驰", "fault": "missing_query"}}
+{"id": "read_invalid_enum", "version": 2, "split": "holdout", "messages": ["统计媒体库里周星驰参演的电影总数，说明统计口径和来源，只读。"], "rubric": {"kind": "read_recovery", "actor": "周星驰", "fault": "invalid_enum"}}
+{"id": "dune_year", "version": 2, "split": "holdout", "messages": ["查我的媒体库有没有2021年电影《沙丘》（Dune），按库中实际实体的年份核对，不要把1984年同名版本算进来。可以读取同名版本对照，只读。"], "rubric": {"kind": "year_identity", "title": "沙丘", "year": "2021"}}

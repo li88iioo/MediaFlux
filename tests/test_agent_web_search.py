@@ -1,6 +1,6 @@
 from __future__ import annotations
-from app.agent.models import ToolResult
-from typing import Callable
+from app.modules.web_evidence import _result as make_result
+from typing import Callable, TypedDict
 from app.clients.http import FixedHostHttpClient
 from typing import cast
 
@@ -13,18 +13,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.discovery.web_request_singleflight import (
-    web_request_singleflight,
+from app.modules.web_evidence import (
+    WebEvidenceError,
+    _map_search_response, _provider_error, _search_tavily,
+    clear_web_cache, search_web, web_request_singleflight,
 )
-from app.agent.domains.discovery.web_search_actions import (
-    _map_response,
-    _provider_error,
-    _search_tavily,
-    reset_web_search_cache_for_tests,
-    search_web,
-    web_search_arguments,
-)
-from app.agent.errors import AgentToolError
+from app.modules.web_evidence import normalize_search_arguments
+from app import sdk
 from app.agent.rate_limit import AgentRateLimiter
 from tests.support import IsolatedDatabaseTestCase
 
@@ -33,10 +28,40 @@ def _config(values):
     return lambda key, default="": values.get(key, default)
 
 
+class _SearchScope(TypedDict, total=False):
+    include_domains: list[str]
+    exclude_domains: list[str]
+    start_date: str
+    end_date: str
+    time_range: str
+
+
 class WebSearchArgumentTests(unittest.TestCase):
+    def test_source_and_date_filters_normalize_without_losing_scope(self):
+        result = normalize_search_arguments({
+            "query": "release", "include_domains": [" Jellyfin.ORG.", "jellyfin.org"],
+            "exclude_domains": ["forum.jellyfin.org"], "start_date": "2026-01-01", "end_date": "2026-11-08",
+        })
+        self.assertEqual(result["include_domains"], ["jellyfin.org"])
+        self.assertEqual(result["exclude_domains"], ["forum.jellyfin.org"])
+        self.assertEqual(result["start_date"], "2026-01-01")
+        self.assertEqual(result["end_date"], "2026-11-08")
+        for filters in (
+            {"include_domains": "jellyfin.org"}, {"include_domains": ["https://jellyfin.org/docs"]},
+            {"include_domains": ["*.jellyfin.org"]}, {"include_domains": ["server.local"]},
+            {"include_domains": ["example.com?api_key=abcdefgh123456"]},
+            {"exclude_domains": ["bad_name.org"]},
+            {"include_domains": ["example.com"], "exclude_domains": ["EXAMPLE.COM"]},
+            {"start_date": "2026-02-30"}, {"start_date": "20260101"},
+            {"start_date": "2026-11-08", "end_date": "2026-01-01"},
+            {"time_range": "week", "end_date": "2026-01-01"},
+        ):
+            with self.subTest(filters=filters), self.assertRaises(WebEvidenceError):
+                normalize_search_arguments({"query": "release", **filters})
+
     def test_arguments_are_strict_and_normalized(self):
         self.assertEqual(
-            web_search_arguments(
+            normalize_search_arguments(
                 {
                     "query": "  Jellyfin １２  ",
                     "max_results": 3,
@@ -59,8 +84,8 @@ class WebSearchArgumentTests(unittest.TestCase):
             {"query": "x", "max_results": 11},
             {"query": "x", "url": "https://example.com"},
         ):
-            with self.subTest(value=value), self.assertRaises(AgentToolError):
-                web_search_arguments(value)
+            with self.subTest(value=value), self.assertRaises(WebEvidenceError):
+                normalize_search_arguments(value)
 
     def test_arguments_reject_secret_like_query(self):
         messages = (
@@ -75,9 +100,9 @@ class WebSearchArgumentTests(unittest.TestCase):
         for message in messages:
             with (
                 self.subTest(message=message),
-                self.assertRaisesRegex(AgentToolError, "疑似包含凭据") as raised,
+                self.assertRaisesRegex(WebEvidenceError, "疑似包含凭据") as raised,
             ):
-                web_search_arguments({"query": message})
+                normalize_search_arguments({"query": message})
             self.assertEqual(raised.exception.code, "sensitive_external_input")
 
     def test_arguments_allow_public_security_document_queries(self):
@@ -94,7 +119,7 @@ class WebSearchArgumentTests(unittest.TestCase):
         for message in messages:
             with self.subTest(message=message):
                 self.assertEqual(
-                    web_search_arguments({"query": message})["query"], message
+                    normalize_search_arguments({"query": message})["query"], message
                 )
 
 
@@ -118,7 +143,7 @@ class WebSearchDatabaseFacadeCompatibilityTests(unittest.TestCase):
 class WebSearchExecutionTests(IsolatedDatabaseTestCase):
     def setUp(self):
         super().setUp()
-        reset_web_search_cache_for_tests()
+        clear_web_cache()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM agent_web_search_daily_usage")
         self.values = {
@@ -133,21 +158,21 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
     def test_disabled_or_missing_key_never_calls_provider(self):
         with (
             patch(
-                "app.agent.domains.discovery.web_search_actions.get",
+                "app.modules.web_evidence.get",
                 side_effect=_config({"WEB_SEARCH_ENABLED": "0"}),
             ),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily") as provider,
+            patch("app.modules.web_evidence._search_tavily") as provider,
         ):
-            self.assertEqual(search_web({"query": "x"}).status, "disabled")
+            self.assertEqual(search_web(**{"query": "x"})['status'], "disabled")
             provider.assert_not_called()
         with (
             patch(
-                "app.agent.domains.discovery.web_search_actions.get",
+                "app.modules.web_evidence.get",
                 side_effect=_config({"WEB_SEARCH_ENABLED": "1", "TAVILY_API_KEY": ""}),
             ),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily") as provider,
+            patch("app.modules.web_evidence._search_tavily") as provider,
         ):
-            self.assertEqual(search_web({"query": "x"}).status, "configuration_missing")
+            self.assertEqual(search_web(**{"query": "x"})['status'], "configuration_missing")
             provider.assert_not_called()
 
     def test_sensitive_query_never_calls_provider_or_consumes_budget(self):
@@ -158,15 +183,15 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             "password=$abcdefgh123456",
         )
         with (
-            patch("app.agent.domains.discovery.web_search_actions.get", side_effect=_config(self.values)),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily") as provider,
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence._search_tavily") as provider,
         ):
             for message in messages:
                 with (
                     self.subTest(message=message),
-                    self.assertRaisesRegex(AgentToolError, "疑似包含凭据"),
+                    self.assertRaisesRegex(WebEvidenceError, "疑似包含凭据"),
                 ):
-                    search_web({"query": message})
+                    search_web(**{"query": message})
         provider.assert_not_called()
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
@@ -176,7 +201,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         )
 
     def test_success_is_cached_and_charged_once(self):
-        result = ToolResult(
+        result = make_result(
             True, "ok", "找到 1 条网页结果", data={"results": [{"title": "Demo"}]}
         )
 
@@ -184,16 +209,16 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             return result
 
         with (
-            patch("app.agent.domains.discovery.web_search_actions.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
             patch(
-                "app.agent.domains.discovery.web_search_actions._search_tavily", side_effect=provider
+                "app.modules.web_evidence._search_tavily", side_effect=provider
             ) as call,
         ):
-            first = search_web({"query": "Jellyfin 12", "max_results": 10})
-            second = search_web({"query": "Jellyfin 12", "max_results": 10})
-        self.assertTrue(first.ok)
-        self.assertFalse(first.data["cached"])
-        self.assertTrue(second.data["cached"])
+            first = search_web(**{"query": "Jellyfin 12", "max_results": 10})
+            second = search_web(**{"query": "Jellyfin 12", "max_results": 10})
+        self.assertTrue(first['ok'])
+        self.assertFalse(first['data']["cached"])
+        self.assertTrue(second['data']["cached"])
         self.assertEqual(call.call_count, 1)
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
@@ -202,9 +227,90 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             1,
         )
 
+    def test_sdk_filters_reach_provider_and_cache_isolates_each_scope(self):
+        self.values["TAVILY_DAILY_CREDIT_LIMIT"] = "20"
+        async def provider(arguments, **_kwargs):
+            return _map_search_response({"results": []}, arguments, 1)
+        scopes: list[_SearchScope] = [
+            {}, {"include_domains": ["example.com"]}, {"exclude_domains": ["example.com"]},
+            {"start_date": "2026-01-01"}, {"end_date": "2026-11-08"}, {"time_range": "week"},
+        ]
+        with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
+            "app.modules.web_evidence._search_tavily", side_effect=provider,
+        ) as call:
+            for scope in scopes:
+                first = sdk.web.search("release", **scope)
+                second = sdk.web.search("release", **scope)
+                self.assertFalse(first["data"]["cached"])
+                self.assertTrue(second["data"]["cached"])
+                self.assertEqual(first["data"]["filters"], scope)
+                self.assertEqual(first["data"]["max_results"], 5)
+            canonical = sdk.web.search("release", include_domains=["EXAMPLE.COM", "example.com"])
+        self.assertTrue(canonical["data"]["cached"])
+        self.assertEqual(call.await_count, len(scopes))
+
+    def test_results_enforce_domain_boundaries_and_preserve_source_dates(self):
+        arguments = normalize_search_arguments({
+            "query": "release", "max_results": 10,
+            "include_domains": ["example.com"], "exclude_domains": ["forum.example.com"],
+        })
+        result = _map_search_response({"results": [
+            {"title": "Release", "content": "details", "url": f"https://{host}/release", "published_date": "2026-01-01"}
+            for host in ("example.com", "docs.example.com", "forum.example.com", "example.com.evil.org", "notexample.com")
+        ]}, arguments, 1)
+        self.assertEqual([r["source"] for r in result["data"]["results"]], ["example.com", "docs.example.com"])
+        self.assertEqual(result["data"]["filtered_results"], 3)
+        self.assertEqual(result["data"]["results"][0]["published_date"], "2026-01-01")
+
+    def test_service_and_sdk_keep_full_snippet_and_source_limits(self):
+
+        snippet = "source detail " * 200
+        mapped = _map_search_response({"results": [
+            {"title": "完整来源", "content": snippet, "url": "https://example.com/page"},
+            {"title": "第二项", "content": "other", "url": "https://example.com/other"},
+        ]}, {"query": "source", "topic": "general", "max_results": 1}, 1)
+        with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
+            "app.modules.web_evidence._search_tavily", return_value=mapped,
+        ) as provider:
+            full = search_web("source", max_results=1)
+            shown = sdk.web.search("source", max_results=1)
+            cached = search_web("source", max_results=1)
+        self.assertEqual(full["data"]["results"][0]["snippet"], snippet.strip())
+        self.assertEqual(full["data"]["returned"], 1)
+        self.assertEqual(full["data"]["source_result_count"], 2)
+        self.assertTrue(full["data"]["truncated"])
+        self.assertFalse(full["data"]["total_known"])
+        self.assertIsNone(full["data"]["total"])
+        self.assertIsNone(shown["data"]["total"])
+        self.assertEqual(shown["data"]["results"][0]["snippet"], snippet.strip())
+        self.assertFalse(shown["data"]["total_known"])
+        self.assertEqual(cached["data"]["results"][0]["snippet"], snippet.strip())
+        provider.assert_awaited_once()
+
+    def test_old_search_toolresult_layout_at_current_key_is_refetched(self):
+        from app.modules import web_evidence
+
+        self.values["TAVILY_DAILY_CREDIT_LIMIT"] = "100"
+        arguments = {"query": "fresh source", "max_results": 5, "topic": "general"}
+        fresh = _map_search_response({"results": [{"title": "新来源", "content": "新的完整来源内容", "url": "https://example.com/page"}]}, arguments, 1)
+        old = {"ok": True, "status": "ok", "summary": "旧缓存", "data": {"results": [{"title": "旧来源", "snippet": "截断的摘要"}], "total": 1}, "evidence": [], "suggestions": [], "error": None}
+        key = web_evidence._search_cache_key(arguments, "basic")
+        for legacy in (old, {"kind": web_evidence._CACHE_KIND, "result": old}):
+            with self.subTest(layout=legacy.get("kind", "direct_toolresult")):
+                clear_web_cache()
+                db.set_agent_web_search_cache(key, legacy, ttl_seconds=900)
+                with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
+                    "app.modules.web_evidence._search_tavily", return_value=fresh,
+                ) as provider:
+                    first, second = search_web("fresh source"), search_web("fresh source")
+                provider.assert_awaited_once()
+                self.assertFalse(first["data"]["cached"])
+                self.assertTrue(second["data"]["cached"])
+                self.assertEqual(second["data"]["results"], fresh["data"]["results"])
+
     def _run_two_threads(self, action):
         start = threading.Barrier(2)
-        results: list[ToolResult | None] = [None, None]
+        results: list[dict | None] = [None, None]
         errors: list[BaseException] = []
 
         def worker(index: int) -> None:
@@ -248,7 +354,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             provider_calls += 1
             if not await asyncio.to_thread(both_reserved.wait, 2):
                 raise RuntimeError("concurrent waiter did not reserve")
-            return ToolResult(
+            return make_result(
                 True,
                 "ok",
                 "找到 1 条网页结果",
@@ -256,15 +362,15 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             )
 
         with (
-            patch("app.agent.domains.discovery.web_search_actions.get", side_effect=_config(self.values)),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily", side_effect=provider),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence._search_tavily", side_effect=provider),
             patch.object(web_request_singleflight, "reserve", side_effect=reserve),
         ):
-            results = self._run_two_threads(lambda: search_web({"query": "same"}))
+            results = self._run_two_threads(lambda: search_web(**{"query": "same"}))
 
         self.assertEqual(provider_calls, 1)
-        self.assertTrue(all(result is not None and result.ok for result in results))
-        self.assertEqual(sorted(result.data["cached"] for result in results), [False, True])
+        self.assertTrue(all(result is not None and result['ok'] for result in results))
+        self.assertEqual(sorted(result['data']["cached"] for result in results), [False, True])
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
                 provider="tavily", usage_date=db.current_agent_web_search_usage_date()
@@ -293,17 +399,17 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             provider_calls += 1
             if not await asyncio.to_thread(both_reserved.wait, 2):
                 raise RuntimeError("concurrent waiter did not reserve")
-            return ToolResult(False, "timeout", "网页搜索服务响应超时")
+            return make_result(False, "timeout", "网页搜索服务响应超时")
 
         with (
-            patch("app.agent.domains.discovery.web_search_actions.get", side_effect=_config(self.values)),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily", side_effect=provider),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence._search_tavily", side_effect=provider),
             patch.object(web_request_singleflight, "reserve", side_effect=reserve),
         ):
-            results = self._run_two_threads(lambda: search_web({"query": "failure"}))
+            results = self._run_two_threads(lambda: search_web(**{"query": "failure"}))
 
         self.assertEqual(provider_calls, 1)
-        self.assertEqual(sorted(result.status for result in results), ["timeout", "unavailable"])
+        self.assertEqual(sorted(result['status'] for result in results), ["timeout", "unavailable"])
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
                 provider="tavily", usage_date=db.current_agent_web_search_usage_date()
@@ -314,14 +420,14 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
     def test_provider_failure_refunds_reserved_credits(self):
 
         async def provider(*args, **kwargs):
-            return ToolResult(False, "timeout", "网页搜索服务响应超时")
+            return make_result(False, "timeout", "网页搜索服务响应超时")
 
         with (
-            patch("app.agent.domains.discovery.web_search_actions.get", side_effect=_config(self.values)),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily", side_effect=provider),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence._search_tavily", side_effect=provider),
         ):
-            result = search_web({"query": "temporary failure"})
-        self.assertEqual(result.status, "timeout")
+            result = search_web(**{"query": "temporary failure"})
+        self.assertEqual(result['status'], "timeout")
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
                 provider="tavily", usage_date=db.current_agent_web_search_usage_date()
@@ -417,15 +523,15 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             )
         )
         with (
-            patch("app.agent.domains.discovery.web_search_actions.get", side_effect=_config(self.values)),
-            patch("app.agent.domains.discovery.web_search_actions._search_tavily") as provider,
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence._search_tavily") as provider,
         ):
-            result = search_web({"query": "different"})
-        self.assertEqual(result.status, "budget_exhausted")
+            result = search_web(**{"query": "different"})
+        self.assertEqual(result['status'], "budget_exhausted")
         provider.assert_not_called()
 
     def test_provider_results_drop_unsafe_urls(self):
-        result = _map_response(
+        result = _map_search_response(
             {
                 "results": [
                     {
@@ -463,14 +569,14 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             {"query": "security", "topic": "general", "max_results": 10},
             12,
         )
-        self.assertTrue(result.ok)
-        self.assertEqual(len(result.data["results"]), 1)
-        self.assertEqual(result.data["results"][0]["url"], "https://example.com/page")
+        self.assertTrue(result['ok'])
+        self.assertEqual(len(result['data']["results"]), 1)
+        self.assertEqual(result['data']["results"][0]["url"], "https://example.com/page")
 
     def test_provider_statuses_have_stable_public_mapping(self):
-        self.assertEqual(_provider_error(429).status, "rate_limited")
-        self.assertEqual(_provider_error(401).status, "authentication")
-        self.assertEqual(_provider_error(503).status, "unavailable")
+        self.assertEqual(_provider_error(429)['status'], "rate_limited")
+        self.assertEqual(_provider_error(401)['status'], "authentication")
+        self.assertEqual(_provider_error(503)['status'], "unavailable")
 
     def test_provider_timeout_is_safely_mapped(self):
 
@@ -491,8 +597,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
                 client_factory=cast(Callable[..., FixedHostHttpClient], lambda **_kwargs: TimeoutClient()),
             )
         )
-        self.assertEqual(result.status, "timeout")
-        self.assertNotIn("private upstream detail", result.summary)
+        self.assertEqual(result['status'], "timeout")
+        self.assertNotIn("private upstream detail", result['message'])
 
     def test_tavily_client_pins_validated_address(self):
         captured = {}
@@ -501,7 +607,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             def __init__(self, **kwargs):
                 captured.update(kwargs)
 
-            async def post_json(self, *_args, **_kwargs):
+            async def post_json(self, *_args, **kwargs):
+                captured["body"] = kwargs["json"]
                 return SimpleNamespace(status_code=200, text='{"results": []}')
 
             async def aclose(self):
@@ -513,13 +620,22 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
                     "query": "Jellyfin 12",
                     "topic": "general",
                     "max_results": 5,
-                    "time_range": "",
+                    "include_domains": ["jellyfin.org"],
+                    "exclude_domains": ["forum.jellyfin.org"],
+                    "start_date": "2026-01-01",
+                    "end_date": "2026-11-08",
                 },
                 api_key="secret-key",
                 depth="basic",
                 client_factory=cast(Callable[..., FixedHostHttpClient], FakeClient),
             )
         )
-        self.assertTrue(result.ok)
+        self.assertTrue(result['ok'])
         self.assertTrue(captured["pin_resolved_address"])
         self.assertEqual(captured["allowed_hosts"], {"api.tavily.com"})
+        self.assertEqual(captured["body"]["include_domains"], ["jellyfin.org"])
+        self.assertEqual(captured["body"]["exclude_domains"], ["forum.jellyfin.org"])
+        self.assertEqual(captured["body"]["start_date"], "2026-01-01")
+        self.assertEqual(captured["body"]["end_date"], "2026-11-08")
+        self.assertTrue(captured["body"]["include_published_date"])
+        self.assertFalse(captured["body"]["include_raw_content"])

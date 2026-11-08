@@ -354,6 +354,8 @@ def create_request(
     initial_targets: str = "",
     retry_source_request_id: int | None = None,
     retry_source_status: str = "",
+    verification_targets: list[dict] | None = None,
+    verification_owner: str = "",
 ) -> dict[str, Any]:
     keys = request_keys(item)
     req_id, created = db.create_download_request(
@@ -367,6 +369,7 @@ def create_request(
         initial_targets=initial_targets,
         retry_source_request_id=retry_source_request_id,
         retry_source_status=retry_source_status,
+        verification_targets=verification_targets, verification_owner=verification_owner,
     )
     row = db.get_download_request(req_id)
     return {"id": req_id, "created": created, "status": row["status"] if row else ""}
@@ -803,6 +806,80 @@ def download_resubmit_capabilities(
     }
 
 
+class DownloadRetryChanged(ValueError):
+    """确认后的请求或配置不再匹配预检；尚未调用下载后端。"""
+
+
+_RETRY_CONFIG_KEYS = (
+    "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY", "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
+    "RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "OFFLINE_MAGNET_ENABLED", "OFFLINE_ED2K_ENABLED",
+    "OFFLINE_HTTP_ENABLED", "OFFLINE_TARGET_DIR", "OFFLINE_SECONDARY_ENABLED", "OFFLINE_SECONDARY_DIR",
+    "OFFLINE_SECONDARY_KEYWORDS", "OFFLINE_EXCLUDE_KEYWORDS", "OFFLINE_MIN_FILE_MB", "OFFLINE_ALLOWED_EXTS",
+)
+
+
+def _download_retry_snapshot(row, target: str) -> dict[str, Any]:
+    if row is None:
+        raise ValueError("下载待处理记录不存在")
+    if row["attention_cleared_at"]:
+        raise ValueError("该下载记录已经处理，无需重新提交")
+    stages = [label for key, label in (("status", "请求分发"), ("qb_status", "qBittorrent"), ("gy_status", "光鸭"))
+              if row[key] in {"failed", "manual_review"}]
+    stages.extend(label for key, label in (("local_import_status", "本地导入"), ("strm_status", "STRM"))
+                  if row[key] == "failed")
+    if int(row["organize_started"] or 0) < 0 or row["organize_status"] == "failed":
+        stages.append("媒体整理")
+    if row["gy_staging_cleanup_status"] in {"retained", "failed"}:
+        stages.append("光鸭暂存清理")
+    if not stages:
+        raise ValueError("该下载记录当前无需处理")
+    capability = download_resubmit_capabilities(row).get(target) or {}
+    if not capability.get("enabled"):
+        raise ValueError(capability.get("reason") or "当前目标不可重新提交")
+    state = {
+        "request_id": int(row["id"]), "target": target,
+        "target_label": {"qb": "qBittorrent", "guangya": "光鸭", "both": "qBittorrent 与光鸭"}[target],
+        "attention_stages": stages,
+        **{key: row[key] for key in (
+            "kind", "status", "qb_status", "gy_status", "local_import_status", "organize_started",
+            "organize_status", "strm_status", "gy_staging_cleanup_status", "attention_cleared_at", "updated_at",
+        )},
+        "effects": ["会重试所选目标，保留未重试目标的任务；根据当前状态补投原请求或创建新的提交记录。",
+                    "若提交失败或受理结果未知，保留原待处理事实；不会自动重复提交。"],
+    }
+    private = {
+        **state,
+        **{key: hashlib.sha256(bytes(row[key]) if isinstance(row[key], (bytes, bytearray, memoryview))
+                              else str(row[key] or "").encode()).hexdigest()
+           for key in ("request_key", "title", "source_value", "torrent_data")},
+        "runtime_config": {key: get(key, "") for key in _RETRY_CONFIG_KEYS},
+    }
+    state["fingerprint"] = hashlib.sha256(json.dumps(private, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return state
+
+
+def prepare_download_retry(request_id: int, target: str) -> dict[str, Any]:
+    """只读冻结待处理请求、目标能力、来源身份与配置；不返回链接或凭据。"""
+    if type(request_id) is not int or request_id < 1:
+        raise ValueError("request_id 必须是大于 0 的整数")
+    if not isinstance(target, str) or target.strip().lower() not in SUPPORTED_TARGETS:
+        raise ValueError("target 仅支持 qb、guangya 或 both")
+    return _download_retry_snapshot(db.get_download_request(request_id), target.strip().lower())
+
+
+def public_download_retry_result(result: dict, *, source_request_id: int, target: str) -> dict:
+    """只公开实际请求关联与安全分发事实，不透传原始后端回包。"""
+    public = public_dispatch_summary(result)
+    return {
+        **public, "source_request_id": source_request_id, "request_id": result.get("request_id"),
+        "target": target, "created": bool(result.get("created")),
+        "source_attention_preserved": bool(result.get("source_attention_preserved", not result.get("ok"))),
+        "summary": {"submitted": "下载重试已受理", "partial": "下载重试仅部分目标已受理",
+                    "manual_review": "下载重试受理结果待核对", "duplicate": "已有请求，未重复提交"}.get(
+                        public["status"], "下载重试未完成，原待处理事实保留"),
+    }
+
+
 def resubmit_download_request(
     source_request_id: int,
     targets: str,
@@ -814,11 +891,19 @@ def resubmit_download_request(
     qb_runtime_config: dict[str, Any] | None = None,
     rss_item_id: int | None = None,
     log_path: str | None = None,
+    expected_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """安全重试指定目标；活动请求仅补投失败目标，其余创建历史 successor。"""
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     source_row = db.get_download_request(source_request_id)
+    if expected_fingerprint is not None:
+        try:
+            snapshot = _download_retry_snapshot(source_row, targets)
+        except ValueError as exc:
+            raise DownloadRetryChanged("下载待处理记录已变化，请重新预检") from exc
+        if snapshot["fingerprint"] != expected_fingerprint:
+            raise DownloadRetryChanged("下载来源、状态或服务配置已变化，请重新预检")
     if not source_row:
         return {"ok": False, "error": "原下载请求不存在"}
 
@@ -876,7 +961,7 @@ def resubmit_download_request(
             "request_id": source_request_id,
             "created": False,
             "targets": targets,
-            "source_attention_preserved": not bool(result.get("ok")) or bool(
+            "source_attention_preserved": source_row[f"{peer_prefix}_status"] == "outcome_unknown" or not bool(result.get("ok")) or bool(
                 db.count_download_requests_requiring_attention(source_request_id)
             ),
         }

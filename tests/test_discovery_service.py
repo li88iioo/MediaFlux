@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
 
-from app import database
+from app import database, sdk
 from app.discovery.cache import DiscoveryCache
 from app.discovery.models import (
     DiscoveryPage,
@@ -267,12 +267,22 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_fresh_cache_hit_skips_provider_and_marks_cached(self):
-        first = self.service.list_items("tmdb", "popular", "movie", 1, {})
-        second = self.service.list_items("tmdb", "popular", "movie", 1, {})
+        with (
+            patch("app.discovery.service.config.get_bool", return_value=True),
+            patch("app.discovery.service.get_discovery_service", return_value=self.service),
+        ):
+            first = sdk.media.catalog("tmdb", "discover", "movie", filters=None)
+            for filters in (None, {}):
+                for limit in (None, 1):
+                    with self.subTest(filters=filters, limit=limit):
+                        page = sdk.media.catalog(
+                            "tmdb", "discover", "movie", filters=filters, limit=limit,
+                        )
+                        self.assertEqual(page["items"], first["items"])
+                        self.assertTrue(page["cached"])
+                        self.assertFalse(page["stale"])
         self.assertEqual(self.provider.calls, 1)
-        self.assertFalse(first.cached)
-        self.assertTrue(second.cached)
-        self.assertFalse(second.stale)
+        self.assertFalse(first["cached"])
 
     def test_detail_year_is_reused_after_cache_and_service_recreation(self):
         detail = MediaCard(
@@ -397,6 +407,43 @@ class DiscoveryServiceTests(unittest.TestCase):
 
         self.assertEqual(page.items[0].year, "")
         self.assertEqual(page.items[0].release_date, "")
+
+    def test_catalog_marks_stale_only_when_old_detail_dates_are_used(self):
+        from app.sdk import media
+
+        for number, (age, year, release_date, cached_year, cached_date, expected_stale) in enumerate((
+            (0, "", "", "2026", "2026-03-04", False),
+            (61, "", "", "2026", "2026-03-04", True),
+            (61, "2026", "", "2026", "2026-03-04", True),
+            (61, "", "2026-03-04", "2026", "2026-03-04", True),
+            (61, "2025", "2025-02-01", "2026", "2026-03-04", False),
+            (61, "", "", "unknown", "TBA", False),
+            (301, "", "", "2026", "2026-03-04", False),
+        ), 1):
+            with self.subTest(age=age, year=year, date=release_date, cached_year=cached_year):
+                card = MediaCard(provider="tmdb", external_id=str(number), media_type="movie",
+                                 title="日期补全样本", year=year, release_date=release_date)
+                source_page = DiscoveryPage(items=(card,), page=number, provider=ProviderHealth(name="tmdb"))
+                self.cache.set_detail_metadata("tmdb", "movie", str(number), year=cached_year,
+                    release_date=cached_date, ttl_seconds=60, stale_seconds=300)
+                self.now += timedelta(seconds=age)
+                with patch.object(self.provider, "list_items", return_value=source_page) as fetch, patch(
+                    "app.discovery.service.get_discovery_service", return_value=self.service,
+                ), patch("app.discovery.service.require_discovery_enabled"):
+                    page = media.catalog("tmdb", "discover", "movie", page=number)
+                    collected = media.catalog("tmdb", "discover", "movie", page=number, limit=1)
+
+                self.assertIs(page["cached"], False)
+                self.assertIs(collected["cached"], True)
+                self.assertIs(page["stale"], expected_stale)
+                self.assertIs(collected["stale"], expected_stale)
+                expected_year = year or (cached_year if age < 300 and cached_year != "unknown" else "")
+                expected_date = release_date or (cached_date if age < 300 and cached_date != "TBA" else "")
+                self.assertEqual((page["items"][0]["year"], page["items"][0]["release_date"]),
+                                 (expected_year, expected_date))
+                self.assertEqual(collected["items"], page["items"])
+                fetch.assert_called_once()
+                self.assertEqual((card.year, card.release_date), (year, release_date))
 
     def test_stale_cache_returns_old_page_and_refreshes_once(self):
         self.service.list_items("tmdb", "popular", "movie", 1, {})
@@ -682,10 +729,20 @@ class DiscoveryServiceTests(unittest.TestCase):
         lookup.assert_called_once()
 
     def test_page_and_filter_validation_happens_before_provider(self):
-        with self.assertRaises(ValueError):
-            self.service.list_items("tmdb", "popular", "movie", 0, {})
-        with self.assertRaises(ValueError):
-            self.service.list_items("tmdb", "discover", "movie", 1, {"bad": "x"})
+        with (
+            patch("app.discovery.service.config.get_bool", return_value=True),
+            patch("app.discovery.service.get_discovery_service", return_value=self.service),
+            patch.object(self.cache, "get", wraps=self.cache.get) as cache_get,
+        ):
+            with self.assertRaises(ValueError):
+                self.service.list_items("tmdb", "popular", "movie", 0, {})
+            for filters in ({"bad": "x"}, [], False, 0, ""):
+                for limit in (None, 1):
+                    with self.subTest(filters=filters, limit=limit), self.assertRaises(ValueError):
+                        sdk.media.catalog(
+                            "tmdb", "discover", "movie", filters=cast(dict, filters), limit=limit,
+                        )
+        cache_get.assert_not_called()
         self.assertEqual(self.provider.calls, 0)
 
     def test_watchlist_state_is_attached_with_one_batch_lookup(self):
@@ -706,6 +763,82 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertTrue(self.service.remove_watchlist("tmdb", "movie", "10"))
         self.assertFalse(self.service.remove_watchlist("tmdb", "movie", "10"))
         self.assertEqual(self.service.list_watchlist()["items"][0]["provider"], "douban")
+
+    def test_watchlist_writes_validate_identity_before_provider_or_database(self):
+        for provider, media_type, external_id in (
+            ("unknown", "movie", "1"),
+            ("bangumi", "movie", "1"),
+            ("tmdb", "all", "1"),
+            ("tmdb", "tv", "not-a-tmdb-id"),
+            ("douban", "movie", "https://private.invalid/1"),
+            ("douban", "movie", "1" * 129),
+        ):
+            with self.subTest(identity=(provider, media_type, external_id)):
+                with self.assertRaises(ValueError):
+                    self.service.prepare_watchlist_add(provider, media_type, external_id)
+                with self.assertRaises(ValueError):
+                    self.service.remove_watchlist(provider, media_type, external_id)
+                if media_type != "all":
+                    with self.assertRaises(ValueError):
+                        self.service.add_watchlist(MediaCard(
+                            provider=provider, media_type=media_type,
+                            external_id=external_id, title="Invalid",
+                        ))
+        self.assertEqual(self.provider.detail_calls, 0)
+        self.assertEqual(self.service.list_watchlist()["total"], 0)
+
+    def test_watchlist_preview_freezes_canonical_detail_without_writing(self):
+        self.provider.detail_card = MediaCard(
+            provider="tmdb", media_type="movie", external_id="10",
+            title="  Verified\nTitle  ", year="2026", poster_key="private-poster",
+        )
+        preview = self.service.prepare_watchlist_add(" TMDB ", " MOVIE ", "10")
+        assert preview is not None
+        self.assertEqual(preview["canonical"]["title"], "Verified Title")
+        self.assertIs(preview["expected_absent"], True)
+        self.assertEqual(self.service.list_watchlist()["total"], 0)
+        self.provider.detail_card = MediaCard(
+            provider="tmdb", media_type="movie", external_id="10", title="Later title",
+        )
+        card = MediaCard(**preview["canonical"])
+        number = self.service.add_watchlist(card, expected_absent=True)
+        self.assertIsInstance(number, int)
+        row = database.get_media_watchlist_by_id(number)
+        assert row is not None
+        self.assertEqual((row["title"], row["poster_key"]), ("Verified Title", "private-poster"))
+        self.assertEqual(self.provider.detail_calls, 1)
+        existing = self.service.prepare_watchlist_add("tmdb", "movie", "10")
+        assert existing is not None
+        self.assertFalse(existing["expected_absent"])
+        self.assertEqual(self.provider.detail_calls, 1)
+
+    def test_watchlist_preview_rejects_provider_identity_mismatch(self):
+        self.provider.detail_card = MediaCard(
+            provider="douban", media_type="movie", external_id="10", title="Other source",
+        )
+        with self.assertRaisesRegex(ValueError, "标识不一致"):
+            self.service.prepare_watchlist_add("tmdb", "movie", "10")
+        self.assertEqual(self.service.list_watchlist()["total"], 0)
+
+    def test_watchlist_conditional_writes_preserve_concurrent_changes(self):
+        preview = self.service.prepare_watchlist_add("tmdb", "movie", "10")
+        assert preview is not None
+        current = MediaCard(provider="tmdb", media_type="movie", external_id="10", title="Concurrent")
+        self.service.add_watchlist(current)
+        self.assertIsNone(self.service.add_watchlist(MediaCard(**preview["canonical"]), expected_absent=True))
+        row = database.get_media_watchlist("tmdb", "10", "movie")
+        assert row is not None
+        snapshot = self.service.get_watchlist_snapshot(row["id"])
+        self.assertEqual(snapshot["title"], "Concurrent")
+        self.service.add_watchlist(MediaCard(
+            provider="tmdb", media_type="movie", external_id="10", title="Updated",
+        ))
+        self.assertFalse(self.service.remove_watchlist("tmdb", "movie", "10", expected_snapshot=snapshot))
+        with self.assertRaises(ValueError):
+            self.service.remove_watchlist("tmdb", "movie", "11", expected_snapshot=snapshot)
+        fresh = self.service.get_watchlist_snapshot(row["id"])
+        self.assertTrue(self.service.remove_watchlist("tmdb", "movie", "10", expected_snapshot=fresh))
+        self.assertEqual(self.service.get_watchlist_snapshot(row["id"]), {"exists": False})
 
     def test_normalized_identifiers_are_used_for_registry_lookup(self):
         page = self.service.list_items(" TMDB ", " POPULAR ", " MOVIE ", 1, {})

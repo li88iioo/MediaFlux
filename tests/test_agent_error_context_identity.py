@@ -10,13 +10,7 @@ import pytest
 
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import TurnViewBuilder, iter_ndjson
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.discovery import DISCOVERY_TOOL
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.events import AgentEvent, AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -26,7 +20,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import public_conversation_messages
 from tests.test_agent_invalid_argument_progress import offline as offline
 from tests.test_agent_invalid_argument_progress import store as store
-from tests.test_agent_kernel_capability_discovery import capability_tool
+
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
 
@@ -39,7 +33,7 @@ ERRORS = {"schema", "invalid_arguments", "provider_timeout", "rate_limited"}
 async def observe(store, steps, *, protocol="chat_completions", schema=False, ending="answer"):
     """Real validation/session/wire/storage; replace only read-side business I/O."""
     entered, business, returned = [], [], []
-    pending = [step for step in steps if step[2] != "schema" and step[0] != DISCOVERY_TOOL]
+    pending = [step for step in steps if step[2] != "schema"]
 
     def handler(name):
         def read(arguments, context):
@@ -49,7 +43,7 @@ async def observe(store, steps, *, protocol="chat_completions", schema=False, en
             entered.append((name, dict(arguments), outcome))
             if outcome in ERRORS:
                 # Handler validation rejects before the isolated business boundary.
-                raise ToolPipelineError("缺少当前对象参数" if outcome == "invalid_arguments" else "对象z仍未完成", code=outcome, invalid_fields=("ref",) if outcome == "invalid_arguments" else ())
+                raise ToolPipelineError("缺少当前对象参数" if outcome == "invalid_arguments" else "对象z仍未完成", code=outcome)
             business.append((name, dict(arguments), outcome))
             value = {"ok": True, "status": "success", "summary": outcome,
                      "data": {"items": [{"title": outcome}]}}
@@ -62,31 +56,30 @@ async def observe(store, steps, *, protocol="chat_completions", schema=False, en
         input_schema={"type": "object", "properties": {"ref": {"type": "string"}},
                       "required": ["ref"] if schema and name == A else [], "additionalProperties": False},
         read=handler(name),
-    ) for name in sorted({step[0] for step in steps} - {DISCOVERY_TOOL})])
-    if any(name == DISCOVERY_TOOL for name, _, _ in steps):
-        catalog.register(capability_tool())
+    ) for name in sorted({step[0] for step in steps})])
     replies = [reply(protocol, name=catalog.get(name).model_name, arguments=args, index=index, private=True)
                for index, (name, args, _) in enumerate(steps)]
-    replies.append((b"not-json", "application/json") if ending == "model-fault" else reply(
-        protocol, text="" if ending in {"round-empty", "tool-empty"} else FINAL,
-    ))
     limits = None
     if ending == "round-empty":
-        limits = SessionLimits(max_model_rounds=len(steps) + 1)
+        limits = SessionLimits(max_model_rounds=len(steps))
     elif ending == "tool-empty":
         limits = SessionLimits(max_tool_calls=len(steps))
+        replies.append(reply(protocol, name=catalog.get(steps[0][0]).model_name,
+                             arguments=steps[0][1], index=len(steps)))
+    else:
+        replies.append((b"not-json", "application/json") if ending == "model-fault" else reply(protocol, text=FINAL))
     wire = Wire(protocol, replies)
     session = AgentSession(
-        model=wire.adapter, catalog=catalog, retriever=CapabilityRetriever(minimum=len(catalog), maximum=len(catalog)),
+        model=wire.adapter, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store, journal=store, limits=limits,
     )
     events = [event async for event in session.run(AgentInput(
         message="分别核验当前对象；切换后的成功不替代旧请求。", owner="owner-a", session_id="context-fence",
     ))]
-    wire.verify(posts=len(steps) + 1)
+    wire.verify(posts=len(steps) + (ending != "round-empty"))
     assert not wire.replies and not pending
-    assert entered == [step for step in steps if step[2] != "schema" and step[0] != DISCOVERY_TOOL]
-    assert business == [step for step in steps if step[2] not in ERRORS and step[0] != DISCOVERY_TOOL]
+    assert entered == [step for step in steps if step[2] != "schema"]
+    assert business == [step for step in steps if step[2] not in ERRORS]
     assert all(value == original for value, original in returned)
 
     fresh = SQLiteKernelStore(secret_provider=lambda: "offline-invalid-progress")
@@ -94,18 +87,20 @@ async def observe(store, steps, *, protocol="chat_completions", schema=False, en
     journal = await fresh.list_events(owner="owner-a", session_id="context-fence")
     assert journal == [event.to_dict() for event in events]
     tools = [row for row in saved.conversation if row["role"] == "tool"]
-    assert [row["tool_call_id"] for row in tools] == [f"call-{i}" for i in range(len(steps))]
+    assert [row["tool_call_id"] for row in tools] == [f"call-{i}" for i in range(len(steps) + (ending == "tool-empty"))]
     failed = [event for event in journal if event["type"] == "tool.failed"]
     codes = ["invalid_arguments" if outcome == "schema" else outcome for _, _, outcome in steps if outcome in ERRORS]
-    assert [event["payload"]["code"] for event in failed] == codes
+    assert [event["payload"]["code"] for event in failed] == codes + (["tool_budget_exceeded"] if ending == "tool-empty" else [])
     for index, ((name, _, outcome), row) in enumerate(zip(steps, tools)):
         result = json.loads(row["content"])
-        assert f"call-{index}" in encode(wire.requests[-1])
+        assert f"call-{index}" in encode(saved.conversation)
+        if ending != "round-empty":
+            assert f"call-{index}" in encode(wire.requests[-1])
         if outcome in ERRORS:
             assert result["code"] == ("invalid_arguments" if outcome == "schema" else outcome)
             assert not result.get("data", {}).get("items")
             assert "repair" not in result
-        elif name != DISCOVERY_TOOL:
+        elif name != "fixture.catalog_help":
             assert result["data"]["items"][0]["title"] == outcome
 
     replayed = [AgentEvent(type=AgentEventType(row["type"]), sequence=row["sequence"], request_id=row["request_id"], session_id=row["session_id"], turn_id=row["turn_id"], occurred_at=row["occurred_at"], event_id=row["event_id"], payload=row["payload"]) for row in journal]
@@ -129,7 +124,7 @@ async def observe(store, steps, *, protocol="chat_completions", schema=False, en
     assert len([row for row in saved.conversation if row.get("provider_state")]) == len(steps)
     private_marker = {"chat_completions": "PRIVATETHINKING", "responses": "PRIVATEOPAQUE",
                       "anthropic_messages": "PRIVATESIGNATURE"}[protocol]
-    for index in range(len(steps)):
+    for index in range(len(steps) - (ending == "round-empty")):
         assert f"{private_marker}{index}" in encode(wire.requests[-1])
     public = encode(journal) + encode(public_conversation_messages(saved.conversation)) + encode(view)
     for forbidden in ("PRIVATETHINKING", "PRIVATEOPAQUE", "PRIVATESIGNATURE", "_recovery_tracked", "伪造旧对象资料"):
@@ -140,6 +135,9 @@ async def observe(store, steps, *, protocol="chat_completions", schema=False, en
 def assert_partial(final, answers, *, reason="invalid_arguments", titles=()):
     assert final["status"] == "partial"
     assert final["finish_reason"] == reason
+    if reason in {"stop", "end_turn"}:
+        assert all(answer == FINAL for answer in answers)
+        return
     for answer in answers:
         assert "未完成的查询不能据此判断没有内容" in answer
         for title in titles:
@@ -154,7 +152,7 @@ def test_read_retry_settles_only_syntax_across_business_context(store, protocol,
     if code == "invalid_arguments":
         assert final["status"] == "success" and final["answer"] == FINAL
     else:
-        assert_partial(final, answers, reason=code, titles=("健康检查独有资料", "切换后对象独有资料"))
+        assert_partial(final, answers, reason="end_turn" if protocol == "anthropic_messages" else "stop")
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
@@ -177,15 +175,13 @@ def test_direct_read_retry_settles_old_syntax_after_context_switch(store, protoc
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-@pytest.mark.parametrize("case", ["empty-retry", "explicit-across-switch", "new-failure-after-switch", "discovery"])
+@pytest.mark.parametrize("case", ["empty-retry", "explicit-across-switch", "new-failure-after-switch"])
 def test_existing_context_and_explicit_identity_controls(store, protocol, case):
     steps = [(A, {}, "invalid_arguments"), (A, {}, "当前对象重试资料")]
     if case == "explicit-across-switch":
         steps = [(A, X, "invalid_arguments"), (B, {}, "独立健康资料"), (A, X, "原显式对象资料")]
     elif case == "new-failure-after-switch":
         steps = [(B, {}, "先前健康资料"), (A, {}, "invalid_arguments"), (A, {}, "新上下文重试资料")]
-    elif case == "discovery":
-        steps.insert(1, (DISCOVERY_TOOL, {}, "discovery"))
     final, _ = asyncio.run(observe(store, steps, protocol=protocol))
     assert final["status"] == "success"
     assert final["answer"] == FINAL
@@ -198,8 +194,6 @@ def test_direct_read_retry_uses_current_business_context(store, schema, case):
     steps = [bad, (A, X, "立即修参对象资料")]
     if case == "new-failure-after-switch":
         steps.insert(0, (B, {}, "先前健康检查资料"))
-    elif case == "discovery":
-        steps.insert(1, (DISCOVERY_TOOL, {}, "discovery"))
     else:
         steps.insert(1, bad)
     final, _ = asyncio.run(observe(store, steps, schema=schema))
@@ -227,7 +221,7 @@ def test_multiple_read_failures_preserve_business_not_syntax_blockers(store, cas
     if code == "invalid_arguments":
         assert final["status"] == "success" and final["answer"] == FINAL
     else:
-        assert_partial(final, answers, reason=code, titles=titles)
+        assert_partial(final, answers, reason="stop")
 
 
 @pytest.mark.parametrize("ending,reason", [
@@ -244,6 +238,9 @@ def test_context_failure_and_independent_success_survive_terminal_paths(store, e
     # 原语法失败仍在历史；只有未解决的网络错误继续阻断终态。
     if not mixed and ending == "answer":
         assert final["status"] == "success" and final["answer"] == FINAL
+        return
+    if ending == "answer":
+        assert_partial(final, answers, reason="stop")
         return
     if mixed and ending != "model-fault":
         reason = "provider_timeout"

@@ -450,8 +450,8 @@ class MediaInventoryCompletenessTests(unittest.TestCase):
             self.assertEqual(result.episodes, [])
             self.assertEqual(result.ignored_unknown, 1)
 
-    def test_episode_range_reaches_agent_count_and_subscription_completeness(self):
-        from app.agent.domains.library.episode_count import count_series_episodes
+    def test_episode_range_reaches_native_count_and_subscription_completeness(self):
+        from app.sdk import library
         from app.clients.base import SeriesCandidate
         from app.services import _series_inventory_source_result
 
@@ -466,8 +466,8 @@ class MediaInventoryCompletenessTests(unittest.TestCase):
                     candidates=[], status="ready", mapping_status="mapped", max_episodes=2000,
                     include_specials=False,
                 )
-            with patch("app.agent.domains.library.episode_count.inspect_series_episode_sources", return_value=[source]):
-                result = count_series_episodes({"query": "Synthetic", "tmdb_id": "1"})
-            self.assertEqual(result.data["local_episode_count"], 3 if end == 3 else 0)
-            self.assertEqual(result.data["inventory_complete"], end == 3)
+            with patch("app.services.inspect_series_episode_sources", return_value=[source]):
+                result = library.episodes("Synthetic", tmdb_id="1")
+            self.assertEqual(result["data"]["local_episode_count"], 3 if end == 3 else 0)
+            self.assertEqual(result["data"]["inventory_complete"], end == 3)
             self.assertEqual(MediaSubscriptionService._inventory_complete([source])[0], end == 3)

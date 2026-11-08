@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+from datetime import date, datetime
 from typing import Any
 
 _TMDB_ID_RE = re.compile(r"[0-9]{1,10}")
@@ -104,3 +106,56 @@ def tmdb_alias_values(candidate: dict) -> list[object]:
             else:
                 values.append(item)
     return values
+
+
+def normalize_audit_date(value: object = None) -> str:
+    today = datetime.now().astimezone().date()
+    if value is None:
+        return today.isoformat()
+    if not isinstance(value, str):
+        raise ValueError("as_of 必须是 YYYY-MM-DD 日期")
+    try:
+        parsed = date.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise ValueError("as_of 必须是 YYYY-MM-DD 日期") from exc
+    if parsed > today:
+        raise ValueError("as_of 不能晚于今天")
+    return parsed.isoformat()
+
+
+def normalize_episode_verification(value: Any) -> dict[str, Any] | None:
+    """解析服务端冻结的最小复核目标；格式合法不代表已经审计确认缺集。"""
+    required = {"title", "tmdb_id", "season", "episode", "as_of"}
+    if not isinstance(value, dict) or set(value) not in (required, required | {"library_name"}):
+        return None
+    normalized: dict[str, Any] = {}
+    for name, maximum in (("title", 120), ("library_name", 80)):
+        raw = value.get(name, "")
+        if not isinstance(raw, str):
+            return None
+        text = " ".join(unicodedata.normalize("NFKC", raw).split())
+        if (raw or name == "title") and (
+            not text or any(unicodedata.category(char).startswith("C") for char in text)
+        ):
+            return None
+        normalized[name] = text[:maximum]
+    tmdb_id = str(value.get("tmdb_id") or "").strip()
+    if not tmdb_id.isascii() or not tmdb_id.isdigit() or not 1 <= len(tmdb_id) <= 10:
+        return None
+    normalized["tmdb_id"] = tmdb_id
+    for name, maximum in (("season", 100), ("episode", 1000)):
+        raw = value[name]
+        if isinstance(raw, bool):
+            return None
+        try:
+            number = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not 1 <= number <= maximum:
+            return None
+        normalized[name] = number
+    try:
+        normalized["as_of"] = normalize_audit_date(str(value["as_of"] or "").strip())
+    except ValueError:
+        return None
+    return normalized

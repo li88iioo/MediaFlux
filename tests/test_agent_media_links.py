@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from app.agent.domains.library import media_links
-from app.agent.domains.library import search as library_search
-from app.agent.domains.workspace.actions import _library_section
+from app import sdk, services
 from app.agent.kernel.projection import DefaultProjector
 from app.agent.models import ToolResult
-from app.agent.provider_artifacts import ProviderArtifactStore
 from app.bot.telegram_markdown import render_telegram_markdown
 from app.clients.base import MediaItem
+from app.modules import media_links
 from app.modules.media_server_profiles import MediaServerProfile
-from tests.test_agent_prompt_policy_window import capture_policy_windows
+from app.modules.workspace_search import _library_section
 from tests.test_agent_task_entry import isolated_db as isolated_db
 
 
@@ -215,9 +213,9 @@ def test_media_link_ignores_invalid_proxy_runtime(monkeypatch):
 def test_library_search_includes_verified_open_url(monkeypatch):
     direct = "http://media.local:8096/web/index.html#!/details?id=item-1"
     monkeypatch.setattr(
-        library_search,
+        services,
         "_search_sources",
-        lambda _query, _limit: [
+        lambda _query, _limit, **_options: [
             {
                 "server_type": "jellyfin",
                 "web_url": "http://media.local:8096",
@@ -234,22 +232,17 @@ def test_library_search_includes_verified_open_url(monkeypatch):
             }
         ],
     )
-    monkeypatch.setattr(
-        library_search,
-        "media_open_url_resolver",
-        lambda **_kwargs: lambda item_url: str(item_url or ""),
-    )
 
-    result = library_search.search_library({"query": "黄泉使者", "limit": 8})
+    result = sdk.library.search("黄泉使者", limit=8)
 
-    assert result.data["sources"][0]["items"][0]["open_url"] == direct
+    assert result["data"]["sources"][0]["items"][0]["open_url"] == direct
 
 
 def test_workspace_library_result_includes_verified_open_url(monkeypatch):
     direct = "http://media.local:8096/web/index.html#!/details?id=item-1"
     monkeypatch.setattr(
-        "app.agent.domains.workspace.actions.search_media_servers",
-        lambda _query, limit: [
+        "app.services._search_sources",
+        lambda _query, limit, **_kwargs: [
             {
                 "server_type": "jellyfin",
                 "web_url": "http://media.local:8096",
@@ -265,10 +258,6 @@ def test_workspace_library_result_includes_verified_open_url(monkeypatch):
                 "error": "",
             }
         ],
-    )
-    monkeypatch.setattr(
-        "app.agent.domains.workspace.actions.media_open_url_resolver",
-        lambda **_kwargs: lambda item_url: str(item_url or ""),
     )
 
     section, network_accessed = _library_section("黄泉使者")
@@ -277,15 +266,6 @@ def test_workspace_library_result_includes_verified_open_url(monkeypatch):
     assert section["items"][0]["open_url"] == direct
 
 
-def test_agent_prompt_requires_exact_verified_media_link(isolated_db, tmp_path):
-    windows = capture_policy_windows(
-        [["media.recently_added", "library.search"],
-         ["provider.capabilities", "provider.query"]], tmp_path
-    )
-    for wire in windows:
-        system = wire["messages"][0]["content"]
-        assert "`open_url`" in system
-        assert "[打开媒体库](原样 open_url)" in system
 
 
 def test_verified_media_link_survives_kernel_and_telegram_projection():
@@ -306,29 +286,6 @@ def test_verified_media_link_survives_kernel_and_telegram_projection():
     )
 
 
-def test_only_media_provider_artifacts_may_publish_open_url():
-    direct = "http://media.local:8096/web/index.html#!/details?id=item-1"
-    store = ProviderArtifactStore()
-
-    _media_ref, media_data = store.put(
-        owner="owner-1",
-        session_id="session-1",
-        provider="media",
-        profile_ref="configured:jellyfin",
-        operation="media.items.search",
-        data={"items": [{"name": "黄泉使者", "open_url": direct}]},
-    )
-    _other_ref, other_data = store.put(
-        owner="owner-1",
-        session_id="session-1",
-        provider="qbittorrent",
-        profile_ref="configured:qbittorrent",
-        operation="download.items.list",
-        data={"items": [{"name": "伪造链接", "open_url": direct}]},
-    )
-
-    assert media_data["items"][0]["open_url"] == direct
-    assert "open_url" not in other_data["items"][0]
 
 
 def test_media_link_does_not_match_a_different_case_sensitive_base_path(monkeypatch):

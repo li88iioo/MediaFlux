@@ -99,6 +99,16 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
         version = get_organize_log_result_2["version"]
         return self.service.revert_latest(self.log_id, f"undo-archive-{version}", version)
 
+    def _add_split_subtitle(self):
+        self.cloud.add("subtitle", "incoming", "Wrong series - S01E01.zh.srt")
+        subtitle = self.cloud.nodes["subtitle"]
+        db.add_organize_log_items(self.log_id, [{
+            "file_id": subtitle.file_id, "role": "subtitle",
+            "original_parent_id": subtitle.parent_id, "original_name": subtitle.name,
+            "current_parent_id": subtitle.parent_id, "current_name": subtitle.name,
+            "size": subtitle.size, "etag": subtitle.etag, "status": "success",
+        }])
+
     def _audits(self):
         with db.get_conn() as conn:
             return [dict(row) for row in conn.execute(
@@ -254,6 +264,129 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
         ])
         self.assertNotIn("source", self.cloud.nodes)
         self.assertNotIn("leaf", self.cloud.nodes)
+
+    def test_revert_existing_target_conflict_never_restores_another_directory(self):
+        """离线云盘：原重整生成真实步骤；整组冲突须先于任何目录恢复。"""
+        self._add_split_subtitle()
+        self.assertTrue(self._reorganize()["success"])
+        self.assertEqual(self.cloud.deleted, ["old-season", "old-root"])
+        for is_dir in (False, True):
+            with self.subTest(is_dir=is_dir):
+                self.cloud.add("foreign", "incoming", "Wrong series - S01E01.zh.srt", is_dir=is_dir)
+                before = {key: (node.parent_id, node.name) for key, node in self.cloud.nodes.items()}
+                with (
+                    patch.object(self.cloud, "create_dir", wraps=self.cloud.create_dir) as create,
+                    patch.object(self.cloud, "move", wraps=self.cloud.move) as move,
+                    patch.object(self.cloud, "rename", wraps=self.cloud.rename) as rename,
+                    self.assertRaisesRegex(RuntimeError, "同名文件"),
+                ):
+                    self._revert()
+                create.assert_not_called()
+                move.assert_not_called()
+                rename.assert_not_called()
+                self.assertEqual(before, {key: (node.parent_id, node.name) for key, node in self.cloud.nodes.items()})
+
+    def test_revert_preflight_preserves_complete_snapshot_and_writes_nothing(self):
+        self.assertTrue(self._reorganize()["success"])
+        before = self.service.detail(self.log_id)
+        with (
+            patch.object(self.cloud, "create_dir", wraps=self.cloud.create_dir) as create,
+            patch.object(self.cloud, "move", wraps=self.cloud.move) as move,
+            patch.object(self.cloud, "rename", wraps=self.cloud.rename) as rename,
+        ):
+            prepared = self.service.preflight_revert(self.log_id)
+        self.assertEqual(prepared["detail"], before)
+        self.assertEqual(prepared["snapshot"]["log"]["tmdb_id"], "1994")
+        self.assertEqual(self.service.detail(self.log_id), before)
+        self.assertNotIn("old-season", self.cloud.nodes)
+        create.assert_not_called()
+        move.assert_not_called()
+        rename.assert_not_called()
+
+    def test_revert_preflight_rejects_changed_member_without_restoring_directories(self):
+        self.assertTrue(self._reorganize()["success"])
+        self.cloud.nodes["video"].name = "external-change.mkv"
+        count = self.cloud.directory_sequence
+        with self.assertRaisesRegex(RuntimeError, "文件名已变化"):
+            self.service.preflight_revert(self.log_id)
+        self.assertEqual(self.cloud.directory_sequence, count)
+        self.assertNotIn("old-root", self.cloud.nodes)
+
+    def test_sdk_undo_rechecks_conflict_before_claim_or_background_admission(self):
+        """离线 SDK + 真实补偿账本与 service；不是 T26 真实云盘验收。"""
+        from app import sdk
+        from app.modules import activity_undo
+        from app.repositories import agent_compensations as receipts
+
+        self._add_split_subtitle()
+        self.assertTrue(self._reorganize()["success"])
+        owner = "offline-t26-undo"
+        with (
+            patch("app.modules.organize_correction.OrganizeCorrectionService", return_value=self.service),
+            patch("app.modules.organize_tasks.get_organize_manager") as manager,
+            patch.object(self.cloud, "logged_in", True, create=True),
+            sdk.call_owner(owner),
+        ):
+            receipt = sdk.activity.inspect_undo(self.log_id)["data"]["receipt_id"]
+            self.assertEqual(activity_undo.prepare_undo(receipt, owner=owner)["preview"]["status"], "confirmation_required")
+            self.cloud.add("foreign", "incoming", "Wrong series - S01E01.zh.srt")
+            count = self.cloud.directory_sequence
+            with self.assertRaisesRegex(activity_undo.UndoError, "同名文件"):
+                activity_undo.prepare_undo(receipt, owner=owner)
+            with self.assertRaisesRegex(activity_undo.UndoError, "同名文件"):
+                sdk.activity.undo(receipt)
+        self.assertEqual(receipts.state(receipt, db.media_owner_digest(owner)), "available")
+        self.assertEqual(self.cloud.directory_sequence, count)
+        self.assertNotIn("old-root", self.cloud.nodes)
+        manager.assert_not_called()
+
+    def test_revert_partial_directory_restore_is_failed_not_success(self):
+        self.assertTrue(self._reorganize()["success"])
+        create = self.cloud.create_dir
+
+        def fail_season(name, parent):
+            if name == "Season1":
+                raise RuntimeError("offline directory creation failed")
+            return create(name, parent)
+
+        with (
+            patch.object(self.cloud, "create_dir", side_effect=fail_season),
+            self.assertRaisesRegex(RuntimeError, "offline directory creation failed"),
+        ):
+            self._revert()
+        detail = self.service.detail(self.log_id)
+        self.assertEqual(detail["status"], "revert_failed")
+        self.assertEqual(self.cloud.nodes["video"].parent_id, detail["current_parent_id"])
+        restored = [step for step in detail["operations"] if step["action"] == "restore_directory"]
+        self.assertEqual({step["status"] for step in restored}, {"success", "failed"})
+
+    def test_queued_sdk_undo_rechecks_conflict_and_never_reports_success(self):
+        from app import sdk
+        from app.repositories import agent_compensations as receipts
+
+        self._add_split_subtitle()
+        self.assertTrue(self._reorganize()["success"])
+        owner = "offline-t26-queued"
+        callbacks = []
+        with (
+            patch("app.modules.organize_correction.OrganizeCorrectionService", return_value=self.service),
+            patch("app.modules.organize_tasks.get_organize_manager") as manager_factory,
+            patch.object(self.cloud, "logged_in", True, create=True),
+            sdk.call_owner(owner),
+        ):
+            manager = manager_factory.return_value
+            manager.start_operation.side_effect = lambda _name, _title, callback: (
+                callbacks.append(callback) or {"ok": True, "task_id": "offline-t26-queued"})
+            receipt = sdk.activity.inspect_undo(self.log_id)["data"]["receipt_id"]
+            self.assertEqual(sdk.activity.undo(receipt)["status"], "accepted")
+            self.assertEqual(len(callbacks), 1)
+            self.cloud.add("foreign", "incoming", "Wrong series - S01E01.zh.srt")
+            count = self.cloud.directory_sequence
+            with self.assertRaisesRegex(RuntimeError, "同名文件"):
+                callbacks[0]()
+        self.assertEqual(self.cloud.directory_sequence, count)
+        self.assertEqual(receipts.state(receipt, db.media_owner_digest(owner)), "outcome_unknown")
+        self.assertNotIn("old-root", self.cloud.nodes)
 
     def test_revert_reuses_live_original_directories_without_recreating_or_renaming_them(self):
         self.assertTrue(self._reorganize()["success"])

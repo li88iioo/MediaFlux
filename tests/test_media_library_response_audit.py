@@ -8,11 +8,10 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.agent.provider_models import ProviderGatewayError
-from app.agent.providers.media_server import MediaServerProviderTransport
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.main import create_app
+from app.modules import media_library
 from app.modules.media_server_profiles import MediaServerProfile
 from app.routes.media_libraries_api import _probe_profile
 from tests.support import IsolatedDatabaseTestCase
@@ -89,9 +88,8 @@ class MediaLibraryResponseAuditTests(TestCase):
                         with self.assertRaisesRegex(ValueError, "响应结构无效"):
                             client.list_virtual_folders()
 
-    def test_control_center_and_agent_report_unavailable_not_zero_libraries(self):
+    def test_control_center_and_public_library_report_unavailable_not_zero_libraries(self):
         profile = self._profile()
-        transport = MediaServerProviderTransport()
         with (
             JellyfinClient(profile.url, profile.credential) as client,
             patch.object(client, "_request", return_value={"Items": None}),
@@ -106,11 +104,11 @@ class MediaLibraryResponseAuditTests(TestCase):
             self.assertTrue(error)
             close.assert_called_once()
             with (
-                patch.object(transport, "_profile", return_value=profile),
-                patch.object(transport, "_client", return_value=client),
+                patch.object(media_library, "list_configured_profiles", return_value=[profile]),
+                patch.object(MediaServerProfile, "create_client", return_value=client),
             ):
-                with self.assertRaises(ProviderGatewayError) as raised:
-                    transport.execute_read(profile.source, "media.libraries.list", {})
+                with self.assertRaises(media_library.MediaLibraryError) as raised:
+                    media_library.libraries("jellyfin")
             self.assertEqual(raised.exception.code, "provider_unavailable")
             self.assertEqual(close.call_count, 2)
 

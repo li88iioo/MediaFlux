@@ -290,13 +290,21 @@ class IndexerItem:
         return replace(self, result_id=result_id)
 
     def to_public_dict(self) -> dict[str, Any]:
+        size_text = self.size_text
+        if not size_text and self.size_bytes is not None:
+            size = float(self.size_bytes)
+            for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"):
+                if size < 1024 or unit == "EiB":
+                    break
+                size /= 1024
+            size_text = f"{self.size_bytes} B" if unit == "B" else f"{size:.2f} {unit}"
         return {
             "result_id": self.result_id,
             "site_id": self.site_id,
             "site_name": self.site_name,
             "title": self.title,
             "category": self.category,
-            "size_text": self.size_text,
+            "size_text": size_text,
             "size_bytes": self.size_bytes,
             "seeders": self.seeders,
             "leechers": self.leechers,

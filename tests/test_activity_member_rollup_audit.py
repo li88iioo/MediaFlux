@@ -7,15 +7,11 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.activity.actions import (
-    search_arguments,
-    select_activity,
-    selection_arguments,
-    timeline_snapshot,
-)
+from app import sdk
 from app.modules.media_automation_rules import drain_automation_rules
 from app.modules.telegram_notification_policy import NotificationImportance
 from app.repositories import activity
+from app.repositories.activity import timeline_snapshot
 from app.repositories import media_automation_rules as rules
 from tests.support import IsolatedDatabaseTestCase
 
@@ -35,11 +31,13 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
                 "INSERT INTO local_media_sources(name,local_root,created_at,updated_at) "
                 "VALUES('audit','/fixture','2026-01-01 00:00:00','2026-01-01 00:00:00')"
             ).lastrowid
-            self.task = conn.execute(
+            task_id = conn.execute(
                 "INSERT INTO local_media_tasks(source_id,content_path,operation_token,title,status,created_at,updated_at) "
                 "VALUES(?,'/fixture','fixture-rollup','Fixture','completed','2026-01-01 00:00:00','2026-01-01 00:00:00')",
                 (source,),
             ).lastrowid
+            assert task_id is not None
+            self.task = task_id
         self.target = {"kind": "local_media", "id": self.task}
 
     def _members(self, good_count, *, failures=0):
@@ -61,30 +59,30 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
     @staticmethod
     def _stage(result):
         return next(
-            stage for stage in result.data["stages"] if stage["stage"] == "成员处理"
+            stage for stage in result["data"]["stages"] if stage["stage"] == "成员处理"
         )
 
     def test_failure_after_101_members_is_current_attention_not_completed(self):
         self._members(149, failures=1)
-        result = timeline_snapshot(self.target)
-        self.assertEqual(result.status, "attention")
-        self.assertTrue(result.data["needs_attention"])
+        result = timeline_snapshot(self.target["kind"], self.target["id"])
+        self.assertEqual(result["status"], "attention")
+        self.assertTrue(result["data"]["needs_attention"])
         stage = self._stage(result)
         self.assertEqual((stage["total_count"], stage["attention_count"]), (150, 1))
         self.assertEqual((stage["count"], stage["truncated"]), (100, True))
 
     def test_small_and_empty_normal_results_keep_display_contract(self):
-        empty = timeline_snapshot(self.target)
-        self.assertEqual(empty.status, "completed")
+        empty = timeline_snapshot(self.target["kind"], self.target["id"])
+        self.assertEqual(empty["status"], "completed")
         self.assertEqual(
             (self._stage(empty)["count"], self._stage(empty)["truncated"]), (0, False)
         )
         self._members(3)
-        result = timeline_snapshot(self.target)
-        self.assertEqual(result.status, "completed")
+        result = timeline_snapshot(self.target["kind"], self.target["id"])
+        self.assertEqual(result["status"], "completed")
         stage = self._stage(result)
         self.assertEqual((stage["count"], stage["truncated"]), (3, False))
-        self.assertFalse(result.data["needs_attention"])
+        self.assertFalse(result["data"]["needs_attention"])
 
     def test_large_member_rollup_uses_two_selects_and_no_prefix_item_read(self):
         self._members(1_000, failures=1)
@@ -140,23 +138,23 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
 
     def test_download_cannot_hide_failed_linked_task_behind_20_completed_tasks(self):
         target = self._linked_download("failed")
-        result = timeline_snapshot(target)
-        self.assertTrue(result.data["needs_attention"])
-        self.assertEqual(result.status, "attention")
+        result = timeline_snapshot(target["kind"], target["id"])
+        self.assertTrue(result["data"]["needs_attention"])
+        self.assertEqual(result["status"], "attention")
         summary = next(
             stage
-            for stage in result.data["stages"]
+            for stage in result["data"]["stages"]
             if stage["stage"] == "关联本地任务汇总"
         )
         self.assertEqual((summary["total_count"], summary["attention_count"]), (21, 1))
-        self.assertEqual(len(result.references[0].value["items"]), 21)
+        self.assertEqual(len(result["data"]["activities"]), 21)
 
     def test_download_does_not_complete_while_hidden_linked_task_is_pending(self):
         target = self._linked_download("waiting_stable")
-        result = timeline_snapshot(target)
-        self.assertEqual(result.status, "in_progress")
-        self.assertFalse(result.data["terminal"])
-        self.assertFalse(result.data["needs_attention"])
+        result = timeline_snapshot(target["kind"], target["id"])
+        self.assertEqual(result["status"], "in_progress")
+        self.assertFalse(result["data"]["terminal"])
+        self.assertFalse(result["data"]["needs_attention"])
 
     def test_hidden_member_failure_hands_off_one_attention_notification(self):
         self._members(149, failures=1)
@@ -195,6 +193,59 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
         )
         self.assertFalse(publish.call_args.kwargs["deliver_now"])
 
+    def test_recovered_historical_failure_finishes_once_without_new_alarm(self):
+        with db.get_conn() as conn:
+            log_id = conn.execute(
+                "INSERT INTO organize_log(source,original_path,new_path,title,status,created_at,updated_at) "
+                "VALUES('guangya','/fixture/private-old','/fixture/private-new','Recovered','success',"
+                "'2026-01-01 00:00:00','2026-01-02 00:00:00')"
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO organize_operation_steps(log_id,operation_token,step_index,action,status,error) "
+                "VALUES(?,'private-operation',0,'move_rename','failed','旧失败已处理')",
+                (log_id,),
+            )
+        assert log_id is not None
+        result = timeline_snapshot("organize", log_id)
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["data"]["needs_attention"])
+        self.assertTrue(result["data"]["stages"][1]["historical"])
+        self.assertIn("旧失败", result["data"]["stages"][1]["reason"])
+        rules.save_rule(
+            "recovered-history-audit",
+            kind="activity_follow",
+            settings={
+                "target": {"kind": "organize", "id": log_id},
+                "title": "Recovered",
+                "expires_at": (self.clock + timedelta(hours=1)).isoformat(),
+            },
+            enabled=True,
+            next_run_at=self.clock.isoformat(),
+        )
+        with (
+            patch(
+                "app.modules.media_automation_rules.is_agent_enabled", return_value=True
+            ),
+            patch(
+                "app.modules.media_automation_rules._authorized_notification_chat",
+                return_value="123",
+            ),
+            patch(
+                "app.modules.media_automation_rules.publish_notification_event",
+                return_value=Mock(status="queued"),
+            ) as publish,
+        ):
+            self.assertEqual(drain_automation_rules(now=self.clock), 1)
+            self.assertEqual(
+                drain_automation_rules(now=self.clock + timedelta(minutes=6)), 0
+            )
+        publish.assert_called_once()
+        self.assertEqual(publish.call_args.args[1].title, "活动跟踪结束")
+        self.assertEqual(
+            publish.call_args.kwargs["importance"], NotificationImportance.RESULT
+        )
+        self.assertNotIn("/fixture", str(publish.call_args.args[1]))
+
     def test_small_linked_list_does_not_pay_for_overflow_aggregation(self):
         request, _ = db.create_download_request("small-linked", "magnet", title="Small")
         db.update_download_request(
@@ -224,10 +275,10 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(snapshot["local_tasks"]), 1)
         self.assertEqual(snapshot["local_task_status_counts"], {})
         self.assertFalse(any("GROUP BY status" in sql for sql in statements))
-        result = timeline_snapshot({"kind": "download", "id": request})
-        self.assertEqual(result.status, "completed")
+        result = timeline_snapshot("download", request)
+        self.assertEqual(result["status"], "completed")
         self.assertNotIn(
-            "关联本地任务汇总", [stage["stage"] for stage in result.data["stages"]]
+            "关联本地任务汇总", [stage["stage"] for stage in result["data"]["stages"]]
         )
 
     def test_overflow_failure_and_pending_both_remain_visible_without_false_terminal(
@@ -252,10 +303,10 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
                 "VALUES(?,?,'/fixture','linked-newest','Newest','completed','2026-01-02 00:00:00','2026-01-02 00:00:00')",
                 (source, "a" * 40),
             )
-        result = timeline_snapshot(target)
+        result = timeline_snapshot(target["kind"], target["id"])
         summary = next(
             stage
-            for stage in result.data["stages"]
+            for stage in result["data"]["stages"]
             if stage["stage"] == "关联本地任务汇总"
         )
         self.assertEqual(
@@ -266,9 +317,9 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
             ),
             (22, 1, 1),
         )
-        self.assertEqual(result.status, "attention")
-        self.assertFalse(result.data["terminal"])
-        self.assertEqual(len(result.references[0].value["items"]), 21)
+        self.assertEqual(result["status"], "attention")
+        self.assertFalse(result["data"]["terminal"])
+        self.assertEqual(len(result["data"]["activities"]), 21)
 
     def test_member_aggregate_and_parent_share_snapshot_during_concurrent_repair(self):
         self._members(149, failures=1)
@@ -313,34 +364,20 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
                 yield Connection(conn)
 
         with patch.object(db, "get_conn", hooked):
-            current = timeline_snapshot(self.target)
+            current = timeline_snapshot(self.target["kind"], self.target["id"])
         self.assertTrue(repaired)
-        self.assertEqual(current.status, "attention")
+        self.assertEqual(current["status"], "attention")
         self.assertEqual(self._stage(current)["attention_count"], 1)
-        self.assertEqual(timeline_snapshot(self.target).status, "completed")
-
-    def test_last_emitted_timeline_reference_is_accepted_by_public_selection_contract(
-        self,
-    ):
-        from app.agent.domains.activity.tools import _SELECTION
-
-        target = self._linked_download("failed")
-        reference = timeline_snapshot(target).references[0].value
-        position = len(reference["items"])
-        self.assertEqual(position, 21)  # 当前对象 + 20个关联对象，不丢弃原有导航项。
-        arguments = selection_arguments(
-            {"activity_selection_ref": "ref_" + "a" * 24, "position": position}
-        )
         self.assertEqual(
-            select_activity(
-                {"activity_selection": reference, "position": arguments["position"]}
-            ),
-            reference["items"][-1],
+            timeline_snapshot(self.target["kind"], self.target["id"])["status"],
+            "completed",
         )
-        self.assertEqual(_SELECTION["properties"]["position"]["maximum"], position)
-        with self.assertRaises(ValueError):
-            selection_arguments(
-                {"activity_selection_ref": "ref_" + "a" * 24, "position": position + 1}
-            )
-        with self.assertRaises(ValueError):
-            search_arguments({"limit": 21})  # 搜索结果上限仍是20，不随引用边界扩大。
+
+    def test_all_timeline_members_remain_navigable_by_native_ids(self):
+        target = self._linked_download("failed")
+        members = sdk.activity.timeline(target["kind"], target["id"])["data"]["activities"]
+        self.assertEqual(len(members), 21)  # 当前对象 + 20 个关联对象。
+        last = members[-1]
+        result = sdk.activity.timeline(last["kind"], last["id"])
+        self.assertTrue(result["ok"])
+        self.assertIn(last, result["data"]["activities"])

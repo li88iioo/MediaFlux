@@ -4,303 +4,74 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.provider_operations import build_provider_catalog
+from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.public_safety import public_tool_label
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_FORBIDDEN_TOOL_NAMES = {
-    "downloads.pause_task",
-    "downloads.resume_task",
-    "downloads.delete_task",
-    "library.refresh_library",
-    "indexer.submit_resource",
-    "indexer.submit_resource_batch",
-    "rss.set_subscription_enabled",
-    "rss.set_refresh_interval",
-    "guangya.change_plan.execute",
-    "guangya.fs.change.preview",
-    "guangya.media_hygiene.execute",
-    "guangya.organize.clean_empty",
-    "discovery.get_watchlist_summary",
-}
-_REQUIRED_PROJECT_TOOLS = {
-    "agent.capabilities",
-    "agent.runtime_status",
-    "automation.diagnose_pipeline",
-    "workspace.briefing",
-    "workspace.health",
-    "workspace.next_actions",
-    "workspace.search",
-    "workspace.todo",
-    "provider.capabilities",
-    "provider.query",
-    "provider.change.preview",
-    "provider.change.execute",
-    "provider.job.status",
-    "config.diagnose",
-    "config.diagnose_media_servers",
-    "config.explain_component",
-    "config.feature_summary",
-    "config.safe_policy_summary",
-    "config.set_feature_state",
-    "config.set_safe_policy",
-    "library.search",
-    "library.batch_presence",
-    "library.audit_episodes",
-    "library.audit_library_episodes",
-    "library.check_updates",
-    "library.count_series_episodes",
-    "library.search_missing_episode_resources",
-    "library.search_missing_season_resources",
-    "library.patrol_status",
-    "library.set_patrol_policy",
-    "library.trigger_patrol_now",
-    "downloads.diagnose_queue",
-    "downloads.request_summaries",
-    "downloads.retry_submission",
-    "config.indexer_sites_summary",
-    "config.set_indexer_sites",
-    "indexer.diagnose_readiness",
-    "indexer.search_resources",
-    "ingest.inspect",
-    "ingest.submit",
-    "ingest.status",
-    "web.read",
-    "web.search",
-    "bangumi.calendar",
-    "discovery.search",
-    "discovery.person_filmography",
-    "discovery.detail",
-    "discovery.recommend",
-    "discovery.lookup_rating",
-    "discovery.mapping_candidates",
-    "discovery.confirm_mapping",
-    "discovery.watchlist_summaries",
-    "discovery.add_watchlist",
-    "discovery.remove_watchlist",
-    "media.subscription_summaries",
-    "media.subscription_updates",
-    "media.get_subscription_summary",
-    "media.get_subscription_policy",
-    "media.create_subscription",
-    "media.set_subscription_policy",
-    "media.set_subscription_enabled",
-    "media.delete_subscription",
-    "media.subscription_notification_rule",
-    "media.set_subscription_notification_rule",
-    "media.reset_subscription_notification_rule",
-    "media.continue_watching",
-    "media.recently_added",
-    "media.recently_played",
-    "media.recommend_from_library",
-    "guangya.account.status",
-    "guangya.connection_status",
-    "guangya.fs.query",
-    "guangya.fs.change.execute",
-    "guangya.recycle.list",
-    "guangya.recycle.restore",
-    "guangya.recycle.clear",
-    "guangya.operation.status",
-    "guangya.share.list",
-    "guangya.share.create",
-    "guangya.share.revoke",
-    "guangya.organize.preview",
-    "guangya.organize.run_once",
-    "guangya.organize.status",
-    "guangya.organize.cleanup.classify",
-    "guangya.organize.cleanup.preview",
-    "guangya.organize.cleanup.execute",
-    "guangya.rename.preview",
-    "guangya.rename.execute",
-    "guangya.directory_scrape.inspect",
-    "guangya.directory_scrape.search",
-    "guangya.directory_scrape.preview",
-    "guangya.directory_scrape.run",
-    "strm.diagnose",
-    "strm.status",
-    "strm.run_history",
-    "strm.run_once",
-    "strm.retry_failures",
-    "strm.schedule_policy",
-    "strm.set_schedule_policy",
-    "local_media.diagnose",
-    "local_media.source_summaries",
-    "local_media.get_source_summary",
-    "local_media.task_summaries",
-    "local_media.inspect_task",
-    "local_media.preview_task",
-    "local_media.scan_sources",
-    "local_media.retry_task",
-    "local_media.refresh_task_library",
-    "local_media.verify_task_library_visibility",
-    "local_media.set_source_trigger_enabled",
-    "rss.diagnose",
-    "rss.subscription_summaries",
-    "rss.get_subscription_summary",
-    "rss.create_subscription",
-    "rss.update_subscription",
-    "rss.delete_subscription",
-    "rss.recent_activity",
-    "rss.entry_summaries",
-    "rss.mark_entries",
-    "rss.refresh_subscription",
-    "rss.refresh_subscriptions",
-    "rss.submit_entries_to_qb",
-    "rss.submit_pending_to_qb",
-    "rss.retry_failed",
-}
-_REQUIRED_PROVIDER_OPERATIONS = {
-    "media.system.info",
-    "media.libraries.list",
-    "media.library.counts",
-    "media.items.search",
-    "media.items.recent_added",
-    "media.items.recent_played",
-    "media.items.continue_watching",
-    "media.series.search",
-    "media.series.episodes",
-    "media.library.refresh",
-    "media.item.refresh",
-    "qb.app.version",
-    "qb.transfer.info",
-    "qb.torrents.info",
-    "qb.torrents.files",
-    "qb.torrents.pause",
-    "qb.torrents.resume",
-    "qb.torrents.delete_task",
-}
 
 
-def test_provider_catalog_is_the_only_external_media_and_qb_write_surface() -> None:
-    operations = {
-        spec.operation_id: spec for spec in build_provider_catalog().operations()
-    }
-    assert _REQUIRED_PROVIDER_OPERATIONS <= operations.keys()
-    for operation in (
-        "media.library.refresh",
-        "media.item.refresh",
-        "qb.torrents.pause",
-        "qb.torrents.resume",
-        "qb.torrents.delete_task",
-    ):
-        assert operations[operation].risk.value != "read"
 
 
-def test_all_registered_tools_have_one_complete_kernel_lifecycle() -> None:
-    """防止新增能力只有声明、只有预览或引用到不存在的下一环。"""
-    specs = build_tool_specs()
-    by_name = {spec.name: spec for spec in specs}
-    assert len(by_name) == len(specs)
-    assert not _FORBIDDEN_TOOL_NAMES & by_name.keys()
-    assert _REQUIRED_PROJECT_TOOLS <= by_name.keys()
-
-    for spec in specs:
-        assert public_tool_label(spec.name) != "项目操作", spec.name
-        for related in spec.related_tools:
-            assert related in by_name, f"{spec.name} -> {related}"
-        if spec.risk.value == "read":
-            assert spec.handler is not None or spec.context_handler is not None, spec.name
-            assert not spec.requires_confirmation, spec.name
-            continue
-        assert spec.requires_confirmation, spec.name
-        assert spec.context_confirmation_preparer is not None, spec.name
-        assert spec.context_confirmed_handler is not None, spec.name
 
 
-def test_watchlist_reads_have_one_read_only_entry_and_no_retired_handler_or_alias() -> None:
-    from app.agent import domain_tool_metadata, public_safety, rate_limit
-    from app.agent.domains.discovery import (
-        watchlist_actions as discovery_watchlist_actions,
-    )
+def test_watchlist_reads_use_native_services_and_writes_keep_confirmation() -> None:
+    import importlib.util
+    from app import sdk
     from app.agent.kernel.capabilities import ToolEffect
-    from app.agent.kernel.ports import catalog_from_tool_specs
+    from app.agent.kernel.ports.sdk_effects import watchlist_tools
 
-    specs = build_tool_specs()
-    watchlist_specs = {spec.name: spec for spec in specs if spec.name.startswith('discovery.') and 'watchlist' in spec.name}
-    assert set(watchlist_specs) == {
-        'discovery.watchlist_summaries', 'discovery.add_watchlist', 'discovery.remove_watchlist',
-    }
-    spec = watchlist_specs['discovery.watchlist_summaries']
-    assert spec.risk.value == 'read'
-    assert spec.handler is discovery_watchlist_actions.list_watchlist_summaries
-    assert spec.validator is discovery_watchlist_actions.watchlist_summaries_arguments
-    assert not spec.requires_confirmation and spec.parallel_read
-
-    catalog = catalog_from_tool_specs(specs)
-    retired = 'discovery.get_watchlist_summary'
-    assert not catalog.has(retired)
-    assert not catalog.has(retired.replace('.', '__'))
-    assert not hasattr(discovery_watchlist_actions, 'get_watchlist_summary')
-    for mapping in (
-        domain_tool_metadata.TOOL_RETRIEVAL_TERMS, public_safety._PUBLIC_TOOL_LABELS,
-        public_safety._PUBLIC_TOOL_ALIASES, rate_limit._TOOL_RATE_LIMIT_SCOPES,
-        rate_limit._TOOL_RATE_LIMITS,
-    ):
-        assert retired not in mapping
-        assert retired.replace('.', '__') not in mapping
-    assert retired not in domain_tool_metadata.loaded_tool_guidance([spec.name])
-
-    tool = catalog.get(spec.name)
-    assert tool.effect is ToolEffect.READ and tool.read is not None
-    assert tool.prepare is None and tool.execute_confirmed is None
-    assert tool.metadata['parallel_read'] is True
-    assert set(tool.input_schema['properties']) == {'mode', 'before_number', 'watchlist_number'}
-    assert tool.input_schema['additionalProperties'] is False
+    catalog = build_tool_catalog()
+    for retired in ("library.search", "discovery.watchlist_summaries", "discovery.get_watchlist_summary",
+                    "discovery.add_watchlist", "discovery.remove_watchlist"):
+        assert not catalog.has(retired) and not catalog.has(retired.replace(".", "__"))
+    assert importlib.util.find_spec("app.agent.domains.discovery.watchlist_actions") is None
+    reads = {"watchlist.list", "watchlist.get", "watchlist.statistics"}
+    assert reads <= sdk.METHODS.keys() and reads.isdisjoint(sdk.WRITE_METHODS)
+    for native in watchlist_tools():
+        assert catalog.has(native.name)
+        assert native.effect is ToolEffect.WRITE and native.prepare is not None and native.execute_confirmed is not None
+    assert catalog.has("watchlist.add") and catalog.has("watchlist.remove")
 
 
-def test_guangya_fs_change_is_one_full_plan_confirmation_tool() -> None:
+def test_rss_delivery_has_only_native_sdk_entries() -> None:
+    from app import sdk
+    from app.agent.kernel.ports.sdk_effects import rss_delivery_tools
+    old = {"rss.entry_summaries", "rss.mark_entries", "rss.refresh_subscriptions", "rss.retry_failed", "rss.submit_entries_to_qb", "rss.submit_pending_to_qb"}
+    assert old.isdisjoint({spec.name for spec in build_tool_catalog().visible()})
+    assert {spec.name for spec in rss_delivery_tools()} == {"rss.mark", "rss.refresh", "rss.retry", "rss.download"}
+    assert callable(sdk.rss.entries)
+    for name in ("rss_entry_actions", "rss_refresh_actions", "rss_download_actions", "rss_retry_actions"):
+        assert not (_REPO_ROOT / "app/agent/domains/subscriptions" / (name + ".py")).exists()
+
+
+def test_cloud_change_uses_native_write_gate_and_no_legacy_model_spec() -> None:
     from app.agent.kernel.capabilities import ToolEffect
-    from app.agent.kernel.ports import catalog_from_tool_specs
+    from app.agent.kernel.ports.sdk_effects import cloud_change_tool
+    from app import sdk
 
-    specs = build_tool_specs()
-    spec = next(item for item in specs if item.name == "guangya.fs.change.execute")
-    assert spec.risk.value == "danger"
-    assert spec.requires_confirmation
-    assert spec.handler is None and spec.context_handler is None
-    assert spec.parameters["required"] == ["operations"]
-    assert set(spec.parameters["properties"]) == {"operations", "observation_ref", "trigger_strm"}
-    assert spec.parameters["additionalProperties"] is False
-    operations = spec.parameters["properties"]["operations"]
-    assert operations["minItems"] == 1
-    assert operations["maxItems"] == 200
-    operation_names = {
-        name
-        for branch in operations["items"]["oneOf"]
-        for name in branch["properties"]["op"]["enum"]
-    }
-    assert operation_names == {
-        "rename", "move", "copy", "relocate", "batch_relocate", "batch_files", "create_directory", "trash",
-    }
-
-    catalog = catalog_from_tool_specs(specs)
-    assert not catalog.has("guangya.fs.change.preview")
-    assert not catalog.has("guangya__fs__change__preview")
-    tool = catalog.get(spec.name)
-    assert tool.effect is ToolEffect.DANGER
-    assert tool.read is None
-    assert tool.prepare is not None and tool.execute_confirmed is not None
-    assert tool.metadata["workflow"] == "guangya_fs_change"
-    assert tool.metadata["workflow_stage"] == 10
-    assert tool.metadata["parallel_read"] is False
+    tool = cloud_change_tool()
+    assert tool.effect is ToolEffect.WRITE
+    assert tool.read is None and tool.prepare is not None and tool.execute_confirmed is not None
+    assert set(tool.input_schema["properties"]) == {"operations", "trigger_strm"}
+    assert sdk.METHODS["cloud.episodes"] == sdk.cloud.episodes
+    assert sdk.METHODS["cloud.preview_episodes"] == sdk.cloud.preview_episodes
+    assert "cloud.change" in sdk.WRITE_METHODS
 
 
 def test_guangya_fs_change_retired_preview_has_no_runtime_metadata_or_alias() -> None:
     from app.agent import (
         action_history,
         confirmation_contract,
-        domain_tool_metadata,
         public_safety,
         rate_limit,
     )
 
-    execute = "guangya.fs.change.execute"
+    execute = "cloud.change"
     retired = "guangya.fs.change.preview"
     mappings = (
         action_history._TOOL_LABELS,
         action_history._SAFE_FIELDS,
         confirmation_contract._CONFIRMATION_COPY,
-        domain_tool_metadata.TOOL_RETRIEVAL_TERMS,
         public_safety._PUBLIC_TOOL_LABELS,
         public_safety._PUBLIC_TOOL_ALIASES,
         rate_limit._TOOL_RATE_LIMIT_SCOPES,
@@ -311,70 +82,33 @@ def test_guangya_fs_change_retired_preview_has_no_runtime_metadata_or_alias() ->
         assert retired.replace(".", "__") not in mapping
     assert action_history._TOOL_LABELS[execute] == public_tool_label(execute) == "光鸭文件变更"
     assert public_tool_label(execute.replace(".", "__")) == "光鸭文件变更"
-    assert "复制" in domain_tool_metadata.TOOL_RETRIEVAL_TERMS[execute]
-    guidance = domain_tool_metadata.loaded_tool_guidance([execute])
-    assert retired not in guidance
-    assert "必填的完整 operations" in guidance
-    assert "只有用户确认后才执行" in guidance
-    assert "不能用空参数" in guidance
-    reference = (_REPO_ROOT / "docs/tutorials/09_Agent工具与能力参考.md").read_text()
-    assert retired not in reference
-    assert "不接受 `{}`" in reference
-
-
-def test_guangya_fs_change_intents_retrieve_the_single_execute_entry() -> None:
-    from app.agent.kernel.capabilities import CapabilityRetriever
-    from app.agent.kernel.ports import catalog_from_tool_specs
-
-    catalog = catalog_from_tool_specs(build_tool_specs())
-    for message in ("把刚才这个文件复制到备份目录", "在光鸭新建目录", "移动光鸭文件并生成文件变更确认卡"):
-        names = CapabilityRetriever().retrieve(message, catalog).names
-        assert "guangya.fs.change.execute" in names, (message, names)
-        assert "guangya.fs.change.preview" not in names
+    from app import sdk
+    assert callable(sdk.cloud.change)
 
 
 def test_guangya_fs_change_uses_one_policy_with_separate_confirmation_budget(monkeypatch) -> None:
     from app.agent import rate_limit
 
-    execute = "guangya.fs.change.execute"
-    assert rate_limit.tool_rate_limit_policy(execute) == (f"tool:{execute}", 3, 1)
+    execute = "cloud.change"
+    # 真实光鸭写入验收（2026-11-04）：预检、过期重预检、下一项预检在一分钟内即触顶 3 次。
+    assert rate_limit.tool_rate_limit_policy(execute) == (f"tool:{execute}", 6, 1)
     limiter = rate_limit.AgentRateLimiter(clock=lambda: 100.0)
     monkeypatch.setattr(rate_limit, "agent_rate_limiter", limiter)
-    for remaining in (2, 1, 0):
+    for remaining in (5, 4, 3, 2, 1, 0):
         decision = rate_limit.consume_agent_tool("fs-owner", execute)
         assert decision.allowed and decision.remaining == remaining
     assert not rate_limit.consume_agent_tool("fs-owner", execute).allowed
     # 准备额度耗尽不能阻止用户确认已有卡片；仍使用唯一 execute 的限流合同。
     confirmed = rate_limit.consume_agent_tool("fs-owner", execute, scope_suffix="confirmed")
-    assert confirmed.allowed and confirmed.limit == 3 and confirmed.remaining == 2
+    assert confirmed.allowed and confirmed.limit == 6 and confirmed.remaining == 5
 
 
-def test_provider_operations_are_bounded_and_writes_are_reference_scoped() -> None:
-    for spec in build_provider_catalog().operations():
-        assert spec.max_items > 0, spec.operation_id
-        assert spec.timeout_seconds > 0, spec.operation_id
-        if spec.risk.value != "read":
-            assert spec.reference_arguments, spec.operation_id
 
 
-def test_batch_updates_use_one_read_and_recheck_the_persisted_list(monkeypatch) -> None:
-    """十部片单与省略标题的续问穿过真实目录/Kernel/审计；不连接真实媒体库。"""
-    import asyncio
+def test_native_updates_refreshes_the_same_persisted_list(monkeypatch, tmp_path) -> None:
     import json
-    from collections import Counter
-
-    from app.agent.domains.library import episode_audit
-    from app.agent.kernel.capabilities import CapabilityRetriever
-    from app.agent.kernel.events import AgentEventType
-    from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
-    from app.agent.kernel.persistence import SQLiteKernelStore
-    from app.agent.kernel.pipeline import ToolPipeline
-    from app.agent.kernel.ports import catalog_from_tool_specs
-    from app.agent.kernel.session import AgentSession, SessionLimits
-    from app.agent.kernel.state_types import AgentInput
-    from tests.support import isolated_test_database
-    from tests.test_agent_kernel_core import ScriptedModel
-
+    from app.modules import episode_audit
+    from app.sdk import library
     titles = ["师兄啊师兄", "凡人修仙传", "光阴之外", "择日飞升", "大主宰",
               "牧神记", "沧元图", "一斩苍穹", "东大高武学院", "将夜"]
     identities = {title: str(10000 + index) for index, title in enumerate(titles)}
@@ -402,47 +136,106 @@ def test_batch_updates_use_one_read_and_recheck_the_persisted_list(monkeypatch) 
     monkeypatch.setattr(episode_audit, "close_tmdb_client", lambda _client: None)
     episode_audit.reset_episode_audit_cache_for_tests()
 
-    async def run():
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        state = SQLiteKernelStore()
+    saved = tmp_path / "queries.json"
+    saved.write_text(json.dumps(titles))
+    try:
         for turn in (1, 2):
             if turn == 2:
                 inventory.append((1, 2))
-            model = ScriptedModel([
-                [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                    f"batch-{turn}", "library.check_updates",
-                    {"queries": titles, "media_type": "tv", "as_of": "2026-08-01"},
-                )), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
-                [ModelEvent(ModelEventType.TEXT_DELTA, text="本轮已逐部核对，未检索全网资源。"),
-                 ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
-            ])
-            # 重建会话对象，验证续问依赖持久对话，而不是旧实例中的临时片单。
-            session = AgentSession(
-                model=model, catalog=catalog, retriever=CapabilityRetriever(),
-                pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
-                limits=SessionLimits(max_tool_calls=2, max_model_rounds=4),
-            )
-            events = [event async for event in session.run(AgentInput(
-                owner="batch-owner", session_id="batch-session", request_id=f"request-{turn}",
-                message="媒体库中的 " + "/".join(titles) + " 都有更新吗？" if turn == 1 else "再检查一下更新",
-            ))]
-            selected = next(event for event in events if event.type == AgentEventType.CAPABILITIES_SELECTED)
-            assert "library.check_updates" in selected.payload["tools"]
-            assert events[-1].type == AgentEventType.TURN_COMPLETED
-            assert events[-1].payload["tool_calls"] == 1
-            assert not any(event.type == AgentEventType.EFFECT_APPROVAL_REQUIRED for event in events)
-            tool_message = next(message for message in reversed(model.requests[-1].messages) if message.role == "tool")
-            data = json.loads(tool_message.content)["data"]
+            result = library.updates(queries=json.loads(saved.read_text()), media_type="tv", as_of="2026-08-01")
+            data = result["data"]
             assert [item["query"] for item in data["items"]] == titles
             assert {item["status"] for item in data["items"]} == {"updates_available" if turn == 1 else "up_to_date"}
             assert data["counts"]["requested"] == 10
-            if turn == 2:
-                history = "\n".join(message.content for message in model.requests[0].messages)
-                assert all(title in history for title in titles)
-        assert Counter(reads) == Counter({title: 2 for title in titles})
-
-    try:
-        with isolated_test_database():
-            asyncio.run(run())
+            assert data["resource_search_status"] == "not_checked"
+        assert sorted(reads) == sorted(titles * 2)
     finally:
         episode_audit.reset_episode_audit_cache_for_tests()
+
+
+def test_library_inventory_has_native_reads_without_legacy_modules_or_live_metadata():
+    import importlib.util
+    from app import sdk
+    from app.agent import rate_limit
+
+    catalog = build_tool_catalog()
+    for retired, module in (
+        ("library.batch_presence", "batch_presence"),
+        ("library.count_series_episodes", "episode_count"),
+    ):
+        assert not catalog.has(retired) and not catalog.has(retired.replace(".", "__"))
+        assert importlib.util.find_spec(f"app.agent.domains.library.{module}") is None
+        for mapping in (
+                        rate_limit._TOOL_RATE_LIMIT_SCOPES, rate_limit._TOOL_RATE_LIMITS):
+            assert retired not in mapping
+        # 历史记录仍能显示原业务名称；不能再成为执行入口。
+        assert public_tool_label(retired) != retired
+    assert {"library.presence", "library.episodes"} <= sdk.METHODS.keys()
+    assert {"library.presence", "library.episodes"}.isdisjoint(sdk.WRITE_METHODS)
+
+
+def test_library_audit_updates_have_no_legacy_execution_entries():
+    import importlib.util
+    from app import sdk
+    from app.agent import rate_limit
+    catalog = build_tool_catalog()
+    for name in ("library.audit_episodes", "library.check_updates"):
+        assert not catalog.has(name) and not catalog.has(name.replace(".", "__"))
+    assert importlib.util.find_spec("app.agent.domains.library.update_actions") is None
+    assert {"library.audit", "library.updates"} <= sdk.METHODS.keys()
+    assert {"library.audit", "library.updates"}.isdisjoint(sdk.WRITE_METHODS)
+    for name in ("library.audit_episodes", "library.check_updates", "library.audit", "library.updates"):
+        assert name not in rate_limit._TOOL_RATE_LIMIT_SCOPES
+        assert name not in rate_limit._TOOL_RATE_LIMITS
+
+
+def test_schedule_policies_have_one_business_service_and_native_sdk_confirmation():
+    import importlib.util
+    from app import sdk
+    from app.agent.kernel.capabilities import ToolEffect
+    from app.agent.kernel.ports.sdk_effects import schedule_policy_tools
+
+    catalog = build_tool_catalog()
+    reads = {"strm.schedule", "cloud.organize_schedule", "library.patrol_policy"}
+    writes = {"strm.set_schedule", "cloud.set_organize_schedule", "library.set_patrol_policy"}
+    assert reads <= sdk.METHODS.keys() and reads.isdisjoint(sdk.WRITE_METHODS)
+    assert writes <= sdk.WRITE_METHODS
+    for module in ("app.agent.policy_confirmation", "app.agent.domains.strm.schedule_actions",
+                   "app.agent.domains.guangya.schedule_actions", "app.agent.domains.library.patrol_config_actions"):
+        assert importlib.util.find_spec(module) is None
+    for tool in schedule_policy_tools():
+        assert catalog.has(tool.name)
+        assert tool.effect is ToolEffect.WRITE and tool.prepare is not None and tool.execute_confirmed is not None
+        assert public_tool_label(tool.name) != tool.name
+    assert writes == {tool.name for tool in schedule_policy_tools()}
+
+def test_activity_follow_uses_native_ids_and_public_repository_only():
+    import importlib.util
+
+    from app import sdk
+    from app.agent.kernel.ports.sdk_effects import activity_follow_tools
+
+    assert importlib.util.find_spec("app.agent.domains.activity.follow_actions") is None
+    names = {"activity.follow", "activity.follows", "activity.unfollow"}
+    assert names <= sdk.METHODS.keys()
+    assert names & sdk.WRITE_METHODS == {"activity.follow", "activity.unfollow"}
+    specs = {tool.name: tool for tool in activity_follow_tools()}
+    assert specs.keys() == {"activity.follow", "activity.unfollow"}
+    assert specs["activity.follow"].input_schema["required"] == ["kind", "identifier"]
+    assert "activity_selection_ref" not in specs["activity.follow"].input_schema["properties"]
+    assert all("owner" not in item["signature"] and "chat_id" not in item["signature"]
+               for item in sdk.describe_methods() if item["name"] in names)
+
+
+def test_media_subscriptions_have_one_native_create_and_no_legacy_actions():
+    import importlib.util
+    from app import sdk
+    from app.agent.kernel.ports.sdk_effects import subscription_tools, automation_tools
+
+    assert {"subscriptions.list", "subscriptions.get", "subscriptions.create", "subscriptions.update", "subscriptions.delete",
+            "subscriptions.check_updates", "subscriptions.notification", "subscriptions.set_notification", "subscriptions.reset_notification", "subscriptions.today"} <= sdk.METHODS.keys()
+    assert "automation.create_media_rule" not in sdk.METHODS
+    assert {tool.name for tool in automation_tools()} == {"automation.set_digest"}
+    assert {tool.name for tool in subscription_tools()} == {"subscriptions.create", "subscriptions.update", "subscriptions.delete", "subscriptions.set_notification", "subscriptions.reset_notification"}
+    for name in ("actions", "queries", "policy", "common", "consumption_actions"):
+        assert importlib.util.find_spec("app.agent.domains.subscriptions." + name) is None

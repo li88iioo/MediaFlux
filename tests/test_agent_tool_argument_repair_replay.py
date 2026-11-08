@@ -5,14 +5,9 @@ from copy import deepcopy
 
 import pytest
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.conversation_context import restore_messages
-from app.agent.kernel.effects import PreparedEffect
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelMessage, ModelRequest
 from app.agent.kernel.persistence import SQLiteKernelStore
@@ -82,7 +77,7 @@ def make_session(model, store, executed, limits=None):
         executed.append(dict(arguments))
         return {'ok':True,'status':'success','summary':'已核验','data':{}}
     catalog = ToolCatalog([KernelToolSpec(name='lookup', domain='library', description='只读核验', input_schema={'type':'object','properties':{'query':{'type':'string'}},'required':['query']}, effect=ToolEffect.READ, read=handler)])
-    return AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=1,maximum=1), pipeline=ToolPipeline(catalog=catalog,state_store=store), state_store=store, **({'limits':limits} if limits else {}))
+    return AgentSession(model=model, catalog=catalog,  pipeline=ToolPipeline(catalog=catalog,state_store=store), state_store=store, **({'limits':limits} if limits else {}))
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
@@ -340,6 +335,29 @@ def test_duplicate_native_identity_and_invalid_private_reject(protocol):
     assert error is not None and not any(e.type is ModelEventType.FINISH for e in events)
 
 
+@pytest.mark.parametrize('mode', ['json', 'sse'])
+@pytest.mark.parametrize('reasoning', [None, ''])
+def test_chat_nullable_reasoning_does_not_block_argument_repair(mode, reasoning):
+    if mode == 'json':
+        data, kind = payload('chat_completions', mode)
+        value = json.loads(data)
+        value['choices'][0]['message']['reasoning_content'] = reasoning
+        response = encode(value).encode(), kind
+    else:
+        events = frames('chat_completions', RAW, final=RAW)
+        for event in events:
+            if isinstance(event, dict):
+                event['choices'][0]['delta']['reasoning_content'] = reasoning
+        response = event_wire(events)
+    events, error = asyncio.run(observe('chat_completions', response))
+    assert error is None
+    finish = next(event for event in events if event.type is ModelEventType.FINISH)
+    assert finish.provider_state is not None
+    assert finish.provider_state.layout() == ([] if reasoning is None else [{'type': 'reasoning_content', 'text': ''}])
+    call = next(event.tool_call for event in events if event.type is ModelEventType.TOOL_CALL_COMPLETED)
+    assert call is not None and call.argument_error == 'invalid_json'
+
+
 def test_unknown_tool_precedes_syntax_repair(store):
     async def run():
         executed=[]
@@ -409,7 +427,7 @@ def test_repeated_errors_exhaust_normal_budget(store):
         assert not executed
         assert events[-1].type is AgentEventType.TURN_FAILED
         assert events[-1].payload['code'] == 'invalid_arguments'
-        assert not transport.requests[-1].get('tools')
+        assert transport.requests[-1].get('tools')
         failures = [event.payload for event in events if event.type is AgentEventType.TOOL_FAILED]
         assert [(event['call_id'], event['code']) for event in failures] == [
             ('call-0', 'invalid_arguments'), ('call-1', 'invalid_arguments'),
@@ -592,7 +610,7 @@ def test_anthropic_bounded_invalid_json_rebuilds_original_history_once(mode, thi
             _assert_discarded_native_absent(request)
         phases = [event.payload['phase'] for event in events if event.type is AgentEventType.MODEL_STARTED]
         assert phases.count('answer_recovery') == 1
-        recovery_prompt = transport.requests[1]['system']
+        recovery_prompt = ''.join(block['text'] for block in transport.requests[1]['system'])
         assert '参数' in recovery_prompt and ('JSON' in recovery_prompt or '重建' in recovery_prompt)
         starts = [event for event in events if event.type is AgentEventType.TOOL_STARTED]
         assert len(starts) == 1
@@ -737,7 +755,6 @@ def test_anthropic_shared_parser_invalid_json_remains_strict(allow_argument_erro
 @pytest.mark.parametrize('mode', ['sse', 'json'])
 def test_anthropic_valid_object_missing_schema_directly_retries_read(mode, store):
     async def run():
-        from tests.error30_model_inputs import repair_entries
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
         blocks: list[dict[str, Any]] = [{'type': 'thinking', 'thinking': 'valid-schema-thinking', 'signature': 'valid-schema-signature'},
@@ -757,7 +774,7 @@ def test_anthropic_valid_object_missing_schema_directly_retries_read(mode, store
                    for event in events if event.type is AgentEventType.MODEL_STARTED)
         call = next(event.tool_call for event in recorder.rounds[0]['events'] if event.tool_call)
         assert call.arguments == {} and call.argument_error is None and call.raw_arguments is None
-        assert not repair_entries(transport.requests[1]), 'READ schema feedback must not offer repair authority'
+        assert 'agent__repair' not in json.dumps(transport.requests[1]), 'schema feedback uses ordinary direct retry'
         repaired = next(event.tool_call for event in recorder.rounds[1]['events'] if event.tool_call)
         assert repaired.name == 'lookup' and repaired.arguments == {'query': _NATIVE_NEW_QUERY}
         for request in transport.requests:
@@ -862,7 +879,7 @@ def test_anthropic_recovered_new_write_still_requires_its_own_confirmation(mode,
             _native_response(mode, [{'type': 'tool_use', 'id': _NATIVE_NEW_ID, 'name': 'update', 'input': arguments}]),
             _native_final(mode)])
         recorder = _NativeRoundRecorder(transport.adapter, cold, executed)
-        session = AgentSession(model=recorder, catalog=catalog, retriever=CapabilityRetriever(minimum=1, maximum=1),
+        session = AgentSession(model=recorder, catalog=catalog,
             pipeline=ToolPipeline(catalog=catalog, state_store=cold), state_store=cold)
         events = [event async for event in session.run(
             AgentInput(message='本轮准备新写操作', owner='owner', session_id=_NATIVE_SESSION))]

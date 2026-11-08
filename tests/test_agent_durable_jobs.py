@@ -8,16 +8,16 @@ from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.library.patrol_progress import empty_patrol_projection
-from app.agent.domains.system.jobs_actions import (
-    get_agent_job_status,
-    prepare_start_episode_audit,
-    start_episode_audit_arguments,
-    start_episode_audit_confirmed,
+from app.modules.library_patrol import empty_patrol_projection
+from app.modules.library_audit_jobs import (
+    audit_job,
+    prepare_start_audit,
+    start_audit,
 )
-from app.agent.errors import AgentToolError
-from app.agent.models import ToolContext, ToolResult
+from app.repositories.agent_jobs import AgentJobError
+from app.agent.models import ToolResult
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
+from app.modules.episode_audit import EpisodeAuditResult
 from tests.support import IsolatedDatabaseTestCase
 
 _AS_OF = "2026-08-09"
@@ -38,8 +38,8 @@ def _projection_json() -> str:
 
 def _result(
     *, ok: bool, status: str, checked: int = 0, continuation: bool = False
-) -> ToolResult:
-    return ToolResult(
+) -> EpisodeAuditResult:
+    return EpisodeAuditResult(
         ok=ok,
         status=status,
         summary=status,
@@ -394,13 +394,10 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         assert stored is not None
         self.assertEqual(stored["status"], "failed")
         self.assertEqual(stored["error_code"], "NotConfigured")
-        public = get_agent_job_status(
-            {"job_id": str(row["job_id"]), "limit": 5},
-            ToolContext(owner="owner-not-configured"),
-        )
-        self.assertFalse(public.ok)
-        self.assertEqual(public.status, "failed")
-        self.assertNotIn("暂未发现", public.summary)
+        public = audit_job(owner="owner-not-configured", **{"job_id": str(row["job_id"]), "limit": 5})
+        self.assertFalse(public["ok"])
+        self.assertEqual(public["status"], "failed")
+        self.assertNotIn("暂未发现", public["summary"])
 
     def test_unavailable_is_retried_and_inconclusive_is_a_valid_terminal_result(self):
         unavailable, _ = self._create(owner="owner-unavailable")
@@ -431,45 +428,33 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         )
         assert stored is not None
         self.assertEqual(stored["status"], "succeeded")
-        public = get_agent_job_status(
-            {"job_id": str(inconclusive["job_id"]), "limit": 5},
-            ToolContext(owner="owner-inconclusive"),
-        )
-        self.assertTrue(public.ok)
-        self.assertEqual(public.status, "inconclusive")
-        self.assertNotIn("暂未发现", public.summary)
+        public = audit_job(owner="owner-inconclusive", **{"job_id": str(inconclusive["job_id"]), "limit": 5})
+        self.assertTrue(public["ok"])
+        self.assertEqual(public["status"], "inconclusive")
+        self.assertNotIn("暂未发现", public["summary"])
 
     def test_confirmation_describes_full_scan_with_batch_limit_and_rejects_stale_replay(
         self,
     ):
-        arguments = start_episode_audit_arguments({"as_of": _AS_OF, "max_series": 2})
-        context = ToolContext(owner="owner-confirm")
-        preview, fingerprint = prepare_start_episode_audit(arguments, context)
-        self.assertIn("整个媒体库", preview.summary)
-        self.assertIn("每批最多 2 部", preview.summary)
-        self.assertIn("创建后台", preview.summary)
-        self.assertTrue(any("不会自动下载" in item for item in preview.data["effects"]))
-        self.assertTrue(
-            any("Jellyfin / Emby" in item for item in preview.data["effects"])
-        )
+        arguments = {"as_of": _AS_OF, "max_series": 2}
+        context = "owner-confirm"
+        preview, fingerprint = prepare_start_audit(owner=context, **arguments)
+        self.assertEqual(preview["data"]["max_series"], 2)
+        self.assertEqual(preview["data"]["as_of"], _AS_OF)
+        self.assertFalse(preview["data"]["reused"])
         wake = Mock()
         with patch(
-            "app.agent.domains.system.jobs_actions.get_agent_jobs_scheduler",
+            "app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler",
             return_value=Mock(wake=wake),
         ):
-            accepted = start_episode_audit_confirmed(arguments, fingerprint, context)
-        self.assertEqual(accepted.status, "accepted")
-        self.assertEqual(accepted.data["progress_total"], 0)
-        self.assertIn("整个媒体库", accepted.summary)
-        self.assertEqual(
-            accepted.effect_metadata["completion"],
-            {
-                "kind": "agent_job",
-                "job_id": accepted.data["job_id"],
-                "operation": "audit",
-            },
-        )
+            accepted = start_audit(owner=context, expected_snapshot=fingerprint, **arguments)
+        self.assertEqual(accepted["status"], "accepted")
+        self.assertIsNone(accepted["data"]["progress_total"])
+        row = db.get_agent_job(owner=context, job_id=accepted["data"]["job_id"])
+        assert row is not None
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(json.loads(row["input_json"]), arguments)
         wake.assert_called_once_with()
-        with self.assertRaises(AgentToolError) as stale:
-            start_episode_audit_confirmed(arguments, fingerprint, context)
+        with self.assertRaises(AgentJobError) as stale:
+            start_audit(owner=context, expected_snapshot=fingerprint, **arguments)
         self.assertEqual(stale.exception.code, "confirmation_stale")

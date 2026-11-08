@@ -294,6 +294,7 @@ class RuntimeLayoutTests(unittest.TestCase):
     def test_cli_pid_written_only_to_runtime_and_removed_even_on_server_error(self):
         import app.main
 
+        environment = dict(os.environ)
         for fail in (False, True):
             with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
                 paths = make_paths(Path(directory))
@@ -304,6 +305,7 @@ class RuntimeLayoutTests(unittest.TestCase):
                         raise OSError("server failed")
 
                 with (
+                    patch.dict(os.environ),
                     patch("app.cli.get_runtime_paths", return_value=paths),
                     patch("app.modules.backup.recover_pending_restore", return_value=False),
                     patch("app.modules.first_run.resolve_bind_host", return_value="127.0.0.1"),
@@ -317,6 +319,7 @@ class RuntimeLayoutTests(unittest.TestCase):
                     else:
                         self.assertEqual(main(["start", "--port", "1258"]), 0)
                 self.assertFalse(paths.pid_file.exists())
+                self.assertEqual(dict(os.environ), environment)
 
 
     def test_cli_configures_explicit_data_dir_before_importing_consumers(self):

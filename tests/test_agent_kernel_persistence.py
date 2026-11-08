@@ -15,7 +15,7 @@ from app.agent.kernel.persistence import (
 from app.agent.kernel.references import InMemoryReferenceStore, ReferenceError
 from app.agent.kernel.session_guard import session_scope_guard
 from app.agent.kernel.state import InMemorySessionStateStore
-from app.agent.kernel.state_types import StalePublicationError, StateUpdate
+from app.agent.kernel.state_types import StalePublicationError, StateUpdate, _PublicationFinished
 
 
 class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -431,6 +431,111 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["turn_id"], "turn-b")
+
+    async def test_active_journal_survives_count_current_writer_expiry_and_cold_store(self) -> None:
+        now = [10_000.0]
+        store = SQLiteKernelStore(secret_provider=lambda: "test-kernel-secret", clock=lambda: now[0],
+                                  max_events_per_session=10, event_retention_seconds=3_600)
+        lease, _ = await store.begin_turn(owner="owner", session_id="session", request_id="request")
+        await store.append_for_turn(AgentEvent(AgentEventType.TURN_STARTED, lease.session_id, lease.turn_id,
+            lease.request_id, 1, {"stream_display_enabled": True}), lease)
+        for sequence in range(2, 28):
+            await store.append_for_turn(AgentEvent(AgentEventType.MODEL_DELTA, lease.session_id, lease.turn_id,
+                lease.request_id, sequence, {"delta": str(sequence)}), lease)
+        now[0] += 3_601
+        store._events_since_global_prune = 127
+        await store.append_for_turn(AgentEvent(AgentEventType.MODEL_DELTA, lease.session_id, lease.turn_id,
+            lease.request_id, 28, {"delta": "still active"}), lease)
+        rebuilt = SQLiteKernelStore(secret_provider=lambda: "test-kernel-secret", clock=lambda: now[0],
+                                    max_events_per_session=10, event_retention_seconds=3_600)
+        events = await rebuilt.list_events(owner="owner", session_id="session", limit=1,
+                                          request_id=lease.request_id, turn_id=lease.turn_id)
+        self.assertEqual([event["sequence"] for event in events], list(range(1, 29)))
+        self.assertTrue(events[0]["payload"]["stream_display_enabled"])
+        self.assertEqual(len(await rebuilt.list_events(owner="owner", session_id="session", limit=3)), 3)
+        for sequence in range(29, 44):
+            await rebuilt.append_for_turn(AgentEvent(AgentEventType.MODEL_DELTA, lease.session_id, lease.turn_id,
+                lease.request_id, sequence, {"delta": "fresh"}), lease)
+        successor, _ = await rebuilt.begin_turn(owner="owner", session_id="session", request_id="successor")
+        await rebuilt.append_for_turn(AgentEvent(AgentEventType.TURN_STARTED, successor.session_id, successor.turn_id,
+            successor.request_id, 1), successor)
+        history = await rebuilt.list_events(owner="owner", session_id="session", request_id=lease.request_id,
+                                            turn_id=lease.turn_id)
+        self.assertEqual([event["sequence"] for event in history], list(range(34, 44)))
+        with self.assertRaises(StalePublicationError):
+            await rebuilt.append_for_turn(AgentEvent(AgentEventType.MODEL_DELTA, lease.session_id, lease.turn_id,
+                lease.request_id, 44, {"delta": "late"}), lease)
+
+    async def test_failure_without_lease_is_audited_when_session_state_signature_is_invalid(self) -> None:
+        lease, _ = await self.store.begin_turn(owner="owner", session_id="session", request_id="original")
+        owner_digest, session_digest = self.store._scope("owner", "session")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_kernel_sessions SET state_json='{}' WHERE owner_digest=? AND session_digest=?",
+                         (owner_digest, session_digest))
+        failure = AgentEvent(AgentEventType.TURN_FAILED, "session", "admission-failure", "rejected", 1,
+                             {"code": "admission_failed"})
+        await self.store.append(failure, owner="owner")
+        self.assertEqual([event["event_id"] for event in await self.store.list_events(owner="owner", session_id="session")],
+                         [failure.event_id])
+        with self.assertRaises(ValueError):
+            await self.store.append_for_turn(AgentEvent(AgentEventType.MODEL_DELTA, lease.session_id, lease.turn_id,
+                lease.request_id, 1, {"delta": "must reject"}), lease)
+
+    async def test_terminal_journal_restores_count_and_expiry_retention(self) -> None:
+        now = [10_000.0]
+        store = SQLiteKernelStore(secret_provider=lambda: "test-kernel-secret", clock=lambda: now[0],
+                                  max_events_per_session=10, event_retention_seconds=3_600)
+        for kind in (AgentEventType.TURN_COMPLETED, AgentEventType.TURN_FAILED, AgentEventType.TURN_CANCELLED):
+            with self.subTest(terminal=kind):
+                sid = "session-" + kind.value
+                lease, _ = await store.begin_turn(owner="owner", session_id=sid, request_id="request")
+                for sequence in range(1, 19):
+                    await store.append_for_turn(AgentEvent(AgentEventType.MODEL_DELTA, sid, lease.turn_id,
+                        lease.request_id, sequence, {"delta": str(sequence)}), lease)
+                self.assertEqual(len(await store.list_events(owner="owner", session_id=sid,
+                    request_id=lease.request_id, turn_id=lease.turn_id)), 18)
+                if kind is AgentEventType.TURN_CANCELLED:
+                    self.assertTrue(await store.cancel_publication(owner="owner", session_id=sid, request_id=lease.request_id))
+                await store.append_for_turn(AgentEvent(kind, sid, lease.turn_id, lease.request_id, 19), lease)
+                events = await store.list_events(owner="owner", session_id=sid,
+                                                request_id=lease.request_id, turn_id=lease.turn_id)
+                self.assertEqual([event["sequence"] for event in events], list(range(10, 20)))
+                if kind is not AgentEventType.TURN_CANCELLED:
+                    await store.commit(lease, updates=(_PublicationFinished("", None),))
+                await store.append(AgentEvent(AgentEventType.TOOL_COMPLETED, sid, "history-turn", "history-request", 1), owner="owner")
+                self.assertEqual(len(await store.list_events(owner="owner", session_id=sid)), 10)
+                now[0] += 3_601
+                store._events_since_global_prune = 127
+                await store.append(AgentEvent(AgentEventType.TOOL_COMPLETED, "trigger", "trigger-turn-" + kind.value,
+                    "trigger-request", 1), owner="third")
+                self.assertEqual(await store.list_events(owner="owner", session_id=sid), [])
+
+    async def test_directed_journal_read_keeps_history_window_and_validates_signed_identity(self) -> None:
+        lease, _ = await self.store.begin_turn(owner="owner", session_id="session", request_id="request")
+        events = [AgentEvent(AgentEventType.MODEL_DELTA, lease.session_id, lease.turn_id, lease.request_id,
+                            sequence, {"delta": str(sequence)}) for sequence in (3, 1, 2)]
+        for event in events:
+            await self.store.append_for_turn(event, lease)
+        directed = await self.store.list_events(owner="owner", session_id="session", limit=1,
+            request_id=lease.request_id, turn_id=lease.turn_id)
+        self.assertEqual([event["sequence"] for event in directed], [1, 2, 3])
+        self.assertEqual(len(await self.store.list_events(owner="owner", session_id="session", limit=1)), 1)
+        for owner, sid, request, turn in (("other", "session", lease.request_id, lease.turn_id),
+                ("owner", "other", lease.request_id, lease.turn_id),
+                ("owner", "session", "other", lease.turn_id), ("owner", "session", lease.request_id, "other")):
+            self.assertEqual(await self.store.list_events(owner=owner, session_id=sid, request_id=request, turn_id=turn), [])
+        for request, turn in ((lease.request_id, ""), ("", lease.turn_id)):
+            with self.assertRaises(ValueError):
+                await self.store.list_events(owner="owner", session_id="session", request_id=request, turn_id=turn)
+        forged = AgentEvent(AgentEventType.MODEL_DELTA, "session", "other-turn", "other-request", 4, {"delta": "private"})
+        await self.store.append(forged, owner="owner")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_kernel_events SET event_json='{}' WHERE event_id=?", (events[2].event_id,))
+            conn.execute("UPDATE agent_kernel_events SET turn_id=?,request_id=? WHERE event_id=?",
+                         (lease.turn_id, lease.request_id, forged.event_id))
+        restored = await self.store.list_events(owner="owner", session_id="session",
+            request_id=lease.request_id, turn_id=lease.turn_id)
+        self.assertEqual([event["sequence"] for event in restored], [1, 3])
 
     async def test_session_listing_reset_and_delete_are_owner_scoped(self) -> None:
         lease, _ = await self.store.begin_turn(

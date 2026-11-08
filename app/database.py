@@ -48,7 +48,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 40
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -598,6 +598,8 @@ def init_db() -> None:
                     database_migrations._migrate_rss_delivery_ownership_v36(connection)
                 if previous_schema_version == 0:
                     database_migrations._migrate_manual_episode_confirmations_v37(connection)
+                    database_migrations._migrate_download_verification_targets_v38(connection)
+                    database_migrations._migrate_missing_resource_source_v40(connection)
 
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
@@ -1192,10 +1194,12 @@ def list_organize_root_identities(media_root_path: str) -> list[sqlite3.Row]:
     branch = prefix + "/"
     with get_conn() as conn:
         return conn.execute(
-            "SELECT DISTINCT media_type,provider,external_id,tmdb_id FROM ("
-            "SELECT media_type,provider,external_id,tmdb_id FROM organize_log "
+            "SELECT DISTINCT media_type,provider,external_id,tmdb_id,"
+            "CASE WHEN provider IN ('metatube','clean_title') THEN title ELSE '' END AS title,"
+            "CASE WHEN provider IN ('metatube','clean_title') THEN current_name ELSE '' END AS current_name FROM ("
+            "SELECT media_type,provider,external_id,tmdb_id,title,current_name FROM organize_log "
             "WHERE status='success' AND new_path=? UNION ALL "
-            "SELECT media_type,provider,external_id,tmdb_id FROM organize_log "
+            "SELECT media_type,provider,external_id,tmdb_id,title,current_name FROM organize_log "
             "WHERE status='success' AND new_path>=? AND new_path<?)",
             (prefix, branch, branch + "\U0010ffff"),
         ).fetchall()
@@ -1374,47 +1378,41 @@ def count_organize_timeline_by_status(*, owner: str = "admin") -> dict[str, int]
     return counts
 
 
-def get_agent_organize_audit(
-    *, owner: str = "admin", origin: str = "all", status: str = "all", limit: int = 10
+def organize_history_page(
+    *, owner: str = "admin", origin: str = "all", status: str = "all",
+    keyword: str = "", limit: int = 50, offset: int = 0,
 ) -> dict[str, Any]:
-    """为 Agent 返回整理时间线的固定脱敏视图，不暴露路径、标识或错误正文。"""
-    normalized_status = (status or "all").strip().lower()
-    if normalized_status not in _TIMELINE_STATUS_VALUES | {"all"}:
-        raise ValueError("不支持的整理状态")
-    safe_limit = max(1, min(limit, 50))
+    """与日志页面共用状态/来源口径，在同一读快照内汇总和分页。"""
+    if not all(isinstance(value, str) for value in (origin, status, keyword)):
+        raise ValueError("origin、status、keyword 必须是字符串")
+    if type(limit) is not int or limit < 1 or type(offset) is not int or offset < 0:
+        raise ValueError("limit 必须为正整数，offset 必须为非负整数")
+    normalized_status = status.strip().lower()
     base_sql, params = _organize_timeline_query(
-        owner=owner,
-        origin=origin,
-        status="" if normalized_status == "all" else normalized_status,
+        owner=owner, origin=origin,
+        status="" if normalized_status == "all" else normalized_status, keyword=keyword,
     )
     with get_conn() as conn:
-        total = int(
-            conn.execute(f"SELECT COUNT(*) FROM ({base_sql})", params).fetchone()[0]
-        )
+        conn.execute("BEGIN")
         origin_rows = conn.execute(
-            f"SELECT origin, COUNT(*) AS count FROM ({base_sql}) GROUP BY origin",
-            params,
+            f"SELECT origin, COUNT(*) AS count FROM ({base_sql}) GROUP BY origin", params,
         ).fetchall()
         status_rows = conn.execute(
-            f"SELECT status, COUNT(*) AS count FROM ({base_sql}) GROUP BY status",
-            params,
+            f"SELECT status, COUNT(*) AS count FROM ({base_sql}) GROUP BY status", params,
         ).fetchall()
         rows = conn.execute(
-            "SELECT origin,status,title,media_type,year,season,episode,updated_at "
-            f"FROM ({base_sql}) ORDER BY updated_at DESC, origin DESC, id DESC LIMIT ?",
-            [*params, safe_limit + 1],
+            f"SELECT * FROM ({base_sql}) ORDER BY updated_at DESC, origin DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
         ).fetchall()
-
+    total = sum(int(row["count"]) for row in origin_rows)
+    returned = len(rows)
+    more = offset + returned < total
     return {
-        "total": total,
-        "by_origin": {
-            str(row["origin"]): int(row["count"] or 0) for row in origin_rows
-        },
-        "by_status": {
-            str(row["status"]): int(row["count"] or 0) for row in status_rows
-        },
-        "records": [dict(row) for row in rows[:safe_limit]],
-        "truncated": len(rows) > safe_limit,
+        "total": total, "returned": returned, "offset": offset, "limit": limit,
+        "has_more": more, "next_offset": offset + returned if more else None,
+        "by_origin": {str(row["origin"]): int(row["count"]) for row in origin_rows},
+        "by_status": {str(row["status"]): int(row["count"]) for row in status_rows},
+        "items": [dict(row) for row in rows],
     }
 
 
@@ -1844,6 +1842,36 @@ def purge_expired_agent_task_history(
         }
 
 
+def media_owner_digest(owner: str) -> str:
+    """媒体偏好、审计及回退凭证的既有主体分区；保留历史 HMAC 域。"""
+    normalized = (owner or "").strip()
+    if not normalized:
+        raise ValueError("无法确认当前 Agent 身份")
+    from app.modules.web_secret import get_web_secret
+
+    return hmac.new(
+        get_web_secret().encode("utf-8"),
+        b"mediaflux-agent-action-history:v1\0" + normalized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def native_agent_owner_digest(owner: str, *, secret: bytes | None = None) -> str:
+    """与 native KernelStore 使用同一 owner 身份域，不需要运行时实例。"""
+    normalized = (owner or "").strip()
+    if not normalized or len(normalized) > 512:
+        raise ValueError("Agent Kernel scope 无效")
+    from app.modules.web_secret import get_web_secret
+
+    if secret is None:
+        secret = (get_web_secret() or "").encode("utf-8")
+    if not secret:
+        raise ValueError("Agent Kernel 持久化密钥不可用")
+    return hmac.new(
+        secret, b"owner:v1\0" + normalized.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
 def purge_agent_subject_data(
     *, owner: str, principal: str | None = None
 ) -> dict[str, int]:
@@ -1862,9 +1890,8 @@ def purge_agent_subject_data(
         ).hexdigest()
 
     digests = {
-        "action_history": digest(
-            b"mediaflux-agent-action-history:v1\0", normalized_owner
-        ),
+        "native": native_agent_owner_digest(normalized_owner),
+        "action_history": media_owner_digest(normalized_owner),
         "session_context": digest(
             b"mediaflux-agent-session-context:v1\0", normalized_owner
         ),
@@ -1884,7 +1911,21 @@ def purge_agent_subject_data(
     deleted: dict[str, int] = {}
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        # 删除内容但保留发布代际下界；同名会话重建不能重新接受清理前的 lease。
+        conn.execute(
+            "INSERT INTO agent_kernel_session_epochs("
+            "owner_digest,session_digest,generation,updated_at) "
+            "SELECT owner_digest,session_digest,generation,? FROM agent_kernel_sessions "
+            "WHERE owner_digest=? ON CONFLICT(owner_digest,session_digest) DO UPDATE SET "
+            "generation=MAX(agent_kernel_session_epochs.generation,excluded.generation),"
+            "updated_at=excluded.updated_at",
+            (time.time(), digests["native"]),
+        )
         for key, table, column in (
+            ("kernel_sessions", "agent_kernel_sessions", "owner_digest"),
+            ("kernel_refs", "agent_kernel_refs", "owner_digest"),
+            ("kernel_events", "agent_kernel_events", "owner_digest"),
+            ("skills", "agent_skill_revisions", "owner_digest"),
             ("action_history", "agent_action_history", "owner_digest"),
             ("media_preferences", "agent_media_preferences", "owner_digest"),
             ("session_context", "agent_session_context", "owner_digest"),
@@ -1898,6 +1939,10 @@ def purge_agent_subject_data(
             ("conversation_epochs", "agent_conversation_epochs", "principal_digest"),
         ):
             digest_key = {
+                "kernel_sessions": "native",
+                "kernel_refs": "native",
+                "kernel_events": "native",
+                "skills": "native",
                 "media_preferences": "action_history",
                 "confirmation_epochs": "confirmations",
                 "session_context_epochs": "session_context",
@@ -2055,13 +2100,13 @@ from app.repositories.rss import (  # noqa: E402,F401
     RSSEntryPage,
     add_rss_entry_with_media,
     add_rss_subscription,
-    claim_pending_rss_qb_entries,
+    claim_pending_rss_entries,
     claim_retryable_failed_rss_entries,
     claim_rss_entry,
     count_rss_downloaded_entries_since,
     delete_rss_subscription,
     find_rss_subscriptions_by_normalized_name,
-    get_pending_rss_qb_snapshot,
+    get_pending_rss_snapshot,
     get_retryable_failed_rss_snapshot,
     get_rss_diagnostic_summary,
     get_rss_entries_by_ids,
@@ -2080,6 +2125,7 @@ from app.repositories.rss import (  # noqa: E402,F401
     record_rss_entry_failure,
     recover_stale_submitting_rss_entries,
     rss_retry_entry_snapshot,
+    rss_pending_entry_snapshot,
     skip_pending_rss_entries,
     update_rss_entries_processed,
     update_rss_entries_processed_snapshot,
@@ -2440,29 +2486,6 @@ def list_strm_failures(
     with get_conn() as conn:
         return conn.execute(
             f"SELECT * FROM strm_failures{where} ORDER BY id DESC LIMIT ?{offset_sql}",
-            values,
-        ).fetchall()
-
-
-def get_strm_failure_retry_snapshot(
-    *,
-    action: str = "",
-    limit: int = 101,
-) -> list[sqlite3.Row]:
-    """返回确认绑定所需的最小失败项快照，不读取路径、文件名或错误正文。"""
-    if action not in {"", "generate", "metadata"}:
-        raise ValueError("STRM failure retry action must be generate or metadata")
-    clauses = ["status='open'", "action IN ('generate','metadata')"]
-    values: list[object] = []
-    if action:
-        clauses.append("action=?")
-        values.append(action)
-    values.append(max(1, min((limit or 101), 1000)))
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT id,action,failure_count,retry_count,updated_at FROM strm_failures WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY id DESC LIMIT ?",
             values,
         ).fetchall()
 
@@ -3952,16 +3975,31 @@ def finish_task_run(
         )
 
 
-def list_task_runs(task_name: str = "", limit: int = 20) -> list[sqlite3.Row]:
-    sql = "SELECT * FROM task_runs WHERE 1=1"
-    params: list = []
+def query_task_runs_page(
+    task_name: str = "", *, status: str = "", limit: int = 50, offset: int = 0,
+) -> dict[str, Any]:
+    """同一SQLite读快照内先过滤、统计再分页；limit沿用SQLite语义，业务入口校验参数。"""
+    clauses, params = [], []
     if task_name:
-        sql += " AND task_name=?"
+        clauses.append("task_name=?")
         params.append(task_name)
-    sql += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
+    if status:
+        clauses.append("LOWER(TRIM(status))=?")
+        params.append(status.strip().casefold())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
     with get_conn() as conn:
-        return conn.execute(sql, params).fetchall()
+        conn.execute("BEGIN")
+        total = int(conn.execute("SELECT COUNT(*) FROM task_runs" + where, params).fetchone()[0])
+        rows = conn.execute("SELECT * FROM task_runs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+                            [*params, limit, offset]).fetchall()
+    returned = len(rows)
+    has_more = max(0, offset) + returned < total
+    return {"items": rows, "total": total, "returned": returned, "has_more": has_more,
+            "next_offset": max(0, offset) + returned if has_more and returned else None}
+
+
+def list_task_runs(task_name: str = "", limit: int = 20) -> list[sqlite3.Row]:
+    return query_task_runs_page(task_name, limit=limit)["items"]
 
 
 # ===== Agent 受确认动作审计 =====
@@ -4130,19 +4168,19 @@ def add_agent_action_history(
 
 
 def list_agent_action_history(
-    *, owner_digest: str, limit: int = 20, outcome: str = "all"
+    *, owner_digest: str, limit: int = 20, outcome: str = "all", before_id: int | None = None
 ) -> list[sqlite3.Row]:
     """倒序读取 Agent 动作审计；只支持固定结果分类与有界条数。"""
     normalized_owner = (owner_digest or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", normalized_owner):
         raise ValueError("Agent 审计身份摘要无效")
-    if limit < 1 or limit > 50:
-        raise ValueError("Agent 审计查询条数必须为 1 到 50")
+    if type(limit) is not int or not 1 <= limit <= 501:
+        raise ValueError("Agent 审计查询条数必须为 1 到 501")
     normalized_outcome = (outcome or "all").strip().lower()
     if normalized_outcome not in {"all", "success", "failed"}:
         raise ValueError("Agent 审计结果筛选无效")
     sql = (
-        "SELECT tool_name,risk,status,ok,mode,summary,safe_details,error_code,"
+        "SELECT id,tool_name,risk,status,ok,mode,summary,safe_details,error_code,"
         "elapsed_ms,started_at,finished_at FROM agent_action_history "
         "WHERE owner_digest=?"
     )
@@ -4151,6 +4189,11 @@ def list_agent_action_history(
         sql += " AND ok=1"
     elif normalized_outcome == "failed":
         sql += " AND ok=0 AND status NOT IN ('executing','outcome_unknown')"
+    if before_id is not None:
+        if type(before_id) is not int or before_id <= 0:
+            raise ValueError("Agent 审计游标必须是正整数")
+        sql += " AND id<?"
+        params.append(before_id)
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
     with get_conn() as conn:
@@ -4333,7 +4376,6 @@ from app.repositories.local_media import (  # noqa: E402,F401
     _bind_qb_hash_to_active_local_media_task,
     _canonical_local_media_content_path,
     _latest_terminal_local_media_task_for_path,
-    _local_media_age_bucket_sql,
     _local_media_owner,
     _local_media_source_has_active_task,
     _local_media_target_signature,
@@ -4349,8 +4391,6 @@ from app.repositories.local_media import (  # noqa: E402,F401
     delete_local_media_source,
     delete_local_media_tasks,
     get_local_media_diagnostic_summary,
-    get_local_media_history_summary,
-    get_local_media_review_queue_summary,
     get_local_media_source,
     get_local_media_task,
     list_download_requests_for_local_media_task,
@@ -4375,102 +4415,63 @@ from app.repositories.local_media import (  # noqa: E402,F401
 )
 
 
-def _agent_workspace_title_pattern(query: str) -> str:
-    """为 Agent 标题搜索转义 LIKE 通配符，避免把用户输入解释为查询语法。"""
-    value = (
-        (query or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    )
+def _workspace_title_pattern(query: str) -> str:
+    value = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{value}%"
 
 
-def _agent_workspace_search_rows(sql: str, query: str, limit: int) -> dict[str, Any]:
-    safe_limit = max(1, min(limit, 20))
+def _workspace_search_rows(sql: str, parameters: tuple, limit: int, offset: int) -> dict[str, Any]:
+    if type(limit) is not int or not 1 <= limit <= 50 or type(offset) is not int or offset < 0:
+        raise ValueError("limit 必须为1–50，offset必须为非负整数")
     with get_conn() as conn:
-        rows = conn.execute(
-            sql, (_agent_workspace_title_pattern(query), safe_limit + 1)
-        ).fetchall()
-    return {
-        "items": [dict(row) for row in rows[:safe_limit]],
-        "truncated": len(rows) > safe_limit,
-    }
+        rows = conn.execute(sql, (*parameters, limit + 1, offset)).fetchall()
+    items = [dict(row) for row in rows[:limit]]
+    more = len(rows) > limit
+    return {"items": items, "has_more": more, "next_offset": offset + len(items) if more else None}
 
 
-def search_agent_workspace_rss(query: str, *, limit: int = 8) -> dict[str, Any]:
-    """仅按 RSS 标题搜索并读取公开状态字段。"""
-    return _agent_workspace_search_rows(
-        "SELECT title,status,processed,pub_date,created_at FROM rss_entries "
-        "WHERE title LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
-        query,
-        limit,
+def search_workspace_rss(query: str, *, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    return _workspace_search_rows(
+        "SELECT id,rss_item_id,title,status,processed,pub_date,created_at FROM rss_entries "
+        "WHERE title LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ? OFFSET ?",
+        (_workspace_title_pattern(query),), limit, offset,
     )
 
 
-def search_agent_workspace_downloads(
-    query: str, *, limit: int = 8
-) -> dict[str, Any]:
-    """仅按下载标题搜索；不读取路径、任务标识、源值或错误正文。"""
-    safe_limit = max(1, min(limit, 20))
-    pattern = _agent_workspace_title_pattern(query)
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT title,"
-            "CASE WHEN source='qb' THEN 'qb' WHEN source='guangya' THEN 'guangya' ELSE 'download' END AS source,"
-            "status,progress,created_at FROM download_log "
-            "WHERE COALESCE(title,'') LIKE ? ESCAPE '\\' "
-            "UNION ALL "
-            "SELECT title,"
-            "CASE WHEN targets='qb' THEN 'qb' WHEN targets='guangya' THEN 'guangya' "
-            "WHEN targets='both' THEN 'both' ELSE 'download' END AS source,"
-            "status,0 AS progress,created_at FROM download_requests "
-            "WHERE COALESCE(title,'') LIKE ? ESCAPE '\\' "
-            "ORDER BY created_at DESC LIMIT ?",
-            (pattern, pattern, safe_limit + 1),
-        ).fetchall()
-    return {
-        "items": [dict(row) for row in rows[:safe_limit]],
-        "truncated": len(rows) > safe_limit,
-    }
+def search_workspace_downloads(query: str, *, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    pattern = _workspace_title_pattern(query)
+    return _workspace_search_rows(
+        "SELECT id,'log' AS record_type,request_id,title,"
+        "CASE WHEN source='qb' THEN 'qb' WHEN source='guangya' THEN 'guangya' ELSE 'download' END AS source,"
+        "status,progress,created_at FROM download_log WHERE COALESCE(title,'') LIKE ? ESCAPE '\\' "
+        "UNION ALL SELECT id,'request' AS record_type,id AS request_id,title,"
+        "CASE WHEN targets='qb' THEN 'qb' WHEN targets='guangya' THEN 'guangya' "
+        "WHEN targets='both' THEN 'both' ELSE 'download' END AS source,"
+        "status,0 AS progress,created_at FROM download_requests WHERE COALESCE(title,'') LIKE ? ESCAPE '\\' "
+        "ORDER BY created_at DESC,record_type,id DESC LIMIT ? OFFSET ?",
+        (pattern, pattern), limit, offset,
+    )
 
 
-def search_agent_workspace_organize(query: str, *, limit: int = 8) -> dict[str, Any]:
-    """仅按已识别标题搜索整理历史；不读取文件名、路径、ID 或错误正文。"""
-    safe_limit = max(1, min(limit, 20))
-    pattern = _agent_workspace_title_pattern(query)
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT title,media_type,year,season,episode,status,created_at,"
-            "CASE WHEN source='guangya' THEN 'guangya' ELSE 'organize' END AS source "
-            "FROM organize_log WHERE COALESCE(title,'') LIKE ? ESCAPE '\\' "
-            "OR (COALESCE(title,'')='' AND COALESCE(original_name,'') LIKE ? ESCAPE '\\') "
-            "ORDER BY id DESC LIMIT ?",
-            (pattern, pattern, safe_limit + 1),
-        ).fetchall()
-    return {
-        "items": [dict(row) for row in rows[:safe_limit]],
-        "truncated": len(rows) > safe_limit,
-    }
+def search_workspace_organize(query: str, *, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    pattern = _workspace_title_pattern(query)
+    return _workspace_search_rows(
+        "SELECT id,file_id,title,media_type,year,season,episode,status,created_at,"
+        "CASE WHEN source='guangya' THEN 'guangya' ELSE 'organize' END AS source "
+        "FROM organize_log WHERE COALESCE(title,'') LIKE ? ESCAPE '\\' "
+        "OR (COALESCE(title,'')='' AND COALESCE(original_name,'') LIKE ? ESCAPE '\\') "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (pattern, pattern), limit, offset,
+    )
 
 
-def search_agent_workspace_local_media(
-    query: str, *, owner: str = "admin", limit: int = 8
-) -> dict[str, Any]:
-    """仅按本地媒体任务标题搜索安全状态字段。"""
-    safe_limit = max(1, min(limit, 20))
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT title,media_type,year,status,trigger,created_at,updated_at "
-            "FROM local_media_tasks WHERE owner=? "
-            "AND COALESCE(title,'') LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
-            (
-                _local_media_owner(owner),
-                _agent_workspace_title_pattern(query),
-                safe_limit + 1,
-            ),
-        ).fetchall()
-    return {
-        "items": [dict(row) for row in rows[:safe_limit]],
-        "truncated": len(rows) > safe_limit,
-    }
+def search_workspace_local_media(query: str, *, owner: str = "admin", limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    return _workspace_search_rows(
+        "SELECT id,source_id,title,media_type,year,status,trigger,created_at,updated_at "
+        "FROM local_media_tasks WHERE owner=? AND COALESCE(title,'') LIKE ? ESCAPE '\\' "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (_local_media_owner(owner), _workspace_title_pattern(query)), limit, offset,
+    )
 
 
 def claim_agent_action_lease(lease_key: str, *, ttl_seconds: int = 90) -> str | None:

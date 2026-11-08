@@ -565,9 +565,9 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                 engine = RSSEngine()
                 batch = engine.download_many(entries[1:3])
                 snapshot = engine.submit_snapshot(
-                    [dict(row) for row in db.get_pending_rss_qb_snapshot()],
+                    [dict(row) for row in db.get_pending_rss_snapshot()],
                     {'url': 'http://qb.local', 'default_method': 'qb'},
-                    claim=db.claim_pending_rss_qb_entries,
+                    claim=db.claim_pending_rss_entries,
                 )
                 self.assertEqual((batch['pending_count'], batch['success_count'], batch['existing_count'], batch['failure_count']), (2, 0, 0, 0))
                 self.assertEqual((snapshot['pending'], snapshot['submitted'], snapshot['failed']), (1, 0, 0))

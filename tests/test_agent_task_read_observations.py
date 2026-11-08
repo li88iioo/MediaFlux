@@ -1,4 +1,5 @@
 """F09：事后 READ 回执显式关联；共用配置账本、SQLite CAS 和真实 Kernel。"""
+from tests.agent_task_native_helpers import task_call, returned_task
 from typing import Any
 
 import asyncio
@@ -12,33 +13,39 @@ from unittest.mock import patch
 import pytest
 
 from app.agent.kernel import bootstrap, task_state
-from app.agent.kernel.bootstrap import build_agent_kernel_runtime
-from app.agent.kernel.capabilities import CapabilityRetriever, ToolCatalog
+from app.agent.kernel.bootstrap import build_agent_kernel_runtime, build_tool_catalog
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.conversation_state import retain_conversation
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import catalog_from_tool_specs
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolResult
-from app.agent.provider_actions import get_provider_gateway
-from app.agent.provider_models import ProviderProfileView
 from tests.test_agent_kernel_core import ScriptedModel, read_tool
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_task_cas import command, observe
 from tests.test_agent_task_cas import task_store as isolated_store
-from tests.test_agent_task_first_slice import OWNER, declaration
+from tests.test_agent_task_first_slice import OWNER, declaration, configuration_call
 from tests.test_agent_tool_argument_ingress import Wire
 
 GOAL = "观察 TMDB 配置，读取 Jellyfin 库名和类型；仅观察、不修改。"
-TOOL = "provider.query"
-ARGS = {"profile_ref": "media:1", "operation": "media.libraries.list", "arguments": {}}
-OTHER = {**ARGS, "operation": "media.items.counts"}
+TOOL = "fixture.library_read"
+ARGS = {"query": "libraries"}
+OTHER = {"query": "counts"}
 SUMMARY = "读取到 Jellyfin 库名和类型"
 SUCCESS = {"ok": True, "status": "success", "summary": SUMMARY, "data": {"items": []}}
 task_store = isolated_store
+
+
+def library_read(handler, *, parallel=False):
+    return replace(
+        read_tool(TOOL, handler=handler),
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"], "additionalProperties": False},
+        metadata={"parallel_read": parallel},
+    )
 
 
 def declared(*, mixed=False, goals=("libraries",)):
@@ -92,6 +99,7 @@ def reads(task):
 
 
 def tool_round(calls):
+    calls = [configuration_call(tool, args) if tool == "diagnostics.component" else (tool, args) for tool, args in calls]
     return [*(ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
         f"call-{index}-{tool}", tool, args,
     )) for index, (tool, args) in enumerate(calls)),
@@ -102,8 +110,8 @@ class TaskModel(ScriptedModel):
     """复用脚本模型，只在收到实际回执后生成 checkpoint；不代替任务执行器。"""
 
     def __init__(self, calls, *, goals=()):
-        super().__init__([tool_round([("agent.capabilities", {
-            "tool_names": ["agent.task", TOOL, "config.explain_component"],
+        super().__init__([tool_round([("agent.run_code", {
+            "language": "shell", "code": "mf session.checkpoint_task --help",
         })]), tool_round(calls)])
         self.goals = goals
 
@@ -111,13 +119,13 @@ class TaskModel(ScriptedModel):
         if not self.rounds:
             if self.goals is not None:
                 outputs = [json.loads(m.content) for m in request.messages if m.role == "tool"]
-                task = next(v["task"] for v in reversed(outputs) if v.get("task"))
+                task = next(t for v in reversed(outputs) if (t := returned_task(v)))
                 facts = [f for f in reads(task) if f["tool"] == TOOL]
                 args: dict[str, Any] = {"operation": "checkpoint", "blockers": [],
                         "evidence_ids": [f["evidence_id"] for f in task["verified_facts"]]}
                 if self.goals:
                     args["read_evidence"] = dict(zip(self.goals, [f["evidence_id"] for f in facts]))
-                self.rounds.append(tool_round([("agent.task", args)]))
+                self.rounds.append(tool_round([task_call(args)]))
             self.rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="已报告观察，不推断全量或写入完成。"),
                                 ModelEvent(ModelEventType.FINISH, finish_reason="stop")])
         async for event in super().stream(request, cancellation=cancellation):
@@ -134,15 +142,15 @@ def no_network(monkeypatch):
 
 @pytest.fixture
 def backend(task_store, monkeypatch):
-    gateway = get_provider_gateway()
-    profile = ProviderProfileView("media:1", "media", "fixture Jellyfin", "online")
-    monkeypatch.setattr(gateway, "profiles", lambda provider="": [profile] if provider in ("", "media") else [])
     calls = []
-
-    def query(*, context, **arguments):
+    def query(arguments, context):
         calls.append(deepcopy(arguments))
         return ToolResult(**deepcopy(SUCCESS))
-    monkeypatch.setattr(gateway, "query", query)
+    def catalog():
+        original = build_tool_catalog()
+        original.register(library_read(query))
+        return original
+    monkeypatch.setattr(bootstrap, "build_tool_catalog", catalog)
     return calls
 
 
@@ -154,6 +162,7 @@ async def seed(store, value):
 async def turn(store, calls, *, goals=(), message=GOAL):
     model = TaskModel(calls, goals=goals)
     runtime = build_agent_kernel_runtime(model=model, store=store)
+    runtime.session.model_tools = (runtime.session.model_tools or frozenset()) | {TOOL}
     events = [e async for e in runtime.session.run(AgentInput(message=message, owner=OWNER, session_id="cas"))]
     saved = await store.load(owner=OWNER, session_id="cas")
     assert not any(e.type.value == "tool.failed" for e in events)
@@ -164,7 +173,7 @@ async def turn(store, calls, *, goals=(), message=GOAL):
 def test_configuration_history_and_two_domain_cold_recovery(task_store, backend, configuration_first):
     async def run():
         await seed(task_store, declared(mixed=True))
-        config_call = ("config.explain_component", {"component": "tmdb"})
+        config_call = ("diagnostics.component", {"component": "tmdb"})
         first = config_call if configuration_first else (TOOL, ARGS)
         second = (TOOL, ARGS) if configuration_first else config_call
         saved, _, events = await turn(task_store, [first], goals=() if configuration_first else ("libraries",))
@@ -185,9 +194,14 @@ def test_configuration_history_and_two_domain_cold_recovery(task_store, backend,
         assert all(f in final["verified_facts"] for f in task["verified_facts"] if any(
             f["evidence_id"] in o["evidence_ids"] for o in task["obligations"]))
         assert GOAL in json.dumps(asdict(model.requests[0]), ensure_ascii=False)
-        assert backend == [ARGS]
+        assert [{k:a[k] for k in ARGS} for a in backend] == [ARGS]
         business_calls = [e.payload["tool"] for e in events if e.type.value == "tool.started" and not e.payload["tool"].startswith("agent.")]
-        assert business_calls == [second[0]]
+        if second[0] == "diagnostics.component":
+            sdk_calls = [call["method"] for event in events if event.type.value == "tool.completed"
+                         for call in event.payload["result"].get("data", {}).get("sdk_calls", [])]
+            assert sdk_calls == [second[0], "session.checkpoint_task"] and business_calls == []
+        else:
+            assert business_calls == [second[0]]
         [configuration] = [f for f in final["verified_facts"] if f.get("component") == "tmdb"]
         assert configuration["verifier_version"] == "configuration-v1"
     asyncio.run(run())
@@ -300,18 +314,17 @@ def test_same_round_tracked_reads_keep_both_receipts_and_ordinary_reads_stay_par
                 return ToolResult(**deepcopy(SUCCESS))
             finally:
                 active -= 1
-        def catalog(specs):
-            original = catalog_from_tool_specs(specs)
-            return ToolCatalog([replace(original.get(s.name), read=handler, metadata={
-                **original.get(s.name).metadata, "parallel_read": True,
-            }) if s.name == TOOL else original.get(s.name) for s in specs])
+        def catalog():
+            original = build_tool_catalog()
+            original.register(library_read(handler, parallel=True))
+            return original
         if mode != "untracked":
             await seed(task_store, declared(mixed=mode == "configuration-only",
                                            goals=() if mode == "configuration-only" else ("libraries", "counts")))
-        with patch.object(bootstrap, "catalog_from_tool_specs", catalog):
+        with patch.object(bootstrap, "build_tool_catalog", catalog):
             saved, _, events = await turn(task_store, [(TOOL, ARGS), (TOOL, OTHER)],
                                          goals=("libraries", "counts") if mode == "tracked" else None)
-        assert calls == [ARGS, OTHER] and active == 0
+        assert [{k:a[k] for k in ARGS} for a in calls] == [ARGS, OTHER] and active == 0
         assert peak == (1 if mode == "tracked" else 2)
         if mode == "tracked":
             task = saved.metadata["task"]
@@ -358,7 +371,7 @@ def test_short_model_data_survives_task_receipt_through_native_wire_and_cold_sql
             reply("chat_completions", text="已依据实际观察回答。"),
         ])
         session = AgentSession(model=wire.adapter, catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            model_tools=[tool.name],
             pipeline=ToolPipeline(catalog=catalog, state_store=task_store), state_store=task_store)
         completed = []
         async for event in session.run(AgentInput(message=GOAL, owner=OWNER, session_id="cas")):
@@ -386,6 +399,8 @@ def test_short_model_data_survives_task_receipt_through_native_wire_and_cold_sql
 
 
 def test_read_task_patch_commit_conflict_never_publishes_success_or_earns_progress(task_store, monkeypatch):
+    from app.agent.kernel.adapters import TurnViewBuilder
+
     async def run():
         initial = await seed(task_store, declared())
         original_commit = task_store.commit
@@ -407,12 +422,13 @@ def test_read_task_patch_commit_conflict_never_publishes_success_or_earns_progre
             **SUCCESS, "data": {"marker": marker},
         })
         catalog = ToolCatalog([tool])
+        answer = "任务检查点冲突，尚未完成。"
         model = ScriptedModel([tool_round([(tool.name, {})]), [
-            ModelEvent(ModelEventType.TEXT_DELTA, text="任务检查点冲突，尚未完成。"),
+            ModelEvent(ModelEventType.TEXT_DELTA, text=answer),
             ModelEvent(ModelEventType.FINISH, finish_reason="stop"),
         ]])
         session = AgentSession(model=model, catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            model_tools=[tool.name],
             pipeline=ToolPipeline(catalog=catalog, state_store=task_store), state_store=task_store)
         events = [event async for event in session.run(AgentInput(message=GOAL, owner=OWNER, session_id="cas"))]
         cold = await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(owner=OWNER, session_id="cas")
@@ -421,8 +437,23 @@ def test_read_task_patch_commit_conflict_never_publishes_success_or_earns_progre
         assert not any(event.type is AgentEventType.TOOL_COMPLETED for event in events)
         [failure] = [event for event in events if event.type is AgentEventType.TOOL_FAILED]
         assert failure.payload["code"] == "task_conflict"
-        assert events[-1].type is AgentEventType.TURN_FAILED
-        assert events[-1].payload["code"] == "task_conflict"
+        # 响应交付与任务完成分开：普通 READ 失败由模型说明，不覆写为第二段答案。
+        terminal = events[-1]
+        assert terminal.type is AgentEventType.TURN_COMPLETED
+        assert terminal.payload["status"] == terminal.payload["turn_status"] == "partial"
+        task = terminal.payload["task"]
+        assert task == task_state.task_projection(cold.metadata["task"])
+        assert task["status"] == "partial" and task["verified_facts"] == []
+        assert task["remaining_obligation_ids"] == ["libraries"]
+        assert all(obligation["state"] == "pending" for obligation in task["obligations"])
+        builder = TurnViewBuilder()
+        for event in events:
+            builder.apply(event)
+        view = builder.build()
+        assert view.terminal and view.status == "partial" and view.task == task
+        assert view.answer == terminal.payload["answer"] == answer
+        assert "".join(event.payload["delta"] for event in events
+                       if event.type is AgentEventType.MODEL_DELTA) == answer
         assert marker not in json.dumps(cold.conversation)
         [call] = [call for row in cold.conversation for call in row.get("tool_calls", [])]
         [result] = [row for row in cold.conversation if row.get("role") == "tool"]

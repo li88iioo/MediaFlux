@@ -236,5 +236,8 @@ class TencentCalendarProvider:
             return SourceResult(status="unavailable", sampled=len(sampled), ignored=ignored,
                                 message="腾讯公开周排期读取失败或要求验证，已停止请求；未取得可用排期。")
         failure_note = "后续接口读取失败或要求验证，已停止请求；仅保留已核验事件，覆盖不全。" if failed else ""
-        return SourceResult(entries=entries, status="partial", sampled=len(sampled), ignored=ignored,
-                            message=f"腾讯官方追漫日历覆盖本周{len(covered)}/7天，非全站完整排期。{failure_note}会员/免费排期独立，未核验的免费进度留空。")
+        return SourceResult(entries=entries,
+                            status="ok" if covered == set(week) and not ignored and not failed else "partial",
+                            sampled=len(sampled), ignored=ignored,
+                            covered_dates=tuple(day.isoformat() for day in sorted(covered)),
+                            message=f"腾讯官方追漫周历已读取本周{len(covered)}/7天，范围限该官方周历，不代表全站片库或全部排期。{failure_note}未纳入排期记录{ignored}条。会员/免费排期独立，未核验的免费进度留空。")

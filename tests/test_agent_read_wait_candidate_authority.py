@@ -56,7 +56,7 @@ def test_same_wait_id_repark_preserves_current_authority(mode, tmp_path):
             # Same-publication trusted composition, as in accepted B08 fixture:
             # actual pipeline prepare, not a forged record or continued model.
             from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
-            from app.agent.kernel.effects import PreparedEffect
+            from app.agent.kernel.tool_calls import PreparedEffect
             from app.agent.kernel.state_types import CancellationToken, PublicationLease
             from app.agent.kernel.tool_calls import ToolCallContext
             def prepare(args, context):

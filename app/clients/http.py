@@ -142,8 +142,10 @@ class HttpStreamResponse:
 
 
 class FixedHostHttpClient:
-    """Bounded HTTP client that can only reach explicit public HTTPS hosts.
+    """有界固定主机客户端；默认仅允许公网 HTTPS 标准端口。
 
+    configured_origin 仅用于管理员配置的 Provider，锁定协议、主机和端口，
+    允许该端点使用本机、内网或公网 HTTP(S)，不改变公共工具的默认边界。
     timeout_seconds 为客户端网络预算；启用 GET 超时重试时按尝试次数分配。
     POST 调用者可将 get_timeout_retries 设为 0，完整使用网络空闲预算。
     require_identity_encoding 为可选的读前编码限制，默认保持既有自动解压行为。
@@ -162,6 +164,7 @@ class FixedHostHttpClient:
         resolver: Resolver | None = None,
         pin_resolved_address: bool = False,
         require_identity_encoding: bool = False,
+        configured_origin: str | None = None,
     ):
         hosts = frozenset(host.strip().rstrip(".").lower() for host in allowed_hosts if host.strip())
         if not hosts:
@@ -170,6 +173,14 @@ class FixedHostHttpClient:
                 or not isinstance(get_timeout_retries, int) or get_timeout_retries < 0):
             raise ValueError("invalid HTTP bounds")
         self.allowed_hosts = hosts
+        self._configured_origin: tuple[str, str, int | None] | None = None
+        if configured_origin is not None:
+            origin = httpx.URL(configured_origin)
+            origin_host = origin.host.rstrip(".").lower()
+            if (origin.scheme not in {"http", "https"} or origin_host not in hosts
+                    or origin.userinfo or origin.port == 0):
+                raise ValueError("invalid configured upstream origin")
+            self._configured_origin = (origin.scheme, origin_host, origin.port)
         self.max_response_bytes = int(max_response_bytes)
         self.max_redirects = int(max_redirects)
         self._resolver = resolver or self._default_resolver
@@ -333,7 +344,7 @@ class FixedHostHttpClient:
         extensions = None
         if self.pin_resolved_address:
             request_url = current.copy_with(host=str(addresses[0]))
-            request_headers["Host"] = current.host
+            request_headers["Host"] = current.netloc.decode("ascii")
             extensions = {"sni_hostname": current.host}
         return request_url, request_headers, extensions
 
@@ -416,18 +427,22 @@ class FixedHostHttpClient:
     def _validated_addresses(
         self, url: httpx.URL
     ) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-        if url.scheme.lower() != "https":
-            raise HttpSecurityError("only HTTPS upstream URLs are allowed")
-        if url.username or url.password:
+        if url.userinfo:
             raise HttpSecurityError("URL credentials are forbidden")
         host = (url.host or "").rstrip(".").lower()
-        if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
-            raise HttpSecurityError("localhost is forbidden")
         if host not in self.allowed_hosts:
             raise HttpSecurityError("upstream host is not registered")
-        port = url.port or 443
-        if port != 443:
-            raise HttpSecurityError("non-standard upstream ports are forbidden")
+        if self._configured_origin is not None:
+            if (url.scheme, host, url.port) != self._configured_origin:
+                raise HttpSecurityError("upstream origin differs from configured endpoint")
+        else:
+            if url.scheme.lower() != "https":
+                raise HttpSecurityError("only HTTPS upstream URLs are allowed")
+            if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
+                raise HttpSecurityError("localhost is forbidden")
+            if url.port not in {None, 443}:
+                raise HttpSecurityError("non-standard upstream ports are forbidden")
+        port = url.port or (443 if url.scheme == "https" else 80)
         return self._validate_resolved_addresses(host, port)
 
     def _validate_resolved_addresses(
@@ -441,7 +456,7 @@ class FixedHostHttpClient:
         if not addresses:
             raise HttpSecurityError("upstream host did not resolve")
         for address in addresses:
-            if not address.is_global:
+            if self._configured_origin is None and not address.is_global:
                 raise HttpSecurityError("upstream host resolved to a non-public address")
         return sorted(addresses, key=lambda item: (item.version, str(item)))
 

@@ -2,8 +2,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from app.agent.provider_models import ProviderGatewayError
-from app.agent.providers.qbittorrent import QBittorrentProviderTransport
+from app import sdk
 from app.clients.qbittorrent import QBittorrentClient
 
 
@@ -44,12 +43,12 @@ class QBReadContractTests(unittest.TestCase):
             self.assertTrue(self.client.get_completion('a' * 40))
             self.assertEqual(self.client.list_torrents()[0].name, 'Show')
 
-    def test_provider_reports_unavailable_instead_of_zero_files_and_closes_client(self):
-        transport = QBittorrentProviderTransport()
-        with patch.object(transport, '_client', return_value=self.client), patch.object(
-            self.client, '_get', return_value=Mock(json=lambda: {'error': 'not a file list'})
-        ), patch.object(self.client, 'close', wraps=self.client.close) as close:
-            with self.assertRaises(ProviderGatewayError) as error:
-                transport.execute_read('configured:qbittorrent', 'qb.torrents.files', {'torrent_ref': 'a' * 40})
-            self.assertEqual(error.exception.code, 'provider_unavailable')
+    def test_sdk_reports_invalid_response_instead_of_zero_files_and_closes_client(self):
+        settings = {"QB_URL": "http://synthetic.invalid", "QB_USERNAME": "", "QB_PASSWORD": "", "QB_API_KEY": "synthetic"}
+        with patch("app.config.get_many", return_value=settings), patch(
+            "app.clients.qbittorrent.QBittorrentClient", return_value=self.client
+        ), patch.object(self.client, '_get', return_value=Mock(json=lambda: {'error': 'not a file list'})), \
+             patch.object(self.client, 'close', wraps=self.client.close) as close:
+            with self.assertRaises(ValueError):
+                sdk.downloads.files('a' * 40)
             close.assert_called_once()

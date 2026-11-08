@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +19,18 @@ from app.runtime_paths import RuntimePaths, configure_runtime_paths
 
 class FirstRunTests(unittest.TestCase):
     def setUp(self) -> None:
+        from app import config, database, runtime_paths
+        from app.modules import first_run
+
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.dict(os.environ))
+        stack.callback(configure_runtime_paths, runtime_paths._configured_paths)
+        # reload 原位修改模块字典；连同完整环境恢复实际调用前的绑定。
+        for module in (config, database, first_run):
+            stack.enter_context(patch.dict(module.__dict__))
         root = Path(self.temp.name)
         self.paths = RuntimePaths(
             program_dir=root / "program",
@@ -29,22 +41,18 @@ class FirstRunTests(unittest.TestCase):
             strm_dir=root / "strm-data",
             trash_dir=root / "trash",
         )
-        self.environment = {
-            key: os.environ.get(key)
-            for key in (
-                "ENV_WEB_PASSPORT",
-                "ENV_WEB_PASSWORD",
-                "WEB_HOST",
-                "MEDIAFLUX_INITIALIZED",
-                "MEDIAFLUX_TEST_MODE",
-                "MEDIAFLUX_TEST_DB_PATH",
-                "WEB_SECRET_KEY",
-                "APP_ENV",
-                "MEDIAFLUX_CONTAINER",
-                "MEDIAFLUX_ALLOW_REMOTE_SETUP",
-            )
-        }
-        for key in self.environment:
+        for key in (
+            "ENV_WEB_PASSPORT",
+            "ENV_WEB_PASSWORD",
+            "WEB_HOST",
+            "MEDIAFLUX_INITIALIZED",
+            "MEDIAFLUX_TEST_MODE",
+            "MEDIAFLUX_TEST_DB_PATH",
+            "WEB_SECRET_KEY",
+            "APP_ENV",
+            "MEDIAFLUX_CONTAINER",
+            "MEDIAFLUX_ALLOW_REMOTE_SETUP",
+        ):
             os.environ.pop(key, None)
         os.environ["MEDIAFLUX_TEST_MODE"] = "0"
         configure_runtime_paths(self.paths)
@@ -53,22 +61,12 @@ class FirstRunTests(unittest.TestCase):
         self._reload_runtime_modules()
 
     def tearDown(self) -> None:
-        for key, value in self.environment.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
         from app.security import clear_setup_failures
         clear_setup_failures("testclient")
-        configure_runtime_paths(None)
-        self._reload_runtime_modules(restore_default_database=True)
-        self.temp.cleanup()
 
     def _reload_runtime_modules(
         self,
         paths: RuntimePaths | None = None,
-        *,
-        restore_default_database: bool = False,
     ) -> None:
         import app.config as config
         import app.database as database
@@ -76,8 +74,7 @@ class FirstRunTests(unittest.TestCase):
 
         importlib.reload(config)
         importlib.reload(database)
-        if not restore_default_database:
-            database.configure_database((paths or self.paths).database_path, test_mode=False)
+        database.configure_database((paths or self.paths).database_path, test_mode=False)
         importlib.reload(first_run)
         first_run._reset_startup_state_for_tests()
         self.config = config
@@ -630,3 +627,21 @@ class FirstRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_first_run_fixture_restores_published_environment_and_runtime_state():
+    from app import config, database, runtime_paths
+
+    environment = dict(os.environ)
+    database_scope = (database.DB_PATH, database._configured_test_mode)
+    configured_paths = runtime_paths._configured_paths
+    externally_managed = config.has_external_override("TMDB_API_KEY")
+    result = unittest.TestResult()
+    FirstRunTests(
+        "test_initialize_admin_preserves_unrelated_config_and_replaces_partial_credentials"
+    ).run(result)
+    assert result.wasSuccessful(), (result.errors, result.failures)
+    assert dict(os.environ) == environment
+    assert config.has_external_override("TMDB_API_KEY") == externally_managed
+    assert (database.DB_PATH, database._configured_test_mode) == database_scope
+    assert runtime_paths._configured_paths is configured_paths

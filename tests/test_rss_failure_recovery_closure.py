@@ -759,6 +759,30 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                 assert qb.add_torrent_detailed.call_args.kwargs["category"] == "frozen-rss"
                 assert qb.add_torrent_detailed.call_args.kwargs["save_path"] == "/synthetic/frozen"
 
+    def test_native_download_preview_and_execution_keep_original_receipt_target(self):
+        from app.modules import rss_delivery
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                rid, eid, _ = self.accepted(backend)
+                self.fail_request(rid, backend)
+                row = assert_present(db.get_rss_entry(eid))
+                db.update_rss_subscription(row["rss_item_id"], {"download_method": "guangya" if backend == "qb" else "qb"})
+                self.assertEqual(db.update_rss_entries_processed([eid], False), 1)
+                args = {"entry_ids": [eid]}
+                runtime = {"url": "http://frozen.invalid", "default_method": "qb"}
+                with (patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(runtime, "")),
+                      patch.object(dispatcher, "_submit_qb", side_effect=self.success) as qb,
+                      patch.object(dispatcher, "_submit_guangya", side_effect=self.success) as gy):
+                    preview, fingerprint = rss_delivery.prepare("download", args)
+                    self.assertEqual(preview["data"]["target"], "qbittorrent" if backend == "qb" else "guangya")
+                    result = rss_delivery.execute("download", args, fingerprint)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(qb.call_count, int(backend == "qb"))
+                self.assertEqual(gy.call_count, int(backend == "guangya"))
+                current = assert_present(db.get_rss_entry(eid))
+                self.assertEqual(current["download_backend"], backend)
+                self.assertNotEqual(current["download_request_id"], rid)
+
     def test_active_unknown_and_manual_skips_never_resubmit(self):
         for backend in ("qb", "guangya"):
             for status in ("submitting", "submitted", "downloading", "outcome_unknown", "manual_review", "completed"):
@@ -904,9 +928,9 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
     def test_batch_claimed_snapshot_still_submits_same_episode_once(self):
         self.pending(media_key="tmdb:42:tv:S01E001")
         self.pending(media_key="tmdb:42:tv:S01E001")
-        expected = [dict(row) for row in db.get_pending_rss_qb_snapshot()]
+        expected = [dict(row) for row in db.get_pending_rss_snapshot()]
         with patch.object(dispatcher, "_submit_qb", side_effect=self.success) as backend:
-            result = RSSEngine().submit_snapshot(expected, {"url": "http://qb.invalid", "default_method": "qb"}, claim=db.claim_pending_rss_qb_entries)
+            result = RSSEngine().submit_snapshot(expected, {"url": "http://qb.invalid", "default_method": "qb"}, claim=db.claim_pending_rss_entries)
         self.assertFalse(result["conflict"])
         self.assertTrue(result["ok"], result)
         backend.assert_called_once()

@@ -1,4 +1,5 @@
 """Native quota rejection closes its call and parks the tracked task atomically."""
+from tests.agent_task_native_helpers import task_call
 import asyncio
 import json
 from dataclasses import replace
@@ -13,12 +14,27 @@ from app.agent.errors import ToolRateLimitError
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
-    build_agent_kernel_runtime,
+    build_agent_kernel_runtime as _build_agent_kernel_runtime,
 )
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.rate_limit import RateLimitDecision
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
+
+
+def build_wait_runtime(**kwargs):
+    from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
+
+    runtime = _build_agent_kernel_runtime(**kwargs)
+    runtime.session.catalog.register(KernelToolSpec(
+        name="fixture.lookup", domain="fixture", description="读取等待测试对象",
+        input_schema={"type": "object", "required": ["query"],
+                      "properties": {"query": {"type": "string"}}, "additionalProperties": False},
+        effect=ToolEffect.READ,
+        read=lambda arguments, context: {"ok": True, "summary": arguments["query"]},
+    ))
+    runtime.session.model_tools = (runtime.session.model_tools or frozenset()) | {"fixture.lookup"}
+    return runtime
 
 
 @pytest.fixture(autouse=True)
@@ -45,9 +61,9 @@ class WaitScript(NativeScript):
             message = {'content': '已取得真实查询结果。'}
         else:
             name, args = {
-                'discover': ('agent__capabilities', {'tool_names': ['agent.task', 'web.search']}),
-                'create': ('agent__task', declaration()),
-                'read': ('web__search', {'query': 'quota fixture'}),
+                'discover': ('agent__run_code', {'language': 'shell', 'code': 'mf --help'}),
+                'create': task_call(declaration(), wire=True),
+                'read': ('fixture__lookup', {'query': 'quota fixture'}),
             }[step]
             message = {'content': '', 'tool_calls': [{'id': self.prefix + '-' + step, 'type': 'function',
                        'function': {'name': name, 'arguments': json.dumps(args, ensure_ascii=False)}}]}
@@ -56,7 +72,7 @@ class WaitScript(NativeScript):
 
 class Quota:
     async def acquire(self, *, tool_name, **kwargs):
-        if tool_name == 'web.search':
+        if tool_name == 'fixture.lookup':
             raise ToolRateLimitError(RateLimitDecision(False, 6, 1, 0, retry_after_seconds=10,
                                                       retry_at_epoch=110, reason='quota'))
 
@@ -68,7 +84,7 @@ def test_native_quota_park_and_cold_cancel(cancel_entry):
         initialize_runtime_fence()
         script = WaitScript()
         store = SQLiteKernelStore(clock=lambda: 100)
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=store)
+        runtime = build_wait_runtime(model=script.adapter, store=store)
         # Explicit trusted injection; ordinary model metadata cannot supply authority.
         runtime.session.continuation_binding = _capture_creation_binding()
         runtime.session.pipeline.rate_limiter = Quota()
@@ -86,7 +102,7 @@ def test_native_quota_park_and_cold_cancel(cancel_entry):
         assert record['expires_at'] == 400
         results = [r for r in state.conversation if r.get('tool_call_id') == 'initial-read']
         assert len(results) == 1 and 'rate_limited' in results[0]['content']
-        fresh = build_agent_kernel_runtime(model=WaitScript(True).adapter, store=cold)
+        fresh = build_wait_runtime(model=WaitScript(True).adapter, store=cold)
         if cancel_entry == 'native':
             assert await fresh.session.cancel(owner=OWNER, session_id='wait-park', request_id='wait-source')
         else:
@@ -113,7 +129,7 @@ def test_scheduler_cold_native_resume_uses_new_id_and_one_read():
         db.init_db()
         initialize_runtime_fence()
         script = WaitScript()
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+        runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
         runtime.session.continuation_binding = _capture_creation_binding()
         runtime.session.pipeline.rate_limiter = Quota()
         events = [e async for e in runtime.session.run(AgentInput(message=GOAL, owner=OWNER,
@@ -124,13 +140,13 @@ def test_scheduler_cold_native_resume_uses_new_id_and_one_read():
     resumed = WaitScript(True)
     handlers = []
     def factory(candidate, binding, store):
-        runtime = build_agent_kernel_runtime(model=resumed.adapter, store=store)
+        runtime = build_wait_runtime(model=resumed.adapter, store=store)
         runtime.session.continuation_binding = binding
         async def read(args, context):
             handlers.append(args)
             return {'ok': True, 'summary': 'fixture READ complete'}
-        tool = runtime.session.catalog.get('web.search')
-        runtime.session.catalog._tools['web.search'] = replace(tool, read=read)
+        tool = runtime.session.catalog.get('fixture.lookup')
+        runtime.session.catalog._tools['fixture.lookup'] = replace(tool, read=read)
         return replace(runtime, creation_binding=binding)
     scheduler = AgentJobsScheduler(clock=lambda: datetime.fromtimestamp(timer[0]))
     scheduler._continuation_runtime_factory = factory
@@ -161,17 +177,17 @@ def test_restored_read_runs_before_model_without_regenerating_arguments():
         _, candidate = await parked_runtime(timer)
         timer[0] = 110
         script = WaitScript(True)
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+        runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
         runtime.session.continuation_binding = _capture_creation_binding()
         invoked = []
         async def read(arguments, context):
             assert not script.requests, 'pending READ must run before model synthesis'
             invoked.append(arguments)
             return {'ok': True, 'summary': 'trusted pending READ completed'}
-        tool = runtime.session.catalog.get('web.search')
-        runtime.session.catalog._tools['web.search'] = replace(tool, read=read)
+        tool = runtime.session.catalog.get('fixture.lookup')
+        runtime.session.catalog._tools['fixture.lookup'] = replace(tool, read=read)
         assert await runtime.session.resume_wait(candidate=candidate)
-        assert invoked == [{'query': 'quota fixture', 'max_results': 5, 'topic': 'general'}]
+        assert invoked == [{'query': 'quota fixture'}]
         assert len(script.requests) == 1
         state = await runtime.store.load(owner=OWNER, session_id='wait-control')
         assert state.metadata['read_wait']['terminal_reason'] == 'completed'
@@ -188,7 +204,7 @@ def test_cold_wait_expiry_or_clock_reversal_never_requests_model(advance):
         _, candidate = await parked_runtime(timer)
         timer[0] += advance
         script = WaitScript(True)
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+        runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
         runtime.session.continuation_binding = _capture_creation_binding()
         assert not await runtime.session.resume_wait(candidate=candidate)
         state = await runtime.store.load(owner=OWNER, session_id='wait-control')
@@ -212,7 +228,7 @@ def test_claim_exclusion_running_never_replays_after_lease():
                 await release.wait()
                 yield ModelEvent(ModelEventType.TEXT_DELTA, text='not a read')
                 yield ModelEvent(ModelEventType.FINISH, finish_reason='stop')
-        runtime = build_agent_kernel_runtime(model=Held(), store=SQLiteKernelStore(clock=lambda: timer[0]))
+        runtime = build_wait_runtime(model=Held(), store=SQLiteKernelStore(clock=lambda: timer[0]))
         runtime.session.continuation_binding = _capture_creation_binding()
         worker = asyncio.create_task(runtime.session.resume_wait(candidate=candidate))
         try:
@@ -240,7 +256,7 @@ def test_repark_segments_and_task_budgets_survive_cold_runtimes():
             timer[0] += 10
             script = WaitScript(True)
             script.prefix = f'resume-{index}'
-            fresh = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+            fresh = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
             fresh.session.continuation_binding = _capture_creation_binding()
             class Again:
                 async def acquire(self, **kwargs):
@@ -266,7 +282,7 @@ def test_new_turn_or_durable_epoch_revokes_old_wait(change):
         runtime, candidate = await parked_runtime(timer)
         timer[0] = 110
         script = WaitScript(True)
-        fresh = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+        fresh = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
         fresh.session.continuation_binding = _capture_creation_binding()
         if change == 'foreground':
             script.steps = ['finish']
@@ -323,16 +339,16 @@ def test_cancel_during_journal_io_cannot_publish_late_tool_event():
         timer[0] = 110
         store = SQLiteKernelStore(clock=lambda: timer[0])
         script = WaitScript(True)
-        runtime = build_agent_kernel_runtime(model=script.adapter, store=store)
+        runtime = build_wait_runtime(model=script.adapter, store=store)
         runtime.session.continuation_binding = _capture_creation_binding()
         async def read(args, context):
             return {'ok': True, 'summary': 'read-before-cancel'}
-        tool = runtime.session.catalog.get('web.search')
-        runtime.session.catalog._tools['web.search'] = replace(tool, read=read)
+        tool = runtime.session.catalog.get('fixture.lookup')
+        runtime.session.catalog._tools['fixture.lookup'] = replace(tool, read=read)
         entered, release = threading.Event(), threading.Event()
         original = store._append_event_sync
         def delayed(event, owner, *args):
-            if event.type.value == 'tool.completed' and event.payload.get('tool') == 'web.search':
+            if event.type.value == 'tool.completed' and event.payload.get('tool') == 'fixture.lookup':
                 entered.set()
                 assert release.wait(5), 'journal release timeout'
             return original(event, owner, *args)
@@ -340,12 +356,12 @@ def test_cancel_during_journal_io_cannot_publish_late_tool_event():
             worker = asyncio.create_task(runtime.session.resume_wait(candidate=candidate))
             try:
                 assert await asyncio.to_thread(entered.wait, 5), 'journal entry timeout'
-                cold = build_agent_kernel_runtime(model=WaitScript(True).adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+                cold = build_wait_runtime(model=WaitScript(True).adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
                 assert await cold.session.cancel(owner=OWNER, session_id='wait-control', request_id='source')
                 release.set()
                 await asyncio.wait_for(worker, 5)
                 events = await cold.store.list_events(owner=OWNER, session_id='wait-control')
-                assert not any(e['type'] == 'tool.completed' and e['payload'].get('tool') == 'web.search' for e in events)
+                assert not any(e['type'] == 'tool.completed' and e['payload'].get('tool') == 'fixture.lookup' for e in events)
                 assert len(script.requests) == 0
             finally:
                 release.set()
@@ -359,7 +375,7 @@ async def parked_runtime(timer, session_id='wait-control'):
     db.init_db()
     initialize_runtime_fence()
     script = WaitScript()
-    runtime = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+    runtime = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
     runtime.session.continuation_binding = _capture_creation_binding()
     runtime.session.pipeline.rate_limiter = Quota()
     events = [e async for e in runtime.session.run(AgentInput(message=GOAL, owner=OWNER,
@@ -379,7 +395,7 @@ def test_cold_cancel_blocks_handler_start_and_late_reference(phase):
         runtime, candidate = await parked_runtime(timer)
         timer[0] = 110
         script = WaitScript(True)
-        fresh = build_agent_kernel_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+        fresh = build_wait_runtime(model=script.adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
         fresh.session.continuation_binding = _capture_creation_binding()
         entered, release = asyncio.Event(), asyncio.Event()
         calls = []
@@ -396,12 +412,12 @@ def test_cold_cancel_blocks_handler_start_and_late_reference(phase):
             return ToolOutcome(model_content='late private result', public_content={'ok': True},
                                refs=(ReferenceValue(kind='late_ref', value={'late': True}),))
         fresh.session.pipeline.rate_limiter = Limiter()
-        tool = fresh.session.catalog.get('web.search')
-        fresh.session.catalog._tools['web.search'] = replace(tool, read=read)
+        tool = fresh.session.catalog.get('fixture.lookup')
+        fresh.session.catalog._tools['fixture.lookup'] = replace(tool, read=read)
         worker = asyncio.create_task(fresh.session.resume_wait(candidate=candidate))
         try:
             await asyncio.wait_for(entered.wait(), 5)
-            cold = build_agent_kernel_runtime(model=WaitScript(True).adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
+            cold = build_wait_runtime(model=WaitScript(True).adapter, store=SQLiteKernelStore(clock=lambda: timer[0]))
             assert await cold.session.cancel(owner=OWNER, session_id='wait-control', request_id='source')
             stopped = await cold.store.load(owner=OWNER, session_id='wait-control')
             release.set()

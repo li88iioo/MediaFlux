@@ -671,6 +671,7 @@ class OrganizeCorrectionService:
                 "media_type": match.media_type,
                 "provider": Organizer._match_provider(match),
                 "external_id": Organizer._match_external_id(match),
+                "metadata": {"number": str(match.metadata.get("number") or "")},
             },
             "target_root_id": rules.target_dir_id,
             "target_path": target_path,
@@ -779,10 +780,11 @@ class OrganizeCorrectionService:
             except Exception as exc:
                 logger.warning("清理本次纠偏创建的空目录失败 type=%s", type(exc).__name__)
 
-    def _restore_directory_targets(self, log_id: int, operation_token: str,
-                                   directory_ids: list[str], *, recreate: bool = True) -> dict[str, str]:
-        """只重建成功清理凭据中的目录；同名外来目录及未知创建绝不接管。"""
+    def _directory_targets(self, directory_ids: list[str], *, recreate: bool = True
+                           ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+        """只读解析原目录和成功恢复凭据；待重建目录保留原 ID，按父先子后排列。"""
         resolved: dict[str, str] = {}
+        missing: dict[str, tuple[str, str]] = {}
         visiting: set[str] = set()
 
         def resolve(directory_id: str) -> str:
@@ -821,10 +823,12 @@ class OrganizeCorrectionService:
                 if name in ('.', '..') or any(char in name for char in ('/', '\\', '\x00')):
                     raise RuntimeError("原目录清理凭据中的名称无效")
                 parent_id = resolve(str(audit['parent_id']))
-                parent = self.client.file_info(parent_id)
-                if parent_id != '0' and (parent is None or not parent.is_dir):
-                    raise RuntimeError("回退目录的已知父目录不存在，禁止盲建")
-                children = self.client.list_dir(parent_id)
+                children = []
+                if parent_id not in missing:
+                    parent = self.client.file_info(parent_id)
+                    if parent_id != '0' and (parent is None or not parent.is_dir):
+                        raise RuntimeError("回退目录的已知父目录不存在，禁止盲建")
+                    children = self.client.list_dir(parent_id)
                 original = next((entry for entry in children if entry.file_id == directory_id), None)
                 if original is not None:
                     if not original.is_dir or original.name != name:
@@ -834,10 +838,14 @@ class OrganizeCorrectionService:
                     if restored['status'] != 'success':
                         raise RuntimeError("上次目录恢复结果未知，必须人工核验，禁止重放")
                     result = resolve(str(restored['to_parent_id']))
-                    current = self.client.file_info(result)
-                    if (current is None or not current.is_dir or current.parent_id != parent_id
-                            or current.name != name or not any(entry.file_id == result for entry in self.client.list_dir(parent_id))):
-                        raise RuntimeError("已恢复目录的身份或位置已变化，禁止接管同名目录")
+                    if result in missing:
+                        if missing[result] != (parent_id, name):
+                            raise RuntimeError("已恢复目录的身份或位置已变化，禁止接管同名目录")
+                    else:
+                        current = self.client.file_info(result)
+                        if (current is None or not current.is_dir or current.parent_id != parent_id
+                                or current.name != name or not any(entry.file_id == result for entry in self.client.list_dir(parent_id))):
+                            raise RuntimeError("已恢复目录的身份或位置已变化，禁止接管同名目录")
                 else:
                     try:
                         info = self.client.file_info(directory_id)
@@ -851,35 +859,60 @@ class OrganizeCorrectionService:
                         raise RuntimeError("原目录已被外部移动或改名，禁止猜测重建")
                     if any(entry.name == name for entry in children):
                         raise RuntimeError("回退路径存在无恢复凭据的同名条目，禁止合并或覆盖")
-                    step_id = db.add_organize_operation_step(
-                        log_id, operation_token + ':directories', len(resolved) + 1, 'restore_directory',
-                        file_id=directory_id, from_parent_id=directory_id, from_name=name,
-                        to_parent_id=parent_id, to_name=name, status='running',
-                    )
-                    try:
-                        result = (self.client.create_dir(name, parent_id) or '')
-                        current = self.client.file_info(result) if result else None
-                        matches = [entry for entry in self.client.list_dir(parent_id) if entry.name == name]
-                        if (current is None or not current.is_dir or current.parent_id != parent_id
-                                or current.name != name or len(matches) != 1 or matches[0].file_id != result):
-                            raise RuntimeError("目录恢复的返回身份未确认，必须人工核验")
-                        with db.get_conn() as conn:
-                            changed = conn.execute(
-                                "UPDATE organize_operation_steps SET to_parent_id=?,status='success',finished_at=? "
-                                "WHERE id=? AND status='running'", (result, db.now(), step_id),
-                            )
-                            if changed.rowcount != 1:
-                                raise RuntimeError("目录恢复凭据未能可靠提交，必须人工核验")
-                    except Exception as exc:
-                        db.finish_organize_operation_step(step_id, 'failed', str(exc))
-                        raise
+                    missing[directory_id] = (parent_id, name)
+                    result = directory_id
             visiting.remove(directory_id)
             resolved[directory_id] = result
             return result
 
         for parent_id in directory_ids:
             resolve(parent_id)
-        return resolved
+        return resolved, missing
+
+    def _restore_directory_targets(self, log_id: int, operation_token: str,
+                                   directory_ids: list[str], *, recreate: bool = True) -> dict[str, str]:
+        """只重建成功清理凭据中的目录；每次创建前复验父目录与同名占用。"""
+        resolved, missing = self._directory_targets(directory_ids, recreate=recreate)
+        for index, (directory_id, (parent_id, name)) in enumerate(missing.items(), start=1):
+            parent_id = resolved[parent_id]
+            parent = self.client.file_info(parent_id)
+            if parent_id != '0' and (parent is None or not parent.is_dir):
+                raise RuntimeError("回退目录的已知父目录不存在，禁止盲建")
+            if any(entry.name == name for entry in self.client.list_dir(parent_id)):
+                raise RuntimeError("回退路径存在无恢复凭据的同名条目，禁止合并或覆盖")
+            step_id = db.add_organize_operation_step(
+                log_id, operation_token + ':directories', index, 'restore_directory',
+                file_id=directory_id, from_parent_id=directory_id, from_name=name,
+                to_parent_id=parent_id, to_name=name, status='running',
+            )
+            try:
+                result = self.client.create_dir(name, parent_id) or ''
+                current = self.client.file_info(result) if result else None
+                matches = [entry for entry in self.client.list_dir(parent_id) if entry.name == name]
+                if (current is None or not current.is_dir or current.parent_id != parent_id
+                        or current.name != name or len(matches) != 1 or matches[0].file_id != result):
+                    raise RuntimeError("目录恢复的返回身份未确认，必须人工核验")
+                with db.get_conn() as conn:
+                    changed = conn.execute(
+                        "UPDATE organize_operation_steps SET to_parent_id=?,status='success',finished_at=? "
+                        "WHERE id=? AND status='running'", (result, db.now(), step_id),
+                    )
+                    if changed.rowcount != 1:
+                        raise RuntimeError("目录恢复凭据未能可靠提交，必须人工核验")
+                resolved[directory_id] = result
+            except Exception as exc:
+                db.finish_organize_operation_step(step_id, 'failed', str(exc))
+                raise
+        return {key: resolved.get(value, value) for key, value in resolved.items()}
+
+    def _preflight_restore_targets(self, targets: list[tuple[CorrectionItem, str, str]]) -> None:
+        """整组对象及可读目标先核验；不存在且有凭据的目录此处绝不创建。"""
+        self._verify_items([item for item, _parent, _name in targets])
+        resolved, missing = self._directory_targets([parent for _item, parent, _name in targets])
+        self._verify_targets_available(
+            [(item, resolved[parent], name) for item, parent, name in targets if resolved[parent] not in missing],
+            allow_group_file_ids={item.file_id for item, _parent, _name in targets},
+        )
 
     def _verify_targets_available(self, targets: list[tuple[CorrectionItem, str, str]],
                                   *, allow_group_file_ids: set[str] | None = None) -> None:
@@ -890,7 +923,7 @@ class OrganizeCorrectionService:
                 cache[parent_id] = self.client.list_dir(parent_id)
             conflict = next((
                 entry for entry in cache[parent_id]
-                if not entry.is_dir and entry.name == name
+                if entry.name == name
                 and entry.file_id != item.file_id and entry.file_id not in allowed
             ), None)
             if conflict:
@@ -1746,20 +1779,19 @@ class OrganizeCorrectionService:
         if not detail["allowed_actions"]["return_to_source"]:
             raise ValueError(detail.get("safety_notice") or "当前状态不能送回源目录")
         items = self._load_items(log_id)
-        self._verify_items(items)
+        targets = [(item, item.original_parent_id, item.original_name) for item in items]
+        self._preflight_restore_targets(targets)
         rules = OrganizeRules.from_config()
         cleanup_directories, cleanup_protected, cleanup_warnings = (
             self._capture_archive_cleanup_directories(
                 detail=detail, items=items, rules=rules,
             )
         )
-        targets = [(item, item.original_parent_id, item.original_name) for item in items]
         if not db.claim_organize_log_operation(
             log_id, operation_token, "returning", tuple(RETURN_STATUSES), expected_version,
         ):
             raise RuntimeError("日志状态或版本已变化，请刷新后重试")
         completed: list[AppliedTransition] = []
-        targets_verified = False
         try:
             restored = self._restore_directory_targets(
                 log_id, operation_token, [parent for _item, parent, _name in targets],
@@ -1768,7 +1800,6 @@ class OrganizeCorrectionService:
                 [(item, restored[parent], name) for item, parent, name in targets],
                 allow_group_file_ids={item.file_id for item in items},
             )
-            targets_verified = True
             for index, item in enumerate(items, start=1):
                 parent_id = restored[item.original_parent_id]
                 step_id = db.add_organize_operation_step(
@@ -1809,7 +1840,7 @@ class OrganizeCorrectionService:
                     ) from persist_exc
             self._rollback_transitions(completed)
             db.update_organize_log(
-                log_id, status=self._failure_status(log_id, "failed" if targets_verified else detail["status"]), error=str(exc)
+                log_id, status=self._failure_status(log_id, "failed"), error=str(exc)
             )
             raise
         post_warnings = self._run_post_actions(items=items, rules=rules, transitions=completed)
@@ -1837,8 +1868,8 @@ class OrganizeCorrectionService:
             "warnings": list(dict.fromkeys(warnings)),
         }
 
-    def revert_latest(self, log_id: int, operation_token: str,
-                      expected_version: int) -> dict:
+    def preflight_revert(self, log_id: int) -> dict:
+        """只读核对原前像、完整媒体组和全部回退目标，供确认卡及原执行链共用。"""
         detail = self.detail(log_id)
         if not detail["allowed_actions"]["revert"]:
             raise ValueError("没有可安全回退的上一版操作快照")
@@ -1852,7 +1883,6 @@ class OrganizeCorrectionService:
             snapshot = json.loads(snapshots[0]) if snapshots else None
         except (TypeError, ValueError) as exc:
             raise ValueError("最近操作的业务前像损坏，必须人工核验") from exc
-        legacy_warning = "" if snapshot is not None else "历史步骤缺少业务前像，本次仅回退文件位置和名称；原媒体身份需人工核验"
         items = self._load_items(log_id)
         items_by_file = {item.file_id: item for item in items}
         if {str(step.get("file_id") or "") for step in steps} != set(items_by_file):
@@ -1862,17 +1892,25 @@ class OrganizeCorrectionService:
             item = items_by_file.get(str(previous.get("file_id") or ""))
             if not item:
                 raise RuntimeError("操作快照中的文件已不属于当前媒体组")
-            self._verify_item(item)
             targets.append((
                 item, str(previous.get("from_parent_id") or ""),
                 str(previous.get("from_name") or ""),
             ))
+        self._preflight_restore_targets(targets)
+        return {"detail": detail, "steps": steps, "snapshot": snapshot, "items": items, "targets": targets}
+
+    def revert_latest(self, log_id: int, operation_token: str,
+                      expected_version: int) -> dict:
+        prepared = self.preflight_revert(log_id)
+        steps, items, targets = (prepared[key] for key in ("steps", "items", "targets"))
+        snapshot = prepared["snapshot"]
+        legacy_warning = "" if snapshot is not None else "历史步骤缺少业务前像，本次仅回退文件位置和名称；原媒体身份需人工核验"
+        items_by_file = {item.file_id: item for item in items}
         if not db.claim_organize_log_operation(
             log_id, operation_token, "reverting", tuple(REVERT_STATUSES), expected_version,
         ):
             raise RuntimeError("日志状态或版本已变化，请刷新后重试")
         completed: list[AppliedTransition] = []
-        targets_verified = False
         try:
             restored = self._restore_directory_targets(
                 log_id, operation_token, [parent for _item, parent, _name in targets],
@@ -1881,7 +1919,6 @@ class OrganizeCorrectionService:
                 [(item, restored[parent], name) for item, parent, name in targets],
                 allow_group_file_ids={item.file_id for item in items},
             )
-            targets_verified = True
             if snapshot is not None:
                 for state in [snapshot['log'], *snapshot['items']]:
                     parent = state.get('target_parent_id')
@@ -1927,7 +1964,7 @@ class OrganizeCorrectionService:
         except Exception as exc:
             self._rollback_transitions(completed)
             db.update_organize_log(
-                log_id, status=self._failure_status(log_id, "revert_failed" if targets_verified else detail["status"]), error=str(exc)
+                log_id, status=self._failure_status(log_id, "revert_failed"), error=str(exc)
             )
             raise
         rules = OrganizeRules.from_config()

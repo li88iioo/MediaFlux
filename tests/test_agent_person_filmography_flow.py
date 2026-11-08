@@ -1,142 +1,54 @@
-from __future__ import annotations
+"""人物完整片单直接交公共库存查询，真实ID/年份且一次库存读取。"""
+from unittest.mock import Mock, patch
 
-import unittest
+import pytest
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.events import AgentEventType
-from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
-from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.session import AgentSession
-from app.agent.kernel.state import InMemorySessionStateStore
-from app.agent.kernel.state_types import AgentInput
-from tests.test_agent_kernel_core import ScriptedModel, collect
+from app.clients.base import MediaIdentityCandidate, MediaIdentityInventory
+from app.sdk import library, media
 
 
-class PersonFilmographyFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_complete_filmography_library_audit_uses_two_tool_calls(self) -> None:
-        films = [
-            {
-                "tmdb_id": "77",
-                "media_type": "movie",
-                "title": "记忆碎片",
-                "year": "2000",
-            },
-            {
-                "tmdb_id": "157336",
-                "media_type": "movie",
-                "title": "星际穿越",
-                "year": "2014",
-            },
-        ]
-        calls: list[str] = []
+@pytest.mark.parametrize("extra", [0, 135])
+def test_filmography_identities_feed_one_native_inventory_read(extra):
+    tmdb = Mock()
+    tmdb.search_people.return_value = {"page": 1, "total_pages": 1, "total_results": 2, "results": [
+        {"id": 19508, "name": "诺兰", "known_for_department": "Acting", "popularity": 999},
+        {"id": 525, "name": "诺兰", "known_for_department": "Directing", "popularity": 1,
+         "known_for": [{"id": 157336, "title": "星际穿越", "media_type": "movie"}]},
+    ]}
+    tmdb.person_movie_credits.return_value = {"cast": [], "crew": [
+        {"id": 157336, "title": "星际穿越", "release_date": "2014-11-05", "department": "Directing", "job": "Director"},
+        {"id": 77, "title": "记忆碎片", "release_date": "2000-10-11", "department": "Directing", "job": "Director"},
+        *[{"id": 200000 + i, "title": f"电影{i}", "release_date": "2020-01-01", "department": "Directing", "job": "Director"}
+          for i in range(extra)],
+    ]}
+    client = Mock()
+    client.list_media_identity_inventory.return_value = MediaIdentityInventory(
+        candidates=[MediaIdentityCandidate(tmdb_id="157336", name="星际穿越", year="2014", media_type="movie")], total=1,
+    )
+    with (
+        patch("app.discovery.people.config.get_bool", return_value=True),
+        patch("app.discovery.people.TMDBClient", return_value=tmdb),
+        patch("app.services._configured_media_sources", return_value=[("jellyfin", "Jellyfin", "", client)]),
+    ):
+        people = media.people("诺兰")
+        assert [p["id"] for p in people["items"]] == [19508, 525]
+        # 调用者用已知导演身份核对候选；服务不自动选择高popularity演员。
+        director = next(p for p in people["items"] if p["known_for_department"] == "Directing")
+        films = media.filmography(str(director["id"]), role="directing", include_upcoming=False)
+        result = library.presence(films["library_check_items"])
 
-        def filmography(arguments, _context):
-            calls.append("discovery.person_filmography")
-            self.assertEqual(arguments["person"], "诺兰")
-            return {
-                "ok": True,
-                "status": "success",
-                "summary": "已取得诺兰导演作品表",
-                "data": {"items": films},
-            }
-
-        def batch_presence(arguments, _context):
-            calls.append("library.batch_presence")
-            self.assertEqual(arguments["items"], films)
-            return {
-                "ok": True,
-                "status": "success",
-                "summary": "已批量核对 2 部媒体",
-                "data": {
-                    "items": [
-                        {**films[0], "library_status": "missing"},
-                        {**films[1], "library_status": "present"},
-                    ]
-                },
-            }
-
-        catalog = ToolCatalog(
-            [
-                KernelToolSpec(
-                    name="discovery.person_filmography",
-                    domain="discovery",
-                    description="读取导演全部电影并按上映日期排序",
-                    examples=("列出诺兰导演的所有电影",),
-                    input_schema={"type": "object"},
-                    effect=ToolEffect.READ,
-                    read=filmography,
-                ),
-                KernelToolSpec(
-                    name="library.batch_presence",
-                    domain="library",
-                    description="一次批量核对片单中哪些已入库、哪些缺失",
-                    examples=("标出片单里我库中缺哪几部",),
-                    input_schema={"type": "object"},
-                    effect=ToolEffect.READ,
-                    read=batch_presence,
-                ),
-            ]
-        )
-        model = ScriptedModel(
-            [
-                [
-                    ModelEvent(
-                        ModelEventType.TOOL_CALL_COMPLETED,
-                        tool_call=ModelToolCall(
-                            "filmography-1",
-                            "discovery.person_filmography",
-                            {"person": "诺兰", "role": "directing"},
-                        ),
-                    ),
-                    ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
-                ],
-                [
-                    ModelEvent(
-                        ModelEventType.TOOL_CALL_COMPLETED,
-                        tool_call=ModelToolCall(
-                            "presence-1",
-                            "library.batch_presence",
-                            {"items": films},
-                        ),
-                    ),
-                    ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
-                ],
-                [
-                    ModelEvent(
-                        ModelEventType.TEXT_DELTA,
-                        text="诺兰电影已按年份列出；《记忆碎片》缺失，《星际穿越》在库。",
-                    ),
-                    ModelEvent(ModelEventType.FINISH, finish_reason="stop"),
-                ],
-            ]
-        )
-        state = InMemorySessionStateStore()
-        session = AgentSession(
-            model=model,
-            catalog=catalog,
-            retriever=CapabilityRetriever(minimum=2, maximum=2),
-            pipeline=ToolPipeline(catalog=catalog, state_store=state),
-            state_store=state,
-        )
-
-        events = await collect(
-            session.run(
-                AgentInput(
-                    message="把诺兰导演的所有电影按上映年份排出来，标出我库里缺哪几部",
-                    owner="owner",
-                    session_id="session",
-                )
-            )
-        )
-
-        self.assertEqual(calls, ["discovery.person_filmography", "library.batch_presence"])
-        self.assertNotIn(AgentEventType.TURN_FAILED, [event.type for event in events])
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
-        self.assertEqual(events[-1].payload["tool_calls"], 2)
-        self.assertEqual(events[-1].payload["model_calls"], 3)
-        self.assertIn("记忆碎片", events[-1].payload["answer"])
+    assert films["ok"] and films["complete"] and result["ok"] and result["status"] == "success"
+    rows = result["data"]["items"]
+    assert [(row["tmdb_id"], row["year"], row["library_status"]) for row in rows[:2]] == [
+        ("77", "2000", "missing"), ("157336", "2014", "present"),
+    ]
+    assert result["data"]["total"] == len(rows) == films["total"] == 2 + extra
+    assert all(row["media_type"] == "movie" and row["library_status"] == "missing" for row in rows[2:])
+    assert tmdb.search_people.call_count == 1
+    assert tmdb.search_people.call_args.args == ("诺兰",)
+    assert tmdb.search_people.call_args.kwargs["page"] == 1
+    args, kwargs = tmdb.person_movie_credits.call_args
+    assert args == ("525",) and kwargs["retries"] == 0 and kwargs["deadline_at"] > 0
+    client.list_media_identity_inventory.assert_called_once_with("movie", max_items=5000, page_size=200)
+    assert tmdb.close.call_count == 2
+    client.close.assert_called_once_with()

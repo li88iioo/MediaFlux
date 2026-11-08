@@ -1,226 +1,210 @@
-"""追漫日历进入实际AgentSession工具循环；模型为本地桩，不调用外部LLM或平台。"""
+"""冷 root 工作区经真实 file IPC 调用媒体 SDK；所有外部提供者为隔离假数据。"""
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
+import os
+import tempfile
 import threading
 import unittest
-from datetime import datetime
-from unittest.mock import ANY, Mock, patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-import tests  # noqa: F401 -- 导入应用前隔离运行目录和配置。
-from app.agent.domain_catalog import build_tool_specs
-from app.agent.kernel.capabilities import CapabilityRetriever
-from app.agent.kernel.events import AgentEventType
-from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
+from app.agent.kernel import sandbox
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.pipeline import ToolPipeline
-from app.agent.kernel.ports.existing_actions import (
-    adapt_tool_spec,
-    catalog_from_tool_specs,
-)
-from app.agent.kernel.ports.mediaflux_policy import MediaFluxAuthorizationPolicy
-from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
-from app.agent.kernel.state_types import AgentInput
-from app.discovery.cache import DiscoveryCache
-from app.discovery.calendar.models import CalendarEntry, CalendarEvent, SourceResult
-from app.discovery.calendar.service import CalendarService
+from app.discovery.models import DiscoveryPage, MediaCard, ProviderHealth, ProviderTimeout
+from app.discovery.registry import ProviderRegistry
+from app.discovery.search import DiscoverySearchResult, DiscoverySearchService
+from app.discovery.service import DiscoveryService
 from tests.support import isolated_test_database
-from tests.test_agent_anime_calendar import card, model_rows, snapshot
-from tests.test_agent_kernel_capability_discovery import call, session_for
-from tests.test_agent_kernel_core import ScriptedModel, collect
+from tests.test_agent_anime_calendar import calendar_service
+from tests.test_agent_code_sandbox import make_context
 
 
-class CalendarEchoModel:
-    """用工具实际返回值生成测试答复，避免硬编码成功文本掩盖链路失败。"""
-    def __init__(self, arguments):
-        self.arguments = arguments
-        self.requests = []
-        self.facts = None
+class MetadataProvider:
+    def __init__(self, name):
+        self.name, self.calls = name, []
 
-    async def stream(self, request, *, cancellation):
-        self.requests.append(request)
-        cancellation.raise_if_cancelled()
-        if len(self.requests) == 1:
-            assert "discovery__anime_calendar" in {tool["name"] for tool in request.tools}
-            yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                             tool_call=ModelToolCall("calendar-read", "discovery__anime_calendar", self.arguments))
-            yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
-            return
-        assert len(self.requests) == 2
-        messages = [message for message in request.messages if message.role == "tool"]
-        assert len(messages) == 1
-        self.facts = json.loads(messages[0].content)
-        data = self.facts.get("data", {})
-        if self.facts["status"] == "loading":
-            text = "来源正在后台获取，暂不能确认今天的排期，不代表今天没有更新。"
-        elif self.facts["status"] == "partial":
-            row = model_rows(data)[0]
-            text = f'{row["source_name"]} {row["date"]} 已收录 {data["total"]} 条排期：{row["update_time"]} {row["title"]}。'
-        else:
-            text = self.facts["summary"]
-        await asyncio.sleep(0)
-        yield ModelEvent(ModelEventType.TEXT_DELTA, text=text)
-        yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
+    def card(self, index, media_type="tv"):
+        return MediaCard(self.name, str(index), media_type, f"作品-{index}", year="2026",
+                         tmdb_id=str(index) if self.name == "tmdb" else "",
+                         origin_country=("CN", "US"), original_language="zh", genre_ids=(16,),
+                         weekday=4 if self.name == "bangumi" else None)
+
+    def search(self, query, page):
+        self.calls.append(("search", query, page))
+        return [self.card(i) for i in range(1, 31)], True
+
+    def list_items(self, category, media_type, page, filters):
+        self.calls.append(("list", category, page, filters))
+        return DiscoveryPage(tuple(self.card(i, media_type) for i in range(1, 31)),
+                             page=page, has_more=page < 2, provider=ProviderHealth(name=self.name))
+
+    def get_detail(self, external_id, media_type):
+        self.calls.append(("detail", external_id, media_type))
+        return self.card(int(external_id), media_type)
+
+    def close(self):
+        pass
 
 
-class AgentAnimeCalendarSessionTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.data = snapshot()
-        self.data["days"][3]["items"] = [card(title="离线回放动漫")]
-        self.service = Mock(get_week=Mock(side_effect=lambda **kwargs: copy.deepcopy(self.data)))
-        self.getter = self.enterContext(patch("app.agent.domains.discovery.calendar_actions.get_calendar_service", return_value=self.service))
-        self.enabled = self.enterContext(patch("app.agent.domains.discovery.calendar_actions.config.get_bool", return_value=True))
-        self.enterContext(patch("app.agent.kernel.ports.mediaflux_policy.is_agent_enabled", return_value=True))
-        self.network_attempts = []
-        def forbidden(*args, **kwargs):
-            self.network_attempts.append(True)
-            raise AssertionError("AgentSession追漫日历回归禁止真实网络")
-        for name in ("getaddrinfo", "create_connection", "socket.connect", "socket.connect_ex"):
-            self.enterContext(patch("socket." + name, side_effect=forbidden))
-
-    def tearDown(self):
-        self.assertEqual(self.network_attempts, [])
-
-    def session(self, model):
-        catalog = catalog_from_tool_specs(build_tool_specs())
-        store = InMemorySessionStateStore()
-        pipeline = ToolPipeline(catalog=catalog, state_store=store, authorization=MediaFluxAuthorizationPolicy())
-        return AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=store)
-
-    async def test_natural_calendar_query_uses_registered_read_tool_and_projects_actual_facts(self):
-        model = CalendarEchoModel({"source": "youku"})
-        session = self.session(model)
-        events = await collect(session.run(AgentInput(message="今天优酷有哪些动漫更新，打开追漫日历", owner="webk:v1:" + "a" * 64,
-                                                       session_id="calendar-session")))
-        self.service.get_week.assert_called_once_with(wait_sources=("youku",), cancelled=ANY)
-        self.assertEqual(len(model.requests), 2)
-        facts = model.facts
-        assert facts is not None
-        self.assertEqual((facts["status"], facts["data"]["total"], facts["data"]["returned"]), ("partial", 1, 1))
-        self.assertEqual(facts["data"]["items"][0]["audience"], "member")
-        self.assertEqual(facts["data"]["items"][0]["free_progress"], "")
-        self.assertEqual(facts["data"]["sources"][0]["fetched_at"], "2026-09-10T04:24:05+08:00")
-        self.assertEqual(facts["data"]["calendar_url"], "/discovery/calendar")
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
-        self.assertEqual(sum(event.type == AgentEventType.TOOL_STARTED for event in events), 1)
-        self.assertFalse(any(event.type in {AgentEventType.TOOL_FAILED, AgentEventType.EFFECT_APPROVAL_REQUIRED} for event in events))
-        content = json.dumps([event.to_dict() for event in events], ensure_ascii=False)
-        self.assertIn("离线回放动漫", content)
-        for private in ("private-poster-key", "should-not-be-returned", "private-token", "trackInfo"):
-            self.assertNotIn(private, content)
-
-    async def test_source_still_loading_after_bounded_wait_explains_gap_without_bangumi(self):
-        self.data["sources"][2]["status"] = "loading"
-        self.data["days"][3]["items"] = []
-        self.data["refreshing"] = True
-        model = CalendarEchoModel({"source": "youku"})
-        events = await collect(self.session(model).run(AgentInput(message="今天优酷动漫排期", owner="webk:v1:" + "b" * 64,
-                                                                session_id="loading-session")))
-        self.service.get_week.assert_called_once_with(wait_sources=("youku",), cancelled=ANY)
-        assert model.facts is not None
-        self.assertEqual(model.facts["status"], "loading")
-        self.assertEqual(model.facts["data"]["retry_after"], 5)
-        self.assertEqual(len(model.requests), 2)
-        self.assertEqual(sum(event.type == AgentEventType.TOOL_STARTED for event in events), 1)
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
-
-    async def test_cold_week_finishes_in_one_turn_from_shared_collector_without_user_refresh(self):
+@unittest.skipUnless(sandbox.sandbox_supported(), "需要可运行 Bubblewrap 的 Linux 隔离工作区")
+class NativeMediaWorkspaceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.addCleanup(os.umask, os.umask(0o077))
+        temp = self.enterContext(tempfile.TemporaryDirectory(prefix="native-media-"))
+        self.directory = Path(temp)
         self.enterContext(isolated_test_database())
-        started, release = threading.Event(), threading.Event()
-        calls = []
-        dates = [day["date"] for day in self.data["days"]]
+        self.enterContext(patch.dict(os.environ, {"DISCOVERY_ENABLED": "1"}))
+        self.enterContext(patch.object(sandbox, "get_runtime_paths", return_value=SimpleNamespace(
+            data_dir=self.directory, runtime_dir=self.directory / ("long-runtime-" * 10))))
+        self.providers = {name: MetadataProvider(name) for name in ("tmdb", "bangumi")}
+        self.discovery = DiscoveryService(registry=ProviderRegistry(self.providers))
+        self.search = DiscoverySearchService(providers={"tmdb": self.providers["tmdb"]})
+        self.calendar, self.calendar_sources = calendar_service()
+        for service in (self.discovery, self.search, self.calendar):
+            self.addCleanup(service.shutdown)
+        for target, service in (("app.discovery.search.get_discovery_search_service", self.search),
+                                ("app.discovery.service.get_discovery_service", self.discovery),
+                                ("app.discovery.calendar.service.get_calendar_service", self.calendar)):
+            self.enterContext(patch(target, return_value=service))
+        self.store = InMemorySessionStateStore()
+        self.pipeline = ToolPipeline(catalog=ToolCatalog(), state_store=self.store)
+        self.pipeline.catalog.register(sandbox.run_code_tool(self.pipeline))
+        self.context = await make_context(self.store)
 
-        class Provider:
-            source = "tencent"
-            allowed_hosts = frozenset({"v.qq.com"})
+    async def execute(self, code):
+        result = await self.pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=self.context)
+        return json.loads(result.outcome.full_model_content or result.outcome.model_content)["data"]
 
-            async def fetch(self, http):
-                calls.append(True)
-                started.set()
-                await asyncio.to_thread(release.wait, 2)
-                return SourceResult(tuple(CalendarEntry(
-                    "tencent", f"show_{i}", f"回放动漫{i}", "animation",
-                    f"https://v.qq.com/x/cover/show_{i}.html",
-                    evidence="线程测试平台排期回放",
-                    events=(CalendarEvent(dates[i % 7], "10:00", "会员更新一话", "member"),),
-                ) for i in range(53)), "partial", "公开排期有限覆盖")
+    async def test_cold_native_python_cli_full_responses_and_saved_work_readback(self):
+        code = """import json, subprocess
+from mf.media import search, detail, catalog, calendar
+facts = {
+    "search": search("作品", providers=["tmdb"], media_type="tv", year="2026"),
+    "detail": detail("tmdb", "tv", "42"),
+    "page": catalog("tmdb", "discover", "tv"),
+    "collected": catalog("tmdb", "discover", "tv", limit=3, genre="16", region="CN", year_from="2016"),
+    "bangumi": catalog("bangumi", "calendar", "tv", filters={"weekday":"4"}),
+    "calendar": calendar(),
+}
+facts["cli"] = json.loads(subprocess.check_output(["mf", "media.detail", "--provider", "tmdb", "--media-type", "tv", "--external-id", "42"]))
+for card in [facts["search"]["items"][0], facts["detail"]["item"], facts["page"]["items"][0], facts["collected"]["items"][0], facts["cli"]["item"]]:
+    assert card["origin_country"] == ["CN", "US"] and card["original_language"] == "zh" and card["genre_ids"] == [16]
+json.dump(facts, open("media-facts.json", "w"))
+print(len(facts["search"]["items"]), len(facts["page"]["items"]), facts["collected"]["scope"]["next_offset"], len(facts["calendar"]["days"]))
+"""
+        result = await self.execute(code)
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(result["stdout"].strip(), "30 30 3 7")
+        calls = result["sdk_calls"]
+        self.assertEqual([call["method"] for call in calls],
+                         ["media.search", "media.detail", "media.catalog", "media.catalog", "media.catalog", "media.calendar", "media.detail"])
+        workspace, _ = sandbox._workspace_location(self.context.owner, self.context.session_id)
+        observations = [json.loads((workspace / call["response_path"].lstrip("/")).read_text()) for call in calls]
+        self.assertEqual(observations[0]["arguments"]["year"], "2026")
+        self.assertIsNone(observations[1]["result"]["item"]["number_of_seasons"])
+        self.assertTrue(observations[1]["result"]["item"]["mapping_confirmed"])
+        self.assertEqual(len(observations[5]["result"]["days"]), 7)
+        self.assertTrue(any(call[0] == "list" and call[3].get("with_genres") == "16"
+                            and call[3].get("with_origin_country") == "CN"
+                            and call[3].get("first_air_date.gte") == "2016-01-01"
+                            for call in self.providers["tmdb"].calls))
+        replay = await self.execute('import json\nv=json.load(open("media-facts.json"))\nprint(v["cli"]["item"]["external_id"], sum(len(d["items"]) for d in v["calendar"]["days"]))')
+        self.assertEqual(replay["stdout"].strip(), "42 54")
+        self.assertEqual(replay["sdk_calls"], [])
 
-        class NoNetwork:
-            def __init__(self, hosts):
-                pass
+    async def test_calendar_publishes_usable_week_with_optional_metadata_pending_over_real_ipc(self):
+        self.calendar.metadata = SimpleNamespace(enrich=lambda entries: [
+            {**entry.to_dict(), "mapping_status": "pending"} for entry in entries
+        ])
+        result = await self.execute('from mf.media import calendar\nv=calendar()\n'
+                                    'print(v["refreshing"], v["metadata_pending"], len(v["days"]), '
+                                    'sum(len(d["items"]) for d in v["days"]))')
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(result["stdout"].strip(), "False True 7 54")
+        self.assertEqual([call["method"] for call in result["sdk_calls"]], ["media.calendar"])
+        self.assertTrue(all(source.calls == 1 for source in self.calendar_sources.values()))
 
-            async def aclose(self):
-                pass
+    async def test_rating_python_cli_and_argument_retry_keep_movie_identity(self):
+        page = DiscoverySearchResult(query="同名作品", page=1, items=(
+            MediaCard("douban", "201", "tv", "同名作品", year="2026", rating=6.4),
+            MediaCard("douban", "202", "movie", "同名作品", year="2026", rating=8.1),
+        ), has_more=False, errors=(), providers_attempted=("douban",), providers_succeeded=("douban",))
+        with patch.object(self.search, "search", return_value=page) as search, patch(
+            "app.discovery.ratings.get_discovery_search_service", return_value=self.search,
+        ):
+            result = await self.execute('''import json, subprocess
+from mf import media
+try:
+    media.rating("同名作品", media_type="movie", year="bad-year")
+except RuntimeError:
+    print("参数未执行")
+value = media.rating("同名作品", media_type="movie", year=2026, allow_web_fallback=False)
+cli = json.loads(subprocess.check_output(["mf", "media.rating", "--query", "同名作品", "--media-type", "movie", "--year", "2026", "--no-allow-web-fallback"]))
+assert value["data"] == cli["data"]
+json.dump(value, open("rating.json", "w"))
+print(value["data"]["media_type"], value["data"]["year"], value["data"]["rating"])
+''')
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(result["stdout"].strip().splitlines(), ["参数未执行", "movie 2026 8.1"])
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual([call["ok"] for call in result["sdk_calls"]], [False, True, True])
+        replay = await self.execute('import json\nv=json.load(open("rating.json"))\nprint(v["data"]["source_method"], v["data"]["rating"])')
+        self.assertEqual(replay["stdout"].strip(), "douban_search 8.1")
+        self.assertEqual(replay["sdk_calls"], [])
 
-        class Metadata:
-            def enrich(self, entries):
-                return [entry.to_dict() for entry in entries]
+    async def test_real_broker_host_cancel_stops_collector_before_next_page(self):
+        from app.services import collect_discovery_recommendations
 
-        now = datetime(2026, 9, 10, 12)
-        service = CalendarService(providers={"tencent": Provider()}, cache=DiscoveryCache(clock=lambda: now),
-                                  http_factory=NoNetwork, metadata=Metadata(), clock=lambda: now)
-        self.addCleanup(service.shutdown)
-        self.getter.return_value = service
-        model = CalendarEchoModel({"day": "week", "source": "tencent"})
-        session = self.session(model)
-        turn = asyncio.create_task(collect(session.run(AgentInput(
-            message="腾讯动漫周一到周日追更表", owner="webk:v1:" + "a" * 64, session_id="cold-week",
-        ))))
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def collect(*args, **kwargs):
+            try:
+                return collect_discovery_recommendations(*args, **kwargs)
+            finally:
+                finished.set()
+        self.enterContext(patch("app.services.collect_discovery_recommendations", side_effect=collect))
+        original = self.providers["tmdb"].list_items
+        def page(*args):
+            entered.set()
+            assert release.wait(3)
+            result = original(*args)
+            return DiscoveryPage(result.items[:1], has_more=True, provider=result.provider)
+        self.enterContext(patch.object(self.providers["tmdb"], "list_items", side_effect=page))
+        task = asyncio.create_task(self.execute('from mf.media import catalog\ncatalog("tmdb", "discover", "tv", limit=3)'))
         try:
-            self.assertTrue(await asyncio.to_thread(started.wait, 2))
-            self.assertFalse(turn.done(), "冷加载不能直接结束用户请求")
-            self.assertEqual(service.get_week()["sources"][0]["status"], "loading", "页面读取保持非阻塞")
+            self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+            self.context.cancellation.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+            self.assertTrue(await asyncio.to_thread(finished.wait, 3))
+            self.assertEqual(len([call for call in self.providers["tmdb"].calls if call[0] == "list"]), 1)
         finally:
             release.set()
-        events = await asyncio.wait_for(turn, 5)
-        assert model.facts is not None
-        facts = model.facts["data"]
-        self.assertEqual((facts["total"], facts["returned"]), (53, 53))
-        self.assertFalse(facts["has_more"])
-        self.assertEqual({row["date"] for row in model_rows(facts)}, set(dates))
-        self.assertEqual((len(calls), len(model.requests)), (1, 2))
-        self.assertEqual(sum(event.type == AgentEventType.TOOL_STARTED for event in events), 1)
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+            await asyncio.to_thread(finished.wait, 3)
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
-    async def test_missing_initial_capability_can_be_discovered_then_called_in_same_turn(self):
-        target = adapt_tool_spec(next(spec for spec in build_tool_specs() if spec.name == "discovery.anime_calendar"))
-        session, model = session_for([target], [
-            [call("agent.capabilities", {"tool_names": ["discovery.anime_calendar"]}, "find-calendar")],
-            [call("discovery__anime_calendar", {"source": "youku"}, "calendar-read")],
-            [ModelEvent(ModelEventType.TEXT_DELTA, text="按工具返回的公开排期及来源状态回答。")],
-        ])
-        events = await collect(session.run(AgentInput(message="查询追漫日历优酷今天的排期", owner="fixture-owner", session_id="find-session")))
-        self.service.get_week.assert_called_once_with(wait_sources=("youku",), cancelled=ANY)
-        self.assertNotIn("discovery__anime_calendar", {tool["name"] for tool in model.requests[0].tools})
-        self.assertIn("discovery__anime_calendar", {tool["name"] for tool in model.requests[1].tools})
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
-        data = json.loads(next(message.content for message in model.requests[2].messages
-                               if message.role == "tool" and message.tool_call_id == "calendar-read"))
-        self.assertEqual(data["data"]["total"], 1)
-        self.assertEqual(data["data"]["calendar_url"], "/discovery/calendar")
-
-    async def test_read_tool_still_requires_production_principal_authorization(self):
-        for owner in ("not-a-web-principal", "tg:v1:123\x1f456"):
-            with self.subTest(owner=owner), patch("app.agent.kernel.ports.mediaflux_policy.telegram_owner_route_is_currently_authorized", return_value=False):
-                model = ScriptedModel([
-                    [call("discovery__anime_calendar", {"source": "youku"}), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
-                    [ModelEvent(ModelEventType.TEXT_DELTA, text="当前身份无权读取。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
-                ])
-                events = await collect(self.session(model).run(AgentInput(message="今天优酷追漫日历", owner=owner, session_id="denied-session")))
-                failed = [event for event in events if event.type == AgentEventType.TOOL_FAILED]
-                self.assertEqual(len(failed), 1)
-                self.assertEqual(failed[0].payload["code"], "authorization_denied")
-                self.getter.assert_not_called()
-
-    async def test_feature_disabled_is_explained_by_tool_without_calendar_access(self):
-        model = CalendarEchoModel({"source": "youku"})
-        session = self.session(model)
-        self.enabled.return_value = False
-        events = await collect(session.run(AgentInput(message="今天优酷追漫日历", owner="webk:v1:" + "c" * 64,
-                                                       session_id="disabled-session")))
-        self.getter.assert_not_called()
-        assert model.facts is not None
-        self.assertEqual(model.facts["status"], "disabled")
-        self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+    async def test_real_sdk_reports_unknown_inventory_source_failure_and_parameter_rejection(self):
+        with patch("app.services._configured_media_sources", return_value=[]), patch.object(
+            self.providers["tmdb"], "search", side_effect=ProviderTimeout("token=private-provider")
+        ):
+            result = await self.execute("""from mf import media
+unknown = media.catalog("tmdb", "discover", "tv", limit=1, exclude_library=True)
+failed = media.search("作品", providers=["tmdb"])
+print(unknown["status"], unknown["returned"], unknown["library_check"]["counts"]["indeterminate"])
+print(failed["status"], len(failed["errors"]))
+try:
+    media.search("作品", year="not-a-year")
+except RuntimeError:
+    print("参数未执行")
+""")
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(result["stdout"].strip().splitlines(), ["partial 0 30", "unavailable 1", "参数未执行"])
+        self.assertEqual([call["ok"] for call in result["sdk_calls"]], [True, False, False])
+        self.assertNotIn("private-provider", json.dumps(result))

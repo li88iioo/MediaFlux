@@ -1,12 +1,36 @@
-"""结构化媒体偏好的校验与消费策略；不解释自然语言、不执行任何写操作。"""
+"""结构化媒体偏好的校验、变更预检与条件提交；只保存用户显式变更。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
+import secrets
 import unicodedata
 from typing import Any
 
-from app.repositories.media_experience import default_media_preferences
+from app.database import media_owner_digest
+from app.modules.media_probe import infer_dynamic_ranges
+from app.repositories import media_experience as repository
+from app.repositories.media_experience import default_media_preferences, get_media_preferences
+
+_PREFERENCE_LABELS = {
+    "preferred_server": "首选媒体服务器", "preferred_download_target": "默认下载目标",
+    "preferred_resolution": "首选分辨率", "minimum_resolution": "最低分辨率",
+    "preferred_hdr": "首选动态范围", "preferred_codecs": "首选编码",
+    "preferred_subtitles": "首选字幕", "preferred_audio_languages": "首选音轨语言",
+    "preferred_release_groups": "首选发布组", "excluded_keywords": "排除关键词",
+    "preferred_genres": "偏好题材", "excluded_genres": "排除题材",
+    "max_episode_size_gb": "单集最大大小（GiB，0为不限）", "min_rating": "最低评分",
+    "exclude_played": "排除已看内容", "memory_notes": "长期备忘",
+}
+
+
+_PREFERENCE_VALUES = {
+    "any": "不限", "dolby_vision": "杜比视界", "hdr10": "HDR10", "hdr10+": "HDR10+", "sdr": "SDR",
+    "guangya": "光鸭", "qb": "qBittorrent", "both": "两者", "jellyfin": "Jellyfin", "emby": "Emby",
+}
+
 
 _ENUMS = {
     "preferred_server": ("any", "jellyfin", "emby"),
@@ -23,7 +47,9 @@ _LIST_LIMITS = {
     "excluded_keywords": 24,
     "preferred_genres": 12,
     "excluded_genres": 8,
+    "memory_notes": 20,
 }
+_TERM_CHARS = {"memory_notes": 200}
 _CODECS = ("h264", "hevc", "av1")
 _RESOLUTIONS = {"any": 0, "720p": 720, "1080p": 1080, "2160p": 2160}
 PREFERENCE_FIELDS = tuple(default_media_preferences())
@@ -33,7 +59,7 @@ PREFERENCE_PROPERTIES: dict[str, Any] = {
         key: {
             "type": "array", "maxItems": maximum, "uniqueItems": True,
             "items": ({"type": "string", "enum": list(_CODECS)} if key == "preferred_codecs"
-                      else {"type": "string", "minLength": 1, "maxLength": 80}),
+                      else {"type": "string", "minLength": 1, "maxLength": _TERM_CHARS.get(key, 80)}),
         }
         for key, maximum in _LIST_LIMITS.items()
     },
@@ -42,6 +68,10 @@ PREFERENCE_PROPERTIES: dict[str, Any] = {
     "min_rating": {"type": "number", "minimum": 0, "maximum": 10},
     "exclude_played": {"type": "boolean"},
 }
+PREFERENCE_PROPERTIES["memory_notes"]["description"] = (
+    "长期备忘：结构化字段表达不了、用户明确要求记住的事实或习惯（如“动漫库叫 Anime”“不要推荐韩剧”）。"
+    "提交完整新列表：保留仍有效的旧条目，删除用户要求忘记的条目；每条一句，不存密钥、链接或一次性任务。"
+)
 PREFERENCE_PROPERTIES["preferred_resolution"]["description"] = (
     "软偏好/排序优先级。例如‘默认优先4K’只设置本字段为2160p，不同时设置最低分辨率。"
 )
@@ -57,6 +87,16 @@ RESOURCE_PREFERENCE_FIELDS = (
 RESOURCE_PREFERENCE_PROPERTIES = {
     key: PREFERENCE_PROPERTIES[key] for key in RESOURCE_PREFERENCE_FIELDS
 }
+
+
+def resolve_download_target(owner: str) -> tuple[str, str]:
+    """解析默认下载目标与来源；写操作仅在预检调用，确认使用冻结的实际目标。"""
+    if normalized_owner := (owner or "").strip():
+        preferences = repository.get_media_preferences(media_owner_digest(normalized_owner))
+        target = str(preferences.get("preferred_download_target") or "").strip()
+        if preferences.get("explicit") and target in {"qb", "guangya", "both"}:
+            return target, "saved_preference"
+    return "guangya", "product_default"
 
 
 def validate_preference_updates(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -77,7 +117,7 @@ def validate_preference_updates(arguments: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(item, str):
                     raise ValueError(f"{key} 中的匹配词必须是字符串")  # noqa: TRY004 - 偏好字段统一按无效值处理。
                 term = unicodedata.normalize("NFKC", item).strip()
-                if (not term or len(term) > 80 or
+                if (not term or len(term) > _TERM_CHARS.get(key, 80) or
                         any(unicodedata.category(char).startswith("C") for char in term)):
                     raise ValueError(f"{key} 中包含无效匹配词")
                 if key in {"preferred_genres", "excluded_genres"} and any(
@@ -103,6 +143,68 @@ def validate_preference_updates(arguments: dict[str, Any]) -> dict[str, Any]:
             value = float(raw)
         result[key] = value
     return result
+
+
+def snapshot_media_preferences_change(
+    current: dict[str, Any], updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按确切已读/已提交版本冻结字段合并；同一算法用于预检与 undo 写后证明。"""
+    normalized = validate_preference_updates(updates) if updates is not None else None
+    proposed = repository.merge_media_preferences(current, normalized) if normalized is not None else default_media_preferences()
+    snapshot = {"current": current, "proposed": proposed} if normalized is not None else current
+    fingerprint = hashlib.sha256(json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return {"current": current, "proposed": proposed, "updates": normalized, "fingerprint": fingerprint}
+
+
+def prepare_media_preferences_change(
+    owner_digest: str, updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """读取完整当前版本并冻结字段合并；updates=None 表示恢复默认，预检不写入。"""
+    if not isinstance(owner_digest, str) or not owner_digest.strip():
+        raise ValueError("媒体偏好必须提供确切身份摘要")
+    return snapshot_media_preferences_change(repository.get_media_preferences(owner_digest), updates)
+
+
+def public_media_preferences(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: value[key] for key in (*PREFERENCE_FIELDS, "explicit") if key in value}
+
+
+def media_preferences_preview(prepared: dict[str, Any]) -> dict[str, Any]:
+    """共用业务预览；完整备忘逐条列出，不把私有 revision token 暴露给客户端。"""
+    current = public_media_preferences(prepared["current"])
+    if prepared["updates"] is None:
+        return {"current": current, "defaults": prepared["proposed"]}
+    changes = []
+    for key, value in prepared["updates"].items():
+        if key == "memory_notes":
+            text = "".join(f"\n· {note}" for note in value) or "清空"
+        elif isinstance(value, list):
+            text = "、".join(value) or "清空"
+        elif isinstance(value, bool):
+            text = "是" if value else "否"
+        else:
+            text = _PREFERENCE_VALUES.get(str(value), str(value))
+        changes.append(f"{_PREFERENCE_LABELS[key]}：{text}")
+    return {"current": current, "proposed": prepared["proposed"], "effects": changes}
+
+
+def apply_media_preferences_change(
+    owner_digest: str, updates: dict[str, Any] | None = None, *, expected_fingerprint: str,
+) -> dict[str, Any] | None:
+    """比对原预检并复用仓储 revision/token CAS；返回自身提交状态，漂移返回 None。"""
+    prepared = prepare_media_preferences_change(owner_digest, updates)
+    if not secrets.compare_digest(prepared["fingerprint"], expected_fingerprint or ""):
+        return None
+    current = prepared["current"]
+    expected = {"expected_revision": current["revision"], "expected_revision_token": current["revision_token"]}
+    if prepared["updates"] is not None:
+        return repository.set_media_preferences(owner_digest, updates=prepared["updates"], **expected)
+    if repository.clear_media_preferences(owner_digest, **expected):
+        # 删除无独立版本墓碑；仅返回已知缺失状态，不能用其跨 ABA 执行回退。
+        return {**default_media_preferences(), "revision": 0, "explicit": False}
+    return None
 
 
 def effective_preferences(
@@ -176,8 +278,8 @@ def resource_preference_match(
     if resolution and resolution == _RESOLUTIONS[profile["preferred_resolution"]]:
         score += 45
         reasons.append(f"偏好分辨率：{profile['preferred_resolution']}")
-    dolby = bool(re.search(r"(?<![a-z0-9])(?:dv|dovi)(?![a-z0-9])|dolby[ ._-]*vision|杜比视界", title))
-    hdr = "dolby_vision" if dolby else "hdr10+" if "hdr10+" in title else "hdr10" if "hdr" in title else "sdr" if "sdr" in title else ""
+    ranges = infer_dynamic_ranges(title)
+    hdr = {"DoVi": "dolby_vision", "HDR10+": "hdr10+", "HDR10": "hdr10", "SDR": "sdr"}.get(ranges[0], "") if ranges else ""
     if profile["preferred_hdr"] != "any" and hdr == profile["preferred_hdr"]:
         score += 25
         reasons.append(f"偏好画面格式：{hdr}")
@@ -209,3 +311,36 @@ def resource_preference_match(
             eligible = False
             warnings.append("文件大小未知，无法核对单集大小限制")
     return {"score": score, "eligible": eligible, "reasons": reasons, "warnings": warnings}
+
+
+def owner_media_preferences(owner: str) -> dict[str, Any]:
+    owner = (owner or "").strip()
+    if not owner:
+        return default_media_preferences()
+    return effective_preferences(get_media_preferences(media_owner_digest(owner)))
+
+
+def owner_memory(owner: str) -> str:
+    """当前身份的偏好和技能索引；技能正文按需读取，不作为系统指令灌入。"""
+    from app.repositories.agent_skills import list_skills
+
+    preferences = owner_media_preferences(owner)
+    defaults = default_media_preferences()
+    saved = {key: preferences[key] for key in PREFERENCE_FIELDS
+             if key != "memory_notes" and preferences.get(key) != defaults.get(key)}
+    notes = list(preferences.get("memory_notes") or [])
+    skills = sorted(list_skills(owner=owner), key=lambda item: item["revision"], reverse=True)
+    if not saved and not notes and not skills:
+        return ""
+    memory: dict[str, Any] = {"preferences": saved, "notes": notes}
+    if skills:
+        memory["skills"] = {
+            "items": [{"name": item["name"], "revision": item["revision"],
+                       "description": item["description"][:160],
+                       **({"description_truncated": True} if len(item["description"]) > 160 else {})}
+                      for item in skills[:20]],
+            "total": len(skills), "list_method": "skills.list", "read_method": "skills.get",
+        }
+    return json.dumps(memory, ensure_ascii=False) + (
+        "\n更新或忘记偏好时，用 preferences.update 提交需要更新的字段（memory_notes 提交完整新列表），或用 preferences.clear 清除全部偏好，用户确认后生效。" if saved or notes else ""
+    )

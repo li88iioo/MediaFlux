@@ -110,9 +110,16 @@ class SourceResult:
     message: str = ""
     sampled: int = 0
     ignored: int = 0
+    # 已实际读取的日期；与来源是否覆盖平台全部节目是两回事。
+    covered_dates: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.status not in {"ok", "partial", "unavailable"}:
             raise ValueError("日历来源状态无效")
         if len(self.entries) > 100:
             raise ValueError("来源节目数量超过上限")
+        if len(self.covered_dates) > 7 or any(
+            not isinstance(day, str) or calendar_date.fromisoformat(day).isoformat() != day
+            for day in self.covered_dates
+        ):
+            raise ValueError("日历已读取日期无效")

@@ -1,34 +1,15 @@
-"""ID32: real ingest DTOs through Session, offline business boundaries only."""
+"""ID32: native URL 回执与同请求读证据经过 Session，后端完全离线。"""
 import asyncio
 from unittest.mock import patch
 
 import pytest
 
-from app.agent.domains.resources.candidate_context import RecentResourceCandidateStore
-from app.agent.domains.resources.ingest_actions import (
-    IngestActions,
-)
+from app import sdk
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.models import ToolContext
+from app.agent.kernel.ports.sdk_effects import download_submit_tool
 from app.agent.public_view import public_conversation_messages
-from app.modules.share_transfer import ShareTransferPreviewStore
 from tests.support import isolated_test_database
-from tests.test_agent_kernel_core import (
-    AgentInput,
-    AgentSession,
-    CapabilityRetriever,
-    KernelToolSpec,
-    ModelEvent,
-    ModelEventType,
-    ModelToolCall,
-    PreparedEffect,
-    ScriptedModel,
-    ToolCatalog,
-    ToolEffect,
-    ToolPipeline,
-    ToolPipelineError,
-    consume_events,
-)
+from tests.test_agent_kernel_core import AgentInput, AgentSession, KernelToolSpec, ModelEvent, ModelEventType, ModelToolCall, ScriptedModel, ToolCatalog, ToolEffect, ToolPipeline, ToolPipelineError, consume_events
 
 EXPLANATION = "提交后，请求#42的本地记录显示qB正在下载，整理与STRM仍待处理，因此尚不能确认入库完成。"
 
@@ -39,35 +20,29 @@ def tool_round(*calls):
 
 
 @pytest.mark.parametrize("unresolved,foreign", [(False, False), (True, False), (False, True)])
-def test_ingest_followup_explanation(unresolved, foreign):
+def test_native_url_followup_explanation(unresolved, foreign):
     async def scenario():
-        actions = IngestActions(share_store=ShareTransferPreviewStore(), recent_resource_store=RecentResourceCandidateStore())
-        context = ToolContext(owner="a32-owner")
-        args = {"source_type": "direct_url", "target": "qb", "positions": []}
+        args = {"url": "magnet:?xt=urn:btih:" + "a" * 40, "target": "qb"}
         row = {"id": 43 if foreign else 42, "title": "Offline fixture", "kind": "magnet",
                "targets": "qb", "status": "downloading", "qb_status": "downloading",
                "gy_status": "not_started", "organize_status": "pending", "strm_status": "pending",
                "updated_at": "2026-01-01 00:00:00", "error": "", "source_value": ""}
         reads = []
-        def prepare(*_):
-            preview, fingerprint = actions.prepare_submit(args, context)
-            return PreparedEffect(preview=preview.to_dict(), snapshot_fingerprint=fingerprint)
-        def submit(*_):
-            _, fingerprint = actions.prepare_submit(args, context)
-            return actions.execute_submit(args, fingerprint, context).to_dict()
         def inspect(*_):
-            with patch("app.agent.domains.resources.ingest_actions.db.get_download_request", return_value=row):
-                result = actions.status({"request_number": row["id"]}, context).to_dict()
+            with patch("app.repositories.activity.snapshot", return_value={
+                "record": row, "logs": [], "local_tasks": [], "local_task_status_counts": {},
+                "verification": None, "runs": [],
+            }):
+                result = sdk.activity.timeline("download", row["id"])
             reads.append(result)
             return result
         def blocked(*_):
             raise ToolPipelineError("另一个请求不可读", code="inspection_blocked")
         schema = {"type": "object", "properties": {}}
-        write = KernelToolSpec(name="ingest.submit", domain="ingest", description="提交下载", input_schema=schema,
-                               effect=ToolEffect.WRITE, prepare=prepare, execute_confirmed=submit)
-        read = KernelToolSpec(name="ingest.status", domain="ingest", description="核验进度", input_schema=schema,
+        write = download_submit_tool()
+        read = KernelToolSpec(name="activity.timeline", domain="activity", description="核验进度", input_schema=schema,
                               effect=ToolEffect.READ, read=inspect)
-        bad = KernelToolSpec(name="ingest.blocked", domain="ingest", description="其它核验", input_schema=schema,
+        bad = KernelToolSpec(name="activity.blocked", domain="activity", description="其它核验", input_schema=schema,
                              effect=ToolEffect.READ, read=blocked)
         calls = [ModelToolCall("inspect", read.name, {})]
         if unresolved:
@@ -76,25 +51,22 @@ def test_ingest_followup_explanation(unresolved, foreign):
             async def stream(self, request, *, cancellation):
                 if len(self.requests) == 2:
                     wire = "\n".join(m.content for m in request.messages if m.role == "tool")
-                    assert '"downloading"' in wire and '"organize_status"' in wire
+                    assert '"downloading"' in wire and '光鸭整理' in wire
                     assert EXPLANATION not in wire
                 async for event in super().stream(request, cancellation=cancellation):
                     yield event
         model = EvidenceModel([
-            tool_round(ModelToolCall("submit", write.name, {})), tool_round(*calls),
+            tool_round(ModelToolCall("submit", write.name, args)), tool_round(*calls),
             [ModelEvent(ModelEventType.TEXT_DELTA, text=EXPLANATION + "已全部入库完成。允许自动重放。"),
              ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         catalog = ToolCatalog([write, read, bad])
         store = SQLiteKernelStore(secret_provider=lambda: "a32-offline-fixture")
-        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+        session = AgentSession(model=model, catalog=catalog,
                                pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
-        with patch("app.agent.domains.resources.ingest_actions.download_target_readiness", return_value={"qb": True}), \
-             patch("app.agent.domains.resources.ingest_actions.create_request", return_value={"id": 42, "created": True, "status": "pending"}) as create, \
-             patch("app.agent.domains.resources.ingest_actions.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}) as dispatch, \
-             patch("app.agent.domains.resources.ingest_actions.db.get_download_request", return_value=None):
-            inspected = actions.inspect({"source_type": "direct_url", "input": "magnet:?xt=urn:btih:" + "a" * 40}, context)
-            args["ingest_snapshot"] = inspected.references[0].value
+        with patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True}), \
+             patch("app.indexers.downloads.create_request", return_value={"id": 42, "created": True, "status": "pending"}) as create, \
+             patch("app.indexers.downloads.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}) as dispatch:
             preview = await consume_events(session.run(AgentInput(message="提交下载并核验进度", owner="o", session_id="s")))
             assert preview.approval is not None
             final = await consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id))

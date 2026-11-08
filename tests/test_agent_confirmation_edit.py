@@ -11,7 +11,8 @@ import pytest
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
@@ -203,13 +204,12 @@ def test_changed_domain_snapshot_after_edit_is_rejected_by_original_executor(rig
 def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(task_store, tmp_path, monkeypatch):
     """真实本地配置执行器，只有模型按脚本；600旧调用保留，900成为实际UI意图和回执。"""
     from app import config
-    from app.agent.domain_catalog import build_tool_specs
     from app.agent.feature_gate import initialize_runtime_fence
-    from app.agent.kernel.capabilities import CapabilityRetriever
+
     from app.agent.kernel.events import AgentEventType as E
     from app.agent.kernel.model import ModelEvent, ModelToolCall
     from app.agent.kernel.model import ModelEventType as M
-    from app.agent.kernel.ports import adapt_tool_spec
+    from app.agent.kernel.ports.sdk_effects import policy_config_tool
     from app.agent.kernel.session import AgentSession
     from app.agent.kernel.state_types import AgentInput
     from tests.test_agent_kernel_core import ScriptedModel, collect
@@ -223,7 +223,7 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
     for key in ("DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS"):
         monkeypatch.delenv(key, raising=False)
     initialize_runtime_fence()
-    tool = adapt_tool_spec(next(spec for spec in build_tool_specs() if spec.name == "config.set_safe_policy"))
+    tool = policy_config_tool()
     from copy import deepcopy
     from dataclasses import replace
     origins = []
@@ -240,7 +240,7 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
                             ModelEvent(M.FINISH, finish_reason="tool_calls")], final, final])
     pipeline = ToolPipeline(catalog=catalog, state_store=task_store,
                             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
-    session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=task_store)
+    session = AgentSession(model=model, catalog=catalog,  pipeline=pipeline, state_store=task_store)
     from app.agent.kernel.bootstrap import _capture_creation_binding
     session.continuation_binding = _capture_creation_binding()
 
@@ -336,7 +336,7 @@ def test_sensitive_schema_field_cannot_be_changed_by_edit_patch(rig, field):
 
 
 def test_second_card_created_by_confirmed_continuation_is_editable_under_original_fence(rig):
-    from app.agent.kernel.capabilities import CapabilityRetriever
+
     from app.agent.kernel.events import AgentEventType as E
     from app.agent.kernel.model import ModelEvent, ModelToolCall
     from app.agent.kernel.model import ModelEventType as M
@@ -349,7 +349,7 @@ def test_second_card_created_by_confirmed_continuation_is_editable_under_origina
                     {"label": label, "object_id": "opaque-object-7", "signature": "credential-signed-original"})),
                 ModelEvent(M.FINISH, finish_reason="tool_calls")]
     model = ScriptedModel([call("A"), call("B"), [ModelEvent(M.TEXT_DELTA, text="完成"), ModelEvent(M.FINISH, finish_reason="stop")]])
-    session = AgentSession(model=model, catalog=rig.pipeline.catalog, retriever=CapabilityRetriever(),
+    session = AgentSession(model=model, catalog=rig.pipeline.catalog,
                            pipeline=rig.pipeline, state_store=rig.store)
 
     async def run():
@@ -369,7 +369,7 @@ def test_second_card_created_by_confirmed_continuation_is_editable_under_origina
 
 
 def test_edit_rejects_live_confirmation_tail_until_current_execution_finishes(rig):
-    from app.agent.kernel.capabilities import CapabilityRetriever
+
     from app.agent.kernel.events import AgentEventType as E
     from app.agent.kernel.model import ModelEvent, ModelToolCall
     from app.agent.kernel.model import ModelEventType as M
@@ -383,7 +383,7 @@ def test_edit_rejects_live_confirmation_tail_until_current_execution_finishes(ri
                 ModelEvent(M.FINISH, finish_reason="tool_calls")]
 
     session = AgentSession(model=ScriptedModel([call("A"), call("B")]), catalog=rig.pipeline.catalog,
-        retriever=CapabilityRetriever(), pipeline=rig.pipeline, state_store=rig.store, journal=rig.store)
+         pipeline=rig.pipeline, state_store=rig.store, journal=rig.store)
 
     async def run():
         initial = await collect(session.run(AgentInput(message="修改名称A，然后修改B。", owner=OWNER, session_id=SESSION)))

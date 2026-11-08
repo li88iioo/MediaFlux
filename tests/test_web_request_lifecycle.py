@@ -6,12 +6,12 @@ from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.domains.discovery import web_read_actions as read
-from app.agent.domains.discovery import web_search_actions as search
-from app.agent.domains.discovery.web_request_singleflight import (
+from app.modules import web_evidence as read
+from app.modules import web_evidence as search
+from app.modules.web_evidence import (
     web_request_singleflight,
 )
-from app.agent.models import ToolResult
+from app.modules.web_evidence import _result as make_result
 from app.modules import recognition_web_hints as hints
 from tests.support import IsolatedDatabaseTestCase
 
@@ -19,9 +19,9 @@ from tests.support import IsolatedDatabaseTestCase
 class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
     def setUp(self):
         super().setUp()
-        search.clear_web_search_cache()
+        search.clear_web_cache()
         hints.clear_recognition_web_hint_cache()
-        self.addCleanup(search.clear_web_search_cache)
+        self.addCleanup(search.clear_web_cache)
         self.addCleanup(hints.clear_recognition_web_hint_cache)
         stack = self.enterContext(ExitStack())
         values = {
@@ -42,18 +42,18 @@ class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
         return (
             (
                 search,
-                "_cached",
+                "_cached_result",
                 "_search_tavily",
-                lambda: search.search_web({"query": "demo"}),
-                search.clear_web_search_cache,
+                lambda: search.search_web("demo"),
+                search.clear_web_cache,
                 web_request_singleflight,
             ),
             (
                 read,
-                "_restore_cached_result",
+                "_cached_result",
                 "_read_local",
-                lambda: read.read_web({"url": "https://example.com/article"}),
-                search.clear_web_search_cache,
+                lambda: read.read_web("https://example.com/article"),
+                search.clear_web_cache,
                 web_request_singleflight,
             ),
             (
@@ -74,12 +74,11 @@ class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
             return hints.RecognitionWebHintResult(
                 titles=("Demo",), attempted=True, status="ok"
             )
-        return ToolResult(
+        return make_result(
             ok,
             "ok" if ok else "unavailable",
             "demo",
-            data={"url": "https://example.com/article", "cached": False},
-            model_data={"chunks": ["demo"]},
+            data={"url": "https://example.com/article", "content": "demo", "cached": False},
         )
 
     def test_owner_rechecks_cache_after_another_request_publishes(self):
@@ -108,7 +107,7 @@ class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
                     result = request()
                 self.assertEqual(call.call_count, 1)
                 self.assertTrue(
-                    result.cached if isinstance(result, hints.RecognitionWebHintResult) else result.data["cached"]
+                    result.cached if isinstance(result, hints.RecognitionWebHintResult) else result["data"]["cached"]
                 )
                 self.assertEqual(flight.active_count, 0)
 
@@ -126,7 +125,7 @@ class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
                     result = request()
                 self.assertEqual(call.call_count, 2)
                 self.assertFalse(
-                    result.cached if isinstance(result, hints.RecognitionWebHintResult) else result.data["cached"]
+                    result.cached if isinstance(result, hints.RecognitionWebHintResult) else result["data"]["cached"]
                 )
                 self.assertEqual(flight.active_count, 0)
 

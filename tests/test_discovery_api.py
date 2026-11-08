@@ -382,6 +382,31 @@ class DiscoveryAPITests(_BaseClientTests):
         )
         self.assertEqual(detail.json()["title"], "Detail")
 
+    def test_advertised_date_and_country_filters_work_through_http(self):
+        from app.discovery.registry import validate_filters
+        self.authenticate()
+        service = Mock(wraps=FakeDiscoveryService())
+        service.list_filters = DiscoveryService.list_filters
+
+        def list_items(provider, category, media_type, page, filters):
+            validate_filters(provider, category, media_type, filters)
+            return FakeDiscoveryService().list_items(provider, category, media_type, page, filters)
+
+        service.list_items.side_effect = list_items
+        with patch("app.routes.discovery_api.get_discovery_service", return_value=service):
+            for media_type, date_field in (("movie", "release_date"), ("tv", "first_air_date")):
+                with self.subTest(media_type=media_type):
+                    definition = self.client.get(f"/api/discovery/filters/tmdb/{media_type}").json()
+                    fields = {item["key"]: item for item in definition["extra_filters"]}
+                    filters = {key: fields[key]["example"] for key in (
+                        "with_origin_country", f"{date_field}.gte", "vote_average.gte", "vote_average.lte", "vote_count.gte",
+                    )}
+                    response = self.client.get("/api/discovery/items", params={
+                        "provider": "tmdb", "category": definition["category"], "media_type": media_type, **filters,
+                    })
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(service.list_items.call_args.args[-1], filters)
+
     def test_authenticated_douban_api_uses_public_client_without_reading_frodo_credentials(self):
         # A public Douban client requires no Frodo credentials, not an empty
         # installation. Keep the real stable env/DB pair supplied by setUp.

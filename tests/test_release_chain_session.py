@@ -8,13 +8,9 @@ from dataclasses import replace
 from unittest.mock import Mock, patch
 
 from app.agent.confirmation import ConfirmationStore
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
@@ -55,7 +51,7 @@ class ConfirmationSessionPointerTests(unittest.IsolatedAsyncioTestCase):
         pipeline = ToolPipeline(catalog=catalog, state_store=store,
             effect_store=ConfirmationEffectPlanStore(ConfirmationStore()))
         session = AgentSession(model=Mock(), catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1), pipeline=pipeline, state_store=store)
+             pipeline=pipeline, state_store=store)
         prepared = await pipeline.execute("downloads.submit", {}, context=context)
         assert prepared.effect_plan is not None
         return session, context, prepared.effect_plan.plan_id, execute

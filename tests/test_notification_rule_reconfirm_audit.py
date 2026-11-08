@@ -6,8 +6,8 @@ import sqlite3
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.subscriptions import consumption_actions as actions
-from app.agent.errors import AgentToolError
+from app.modules import media_subscription_notifications as actions
+from app.modules.media_subscriptions import MediaSubscriptionError
 from app.agent.models import ToolContext
 from app.repositories import media_experience as repository
 from tests.support import IsolatedDatabaseTestCase
@@ -66,18 +66,14 @@ class NotificationRuleReconfirmAuditTests(IsolatedDatabaseTestCase):
         self,
     ) -> None:
         arguments = {
-            "subscription_number": self.sid,
+            "subscription_id": self.sid,
             "enabled": True,
             "notify_on_satisfied": True,
         }
-        _, fingerprint = actions.prepare_set_subscription_notification_rule(
-            arguments, self.context
-        )
-        with patch.object(actions, "get_notification_rule", self._replace_after_read):
-            with self.assertRaises(AgentToolError) as raised:
-                actions.set_subscription_notification_rule_confirmed(
-                    arguments, fingerprint, self.context
-                )
+        fingerprint = actions.prepare_rule_change('set_notification', arguments)["snapshot"]
+        with patch.object(actions, "notification_rule", self._replace_after_read):
+            with self.assertRaises(MediaSubscriptionError) as raised:
+                actions.apply_rule_change('set_notification', arguments, expected_snapshot=fingerprint)
         self.assertEqual(raised.exception.code, "confirmation_stale")
         actual = repository.get_notification_rule(self.sid)
         assert actual is not None
@@ -86,15 +82,11 @@ class NotificationRuleReconfirmAuditTests(IsolatedDatabaseTestCase):
         self.assertEqual(actual["revision"], 1)
 
     def test_reset_recreate_between_precheck_and_reset_keeps_new_rule(self) -> None:
-        arguments = {"subscription_number": self.sid}
-        _, fingerprint = actions.prepare_reset_subscription_notification_rule(
-            arguments, self.context
-        )
-        with patch.object(actions, "get_notification_rule", self._replace_after_read):
-            with self.assertRaises(AgentToolError) as raised:
-                actions.reset_subscription_notification_rule_confirmed(
-                    arguments, fingerprint, self.context
-                )
+        arguments = {"subscription_id": self.sid}
+        fingerprint = actions.prepare_rule_change('reset_notification', arguments)["snapshot"]
+        with patch.object(actions, "notification_rule", self._replace_after_read):
+            with self.assertRaises(MediaSubscriptionError) as raised:
+                actions.apply_rule_change('reset_notification', arguments, expected_snapshot=fingerprint)
         self.assertEqual(raised.exception.code, "confirmation_stale")
         actual = repository.get_notification_rule(self.sid)
         assert actual is not None
@@ -104,32 +96,24 @@ class NotificationRuleReconfirmAuditTests(IsolatedDatabaseTestCase):
     def test_write_failure_rolls_back_and_restart_can_retry_same_confirmation(
         self,
     ) -> None:
-        arguments = {"subscription_number": self.sid, "notify_on_satisfied": True}
-        _, fingerprint = actions.prepare_set_subscription_notification_rule(
-            arguments, self.context
-        )
+        arguments = {"subscription_id": self.sid, "notify_on_satisfied": True}
+        fingerprint = actions.prepare_rule_change('set_notification', arguments)["snapshot"]
         with db.get_conn() as conn:
             conn.execute(
                 "CREATE TRIGGER audit_rule_failure BEFORE UPDATE ON media_subscription_notification_rules BEGIN SELECT RAISE(ABORT,'audit interruption'); END"
             )
         try:
             with self.assertRaises(sqlite3.IntegrityError):
-                actions.set_subscription_notification_rule_confirmed(
-                    arguments, fingerprint, self.context
-                )
+                actions.apply_rule_change('set_notification', arguments, expected_snapshot=fingerprint)
             self.assertEqual(repository.get_notification_rule(self.sid), self.initial)
         finally:
             with db.get_conn() as conn:
                 conn.execute("DROP TRIGGER audit_rule_failure")
         db.init_db()
-        receipt = actions.set_subscription_notification_rule_confirmed(
-            arguments, fingerprint, self.context
-        )
-        self.assertTrue(receipt.ok)
-        with self.assertRaises(AgentToolError) as raised:
-            actions.set_subscription_notification_rule_confirmed(
-                arguments, fingerprint, self.context
-            )
+        receipt = actions.apply_rule_change('set_notification', arguments, expected_snapshot=fingerprint)
+        self.assertTrue(receipt["ok"])
+        with self.assertRaises(MediaSubscriptionError) as raised:
+            actions.apply_rule_change('set_notification', arguments, expected_snapshot=fingerprint)
         self.assertEqual(raised.exception.code, "confirmation_stale")
         actual = repository.get_notification_rule(self.sid)
         assert actual is not None
@@ -138,24 +122,13 @@ class NotificationRuleReconfirmAuditTests(IsolatedDatabaseTestCase):
 
     def test_new_confirmation_after_reset_recreate_is_valid(self) -> None:
         self._replace_after_read(self.sid)
-        arguments = {"subscription_number": self.sid, "enabled": True}
-        _, fingerprint = actions.prepare_set_subscription_notification_rule(
-            arguments, self.context
-        )
-        result = actions.set_subscription_notification_rule_confirmed(
-            arguments, fingerprint, self.context
-        )
-        self.assertTrue(result.ok)
-        _, reset_fingerprint = actions.prepare_reset_subscription_notification_rule(
-            {"subscription_number": self.sid},
-            self.context,
-        )
-        reset = actions.reset_subscription_notification_rule_confirmed(
-            {"subscription_number": self.sid},
-            reset_fingerprint,
-            self.context,
-        )
-        self.assertTrue(reset.ok)
+        arguments = {"subscription_id": self.sid, "enabled": True}
+        fingerprint = actions.prepare_rule_change('set_notification', arguments)["snapshot"]
+        result = actions.apply_rule_change('set_notification', arguments, expected_snapshot=fingerprint)
+        self.assertTrue(result["ok"])
+        reset_fingerprint = actions.prepare_rule_change('reset_notification', {"subscription_id": self.sid})["snapshot"]
+        reset = actions.apply_rule_change('reset_notification', {"subscription_id": self.sid}, expected_snapshot=reset_fingerprint)
+        self.assertTrue(reset["ok"])
         current = repository.get_notification_rule(self.sid)
         assert current is not None
         self.assertFalse(current["explicit"])

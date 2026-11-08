@@ -9,12 +9,7 @@ import socket
 import httpx
 import pytest
 
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -143,7 +138,7 @@ def make_session(wire, tools, *, limits=None):
     catalog = ToolCatalog(tools)
     store = SQLiteKernelStore(secret_provider=lambda: SECRET)
     return AgentSession(
-        model=wire.model, catalog=catalog, retriever=CapabilityRetriever(),
+        model=wire.model, catalog=catalog,
         pipeline=ToolPipeline(catalog=catalog, state_store=store, reference_store=store),
         state_store=store, limits=limits,
     )
@@ -275,7 +270,7 @@ def test_responses_completed_call_event_before_eof_is_not_executed_or_charged():
         assert events[-1].payload["status"] == "success"
         assert events[-1].payload["tool_calls"] == events[-1].payload["business_tool_calls"] == 1
         assert wire.requests[1].get("tools") == wire.requests[0].get("tools")
-        assert not wire.requests[2].get("tools"), "真正完成 READ 后才耗尽 1 次业务工具额度"
+        assert wire.requests[2].get("tools"), "达到调用额度后仍可自然回答；工具执行由同一预算拒绝"
         assert "discard-call" not in json.dumps(history("responses", wire.requests[1]))
         cold = await session.state_store.load(owner=OWNER, session_id=SESSION)
         assert "discard-call" not in json.dumps(cold.conversation)
@@ -298,7 +293,8 @@ def private_read_reply(protocol):
     if protocol == "responses":
         body["output"].insert(0, {
             "type": "reasoning", "id": "rs_1", "status": "completed",
-            "summary": [{"type": "summary_text", "text": THINKING}], "encrypted_content": REDACTED,
+            "summary": [{"type": "summary_text", "text": "Checking the actual result."}], "encrypted_content": REDACTED,
+            "content": [{"type": "reasoning_text", "text": THINKING}],
         })
     else:
         body["choices"][0]["message"]["reasoning_content"] = THINKING
@@ -344,7 +340,7 @@ def private_blocks(protocol, request):
 
 def system_text(protocol, request):
     if protocol == "anthropic_messages":
-        return request["system"]
+        return "".join(block["text"] for block in request["system"])
     return json.dumps([row for row in history(protocol, request) if row.get("role") == "system"], ensure_ascii=False)
 
 
@@ -370,19 +366,20 @@ def test_completed_read_and_native_private_group_survive_but_current_truncated_g
         assert RECOVERY_HINT not in system_text(protocol, wire.requests[1])
         assert RECOVERY_HINT in system_text(protocol, wire.requests[2])
         assert RECOVERY_HINT not in system_text(protocol, wire.requests[3])
-        assert "实际剩余工具调用 1 次" in system_text(protocol, wire.requests[2])
-        assert "剩余规划轮次 1" in system_text(protocol, wire.requests[2])
-        assert "实际剩余工具调用 0 次" in system_text(protocol, wire.requests[3])
-        assert "剩余规划轮次 0" in system_text(protocol, wire.requests[3])
+        assert "实际剩余工具调用" not in system_text(protocol, wire.requests[2])
+        assert "剩余规划轮次" not in system_text(protocol, wire.requests[2])
+        assert "实际剩余工具调用" not in system_text(protocol, wire.requests[3])
+        assert "剩余规划轮次" not in system_text(protocol, wire.requests[3])
         assert wire.requests[2].get("tools") == wire.requests[1].get("tools")
-        assert not wire.requests[3].get("tools")
+        assert wire.requests[3].get("tools") == wire.requests[2].get("tools")
         original = private_blocks(protocol, wire.requests[1])
         assert original, "第一次工具回合必须真正携带完整原生 private 状态"
         assert private_blocks(protocol, wire.requests[2]) == original
         assert private_blocks(protocol, wire.requests[3]) == original
         if protocol == "responses":
             assert original == [{"type": "reasoning", "id": "rs_1", "status": "completed",
-                                 "summary": [{"type": "summary_text", "text": THINKING}], "encrypted_content": REDACTED}]
+                                 "summary": [{"type": "summary_text", "text": "Checking the actual result."}], "encrypted_content": REDACTED,
+                                 "content": [{"type": "reasoning_text", "text": THINKING}]}]
         elif protocol == "chat_completions":
             assert original == [THINKING]
         else:
@@ -490,7 +487,7 @@ def test_user_can_cancel_during_native_reconstruction_without_a_third_request(pr
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("boundary", ["no-model-round", "last-read-round", "final-synthesis-round", "tool-quota"])
+@pytest.mark.parametrize("boundary", ["no-model-round", "last-read-round", "last-round-keeps-tools", "tool-quota"])
 def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(boundary):
     async def scenario():
         protocol = "responses"
@@ -502,7 +499,7 @@ def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(boundary
             limits = SessionLimits(max_model_rounds=2)
             responses = [truncated_text(protocol), reply(protocol, call_id="read-1", arguments={"target": 1})]
         else:
-            limits = SessionLimits(max_model_rounds=3 if boundary == "final-synthesis-round" else 5,
+            limits = SessionLimits(max_model_rounds=3 if boundary == "last-round-keeps-tools" else 5,
                                    max_tool_calls=1 if boundary == "tool-quota" else 2)
             responses = [reply(protocol, call_id="read-1", arguments={"target": 1}),
                          truncated_text(protocol), reply(protocol, call_id="forbidden-read-2", arguments={"target": 2})]
@@ -512,8 +509,10 @@ def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(boundary
         session = make_session(wire, [read_tool(reads)], limits=limits)
         events = await run_turn(session)
         assert len(wire.requests) == expected_requests and len(wire.responses) == 1
+        assert limits.max_model_rounds is not None
         assert len(wire.requests) <= limits.max_model_rounds
-        assert reads == ([] if boundary == "no-model-round" else [1])
+        expected_reads = [] if boundary == "no-model-round" else [1, 2] if boundary == "last-round-keeps-tools" else [1]
+        assert reads == expected_reads
         if boundary == "no-model-round":
             assert phases(events) == ["planning"]
             assert events[-1].type is AgentEventType.TURN_FAILED
@@ -525,19 +524,18 @@ def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(boundary
                 "tool_budget_exceeded" if boundary == "tool-quota" else "model_round_budget_exceeded"
             )
             assert events[-1].payload["model_calls"] == expected_requests
-            assert events[-1].payload["business_tool_calls"] == 1
+            assert events[-1].payload["business_tool_calls"] == len(expected_reads)
         if boundary == "last-read-round":
             assert wire.requests[1].get("tools") == wire.requests[0].get("tools")
-        elif boundary in {"final-synthesis-round", "tool-quota"}:
-            assert not wire.requests[2].get("tools")
+        elif boundary in {"last-round-keeps-tools", "tool-quota"}:
+            assert wire.requests[2].get("tools")
             rejected = [e for e in events if e.type is AgentEventType.TOOL_FAILED]
-            assert [(e.payload["call_id"], e.payload["code"]) for e in rejected] == [
-                ("forbidden-read-2", "tool_budget_exceeded" if boundary == "tool-quota" else "not_executed_final_round"),
-            ]
+            assert [(e.payload["call_id"], e.payload["code"]) for e in rejected] == (
+                [("forbidden-read-2", "tool_budget_exceeded")] if boundary == "tool-quota" else [])
         cold = await session.state_store.load(owner=OWNER, session_id=SESSION)
         assert DRAFT not in json.dumps(cold.conversation, ensure_ascii=False)
         assert [row["tool_call_id"] for row in cold.conversation if row["role"] == "tool" and json.loads(row["content"]).get("ok")] == (
-            [] if boundary == "no-model-round" else ["read-1"]
+            [] if boundary == "no-model-round" else ["read-1", "forbidden-read-2"] if boundary == "last-round-keeps-tools" else ["read-1"]
         )
 
     asyncio.run(scenario())

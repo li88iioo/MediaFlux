@@ -6,11 +6,14 @@ import json
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.local_media.queries import (
-    diagnose_local_media,
-    local_media_diagnosis_arguments,
-)
-from app.agent.errors import AgentToolError
+from app import sdk
+from app.agent.models import ToolResult
+
+
+def read_diagnosis():
+    return ToolResult(**sdk.local.diagnose())
+
+
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -68,11 +71,9 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         return task_id
 
     def test_arguments_reject_every_extra_field(self):
-        self.assertEqual(local_media_diagnosis_arguments({}), {})
-        with self.assertRaisesRegex(
-            AgentToolError, "^local_media\\.diagnose 不接受参数$"
-        ):
-            local_media_diagnosis_arguments({"path": "/private"})
+        self.assertEqual(sdk.prepare_sdk_method("local.diagnose", {}, owner="test"), {})
+        with self.assertRaises(TypeError):
+            sdk.prepare_sdk_method("local.diagnose", {"path": "/private"}, owner="test")
 
     def test_database_summary_is_owner_scoped_and_classifies_states(self):
         source = self._source()
@@ -117,12 +118,12 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
 
     def test_empty_and_inactive_states_are_explicit(self):
         with patch(
-            "app.agent.domains.local_media.queries.peek_local_media_scheduler_status"
+            "app.modules.local_media_scheduler.peek_local_media_scheduler_status"
         ) as scheduler:
             scheduler.return_value = {"running": False, "interval_seconds": 10}
-            empty = diagnose_local_media({})
+            empty = read_diagnosis()
             self._source(enabled=0)
-            inactive = diagnose_local_media({})
+            inactive = read_diagnosis()
         self.assertEqual(empty.status, "not_configured")
         self.assertTrue(empty.ok)
         self.assertEqual(inactive.status, "inactive")
@@ -136,10 +137,10 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self._task(source, "planned", suffix="planned")
         self._task(source, "waiting_stable", suffix="waiting")
         with patch(
-            "app.agent.domains.local_media.queries.peek_local_media_scheduler_status"
+            "app.modules.local_media_scheduler.peek_local_media_scheduler_status"
         ) as scheduler:
             scheduler.return_value = {"running": True, "interval_seconds": 5}
-            active = diagnose_local_media({})
+            active = read_diagnosis()
         self.assertEqual(active.status, "active")
         self.assertEqual(active.data["attention"]["total"], 0)
         self.assertNotIn("scan_enabled", active.data["sources"])
@@ -149,10 +150,10 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         source_without_target = self._source(suffix="unmapped")
         assert isinstance(source_without_target, int)
         with patch(
-            "app.agent.domains.local_media.queries.peek_local_media_scheduler_status"
+            "app.modules.local_media_scheduler.peek_local_media_scheduler_status"
         ) as scheduler:
             scheduler.return_value = {"running": True, "interval_seconds": 5}
-            attention = diagnose_local_media({})
+            attention = read_diagnosis()
         self.assertEqual(attention.status, "attention")
         self.assertEqual(
             attention.data["attention"],
@@ -173,23 +174,23 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             source, "default", "/library/default", owner="admin"
         )
         with patch(
-            "app.agent.domains.local_media.queries.peek_local_media_scheduler_status",
+            "app.modules.local_media_scheduler.peek_local_media_scheduler_status",
             return_value={"running": False, "interval_seconds": 0},
         ):
-            stopped = diagnose_local_media({})
+            stopped = read_diagnosis()
         self.assertEqual(stopped.status, "attention")
         self.assertEqual(
             stopped.data["attention"]["categories"]["scheduler_not_running"], 1
         )
-        self.assertIn("调度器当前未运行", stopped.suggestions[-1])
+        self.assertFalse(stopped.data["scheduler"]["running"])
         with db.get_conn() as conn:
             conn.execute("UPDATE local_media_sources SET enabled=0 WHERE owner='admin'")
         self._task(source, "failed", suffix="inactive-failed")
         with patch(
-            "app.agent.domains.local_media.queries.peek_local_media_scheduler_status",
+            "app.modules.local_media_scheduler.peek_local_media_scheduler_status",
             return_value={"running": False, "interval_seconds": 0},
         ):
-            inactive_failed = diagnose_local_media({})
+            inactive_failed = read_diagnosis()
         self.assertEqual(inactive_failed.status, "attention")
         self.assertEqual(inactive_failed.data["attention"]["categories"]["failed"], 1)
 
@@ -198,7 +199,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             patch("app.modules.local_media_scheduler._scheduler", None),
             patch("app.config._read_env_file") as read_env,
         ):
-            result = diagnose_local_media({})
+            result = read_diagnosis()
             from app.modules import local_media_scheduler
 
             self.assertIsNone(local_media_scheduler._scheduler)
@@ -211,10 +212,10 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         source = self._source(suffix="leak")
         self._task(source, "failed", suffix="leak")
         with patch(
-            "app.agent.domains.local_media.queries.peek_local_media_scheduler_status"
+            "app.modules.local_media_scheduler.peek_local_media_scheduler_status"
         ) as scheduler:
             scheduler.return_value = {"running": False, "interval_seconds": 10}
-            result = diagnose_local_media({})
+            result = read_diagnosis()
         serialized = json.dumps(result.to_dict(), ensure_ascii=False)
         for secret in (
             "SECRET_SOURCE_leak",
@@ -239,15 +240,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.error, "")
         self.assertFalse(result.data["network_accessed"])
 
-    def test_exception_returns_fixed_sanitized_error(self):
-        with patch(
-            "app.agent.domains.local_media.queries.db.get_local_media_diagnostic_summary",
-            side_effect=RuntimeError("LOCAL_SECRET /private/path"),
-        ):
-            result = diagnose_local_media({})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "unavailable")
-        serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-        self.assertNotIn("LOCAL_SECRET", serialized)
-        self.assertNotIn("/private/path", serialized)
-        self.assertFalse(result.data["network_accessed"])
+    def test_exception_does_not_turn_into_zero_task_facts(self):
+        with patch("app.modules.local_media_tasks.db.get_local_media_diagnostic_summary", side_effect=RuntimeError("database unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                sdk.local.diagnose()

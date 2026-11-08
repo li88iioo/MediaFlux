@@ -21,7 +21,8 @@ from app.agent.errors import ConfirmationClaimError, ToolPipelineError
 from app.agent.kernel.bootstrap import _capture_creation_binding
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.continuation import effect_origin, effect_payload
-from app.agent.kernel.effects import ConfirmationEffectPlanStore, PreparedEffect
+from app.agent.kernel.effects import ConfirmationEffectPlanStore
+from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports.mediaflux_effects import MediaFluxEffectLifecycle
@@ -367,7 +368,6 @@ def test_registration_storage_fault_keeps_original_exception_and_code(case):
 
 
 def test_real_admitted_tracker_cannot_be_overwritten_by_sync_failure(case):
-    from app.agent.kernel.ports.existing_actions import adapt_tool_spec
     from tests.test_agent_effect_admission import (
         _domain_arguments,
         _offline_runtime,
@@ -380,7 +380,7 @@ def test_real_admitted_tracker_cannot_be_overwritten_by_sync_failure(case):
         client = _OfflineClient()
         with _offline_runtime(case.root, client) as stack, _paused_manager():
             arguments = _domain_arguments("fs", client, ToolContext(owner=OWNER, session_id=SID), stack)
-            case.tool = adapt_tool_spec(_spec("fs", actions=stack.domain_actions))
+            case.tool = _spec("fs")
             case.pipeline.catalog.register(case.tool)
             await case.preview(arguments)
             accepted = await case.confirm()

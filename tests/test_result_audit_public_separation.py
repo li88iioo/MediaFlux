@@ -7,12 +7,7 @@ from dataclasses import replace
 import pytest
 
 from app.agent.kernel.adapters import TurnViewBuilder, iter_ndjson
-from app.agent.kernel.capabilities import (
-    CapabilityRetriever,
-    KernelToolSpec,
-    ToolCatalog,
-    ToolEffect,
-)
+from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -64,7 +59,7 @@ def test_credentials_redacted_in_cold_audit_and_all_result_views(store):  # noqa
         wire = Wire("chat_completions", [reply("chat_completions", name=catalog.get(A).model_name,
             arguments={}, index=0), reply("chat_completions", text="safe-answer")])
         session = AgentSession(model=wire.adapter, catalog=catalog,
-            retriever=CapabilityRetriever(minimum=1, maximum=1),
+
             pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store, journal=store)
         events = [event async for event in session.run(AgentInput(message="read", owner="owner-a", session_id="audit-secret"))]
         wire.verify(posts=2)

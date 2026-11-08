@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -265,18 +265,24 @@ def add_media_watchlist(
     title: str = "",
     year: str = "",
     poster_key: str = "",
-) -> None:
+    *,
+    expected_absent: bool = False,
+) -> int | None:
+    """普通添加更新元数据；冻结预览只允许首次插入，冲突返回 None。"""
     database = _database()
+    conflict = "DO NOTHING" if expected_absent else (
+        "DO UPDATE SET title=excluded.title,year=excluded.year,poster_key=excluded.poster_key"
+    )
     with database.get_conn() as conn:
-        conn.execute(
+        row = conn.execute(
             "INSERT INTO media_watchlist(provider,external_id,media_type,title,year,poster_key,created_at) "
-            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) DO UPDATE SET "
-            "title=excluded.title,year=excluded.year,poster_key=excluded.poster_key",
+            f"VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) {conflict} RETURNING id",
             (
                 provider, external_id, media_type, (title or ""),
                 (year or ""), (poster_key or ""), database.now(),
             ),
-        )
+        ).fetchone()
+        return int(row["id"]) if row is not None else None
 
 
 def get_media_watchlist(
@@ -298,11 +304,37 @@ def get_media_watchlist_by_id(watchlist_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def delete_media_watchlist(provider: str, external_id: str, media_type: str) -> bool:
+def media_watchlist_snapshot(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "watchlist_number": int(row["id"]),
+        **{key: str(row[key] or "") for key in (
+            "provider", "external_id", "media_type", "title", "year", "poster_key", "created_at",
+        )},
+    }
+
+
+def delete_media_watchlist(
+    provider: str, external_id: str, media_type: str, *,
+    expected_snapshot: dict[str, Any] | None = None,
+) -> bool:
+    """在同一条 DELETE 中核对完整快照，避免预检后覆盖并发修改。"""
+    where = "provider=? AND external_id=? AND media_type=?"
+    parameters: tuple[Any, ...] = (provider, external_id, media_type)
+    if expected_snapshot is not None:
+        if expected_snapshot.get("exists") is not True or parameters != tuple(
+            expected_snapshot.get(key) for key in ("provider", "external_id", "media_type")
+        ):
+            return False
+        where += " AND id=? AND COALESCE(title,'')=? AND COALESCE(year,'')=? AND COALESCE(poster_key,'')=? AND COALESCE(created_at,'')=?"
+        parameters += tuple(expected_snapshot.get(key) for key in (
+            "watchlist_number", "title", "year", "poster_key", "created_at",
+        ))
     with _database().get_conn() as conn:
         cur = conn.execute(
-            "DELETE FROM media_watchlist WHERE provider=? AND external_id=? AND media_type=?",
-            (provider, external_id, media_type),
+            f"DELETE FROM media_watchlist WHERE {where}", parameters,
         )
         return bool(cur.rowcount)
 

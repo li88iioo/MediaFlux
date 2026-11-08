@@ -6,7 +6,7 @@ import json
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.domains.strm.failure_actions import triage_strm_failures
+from app import sdk
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -89,81 +89,44 @@ class StrmFailureTriageUnitTests(IsolatedDatabaseTestCase):
         for secret in ("SECRET", "/private", "UUID", "PATH", "source-", ".mkv"):
             self.assertNotIn(secret, serialized)
 
-    def test_result_states_and_sensitive_fields_are_fixed_and_redacted(self):
-        empty = triage_strm_failures({})
-        self.assertTrue(empty.ok)
-        self.assertEqual(empty.status, "healthy")
-        self.assertEqual(empty.data["probe_mode"], "database")
-        self.assertFalse(empty.data["network_accessed"])
-        self.assertFalse(empty.data["filesystem_accessed"])
-        failure_id = self._record(
-            source="PRIVATE-SOURCE-ID",
-            file_id="PRIVATE-FILE-ID",
-            action="generate",
-            error="secret-token=https://private.example/token /home/private/video.mkv",
-        )
-        attention = triage_strm_failures({})
-        self.assertFalse(attention.ok)
-        self.assertEqual(attention.status, "attention")
-        self.assertEqual(attention.data["failures"]["open"], 1)
-        serialized = json.dumps(attention.to_dict(), ensure_ascii=False)
-        for secret in (
-            "PRIVATE-SOURCE-ID",
-            "PRIVATE-FILE-ID",
-            "source-PRIVATE",
-            "video.mkv",
-            "/home/private",
-            "private.example",
-            "secret-token",
-        ):
-            self.assertNotIn(secret, serialized)
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE strm_failures SET status='retrying',retry_count=1 WHERE id=?",
-                (failure_id,),
-            )
-        running = triage_strm_failures({})
-        self.assertTrue(running.ok)
-        self.assertEqual(running.status, "running")
-        self.assertEqual(running.data["failures"]["retrying"], 1)
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE strm_failures SET status='resolved',resolved_at=updated_at WHERE id=?",
-                (failure_id,),
-            )
-        resolved = triage_strm_failures({})
-        self.assertTrue(resolved.ok)
-        self.assertEqual(resolved.status, "healthy")
-        self.assertEqual(resolved.data["failures"]["resolved"], 1)
+    def test_native_reads_full_stored_error_and_real_id_in_each_state(self):
+        self.assertEqual(sdk.strm.failures()["status"], "healthy")
+        identifier = self._record(source="source", file_id="file", action="generate",
+                                  error="磁盘写入失败 " + "细节" * 160 + " permission denied password=PRIVATE https://private.invalid/token")
+        stored = dict(db.list_strm_failures()[0])
+        for state, expected in (("open", "attention"), ("retrying", "running"), ("resolved", "healthy")):
+            with db.get_conn() as conn:
+                conn.execute("UPDATE strm_failures SET status=? WHERE id=?", (state, identifier))
+            result = sdk.strm.failures(status=state)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], expected)
+            row, = result["data"]["items"]
+            self.assertEqual((row["id"], row["status"]), (identifier, state))
+            self.assertEqual(row["error"], stored["error"])
+            self.assertIn("permission denied", row["error"])
+            self.assertGreater(len(row["error"]), 300)
+            self.assertNotIn("PRIVATE", row["error"])
+            self.assertNotIn("private.invalid", row["error"])
+            self.assertEqual(result["data"]["error_representation"], "stored_redacted_text")
+            self.assertIn("不能还原", result["data"]["error_note"])
 
-    def test_triage_never_reuses_raw_helpers_filesystem_or_retry(self):
-        self._record(
-            source="source-a",
-            file_id="file-a",
-            action="metadata",
-            error="private failure",
-        )
-        with (
-            patch(
-                "app.database.list_strm_failures",
-                side_effect=AssertionError("raw rows used"),
-            ) as raw,
-            patch(
-                "app.database.summarize_strm_failures",
-                side_effect=AssertionError("source summary used"),
-            ) as source_summary,
-            patch(
-                "app.database.list_strm_index_diagnostics",
-                side_effect=AssertionError("filesystem used"),
-            ) as diagnostics,
-            patch(
-                "app.modules.strm.retry_strm_failures",
-                side_effect=AssertionError("retry used"),
-            ) as retry,
-        ):
-            result = triage_strm_failures({})
-        self.assertEqual(result.status, "attention")
-        raw.assert_not_called()
-        source_summary.assert_not_called()
-        diagnostics.assert_not_called()
-        retry.assert_not_called()
+    def test_native_read_filters_pages_and_does_not_turn_database_failure_into_empty(self):
+        identifiers = [self._record(source="source", file_id=f"file-{i}", action="metadata", error=f"完整错误{i}")
+                       for i in range(205)]
+        self._record(source="other", file_id="other", action="generate", error="other")
+        items, offset = [], 0
+        while True:
+            with patch("app.modules.strm.GuangYaClient", side_effect=AssertionError("不得访问云盘")), \
+                 patch("app.modules.strm.retry_strm_failures", side_effect=AssertionError("不得重试")):
+                result = sdk.strm.failures(status="open", source_id="source", action="metadata", limit=120, offset=offset)
+            data = result["data"]
+            self.assertEqual(data["total"], 205)
+            items.extend(data["items"])
+            if not data["has_more"]:
+                self.assertIsNone(data["next_offset"])
+                break
+            offset = data["next_offset"]
+        self.assertEqual([item["id"] for item in items], list(reversed(identifiers)))
+        with patch("app.database.list_strm_failures", side_effect=RuntimeError("unavailable")):
+            with self.assertRaises(RuntimeError):
+                sdk.strm.failures()

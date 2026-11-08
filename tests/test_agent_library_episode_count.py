@@ -1,54 +1,95 @@
-"""Media Agent 本地剧集库存单元测试：桩替换来源读取，不连接媒体服务器或真实外网。"""
+"""共用库存统计与原生 SDK 数据契约：桩替换来源读取，不访问真实服务。"""
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+import textwrap
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from typing import Any
+from unittest.mock import Mock, patch
 
 import pytest
 
-from app.agent.domains.library.episode_count import (
-    count_series_episodes,
-    count_series_episodes_arguments,
-)
-from app.agent.errors import AgentToolError
+from app.sdk import library
+from app.clients.base import SeriesCandidate, SeriesEpisodeInventory, SeriesSearchResult
+from app.services import count_series_episodes as count_series_episode_inventory
 
 
 class LibraryEpisodeCountArgumentsTests(unittest.TestCase):
-    def test_normalizes_supported_arguments(self):
-        self.assertEqual(
-            count_series_episodes_arguments(
-                {"query": "  师兄啊师兄  ", "tmdb_id": " 12345 "}
-            ),
-            {"query": "师兄啊师兄", "tmdb_id": "12345"},
+    @patch("app.services.inspect_series_episode_sources", return_value=[])
+    def test_normalizes_supported_arguments(self, inspect_sources):
+        library.episodes("  ＴＶ师兄啊师兄？  ", tmdb_id=" 12345 ")
+        inspect_sources.assert_called_once_with(
+            "TV师兄啊师兄", tmdb_id="12345", max_episodes=2000, include_specials=False,
         )
 
-    def test_accepts_named_library_scope(self):
-        self.assertEqual(
-            count_series_episodes_arguments(
-                {
-                    "query": "师兄啊师兄",
-                    "library_name": "  美女库  ",
-                }
-            ),
-            {"query": "师兄啊师兄", "tmdb_id": "", "library_name": "美女库"},
+    @patch("app.services.inspect_series_episode_sources", return_value=[])
+    def test_accepts_named_library_scope(self, inspect_sources):
+        library.episodes("师兄啊师兄", library_name="  美女库  ")
+        inspect_sources.assert_called_once_with(
+            "师兄啊师兄", tmdb_id="", library_name="美女库",
+            max_episodes=2000, include_specials=False,
         )
 
-    def test_rejects_invalid_or_extra_arguments(self):
-        invalid = (
-            {},
-            {"query": 1},
-            {"query": "剧名\n注入"},
-            {"query": "剧名", "tmdb_id": "abc"},
-            {"query": "剧名", "extra": True},
+    def test_rejects_invalid_arguments_before_reading_inventory(self):
+        invalid: tuple[dict[str, Any], ...] = (
+            {}, {"query": 1}, {"query": ""}, {"query": "剧名\n注入"},
+            {"query": "剧" * 121}, {"query": "剧名", "tmdb_id": "abc"},
+            {"query": "剧名", "tmdb_id": 123},
+            {"query": "剧名", "tmdb_id": "１２３"},
+            {"query": "剧名", "tmdb_id": "1" * 11},
+            {"query": "剧名", "library_name": 123},
+            {"query": "剧名", "library_name": " "},
+            {"query": "剧名", "library_name": "库" * 81},
+            {"query": "剧名", "library_name": "库\x00名"},
         )
-        for arguments in invalid:
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                count_series_episodes_arguments(arguments)
+        with patch("app.services.inspect_series_episode_sources") as inspect_sources:
+            for arguments in invalid:
+                with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                    library.episodes(**arguments)
+            invalid_signature: tuple[dict[str, Any], ...] = ({"query": "剧名", "extra": True},)
+            for arguments in invalid_signature:
+                with self.subTest(arguments=arguments), self.assertRaises(TypeError):
+                    library.episodes(**arguments)
+        inspect_sources.assert_not_called()
 
 
-class LibraryEpisodeCountToolTests(unittest.TestCase):
-    @patch("app.agent.domains.library.episode_count.inspect_series_episode_sources")
+@pytest.mark.parametrize("query", ["", "同名别剧"])
+def test_tmdb_inventory_uses_identity_without_requiring_title_search(query):
+    client = Mock()
+    client.find_series_candidates_by_tmdb.return_value = SeriesSearchResult(
+        candidates=[SeriesCandidate("series-id", "目标剧", "2026", "123")], total=1,
+    )
+    client.search_series_candidates.side_effect = AssertionError("精确身份命中无需标题搜索")
+    client.list_series_episode_inventory.return_value = SeriesEpisodeInventory(episodes=[(1, 1), (1, 3)], total=2)
+    with patch("app.services._configured_media_sources", return_value=[("jellyfin", "Jellyfin", "", client)]):
+        result = library.episodes(query=query, tmdb_id="123")
+    assert result["status"] == "success"
+    assert result["data"]["title"] == "目标剧"
+    assert result["data"]["local_episode_count"] == 2
+    assert result["data"]["seasons"][0]["episode_ranges"] == [[1, 1], [3, 3]]
+    client.search_series_candidates.assert_not_called()
+    client.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_tmdb_only_inventory_without_match_preserves_lookup_completeness(truncated):
+    client = Mock()
+    client.find_series_candidates_by_tmdb.return_value = SeriesSearchResult(truncated=truncated)
+    with patch("app.services._configured_media_sources", return_value=[("jellyfin", "Jellyfin", "", client)]):
+        result = library.episodes(tmdb_id="123")
+    assert result["status"] == "not_found"
+    assert result["data"]["sources"][0]["truncated"] is truncated
+    assert "123" in result["summary"]
+    client.search_series_candidates.assert_not_called()
+    client.list_series_episode_inventory.assert_not_called()
+
+
+class LibraryEpisodeCountSDKTests(unittest.TestCase):
+    @patch("app.services.inspect_series_episode_sources")
     def test_counts_unique_local_episode_coordinates_and_seasons(self, inspect_sources):
         inspect_sources.return_value = [
             {
@@ -73,14 +114,14 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
             },
         ]
 
-        result = count_series_episodes({"query": "师兄啊师兄", "tmdb_id": ""})
+        result = library.episodes(query="师兄啊师兄", tmdb_id="")
 
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.data["local_episode_count"], 4)
-        self.assertEqual(result.data["season_count"], 2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["local_episode_count"], 4)
+        self.assertEqual(result["data"]["season_count"], 2)
         self.assertEqual(
-            result.data["seasons"],
+            result["data"]["seasons"],
             [
                 {
                     "season": 1,
@@ -98,9 +139,9 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
                 },
             ],
         )
-        self.assertEqual(result.data["matched_source_count"], 2)
-        self.assertIs(result.data["inventory_complete"], True)
-        self.assertIn("本地收录 4 集", result.summary)
+        self.assertEqual(result["data"]["matched_source_count"], 2)
+        self.assertIs(result["data"]["inventory_complete"], True)
+        self.assertIn("本地收录 4 集", result["summary"])
         inspect_sources.assert_called_once_with(
             "师兄啊师兄",
             tmdb_id="",
@@ -108,7 +149,7 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
             include_specials=False,
         )
 
-    @patch("app.agent.domains.library.episode_count.inspect_series_episode_sources")
+    @patch("app.services.inspect_series_episode_sources")
     def test_limits_count_to_named_library_without_exposing_internal_id(
         self, inspect_sources
     ):
@@ -124,17 +165,11 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
             }
         ]
 
-        result = count_series_episodes(
-            {
-                "query": "师兄啊师兄",
-                "tmdb_id": "",
-                "library_name": "美女库",
-            }
-        )
+        result = library.episodes(query="师兄啊师兄", tmdb_id="", library_name="美女库")
 
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["library_name"], "美女库")
-        self.assertIs(result.data["inventory_complete"], True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["library_name"], "美女库")
+        self.assertIs(result["data"]["inventory_complete"], True)
         inspect_sources.assert_called_once_with(
             "师兄啊师兄",
             tmdb_id="",
@@ -142,23 +177,23 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
             include_specials=False,
             library_name="美女库",
         )
-        self.assertNotIn("library-id", repr(result.to_dict()))
+        self.assertNotIn("library-id", repr(result))
 
-    @patch("app.agent.domains.library.episode_count.inspect_series_episode_sources")
+    @patch("app.services.inspect_series_episode_sources")
     def test_does_not_report_zero_when_media_server_is_not_configured(
         self, inspect_sources
     ):
         inspect_sources.return_value = []
 
-        result = count_series_episodes({"query": "师兄啊师兄", "tmdb_id": ""})
+        result = library.episodes(query="师兄啊师兄", tmdb_id="")
 
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "not_configured")
-        self.assertIsNone(result.data["local_episode_count"])
-        self.assertIs(result.data["inventory_complete"], False)
-        self.assertNotIn("0 集", result.summary)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "not_configured")
+        self.assertIsNone(result["data"]["local_episode_count"])
+        self.assertIs(result["data"]["inventory_complete"], False)
+        self.assertNotIn("0 集", result["summary"])
 
-    @patch("app.agent.domains.library.episode_count.inspect_series_episode_sources")
+    @patch("app.services.inspect_series_episode_sources")
     def test_not_found_returns_candidates_without_false_count(self, inspect_sources):
         inspect_sources.return_value = [
             {
@@ -172,18 +207,18 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
             }
         ]
 
-        result = count_series_episodes({"query": "师兄啊师兄", "tmdb_id": ""})
+        result = library.episodes(query="师兄啊师兄", tmdb_id="")
 
-        self.assertFalse(result.ok)
-        self.assertEqual(result.status, "not_found")
-        self.assertIsNone(result.data["local_episode_count"])
-        self.assertIs(result.data["inventory_complete"], False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "not_found")
+        self.assertIsNone(result["data"]["local_episode_count"])
+        self.assertIs(result["data"]["inventory_complete"], False)
         self.assertEqual(
-            result.data["candidates"], [{"name": "师兄啊师兄 年番", "year": "2024"}]
+            result["data"]["candidates"], [{"name": "师兄啊师兄 年番", "year": "2024"}]
         )
-        self.assertNotIn("id", result.data["candidates"][0])
+        self.assertNotIn("id", result["data"]["candidates"][0])
 
-    @patch("app.agent.domains.library.episode_count.inspect_series_episode_sources")
+    @patch("app.services.inspect_series_episode_sources")
     def test_marks_unnumbered_or_truncated_inventory_as_partial(self, inspect_sources):
         inspect_sources.return_value = [
             {
@@ -197,14 +232,14 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
             }
         ]
 
-        result = count_series_episodes({"query": "测试剧", "tmdb_id": ""})
+        result = library.episodes(query="测试剧", tmdb_id="")
 
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.data["local_episode_count"], 2)
-        self.assertIs(result.data["inventory_complete"], False)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["local_episode_count"], 2)
+        self.assertIs(result["data"]["inventory_complete"], False)
         self.assertEqual(
-            result.data["seasons"],
+            result["data"]["seasons"],
             [
                 {
                     "season": 1,
@@ -215,10 +250,10 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertIn("下限", result.suggestions[0])
+        self.assertIn("下限", result["suggestions"][0])
 
-    @patch("app.agent.domains.library.episode_count.inspect_series_episode_sources")
-    def test_preserves_normalized_legacy_input_and_serialized_output_fields(
+    @patch("app.services.inspect_series_episode_sources")
+    def test_preserves_normalized_input_and_public_inventory_facts(
         self, inspect_sources
     ):
         inspect_sources.return_value = [
@@ -234,21 +269,11 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
                 "truncated": False,
             }
         ]
-        arguments = count_series_episodes_arguments(
-            {
-                "query": "  师兄啊师兄  ",
-                "tmdb_id": " 12345 ",
-                "library_name": " 剧集库 ",
-            }
+        result = library.episodes(
+            "  师兄啊师兄  ", tmdb_id=" 12345 ", library_name=" 剧集库 ",
         )
+        payload = json.loads(json.dumps(result))
 
-        result = count_series_episodes(arguments)
-        payload = result.to_dict()
-
-        self.assertEqual(
-            arguments,
-            {"query": "师兄啊师兄", "tmdb_id": "12345", "library_name": "剧集库"},
-        )
         inspect_sources.assert_called_once_with(
             "师兄啊师兄",
             tmdb_id="12345",
@@ -275,14 +300,12 @@ class LibraryEpisodeCountToolTests(unittest.TestCase):
         )
         self.assertEqual(
             set(payload),
-            {"ok", "status", "summary", "data", "evidence", "suggestions", "error"},
+            {"ok", "status", "summary", "data", "suggestions", "error"},
         )
         self.assertIs(payload["ok"], True)
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["error"], "")
         self.assertIn("本地收录 2 集", payload["summary"])
-        self.assertEqual(len(payload["evidence"]), 1)
-        self.assertEqual(payload["evidence"][0]["source"], "media_servers")
         self.assertIn("特别篇", payload["suggestions"][0])
         self.assertIs(payload["data"]["inventory_complete"], True)
         self.assertEqual(
@@ -327,11 +350,49 @@ def inventory_source(episodes=(), **fields):
     }
 
 
+def test_shared_inventory_count_runs_without_agent_runtime():
+    script = textwrap.dedent('''
+        import json
+        import sys
+        import tests
+        from unittest.mock import patch
+
+        blocked = ("app.agent.domains", "app.agent.kernel")
+        with patch.dict(sys.modules, dict.fromkeys(blocked)), patch(
+            "socket.socket.connect", side_effect=AssertionError("禁止真实外联"),
+        ):
+            from app.services import count_series_episodes
+
+            with patch("app.services.inspect_series_episode_sources", return_value=json.load(sys.stdin)):
+                result = count_series_episodes("测试剧", tmdb_id="123", library_name="剧集库")
+            assert not any(module is not None and (name == prefix or name.startswith(prefix + "."))
+                           for name, module in sys.modules.items() for prefix in blocked)
+            print(json.dumps(result))
+    ''')
+    sources = [
+        inventory_source([(1, 1), (1, 3), (2, 1)], status="unmapped"),
+        inventory_source([(1, 1), (1, 2), (2, 1)], server_type="emby", server_name="Emby"),
+    ]
+    completed = subprocess.run(
+        [sys.executable, "-c", script], input=json.dumps(sources),
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["ok"] and result["status"] == "success"
+    assert result["data"]["inventory_complete"] is True
+    assert result["data"]["local_episode_count"] == 4
+    assert result["data"]["library_name"] == "剧集库"
+    assert [season["episode_ranges"] for season in result["data"]["seasons"]] == [[[1, 3]], [[1, 1]]]
+    assert "evidence" not in result
+    assert "library.audit_episodes" not in completed.stdout
+
+
 @pytest.fixture
 def inspect_inventory(monkeypatch):
     def inspect(sources):
-        monkeypatch.setattr("app.agent.domains.library.episode_count.inspect_series_episode_sources", lambda *a, **kw: sources)
-        return count_series_episodes({"query": "测试剧"})
+        monkeypatch.setattr("app.services.inspect_series_episode_sources", lambda *a, **kw: sources)
+        return count_series_episode_inventory("测试剧")
     return inspect
 
 
@@ -343,16 +404,16 @@ def inspect_inventory(monkeypatch):
 ])
 def test_observed_ranges_preserve_gaps_seasons_and_deduplicate(inspect_inventory, inventories, expected):
     result = inspect_inventory([inventory_source(episodes, server_name=f"source-{i}") for i, episodes in enumerate(inventories)])
-    assert result.ok and result.status == "success"
-    assert result.data["inventory_complete"] is True
-    assert result.data["local_episode_count"] == 7
-    assert result.data["season_count"] == len(expected)
-    assert result.data["matched_source_count"] == len(inventories)
-    assert result.data["seasons"] == [
+    assert result["ok"] and result["status"] == "success"
+    assert result["data"]["inventory_complete"] is True
+    assert result["data"]["local_episode_count"] == 7
+    assert result["data"]["season_count"] == len(expected)
+    assert result["data"]["matched_source_count"] == len(inventories)
+    assert result["data"]["seasons"] == [
         {"season": season, "count": count, "first_episode": ranges[0][0], "last_episode": ranges[-1][1], "episode_ranges": ranges}
         for season, count, ranges in expected
     ]
-    assert [s["local_episode_count"] for s in result.data["sources"]] == ([7] if len(inventories) == 1 else [5, 5])
+    assert [s["local_episode_count"] for s in result["data"]["sources"]] == ([7] if len(inventories) == 1 else [5, 5])
 
 
 @pytest.mark.parametrize("status", ["ready", "unmapped"])
@@ -363,14 +424,14 @@ def test_incomplete_inventory_keeps_ranges_and_lower_bound(inspect_inventory, st
     if other_complete:
         sources.append(inventory_source([(1, 1)]))
     result = inspect_inventory(sources)
-    assert result.ok and result.status == "partial"
-    assert result.data["inventory_complete"] is False
-    assert result.data["local_episode_count"] == 3
-    assert result.data["matched_source_count"] == len(sources)
-    assert result.data["truncated"] == defect.get("truncated", False)
-    assert result.data["ignored_unknown"] == defect.get("ignored_unknown", 0)
-    assert result.data["seasons"][0]["episode_ranges"] == [[1, 2], [4, 4]]
-    assert "下限" in result.suggestions[0]
+    assert result["ok"] and result["status"] == "partial"
+    assert result["data"]["inventory_complete"] is False
+    assert result["data"]["local_episode_count"] == 3
+    assert result["data"]["matched_source_count"] == len(sources)
+    assert result["data"]["truncated"] == defect.get("truncated", False)
+    assert result["data"]["ignored_unknown"] == defect.get("ignored_unknown", 0)
+    assert result["data"]["seasons"][0]["episode_ranges"] == [[1, 2], [4, 4]]
+    assert "下限" in result["suggestions"][0]
 
 
 @pytest.mark.parametrize("unresolved", [
@@ -380,12 +441,12 @@ def test_incomplete_inventory_keeps_ranges_and_lower_bound(inspect_inventory, st
 def test_unresolved_source_cannot_prove_absence(inspect_inventory, unresolved, unresolved_first):
     sources = [inventory_source([(1, 1), (1, 3), (2, 2)]), inventory_source(**unresolved)]
     result = inspect_inventory(list(reversed(sources)) if unresolved_first else sources)
-    assert result.ok and result.status == "partial"
-    assert result.data["inventory_complete"] is False
-    assert result.data["local_episode_count"] == 3
-    assert result.data["matched_source_count"] == 1
-    assert result.data["source_count"] == 2
-    assert [(s["season"], s["episode_ranges"]) for s in result.data["seasons"]] == [(1, [[1, 1], [3, 3]]), (2, [[2, 2]])]
+    assert result["ok"] and result["status"] == "partial"
+    assert result["data"]["inventory_complete"] is False
+    assert result["data"]["local_episode_count"] == 3
+    assert result["data"]["matched_source_count"] == 1
+    assert result["data"]["source_count"] == 2
+    assert [(s["season"], s["episode_ranges"]) for s in result["data"]["seasons"]] == [(1, [[1, 1], [3, 3]]), (2, [[2, 2]])]
 
 
 @pytest.mark.parametrize("status", ["ready", "unmapped"])
@@ -393,24 +454,24 @@ def test_unresolved_source_cannot_prove_absence(inspect_inventory, unresolved, u
 def test_not_found_other_source_does_not_hide_complete_inventory(inspect_inventory, status, not_found_first):
     sources = [inventory_source([(1, 1), (1, 3)], status=status, ignored_specials=2), inventory_source(status="not_found")]
     result = inspect_inventory(list(reversed(sources)) if not_found_first else sources)
-    assert result.ok and result.status == "success"
-    assert result.data["inventory_complete"] is True
-    assert result.data["local_episode_count"] == 2
-    assert result.data["matched_source_count"] == 1
-    assert result.data["source_count"] == 2
-    assert result.data["ignored_specials"] == 2
-    assert result.data["seasons"][0]["episode_ranges"] == [[1, 1], [3, 3]]
+    assert result["ok"] and result["status"] == "success"
+    assert result["data"]["inventory_complete"] is True
+    assert result["data"]["local_episode_count"] == 2
+    assert result["data"]["matched_source_count"] == 1
+    assert result["data"]["source_count"] == 2
+    assert result["data"]["ignored_specials"] == 2
+    assert result["data"]["seasons"][0]["episode_ranges"] == [[1, 1], [3, 3]]
 
 
 @pytest.mark.parametrize("status", ["ready", "unmapped"])
 def test_selected_empty_inventory_is_not_unmatched(inspect_inventory, status):
     result = inspect_inventory([inventory_source(status=status)])
-    assert result.ok and result.status == "success"
-    assert result.data["inventory_complete"] is True
-    assert result.data["title"] == "测试剧"
-    assert result.data["local_episode_count"] == result.data["season_count"] == 0
-    assert result.data["seasons"] == []
-    assert result.data["matched_source_count"] == 1
+    assert result["ok"] and result["status"] == "success"
+    assert result["data"]["inventory_complete"] is True
+    assert result["data"]["title"] == "测试剧"
+    assert result["data"]["local_episode_count"] == result["data"]["season_count"] == 0
+    assert result["data"]["seasons"] == []
+    assert result["data"]["matched_source_count"] == 1
 
 
 @pytest.mark.parametrize("status, expected_status", [
@@ -419,8 +480,8 @@ def test_selected_empty_inventory_is_not_unmatched(inspect_inventory, status):
 ])
 def test_unmatched_inventory_is_never_complete_or_zero(inspect_inventory, status, expected_status):
     result = inspect_inventory([inventory_source(status=status)])
-    assert not result.ok and result.status == expected_status
-    assert result.data["inventory_complete"] is False
-    assert result.data["local_episode_count"] is None
-    assert result.data["matched_source_count"] == 0
-    assert result.data["source_count"] == 1
+    assert not result["ok"] and result["status"] == expected_status
+    assert result["data"]["inventory_complete"] is False
+    assert result["data"]["local_episode_count"] is None
+    assert result["data"]["matched_source_count"] == 0
+    assert result["data"]["source_count"] == 1

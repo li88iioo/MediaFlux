@@ -1718,6 +1718,78 @@ def _migrate_manual_episode_confirmations_v37(conn: sqlite3.Connection) -> None:
         sync_manual_episode_confirmation(conn, row[0], revoke=row[1] == "reverted" and row[2] in {"return_to_source", "revert"})
 
 
+def _migrate_download_verification_targets_v38(conn: sqlite3.Connection) -> None:
+    """原 job 原位迁入完整目标列表；不改变状态、租约、路由或通知投递事实。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(agent_download_verifications)")}
+    if "title" not in columns:
+        return
+    if "targets_json" not in columns:
+        conn.execute("ALTER TABLE agent_download_verifications ADD COLUMN targets_json TEXT NOT NULL DEFAULT '[]'")
+    names = ("title", "tmdb_id", "season", "episode", "as_of", "library_name", "result")
+    rows = conn.execute("SELECT request_id," + ",".join(names) + " FROM agent_download_verifications").fetchall()
+    for row in rows:
+        targets = [dict(zip(names, tuple(row)[1:]))]
+        conn.execute("UPDATE agent_download_verifications SET targets_json=? WHERE request_id=?",
+                     (json.dumps(targets, ensure_ascii=False, separators=(",", ":")), row[0]))
+    for name in names[:-1]:
+        conn.execute(f"ALTER TABLE agent_download_verifications DROP COLUMN {name}")
+    for row in conn.execute("SELECT id,payload_json FROM agent_download_verification_notification_outbox WHERE payload_json<>''").fetchall():
+        try:
+            payload = json.loads(row[1])
+        except (TypeError, ValueError):
+            continue  # 畸形历史载荷继续由原投递端拒绝，不能捏造成功结果。
+        if not isinstance(payload, dict) or set(payload) != {"title", "season", "episode", "status", "result", "attempts"}:
+            continue
+        target = {name: payload.pop(name) for name in ("title", "season", "episode")}
+        target["result"] = payload["result"]
+        payload["targets"] = [target]
+        conn.execute("UPDATE agent_download_verification_notification_outbox SET payload_json=? WHERE id=?",
+                     (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), row[0]))
+
+
+def _migrate_agent_compensation_payload_v39(conn: sqlite3.Connection) -> None:
+    """只补原补偿表的私有快照和时效；旧无快照行保留状态并明确失效。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(agent_compensations)")}
+    for name, definition in (("payload_json", "TEXT NOT NULL DEFAULT ''"), ("expires_at", "REAL NOT NULL DEFAULT 0")):
+        if columns and name not in columns:
+            conn.execute(f"ALTER TABLE agent_compensations ADD COLUMN {name} {definition}")
+
+
+def _migrate_missing_resource_source_v40(conn: sqlite3.Connection) -> None:
+    """原子重建父子表的来源约束；所有实体、关联和修订原值保留。"""
+    parent = "agent_missing_media_workflows"
+    child = "agent_missing_media_workflow_items"
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (parent,)).fetchone()
+    if row is None or "library.search_missing_" not in row[0]:
+        return
+    indexes = [item[0] for item in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name IN (?,?) AND sql IS NOT NULL", (parent, child))]
+    parent_sql = row[0].replace(parent, parent + "_v40", 1)
+    parent_sql = re.sub(r"CHECK\s*\(source_tool\s+IN\s*\([^)]*\)\)",
+                        "CHECK(source_tool = 'resources.search_missing')", parent_sql, flags=re.IGNORECASE)
+    conn.execute(parent_sql)
+    columns = [item[1] for item in conn.execute(f"PRAGMA table_info({parent})")]
+    selected = ["'resources.search_missing'" if name == "source_tool" else name for name in columns]
+    conn.execute(f"INSERT INTO {parent}_v40 ({','.join(columns)}) SELECT {','.join(selected)} FROM {parent}")
+    child_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (child,)).fetchone()
+    sequence = None
+    if child_row:
+        if "AUTOINCREMENT" in child_row[0].upper():
+            sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (child,)).fetchone()
+        child_sql = child_row[0].replace(child, child + "_v40", 1).replace(parent, parent + "_v40")
+        conn.execute(child_sql)
+        conn.execute(f"INSERT INTO {child}_v40 SELECT * FROM {child}")
+        conn.execute(f"DROP TABLE {child}")
+    conn.execute(f"DROP TABLE {parent}")
+    conn.execute(f"ALTER TABLE {parent}_v40 RENAME TO {parent}")
+    if child_row:
+        conn.execute(f"ALTER TABLE {child}_v40 RENAME TO {child}")
+        if sequence is not None:
+            conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name=?", (sequence[0], child))
+    for sql in indexes:
+        conn.execute(sql)
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1756,4 +1828,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     34: _migrate_download_submission_clocks_v35,
     35: _migrate_rss_delivery_ownership_v36,
     36: _migrate_manual_episode_confirmations_v37,
+    37: _migrate_download_verification_targets_v38,
+    38: _migrate_agent_compensation_payload_v39,
+    39: _migrate_missing_resource_source_v40,
 }

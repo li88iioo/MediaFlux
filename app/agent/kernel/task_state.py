@@ -18,7 +18,7 @@ from app.sensitive_data import contains_sensitive_credential
 
 COMPONENTS = frozenset({"tmdb", "qbittorrent"})
 IDENTITY = ("task_id", "epoch", "revision")
-# 同一字段集合用于模型 Schema 和领域校验，不能再出现“模型可选、执行必填”。
+# 历史TaskPatch的字段合同继续由同一领域校验维护。
 _OPERATION_FIELDS = {
     "create": ("source", "root_goal", "constraints", "obligations"),
     "checkpoint": ("evidence_ids", "blockers"),
@@ -192,20 +192,47 @@ def tracks_read(task: dict | None, tool: str) -> bool:
                     for o in task["obligations"]))
 
 
+def configuration_observations(value: Mapping[str, Any] | None, arguments: dict) -> dict:
+    """SDK读回执沿用原配置凭证合同；配置不完整也是有效观察。"""
+    selected = ({arguments["component"]} if "component" in arguments else COMPONENTS) & COMPONENTS
+    observations: dict[str, dict | None] = {component: None for component in sorted(selected)}
+    if not value or not isinstance(value.get("data"), dict):
+        return observations
+    data = value["data"]
+    if data.get("probe_mode") != "configuration_only" or data.get("network_accessed") is not False:
+        return observations
+    if "component" in arguments:
+        if value.get("ok") is not True or value.get("status") != data.get("status") or data.get("component") not in selected:
+            return observations
+        candidates = [data]
+    else:
+        if value.get("status") not in {"healthy", "degraded", "attention"} or not isinstance(data.get("components"), list):
+            return observations
+        candidates = [{**item, "component": item.get("name")} for item in data["components"] if isinstance(item, dict)]
+    for item in candidates:
+        component = item.get("component")
+        if (isinstance(component, str) and component in selected and item.get("status") in {"ready", "incomplete", "not_configured"}
+                and type(item.get("enabled")) is bool):
+            observations[component] = {"component": component, "status": item["status"], "enabled": item["enabled"],
+                "probe_mode": "configuration_only", "network_accessed": False}
+    return observations
+
+
 def read_observations(task: dict | None, tool: str, arguments: dict, result: Mapping[str, Any] | None) -> dict:
     """记录实际成功READ回执，不要求模型提前编写调用，也不将探索失败变成整项任务的永久阻塞。"""
+    configuration = configuration_observations(result, arguments) if tool in {"diagnostics.configuration", "diagnostics.component"} else {}
     if not tracks_read(task, tool) or not result or result.get("ok") is not True:
-        return {}
+        return configuration
     from app.agent.public_safety import sanitize_public_text
     from app.agent.public_view import public_result_state
     if (str(result.get("status", "success")).strip().casefold() not in {
             "ok", "success", "completed", "healthy", "ready", "found", "not_found", "empty"}
             or public_result_state(result) != "success"):
-        return {}
+        return configuration
     encoded = json.dumps([tool, arguments], sort_keys=True, ensure_ascii=False,
                          separators=(",", ":"), allow_nan=False)
     key = "read:" + hashlib.sha256(encoded.encode()).hexdigest()
-    return {key: {"query_key": key, "status": "success",
+    return {**configuration, key: {"query_key": key, "status": "success",
                   "summary": sanitize_public_text(result.get("summary") or tool, limit=240) or tool}}
 
 
@@ -435,105 +462,3 @@ def task_projection(task: Mapping | None) -> dict | None:
         if f["evidence_id"] not in linked
     ]
     return result
-
-
-def _task_input_schema() -> dict:
-    text = {"type": "string", "minLength": 1}
-    properties = {
-        "operation": {"type": "string", "enum": list(_OPERATION_FIELDS)},
-        "source": {
-            **text, "maxLength": 2048,
-            "description": "Exact user quote. Create accepts original user history; revise/cancel require current user text.",
-        },
-        "root_goal": {**text, "maxLength": 2048},
-        "constraints": {
-            "type": "array", "maxItems": 8, "uniqueItems": True,
-            "items": {**text, "maxLength": 512},
-        },
-        "obligations": {
-            "description": "Required observable business checks only, not answer-writing or checklist-management steps. Use observed_component for configuration checks. Use observed_read with a plain-language criterion for other read-only goals; do not guess future tool names or arguments. Link actual successful READ receipts afterwards using read_evidence. Other acceptance kinds remain blocked.",
-            "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": True,
-            "items": {
-                "type": "object", "required": ["id", "description", "required", "acceptance"],
-                "additionalProperties": False,
-                "properties": {
-                    "id": {**text, "maxLength": 64},
-                    "description": {**text, "maxLength": 512},
-                    "required": {"type": "boolean", "enum": [True]},
-                    "acceptance": {
-                        "type": "object",
-                        "description": "Observed_component requires an observation, even incomplete/not_configured satisfies it. It does not require fixing configuration or proving connectivity. observed_read describes the requested observation, not a future tool call. The model relates actual READ receipts to the criterion; the server verifies receipt origin/scope, not natural-language semantics, exhaustive pages or completed writes. Other goals remain blocked.",
-                        "oneOf": [
-                            {
-                                "properties": {
-                                    "kind": {"enum": ["observed_component"]},
-                                    "component": {"type": "string", "enum": sorted(COMPONENTS)},
-                                },
-                                "required": ["kind", "component"], "additionalProperties": False,
-                            },
-                            {
-                                "properties": {
-                                    "kind": {**text, "maxLength": 64, "not": {"enum": ["observed_component"]}},
-                                    "criterion": {**text, "maxLength": 512},
-                                },
-                                "required": ["kind", "criterion"], "additionalProperties": False,
-                            },
-                        ],
-                    },
-                },
-            },
-        },
-        "read_evidence": {
-            "type": "object", "maxProperties": 16,
-            "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 64},
-            "description": "Checkpoint only: map each observed_read obligation ID to its actual task.verified_facts evidence_id after checking the result meets its criterion. Not future tool names, artifact refs or invented receipts. Omit for configuration-only checkpoints.",
-        },
-        "evidence_ids": {
-            "type": "array", "maxItems": 32, "uniqueItems": True,
-            "items": {**text, "maxLength": 64},
-        },
-        "blockers": {
-            "description": "Unresolved work in the requested task. Discovered configuration issues do not block an observation-only goal once observed.",
-            "type": "array", "maxItems": 16, "uniqueItems": True,
-            "items": {**text, "maxLength": 512},
-        },
-    }
-    return {
-        "type": "object", "properties": properties,
-        "required": ["operation"], "additionalProperties": False,
-        "oneOf": [
-            {
-                "properties": {
-                    **{key: {} for key in fields},
-                    **({"read_evidence": {}} if operation == "checkpoint" else {}),
-                    "operation": {"enum": [operation]},
-                },
-                "required": ["operation", *fields],
-                "additionalProperties": False,
-            }
-            for operation, fields in _OPERATION_FIELDS.items()
-        ],
-    }
-
-
-def task_tool():
-    from .capabilities import KernelToolSpec, ToolEffect
-
-    return KernelToolSpec(
-        name="agent.task",
-        domain="agent",
-        effect=ToolEffect.READ,
-        description=(
-            "持久任务清单/检查点/恢复。TMDB/qB: config.diagnose/config.explain_component observations, "
-            "not connectivity/repairs. observed_read记录其他只读检查目标，不预猜调用；读后用read_evidence关联真实回执。"
-            "No write authority. create accepts exact current/historical user source; "
-            "revise/cancel require current user source. "
-            "checkpoint: task.verified_facts evidence_ids (not artifact refs), blockers. "
-            "Version checks are server-owned."
-        ),
-        examples=("持久任务清单 检查点 剩余义务 恢复", "persistent task checklist checkpoint resume remaining obligations"),
-        input_schema=_task_input_schema(),
-        validator=validate_proposal,
-        read=proposal,
-        metadata={"kernel_utility": True, "query_discoverable": True},
-    )

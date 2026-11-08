@@ -8,12 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from app import database as db
-from app.agent.domains.library.missing_workflows import (
+from app.repositories.agent_download_verification import (
     SQLiteMissingMediaWorkflowRepository,
-    list_missing_workflows,
 )
-from app.agent.models import ToolContext
 from app.modules.agent_download_verification_scheduler import DownloadLibraryVerificationScheduler
+from tests.test_agent_missing_media_workflows import query_workflows
 from tests.support import isolated_test_database
 from tests.test_agent_missing_media_workflows import _VERIFICATION, _search_result
 
@@ -22,9 +21,7 @@ from tests.test_agent_missing_media_workflows import _VERIFICATION, _search_resu
 def frozen_workflow():
     with isolated_test_database():
         repository = SQLiteMissingMediaWorkflowRepository()
-        workflow_id = repository.capture_search(
-            owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result(),
-        )
+        workflow_id = repository.capture_search(owner="owner", **_search_result())
         reference = repository.select_candidate(
             owner="owner", verification=_VERIFICATION,
             candidate_title="The.Show.S02E03.1080p", target="qb",
@@ -47,9 +44,7 @@ def test_rescan_preserves_actual_submission_until_real_scheduler_completion(froz
             verification_enqueued=rescan_at == "verification_pending",
         )
     for _ in range(rescans):
-        case.repository.capture_search(
-            owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result(candidate=False),
-        )
+        case.repository.capture_search(owner="owner", **_search_result(candidate=False))
     cold = SQLiteMissingMediaWorkflowRepository()
     with db.get_conn() as conn:
         row = conn.execute("SELECT * FROM agent_missing_media_workflow_items WHERE item_id=?",
@@ -65,9 +60,10 @@ def test_rescan_preserves_actual_submission_until_real_scheduler_completion(froz
         assert row["state"] == rescan_at
         assert row["download_request_id"] == case.request_id
     db.update_download_request(case.request_id, targets="qb", status="completed", qb_status="completed")
-    assert db.enqueue_agent_download_verification(case.request_id, **_VERIFICATION, owner="owner")
+    assert db.enqueue_agent_download_verification(case.request_id, targets=[{**_VERIFICATION}], owner='owner') == "queued"
     job = db.claim_due_agent_download_verification(current_time="2099-01-01 00:00:00")
     assert job is not None
+    job["targets"] = [{**target, "result": "visible"} for target in job["targets"]]
     DownloadLibraryVerificationScheduler()._finish(job, status="visible", result="visible", attempts=1, current=db.now())
     verification = db.get_agent_download_verification(case.request_id)
     assert verification is not None and verification["status"] == "visible"
@@ -82,12 +78,12 @@ def test_rescan_refreshes_mixed_season_without_losing_accepted_or_terminal_items
     with isolated_test_database():
         repository = SQLiteMissingMediaWorkflowRepository()
         result = _search_result()
-        result.data["episodes"] = [
-            {"episode": episode, "search": {"recommendation": {"selected": {"title": f"The.Show.S02E{episode:02d}"}}}}
+        result["episodes"] = [
+            {"episode": episode, "has_candidate": True}
             for episode in (3, 4)
         ]
-        result.data["verification"].pop("episode")
-        original = repository.capture_search(owner="owner", tool_name="library.search_missing_season_resources", result=result)
+        result["verification"].pop("episode")
+        original = repository.capture_search(owner="owner", **result)
         selected = repository.select_candidate(owner="owner", verification={**_VERIFICATION, "episode": accepted_episode},
                                                candidate_title=f"The.Show.S02E{accepted_episode:02d}.1080p", target="qb")
         assert selected is not None
@@ -95,52 +91,50 @@ def test_rescan_refreshes_mixed_season_without_losing_accepted_or_terminal_items
         assert repository.attach_submission(workflow_ref=asdict(selected), request_id=request, verification_enqueued=True)
         if accepted_state != "verification_pending":
             assert repository.finish_verification(request_id=request, status=accepted_state,
-                                                  result="visible" if accepted_state == "visible" else "missing")
-        repository.capture_search(
-            owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result(candidate=False),
-        )
+                                                  result="visible" if accepted_state == "visible" else "missing", targets=[{**_VERIFICATION, "episode": accepted_episode, "result": 'visible' if accepted_state == 'visible' else 'missing'}])
+        repository.capture_search(owner="owner", **_search_result(candidate=False))
         old = {row["episode"]: row for row in repository.list_for_owner(owner="owner") if row["workflow_id"] == original}
         assert old[accepted_episode]["item_state"] == accepted_state
         assert old[accepted_episode]["download_request_id"] == request
         assert old[7 - accepted_episode]["item_state"] == "stale"
         parent_state = "stale" if accepted_state == "visible" else accepted_state
         assert {row["state"] for row in old.values()} == {parent_state}
-        public = list_missing_workflows({"limit": 10}, ToolContext(owner="owner"), repository=repository)
-        public_old = next(flow for flow in public.data["workflows"] if len(flow["items"]) == 2)
+        public = query_workflows(repository, owner="owner", limit=10)
+        public_old = next(flow for flow in public["workflows"] if len(flow["items"]) == 2)
         assert public_old["state"] == parent_state
         assert public_old["state_label"] != "已入库并可见"
-        assert public.data["attention"] == (1 if accepted_state == "verification_pending" else 2)
+        assert public["attention"] == (1 if accepted_state == "verification_pending" else 2)
         if accepted_state == "verification_pending":
             cold = SQLiteMissingMediaWorkflowRepository()
-            assert cold.finish_verification(request_id=request, status="visible", result="visible")
-            public = list_missing_workflows({"limit": 10}, ToolContext(owner="owner"), repository=cold)
-            public_old = next(flow for flow in public.data["workflows"] if len(flow["items"]) == 2)
+            assert cold.finish_verification(request_id=request, status="visible", result="visible", targets=[{**_VERIFICATION, "episode": accepted_episode, "result": 'visible'}])
+            public = query_workflows(cold, owner="owner", limit=10)
+            public_old = next(flow for flow in public["workflows"] if len(flow["items"]) == 2)
             assert public_old["state"] == "stale"
             assert public_old["state_label"] == "流程已过期，需要重新检查"
-            assert public.data["attention"] == 2
+            assert public["attention"] == 2
 
 
 def test_season_is_publicly_visible_only_when_every_episode_is_visible():
     with isolated_test_database():
         repository = SQLiteMissingMediaWorkflowRepository()
         result = _search_result()
-        result.data["verification"].pop("episode")
-        result.data["episodes"] = [{"episode": episode, "search": result.data["search"]} for episode in (3, 4)]
-        repository.capture_search(owner="owner", tool_name="library.search_missing_season_resources", result=result)
+        result["verification"].pop("episode")
+        result["episodes"] = [{"episode": episode, "has_candidate": True} for episode in (3, 4)]
+        repository.capture_search(owner="owner", **result)
         for episode in (3, 4):
             reference = repository.select_candidate(owner="owner", verification={**_VERIFICATION, "episode": episode},
                                                     candidate_title=f"The.Show.S02E{episode:02d}", target="qb")
             assert reference is not None
             request, _ = db.create_download_request(f"all-visible-{episode}", "magnet", origin="agent")
             assert repository.attach_submission(workflow_ref=asdict(reference), request_id=request, verification_enqueued=True)
-            assert repository.finish_verification(request_id=request, status="visible", result="visible")
-        public = list_missing_workflows({"limit": 10}, ToolContext(owner="owner"), repository=repository)
-        assert public.status == "healthy"
-        assert public.data["attention"] == 0
-        assert len(public.data["workflows"]) == 1
-        assert public.data["workflows"][0]["state"] == "visible"
-        assert public.data["workflows"][0]["state_label"] == "已入库并可见"
-        assert all(item["state"] == "visible" for item in public.data["workflows"][0]["items"])
+            assert repository.finish_verification(request_id=request, status="visible", result="visible", targets=[{**_VERIFICATION, "episode": episode, "result": 'visible'}])
+        public = query_workflows(repository, owner="owner", limit=10)
+        assert public["status"] == "healthy"
+        assert public["attention"] == 0
+        assert len(public["workflows"]) == 1
+        assert public["workflows"][0]["state"] == "visible"
+        assert public["workflows"][0]["state_label"] == "已入库并可见"
+        assert all(item["state"] == "visible" for item in public["workflows"][0]["items"])
 
 
 @pytest.mark.parametrize("terminal,result", [("visible", "visible"), ("attention", "missing")])
@@ -148,13 +142,12 @@ def test_season_is_publicly_visible_only_when_every_episode_is_visible():
 def test_attach_absorbs_real_scheduler_terminal_that_arrives_first(frozen_workflow, terminal, result, rescan):
     case = frozen_workflow
     if rescan:
-        case.repository.capture_search(
-            owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result(),
-        )
+        case.repository.capture_search(owner="owner", **_search_result())
     db.update_download_request(case.request_id, targets="qb", status="completed", qb_status="completed")
-    assert db.enqueue_agent_download_verification(case.request_id, **_VERIFICATION, owner="owner")
+    assert db.enqueue_agent_download_verification(case.request_id, targets=[{**_VERIFICATION}], owner='owner') == "queued"
     job = db.claim_due_agent_download_verification(current_time="2099-01-01 00:00:00")
     assert job is not None
+    job["targets"] = [{**target, "result": result} for target in job["targets"]]
     DownloadLibraryVerificationScheduler()._finish(job, status=terminal, result=result, attempts=1, current=db.now())
     cold = SQLiteMissingMediaWorkflowRepository()
     assert cold.attach_submission(workflow_ref=case.reference, request_id=case.request_id, verification_enqueued=True)
@@ -171,7 +164,7 @@ def test_cancel_and_reselect_rejects_the_old_reference_after_rescan(frozen_workf
                                              candidate_title="The.Show.S02E03.REPACK", target="guangya")
     assert newer is not None and newer.revision > case.reference["revision"] + 1
     for _ in range(rescans):
-        case.repository.capture_search(owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result())
+        case.repository.capture_search(owner="owner", **_search_result())
     cold = SQLiteMissingMediaWorkflowRepository()
     assert not cold.attach_submission(workflow_ref=case.reference, request_id=case.request_id, verification_enqueued=True)
     assert cold.attach_submission(workflow_ref=asdict(newer), request_id=case.request_id, verification_enqueued=True)
@@ -181,20 +174,19 @@ def test_cancel_and_reselect_rejects_the_old_reference_after_rescan(frozen_workf
 def test_stale_unselected_search_item_is_not_a_frozen_confirmation(candidate):
     with isolated_test_database():
         repository = SQLiteMissingMediaWorkflowRepository()
-        original = repository.capture_search(owner="owner", tool_name="library.search_missing_episode_resources",
-                                               result=_search_result(candidate=candidate))
+        original = repository.capture_search(owner="owner", **_search_result(candidate=candidate))
         with db.get_conn() as conn:
             item = conn.execute("SELECT item_id,revision FROM agent_missing_media_workflow_items WHERE workflow_id=?", (original,)).fetchone()
         assert item is not None
         reference = {"workflow_id": original, "item_id": item["item_id"], "revision": item["revision"]}
-        repository.capture_search(owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result())
+        repository.capture_search(owner="owner", **_search_result())
         request, _ = db.create_download_request("unfrozen", "magnet", title="The.Show.S02E03", origin="agent")
         assert not repository.attach_submission(workflow_ref=reference, request_id=request, verification_enqueued=True)
 
 
 def test_actual_submission_cannot_be_rebound_by_duplicate_or_stale_reference(frozen_workflow):
     case = frozen_workflow
-    case.repository.capture_search(owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result())
+    case.repository.capture_search(owner="owner", **_search_result())
     assert case.repository.attach_submission(workflow_ref=case.reference, request_id=case.request_id, verification_enqueued=True)
     other, _ = db.create_download_request("other-submission", "magnet", title="The.Show.S02E03.Other", origin="agent")
     for request in (case.request_id, other):
@@ -210,7 +202,7 @@ def test_accepted_task_survives_search_capacity_pressure_and_cold_completion(fro
     assert case.repository.attach_submission(workflow_ref=case.reference, request_id=case.request_id,
                                              verification_enqueued=verification_enqueued)
     for _ in range(52):
-        case.repository.capture_search(owner="owner", tool_name="library.search_missing_episode_resources", result=_search_result())
+        case.repository.capture_search(owner="owner", **_search_result())
     with db.get_conn() as conn:
         item = conn.execute("SELECT state,download_request_id FROM agent_missing_media_workflow_items WHERE item_id=?",
                             (case.reference["item_id"],)).fetchone()
@@ -219,7 +211,7 @@ def test_accepted_task_survives_search_capacity_pressure_and_cold_completion(fro
     assert item["state"] == ("verification_pending" if verification_enqueued else "submitted")
     assert count is not None and count[0] == 50
     cold = SQLiteMissingMediaWorkflowRepository()
-    assert cold.finish_verification(request_id=case.request_id, status="visible", result="visible")
+    assert cold.finish_verification(request_id=case.request_id, status="visible", result="visible", targets=[{**_VERIFICATION, "result": 'visible'}])
     with db.get_conn() as conn:
         final = conn.execute(
             "SELECT w.state,i.state AS item_state FROM agent_missing_media_workflows w "

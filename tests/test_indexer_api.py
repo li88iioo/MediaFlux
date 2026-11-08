@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from app import config as app_config
 from app.indexers import downloads as indexer_download
+from app.indexers import service as indexer_service
 from app.indexers.errors import IndexerChallengeRequired, IndexerQueryRejected
 from app.indexers.models import (
     AggregatedIndexerResult,
@@ -155,6 +156,7 @@ class FakeStatusRegistry:
             "aipan": FakeStatusAdapter("aipan", "爱盼"),
             "dygang": FakeStatusAdapter("dygang", "电影港"),
             "ys5266": FakeStatusAdapter("ys5266", "5266影视"),
+            "kpkuang": FakeStatusAdapter("kpkuang", "看片狂人"),
             "tpb": FakeStatusAdapter("tpb", "The Pirate Bay"),
             "sukebei": FakeStatusAdapter("sukebei", "Sukebei"),
         }
@@ -364,12 +366,12 @@ class IndexerAPITests(unittest.TestCase):
             ):
                 with self.subTest(url=url):
                     item = IndexerItem(site_id=site_id, site_name="irrelevant label", title="Demo", detail_url=url)
-                    self.assertEqual(indexers_api._public_source_url(service, item), url)
-                    self.assertIsNone(indexers_api._public_source_url(service, replace(item, site_id="nyaa")))
+                    self.assertEqual(indexer_service._public_source_url(service, item), url)
+                    self.assertIsNone(indexer_service._public_source_url(service, replace(item, site_id="nyaa")))
             for url in ("https://evil.example/1", "http://www.btbtlb.com/tdown/1.htm", "https://www.btbtlb.com:444/tdown/1.htm"):
                 with self.subTest(rejected=url):
                     item = IndexerItem(site_id="btbtla", site_name="BTBtla", title="Demo", detail_url=url)
-                    self.assertIsNone(indexers_api._public_source_url(service, item))
+                    self.assertIsNone(indexer_service._public_source_url(service, item))
         finally:
             asyncio.run(registry.aclose())
 
@@ -393,7 +395,7 @@ class IndexerAPITests(unittest.TestCase):
             title="Demo.Show.S02E11-E13.1080p.WEB-DL.mkv",
         )
 
-        payload = indexers_api._public_search_item(item)
+        payload = indexer_service.search_item(item)
 
         self.assertEqual(payload["season"], 2)
         self.assertEqual(payload["episode"], 11)
@@ -418,9 +420,9 @@ class IndexerAPITests(unittest.TestCase):
     def test_public_resource_identity_is_stable_without_exposing_or_reusing_download_refs(self):
         from dataclasses import replace
         original = FakeIndexerService().result_store.item
-        one = indexers_api._public_search_item(original)
-        two = indexers_api._public_search_item(replace(original, result_id="new-reference", title="Demo 4K"))
-        different = indexers_api._public_search_item(replace(original, magnet="magnet:?xt=urn:btih:" + "b" * 40))
+        one = indexer_service.search_item(original)
+        two = indexer_service.search_item(replace(original, result_id="new-reference", title="Demo 4K"))
+        different = indexer_service.search_item(replace(original, magnet="magnet:?xt=urn:btih:" + "b" * 40))
         self.assertEqual(one["resource_key"], two["resource_key"])
         self.assertNotEqual(one["result_id"], two["result_id"])
         self.assertNotEqual(one["resource_key"], different["resource_key"])
@@ -598,7 +600,7 @@ class IndexerAPITests(unittest.TestCase):
             site_id="nyaa", site_name="Nyaa", title="Demo",
             detail_url="https://nyaa.si:99999/view/1",
         )
-        self.assertIsNone(indexers_api._public_source_url(service, malformed))
+        self.assertIsNone(indexer_service._public_source_url(service, malformed))
 
     def test_search_uses_aggregated_has_more_instead_of_guessing_from_items(self):
         self.authenticate()
@@ -658,13 +660,55 @@ class IndexerAPITests(unittest.TestCase):
         self.assertIs(statuses["sukebei"]["retryable"], False)
         self.assertNotIn("magnet", response.text)
 
+    def test_search_payload_keeps_all_nine_participating_registered_sites(self):
+        from app.indexers.config import MANUAL_INDEXER_SITE_ORDER
+        from app.indexers.models import IndexerSitePageState
+
+        sites = ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "kpkuang", "tpb")
+        service = SimpleNamespace(registry=FakeStatusRegistry(), enabled_site_ids=frozenset(MANUAL_INDEXER_SITE_ORDER))
+        result = AggregatedIndexerResult(query="Demo", page=2, items=[], sites_attempted=sites,
+                                         sites_succeeded=sites, partial=False, complete=True)
+        full = indexer_service.search_payload(service, result)
+        expected = [*MANUAL_INDEXER_SITE_ORDER, "aipan", "dygang", "ys5266", "kpkuang"]
+        self.assertEqual([site["site_id"] for site in full["site_statuses"]], expected)
+        self.assertEqual(full["sites_attempted"], list(sites))
+        self.assertTrue(all(site["status"] == "empty" for site in full["site_statuses"]))
+        self.assertFalse(full["partial"])
+        self.assertFalse(full["has_more"])
+
+        result.sites_succeeded = tuple(site for site in sites if site not in {"aipan", "kpkuang"})
+        result.errors = [IndexerProviderError("aipan", "timeout", "cookie=private"),
+                         IndexerProviderError("ys5266", "coverage_limited", "private limit detail"),
+                         IndexerProviderError("kpkuang", "challenge_required", "token=private")]
+        result.site_item_counts = {"dygang": 2, "ys5266": 1}
+        result.site_collected_counts = {"dygang": 2, "ys5266": 4}
+        result.site_truncated_counts = {"ys5266": 3}
+        result.site_page_states = {"dygang": IndexerSitePageState(True, 2, True, 3),
+                                  "aipan": IndexerSitePageState(False, 2, None, None)}
+        result.partial, result.complete, result.has_more = True, False, True
+        partial = indexer_service.search_payload(service, result)
+        statuses = {site["site_id"]: site for site in partial["site_statuses"]}
+        self.assertEqual(list(statuses), expected)
+        self.assertEqual((statuses["aipan"]["status"], statuses["aipan"]["code"]), ("error", "timeout"))
+        self.assertEqual((statuses["kpkuang"]["status"], statuses["kpkuang"]["code"]), ("error", "challenge_required"))
+        self.assertEqual((statuses["ys5266"]["status"], statuses["ys5266"]["truncated_count"]), ("partial", 3))
+        self.assertEqual((statuses["dygang"]["status"], statuses["dygang"]["has_more"], statuses["dygang"]["next_page"]),
+                         ("success", True, 3))
+        self.assertEqual((statuses["aipan"]["has_more"], statuses["aipan"]["next_page"]), (None, None))
+        self.assertTrue(partial["partial"] and partial["has_more"] and partial["truncated"])
+        self.assertFalse(partial["complete"])
+        self.assertNotIn("private", str(partial))
+
+        result.sites_attempted += ("not-registered",)
+        self.assertEqual([site["site_id"] for site in indexer_service.search_site_statuses(service, result)], expected)
+
     def test_capped_search_reports_counts_without_false_site_failure(self):
         service = SimpleNamespace(registry=FakeStatusRegistry(), enabled_site_ids=frozenset({"nyaa"}))
         result = AggregatedIndexerResult(
             query="Demo", page=1, items=[], sites_attempted=("nyaa",), sites_succeeded=("nyaa",),
             site_item_counts={"nyaa": 40}, site_collected_counts={"nyaa": 60}, site_truncated_counts={"nyaa": 20},
         )
-        payload = indexers_api._search_payload(service, result)
+        payload = indexer_service.search_payload(service, result)
         self.assertTrue(payload["truncated"])
         self.assertFalse(payload["partial"])
         self.assertFalse(payload["has_more"])
@@ -680,7 +724,7 @@ class IndexerAPITests(unittest.TestCase):
             sites_succeeded=("mikan",), site_item_counts={"mikan": 2},
             errors=[IndexerProviderError("btbtla", "unavailable", "索引站点暂不可用")], partial=True,
         )
-        statuses = {row["site_id"]: row for row in indexers_api._search_site_statuses(service, result)}
+        statuses = {row["site_id"]: row for row in indexer_service.search_site_statuses(service, result)}
         self.assertEqual(statuses["btbtla"]["status"], "error")
         self.assertEqual(statuses["mikan"]["status"], "success")
         self.assertTrue(statuses["btbtla"]["retryable"])
@@ -725,7 +769,7 @@ class IndexerAPITests(unittest.TestCase):
 
         with (
             patch("app.routes.indexers_api.get_indexer_service", return_value=service),
-            patch.object(indexers_api, "_public_source_url", return_value=None),
+            patch.object(indexer_service, "_public_source_url", return_value=None),
         ):
             response = self.client.get("/api/indexers/search?q=Demo")
 
@@ -735,10 +779,14 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["title"], "Healthy candidate")
         self.assertTrue(payload["partial"])
         statuses = {row["site_id"]: row for row in payload["site_statuses"]}
-        self.assertNotIn("dygang", statuses)
-        self.assertNotIn("ys5266", statuses)
-        self.assertEqual(indexers_api._safe_site_error(result.errors[0]), ("query_rejected", rejected.public_message, False))
-        code, message, retryable = indexers_api._safe_site_error(detail_error)
+        self.assertEqual((statuses["dygang"]["status"], statuses["dygang"]["code"]),
+                         ("error", "query_rejected"))
+        self.assertEqual((statuses["ys5266"]["status"], statuses["ys5266"]["code"]),
+                         ("error", "challenge_required"))
+        self.assertFalse(statuses["dygang"]["retryable"])
+        self.assertFalse(statuses["ys5266"]["retryable"])
+        self.assertEqual(indexer_service._safe_site_error(result.errors[0]), ("query_rejected", rejected.public_message, False))
+        code, message, retryable = indexer_service._safe_site_error(detail_error)
         self.assertEqual(code, "challenge_required")
         self.assertIn("人机验证", message)
         self.assertFalse(retryable)
@@ -793,7 +841,7 @@ class IndexerAPITests(unittest.TestCase):
         normalize.assert_called_once_with("magnet:?xt=urn:btih:" + "a" * 40)
         create.assert_called_once()
         self.assertEqual(create.call_args.kwargs["origin"], "indexer:nyaa")
-        dispatch.assert_called_once_with(31, "qb")
+        dispatch.assert_called_once_with(31, "qb", qb_save_path="", qb_category="")
         self.assertNotIn("magnet", response.text)
 
     def test_download_accepts_both_target(self):
@@ -824,7 +872,7 @@ class IndexerAPITests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        dispatch.assert_called_once_with(31, "both")
+        dispatch.assert_called_once_with(31, "both", qb_save_path="", qb_category="", gy_target_dir="0", gy_target_name="默认目录")
 
     def test_download_duplicate_returns_history_resubmit_contract(self):
         headers = self.authenticate()
@@ -1222,7 +1270,7 @@ class IndexerAPITests(unittest.TestCase):
             "duplicate": 0,
         })
         self.assertTrue(payload["ok"])
-        dispatch.assert_called_once_with(31, "qb")
+        dispatch.assert_called_once_with(31, "qb", qb_save_path="", qb_category="")
 
     def test_batch_download_counts_real_both_partial_separately(self):
         headers = self.authenticate()
@@ -1370,7 +1418,7 @@ class IndexerAPITests(unittest.TestCase):
         dispatch_finished = threading.Event()
         ticks_during_dispatch = 0
 
-        def blocking_dispatch(request_id, target):
+        def blocking_dispatch(request_id, target, **_options):
             dispatch_started.set()
             time.sleep(0.08)
             dispatch_finished.set()
@@ -1429,7 +1477,7 @@ class IndexerAPITests(unittest.TestCase):
             await asyncio.sleep(0.03)
             return service.adapter.resolved
 
-        def dispatch(request_id, target):
+        def dispatch(request_id, target, **_options):
             nonlocal active
             time.sleep(0.01)
             with state_lock:

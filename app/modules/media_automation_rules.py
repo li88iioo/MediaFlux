@@ -115,6 +115,82 @@ def next_summary_at(settings: dict[str, Any], now: datetime | None = None) -> st
     return candidate.isoformat(timespec="seconds")
 
 
+_DIGEST_DEFAULTS = {"hour": 0, "minute": 0, "errors_only": False, "send_empty": False}
+
+
+def digest_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or set(arguments) - {"rule_id", "enabled", *_DIGEST_DEFAULTS} or "enabled" not in arguments:
+        raise AgentToolError("规则参数缺失或包含不支持字段")
+    for key in ("enabled", "errors_only", "send_empty"):
+        if key in arguments and not isinstance(arguments[key], bool):
+            raise AgentToolError(f"{key} 必须是布尔值")
+    for key, maximum in (("hour", 23), ("minute", 59)):
+        value = arguments.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+            raise AgentToolError(f"{key} 超出有效时间范围")
+    rule_id = arguments.get("rule_id", "")
+    if not isinstance(rule_id, str) or len(rule_id) > 100:
+        raise AgentToolError("rule_id 无效")
+    if not rule_id and "hour" not in arguments:
+        raise AgentToolError("新增摘要规则必须指定 hour；修改已有规则请提供 rule_id")
+    return {"rule_id": rule_id, **arguments}
+
+
+def _public_digest(rule: dict[str, Any]) -> dict[str, Any]:
+    return {"rule_id": rule["id"], **{key: rule[key] for key in ("kind", "enabled", "revision", "next_run_at", "created_at", "updated_at")},
+            "settings": {key: rule["settings"].get(key) for key in _DIGEST_DEFAULTS},
+            **({"settings_error": rule["settings_error"]} if rule.get("settings_error") else {})}
+
+
+def digests(*, owner: str) -> dict[str, Any]:
+    rows = rules.list_rules(agent_job_owner_digest(owner), kind="daily_summary")
+    return {"ok": True, "status": "completed", "summary": "已读取主动摘要规则",
+            "data": {"items": [_public_digest(row) for row in rows]}}
+
+
+def prepare_set_digest(arguments: dict[str, Any], *, owner: str,
+                       delivery_route: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    args = digest_arguments(arguments)
+    digest = agent_job_owner_digest(owner)
+    current = rules.get_rule(digest, args["rule_id"]) if args["rule_id"] else None
+    if args["rule_id"] and (current is None or current["kind"] != "daily_summary"):
+        raise AgentToolError("摘要规则不存在", code="precondition_failed")
+    previous = current["settings"] if current else {}
+    settings = {key: args.get(key, previous.get(key, default)) for key, default in _DIGEST_DEFAULTS.items()}
+    digest_arguments({"enabled": args["enabled"], **settings})
+    # 停用沿用已保存目标；启用仍核对宿主真实身份与话题。
+    route = ({key: previous[key] for key in ("notification_owner", "notification_chat_id", "notification_message_thread_id") if key in previous}
+             if current and not args["enabled"] else notification_route_settings(owner, delivery_route=delivery_route))
+    snapshot = {"owner": digest, "arguments": args, "revision": current["revision"] if current else 0, "route": route}
+    return {"snapshot": snapshot, "settings": settings, "preview": {
+        "ok": True, "status": "confirmation_required",
+        "summary": "确认后修改每日主动摘要规则" if current else "确认后新增每日主动摘要规则",
+        "data": {**args, **settings, "timezone": str(datetime.now().astimezone().tzinfo),
+                 "delivery": "复用 Telegram 通知中心与既有全局通知开关",
+                 "effects": ["每天到指定本地时刻汇总当前项目的媒体动态；停用后不再生成摘要。"]}}}
+
+
+def set_digest(arguments: dict[str, Any], *, owner: str, expected_snapshot: dict[str, Any],
+               delivery_route: Mapping[str, Any] | None = None,
+               check_cancelled: Callable[[], None] = lambda: None) -> dict[str, Any]:
+    args = digest_arguments(arguments)
+    if expected_snapshot.get("owner") != agent_job_owner_digest(owner) or expected_snapshot.get("arguments") != args:
+        raise AgentToolError("摘要确认上下文无效", code="confirmation_invalid")
+    prepared = prepare_set_digest(args, owner=owner, delivery_route=delivery_route)
+    if expected_snapshot != prepared["snapshot"]:
+        raise AgentToolError("摘要规则或通知目标已变化，请重新预检", code="precondition_failed")
+    settings = {**prepared["settings"], **expected_snapshot["route"]}
+    check_cancelled()
+    row = rules.save_rule(expected_snapshot["owner"], rule_id=args["rule_id"], kind="daily_summary", settings=settings,
+                          enabled=args["enabled"], next_run_at=next_summary_at(settings), expected_revision=expected_snapshot["revision"])
+    if row is None:
+        raise AgentToolError("摘要规则已变化，请重新预检", code="precondition_failed")
+    summary = "主动摘要规则已保存" if row["enabled"] else "主动摘要已停用"
+    if not args["rule_id"]:
+        summary = "主动摘要规则已新增" + ("（当前停用）" if not row["enabled"] else "")
+    return {"ok": True, "status": "completed", "summary": summary, "data": _public_digest(row)}
+
+
 def _daily_summary(rule: dict[str, Any], now: datetime) -> RuleDelivery:
     settings = rule["settings"]
     summary = today_content_summary()
