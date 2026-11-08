@@ -90,7 +90,7 @@ _METHODS = _install_methods()
 # 导出表来自宿主生成的 SDK 清单；动态命名空间不能由静态分析器展开。
 # pyrefly: ignore [unresolvable-dunder-all]
 __all__ = ["Error", *sorted({name.split(".")[0] for name in _METHODS})]
-__doc__ = "MediaFlux 业务接口。mf --help 查看命令，help(mf.<模块>) 查看方法。\n\n" + "\n".join(
+__doc__ = "MediaFlux 业务接口。mf <模块> --help 查看方法目录，help(mf.<模块>.<方法>) 查看具体用法。\n\n" + "\n".join(
     f"{name}: {globals()[name].__doc__}" for name in __all__ if name != "Error")
 
 
