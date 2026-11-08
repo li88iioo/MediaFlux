@@ -692,6 +692,7 @@ def claim_pending_rss_entries(expected_rows: list[dict], default_method: str = "
 
 
 _RSS_MAX_RETRIES = 5
+_RSS_RETRY_COOLDOWN_SECONDS = 60
 _RSS_QB_RETRY_FAILURE_CODES = (
     "qb_unavailable",
     "qb_rate_limited",
@@ -766,31 +767,43 @@ def rss_retry_entry_snapshot(row) -> dict[str, Any]:
     }
 
 
-def _rss_retry_eligibility_sql(default_method: str) -> tuple[str, tuple[str, ...]]:
-    """共享失败项安全条件；调用者传入 rss_entries 与 rss_items 的 i 联接。"""
+def _rss_retry_admission_sql(default_method: str, timestamp: str) -> tuple[str, tuple[str, ...]]:
+    """筛选、认领及拒绝原因共用一次 SQL 判定；调用者联接 rss_items 为 i。"""
     method = "LOWER(COALESCE(NULLIF(TRIM(rss_entries.download_backend),''),NULLIF(TRIM(i.download_method),''),?))"
     safe_codes = ",".join("?" for _ in _RSS_SAFE_RETRY_FAILURE_CODES)
     qb_codes = ",".join("?" for _ in _RSS_QB_RETRY_FAILURE_CODES)
     gy_codes = ",".join("?" for _ in _RSS_GUANGYA_RETRY_FAILURE_CODES)
     cooldown_codes = ",".join("?" for _ in _RSS_COOLDOWN_FAILURE_CODES)
-    condition = (
-        "(rss_entries.download_request_key='' OR EXISTS (SELECT 1 FROM download_requests r WHERE r.id=rss_entries.download_request_id AND " + _rss_delivery_retry_sql("rss_entries") + ")) AND "
-        "COALESCE(rss_entries.failure_retryable,0)=1 "
-        f"AND COALESCE(rss_entries.retry_count,0)<{_RSS_MAX_RETRIES} "
-        f"AND rss_entries.failure_code IN ({safe_codes}) "
-        f"AND (({method}='qb' AND rss_entries.failure_code IN ({qb_codes})) "
-        f"OR ({method}='guangya' AND rss_entries.failure_code IN ({gy_codes}))) "
-        f"AND (rss_entries.failure_code NOT IN ({cooldown_codes}) OR ("
-        "NULLIF(rss_entries.failed_at,'') IS NOT NULL AND "
-        "datetime(rss_entries.failed_at)<=datetime('now','localtime','-60 seconds')))"
+    decision = (
+        "CASE WHEN COALESCE(rss_entries.processed,0)<>0 THEN 'processed' "
+        "WHEN rss_entries.status='pending' THEN 'ready' "
+        "WHEN rss_entries.status='submitting' THEN 'submitting' "
+        "WHEN COALESCE(rss_entries.status,'')<>'failed' THEN 'processed' "
+        "WHEN i.id IS NULL THEN 'subscription_missing' "
+        "WHEN COALESCE((rss_entries.download_request_key='' OR EXISTS ("
+        "SELECT 1 FROM download_requests r WHERE r.id=rss_entries.download_request_id AND "
+        + _rss_delivery_retry_sql("rss_entries") + ")),0)<>1 THEN 'review_required' "
+        "WHEN rss_entries.failure_code IN ('qb_outcome_unknown','guangya_outcome_unknown',"
+        "'submission_outcome_unknown') THEN 'review_required' "
+        "WHEN COALESCE(rss_entries.failure_retryable,0)<>1 THEN 'not_retryable' "
+        f"WHEN COALESCE(rss_entries.retry_count,0)>={_RSS_MAX_RETRIES} THEN 'retry_limit' "
+        f"WHEN COALESCE(rss_entries.failure_code,'') NOT IN ({safe_codes}) THEN 'not_retryable' "
+        f"WHEN COALESCE((({method}='qb' AND rss_entries.failure_code IN ({qb_codes})) "
+        f"OR ({method}='guangya' AND rss_entries.failure_code IN ({gy_codes}))),0)<>1 THEN 'backend_mismatch' "
+        f"WHEN rss_entries.failure_code IN ({cooldown_codes}) "
+        "AND datetime(rss_entries.failed_at) IS NULL THEN 'invalid_failed_at' "
+        f"WHEN rss_entries.failure_code IN ({cooldown_codes}) "
+        f"AND datetime(rss_entries.failed_at)>datetime(?,'-{_RSS_RETRY_COOLDOWN_SECONDS} seconds') "
+        "THEN 'cooldown' ELSE 'ready' END"
     )
     parameters = (
         *_RSS_SAFE_RETRY_FAILURE_CODES,
         default_method, *_RSS_QB_RETRY_FAILURE_CODES,
         default_method, *_RSS_GUANGYA_RETRY_FAILURE_CODES,
         *_RSS_COOLDOWN_FAILURE_CODES,
+        *_RSS_COOLDOWN_FAILURE_CODES, timestamp,
     )
-    return condition, parameters
+    return decision, parameters
 
 
 def get_retryable_failed_rss_snapshot(
@@ -800,8 +813,9 @@ def get_retryable_failed_rss_snapshot(
 ) -> list[sqlite3.Row]:
     """返回按订阅当前下载方式筛选的安全 RSS 失败快照。"""
     normalized_default = (default_method or "").strip().lower()
-    eligibility, eligibility_parameters = _rss_retry_eligibility_sql(normalized_default)
-    parameters: list[Any] = list(eligibility_parameters)
+    admission, admission_parameters = _rss_retry_admission_sql(normalized_default, db.now())
+    eligibility = f"({admission})='ready'"
+    parameters: list[Any] = list(admission_parameters)
     if entry_ids is not None:
         eligibility += " AND rss_entries.id IN (" + ",".join("?" for _ in entry_ids) + ")"
         parameters.extend(entry_ids)
@@ -837,14 +851,14 @@ def claim_retryable_failed_rss_entries(
         return []
 
     placeholders = ",".join("?" for _ in ids)
-    eligibility, parameters = _rss_retry_eligibility_sql(normalized_default)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        admission, parameters = _rss_retry_admission_sql(normalized_default, db.now())
         query = (
             _RSS_RETRY_ENTRY_SELECT
             + f"WHERE rss_entries.id IN ({placeholders}) "
             + "AND rss_entries.status='failed' AND COALESCE(rss_entries.processed,0)=0 "
-            + f"AND {eligibility} "
+            + f"AND ({admission})='ready' "
             + "ORDER BY COALESCE(NULLIF(rss_entries.failed_at,''),"
             + "NULLIF(rss_entries.submitted_at,''),rss_entries.created_at) DESC, "
             + "rss_entries.id DESC"
@@ -868,22 +882,41 @@ def claim_retryable_failed_rss_entries(
         return rows
 
 
-def claim_rss_entry(entry_id: int) -> bool:
-    """原子认领待处理项或满足当前后端安全策略的失败项。"""
+def claim_rss_entry(entry_id: int, *, admission: dict[str, Any] | None = None) -> bool:
+    """原子认领；可选结果容器取得同一事务判定的拒绝原因和剩余冷却时间。"""
     from app.config import get as get_config
 
     default_method = (get_config("RSS_DOWNLOAD_METHOD", "qb") or "qb").strip().lower()
-    eligibility, parameters = _rss_retry_eligibility_sql(default_method)
     with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        timestamp = db.now()
+        decision, parameters = _rss_retry_admission_sql(default_method, timestamp)
+        row = conn.execute(
+            "SELECT *, CASE WHEN retry_reason='cooldown' "
+            f"THEN datetime(failed_at,'+{_RSS_RETRY_COOLDOWN_SECONDS} seconds') END AS retry_at, "
+            "CASE WHEN retry_reason='cooldown' THEN "
+            f"CAST(strftime('%s',datetime(failed_at,'+{_RSS_RETRY_COOLDOWN_SECONDS} seconds')) AS INTEGER) "
+            "-CAST(strftime('%s',retry_now) AS INTEGER) END AS retry_after FROM ("
+            "SELECT rss_entries.status,rss_entries.failure_code,rss_entries.retry_count,rss_entries.failed_at,"
+            f"? AS retry_now,({decision}) AS retry_reason FROM rss_entries "
+            "LEFT JOIN rss_items i ON i.id=rss_entries.rss_item_id WHERE rss_entries.id=?)",
+            (timestamp, *parameters, entry_id),
+        ).fetchone()
+        if admission is not None:
+            admission.update({key: row[key] if row is not None else None for key in (
+                "failure_code", "retry_count", "retry_reason", "retry_after", "retry_at",
+            )})
+            if row is None:
+                admission["retry_reason"] = "not_found"
+            admission["retry_limit"] = _RSS_MAX_RETRIES
+        if row is None or row["retry_reason"] != "ready":
+            return False
         cur = conn.execute(
             "UPDATE rss_entries SET status='submitting', submitted_at=?, "
             "retry_count=COALESCE(retry_count,0)+CASE WHEN status='failed' THEN 1 ELSE 0 END, "
             "failure_code='', failure_retryable=0, failed_at=NULL WHERE id=? "
-            "AND COALESCE(processed,0)=0 AND (status='pending' OR ("
-            "status='failed' AND EXISTS ("
-            "SELECT 1 FROM rss_items i WHERE i.id=rss_entries.rss_item_id AND "
-            f"({eligibility}))))",
-            (db.now(), entry_id, *parameters),
+            "AND COALESCE(processed,0)=0 AND status IN ('pending','failed')",
+            (timestamp, entry_id),
         )
         return cur.rowcount == 1
 

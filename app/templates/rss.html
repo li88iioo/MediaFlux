@@ -338,7 +338,9 @@ async function rssApiJSON(path,opts={}){
     const response=await api(path,opts);
     let payload={};
     try{payload=await response.json();}catch(_){payload={};}
-    if(!response.ok||payload?.error)throw new Error(payload?.error||`请求失败（HTTP ${response.status}）`);
+    if(!response.ok||payload?.error)throw Object.assign(new Error(payload?.error||`请求失败（HTTP ${response.status}）`),{
+        retry_reason:payload?.retry_reason,retry_after:payload?.retry_after,retry_at:payload?.retry_at,
+    });
     return payload;
 }
 
@@ -810,7 +812,11 @@ async function dlEntry(id,trigger){
             message:pending?'请求已发出，但尚未确认下载目标受理。':existing?'相同资源已经存在，本次未重复提交。':unverified?'下载请求已发送，请进一步核对目标状态。':ok?'条目已推送到下载后端。':'请检查下载目标配置和连接状态。'
         });
         await loadEntries();
-    }catch(error){await appAlert({type:'error',title:'下载提交失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
+    }catch(error){await appAlert({
+        type:error.retry_reason==='cooldown'?'warning':'error',
+        title:error.retry_reason==='cooldown'?'稍后重试':'下载提交失败',
+        message:error.message||'请求失败，请检查网络和服务状态。',
+    });}
     finally{setRssButtonBusy(trigger,false);}
 }
 

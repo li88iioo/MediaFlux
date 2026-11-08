@@ -140,6 +140,18 @@ class RSSFailureRecoveryBrowserTests(unittest.TestCase):
                 self.assert_stable(self.boxes(page), before)
                 self.assertEqual(page.evaluate("calls.at(-1).path"), "/api/rss/entries/1/download")
                 self.assertEqual(page.evaluate("calls.at(-1).opts.method"), "POST")
+                page.evaluate("""async()=>{
+                    pending.shift()({ok:false,status:400,json:async()=>({ok:false,
+                        error:'种子抓取连接失败，请等待 8 秒后重试（00:13:35）',
+                        retry_reason:'cooldown',retry_after:8,retry_at:'2026-11-09 00:13:35'})});
+                    await submit;
+                }""")
+                self.assertEqual(page.evaluate("alerts.at(-1).type"), "warning")
+                self.assertEqual(page.evaluate("alerts.at(-1).title"), "稍后重试")
+                self.assertIn("8 秒", page.evaluate("alerts.at(-1).message"))
+                self.assertFalse(cards.nth(0).locator("button").is_disabled())
+                self.assert_stable(self.boxes(page), before)
+                page.evaluate("window.submit=dlEntry(1,document.querySelector('.rss-entry-actions button'));void 0;")
                 page.evaluate("finish({result:{ok:true,existing:false,request_id:10}})")
                 page.wait_for_function("pending.length===1")
                 page.evaluate("async()=>{finishPage(rows);await submit;}")

@@ -324,6 +324,41 @@ def rss_entry_delivery(entry) -> dict:
         "error": redact_sensitive_text(str(row.get("delivery_error") or ""))[:500],
     }
 
+
+def _rss_retry_rejection_error(admission: dict[str, Any]) -> str:
+    """只翻译仓储准入结果，不在 Python 中重算冷却、次数或后端规则。"""
+    reason = str(admission.get("retry_reason") or "")
+    failure_code = str(admission.get("failure_code") or "")
+    if reason == "cooldown":
+        failure = {
+            "qb_rate_limited": "上次 qBittorrent 请求受限",
+            "guangya_rate_limited": "上次光鸭请求受限",
+            "torrent_fetch_timeout": "上次读取种子超时",
+            "torrent_fetch_failed": "上次读取种子发生网络或传输错误",
+            "torrent_http_error": "上次种子服务器返回 HTTP 错误",
+        }.get(failure_code, "上次下载失败")
+        return (f"{failure}，重试冷却尚未结束，请等待 {admission['retry_after']} 秒后再试"
+                f"（可重试时间：{admission['retry_at']}）")
+    if reason == "not_retryable":
+        return {
+            "qb_auth_failed": "qBittorrent 鉴权失败，请检查下载器凭据后再处理",
+            "guangya_auth_failed": "光鸭鉴权失败，请检查账号或令牌后再处理",
+            "torrent_invalid": "种子内容无效或损坏，请核对或更换下载来源",
+            "torrent_identity_mismatch": "种子内容与链接中的 BT 身份不一致，请核对下载来源",
+            "missing_torrent_url": "条目缺少种子下载链接，请检查订阅源",
+            "invalid_payload": "条目数据或下载链接格式无效，请检查订阅源",
+            "unknown_failure": "失败原因未记录，需先核验下载状态，勿直接重复提交",
+        }.get(failure_code, "该失败尚不能确认可重试，请先核验下载状态")
+    return {
+        "retry_limit": f"已达到 {admission.get('retry_limit')} 次重试上限，请检查失败原因后手动处理该条目",
+        "backend_mismatch": "失败分类与当前下载后端不匹配，请检查订阅的下载方式",
+        "review_required": "原下载仍在处理或提交结果待核验，请在下载中心核验，勿重复提交",
+        "invalid_failed_at": "失败时间缺失或无效，无法确定重试冷却截止时间，请核对该条目",
+        "subscription_missing": "条目所属订阅已不存在，无法安全重试，请核对订阅状态",
+        "not_found": "条目不存在",
+    }.get(reason, "条目正在提交或已被处理")
+
+
 @dataclass
 class RSSEntry:
     """单条 RSS 条目。"""
@@ -939,16 +974,15 @@ class RSSEngine:
         # 显式下载能力。已经开始的外部写入不能因后续暂停而释放防重状态。
         if auto_guard is not None and not auto_guard():
             return {"ok": False, "cancelled": True, "error": RSS_REFRESH_CONFLICT_ERROR}
-        if not entry_already_claimed and not db.claim_rss_entry(entry_id):
-            current = db.get_rss_entry(entry_id)
-            if current is not None and current["status"] == "submitting":
+        admission: dict[str, Any] = {}
+        if not entry_already_claimed and not db.claim_rss_entry(entry_id, admission=admission):
+            if admission.get("retry_reason") == "submitting":
                 return {"ok": False, "pending": True, "status": "submitting",
                         "method": method, "infohash": infohash}
-            error = (
-                "失败条目暂不满足安全重试条件（冷却、次数上限或需核对），请在下载中心处理"
-                if entry["status"] == "failed" else "条目正在提交或已被处理"
-            )
-            return {"error": error, "ok": False, "method": method}
+            return {"error": _rss_retry_rejection_error(admission), "ok": False, "method": method,
+                    **{key: admission.get(key) for key in (
+                        "failure_code", "retry_reason", "retry_after", "retry_at",
+                    )}}
 
         request_id = 0
         stage = "submit"

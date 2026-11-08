@@ -5,15 +5,20 @@ from tests.support import assert_present
 
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import httpx
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from app import database as db
 from app.indexers import downloads
 from app.modules import download_dispatcher as dispatcher
 from app.modules import offline, rss
 from app.repositories import rss as rss_repo
+from app.routes import rss_api
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 _INFO = b"d6:lengthi10485760e4:name9:Movie.mkve"
@@ -284,6 +289,120 @@ class RSSTorrentPreparationFailureTests(IsolatedDatabaseTestCase):
                 self.assertEqual(dict(get_rss_entry_result_13), before)
                 self.assertEqual(self.fetch.call_count, 6)
                 self.assert_no_requests()
+
+    def test_connect_error_retry_api_reports_remaining_cooldown_without_new_attempt(self):
+        eid = self.entry()
+        self.fetch.side_effect = httpx.ConnectError(_URL)
+        with patch.object(db, "now", return_value="2026-11-09 00:12:35"):
+            self.failure(eid, "torrent_fetch_failed", True)
+        before = dict(assert_present(db.get_rss_entry(eid)))
+        app = FastAPI()
+        app.include_router(rss_api.router)
+        with patch.object(rss_api, "require_api_login"), TestClient(app) as client:
+            for timestamp, remaining in (("2026-11-09 00:13:27", 8), ("2026-11-09 00:13:34", 1)):
+                with self.subTest(remaining=remaining), patch.object(db, "now", return_value=timestamp):
+                    self.assertNotIn(eid, self.retryable_ids())
+                    response = client.post(f"/api/rss/entries/{eid}/download")
+                    self.assertEqual(response.status_code, 400)
+                    result = response.json()
+                    self.assertEqual(result["retry_reason"], "cooldown")
+                    self.assertEqual(result["failure_code"], "torrent_fetch_failed")
+                    self.assertEqual(result["retry_after"], remaining)
+                    self.assertEqual(result["retry_at"], "2026-11-09 00:13:35")
+                    self.assertIn("网络或传输错误", result["error"])
+                    self.assertIn(f"{remaining} 秒", result["error"])
+                    self.assertIn(result["retry_at"], result["error"])
+                    self.assertNotIn(_TOKEN, response.text)
+                    self.assertEqual(dict(assert_present(db.get_rss_entry(eid))), before)
+            self.assertEqual(self.fetch.call_count, 1)
+            self.assert_no_requests()
+            self.fetch.side_effect = None
+            with patch.object(db, "now", return_value="2026-11-09 00:13:35"):
+                self.assertIn(eid, self.retryable_ids())
+                result = client.post(f"/api/rss/entries/{eid}/download").json()["result"]
+                self.assertTrue(result["ok"], result)
+                self.assertTrue(client.post(f"/api/rss/entries/{eid}/download").json()["result"]["existing"])
+        self.assertEqual(self.fetch.call_count, 2)
+        self.guangya.assert_called_once()
+        self.assertEqual(assert_present(db.get_rss_entry(eid))["retry_count"], 1)
+
+    def test_retry_rejections_distinguish_limit_backend_unknown_and_invalid_failure_time(self):
+        cases = (
+            ("torrent_fetch_failed", True, 5, "2026-11-09 00:12:35", "retry_limit", "5 次"),
+            ("qb_unavailable", True, 0, "2026-11-09 00:12:35", "backend_mismatch", "下载后端不匹配"),
+            ("torrent_invalid", False, 0, "2026-11-09 00:12:35", "not_retryable", "损坏"),
+            ("torrent_identity_mismatch", False, 0, "2026-11-09 00:12:35", "not_retryable", "身份不一致"),
+            ("qb_auth_failed", False, 0, "2026-11-09 00:12:35", "not_retryable", "qBittorrent 鉴权失败"),
+            ("guangya_auth_failed", False, 0, "2026-11-09 00:12:35", "not_retryable", "光鸭鉴权失败"),
+            ("missing_torrent_url", False, 0, "2026-11-09 00:12:35", "not_retryable", "缺少种子下载链接"),
+            ("invalid_payload", False, 0, "2026-11-09 00:12:35", "not_retryable", "条目数据"),
+            ("unknown_failure", False, 0, "2026-11-09 00:12:35", "not_retryable", "失败原因未记录"),
+            ("guangya_outcome_unknown", False, 0, "2026-11-09 00:12:35", "review_required", "核验"),
+            *[("torrent_fetch_failed", True, 0, timestamp, "invalid_failed_at", "失败时间")
+              for timestamp in (None, "", "invalid")],
+        )
+        for code, retryable, count, failed_at, reason, message in cases:
+            with self.subTest(code=code, reason=reason, failed_at=failed_at):
+                eid = self.entry()
+                db.record_rss_entry_failure(eid, code, retryable)
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET retry_count=?,failed_at=? WHERE id=?", (count, failed_at, eid))
+                before = dict(assert_present(db.get_rss_entry(eid)))
+                with patch.object(db, "now", return_value="2026-11-09 00:13:35"):
+                    self.assertNotIn(eid, self.retryable_ids())
+                    result = self.engine.download(eid)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["retry_reason"], reason)
+                self.assertIn(message, result["error"])
+                self.assertIsNone(result["retry_after"])
+                self.assertIsNone(result["retry_at"])
+                self.assertEqual(dict(assert_present(db.get_rss_entry(eid))), before)
+        self.fetch.assert_not_called()
+        self.assert_no_requests()
+
+    def test_concurrent_expired_retry_claims_once_and_reports_pending(self):
+        eid = self.entry()
+        self.fetch.side_effect = httpx.ConnectError(_URL)
+        with patch.object(db, "now", return_value="2026-11-09 00:12:35"):
+            self.failure(eid, "torrent_fetch_failed", True)
+        self.fetch.side_effect = None
+        entered, release = threading.Event(), threading.Event()
+
+        def submit(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("retry fixture timeout")
+            return {"ok": True, "task_id": "gy-task", "task_ids": ["gy-task"]}
+
+        self.guangya.side_effect = submit
+        with patch.object(db, "now", return_value="2026-11-09 00:13:35"), ThreadPoolExecutor(max_workers=1) as pool:
+            winner = pool.submit(self.engine.download, eid)
+            try:
+                self.assertTrue(entered.wait(5))
+                loser = self.engine.download(eid)
+                self.assertTrue(loser["pending"], loser)
+                self.assertEqual(loser["status"], "submitting")
+                self.assertEqual(assert_present(db.get_rss_entry(eid))["retry_count"], 1)
+            finally:
+                release.set()
+            self.assertTrue(winner.result()["ok"])
+        self.guangya.assert_called_once()
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_orphan_failed_entry_cannot_retry_but_orphan_pending_can_claim(self):
+        failed, pending = self.entry(method="qb"), self.entry(method="qb")
+        db.record_rss_entry_failure(failed, "qb_unavailable", True)
+        with db.get_conn() as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("DELETE FROM rss_items WHERE id IN (SELECT rss_item_id FROM rss_entries WHERE id IN (?,?))", (failed, pending))
+        before = dict(assert_present(db.get_rss_entry(failed)))
+        admission = {}
+        self.assertFalse(db.claim_rss_entry(failed, admission=admission))
+        self.assertEqual(admission["retry_reason"], "subscription_missing")
+        self.assertEqual(dict(assert_present(db.get_rss_entry(failed))), before)
+        self.assertTrue(db.claim_rss_entry(pending))
+        self.assertEqual(assert_present(db.get_rss_entry(pending))["status"], "submitting")
+        self.assert_no_requests()
 
     def test_rss_http_statuses_preserve_source_classification_and_safe_logs(self):
         for status, retryable in _HTTP_CASES:
