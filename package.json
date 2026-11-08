@@ -11,9 +11,9 @@
     "build:static": "node packaging/scripts/minify_static.mjs"
   },
   "devDependencies": {
-    "gsap": "3.15.0",
+    "gsap": "3.15.1",
     "lightningcss": "1.33.0",
-    "lucide": "1.66.0",
+    "lucide": "1.70.0",
     "terser": "5.51.2"
   }
 }

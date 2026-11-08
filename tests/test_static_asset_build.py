@@ -83,8 +83,8 @@ class StaticAssetBuildTests(unittest.TestCase):
         self.assertEqual(package["packageManager"], "npm@12.2.1")
         self.assertEqual(package["devDependencies"]["terser"], "5.51.2")
         self.assertEqual(package["devDependencies"]["lightningcss"], "1.33.0")
-        self.assertEqual(package["devDependencies"]["lucide"], "1.66.0")
-        self.assertEqual(package["devDependencies"]["gsap"], "3.15.0")
+        self.assertEqual(package["devDependencies"]["lucide"], "1.70.0")
+        self.assertEqual(package["devDependencies"]["gsap"], "3.15.1")
         self.assertTrue((self.ROOT / "package-lock.json").is_file())
 
     def test_output_preserves_every_static_asset_path(self) -> None:
