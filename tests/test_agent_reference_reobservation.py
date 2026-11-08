@@ -239,7 +239,8 @@ class Case:
         state = await self.state()
         self.source_users = [deepcopy(row) for row in state.conversation if row.get("role") == "user"]
         assert len(self.source_users) == 1 and self.source_users[0]["history_id"]
-        assert self.source_users == [{"role": "user", "content": GOAL, "history_id": self.source_users[0]["history_id"]}]
+        assert self.source_users == [{"role": "user", "content": GOAL,
+                                      "history_id": self.source_users[0]["history_id"], "history_order": 0}]
         self.assert_source(state)
         return plan
 

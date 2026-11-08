@@ -149,6 +149,8 @@ class FakeApprovalPlan:
     def __init__(self, payload):
         self.payload = payload
         self.arguments = {}
+        self.plan_id = payload["plan_id"]
+        self.tool_name = payload.get("tool_name", "")
 
     def public_approval_dict(self):
         return dict(self.payload)

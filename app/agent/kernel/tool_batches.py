@@ -27,6 +27,7 @@ from .model import (
     ModelToolCall,
 )
 from .projection import _arguments_safe
+from .sandbox import workspace_output_available
 from .session_guard import session_scope_guard
 from .task_state import reduce_task, task_projection
 
@@ -94,8 +95,6 @@ def admit_calls(turn: AgentTurn, reply: _ModelRound) -> None:
             "当前调用参数及已有执行事实超过历史容量，本批调用未执行；请缩小查询。",
             code="history_capacity_exceeded",
         )
-    from .model_rounds import workspace_output_available
-
     bounded_model_messages(
         proposed, history_end=turn.history_end,
         tool_definitions=reply.tools, system_prompt=reply.system_prompt,

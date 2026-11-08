@@ -157,7 +157,7 @@ def test_synchronous_failed_confirm_uses_effect_wait_with_or_without_task(native
         initial = await case.cold_store().load(owner=case.owner, session_id=case.sid)
         users = case.users(initial)
         assert len(users) == 1 and users[0]["history_id"]
-        assert users == [{"role": "user", "content": GOAL, "history_id": users[0]["history_id"]}]
+        assert users == [{"role": "user", "content": GOAL, "history_id": users[0]["history_id"], "history_order": 0}]
         if tracked_task:
             assert initial.metadata["task"]["root_goal"] == GOAL
             assert initial.metadata["read_wait"]["state"] == "idle"
@@ -322,7 +322,7 @@ async def failed_background_candidate(case, prepared, client):
     initial = await case.cold_store().load(owner=case.owner, session_id=case.sid)
     users = case.users(initial)
     assert len(users) == 1 and users[0]["history_id"]
-    assert users == [{"role": "user", "content": GOAL, "history_id": users[0]["history_id"]}]
+    assert users == [{"role": "user", "content": GOAL, "history_id": users[0]["history_id"], "history_order": 0}]
     plan_id = events[-1].payload["plan_id"]
     assert prepared == [case.change_arguments]
     with db.get_conn() as conn:

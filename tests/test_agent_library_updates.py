@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from app.modules.episode_audit import EpisodeAuditResult, check_library_updates, normalize_library_update_arguments
 
@@ -873,7 +873,7 @@ print("31 complete rows saved")'''
         assert later.outcome.public_content["data"]["exit_code"] == 0
     with patch("socket.socket.connect", side_effect=AssertionError("external network forbidden")):
         asyncio.run(run())
-    movie_search.assert_called_once_with("Movie Title", limit=50, media_type="movie", search_by="title", cancelled=unittest.mock.ANY)
+    movie_search.assert_called_once_with("Movie Title", limit=50, media_type="movie", search_by="title", cancelled=ANY)
     assert sorted(reads) == sorted(f"Show{i}" for i in range(31))
 
 

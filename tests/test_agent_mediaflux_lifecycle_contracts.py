@@ -304,7 +304,8 @@ def test_plain_qa_keeps_one_model_zero_tool_nine_write_transactions():
         user_event_id = loaded.conversation[0]["history_id"]
         assert isinstance(user_event_id, str) and user_event_id
         assert loaded.conversation == [
-            {"content": "你好", "role": "user", "history_id": user_event_id}, {"content": "离线回答。", "role": "assistant"},
+            {"content": "你好", "role": "user", "history_id": user_event_id, "history_order": 0},
+            {"content": "离线回答。", "role": "assistant"},
         ]
         assert [row["type"] for row in history] == [event.type.value for event in events]
     asyncio.run(check())

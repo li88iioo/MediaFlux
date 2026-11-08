@@ -248,6 +248,11 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
         events = await collect(session.run(AgentInput(message="将影视探索缓存有效期改成600秒，先生成确认卡。", owner=OWNER,
                                                      session_id=SESSION, request_id="preference-preview")))
         old_id = next(event.payload["plan"]["plan_id"] for event in events if event.type == E.EFFECT_APPROVAL_REQUIRED)
+        initial = await task_store.load(owner=OWNER, session_id=SESSION)
+        source_users = [row for row in initial.conversation if row.get("role") == "user"]
+        assert len(source_users) == 1 and source_users[0]["history_id"]
+        assert source_users == [{"role": "user", "content": "将影视探索缓存有效期改成600秒，先生成确认卡。",
+                                 "history_id": source_users[0]["history_id"], "history_order": 0}]
         result = await session.edit_confirmation(owner=OWNER, session_id=SESSION, plan_id=old_id,
                                                 arguments={"value": 900}, request_id="actual-ui-edit")
         plan = result.effect_plan
@@ -256,7 +261,10 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
         edit = state.conversation[-1]
         assert edit["role"] == "user" and edit["ui_edit"]["arguments"]["value"] == 900
         assert edit["ui_edit"]["request_id"] == "actual-ui-edit"
-        assert state.metadata["pending_effect_goal"] == edit
+        # 目标快照在提交前冻结；用户事件序号由持久化提交统一补充。
+        assert edit == {**state.metadata["pending_effect_goal"], "history_order": 1}
+        assert edit["history_id"] and edit["history_id"] != source_users[0]["history_id"]
+        assert [row for row in state.conversation if row.get("role") == "user"] == source_users + [edit]
         old_call = next(call for row in state.conversation for call in row.get("tool_calls", ()))
         assert old_call["arguments"]["value"] == 600  # 不编造模型曾调用900。
         old_result = next(row for row in state.conversation if row.get("effect_plan_id") == old_id)
@@ -276,6 +284,12 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
         assert any(row["role"] == "user" and '"value":900' in row.get("content", "") for row in messages)
         assert any("900" in row.get("content", "") and "已将" in row.get("content", "") for row in messages)
         state = await task_store.load(owner=OWNER, session_id=SESSION)
+        users = [row for row in state.conversation if row.get("role") == "user"]
+        assert len(users) == 3 and users[-1]["history_id"] not in {source_users[0]["history_id"], edit["history_id"]}
+        assert users == source_users + [
+            {"role": "user", "content": edit["content"], "history_id": edit["history_id"], "history_order": 1},
+            {"role": "user", "content": "刚才缓存有效期最终设为多少？", "history_id": users[-1]["history_id"], "history_order": 2},
+        ]
         calls = [call for row in state.conversation for call in row.get("tool_calls", ())]
         assert len(calls) == 1 and calls[0]["arguments"]["value"] == 600
         assert len(origins) == 1

@@ -34,6 +34,7 @@ from .model import (
 )
 from .provider_model import ModelProviderError, UncommittableModelTurn
 from .references import ReferenceError
+from .sandbox import workspace_output_available
 from .task_state import task_projection
 
 if TYPE_CHECKING:
@@ -54,15 +55,6 @@ class _ModelRound:
     tools: tuple[Mapping[str, Any], ...]
     system_prompt: str
     resuming_read: bool
-
-
-def workspace_output_available(owner: str, session_id: str, path: str) -> bool:
-    """模型请求和调用准入共用同一会话工作区的输出文件检查。"""
-    from .sandbox import _workspace_location
-
-    workspace, _ = _workspace_location(owner, session_id)
-    source = workspace / path.lstrip("/")
-    return source.is_file() and not source.is_symlink()
 
 
 async def _history_snapshot_available(turn: AgentTurn, handle: str) -> bool:

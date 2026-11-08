@@ -967,7 +967,7 @@ class CalendarHttpTests(unittest.IsolatedAsyncioTestCase):
 class CalendarMetadataTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
-        self.rows = [{"id": 42, "name": "离线测试动漫", "original_name": "Fixture", "first_air_date": "2026-01-01",
+        self.rows: list[dict[str, object]] = [{"id": 42, "name": "离线测试动漫", "original_name": "Fixture", "first_air_date": "2026-01-01",
                       "genre_ids": [16], "poster_path": "/poster.jpg", "vote_average": 8.5, "overview": "离线简介"}]
         self.client = SimpleNamespace(api_key="fixture", get=AsyncMock(side_effect=lambda *a, **kw: {
             "results": self.rows, "page": 1, "total_pages": 1, "total_results": len(self.rows),

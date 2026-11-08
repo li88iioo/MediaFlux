@@ -13,6 +13,7 @@ import json
 import random
 import socket
 from copy import deepcopy
+from typing import Any
 
 import pytest
 
@@ -691,7 +692,7 @@ def test_callback_exception_is_atomic_and_clone_alias_graph(kind):
     )
 
 
-def paired(content):
+def paired(content: str) -> list[dict[str, Any]]:
     return [
         {"role": "user", "content": "inspect"},
         {
@@ -750,11 +751,14 @@ def test_authoritative_roundtrip_aliasing_cas_atomic_updates_receipt_merge(kind)
         history_id = state.conversation[0]["history_id"]
         assert isinstance(history_id, str) and history_id
         assert "history_id" not in rows[0], "commit must not mutate caller-owned rows"
+        assert "history_order" not in rows[0], "commit must not mutate caller-owned rows"
         committed_rows = deepcopy(rows)
         committed_rows[0]["history_id"] = history_id
+        committed_rows[0]["history_order"] = 0
         assert state.conversation == committed_rows
         state.conversation[0]["content"] = "mutation"
         state.conversation[0]["history_id"] = "mutated-returned-id"
+        state.conversation[0]["history_order"] = 99
         cold = make_store() if kind == "sqlite" else store
         loaded = await cold.load(owner=OWNER, session_id=SESSION)
         assert loaded.conversation == committed_rows
@@ -826,8 +830,10 @@ def test_legacy_sqlite_hmac_cold_reopen_and_lazy_rewrite():
         history_id = committed.conversation[0]["history_id"]
         assert isinstance(history_id, str) and history_id
         assert "history_id" not in rows[0], "lazy rewrite must not mutate legacy input rows"
+        assert "history_order" not in rows[0], "lazy rewrite must not mutate legacy input rows"
         committed_rows = deepcopy(rows)
         committed_rows[0]["history_id"] = history_id
+        committed_rows[0]["history_order"] = 0
         assert committed.conversation == committed_rows
         with db.get_conn() as conn:
             raw = conn.execute(

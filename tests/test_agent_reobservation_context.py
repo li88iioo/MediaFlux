@@ -48,13 +48,19 @@ def test_confirmed_observation_source_is_private_scoped_and_not_a_new_user_defau
         assert "reobservation_source" not in wire + public
 
         case.script.steps.extend(["read_a", "finish"])
+        new_message = "只读取当前状态，不再执行改名。"
         new_events = [event async for event in case.session.run(AgentInput(
             owner=case.owner, session_id=case.sid, request_id="new-inspection",
-            message="只读取当前状态，不再执行改名。",
+            message=new_message,
         ))]
         assert new_events[-1].payload["status"] == "success"
         assert observed == [source, None], "新用户回合不能继承旧来源或授权"
         assert case.media.executed == ["A"]
+        saved = await case.cold_store().load(owner=case.owner, session_id=case.sid)
+        new_users = case.users(saved)
+        assert len(new_users) == 2 and new_users[-1]["history_id"] != users[0]["history_id"]
+        assert new_users == users + [{"role": "user", "content": new_message,
+                                     "history_id": new_users[-1]["history_id"], "history_order": 1}]
     asyncio.run(run())
 
 

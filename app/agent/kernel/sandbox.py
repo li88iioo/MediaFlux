@@ -530,6 +530,13 @@ def _workspace_location(owner: str, session_id: str) -> tuple[Path, CrossProcess
             CrossProcessLock("agent-workspace-" + scope, directory=paths.data_dir))
 
 
+def workspace_output_available(owner: str, session_id: str, path: str) -> bool:
+    """模型请求和调用准入共用同一会话工作区的输出文件检查。"""
+    workspace, _ = _workspace_location(owner, session_id)
+    source = workspace / path.lstrip("/")
+    return source.is_file() and not source.is_symlink()
+
+
 def clear_workspace(*, owner: str, session_id: str) -> None:
     """取消后等当前命令退出再清理；使用与执行相同的锁，不删除仍在使用的工作区。"""
     root, lock = _workspace_location(owner, session_id)

@@ -1808,7 +1808,8 @@ class AgentUXBrowserTests(unittest.TestCase):
         # 整行点击按钮覆盖在状态文字上，悬停背景必须透明，防止遮住实际文字。
         self.assertEqual(page.locator('.agent-process-toggle').evaluate('node => getComputedStyle(node).backgroundColor'), 'rgba(0, 0, 0, 0)')
         self.snapshot(page, 'expand-pending-confirmation-restored')
-        self.assertTrue(page.locator('.agent-stream-head > svg').is_visible())
+        self.assertTrue(page.locator('.agent-activity-status').is_visible())
+        self.assertEqual(page.locator('.agent-activity-status').inner_text(), '等待确认')
         page.evaluate("""events => { window.__kernelConfig.confirmEvents = events; }""", [
             harness._event(1, 'turn.started', {'kind': 'confirmation'}),
             harness._event(2, 'tool.progress', {'activity': {**activity, 'status': 'success', 'summary': '暂停操作已取得回执。'}}),
@@ -1966,6 +1967,24 @@ class AgentUXBrowserTests(unittest.TestCase):
                             borders: [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth]};
                 }""")
                 self.assertEqual(appearance, {'background': 'rgba(0, 0, 0, 0)', 'shadow': 'none', 'borders': ['0px'] * 4})
+                # 消息复用同一阅读列；去掉头像后，正文应占满消息宽度。
+                layout = page.locator('#agentTranscript').evaluate("""node => {
+                    const style = getComputedStyle(node);
+                    const available = node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+                    const width = Math.min(980, available);
+                    const left = node.getBoundingClientRect().left + node.clientLeft
+                        + parseFloat(style.paddingLeft) + (available - width) / 2;
+                    return {width, left, messages: Array.from(node.querySelectorAll('.agent-message'), message => ({
+                        box: message.getBoundingClientRect().toJSON(),
+                        body: message.querySelector('.agent-message-body').getBoundingClientRect().toJSON(),
+                    }))};
+                }""")
+                self.assertEqual(len(layout['messages']), 2)
+                for message in layout['messages']:
+                    self.assertAlmostEqual(message['box']['width'], layout['width'], delta=0.5)
+                    self.assertAlmostEqual(message['box']['x'], layout['left'], delta=0.5)
+                    self.assertAlmostEqual(message['body']['width'], message['box']['width'], delta=0.5)
+                    self.assertAlmostEqual(message['body']['x'], message['box']['x'], delta=0.5)
                 self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 1)
                 if outcome in ('success', 'partial'):
                     self.snapshot(page, f'progress-final-{width}')

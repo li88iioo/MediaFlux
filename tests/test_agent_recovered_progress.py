@@ -271,9 +271,19 @@ def test_current_error_redaction_and_parameter_identity_never_escape_to_answers(
     assert final["finish_reason"] == "provider_timeout"
     if error_text == "检查不可用 library.search provider_state":
         assert "检查不可用" in unfinished(final["answer"])
-    for text in (final["answer"], saved.conversation[-1]["content"], encode(public_conversation_messages(saved.conversation))):
-        for forbidden in ("PRIVATEIDENTITY", "/srv/private/", "library.search", "provider_state", "_recovery_tracked", "SYNTHETICSECRETVALUE"):
+    public_messages = public_conversation_messages(saved.conversation)
+    for text in (final["answer"], saved.conversation[-1]["content"], encode(public_messages)):
+        for forbidden in ("PRIVATEIDENTITY", "/srv/private/", "provider_state", "_recovery_tracked", "SYNTHETICSECRETVALUE"):
             assert forbidden not in text
+    # 展开执行过程需要结构化 method；用户可见正文、标签和摘要仍须去掉内部工具名。
+    visible_texts = [final["answer"], saved.conversation[-1]["content"]]
+    for message in public_messages:
+        visible_texts.append(message["content"])
+        for activity in message.get("activities", []):
+            visible_texts.extend((activity.get("label", ""), activity.get("summary", "")))
+    assert all("library.search" not in text for text in visible_texts)
+    assert any(activity.get("method") == "library.search"
+               for message in public_messages for activity in message.get("activities", []))
     assert "_recovery_tracked" not in encode([dict(event.payload) for event in events])
 
 

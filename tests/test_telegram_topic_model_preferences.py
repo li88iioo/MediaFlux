@@ -282,7 +282,7 @@ class TelegramTopicAndModelPreferenceTests(unittest.TestCase):
             return {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
 
         setattr(provider_module, "normalize_provider_location", lambda base_url, **_kwargs: SimpleNamespace(
-            host="api.anthropic.com", models_url=base_url.rstrip("/") + "/models"
+            base_url=base_url.rstrip("/"), host="api.anthropic.com", models_url=base_url.rstrip("/") + "/models"
         ))
         setattr(provider_module, "resolve_protocol", resolve_protocol)
         setattr(provider_module, "provider_headers", provider_headers)
@@ -334,6 +334,7 @@ class TelegramTopicAndModelPreferenceTests(unittest.TestCase):
             header_calls, [("anthropic_messages", "test-key", False)]
         )
         self.assertEqual(client_instances[0].kwargs["timeout_seconds"], 12)
+        self.assertEqual(client_instances[0].kwargs["configured_origin"], "https://api.anthropic.com/v1")
         self.assertEqual(
             client_instances[0].get_calls[0][1]["x-api-key"], "test-key"
         )
