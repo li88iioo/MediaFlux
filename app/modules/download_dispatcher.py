@@ -1,12 +1,14 @@
 """统一下载请求分发与幂等控制。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import ipaddress
 import json
 import re
 import unicodedata
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, TypedDict
@@ -568,6 +570,7 @@ class _DispatchOptions(TypedDict, total=False):
     qb_task_id_hint: str
     rss_item_id: int
     log_path: str
+    check_cancelled: Callable[[], None]
 
 
 class _QBSubmissionOptions(TypedDict, total=False):
@@ -575,12 +578,14 @@ class _QBSubmissionOptions(TypedDict, total=False):
     category: str
     runtime_config: dict[str, Any]
     task_id_hint: str
+    check_cancelled: Callable[[], None]
 
 
 class _GuangYaSubmissionOptions(TypedDict, total=False):
     target_dir_id: str
     target_dir_name: str
     qb_runtime_config: dict[str, Any]
+    check_cancelled: Callable[[], None]
 
 
 def _qb_client_options(runtime_config: dict[str, Any] | None) -> dict[str, Any]:
@@ -892,6 +897,7 @@ def resubmit_download_request(
     rss_item_id: int | None = None,
     log_path: str | None = None,
     expected_fingerprint: str | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """安全重试指定目标；活动请求仅补投失败目标，其余创建历史 successor。"""
     if targets not in SUPPORTED_TARGETS:
@@ -920,6 +926,9 @@ def resubmit_download_request(
         }
 
     dispatch_kwargs: _DispatchOptions = {}
+    if check_cancelled is not None:
+        check_cancelled()
+        dispatch_kwargs["check_cancelled"] = check_cancelled
     if qb_save_path is not None:
         dispatch_kwargs["qb_save_path"] = qb_save_path
     if qb_category is not None:
@@ -1053,6 +1062,8 @@ def resubmit_download_request(
     from app.repositories.download_requests import DownloadRequestRetryFenceError
 
     try:
+        if check_cancelled is not None:
+            check_cancelled()
         created = create_request(
             item,
             str(source_row["chat_id"] or ""),
@@ -1144,6 +1155,7 @@ def dispatch_missing_targets(
     rss_item_id: int | None = None,
     log_path: str | None = None,
     prepared_input: DownloadInput | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """向已有资源请求补充尚未提交的后端，不重置已成功目标。"""
     if targets not in SUPPORTED_TARGETS:
@@ -1168,6 +1180,8 @@ def dispatch_missing_targets(
             return {"handled": True, "ok": False, "error": "种子内容与已受理下载不一致，未补充提交"}
         prepared_row = {**dict(row), "torrent_data": prepared_input.torrent_data,
                         "content_type": "application/x-bittorrent"}
+    if check_cancelled is not None:
+        check_cancelled()
     claimed = db.claim_download_request_targets(request_id, targets)
     if not claimed:
         return {"handled": False, "ok": False, "duplicate": True, "error": "该目标已提交或正在处理"}
@@ -1181,6 +1195,7 @@ def dispatch_missing_targets(
         qb_save_path=qb_save_path, qb_category=qb_category,
         qb_runtime_config=qb_runtime_config, qb_task_id_hint=qb_task_id_hint,
         rss_item_id=rss_item_id, log_path=log_path,
+        check_cancelled=check_cancelled,
     )
     return {"handled": True, "duplicate": False, **result}
 
@@ -1197,12 +1212,15 @@ def dispatch_request(
     qb_task_id_hint: str = "",
     rss_item_id: int | None = None,
     log_path: str | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     row = db.get_download_request(request_id)
     if not row:
         return {"ok": False, "error": "下载请求不存在"}
+    if check_cancelled is not None:
+        check_cancelled()
     if not db.claim_download_request(request_id, targets):
         return {"ok": False, "duplicate": True, "error": "该请求已提交或正在处理"}
 
@@ -1213,6 +1231,7 @@ def dispatch_request(
         qb_save_path=qb_save_path, qb_category=qb_category,
         qb_runtime_config=qb_runtime_config, qb_task_id_hint=qb_task_id_hint,
         rss_item_id=rss_item_id, log_path=log_path,
+        check_cancelled=check_cancelled,
     )
 
 
@@ -1228,6 +1247,7 @@ def _dispatch_claimed_targets(
     qb_task_id_hint: str = "",
     rss_item_id: int | None = None,
     log_path: str | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """第一提交、补投与 successor 共用目标级受理链，根状态由仓储原子归并。"""
     request_id = int(row["id"])
@@ -1259,10 +1279,26 @@ def _dispatch_claimed_targets(
     if not _QB_TORRENT_ID_RE.fullmatch(qb_identity):
         qb_identity = ""
     qb_lease = qb_submission_write_lease([qb_identity]) if qb_identity else qb_control_write_lease()
-    for source in claimed_targets:
+
+    def before_submission():
+        try:
+            if check_cancelled is not None:
+                check_cancelled()
+        except asyncio.CancelledError:
+            # 只由已知的发出前检查收尾；后端自身取消仍按原未知结果处理。
+            for name in claimed_targets[index:]:
+                db.finalize_download_request_submission(request_id, (name,),
+                    **{("qb_status" if name == "qb" else "gy_status"): "failed"},
+                    error=f"{name}: 操作已取消，未提交下载后端")
+            raise
+
+    if check_cancelled is not None:
+        qb_options["check_cancelled"] = guangya_options["check_cancelled"] = before_submission
+    for index, source in enumerate(claimed_targets):
         # 远端任务从出现到身份落盘必须与用户移除串行；不能只保护 add，
         # 也不能为等待另一后端的回执长期占用 qB 控制 writer。
         with qb_lease if source == "qb" else nullcontext():
+            before_submission()
             try:
                 result: dict[str, Any] = submissions[source]()
                 if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
@@ -1645,6 +1681,7 @@ def _submit_qb(
     category: str | None = None,
     runtime_config: dict[str, Any] | None = None,
     task_id_hint: str = "",
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     runtime = runtime_config if isinstance(runtime_config, dict) else None
     options = _qb_client_options(runtime)
@@ -1671,6 +1708,8 @@ def _submit_qb(
     if not torrents and public_title is not None:
         urls = augment_public_magnet(urls, public_title)
     try:
+        if check_cancelled is not None:
+            check_cancelled()
         result = client.add_torrent_detailed(
             urls=urls,
             save_path=resolved_save_path,
@@ -1709,6 +1748,7 @@ def _submit_qb(
 def _submit_guangya(
     row, *, target_dir_id: str = "", target_dir_name: str = "",
     qb_runtime_config: dict[str, Any] | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     from app.modules.organize_sources import list_nsfw_download_sources
 
@@ -1737,6 +1777,8 @@ def _submit_guangya(
             display_title=str(row["display_title"] or ""),
         ), "guangya")
         torrent_data = item.torrent_data
+        if check_cancelled is not None:
+            check_cancelled()
         if torrent_data is not None:
             from app.repositories.download_requests import (
                 bind_verified_torrent_identity,
@@ -1764,6 +1806,8 @@ def _submit_guangya(
         ):
             raise RuntimeError("下载请求已失效，拒绝绑定隔离目录")
 
+    if check_cancelled is not None:
+        check_cancelled()
     result = submit_offline(
         str(row["source_value"] or ""),
         title=str(row["title"] or ""),

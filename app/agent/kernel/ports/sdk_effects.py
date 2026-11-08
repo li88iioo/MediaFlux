@@ -809,6 +809,7 @@ def resource_download_tool() -> KernelToolSpec:
                     service, arguments["result_ids"], arguments["target"],
                     expected_snapshot=snapshot, origin_namespace="agent", scope="agent",
                     verification_targets=verifications or None, verification_owner=context.owner if verifications else "",
+                    check_cancelled=context.cancellation.raise_if_cancelled,
                 ))
         except downloads.DownloadSnapshotChanged as exc:
             error = ToolPipelineError(exc.public_message, code=exc.code)
@@ -941,7 +942,7 @@ def download_submit_tool() -> KernelToolSpec:
                     raise downloads.DownloadSnapshotChanged()
                 context.cancellation.raise_if_cancelled()
                 public = downloads.submit_download_url(arguments["url"], arguments["target"], origin="agent",
-                                                        expected_snapshot=snapshot)
+                    expected_snapshot=snapshot, check_cancelled=context.cancellation.raise_if_cancelled)
         except (AgentRuntimeDisabled, RuntimeFenceError, downloads.DownloadSnapshotChanged) as exc:
             if isinstance(exc, (AgentRuntimeDisabled, RuntimeFenceError)):
                 message, code = "Media Agent 授权或运行状态已变化", "agent_disabled"
@@ -990,6 +991,7 @@ def download_retry_tool() -> KernelToolSpec:
                 result = download_dispatcher.resubmit_download_request(
                     arguments["request_id"], arguments["target"], origin="agent",
                     expected_fingerprint=expected_snapshot[len(prefix):],
+                    check_cancelled=context.cancellation.raise_if_cancelled,
                 )
         except (AgentRuntimeDisabled, RuntimeFenceError, download_dispatcher.DownloadRetryChanged) as exc:
             code = "confirmation_stale" if isinstance(exc, download_dispatcher.DownloadRetryChanged) else "agent_disabled"

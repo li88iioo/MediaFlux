@@ -6,7 +6,7 @@ import copy
 import sqlite3
 import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -487,6 +487,175 @@ class BatchConvergenceTests(unittest.TestCase):
             asyncio.run(check())
         backend.assert_not_called()
         self.assertEqual(self.request_count(), 0)
+
+
+    def test_cancel_signal_stops_limiter_queue_and_keeps_started_receipt(self):
+        cancelled = threading.Event()
+
+        def check_cancelled():
+            if cancelled.is_set():
+                raise asyncio.CancelledError
+
+        async def resolve(result_id, *, scope):
+            return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + ("a" if result_id == FIRST else "b") * 40)
+
+        def submit(row, **kwargs):
+            cancelled.set()
+            return {"ok": True, "task_id": "a" * 40}
+
+        service = self.service(resolve)
+        with patch.object(downloads, "_DOWNLOAD_LIMIT", 1), \
+             patch.object(dispatcher, "_submit_qb", side_effect=submit) as backend:
+            with self.assertRaises(asyncio.CancelledError):
+                self.submit(service, [FIRST, ALIAS], "qb", check_cancelled=check_cancelled)
+            self.assertEqual(backend.call_count, 1)
+            self.assertEqual(self.request_count(), 1)
+            repeated = self.submit(service, [FIRST], "qb")
+        self.assertEqual(backend.call_count, 1)
+        self.assertEqual(repeated["items"][0]["existing_status"], "submitted")
+        row = db.get_download_request(repeated["items"][0]["request_id"])
+        assert row is not None
+        self.assertEqual(row["qb_task_id"], "a" * 40)
+
+    def test_cancel_between_backends_keeps_settled_or_unknown_first_receipt(self):
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                cancelled = threading.Event()
+
+                def check_cancelled():
+                    if cancelled.is_set():
+                        raise asyncio.CancelledError
+
+                async def resolve(result_id, *, scope):
+                    return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + ("c" if unknown else "d") * 40)
+
+                def submit(row, **kwargs):
+                    cancelled.set()
+                    return {"ok": not unknown, "task_id": ("c" if unknown else "d") * 40,
+                            "failure_code": "qb_outcome_unknown" if unknown else ""}
+
+                with patch.object(dispatcher, "_submit_qb", side_effect=submit) as qb, \
+                     patch.object(dispatcher, "_submit_guangya") as gy:
+                    with self.assertRaises(asyncio.CancelledError):
+                        self.submit(self.service(resolve), [FIRST], "both", check_cancelled=check_cancelled)
+                qb.assert_called_once()
+                gy.assert_not_called()
+                row = db.get_download_request(qb.call_args.args[0]["id"])
+                assert row is not None
+                self.assertEqual(row["qb_status"], "outcome_unknown" if unknown else "submitted")
+                self.assertEqual(row["qb_task_id"], ("c" if unknown else "d") * 40)
+                self.assertEqual(row["gy_status"], "failed")
+                self.assertEqual(row["status"], "submitted")
+                self.assertIn("未提交下载后端", row["error"])
+
+    def test_cancel_after_input_preparation_never_creates_request(self):
+        cancelled = False
+
+        def check_cancelled():
+            if cancelled:
+                raise asyncio.CancelledError
+
+        original = downloads.prepare_download_input
+        def prepare(*args, **kwargs):
+            nonlocal cancelled
+            item = original(*args, **kwargs)
+            cancelled = True
+            return item
+
+        async def resolve(result_id, *, scope):
+            return ResolvedDownload("magnet", MAGNET)
+
+        with patch.object(downloads, "prepare_download_input", side_effect=prepare), \
+             patch.object(dispatcher, "_submit_qb") as backend:
+            with self.assertRaises(asyncio.CancelledError):
+                self.submit(self.service(resolve), [FIRST], "qb", check_cancelled=check_cancelled)
+        backend.assert_not_called()
+        self.assertEqual(self.request_count(), 0)
+
+    def test_cancel_after_create_cancels_only_owned_pending_request(self):
+        for entry in ("resources", "url"):
+            for existing in (False, True):
+                with self.subTest(entry=entry, existing=existing):
+                    cancelled = False
+                    magnet = "magnet:?xt=urn:btih:" + str(1 + 2 * (entry == "url") + existing) * 40
+                    if existing:
+                        dispatcher.create_request(dispatcher.normalize_download_url(magnet), "", "", origin="other")
+
+                    def check_cancelled():
+                        if cancelled:
+                            raise asyncio.CancelledError
+
+                    name = "_existing_download_request" if entry == "resources" and existing else "create_request"
+                    original = getattr(downloads, name)
+
+                    def created(*args, **kwargs):
+                        nonlocal cancelled
+                        result = original(*args, **kwargs)
+                        cancelled = True
+                        return result
+
+                    async def resolve(result_id, *, scope):
+                        return ResolvedDownload("magnet", magnet)
+
+                    with patch.object(downloads, name, side_effect=created), \
+                         patch.object(dispatcher, "_submit_qb") as backend:
+                        with self.assertRaises(asyncio.CancelledError):
+                            if entry == "resources":
+                                self.submit(self.service(resolve), [FIRST], "qb", check_cancelled=check_cancelled)
+                            else:
+                                downloads.submit_download_url(magnet, "qb", origin="agent", check_cancelled=check_cancelled)
+                    backend.assert_not_called()
+                    with closing(sqlite3.connect(self.db_path)) as connection:
+                        status = connection.execute("SELECT status FROM download_requests WHERE source_value=?", (magnet,)).fetchone()[0]
+                    self.assertEqual(status, "pending" if existing else "cancelled")
+
+    def test_backend_cancellation_does_not_become_retryable_pre_submission_failure(self):
+        async def resolve(result_id, *, scope):
+            return ResolvedDownload("magnet", MAGNET)
+
+        with patch.object(dispatcher, "_submit_qb", side_effect=asyncio.CancelledError) as backend:
+            with self.assertRaises(asyncio.CancelledError):
+                self.submit(self.service(resolve), [FIRST], "qb", check_cancelled=lambda: None)
+        row = db.get_download_request(backend.call_args.args[0]["id"])
+        assert row is not None
+        self.assertEqual(row["status"], "submitting")
+        self.assertEqual(row["qb_status"], "submitting")
+
+    def test_cancel_after_backend_preparation_releases_unissued_claim(self):
+        for target in ("qb", "guangya"):
+            with self.subTest(target=target):
+                cancelled = False
+
+                def check_cancelled():
+                    if cancelled:
+                        raise asyncio.CancelledError
+
+                @contextmanager
+                def writer(*args):
+                    nonlocal cancelled
+                    cancelled = True
+                    yield
+
+                def recover(*args, **kwargs):
+                    nonlocal cancelled
+                    cancelled = True
+                    return None
+
+                async def resolve(result_id, *, scope):
+                    return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + ("e" if target == "qb" else "f") * 40)
+
+                with patch.object(dispatcher, "qb_submission_write_lease", side_effect=writer), \
+                     patch.object(dispatcher, "_recover_guangya_magnet_torrent", side_effect=recover), \
+                     patch.object(dispatcher, "_submit_qb") as qb, \
+                     patch.object(dispatcher, "submit_offline") as gy:
+                    with self.assertRaises(asyncio.CancelledError):
+                        self.submit(self.service(resolve), [FIRST], target, check_cancelled=check_cancelled)
+                qb.assert_not_called()
+                gy.assert_not_called()
+                with closing(sqlite3.connect(self.db_path)) as connection:
+                    row = connection.execute("SELECT status,qb_status,gy_status FROM download_requests ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual(row[0], "failed")
+                self.assertEqual(row[1 if target == "qb" else 2], "failed")
 
 
 if __name__ == "__main__":

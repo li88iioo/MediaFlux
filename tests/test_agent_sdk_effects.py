@@ -6,6 +6,7 @@ from app.agent.kernel.ports.sdk_effects import cloud_organize_tools
 import asyncio
 import json
 import os
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -41,6 +42,8 @@ from tests.support import initialized_web_runtime, isolated_test_database
 
 @pytest.fixture
 def resources_backend(monkeypatch):
+    from app.indexers.downloads import submit_indexer_download_batch
+
     monkeypatch.setenv("INDEXER_SEARCH_ENABLED", "true")
     service = IndexerService(
         registry=IndexerRegistry({site: NyaaAdapter(
@@ -67,6 +70,7 @@ def resources_backend(monkeypatch):
               name: True for name in ("qb", "guangya") if target in (name, "both")}),
           patch("app.indexers.downloads.submit_indexer_download_batch", new=AsyncMock(side_effect=submit)) as backend):
         backend.service = service
+        backend.original_submit = submit_indexer_download_batch
         yield backend
 
 
@@ -513,6 +517,93 @@ def test_submit_revalidation_preserves_stale_error(resources_backend):
         assert error.value.code == "confirmation_stale"
         assert error.value.execution_started is False
         resources_backend.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+def test_native_download_cancellation_during_resolution_never_submits(resources_backend, monkeypatch):
+    from app import database as db
+    from app.indexers import downloads
+    from app.modules import download_dispatcher
+
+    monkeypatch.setenv("QB_URL", "http://qb.invalid")
+
+    async def check():
+        store = SQLiteKernelStore()
+        context = await context_for(store)
+        effects = executor(store)
+        service = resources_backend.service
+        entered, release = threading.Event(), threading.Event()
+        original = service.resolve
+
+        async def resolve(*args, **kwargs):
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+            return await original(*args, **kwargs)
+
+        with patch.object(downloads, "submit_indexer_download_batch", new=resources_backend.original_submit), \
+             patch.object(service, "resolve", new=resolve), \
+             patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True}) as backend, \
+             patch("socket.socket.connect", side_effect=AssertionError("禁止外联")):
+            plan = (await effects.prepare("resources.download", {
+                "result_ids": ["candidate-000000000001"], "target": "qb",
+            }, context=context)).effect_plan
+            assert plan is not None
+            task = asyncio.create_task(effects.execute_confirmed(plan.plan_id, context=context))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                backend.assert_not_called()
+                context.cancellation.cancel()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 5)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+            backend.assert_not_called()
+            with db.get_conn() as conn:
+                assert conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0] == 0
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("method", ["downloads.submit", "downloads.retry"])
+def test_native_download_cancel_during_shared_preflight_never_writes(retry_backend, method):
+    from app import database as db
+    from app.indexers import downloads
+    from app.modules import download_dispatcher
+
+    async def check():
+        store = SQLiteKernelStore()
+        context = await context_for(store)
+        effects = executor(store)
+        arguments = ({"url": "magnet:?xt=urn:btih:" + "d" * 40, "target": "qb"}
+                     if method == "downloads.submit" else {"request_id": retry_backend.request_id, "target": "qb"})
+        plan = (await effects.prepare(method, arguments, context=context)).effect_plan
+        assert plan is not None
+        target, name = ((downloads, "preview_download_url") if method == "downloads.submit"
+                        else (download_dispatcher, "_download_retry_snapshot"))
+        original = getattr(target, name)
+        calls = 0
+
+        def cancelled_preflight(*args, **kwargs):
+            nonlocal calls
+            result = original(*args, **kwargs)
+            calls += 1
+            # URL 的第二次复验位于共享提交服务，已越过 SDK 外层取消检查。
+            if method == "downloads.retry" or calls == 2:
+                context.cancellation.cancel()
+            return result
+
+        with patch.object(target, name, side_effect=cancelled_preflight):
+            with pytest.raises(asyncio.CancelledError):
+                await effects.execute_confirmed(plan.plan_id, context=context)
+        retry_backend.assert_not_called()
+        with db.get_conn() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0] == 1
+        row = db.get_download_request(retry_backend.request_id)
+        assert row is not None and row["qb_status"] == "failed"
 
     asyncio.run(check())
 

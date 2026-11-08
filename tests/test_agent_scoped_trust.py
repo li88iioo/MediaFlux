@@ -323,7 +323,7 @@ def test_automatic_confirmation_retention_keeps_user_and_receipt_identity(rig, n
         context = await rig.context()
         await rig.grant(context, await rig.preview(context))
         request = "把另一部电视剧也加入探索收藏"
-        rows = [row for index in range(17) for row in (
+        rows: list[dict[str, Any]] = [row for index in range(17) for row in (
             {"role": "user", "content": f"旧请求{index}:" + "字" * 3100,
              "history_id": f"old-{index}", "history_order": index},
             {"role": "assistant", "content": "已记录"},

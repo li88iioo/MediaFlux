@@ -9,6 +9,7 @@ import asyncio
 import threading
 import weakref
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any, TypedDict
@@ -506,8 +507,12 @@ def _persist_and_dispatch(
     log_path: str | None = None,
     verification_targets: list[dict] | None = None,
     verification_owner: str = "",
+    check_cancelled: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, Any]]:
     dispatch_kwargs: dict[str, Any] = {}
+    if check_cancelled is not None:
+        check_cancelled()
+        dispatch_kwargs["check_cancelled"] = check_cancelled
     if gy_target_dir:
         dispatch_kwargs["gy_target_dir"] = gy_target_dir
     if gy_target_name:
@@ -526,6 +531,8 @@ def _persist_and_dispatch(
         dispatch_kwargs["log_path"] = log_path
 
     item = prepare_download_input(item, target)
+    if check_cancelled is not None:
+        check_cancelled()
     keys = request_keys(item)
     if rss_entry_id is not None:
         from app.repositories.rss import bind_rss_entry_download
@@ -610,6 +617,8 @@ def _persist_and_dispatch(
                 "created": False,
             }, existing_id, _duplicate_dispatch_result(existing, target)
     if created is None:
+        if check_cancelled is not None:
+            check_cancelled()
         request_options: _RequestOptions = {"admission_id": admission_id} if admission_id is not None else {}
         if verification_targets:
             request_options.update(verification_targets=verification_targets, verification_owner=verification_owner)
@@ -637,6 +646,10 @@ def _persist_and_dispatch(
             dispatch_target,
             **dispatch_kwargs,
         )
+    except asyncio.CancelledError:
+        if created.get("created"):
+            db.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
+        raise
     except Exception as exc:
         # 只将仍持有认领、受理未知的目标转人工核验；已收尾/已取消的
         # 同伴不能因后续目标落盘失败而被覆盖，准入仍沿同一收尾事务同步。
@@ -706,6 +719,7 @@ def submit_download_input(
     log_path: str | None = None,
     verification_targets: list[dict] | None = None,
     verification_owner: str = "",
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """持久化并分发一个已规范化下载输入。
 
@@ -735,6 +749,7 @@ def submit_download_input(
         log_path=log_path,
         verification_targets=verification_targets,
         verification_owner=verification_owner,
+        check_cancelled=check_cancelled,
     )
     return {
         "request_id": request_id,
@@ -773,14 +788,23 @@ def preview_download_url(url: str, target: str) -> tuple[dict, dict]:
 
 
 def submit_download_url(url: str, target: str, *, origin: str,
-                        expected_snapshot: dict | None = None) -> dict:
+                        expected_snapshot: dict | None = None,
+                        check_cancelled: Callable[[], None] | None = None) -> dict:
     """直接链接只准入首次提交；已有活跃请求不会隐式补投失败后端。"""
     preview, snapshot = preview_download_url(url, target)
     if expected_snapshot is not None and snapshot != expected_snapshot:
         raise DownloadSnapshotChanged()
+    if check_cancelled is not None:
+        check_cancelled()
     created = create_request(normalize_download_url(url), "", "", origin=origin)
     request_id = int(created["id"])
-    summary = public_dispatch_summary(dispatch_request(request_id, target))
+    try:
+        dispatch = dispatch_request(request_id, target, check_cancelled=check_cancelled)
+    except asyncio.CancelledError:
+        if created["created"]:
+            db.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
+        raise
+    summary = public_dispatch_summary(dispatch)
     message = {
         "submitted": "已提交", "partial": "仅部分目标已提交", "duplicate": "未完成提交",
         "manual_review": "受理结果待核对",
@@ -798,10 +822,17 @@ class _ResolvedIndexerDownload:
 
 
 async def _resolve_indexer_download(service, result_id: str, target: str, *, scope: str,
-                                    expected_snapshot: dict | None) -> _ResolvedIndexerDownload:
+                                    expected_snapshot: dict | None,
+                                    check_cancelled: Callable[[], None] | None = None) -> _ResolvedIndexerDownload:
     """只读解析成规范下载输入并复验冻结事实；不创建请求或提交后端。"""
+    if check_cancelled is not None:
+        check_cancelled()
     stored, resolved = await _resolve(service, result_id, scope=scope)
+    if check_cancelled is not None:
+        check_cancelled()
     item = await _resolved_download_input(service, stored, resolved)
+    if check_cancelled is not None:
+        check_cancelled()
     # 解析可能等待网络；在远端写入之前复验一次，随后只使用这份目录事实。
     snapshot = preflight_indexer_download(service, result_id, target, scope=scope)
     if expected_snapshot is not None and snapshot != expected_snapshot:
@@ -817,7 +848,11 @@ async def _resolve_indexer_download(service, result_id: str, target: str, *, sco
 
 
 async def _submit_indexer_download(service, resolved: _ResolvedIndexerDownload, *,
-                                   scope: str, origin_namespace: str, **options) -> dict[str, Any]:
+                                   scope: str, origin_namespace: str,
+                                   check_cancelled: Callable[[], None] | None = None, **options) -> dict[str, Any]:
+    if check_cancelled is not None:
+        check_cancelled()
+        options["check_cancelled"] = check_cancelled
     snapshot = resolved.snapshot
     target = snapshot["target"]
     if preflight_indexer_download(service, snapshot["result_id"], target, scope=scope) != snapshot:
@@ -921,9 +956,10 @@ async def download_indexer_result(
             if not _public_errors:
                 raise
             return {**_indexer_download_error(result_id, normalized_target, exc), "pre_submission_failure": True}
+        admission_options: _RequestOptions = {"admission_id": admission_id} if admission_id is not None else {}
         response = await _submit_indexer_download(service, resolved, scope=scope, origin_namespace=namespace,
             chat_id=chat_id, user_id=user_id, message_id=message_id,
-            **({"admission_id": admission_id} if admission_id is not None else {}),
+            **admission_options,
             verification_targets=verification_targets, verification_owner=verification_owner)
     if verification_targets:
         _attach_download_verification([response], verification_owner)
@@ -1017,12 +1053,15 @@ async def submit_indexer_download_batch(
     origin_namespace: str = "indexer", scope: str = "manual",
     verification_targets: dict[str, list[dict]] | None = None,
     verification_owner: str = "",
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """复验整批冻结事实后逐项提交；复用下载限流与幂等，不回滚或重投。
 
     返回有序逐项回执和批量计数；accepted 仅代表受理，不代表下载完成。
     取消继续向调用方传播，已经开始的后端提交仍以原下载请求回执为准。
     """
+    if check_cancelled is not None:
+        check_cancelled()
     snapshot = preflight_indexer_download_batch(service, result_ids, target, scope=scope)
     if snapshot != expected_snapshot:
         raise DownloadSnapshotChanged(public_message="资源集合或下载配置已变化，请重新预检")
@@ -1038,7 +1077,7 @@ async def submit_indexer_download_batch(
     async def resolve(item):
         async with _download_limiter():
             return await _resolve_indexer_download(service, item["result_id"], target,
-                scope=scope, expected_snapshot=item)
+                scope=scope, expected_snapshot=item, check_cancelled=check_cancelled)
 
     resolved = await asyncio.gather(*(resolve(item) for item in snapshot["resources"]), return_exceptions=True)
     groups: list[tuple[set[str], list[int]]] = []
@@ -1085,6 +1124,7 @@ async def submit_indexer_download_batch(
             try:
                 return await _submit_indexer_download(service, value, scope=scope, origin_namespace=namespace,
                     verification_targets=goals.get(index), verification_owner=verification_owner,
+                    check_cancelled=check_cancelled,
                     chat_id=route.chat_id if route else "")
             except Exception as exc:
                 return _indexer_download_error(result_id, target, exc)
