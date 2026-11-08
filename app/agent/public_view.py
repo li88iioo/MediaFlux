@@ -292,6 +292,10 @@ def format_public_result(
         target = _safe(data.get("target"), limit=40).lower()
         if target:
             lines.append(f"- 目标：{_TARGET_LABELS.get(target, target)}")
+        if data.get("source_type") == "direct_url":
+            title = _safe(data.get("title"), limit=240)
+            if title and title not in summary:
+                lines.append(f"- 文件：{title}")
         for key, label in _COUNT_FIELDS:
             if key == "total" and operation_item_lines is not None:
                 continue

@@ -14,6 +14,7 @@ from app.sensitive_data import redact_sensitive_text
 from app.agent.public_safety import sanitize_public_text
 from app.modules.media_automation_rules import notification_route_settings
 from app.repositories import media_automation_rules as rules
+from app.repositories.download_requests import download_display_title, download_request_public_summary
 from app.repositories.agent_jobs import agent_job_owner_digest
 
 _TABLES = {
@@ -139,13 +140,15 @@ def search_page(query: str = "", limit: int = 50, offset: int = 0) -> dict[str, 
     selections = []
     params: list[object] = []
     for rank, (kind, table) in enumerate(_TABLES.items()):
+        title = "COALESCE(NULLIF(display_title,''),title)" if kind == "download" else "title"
         # 表名和类型只取本模块常量；instr 保留 %/_ 的文字包含语义。
         selections.append(
             f"SELECT '{kind}' AS kind,{rank} AS kind_rank,"
-            f"id,title,status,created_at,updated_at FROM {table} "
-            "WHERE (?='' OR instr(lower(title),lower(?))>0)"
+            f"id,{title} AS title,status,created_at,updated_at FROM {table} "
+            "WHERE (?='' OR instr(lower(title),lower(?))>0"
+            + (" OR instr(lower(display_title),lower(?))>0)" if kind == "download" else ")")
         )
-        params.extend((query, query))
+        params.extend((query, query, query) if kind == "download" else (query, query))
     params.extend((limit, offset))
     order = "COALESCE(NULLIF(updated_at,''),created_at) DESC,id DESC,kind_rank ASC"
     with db.get_conn() as conn:
@@ -369,6 +372,7 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
                     progress=max(0.0, min(100.0, float(progress)))
                     if isinstance(progress, (int, float))
                     else None,
+                    task_bound=bool(row.get("qb_task_id" if backend == "qb" else "gy_task_id")),
                 )
             )
         for name, prefix in (("光鸭整理", "organize"), ("STRM", "strm")):
@@ -536,7 +540,8 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
         "message": explanation,
         "error": "",
         "data": {
-            "title": public_text(row.get("title"), 120),
+            "title": public_text(download_display_title(row) if kind == "download" else row.get("title"), 120),
+            **({"request": download_request_public_summary(row)} if kind == "download" else {}),
             "kind": kind,
             "stages": stages,
             "explanation": explanation,

@@ -158,7 +158,7 @@ def test_direct_submission_receipt_matches_real_dispatch(
             store = SQLiteKernelStore()
             context = await context_for(store, owner="owner-a", session="direct-receipt")
             effects = executor(store)
-            arguments = {"url": _MAGNET, "target": "both"}
+            arguments = {"url": _MAGNET + "&dn=Fixture.S01E02.mp4", "target": "both"}
             prepared = await effects.prepare("downloads.submit", arguments, context=context)
             plan = prepared.effect_plan
             assert plan is not None and plan.preview["data"]["backends"] == {"qb": True, "guangya": True}
@@ -182,6 +182,10 @@ def test_direct_submission_receipt_matches_real_dispatch(
         first, result = pair
         request_number = result.data["request_id"]
         assert request_number == first.data["request_id"]
+        assert result.data["title"] == "Fixture.S01E02.mp4"
+        assert "Fixture.S01E02.mp4" in format_public_result({
+            "ok": result.ok, "status": result.status, "summary": result.summary, "data": result.data,
+        })
         assert result.data["created"] is (not repeat)
         assert result.data["duplicate"] is repeat
         qb.assert_called_once()

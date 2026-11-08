@@ -247,6 +247,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
             set(result["data"]),
             {
                 "title",
+                "request",
                 "kind",
                 "stages",
                 "explanation",

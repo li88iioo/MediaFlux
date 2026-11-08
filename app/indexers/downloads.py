@@ -811,6 +811,7 @@ def submit_download_url(url: str, target: str, *, origin: str,
     }.get(summary["status"], "未完成提交")
     return {**summary, "request_id": request_id, "created": bool(created["created"]),
             "target": target, "kind": preview["kind"], "source_type": "direct_url",
+            "title": preview["title"],
             "summary": f"下载请求 #{request_id} {message}"}
 
 

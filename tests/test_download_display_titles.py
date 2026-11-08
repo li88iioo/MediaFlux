@@ -383,6 +383,32 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         # 原生 Agent 读取入口沿同一展示投影，不能恢复已退役的 actions。
         self.assertEqual(sdk.downloads.requests(scope="attention")["items"][0]["title"], "公开展示标题")
 
+    def test_timeline_tracks_bound_task_and_enriched_name_without_cloud_scan(self) -> None:
+        from app import sdk
+
+        request_id, _ = self._create_request()
+        db.update_download_request(request_id, status="submitted", targets="guangya",
+                                   gy_status="submitted", gy_task_id="bound-task")
+        before = sdk.activity.timeline("download", request_id)
+        self.assertEqual(before["data"]["title"], "磁力任务")
+        self.assertEqual(before["data"]["request"]["request_number"], request_id)
+        self.assertTrue(next(s for s in before["data"]["stages"] if s["stage"] == "光鸭下载")["task_bound"])
+
+        self._track_guangya(request_id, ["bound-task"], [
+            self._gy_task("unrelated-task", "不属于这次下载"),
+            self._gy_task("bound-task", "实际文件.S01E02.mp4"),
+        ])
+        after = sdk.activity.timeline("download", request_id)
+        self.assertEqual(after["data"]["title"], "实际文件.S01E02.mp4")
+        self.assertEqual(after["data"]["request"]["title"], after["data"]["title"])
+        self.assertTrue(after["data"]["request"]["created_at"])
+        self.assertEqual(after["data"]["freshness"], "persisted_snapshot")
+        self.assertNotIn("不属于这次下载", str(after))
+        self.assertEqual(sdk.activity.search("实际文件")["items"][0]["id"], request_id)
+        self.assertEqual(sdk.activity.search("实际文件")["items"][0]["title"], after["data"]["title"])
+        self.assertEqual(sdk.activity.search("磁力任务")["items"][0]["id"], request_id)
+        self.assertNotIn("source_value", after["data"]["request"])
+
 
 if __name__ == "__main__":
     unittest.main()

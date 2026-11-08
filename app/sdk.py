@@ -1418,7 +1418,14 @@ class Downloads:
 
     @staticmethod
     def requests(scope: str = "active", limit: int = 12, offset: int = 0) -> dict:
-        """分页查询 MF 本地请求，scope 为 active/attention/recent。request_number 是可传给 retry 的真实请求 ID；按 next_offset 续读。本查询不代表 qB 或光鸭全账户实时队列。"""
+        """分页查询 MF 本地请求，scope 为 active/attention/recent。
+
+        items 每项含 request_number、title（已补全的文件名）、targets（目标列表）、status、
+        qb_status/guangya_status、organize_status/strm_status、created_at/updated_at。
+        request_number 可传 retry 或 activity.timeline("download", request_number)；
+        已知提交回执 request_id 时直接查 timeline，不必遍历本列表。按 next_offset 续读。
+        本查询不代表 qB 或光鸭全账户实时队列。
+        """
         from app.repositories.download_requests import list_download_request_summaries
 
         return list_download_request_summaries(scope=scope, limit=limit, offset=offset)
@@ -1774,7 +1781,15 @@ class Activity:
 
     @staticmethod
     def timeline(kind: str, identifier: int) -> dict:
-        """按持久ID核对各阶段；kind为download/organize/local_media。downloads.submit回执的request_id、resources.download确认回执data.items中的request_id可直接传timeline("download", request_id)，不必搜索或匹配云盘列表。也可用activity.search返回的kind/id。状态来自持久记录，保留未复核范围；下载完成不等于入库。"""
+        """按持久ID核对各阶段；kind为download/organize/local_media。
+
+        downloads.submit 回执 request_id、resources.download 回执 data.items[].request_id
+        直接传 timeline("download", request_id)，无需搜索或匹配云盘列表。
+        返回 ok/status/message/data；data.title 是已补全的文件名，data.request 是下载请求摘要，
+        data.stages 是阶段列表（stage/status/task_bound/progress/updated_at/reason），不是 events。
+        下载阶段 task_bound=True 表示该请求已绑定后端任务；False 表示尚未记录关联，不证明后端没有任务。
+        data.gaps 标明未复核范围，freshness=persisted_snapshot；下载完成不等于媒体库已入库。
+        """
         from app.repositories.activity import timeline_snapshot
 
         return timeline_snapshot(kind, identifier)

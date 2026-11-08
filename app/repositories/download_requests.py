@@ -328,6 +328,7 @@ def download_request_public_summary(row: Any) -> dict[str, Any]:
         "local_import_status": _safe_request_status(row["local_import_status"] if "local_import_status" in row.keys() else ""),
         "strm_status": _safe_request_status(row["strm_status"]),
         "postprocess_issues": postprocess,
+        "created_at": str(row["created_at"] or "")[:32] if "created_at" in row.keys() else "",
         "updated_at": str(row["updated_at"] or "")[:32],
         "error": error,
     }
