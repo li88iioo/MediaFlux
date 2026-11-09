@@ -15,25 +15,27 @@ def legacy(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("CREATE TABLE download_requests(id INTEGER PRIMARY KEY)")
-    conn.execute("INSERT INTO download_requests VALUES(17)")
-    # Use the real parent/member definitions, changing only the historical CHECK contract.
-    schema = database_schema._SCHEMA
-    start = schema.index("CREATE TABLE IF NOT EXISTS agent_missing_media_workflows (")
-    end = (
-        schema.index(
-            ";",
-            schema.index(
-                "CREATE TABLE IF NOT EXISTS agent_missing_media_workflow_items (", start
-            ),
-        )
-        + 1
-    )
-    tables = schema[start:end].replace(
+    # 还原 v39 的旧来源约束及尚未增加分享重试计数的真实下载表。
+    schema = database_schema._SCHEMA.replace(
         "CHECK(source_tool = 'resources.search_missing')",
         "CHECK(source_tool IN ('library.search_missing_episode_resources','library.search_missing_season_resources'))",
     )
-    conn.executescript(tables)
+    conn.executescript(schema)
+    conn.execute("ALTER TABLE download_requests DROP COLUMN share_retry_count")
+    conn.executemany(
+        "INSERT INTO download_requests(id,request_key,kind,status,gy_status,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,'old-created','old-updated')",
+        [
+            (17, "legacy-magnet", "magnet", "pending", ""),
+            (18, "legacy-share-first", "guangya_share", "failed", "failed"),
+            (19, "legacy-share-retried", "guangya_share", "failed", "failed"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO download_log(source,request_id,status,created_at) "
+        "VALUES(?,?,'failed','old-created')",
+        [("qb", 17), ("guangya_share", 18), ("guangya_share", 19), ("guangya_share", 19)],
+    )
     for number, source in enumerate(
         (
             "library.search_missing_episode_resources",
@@ -89,6 +91,11 @@ def legacy(monkeypatch):
 
 
 def test_v39_upgrade_preserves_all_entities_and_foreign_keys(legacy):
+    assert "share_retry_count" not in {
+        row[1] for row in legacy.execute("PRAGMA table_info(download_requests)")
+    }
+    requests = [dict(r) for r in legacy.execute("SELECT * FROM download_requests ORDER BY id")]
+    logs = [tuple(r) for r in legacy.execute("SELECT * FROM download_log ORDER BY id")]
     parents = [
         dict(r)
         for r in legacy.execute(
@@ -102,7 +109,11 @@ def test_v39_upgrade_preserves_all_entities_and_foreign_keys(legacy):
         )
     ]
     assert db._prepare_schema_migration(legacy, database_existed=True) == 39
-    assert legacy.execute("PRAGMA user_version").fetchone()[0] == 40
+    assert legacy.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert [dict(r) for r in legacy.execute("SELECT * FROM download_requests ORDER BY id")] == [
+        {**r, "share_retry_count": {17: 0, 18: 0, 19: 1}[r["id"]]} for r in requests
+    ]
+    assert [tuple(r) for r in legacy.execute("SELECT * FROM download_log ORDER BY id")] == logs
     assert [
         dict(r)
         for r in legacy.execute(
@@ -121,6 +132,7 @@ def test_v39_upgrade_preserves_all_entities_and_foreign_keys(legacy):
         ).fetchone()[0]
         == 1000
     )
+    assert legacy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert not legacy.execute("PRAGMA foreign_key_check").fetchall()
     with pytest.raises(sqlite3.IntegrityError):
         legacy.execute(
@@ -129,6 +141,10 @@ def test_v39_upgrade_preserves_all_entities_and_foreign_keys(legacy):
     with pytest.raises(sqlite3.IntegrityError):
         legacy.execute(
             "UPDATE agent_missing_media_workflow_items SET workflow_id='missing-parent'"
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        legacy.execute(
+            "UPDATE agent_missing_media_workflow_items SET download_request_id=999"
         )
     legacy.execute(
         "DELETE FROM agent_missing_media_workflows WHERE workflow_id='workflow-1'"
@@ -148,24 +164,32 @@ def test_v39_upgrade_preserves_all_entities_and_foreign_keys(legacy):
     )
 
 
-def test_upgrade_chain_rolls_back_parent_child_source_and_version(legacy, monkeypatch):
+@pytest.mark.parametrize("migration_version", [39, 40])
+def test_upgrade_chain_rolls_back_parent_child_source_and_version(
+    legacy, monkeypatch, migration_version
+):
     before = {
         name: [tuple(r) for r in legacy.execute(f"SELECT * FROM {name}")]
         for name in (
+            "download_requests",
+            "download_log",
             "agent_missing_media_workflows",
             "agent_missing_media_workflow_items",
+            "sqlite_sequence",
         )
     }
-    migration = database_migrations._SCHEMA_MIGRATIONS[39]
+    request_columns = list(legacy.execute("PRAGMA table_info(download_requests)"))
+    migration = database_migrations._SCHEMA_MIGRATIONS[migration_version]
 
     def fail(conn):
         migration(conn)
         raise RuntimeError("interrupted upgrade")
 
-    monkeypatch.setitem(database_migrations._SCHEMA_MIGRATIONS, 39, fail)
+    monkeypatch.setitem(database_migrations._SCHEMA_MIGRATIONS, migration_version, fail)
     with pytest.raises(RuntimeError, match="interrupted upgrade"):
         db._prepare_schema_migration(legacy, database_existed=True)
     assert legacy.execute("PRAGMA user_version").fetchone()[0] == 39
+    assert list(legacy.execute("PRAGMA table_info(download_requests)")) == request_columns
     for name, rows in before.items():
         assert [tuple(r) for r in legacy.execute(f"SELECT * FROM {name}")] == rows
     assert not legacy.execute(
