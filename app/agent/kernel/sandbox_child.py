@@ -24,7 +24,9 @@ LIBC.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
 LIBC.prctl.restype = ctypes.c_int
 ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/work",
        "TMPDIR": "/tmp", "LANG": "C.UTF-8", "PYTHONPATH": "/opt/mf",
-       "PYTHONHOME": "/usr/local", "LD_LIBRARY_PATH": "/usr/local/lib"}
+       "PYTHONHOME": "/usr/local", "LD_LIBRARY_PATH": "/usr/local/lib",
+       # 避免每个线程的 malloc arena 预留耗尽 512 MiB 虚拟内存额度。
+       "MALLOC_ARENA_MAX": "2"}
 DENY = ("socket", "connect", "bind", "listen", "accept", "accept4", "sendmsg", "sendmmsg",
         "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd",
         "setsid", "setpgid", "unshare", "setns", "mount", "umount2", "pivot_root",

@@ -798,6 +798,32 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(archived["result"]["items"], list(range(80)))
         self.assertFalse((workspace / "run/mf-responses").exists())
 
+    async def test_threads_fit_memory_budget_without_relaxing_resource_limits(self):
+        result = await self.execute(textwrap.dedent('''
+            import resource, threading
+            from concurrent.futures import ThreadPoolExecutor
+
+            ready = threading.Barrier(16, timeout=5)
+            def worker(index):
+                blocks = [bytearray(2048) for _ in range(256)]
+                ready.wait()
+                return sum(map(len, blocks))
+
+            with ThreadPoolExecutor(16) as pool:
+                sizes = list(pool.map(worker, range(16)))
+            assert sizes == [512 * 1024] * 16
+            assert resource.getrlimit(resource.RLIMIT_AS) == (512 << 20, 512 << 20)
+            assert resource.getrlimit(resource.RLIMIT_NPROC) == (32, 32)
+            try:
+                oversized = bytearray(512 << 20)
+            except MemoryError:
+                print("16 workers completed; memory limit enforced")
+            else:
+                raise AssertionError("workspace memory limit was bypassed")
+        '''))
+        self.assertEqual(result["exit_code"], 0, result["stderr"])
+        self.assertEqual(result["stdout"].strip(), "16 workers completed; memory limit enforced")
+
     async def test_output_is_saved_completely_and_recoverable(self):
         body = "输出开始\n" + "正文" * 12000 + "\n尾部汇总：成功 3，失败 1\n"
         result = await self.execute(f'print({body!r}, end="")')
