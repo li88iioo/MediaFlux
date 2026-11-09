@@ -787,13 +787,15 @@ def test_read_methods_use_real_sdk_file_dispatch_and_business_services(tmp_path,
 
 @pytest.fixture
 def sdk_client(tmp_path, monkeypatch):
-    monkeypatch.setattr(sys, "modules", sys.modules.copy())
     client = Path(__file__).parents[1] / "app/agent/kernel/workspace_client.py"
     (tmp_path / "mf.py").write_text(client.read_text())
     (tmp_path / "mf-methods.json").write_text(json.dumps(sdk.describe_methods()))
     spec = importlib.util.spec_from_file_location("sdk_client_probe", tmp_path / "mf.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # 只恢复代理命名空间，不能回滚用例期间正常导入的应用模块。
+    for namespace in sdk.describe_namespaces():
+        monkeypatch.setitem(sys.modules, f"{spec.name}.{namespace}", module)
     spec.loader.exec_module(module)
     calls = []
     def request(name, arguments):
