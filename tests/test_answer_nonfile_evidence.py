@@ -47,8 +47,10 @@ def test_native_url_followup_explanation(unresolved, foreign):
         calls = [ModelToolCall("inspect", read.name, {})]
         if unresolved:
             calls.append(ModelToolCall("blocked", bad.name, {}))
+        cancellations = []
         class EvidenceModel(ScriptedModel):
             async def stream(self, request, *, cancellation):
+                cancellations.append(cancellation)
                 if len(self.requests) == 2:
                     wire = "\n".join(m.content for m in request.messages if m.role == "tool")
                     assert '"downloading"' in wire and '光鸭整理' in wire
@@ -71,7 +73,9 @@ def test_native_url_followup_explanation(unresolved, foreign):
             assert preview.approval is not None
             final = await consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id))
             create.assert_called_once()
-            dispatch.assert_called_once_with(42, "qb")
+            dispatch.assert_called_once_with(
+                42, "qb", check_cancelled=cancellations[-1].raise_if_cancelled
+            )
         assert len(reads) == 1 and len(model.requests) == 3
         cold = await SQLiteKernelStore(secret_provider=lambda: "a32-offline-fixture").load(owner="o", session_id="s")
         assert cold.conversation[-1]["content"] == final.answer

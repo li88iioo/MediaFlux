@@ -452,6 +452,10 @@ def test_native_resource_single_and_batch_freeze_owner_default_target(preference
         data = result.outcome.public_content["data"]
         assert [item["result_id"] for item in data["items"]] == ids
         assert all(item["target"] == "qb" for item in data["items"])
+        submit.assert_awaited_once_with(service, ids, "qb", expected_snapshot={"target": "qb", "resources": [
+            {"result_id": identity, "target": "qb"} for identity in ids]},
+            origin_namespace="agent", scope="agent", verification_targets=None, verification_owner="",
+            check_cancelled=context.cancellation.raise_if_cancelled)
     with patch("app.agent.kernel.ports.sdk_effects.get_indexer_service", return_value=service), \
          patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=_prepare_batch) as prepare, \
          patch("app.indexers.downloads.submit_indexer_download_batch", new=AsyncMock(return_value={
@@ -459,9 +463,6 @@ def test_native_resource_single_and_batch_freeze_owner_default_target(preference
             "items": [{"result_id": identity, "target": "qb", "request_id": 42, "status": "submitted"} for identity in ids],
          })) as submit:
         asyncio.run(check())
-        submit.assert_awaited_once_with(service, ids, "qb", expected_snapshot={"target": "qb", "resources": [
-            {"result_id": identity, "target": "qb"} for identity in ids]},
-            origin_namespace="agent", scope="agent", verification_targets=None, verification_owner="")
 
 
 def test_native_share_uses_configured_cloud_directory_despite_saved_qb_preference(download_environment):

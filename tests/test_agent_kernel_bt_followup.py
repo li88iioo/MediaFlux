@@ -29,10 +29,12 @@ from tests.test_agent_kernel_resource_ingest import (
 class SubmitTwoFromHistoryModel:
     def __init__(self):
         self.requests = []
+        self.cancellations = []
 
     async def stream(self, request, *, cancellation):
         cancellation.raise_if_cancelled()
         self.requests.append(request)
+        self.cancellations.append(cancellation)
         yield ModelEvent(
             ModelEventType.TOOL_CALL_COMPLETED,
             tool_call=ModelToolCall("batch-followup", "resources.download", _native_arguments(request, [3, 4])),
@@ -92,5 +94,6 @@ class AgentKernelBtFollowupTests(unittest.IsolatedAsyncioTestCase):
                     {"result_id": identity, "target": "guangya"}
                     for identity in ("fixture-resource-3", "fixture-resource-4")
                 ]}, verification_targets=None, verification_owner="",
+                check_cancelled=model.cancellations[-1].raise_if_cancelled,
             )
             self.assertTrue(any(event.type is AgentEventType.EFFECT_COMPLETED for event in confirmed))
