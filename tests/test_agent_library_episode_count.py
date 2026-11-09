@@ -396,6 +396,75 @@ def inspect_inventory(monkeypatch):
     return inspect
 
 
+@pytest.mark.parametrize("first_id, first_year, second_id, second_year", [
+    ("100", "2005", "200", "2001"),
+    ("100", "2005", "200", "2005"),
+    ("100", "", "200", ""),
+    ("", "2005", "", "2001"),
+    ("100", "2005", "", "2001"),
+])
+def test_cross_source_inventory_identity_conflict_is_ambiguous(first_id, first_year, second_id, second_year):
+    sources = []
+    for server, tmdb_id, year, episodes in (
+        ("jellyfin", first_id, first_year, [(1, 1), (1, 2)]),
+        ("emby", second_id, second_year, [(1, 1), (1, 3)]),
+    ):
+        client = Mock()
+        client.search_series_candidates.return_value = SeriesSearchResult(
+            candidates=[SeriesCandidate(f"private-{server}-series", "测试剧", year, tmdb_id)], total=1,
+        )
+        client.list_series_episode_inventory.return_value = SeriesEpisodeInventory(episodes=episodes, total=2)
+        sources.append((server, server, "", client))
+    with patch("app.services._configured_media_sources", return_value=sources):
+        result = library.episodes("测试剧")
+
+    assert not result["ok"] and result["status"] == result["error"] == "ambiguous"
+    data = result["data"]
+    assert data["local_episode_count"] is None and data["inventory_complete"] is False
+    assert data["matched_source_count"] == data["source_count"] == 2
+    assert data["candidates"] == [
+        {"name": "测试剧", "year": year, **({"tmdb_id": tmdb_id} if tmdb_id else {})}
+        for tmdb_id, year in ((first_id, first_year), (second_id, second_year))
+    ]
+    assert [(source["server_type"], source["tmdb_id"], source["year"], source["local_episode_count"])
+            for source in data["sources"]] == [
+        ("jellyfin", first_id, first_year, 2), ("emby", second_id, second_year, 2),
+    ]
+    assert "seasons" not in data and "本地收录" not in result["summary"]
+    assert "TMDB ID" in result["suggestions"][0] and "private-" not in repr(result)
+
+
+@pytest.mark.parametrize("first, second, expected_status", [
+    ({"name": "测试剧", "year": "2026", "tmdb_id": "123"},
+     {"name": "测试剧", "year": "2025", "tmdb_id": "123"}, "success"),
+    ({"name": "测试剧", "year": "2026", "tmdb_id": "123"},
+     {"name": "Another Title", "year": "", "tmdb_id": "123"}, "success"),
+    ({"name": "测试剧", "year": "2026", "tmdb_id": "123"},
+     {"name": "测试剧", "year": "2026"}, "success"),
+    ({"name": "测试剧", "year": "2026", "tmdb_id": "123"},
+     {"name": "测试剧", "year": ""}, "success"),
+    ({"name": "Ｔｅｓｔ·剧", "year": "2026"},
+     {"name": "test 剧", "year": ""}, "success"),
+    ({"name": "测试剧", "year": ""}, {"name": "测试剧", "year": None}, "success"),
+    ({"name": "测试剧", "year": "2026"},
+     {"name": "另一部剧", "year": "2026"}, "ambiguous"),
+])
+def test_cross_source_inventory_uses_provider_id_then_title_year(inspect_inventory, first, second, expected_status):
+    result = inspect_inventory([
+        inventory_source([(1, 1), (1, 2)], selected=first),
+        inventory_source([(1, 1), (1, 3)], selected=second, server_type="emby", server_name="Emby"),
+    ])
+    assert result["status"] == expected_status
+    if expected_status == "ambiguous":
+        assert not result["ok"] and result["data"]["local_episode_count"] is None
+        assert result["data"]["inventory_complete"] is False
+        assert [candidate["name"] for candidate in result["data"]["candidates"]] == [first["name"], second["name"]]
+    else:
+        assert result["ok"] and result["data"]["inventory_complete"] is True
+        assert result["data"]["local_episode_count"] == 3
+        assert result["data"]["seasons"][0]["episode_ranges"] == [[1, 3]]
+
+
 @pytest.mark.parametrize("inventories, expected", [
     ([[(1, 12), (1, 4), (1, 1), (1, 2), (1, 5), (1, 12), (1, 9), (1, 11)]],
      [(1, 7, [[1, 2], [4, 5], [9, 9], [11, 12]])]),

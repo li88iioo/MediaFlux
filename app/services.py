@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
-from itertools import groupby
+from itertools import combinations, groupby
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -1332,17 +1332,18 @@ def inspect_series_episode_sources(
 
 def _series_episode_candidates(sources: list[dict[str, Any]]) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for source in sources:
-        for candidate in source.get("candidates") or []:
+        for candidate in [source.get("selected"), *(source.get("candidates") or [])]:
             if not isinstance(candidate, dict):
                 continue
             name = str(candidate.get("name") or "").strip()
             year = str(candidate.get("year") or "").strip()
-            if not name or (name, year) in seen:
+            tmdb_id = str(candidate.get("tmdb_id") or "").strip()
+            if not name or (name, year, tmdb_id) in seen:
                 continue
-            seen.add((name, year))
-            candidates.append({"name": name, "year": year})
+            seen.add((name, year, tmdb_id))
+            candidates.append({"name": name, "year": year, **({"tmdb_id": tmdb_id} if tmdb_id else {})})
             if len(candidates) >= 8:
                 return candidates
     return candidates
@@ -1369,6 +1370,7 @@ def _series_episode_inventory(source: dict[str, Any]) -> tuple[dict[str, Any], s
         "status": str(source.get("status") or "unavailable"),
         "title": str(selected.get("name") or ""),
         "year": str(selected.get("year") or ""),
+        "tmdb_id": str(selected.get("tmdb_id") or "").strip(),
         "local_episode_count": len(episodes),
         "season_count": len({season for season, _episode in episodes}),
         "truncated": bool(source.get("truncated")),
@@ -1461,8 +1463,21 @@ def count_series_episodes(
     inventories = [_series_episode_inventory(source) for source in sources]
     safe_sources = [source for source, _episodes in inventories]
     matched = [(source, episodes) for source, episodes in inventories if source["status"] in found_statuses]
-    if not matched:
-        statuses = {str(source.get("status") or "unavailable") for source in sources}
+    identities = [
+        (source["tmdb_id"], _normalize_series_identity_title(source["title"]), source["year"].strip())
+        for source, _episodes in matched
+    ]
+    # 双方均有 Provider ID 时以 ID 为准；缺少 ID 才核对标题与双方已知年份。
+    identity_conflict = any(
+        left_id != right_id if left_id and right_id else (
+            (left_title and right_title and left_title != right_title)
+            or (left_year and right_year and left_year != right_year)
+        )
+        for (left_id, left_title, left_year), (right_id, right_title, right_year)
+        in combinations(identities, 2)
+    )
+    if not matched or identity_conflict:
+        statuses = {"ambiguous"} if identity_conflict else {source["status"] for source in safe_sources}
         candidates = _series_episode_candidates(sources)
         if statuses == {"library_not_found"}:
             summary = f"没有找到名为「{library_name}」的媒体库"
@@ -1496,7 +1511,7 @@ def count_series_episodes(
                 "library_name": library_name,
                 "local_episode_count": None,
                 "inventory_complete": False,
-                "matched_source_count": 0,
+                "matched_source_count": len(matched),
                 "source_count": len(sources),
                 "candidates": candidates,
                 "sources": safe_sources,
