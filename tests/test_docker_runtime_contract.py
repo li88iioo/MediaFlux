@@ -342,6 +342,8 @@ class DockerRuntimeContractTests(unittest.TestCase):
         }
         self.assertTrue(playwright_modules, "没有发现任何原生 Playwright 测试，不能空跑门禁")
         self.assertNotIn("needs", browser)
+        self.assertIn('python -m pip install "pytest==9.2.0"', browser_runs)
+        self.assertIn('version("pytest") == "9.2.0"', browser_runs)
         self.assertIn('python -m pip install "playwright==1.64.0"', browser_runs)
         self.assertIn('version("playwright") == "1.64.0"', browser_runs)
         for executable in (
