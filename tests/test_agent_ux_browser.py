@@ -166,6 +166,14 @@ class AgentUXBrowserTests(unittest.TestCase):
         assert match is not None
         return float(match[1])
 
+    def settled_message_box(self, locator):
+        # 入场平移中的坐标舍入会把 44px 高度测成 43.999992；等动画结束后严格验尺寸。
+        locator.evaluate("""async node => {
+            await Promise.all(node.closest('.agent-message').getAnimations()
+                .map(animation => animation.finished));
+        }""")
+        return locator.bounding_box()
+
     def snapshot(self, page, name: str):
         output = os.getenv('MEDIAFLUX_BROWSER_EVIDENCE_DIR')
         if output:
@@ -1050,7 +1058,7 @@ class AgentUXBrowserTests(unittest.TestCase):
                 summary = more.locator('summary')
                 summary_text = summary.inner_text()
                 self.assertIn('另有 12 项', summary_text)
-                summary_box = summary.bounding_box()
+                summary_box = self.settled_message_box(summary)
                 collapsed_box = card.bounding_box()
                 assert summary_box is not None
                 self.assertGreaterEqual(summary_box['height'], 44)
@@ -1688,7 +1696,7 @@ class AgentUXBrowserTests(unittest.TestCase):
                 for raw in ('agent.run_code', '工作区代码执行', 'RAW_ARGUMENTS', 'RAW_STDOUT', '退出码', 'PRIVATE_REASONING'):
                     self.assertNotIn(raw, transcript)
                 self.assertTrue(toggle.is_enabled())
-                toggle_box = toggle.bounding_box()
+                toggle_box = self.settled_message_box(toggle)
                 assert toggle_box is not None
                 self.assertGreaterEqual(toggle_box['height'], 44)
                 self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
