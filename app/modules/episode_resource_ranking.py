@@ -9,7 +9,7 @@ from datetime import date
 from typing import Any
 
 from app.indexers.models import IndexerMediaSearchRequest
-from app.indexers.ranking import match_media_title
+from app.indexers.ranking import rank_media_identity
 from app.indexers.release import parse_indexer_release_position
 from app.modules.episode_mapping import (
     classify_episode_position,
@@ -318,13 +318,16 @@ def _ranked_item(
     )
     identity_reasons = public.get("match_reasons")
     if media is not None:
-        _, kind = match_media_title(title, media=media, fallback_query=media.title)
-        identity_reasons = [kind]
-    identity_matches = identity_reasons is None or bool(
+        _, identity_reasons = rank_media_identity(title, media=media, fallback_query=media.title)
+    year_conflict = "year_conflict" in (identity_reasons or ())
+    identity_matches = not year_conflict and (identity_reasons is None or bool(
         {"title_exact", "title_contains"}.intersection(identity_reasons)
-    )
+    ))
     if not identity_matches:
-        match_warnings.insert(0, "作品名称未匹配目标，不能仅凭相同集号或高画质推荐")
+        match_warnings.insert(0, "资源年份与目标作品不一致，请核对是否为同名作品" if year_conflict else
+                              "作品名称未匹配目标，不能仅凭相同集号或高画质推荐")
+    elif identity_reasons and "year_unverified" in identity_reasons:
+        match_warnings.insert(0, "标题年份晚于剧集首播，可能是分季或发行年份，尚未核验")
     availability_score, downloadable, availability_reasons, availability_warnings = (
         _availability_score(public)
     )

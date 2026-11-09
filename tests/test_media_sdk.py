@@ -370,6 +370,31 @@ def test_resource_request_roundtrip_preserves_scope_and_filters():
         assert len(calls) == before
 
 
+def test_resource_rerank_recomputes_identity_for_the_current_request():
+    from app.indexers.models import IndexerMediaSearchRequest
+    from app.indexers.ranking import rank_item
+
+    request = IndexerMediaSearchRequest.create(title="Example Show", year=2026, media_type="tv", season=1, episode=1)
+    source = {"request": asdict(request), "items": [
+        rank_item(IndexerItem("nyaa", "Nyaa", f"Example Show {year} S01E02 {quality}",
+                              result_id=f"year-{year}-resource-001", download_state="ready",
+                              download_kinds=("magnet",), seeders=seeders),
+                  media=request, fallback_query=request.title).to_public_dict()
+        for year, quality, seeders in ((2026, "720p", 1), (2012, "2160p", 1000))
+    ]}
+    source = json.loads(json.dumps(source))
+    with patch("app.indexers.runtime.get_indexer_service", side_effect=AssertionError("重排不重新搜索")):
+        for year in (2026, 2012):
+            source["request"]["year"] = year
+            before = json.loads(json.dumps(source))
+            ranked = sdk.resources.rank_episode(source, 1, 2)
+            assert ranked["recommendation"]["selected"]["result_id"] == f"year-{year}-resource-001"
+            # 较晚年份可能是分季/发行年份；只有早于首播的年份构成确定冲突。
+            assert ranked["recommendation"]["matched_count"] == (1 if year == 2026 else 2)
+            assert ranked["items"][1]["quality"]["eligible"] is (year == 2012)
+            assert source == before
+
+
 @pytest.mark.parametrize("season,episode", [(-1, 2), (1, -3), (True, 2), (None, 2), (1, None), (1, 1001)])
 def test_resource_rerank_rejects_invalid_target_without_reporting_empty(season, episode):
     source = {"request": {"title": "Demo", "season": 1, "episode": 1},

@@ -41,19 +41,33 @@ class ResourceRecommendationTests(unittest.TestCase):
         from app.indexers.ranking import rank_item
 
         request = IndexerMediaSearchRequest.create(
-            title="目标剧", original_title="Target Show", media_type="tv", season=1, episode=2,
+            title="目标剧", original_title="Target Show", year=2026, media_type="tv", season=1, episode=2,
         )
         items = [
             IndexerItem("nyaa", "Nyaa", "Target Show S01E02 720p", result_id="right-show-000001",
                         download_state="ready", download_kinds=("magnet",), seeders=1),
             IndexerItem("nyaa", "Nyaa", "其他作品 S01E02 2160p", result_id="wrong-show-000001",
                         download_state="ready", download_kinds=("magnet",), seeders=1000),
+            IndexerItem("nyaa", "Nyaa", "Target Show 2012 S01E02 2160p", result_id="wrong-year-000001",
+                        download_state="ready", download_kinds=("magnet",), seeders=1000),
         ]
         public = [rank_item(item, media=request, fallback_query=request.title).to_public_dict() for item in items]
-        ranked = rank_episode_search({"items": public}, season=1, episode=2)
-        self.assertEqual(ranked["recommendation"]["selected"]["result_id"], "right-show-000001")
-        self.assertEqual(ranked["recommendation"]["candidate_count"], 1)
-        self.assertFalse(ranked["items"][1]["quality"]["eligible"])
+        original = copy.deepcopy(public)
+        for media in (None, request):
+            with self.subTest(recompute_identity=media is not None):
+                ranked = rank_episode_search({"items": public}, season=1, episode=2, media=media)
+                self.assertEqual(ranked["recommendation"]["selected"]["result_id"], "right-show-000001")
+                self.assertEqual(ranked["recommendation"]["candidate_count"], 1)
+                self.assertEqual(len(ranked["items"]), 3)
+                for item in ranked["items"][1:]:
+                    self.assertFalse(item["quality"]["eligible"])
+                    self.assertEqual(item["quality"]["confidence"], "low")
+                conflict = next(item for item in ranked["items"] if item["result_id"] == "wrong-year-000001")
+                self.assertTrue(any("年份" in warning for warning in conflict["quality"]["warnings"]))
+                only_conflict = rank_episode_search({"items": [public[2]]}, season=1, episode=2, media=media)
+                self.assertIsNone(only_conflict["recommendation"]["selected"])
+                self.assertEqual(only_conflict["download_plan"]["result_ids"], [])
+        self.assertEqual(public, original)
 
     def test_checksum_cannot_make_a_different_episode_recommended(self):
         item = _item("episode-12-with-checksum", "Show S04E12 [E5DA5D0E]")

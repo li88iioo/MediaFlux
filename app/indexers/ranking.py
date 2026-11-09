@@ -130,10 +130,10 @@ def _contains_evidence(raw_candidate: str, normalized_candidate: str, evidence: 
     return False
 
 
-def match_media_title(
+def rank_media_identity(
     title: str, *, media: IndexerMediaSearchRequest | None, fallback_query: str,
-) -> tuple[float, str]:
-    """搜索排序与缺集推荐复用同一作品名称/别名证据。"""
+) -> tuple[float, list[str]]:
+    """搜索排序与季集重排共用作品名称、别名和年份证据。"""
     candidate = _normalize(title)
     evidences = _evidence_values(media, fallback_query)
     best_ratio = 0.0
@@ -149,17 +149,6 @@ def match_media_title(
             ratio, kind = SequenceMatcher(None, evidence, candidate).ratio(), "title_similar"
         if ratio > best_ratio:
             best_ratio, best_kind = ratio, kind
-    return best_ratio, best_kind
-
-
-def rank_item(
-    item: IndexerItem,
-    *,
-    media: IndexerMediaSearchRequest | None,
-    fallback_query: str,
-    now: datetime | None = None,
-) -> IndexerItem:
-    best_ratio, best_kind = match_media_title(item.title, media=media, fallback_query=fallback_query)
     score = 0.0
     reasons: list[str] = []
     if best_kind == "title_exact":
@@ -176,14 +165,29 @@ def rank_item(
         reasons.append("title_weak")
 
     request_year = media.year if media is not None else None
-    year_text = _TECHNICAL_YEAR_VALUE.sub(" ", item.title)
+    year_text = _TECHNICAL_YEAR_VALUE.sub(" ", title)
     title_years = {int(value) for value in _YEAR.findall(year_text)}
     if request_year and request_year in title_years:
         score += 9
         reasons.append("year_match")
     elif request_year and title_years and request_year not in title_years:
         score -= 18
-        reasons.append("year_conflict")
+        # 剧集可跨年播出；晚于首播的分季/发行年份不是同名作品冲突的证明。
+        is_series = media is not None and (media.media_type == "tv" or (
+            not media.media_type and (media.season is not None or media.episode is not None)
+        ))
+        reasons.append("year_unverified" if is_series and min(title_years) > request_year else "year_conflict")
+    return score, reasons
+
+
+def rank_item(
+    item: IndexerItem,
+    *,
+    media: IndexerMediaSearchRequest | None,
+    fallback_query: str,
+    now: datetime | None = None,
+) -> IndexerItem:
+    score, reasons = rank_media_identity(item.title, media=media, fallback_query=fallback_query)
 
     if media is not None and (media.season is not None or media.episode is not None):
         position = parse_indexer_release_position(item.title, media_title=media.title)

@@ -26,6 +26,7 @@ def test_conflicting_search_hits_stay_in_frozen_scope_but_not_default_recommenda
     assert conflict["quality"]["match"] == "conflict" and not conflict["quality"]["eligible"]
     current = by_id[service.items[1].result_id]
     assert "year_conflict" in current["match_reasons"]
-    assert current["quality"]["match"] == "exact_episode" and current["quality"]["eligible"]
-    assert result["recommendation"]["selected"]["result_id"] in {service.items[1].result_id, service.items[2].result_id}
+    assert current["quality"]["match"] == "exact_episode" and not current["quality"]["eligible"]
+    assert result["recommendation"]["selected"]["result_id"] == service.items[2].result_id
+    assert result["recommendation"]["matched_count"] == 1
     assert result["partial"] and result["has_more"]

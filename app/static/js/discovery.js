@@ -47,6 +47,7 @@
         title_weak: '弱匹配',
         year_match: '年份一致',
         year_conflict: '年份冲突',
+        year_unverified: '分季或发行年份待核对',
         download_ready: '可直接下载',
         download_resolvable: '可解析下载',
         seeded: '有做种',

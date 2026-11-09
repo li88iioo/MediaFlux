@@ -147,6 +147,8 @@ class IndexerRankingTests(unittest.TestCase):
                 self.assertEqual(match_priority(candidate), expected)
 
     def test_year_extraction_ignores_marked_technical_values_only(self):
+        from app.modules.episode_resource_ranking import rank_episode_search
+
         media = IndexerMediaSearchRequest.create(title="起义", year=2026)
         cases = [
             ("起义.1920x1080.WEB-DL", False, False, 1),
@@ -167,6 +169,29 @@ class IndexerRankingTests(unittest.TestCase):
                 self.assertEqual("year_conflict" in ranked.match_reasons, has_conflict)
                 self.assertEqual("year_match" in ranked.match_reasons, has_match)
                 self.assertEqual(match_priority(ranked), expected_priority)
+                public = {**ranked.to_public_dict(), "result_id": "year-evidence-resource-001"}
+                recommendation = rank_episode_search({"items": [public]}, season=1, episode=1, media=media)
+                self.assertEqual(recommendation["items"][0]["quality"]["eligible"], not has_conflict)
+
+    def test_later_tv_release_year_is_not_a_proven_identity_conflict(self):
+        from app.modules.episode_resource_ranking import rank_episode_search
+
+        for media_type, season, release_year, eligible in (
+            ("tv", 2, 2012, True), ("tv", 1, 2012, True), ("", 2, 2012, True),
+            ("tv", 2, 2010, False), ("movie", None, 2012, False),
+        ):
+            with self.subTest(media_type=media_type, season=season, release_year=release_year):
+                media = IndexerMediaSearchRequest.create(title="Show", year=2011, media_type=media_type, season=season)
+                item = rank_item(self._item(f"Show {release_year} S{season or 1:02d}E01 1080p"),
+                                 media=media, fallback_query=media.title)
+                self.assertEqual("year_conflict" in item.match_reasons, not eligible)
+                self.assertEqual("year_unverified" in item.match_reasons, eligible)
+                for context in (None, media):
+                    ranked = rank_episode_search({"items": [{**item.to_public_dict(), "result_id": "season-year-resource-001"}]},
+                                                 season=season or 1, episode=1, media=context)
+                    self.assertEqual(ranked["items"][0]["quality"]["eligible"], eligible)
+                    self.assertEqual(bool(ranked["recommendation"]["selected"]), eligible)
+                    self.assertTrue(any("年份" in warning for warning in ranked["items"][0]["quality"]["warnings"]))
 
     def test_short_cjk_title_requires_a_title_boundary(self):
         media = IndexerMediaSearchRequest.create(

@@ -156,8 +156,10 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
     def test_four_search_paths_keep_the_same_normalized_requests(self):
         from app.indexers.models import (
             AggregatedIndexerResult,
+            IndexerItem,
             IndexerMediaSearchRequest,
         )
+        from app.indexers.ranking import rank_item
 
         service = MediaSubscriptionService()
         detail = {"original_name": "TV original", "original_title": "Movie original"}
@@ -171,7 +173,14 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             target = _ExpectedMedia("tmdb:7:tv:S01E002", season=1, episode=2)
             for preview in (True, False):
                 response = AggregatedIndexerResult(query="fixture", page=1, items=[], sites_attempted=("site",), sites_succeeded=("site",))
-                indexer = SimpleNamespace(media_site_route=lambda **_: ["site"], search_media=AsyncMock(return_value=response))
+                async def search(request, sites):
+                    if request.media_type == "tv":
+                        response.items = [rank_item(IndexerItem("site", "Site", "TV original 2020 S01E02 1080p",
+                                                              result_id="later-season-resource-001", download_state="ready",
+                                                              download_kinds=("magnet",)),
+                                                    media=request, fallback_query=request.title)]
+                    return response
+                indexer = SimpleNamespace(media_site_route=lambda **_: ["site"], search_media=AsyncMock(side_effect=search))
                 with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
                     "app.modules.media_subscriptions.get_indexer_service", return_value=indexer
                 ), patch("app.modules.media_subscriptions.run_indexer_awaitable", new=run):
@@ -181,7 +190,10 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                     else:
                         coroutine = (service._preview_search_movie(row, detail, limit_per_media=3)
                                      if preview else service._search_movie(row, detail, "tmdb:7:movie"))
-                    asyncio.run(coroutine)
+                    result = asyncio.run(coroutine)
+                if media_type == "tv":
+                    self.assertEqual(isinstance(result, dict), preview)
+                    self.assertEqual(result["candidate_count"] if isinstance(result, dict) else result[0], 1)
                 request, sites = indexer.search_media.call_args.args
                 assert row is not None
                 original = detail["original_name" if media_type == "tv" else "original_title"]
