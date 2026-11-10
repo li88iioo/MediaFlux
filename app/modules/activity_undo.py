@@ -105,7 +105,8 @@ def _organize_state(log_id: int) -> tuple[dict, str]:
         if not service.client.logged_in:
             raise UndoError("光鸭尚未登录", code="not_configured")
         try:
-            detail = service.preflight_revert(log_id)["detail"]
+            prepared = service.preflight_revert(log_id)
+            detail, steps = prepared["detail"], prepared["steps"]
         except (ValueError, RuntimeError) as exc:
             raise UndoError(str(exc)) from exc
         fingerprint = _hash(
@@ -114,19 +115,12 @@ def _organize_state(log_id: int) -> tuple[dict, str]:
                 "version": detail["version"],
                 "status": detail["status"],
                 "items": detail["items"],
-                "operations": detail["operations"],
+                "operations": steps,
             }
         )
-        successful = [
-            step
-            for step in detail["operations"]
-            if step.get("action") == "move_rename" and step.get("status") == "success"
-        ]
-        previous = successful[0]["operation_token"]
         samples = [
             {"from": _text(step.get("to_name")), "to": _text(step.get("from_name"))}
-            for step in successful
-            if step["operation_token"] == previous
+            for step in steps
         ]
         return {
             "title": _text(detail.get("title"), 120),

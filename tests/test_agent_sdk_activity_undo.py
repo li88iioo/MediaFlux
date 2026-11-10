@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 from app import database as db, sdk
+from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
 from app.agent.kernel.effects import EffectExecutor
@@ -33,7 +34,7 @@ def organize_backend(monkeypatch):
     def service():
         value = Mock()
         value.detail.side_effect = lambda log_id: detail
-        value.preflight_revert.side_effect = lambda log_id: {"detail": detail}
+        value.preflight_revert.side_effect = lambda log_id: {"detail": detail, "steps": detail["operations"]}
         value.client.logged_in = True
         value.revert_latest.return_value = {"success": True}
         clients.append(value)
@@ -99,6 +100,42 @@ def test_agent_prepare_rejects_domain_preflight_conflict_without_claiming_receip
     assert receipts.state(receipt, db.media_owner_digest(OWNER)) == "available"
     manager.start_operation.assert_not_called()
     service.close.assert_called_once()
+
+
+@pytest.mark.parametrize("members,later_steps", [(301, 0), (1, 300)])
+def test_inspect_undo_uses_complete_reversible_batch_outside_history_window(runtime, monkeypatch, members, later_steps):
+    class ReadClient:
+        logged_in = True
+        def file_info(self, identity):
+            if identity in {"source", "target"}:
+                return GuangYaFile(identity, identity, True, parent_id="0")
+            return GuangYaFile(identity, "new-" + identity + ".mkv", False, parent_id="target", size=10)
+        def list_dir(self, _identity):
+            return []
+    log_id = db.add_organize_log("guangya", "/source/old", "/target/new", "member-0", "success",
+        original_parent_id="source", original_name="old-member-0.mkv", source_dir_id="source")
+    db.add_organize_log_items(log_id, [{"file_id": f"member-{i}", "role": "video" if i == 0 else "subtitle",
+        "original_parent_id": "source", "original_name": f"old-member-{i}.mkv",
+        "current_parent_id": "target", "current_name": f"new-member-{i}.mkv", "size": 10} for i in range(members)])
+    for i in range(members):
+        db.add_organize_operation_step(log_id, "batch", i, "move_rename", file_id=f"member-{i}",
+            from_parent_id="source", from_name=f"old-member-{i}.mkv", to_parent_id="target",
+            to_name=f"new-member-{i}.mkv", status="success")
+    for i in range(later_steps):
+        db.add_organize_operation_step(log_id, "history", i, "probe_rename", status="failed")
+    service_class = organize_correction.OrganizeCorrectionService
+    monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", lambda: service_class(client=cast(GuangYaClient, ReadClient()), scraper=Mock()))
+    with sdk.call_owner(OWNER):
+        result = sdk.activity.inspect_undo(log_id)["data"]
+        assert result["affected"] == members and len(result["changes"]) == min(members, 20)
+        prepared = activity_undo.prepare_undo(result["receipt_id"], owner=OWNER)
+        assert prepared["preview"]["data"]["changes"]["affected"] == members
+        # 展示窗口之外的真实回退目标变化，同样必须撤销原确认。
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_operation_steps SET from_name='changed.mkv' WHERE log_id=? AND action='move_rename' AND step_index=0", (log_id,))
+        with pytest.raises(activity_undo.UndoError) as error:
+            activity_undo.prepare_undo(result["receipt_id"], owner=OWNER)
+        assert error.value.code == "confirmation_stale"
 
 
 @pytest.mark.skipif(not sandbox.sandbox_supported(), reason="需要真实 Linux root 工作区")
