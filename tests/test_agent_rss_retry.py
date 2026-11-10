@@ -45,6 +45,7 @@ class _Response:
 class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
     def setUp(self):
         _clear_rss()
+        self.enterContext(patch("app.modules.download_dispatcher.guangya_download_credential_generation", return_value=31))
         self.runtime = {
             "url": "http://qb.internal:8080",
             "username": "agent-user",

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -15,10 +16,13 @@ from app.agent.kernel import sandbox
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
+from app.agent.kernel.state_types import CancellationToken
+from app.clients.qbittorrent import TorrentAddResult
 from app.modules import rss_delivery
+from app.modules import download_dispatcher
 from app.modules.rss import RSSEngine
 from tests import test_agent_session_result as session_result_tests
-from tests.support import isolated_test_database, seed_rss_entry_state
+from tests.support import assert_present, isolated_test_database, seed_rss_entry_state
 from tests.test_agent_sdk_effects import context_for, executor
 
 native_workspace = session_result_tests.native_workspace
@@ -186,6 +190,7 @@ def test_full_selected_batch_claims_both_targets_and_mark_has_no_old_count_cutof
         patch(
             "app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")
         ),
+        patch.object(download_dispatcher, "guangya_download_credential_generation", return_value=31),
     ):
         qb, gy = feed(), feed("guangya")
         ids = [entry(qb if i % 2 else gy, i) for i in range(1, 72)]
@@ -214,6 +219,146 @@ def test_full_selected_batch_claims_both_targets_and_mark_has_no_old_count_cutof
             (row := db.get_rss_entry(i)) is not None and row["status"] == "skipped"
             for i in more
         )
+
+
+@pytest.mark.parametrize("operation", ["download", "retry"])
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "unknown"])
+def test_batch_cancellation_preserves_started_receipt_and_restores_unstarted_entries(operation, accepted):
+    with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")):
+        ids = [entry(feed(), number) for number in range(1, 4)]
+        if operation == "retry":
+            for identifier in ids:
+                db.record_rss_entry_failure(identifier, "qb_unavailable", True)
+        before = {identifier: dict(assert_present(db.get_rss_entry(identifier))) for identifier in ids}
+        args = {"entry_ids": ids}
+        _, fingerprint = rss_delivery.prepare(operation, args)
+        cancellation = CancellationToken()
+
+        def submit(**kwargs):
+            cancellation.cancel("用户停止批量投递")
+            return TorrentAddResult(True) if accepted else TorrentAddResult(False, "qb_outcome_unknown", False)
+
+        with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed", side_effect=submit) as backend:
+            result = rss_delivery.execute(operation, args, fingerprint, check_cancelled=cancellation.raise_if_cancelled)
+        assert backend.call_count == 1
+        assert result["status"] == ("partial" if accepted else "review_required")
+        assert result["data"]["cancelled"] == 2 and result["data"]["submitted"] == int(accepted)
+        first = assert_present(db.get_rss_entry(ids[-1]))
+        assert first["status"] == ("downloaded" if accepted else "failed")
+        if not accepted:
+            assert result["data"]["outcome_unknown"] == 1 and first["failure_code"] == "qb_outcome_unknown"
+        restored_fields = ("status", "submitted_at", "failure_code", "failure_retryable", "failed_at", "retry_count", "download_request_id", "download_request_key")
+        for identifier in ids[:-1]:
+            current = assert_present(db.get_rss_entry(identifier))
+            assert all(current[key] == before[identifier][key] for key in restored_fields)
+        remaining = {"entry_ids": ids[:-1]}
+        _, fresh = rss_delivery.prepare(operation, remaining)
+        with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed", return_value=TorrentAddResult(True)) as resumed:
+            result = rss_delivery.execute(operation, remaining, fresh)
+        assert result["status"] == "completed" and resumed.call_count == 2
+
+
+@pytest.mark.parametrize("operation", ["download", "retry"])
+def test_cancellation_after_claim_before_first_submission_restores_complete_scope(operation):
+    with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")):
+        sid = feed()
+        ids = [entry(sid, number) for number in range(1, 3)]
+        if operation == "retry":
+            for identifier in ids:
+                db.record_rss_entry_failure(identifier, "qb_unavailable", True)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE rss_entries SET processed=NULL WHERE id=?", (ids[0],))
+        before = {identifier: dict(assert_present(db.get_rss_entry(identifier))) for identifier in ids}
+        args = {"entry_ids": ids}
+        _, fingerprint = rss_delivery.prepare(operation, args)
+        cancellation = CancellationToken()
+        claim_name = "claim_pending_rss_entries" if operation == "download" else "claim_retryable_failed_rss_entries"
+        original_claim = getattr(db, claim_name)
+        def claim(*args, **kwargs):
+            rows = original_claim(*args, **kwargs)
+            cancellation.cancel("认领后取消")
+            return rows
+        with patch.object(db, claim_name, side_effect=claim), patch.object(RSSEngine, "_download_entry") as backend:
+            result = rss_delivery.execute(operation, args, fingerprint, check_cancelled=cancellation.raise_if_cancelled)
+        backend.assert_not_called()
+        assert not result["ok"] and result["status"] == "cancelled" and result["data"]["cancelled"] == 2
+        assert all(dict(assert_present(db.get_rss_entry(identifier))) == before[identifier] for identifier in ids)
+
+
+def test_batch_cancellation_preserves_late_receipts_and_reassigned_claims():
+    with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")):
+        sid = feed()
+        ids = [entry(sid, number) for number in range(1, 5)]
+        args = {"entry_ids": ids}
+        _, fingerprint = rss_delivery.prepare("download", args)
+        cancellation = CancellationToken()
+        def submit(**kwargs):
+            db.record_rss_entry_failure(ids[0], "qb_outcome_unknown", False)
+            with db.get_conn() as conn:
+                conn.execute("UPDATE rss_entries SET submitted_at='2001-01-01 01:02:03' WHERE id=?", (ids[1],))
+            cancellation.cancel("停止剩余投递")
+            return TorrentAddResult(True)
+        with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed", side_effect=submit) as backend:
+            result = rss_delivery.execute("download", args, fingerprint, check_cancelled=cancellation.raise_if_cancelled)
+        backend.assert_called_once()
+        assert result["status"] == "partial" and result["data"]["cancelled"] == 3
+        assert assert_present(db.get_rss_entry(ids[-1]))["status"] == "downloaded"
+        late = assert_present(db.get_rss_entry(ids[0]))
+        assert late["status"] == "failed" and late["failure_code"] == "qb_outcome_unknown"
+        reassigned = assert_present(db.get_rss_entry(ids[1]))
+        assert reassigned["status"] == "submitting" and reassigned["submitted_at"] == "2001-01-01 01:02:03"
+        assert assert_present(db.get_rss_entry(ids[2]))["status"] == "pending"
+
+
+@pytest.mark.parametrize("source", ["pending", "unlinked_retry", "linked_retry"])
+@pytest.mark.parametrize("change", ["before_confirmation", "after_claim", "unchanged"])
+def test_cloud_confirmation_freezes_account_through_original_and_retry_dispatch(source, change):
+    cloud = SimpleNamespace(logged_in=True, credential_generation=31, close=lambda: None)
+    operation = "download" if source == "pending" else "retry"
+    with (
+        isolated_test_database(),
+        patch.object(download_dispatcher, "GuangYaClient", return_value=cloud),
+        patch("app.indexers.downloads.GuangYaClient", return_value=cloud),
+        patch.object(download_dispatcher, "_recover_guangya_magnet_torrent", return_value=None),
+        patch.object(download_dispatcher, "submit_offline", return_value={"ok": True, "task_ids": ["audit-cloud-task"]}) as remote,
+    ):
+        sid = feed("guangya")
+        eid = entry(sid, 1)
+        if source == "linked_retry":
+            from app.repositories.rss import bind_rss_entry_download
+            item = download_dispatcher.DownloadInput("magnet", "Episode", f"magnet:?xt=urn:btih:{1:040x}")
+            assert db.claim_rss_entry(eid)
+            bind_rss_entry_download(eid, download_dispatcher.request_key(item), "guangya")
+            request = download_dispatcher.create_request(item, "", "", origin=f"rss:{sid}")
+            db.update_download_request(request["id"], targets="guangya", status="failed", gy_status="failed")
+        if operation == "retry":
+            db.record_rss_entry_failure(eid, "guangya_unavailable", True)
+        args = {"entry_ids": [eid]}
+        _, fingerprint = rss_delivery.prepare(operation, args)
+        before = dict(assert_present(db.get_rss_entry(eid)))
+        if change == "before_confirmation":
+            cloud.credential_generation += 1
+            with pytest.raises(rss_delivery.RSSSubscriptionError) as error:
+                rss_delivery.execute(operation, args, fingerprint)
+            assert error.value.code == "confirmation_stale"
+            assert dict(assert_present(db.get_rss_entry(eid))) == before
+        else:
+            claim_name = "claim_pending_rss_entries" if operation == "download" else "claim_retryable_failed_rss_entries"
+            original_claim = getattr(db, claim_name)
+            def claim(*args, **kwargs):
+                rows = original_claim(*args, **kwargs)
+                if change == "after_claim":
+                    cloud.credential_generation += 1
+                return rows
+            with patch.object(db, claim_name, side_effect=claim):
+                result = rss_delivery.execute(operation, args, fingerprint)
+            if change == "unchanged":
+                assert result["status"] == "completed"
+                assert remote.call_args.kwargs["client"] is cloud
+            else:
+                assert result["status"] == "failed" and result["data"]["failed"] == 1
+                assert assert_present(db.get_rss_entry(eid))["failure_code"] == "guangya_credentials_changed"
+        assert remote.call_count == int(change == "unchanged")
 
 
 @pytest.mark.parametrize(

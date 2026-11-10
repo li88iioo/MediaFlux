@@ -37,6 +37,7 @@ _SAFE_FAILURE_LABELS = {
     "guangya_unavailable": "光鸭解析服务暂不可用",
     "guangya_rate_limited": "光鸭请求受限",
     "guangya_auth_failed": "光鸭认证失败",
+    "guangya_credentials_changed": "光鸭登录凭据已变化，请重新预检",
 }
 
 
@@ -218,6 +219,7 @@ def _capture(operation: str, arguments: dict) -> dict:
         }
     from app.modules.offline import OfflineRules
     from app.modules.rss import capture_rss_qb_runtime_config
+    from app.modules.download_dispatcher import guangya_download_credential_generation
 
     runtime, config_error = capture_rss_qb_runtime_config()
     query = (
@@ -258,6 +260,12 @@ def _capture(operation: str, arguments: dict) -> dict:
     if "qb" not in targets:
         config_error = ""
         runtime = {"default_method": runtime.get("default_method") or "qb"}
+    credentials = {}
+    if "guangya" in targets:
+        try:
+            credentials["guangya_credential_generation"] = guangya_download_credential_generation()
+        except ValueError as exc:
+            raise RSSSubscriptionError("光鸭登录状态不可用，请重新登录后预检", code="not_configured") from exc
     return {
         "entries": items,
         "runtime_config": runtime,
@@ -265,6 +273,7 @@ def _capture(operation: str, arguments: dict) -> dict:
         "cloud_rules": asdict(OfflineRules.from_config())
         if "guangya" in targets
         else {},
+        **credentials,
         "target": "both"
         if len(targets) > 1
         else "qbittorrent"
@@ -388,6 +397,8 @@ def execute(
         claim=db.claim_pending_rss_entries
         if operation == "download"
         else db.claim_retryable_failed_rss_entries,
+        check_cancelled=check_cancelled,
+        guangya_credential_generation=state.get("guangya_credential_generation"),
     )
     return submission_result(
         raw,
@@ -442,6 +453,7 @@ def submission_result(raw: dict[str, Any], *, kind: str, target: str) -> dict:
     unknown = min(failed, max(0, int(raw.get("outcome_unknown") or 0)))
     confirmed_failed = failed - unknown
     pending = max(0, int(raw.get("pending") or 0))
+    cancelled = max(0, int(raw.get("cancelled") or 0))
     subject = "RSS 失败条目" if retry else "RSS 条目"
     if pending:
         pending_only = submitted == 0 and failed == 0
@@ -473,6 +485,10 @@ def submission_result(raw: dict[str, Any], *, kind: str, target: str) -> dict:
             if retry
             else f"已向 {target_label} 提交 {submitted} 个 RSS 条目"
         )
+    if cancelled:
+        if not (pending or failed):
+            status, ok = ("partial", True) if submitted else ("cancelled", False)
+        summary += f"；另有 {cancelled} 项尚未提交，已按取消停止"
     if unknown:
         suggestions = (
             ["请先核对对应下载器中是否已存在对应任务，勿直接重复提交。"]
@@ -509,6 +525,7 @@ def submission_result(raw: dict[str, Any], *, kind: str, target: str) -> dict:
             "failed": failed,
             **({"outcome_unknown": unknown} if unknown else {}),
             **({"pending": pending} if pending else {}),
+            **({"cancelled": cancelled} if cancelled else {}),
         },
         "suggestions": suggestions,
         "error": error,

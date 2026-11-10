@@ -90,7 +90,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         seed_rss_entry_state(ids[0], "downloaded")
         with patch(
             "app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed"
-        ) as add:
+        ) as add, patch("app.modules.download_dispatcher.guangya_download_credential_generation", return_value=31):
             result, _context = rss_delivery.prepare("download", {"limit": 2})
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["selected_count"], 2)

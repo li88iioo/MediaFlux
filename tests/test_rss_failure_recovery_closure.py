@@ -771,6 +771,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                 args = {"entry_ids": [eid]}
                 runtime = {"url": "http://frozen.invalid", "default_method": "qb"}
                 with (patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(runtime, "")),
+                      patch.object(dispatcher, "guangya_download_credential_generation", return_value=31),
                       patch.object(dispatcher, "_submit_qb", side_effect=self.success) as qb,
                       patch.object(dispatcher, "_submit_guangya", side_effect=self.success) as gy):
                     preview, fingerprint = rss_delivery.prepare("download", args)

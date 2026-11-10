@@ -668,7 +668,8 @@ def get_pending_rss_snapshot(default_method: str = "qb", limit: int | None = 21,
         return conn.execute(query, params).fetchall()
 
 
-def claim_pending_rss_entries(expected_rows: list[dict], default_method: str = "qb") -> list[sqlite3.Row]:
+def claim_pending_rss_entries(expected_rows: list[dict], default_method: str = "qb", *,
+                              submitted_at: str | None = None) -> list[sqlite3.Row]:
     """全有或全无复核集合、目标与持久投递身份，再认领 pending 条目。"""
     expected = [rss_pending_entry_snapshot(row) for row in expected_rows]
     ids = [row["id"] for row in expected]
@@ -684,7 +685,7 @@ def claim_pending_rss_entries(expected_rows: list[dict], default_method: str = "
             "ORDER BY rss_entries.id DESC", [*ids, default_method]).fetchall()
         if [rss_pending_entry_snapshot(row) for row in rows] != expected:
             return []
-        cur = conn.execute(f"UPDATE rss_entries SET status='submitting',submitted_at=? WHERE id IN ({placeholders}) AND status='pending' AND COALESCE(processed,0)=0", [db.now(), *ids])
+        cur = conn.execute(f"UPDATE rss_entries SET status='submitting',submitted_at=? WHERE id IN ({placeholders}) AND status='pending' AND COALESCE(processed,0)=0", [submitted_at or db.now(), *ids])
         if cur.rowcount != len(expected):
             conn.rollback()
             return []
@@ -725,6 +726,7 @@ _RSS_FAILURE_CODES = {
     "qb_outcome_unknown",
     "submission_outcome_unknown",
     "guangya_auth_failed",
+    "guangya_credentials_changed",
     "guangya_submit_failed",
     "guangya_outcome_unknown",
     "unknown_failure",
@@ -732,7 +734,7 @@ _RSS_FAILURE_CODES = {
 }
 _RSS_RETRY_ENTRY_SELECT = (
     "SELECT rss_entries.id,rss_entries.rss_item_id,rss_entries.title,"
-    "rss_entries.status,rss_entries.processed,rss_entries.created_at,rss_entries.payload,"
+    "rss_entries.status,rss_entries.processed,rss_entries.created_at,rss_entries.submitted_at,rss_entries.payload,"
     "rss_entries.failure_code,rss_entries.failure_retryable,rss_entries.retry_count,"
     "rss_entries.failed_at,rss_entries.download_request_id,rss_entries.download_request_key,rss_entries.download_backend,COALESCE(i.download_method,'') AS download_method,"
     "COALESCE(i.qb_save_path,'') AS qb_save_path,"
@@ -840,6 +842,7 @@ def get_retryable_failed_rss_snapshot(
 def claim_retryable_failed_rss_entries(
     expected_rows: Sequence[dict | sqlite3.Row],
     default_method: str = "qb",
+    *, submitted_at: str | None = None,
 ) -> list[sqlite3.Row]:
     """全有或全无地复核并认领 Agent 已确认的安全 RSS 失败集合。"""
     normalized_default = (default_method or "").strip().lower()
@@ -868,7 +871,7 @@ def claim_retryable_failed_rss_entries(
             conn.rollback()
             return []
 
-        submitted_at = db.now()
+        submitted_at = submitted_at or db.now()
         cur = conn.execute(
             f"UPDATE rss_entries SET status='submitting', submitted_at=?, "
             "failure_code='', failure_retryable=0, failed_at=NULL, "
@@ -880,6 +883,24 @@ def claim_retryable_failed_rss_entries(
             conn.rollback()
             return []
         return rows
+
+
+def release_unsubmitted_rss_entries(rows: Sequence[sqlite3.Row], *, submitted_at: str) -> int:
+    """只释放本批尚未开始提交且投递身份未变的认领，原样恢复重试状态。"""
+    restored = 0
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            restored += conn.execute(
+                "UPDATE rss_entries SET status=?,submitted_at=?,failure_code=?,failure_retryable=?,"
+                "failed_at=?,retry_count=? WHERE id=? AND status='submitting' AND COALESCE(processed,0)=0 "
+                "AND submitted_at=? AND COALESCE(download_request_id,0)=? "
+                "AND download_request_key=? AND download_backend=?",
+                (row["status"], row["submitted_at"], row["failure_code"], row["failure_retryable"],
+                 row["failed_at"], row["retry_count"], row["id"], submitted_at,
+                 row["download_request_id"] or 0, row["download_request_key"], row["download_backend"]),
+            ).rowcount
+    return restored
 
 
 def claim_rss_entry(entry_id: int, *, admission: dict[str, Any] | None = None) -> bool:

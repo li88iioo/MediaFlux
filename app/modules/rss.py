@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import re
@@ -36,6 +37,7 @@ from app.modules.offline import TorrentPreparationError
 from app.repositories.rss import (
     RSSEntryStateChangedError,
     RSSMediaAlreadyClaimedError,
+    release_unsubmitted_rss_entries,
     rss_retry_source_is_safe,
 )
 from app.sensitive_data import redact_sensitive_text
@@ -893,7 +895,7 @@ class RSSEngine:
         safe_codes = {"guangya_manifest_unavailable", "guangya_unavailable", "guangya_rate_limited"}
         if code in safe_codes:
             return code, bool(backend.get("retryable")), False
-        return (code if code == "guangya_auth_failed" else "guangya_submit_failed"), False, False
+        return (code if code in {"guangya_auth_failed", "guangya_credentials_changed"} else "guangya_submit_failed"), False, False
 
     def _download_entry(
         self,
@@ -902,6 +904,7 @@ class RSSEngine:
         entry_already_claimed: bool = False,
         qb_runtime_config: dict | None = None,
         auto_guard: Callable[[], bool] | None = None,
+        guangya_credential_generation: int | None = None,
     ) -> dict:
         """将单条 RSS 下载统一接入 download_request / DownloadTracker。"""
         if not entry:
@@ -987,7 +990,7 @@ class RSSEngine:
         request_id = 0
         stage = "submit"
         try:
-            qb_options = {
+            submission_options: dict[str, Any] = {
                 "qb_save_path": str(
                     self._entry_value(entry, "qb_save_path", "")
                     or (runtime or {}).get("default_save_path") or ""
@@ -997,6 +1000,8 @@ class RSSEngine:
                 ),
                 "qb_runtime_config": runtime,
             }
+            if guangya_credential_generation is not None:
+                submission_options["guangya_credential_generation"] = guangya_credential_generation
             from app.indexers.downloads import submit_download_input
             if linked_key:
                 from app.repositories.rss import bind_rss_entry_download
@@ -1019,7 +1024,7 @@ class RSSEngine:
                 dispatch = resubmit_download_request(
                     int(retry_source["id"]), method,
                     origin=f"rss:{int(entry['rss_item_id'])}",
-                    **qb_options,
+                    **submission_options,
                     rss_item_id=int(entry["rss_item_id"]),
                     log_path=_safe_download_source_marker(str(retry_source["source_value"] or "")),
                 )
@@ -1040,7 +1045,7 @@ class RSSEngine:
                     gy_target_name=str(
                         self._entry_value(entry, "gy_target_dir_name", "") or ""
                     ),
-                    **qb_options,
+                    **submission_options,
                     qb_task_id_hint=infohash if method == "qb" else "",
                     rss_item_id=int(entry["rss_item_id"]),
                     rss_entry_id=entry_id,
@@ -1279,6 +1284,8 @@ class RSSEngine:
         runtime_config: dict,
         *,
         claim,
+        check_cancelled: Callable[[], None] | None = None,
+        guangya_credential_generation: int | None = None,
     ) -> dict:
         """按已选定的 pending/retry 原子认领规则执行确认快照。"""
         requested = len(expected_entries)
@@ -1292,19 +1299,32 @@ class RSSEngine:
                 "ok": False, "conflict": True, "requested": requested,
                 "claimed": 0, "submitted": 0, "failed": 0,
             }
+        if check_cancelled:
+            check_cancelled()
+        submitted_at = datetime.now().isoformat(sep=" ", timespec="microseconds")
         claimed_rows = claim(
             expected_entries,
             default_method=str(runtime_config.get("default_method") or "qb"),
+            submitted_at=submitted_at,
         )
         if len(claimed_rows) != requested:
             return {
                 "ok": False, "conflict": True, "requested": requested,
                 "claimed": 0, "submitted": 0, "failed": 0,
             }
-        submitted = failed = outcome_unknown = pending = 0
-        for row in claimed_rows:
+        submitted = failed = outcome_unknown = pending = cancelled = 0
+        for index, row in enumerate(claimed_rows):
+            try:
+                if check_cancelled:
+                    check_cancelled()
+            except asyncio.CancelledError:
+                unstarted = claimed_rows[index:]
+                release_unsubmitted_rss_entries(unstarted, submitted_at=submitted_at)
+                cancelled = len(unstarted)
+                break
             result = self._download_entry(
                 row, entry_already_claimed=True, qb_runtime_config=runtime_config,
+                guangya_credential_generation=guangya_credential_generation,
             )
             if result.get("pending"):
                 pending += 1
@@ -1314,13 +1334,14 @@ class RSSEngine:
                 failed += 1
                 outcome_unknown += bool(result.get("review_required"))
         return {
-            "ok": failed == 0 and pending == 0,
+            "ok": failed == 0 and pending == 0 and cancelled == 0,
             **({"pending": pending} if pending else {}),
             "conflict": False,
             "requested": requested,
             "claimed": len(claimed_rows),
             "submitted": submitted,
             "failed": failed,
+            **({"cancelled": cancelled} if cancelled else {}),
             **({"outcome_unknown": outcome_unknown} if outcome_unknown else {}),
         }
 
