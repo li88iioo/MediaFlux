@@ -30,10 +30,10 @@ from app.repositories.download_requests import (
     download_display_title,
     usable_download_title,
 )
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
 logger = get_logger(__name__)
 
-SUPPORTED_TARGETS = {"qb", "guangya", "both"}
 _URL_RE = re.compile(r"(?i)(magnet:\?\S+|ed2k://\S+|https?://\S+)")
 _QB_TORRENT_ID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _GUANGYA_SHARE_PATH_RE = re.compile(
@@ -884,7 +884,7 @@ def prepare_download_retry(request_id: int, target: str) -> dict[str, Any]:
     """只读冻结待处理请求、目标能力、来源身份与配置；不返回链接或凭据。"""
     if type(request_id) is not int or request_id < 1:
         raise ValueError("request_id 必须是大于 0 的整数")
-    if not isinstance(target, str) or target.strip().lower() not in SUPPORTED_TARGETS:
+    if not isinstance(target, str) or target.strip().lower() not in DOWNLOAD_TARGETS:
         raise ValueError("target 仅支持 qb、guangya 或 both")
     return _download_retry_snapshot(download_requests_repo.get_download_request(request_id), target.strip().lower())[0]
 
@@ -918,7 +918,7 @@ def resubmit_download_request(
     guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     """安全重试指定目标；活动请求仅补投失败目标，其余创建历史 successor。"""
-    if targets not in SUPPORTED_TARGETS:
+    if targets not in DOWNLOAD_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     source_row = download_requests_repo.get_download_request(source_request_id)
     generation = guangya_credential_generation
@@ -1182,7 +1182,7 @@ def dispatch_missing_targets(
     guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     """向已有资源请求补充尚未提交的后端，不重置已成功目标。"""
-    if targets not in SUPPORTED_TARGETS:
+    if targets not in DOWNLOAD_TARGETS:
         return {"handled": False, "ok": False, "error": "下载目标无效"}
     row = download_requests_repo.get_download_request(request_id)
     if not row:
@@ -1240,7 +1240,7 @@ def dispatch_request(
     check_cancelled: Callable[[], None] | None = None,
     guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
-    if targets not in SUPPORTED_TARGETS:
+    if targets not in DOWNLOAD_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     row = download_requests_repo.get_download_request(request_id)
     if not row:

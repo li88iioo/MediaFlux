@@ -42,7 +42,7 @@ class CleanupResult:
     warnings: list[str] = field(default_factory=list)
 
 
-_DIRECT_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+SYSTEM_JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 _DIRECT_SUFFIXES = {".url", ".website", ".part", ".partial", ".tmp", ".temp", ".aria2", ".!qb"}
 _AD_TEXT_RE = re.compile(
     r"(?i)(readme|广告|说明|声明|最新网址|下载必看|本站|发布页|公众号|微信|高清影视之家)"
@@ -77,7 +77,7 @@ def classify_cleanup_items(
         candidate: CleanupCandidate | None = None
         if item.size == 0:
             candidate = CleanupCandidate(item, "empty", "0 字节空文件")
-        elif lower in _DIRECT_NAMES:
+        elif lower in SYSTEM_JUNK_NAMES:
             candidate = CleanupCandidate(item, "system-junk", "系统生成的无用文件")
         elif any(lower.endswith(value) for value in _DIRECT_SUFFIXES):
             candidate = CleanupCandidate(item, "temporary", "下载器或浏览器临时残留")

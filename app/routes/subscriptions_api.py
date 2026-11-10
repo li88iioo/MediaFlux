@@ -18,11 +18,11 @@ from app.modules.media_subscriptions import (
 )
 from app.routes.discovery_image import encode_poster_token
 from app.web import api_error, api_response, require_api_login
+from app.discovery.models import DISCOVERY_PROVIDERS
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/subscriptions")
 _ALLOWED_LIST_STATUS = {"", "new", "checking", "satisfied", "missing", "inconclusive", "error", "paused"}
-_ALLOWED_PROVIDERS = {"tmdb", "douban", "bangumi"}
 _ALLOWED_MEDIA_TYPES = {"movie", "tv"}
 _WATCHLIST_SUBSCRIPTION_FIELDS = {
     "provider", "external_id", "media_type", "title", "year", "tmdb_id",
@@ -275,7 +275,7 @@ async def create_from_watchlist(request: Request, data: Any = Body(default=None)
         provider = str(payload.get("provider") or "").strip().lower()
         external_id = str(payload.get("external_id") or "").strip()
         media_type = str(payload.get("media_type") or "").strip().lower()
-        if provider not in _ALLOWED_PROVIDERS or media_type not in _ALLOWED_MEDIA_TYPES:
+        if provider not in DISCOVERY_PROVIDERS or media_type not in _ALLOWED_MEDIA_TYPES:
             raise MediaSubscriptionError("收藏媒体身份无效")
         if not external_id or len(external_id) > 128 or any(char.isspace() for char in external_id):
             raise MediaSubscriptionError("收藏媒体 ID 无效")

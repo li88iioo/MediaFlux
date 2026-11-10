@@ -43,6 +43,7 @@ from ..tool_calls import PreparedEffect
 from ..projection import DefaultProjector
 from ..scoped_trust import watchlist_approval_scope
 from .mediaflux_policy import confirmation_runtime
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
 
 def _fingerprint(snapshot: dict) -> str:
@@ -1024,7 +1025,7 @@ def download_submit_tool() -> KernelToolSpec:
     def execute(arguments, expected_snapshot, context):
         try:
             with confirmation_runtime(context) as prefix:
-                if not expected_snapshot.startswith(prefix) or arguments.get("target") not in downloads.DOWNLOAD_TARGETS:
+                if not expected_snapshot.startswith(prefix) or arguments.get("target") not in DOWNLOAD_TARGETS:
                     raise downloads.DownloadSnapshotChanged()
                 try:
                     _, snapshot = downloads.preview_download_url(arguments["url"], arguments["target"])

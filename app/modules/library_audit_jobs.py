@@ -12,9 +12,9 @@ from app.modules.library_patrol import (
 )
 from app.repositories import agent_jobs as jobs
 from app.repositories.agent_jobs import AgentJobError
+from app.repositories.agent_jobs import AGENT_JOB_ACTIVE_STATUSES
 
 JOB_TYPE = "library_episode_audit"
-_ACTIVE = {"pending", "running", "retry_wait"}
 _LABELS = {
     "pending": "等待执行",
     "running": "正在检查",
@@ -137,7 +137,7 @@ def _cancel_snapshot(owner, job_id):
         if identity
         else jobs.find_latest_active_agent_job(owner=owner, job_type=JOB_TYPE)
     )
-    if row is None or row["job_type"] != JOB_TYPE or row["status"] not in _ACTIVE:
+    if row is None or row["job_type"] != JOB_TYPE or row["status"] not in AGENT_JOB_ACTIVE_STATUSES:
         raise AgentJobError("当前没有可取消的全库检查", code="precondition_failed")
     return {
         "owner_digest": jobs.agent_job_owner_digest(owner),

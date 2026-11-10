@@ -17,6 +17,7 @@ from app.modules.media_identity import normalize_episode_verification
 from app.modules.web_secret import get_web_secret
 from app import database as db
 from app.modules.resource_candidates import safe_text
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
 
 def _target_identity(target: dict) -> tuple:
@@ -404,7 +405,6 @@ _STATES = {
     "cancelled",
 }
 _PRUNABLE_STATES = {"visible", "stale", "cancelled"}
-_TARGETS = {"qb", "guangya", "both"}
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _MAX_OWNER_LENGTH = 512
 _MAX_WORKFLOWS_PER_OWNER = 50
@@ -568,7 +568,7 @@ class SQLiteMissingMediaWorkflowRepository:
         if (
             safe_verification is None
             or not safe_candidate
-            or safe_target not in _TARGETS
+            or safe_target not in DOWNLOAD_TARGETS
         ):
             return None
         now = db.now()

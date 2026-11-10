@@ -15,8 +15,8 @@ from app.repositories import agent_download_verification as agent_download_verif
 from app.agent.models import Evidence, ToolResult
 from app.agent.session_context import AgentSessionContextRepository
 from app.modules.media_identity import normalize_episode_verification
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
-_ALLOWED_TARGETS = {"qb", "guangya", "both"}
 _ALLOWED_DISPATCH_STATUSES = {"submitted", "partial", "failed", "duplicate", "manual_review"}
 _ALLOWED_RESULT_STATUSES = {"accepted", "partial", "conflict", "unavailable", "outcome_unknown"}
 _BACKEND_NAMES = {"qb", "guangya"}
@@ -220,7 +220,7 @@ def _safe_submission(
     data = result.data if isinstance(result.data, dict) else {}
     target = str(data.get("target") or "").strip().lower()
     dispatch_status = str(data.get("status") or "").strip().lower()
-    if target not in _ALLOWED_TARGETS or dispatch_status not in _ALLOWED_DISPATCH_STATUSES:
+    if target not in DOWNLOAD_TARGETS or dispatch_status not in _ALLOWED_DISPATCH_STATUSES:
         return None
     duplicate = bool(data.get("duplicate"))
     request_id = _positive_int(data.get("request_id") or data.get("request_number"))
@@ -275,7 +275,7 @@ def _submission_from_payload(value: Any) -> RecentDownloadSubmission | None:
     verification_value = value.get("verification")
     verification = parse_recent_download_verification_context(verification_value)
     if (
-        target not in _ALLOWED_TARGETS
+        target not in DOWNLOAD_TARGETS
         or dispatch_status not in _ALLOWED_DISPATCH_STATUSES
         or result_status not in _ALLOWED_RESULT_STATUSES
         or not isinstance(created, bool)
@@ -355,7 +355,7 @@ def sanitize_submission_confirmation_result(result: ToolResult) -> ToolResult:
     result_status = (result.status or "").strip().lower()
 
     public_data: dict[str, Any] = {
-        "target": target if target in _ALLOWED_TARGETS else "unknown",
+        "target": target if target in DOWNLOAD_TARGETS else "unknown",
         "status": (
             dispatch_status
             if dispatch_status in _ALLOWED_DISPATCH_STATUSES

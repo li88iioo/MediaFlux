@@ -17,6 +17,8 @@ from app.repositories import local_media as local_media_repo
 
 _PLACEHOLDER_TITLES = ("", "磁力任务", "链接任务", "ED2K 任务", "未命名任务", "未命名下载请求", "离线下载", "torrent", "resource")
 
+DOWNLOAD_TARGETS = frozenset({"qb", "guangya", "both"})
+
 
 def usable_download_title(value: object) -> bool:
     text = str(value or "").strip()

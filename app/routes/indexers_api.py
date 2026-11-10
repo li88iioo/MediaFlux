@@ -35,6 +35,7 @@ from app.indexers.runtime import get_indexer_service
 from app.indexers.service import search_payload
 from app.modules.download_dispatcher import public_dispatch_summary
 from app.web import api_error, api_response, require_api_login
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
 
 def _require_enabled() -> None:
@@ -43,7 +44,6 @@ def _require_enabled() -> None:
 
 
 router = APIRouter(prefix="/api/indexers", dependencies=[Depends(_require_enabled)])
-_DOWNLOAD_TARGETS = {"qb", "guangya", "both"}
 
 
 def _error_response(exc: HttpError):
@@ -243,7 +243,7 @@ def _validate_batch_payload(data: Any) -> tuple[list[str], str]:
     if not isinstance(raw_target, str):
         raise ValueError("下载目标无效")
     target = raw_target.strip().lower()
-    if target not in _DOWNLOAD_TARGETS:
+    if target not in DOWNLOAD_TARGETS:
         raise ValueError("下载目标仅支持 qb、guangya 或 both")
     return result_ids, target
 
@@ -260,7 +260,7 @@ async def download(request: Request, data: Any = Body(default=None)):
     target = str(data.get("target") or "").strip().lower()
     if not result_id or len(result_id) > 128:
         return api_error("资源结果 ID 无效", 400)
-    if target not in _DOWNLOAD_TARGETS:
+    if target not in DOWNLOAD_TARGETS:
         return api_error("下载目标仅支持 qb、guangya 或 both", 400)
 
     service = get_indexer_service()
@@ -308,7 +308,7 @@ async def resubmit_download(request: Request, data: Any = Body(default=None)):
     target = str(data.get("target") or "").strip().lower()
     if request_id <= 0:
         return api_error("下载请求 ID 无效", 400)
-    if target not in _DOWNLOAD_TARGETS:
+    if target not in DOWNLOAD_TARGETS:
         return api_error("下载目标仅支持 qb、guangya 或 both", 400)
 
     result = await asyncio.to_thread(

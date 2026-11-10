@@ -8,6 +8,8 @@ from typing import Any
 _ALLOWED_MEDIA_TYPES = {"movie", "tv", "all"}
 _ALLOWED_HEALTH = {"healthy", "degraded", "disabled", "unavailable", "not_configured"}
 
+DISCOVERY_PROVIDERS = ("tmdb", "douban", "bangumi")
+
 
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+")
 _CREDENTIAL_RE = re.compile(

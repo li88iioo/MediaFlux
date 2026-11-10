@@ -16,6 +16,7 @@ from typing import Generator, Iterable, Iterator
 from app.modules.local_path_mapping import assert_within
 from app.modules.organize import METADATA_EXTS, VIDEO_EXTS
 from app.modules.subtitle_identity import SubtitleIdentity, plan_subtitle_companions
+from app.modules.organize_postprocess import SUBTITLE_EXTS
 
 
 class LocalStorageError(RuntimeError):
@@ -49,7 +50,6 @@ IGNORED_LOCAL_MEDIA_DIRECTORY_NAMES: frozenset[str] = frozenset(
         "tmp",
     }
 )
-_SUBTITLE_SUFFIXES = {"srt", "ass", "ssa", "sub", "idx", "vtt", "sup"}
 _IMAGE_SUFFIXES = {"jpg", "jpeg", "png", "webp", "avif"}
 
 
@@ -198,7 +198,7 @@ class LocalFilesystemAdapter:
         ext = path.suffix.lower().lstrip(".")
         if ext in VIDEO_EXTS:
             return "video"
-        if ext in _SUBTITLE_SUFFIXES:
+        if ext in SUBTITLE_EXTS:
             return "subtitle"
         if ext == "nfo":
             return "nfo"

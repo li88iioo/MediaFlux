@@ -48,10 +48,10 @@ from app.repositories.download_requests import (
     enrich_download_display_title,
     usable_download_title,
 )
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
 logger = get_logger(__name__)
 
-DOWNLOAD_TARGETS = frozenset({"qb", "guangya", "both"})
 INDEXER_RESUBMITTABLE_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "manual_review"}
 )

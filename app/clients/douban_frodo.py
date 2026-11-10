@@ -49,7 +49,7 @@ _USER_AGENT = (
     "iPhone/15.1.1 iPhone13,2 network/wifi model/unknown"
 )
 _DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-_CREDENTIAL_SOURCES = frozenset({"explicit", "environment", "compatibility_default"})
+FRODO_CREDENTIAL_SOURCES = frozenset({"explicit", "environment", "compatibility_default"})
 _COLLECTIONS = {
     "movie_showing": "movie_showing",
     "movie_soon": "movie_soon",
@@ -103,7 +103,7 @@ def _resolved_credentials(
 
 def _safe_credential_source(value: Any) -> str:
     source = str(value or "").strip()
-    return source if source in _CREDENTIAL_SOURCES else "unknown"
+    return source if source in FRODO_CREDENTIAL_SOURCES else "unknown"
 
 
 def _credential_identity(api_key: str, api_secret: str, user_agent: str) -> str:

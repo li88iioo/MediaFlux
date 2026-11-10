@@ -69,7 +69,7 @@ _SORTS = {
     "rank": "rank",
     "time": "time",
 }
-_IMAGE_HOSTS = {
+DOUBAN_IMAGE_HOSTS = {
     "img1.doubanio.com",
     "img2.doubanio.com",
     "img3.doubanio.com",
@@ -451,7 +451,7 @@ def _safe_poster_url(value: Any) -> str:
     host = (parsed.hostname or "").lower()
     if (
         parsed.scheme not in {"http", "https"}
-        or host not in _IMAGE_HOSTS
+        or host not in DOUBAN_IMAGE_HOSTS
         or parsed.username
         or parsed.password
         or port not in (None, 80, 443)

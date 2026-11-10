@@ -15,6 +15,7 @@ from app.clients.guangya import file_extension, GuangYaClient, GuangYaFile
 from app.modules.guangya_rename import GuangYaNamingError
 from app.modules.organize import DEFAULT_ORGANIZE_VIDEO_EXTS
 from app.clients.guangya import file_snapshot
+from app.modules.local_media_cleanup import SYSTEM_JUNK_NAMES
 
 _MAX_SCANNED_ITEMS = 100_000
 _MAX_SCANNED_DIRS = 5_000
@@ -31,7 +32,6 @@ _AD_TOKEN_RE = re.compile(
     r"(?i)(?:广告|推广|扫码|二维码|最新地址|更多资源|防失联|发布页|解压密码|"
     r"app下载|website|homepage|download|readme|url)"
 )
-_SYSTEM_JUNK = {".ds_store", "thumbs.db", "desktop.ini"}
 _IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
 _LINK_EXTS = {"url", "website", "html", "htm"}
 _TEXT_EXTS = {"txt"}
@@ -116,7 +116,7 @@ def _is_cleanup_review_candidate(item: GuangYaFile) -> bool:
     """只判断文件是否可以交给 Agent 按文件名复核，不直接判定为垃圾。"""
     name = (item.name or "")
     lowered = name.casefold()
-    if lowered in _SYSTEM_JUNK:
+    if lowered in SYSTEM_JUNK_NAMES:
         return True
     ext = file_extension(item)
     stem = re.sub(r"[.。．][^.。．]+$", "", name).strip().casefold()

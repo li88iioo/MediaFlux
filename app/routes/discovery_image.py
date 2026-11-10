@@ -23,6 +23,7 @@ from app.discovery.calendar.posters import (
 from app.logger import get_logger, log_throttled
 from app.modules.image_payload import ImagePayloadError, read_bounded_image
 from app.modules.web_secret import WebSecretUnavailable, get_web_secret
+from app.clients.douban_public import DOUBAN_IMAGE_HOSTS
 
 logger = get_logger(__name__)
 
@@ -85,10 +86,6 @@ def _require_discovery_enabled() -> None:
 router = APIRouter(dependencies=[Depends(_require_discovery_enabled)])
 _MAX_TOKEN_LENGTH = 2048
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._~!$&'()+,;=:@/-]+$")
-_DOUBAN_IMAGE_HOSTS = {
-    "img1.doubanio.com", "img2.doubanio.com", "img3.doubanio.com",
-    "img9.doubanio.com", "qnmob3.doubanio.com",
-}
 
 
 def _serializer() -> URLSafeSerializer:
@@ -120,7 +117,7 @@ def _canonical_poster_key(provider: str, poster_key: str) -> tuple[str, str]:
     host, separator, path = raw.partition("/")
     host = host.lower()
     if provider == "douban":
-        if not separator or host not in _DOUBAN_IMAGE_HOSTS or not path:
+        if not separator or host not in DOUBAN_IMAGE_HOSTS or not path:
             raise HTTPException(status_code=400, detail="invalid douban poster key")
         return provider, f"{host}/{path}"
     if provider == "bangumi":
@@ -210,7 +207,7 @@ def poster(request: Request, provider: str, token: str):
     if is_douban:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower()
-        for alt_host in _DOUBAN_IMAGE_HOSTS:
+        for alt_host in DOUBAN_IMAGE_HOSTS:
             if alt_host != host:
                 alt_url = url.replace(f"https://{host}/", f"https://{alt_host}/", 1)
                 alternate_urls.append(alt_url)

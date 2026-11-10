@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -41,6 +41,8 @@ from app.repositories.media_subscriptions import (
 )
 from app.sensitive_data import redact_sensitive_text
 from app.services import MediaIdentityBatch, inspect_media_identity_sources, inspect_series_episode_sources
+from app.repositories.download_requests import DOWNLOAD_TARGETS
+from app.discovery.models import DISCOVERY_PROVIDERS
 
 logger = get_logger(__name__)
 
@@ -54,8 +56,6 @@ _AUTO_RELEVANCE_THRESHOLD = 90
 _ALLOWED_MEDIA_TYPES = frozenset({"movie", "tv"})
 _ALLOWED_MONITOR_MODES = frozenset({"missing", "future", "selected"})
 _ALLOWED_ACTIONS = frozenset({"notify", "confirm", "auto"})
-_ALLOWED_TARGETS = frozenset({"qb", "guangya", "both"})
-_ALLOWED_PROVIDERS = frozenset({"tmdb", "douban", "bangumi"})
 _ACTIVE_CHECK_RUN_ID: ContextVar[int | None] = ContextVar(
     "media_subscription_active_check_run_id", default=None
 )
@@ -129,7 +129,7 @@ def _numeric_tmdb_id(value: Any) -> str:
     return normalized
 
 
-def _choice(value: Any, allowed: frozenset[str], default: str) -> str:
+def _choice(value: Any, allowed: Collection[str], default: str) -> str:
     normalized = str(value or default).strip().lower()
     if normalized not in allowed:
         raise MediaSubscriptionError(f"不支持的选项：{normalized}")
@@ -153,7 +153,7 @@ def _strict_bool(value: Any, *, default: bool) -> bool:
 
 
 def _provider_identity(provider: Any, external_id: Any, tmdb_id: str) -> tuple[str, str]:
-    normalized_provider = _choice(provider, _ALLOWED_PROVIDERS, "tmdb")
+    normalized_provider = _choice(provider, DISCOVERY_PROVIDERS, "tmdb")
     normalized_external = str(external_id or tmdb_id).strip()
     if not normalized_external or len(normalized_external) > 128:
         raise MediaSubscriptionError("外部媒体 ID 无效")
@@ -417,7 +417,7 @@ def subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict) or set(arguments) - allowed or not {"provider", "external_id", "media_type"} <= arguments.keys():
         raise MediaSubscriptionError("创建订阅需要精确来源、媒体 ID 和媒体类型")
     values = {"season": None, "check_interval_minutes": 4320, "action": "confirm", "download_target": "guangya", "sites": [], "enabled": True, **arguments}
-    for key, choices in (("provider", _ALLOWED_PROVIDERS), ("media_type", _ALLOWED_MEDIA_TYPES)):
+    for key, choices in (("provider", DISCOVERY_PROVIDERS), ("media_type", _ALLOWED_MEDIA_TYPES)):
         values[key] = _choice(values[key], choices, "")
     identity = values["external_id"]
     if not isinstance(identity, str) or not identity.strip() or len(identity) > 180 or any(c.isspace() for c in identity.strip()):
@@ -432,7 +432,7 @@ def subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if isinstance(interval, bool) or not isinstance(interval, int):
         raise MediaSubscriptionError("check_interval_minutes 必须是整数")
     values["check_interval_minutes"] = normalize_subscription_interval(interval)
-    for key, choices in (("action", _ALLOWED_ACTIONS), ("download_target", _ALLOWED_TARGETS)):
+    for key, choices in (("action", _ALLOWED_ACTIONS), ("download_target", DOWNLOAD_TARGETS)):
         values[key] = _choice(values[key], choices, "")
     if not isinstance(values["enabled"], bool):
         raise MediaSubscriptionError("enabled 必须是布尔值")
@@ -448,7 +448,7 @@ def subscription_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     for key in ("enabled", "include_specials"):
         if key in values and not isinstance(values[key], bool):
             raise MediaSubscriptionError(f"{key} 必须是布尔值")
-    for key, choices in (("monitor_mode", _ALLOWED_MONITOR_MODES), ("action", _ALLOWED_ACTIONS), ("download_target", _ALLOWED_TARGETS)):
+    for key, choices in (("monitor_mode", _ALLOWED_MONITOR_MODES), ("action", _ALLOWED_ACTIONS), ("download_target", DOWNLOAD_TARGETS)):
         if key in values:
             values[key] = _choice(values[key], choices, "")
     if "seasons" in values:
@@ -594,7 +594,7 @@ class MediaSubscriptionService:
         tmdb_id = _numeric_tmdb_id(data.get("tmdb_id"))
         monitor_mode = _choice(data.get("monitor_mode"), _ALLOWED_MONITOR_MODES, "missing")
         action = _choice(data.get("action"), _ALLOWED_ACTIONS, "confirm")
-        target = _choice(data.get("download_target"), _ALLOWED_TARGETS, "guangya")
+        target = _choice(data.get("download_target"), DOWNLOAD_TARGETS, "guangya")
         interval = normalize_subscription_interval(data.get("check_interval_minutes", 4320))
         seasons = normalize_subscription_seasons(data.get("seasons"))
         sites = _normalize_sites(data.get("sites"))
@@ -829,7 +829,7 @@ class MediaSubscriptionService:
         if "action" in data:
             fields["action"] = _choice(data["action"], _ALLOWED_ACTIONS, "confirm")
         if "download_target" in data:
-            fields["download_target"] = _choice(data["download_target"], _ALLOWED_TARGETS, "guangya")
+            fields["download_target"] = _choice(data["download_target"], DOWNLOAD_TARGETS, "guangya")
         if "sites" in data:
             fields["sites_json"] = _dumps(_normalize_sites(data["sites"]))
         if "check_interval_minutes" in data:
@@ -1975,7 +1975,7 @@ class MediaSubscriptionService:
         if not bool(subscription["enabled"]):
             raise MediaSubscriptionError("媒体订阅已暂停", status_code=409, code="paused")
         revision = int(subscription["revision"] or 1)
-        normalized_target = _choice(target or subscription["download_target"], _ALLOWED_TARGETS, "guangya")
+        normalized_target = _choice(target or subscription["download_target"], DOWNLOAD_TARGETS, "guangya")
         if require_active_check:
             self._ensure_active_check(int(subscription["id"]), revision, cancel_event)
         elif cancel_event is not None and cancel_event.is_set():

@@ -15,8 +15,8 @@ from app.modules.web_secret import get_web_secret
 from app import database as db
 
 _ALLOWED_JOB_TYPES = {"library_episode_audit"}
-_ACTIVE_STATUSES = {"pending", "running", "retry_wait"}
-_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+AGENT_JOB_ACTIVE_STATUSES = {"pending", "running", "retry_wait"}
+AGENT_JOB_TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 _MAX_OWNER_LENGTH = 512
 _MAX_JSON_BYTES = 65_536
 _MAX_SUMMARY_LENGTH = 240
@@ -506,7 +506,7 @@ def cancel_agent_job(
         if row is None:
             return None, "not_found"
         status = str(row["status"] or "")
-        if status in _TERMINAL_STATUSES:
+        if status in AGENT_JOB_TERMINAL_STATUSES:
             return row, "terminal"
         selected_id = str(row["job_id"])
         if status in {"pending", "retry_wait"}:

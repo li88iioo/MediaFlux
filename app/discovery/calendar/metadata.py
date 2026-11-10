@@ -13,12 +13,9 @@ from .douban_http import CalendarDoubanClient
 from .http import _install_bounded_dns
 from .models import CalendarEntry
 from .tmdb_http import CalendarTMDBClient
+from app.clients.douban_public import DOUBAN_IMAGE_HOSTS
 
 # 与 discovery_image 的 provider key 白名单保持一致，不导入 routes 或签名配置。
-_DOUBAN_IMAGE_HOSTS = frozenset({
-    "img1.doubanio.com", "img2.doubanio.com", "img3.doubanio.com",
-    "img9.doubanio.com", "qnmob3.doubanio.com",
-})
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9._~!$&'()+,;=:@/-]+$")
 _ID = re.compile(r"[1-9][0-9]{0,9}")
 _YEAR = re.compile(r"(?:19|20)[0-9]{2}")
@@ -44,7 +41,7 @@ def _douban_poster_key(value):
         return ""
     try:
         url = urlsplit(value)
-        if (url.scheme != "https" or url.netloc not in _DOUBAN_IMAGE_HOSTS
+        if (url.scheme != "https" or url.netloc not in DOUBAN_IMAGE_HOSTS
                 or url.username or url.password or url.port or url.query or url.fragment):
             return ""
         key = url.netloc + url.path

@@ -25,8 +25,8 @@ from app.discovery.providers.base import (
 from app.discovery.providers.douban import DoubanProvider
 from app.discovery.providers.tmdb import TMDBProvider
 from app.logger import get_logger
+from app.discovery.models import DISCOVERY_PROVIDERS
 
-_PROVIDER_ORDER = ("tmdb", "douban", "bangumi")
 logger = get_logger(__name__)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -283,7 +283,7 @@ class DiscoverySearchService:
             _release_discovery_search_service(self)
 
     def _enabled_names(self) -> list[str]:
-        names = [name for name in _PROVIDER_ORDER if name in self.providers]
+        names = [name for name in DISCOVERY_PROVIDERS if name in self.providers]
         if not app_config.get_bool("DISCOVERY_DOUBAN_ENABLED", True):
             names = [name for name in names if name != "douban"]
         return names
@@ -308,7 +308,7 @@ class DiscoverySearchService:
         selected = list(dict.fromkeys((name or "").strip().lower() for name in selected if (name or "").strip()))
         if not selected:
             raise ValueError("至少选择一个搜索来源")
-        unknown = [name for name in selected if name not in _PROVIDER_ORDER]
+        unknown = [name for name in selected if name not in DISCOVERY_PROVIDERS]
         if unknown:
             raise ValueError("不支持的搜索来源")
         disabled = [name for name in selected if name not in enabled]

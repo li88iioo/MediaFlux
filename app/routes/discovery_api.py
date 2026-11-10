@@ -15,6 +15,7 @@ from app.discovery.search import get_discovery_search_service
 from app.discovery.service import get_discovery_service, project_watchlist_state
 from app.routes.discovery_image import decode_poster_token, encode_poster_token
 from app.web import api_error, api_response, require_api_login
+from app.discovery.models import DISCOVERY_PROVIDERS
 
 
 def _require_discovery_enabled() -> None:
@@ -24,7 +25,6 @@ def _require_discovery_enabled() -> None:
 
 router = APIRouter(prefix="/api/discovery", dependencies=[Depends(_require_discovery_enabled)])
 _BASE_QUERY_KEYS = {"provider", "category", "media_type", "page"}
-_PROVIDERS = {"tmdb", "douban", "bangumi"}
 _MEDIA_TYPES = {"movie", "tv"}
 _PROVIDER_MEDIA_TYPES = {
     "tmdb": {"movie", "tv"},
@@ -58,7 +58,7 @@ def _identity(provider: str, media_type: str, external_id: str) -> tuple[str, st
     provider = (provider or "").strip().lower()
     media_type = (media_type or "").strip().lower()
     external_id = (external_id or "").strip()
-    if provider not in _PROVIDERS:
+    if provider not in DISCOVERY_PROVIDERS:
         raise ValueError("不支持的数据源")
     if media_type not in _MEDIA_TYPES:
         raise ValueError("媒体类型无效")

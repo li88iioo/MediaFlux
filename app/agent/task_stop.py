@@ -11,10 +11,10 @@ from app.agent.effect_completion import session_effect_trackers
 from app.agent.kernel.completion_receipts import EFFECT_PENDING
 from app.agent.kernel.session_guard import session_scope_guard
 from app.agent.kernel.state_types import SessionBusyError
+from app.repositories.agent_jobs import AGENT_JOB_ACTIVE_STATUSES
+from app.repositories.agent_jobs import AGENT_JOB_TERMINAL_STATUSES
 
 _AGENT_JOB_TYPE = "library_episode_audit"
-_AGENT_JOB_ACTIVE = frozenset({"pending", "running", "retry_wait"})
-_AGENT_JOB_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 _ORGANIZE_ACTIVE = frozenset({"queued", "running", "stopping"})
 _ORGANIZE_TERMINAL = frozenset(
     {"completed", "partial", "failed", "cancelled", "manual_review", "stopped"}
@@ -120,9 +120,9 @@ def _cancel_agent_job(owner: str, task_id: str) -> str:
     if str(_value(row, "job_type", "")) != _AGENT_JOB_TYPE:
         return "uncancellable"
     status = str(_value(row, "status", "")).strip().casefold()
-    if status in _AGENT_JOB_TERMINAL:
+    if status in AGENT_JOB_TERMINAL_STATUSES:
         return "already_terminal"
-    if status not in _AGENT_JOB_ACTIVE:
+    if status not in AGENT_JOB_ACTIVE_STATUSES:
         return "uncancellable"
 
     updated, outcome = cancel_agent_job(

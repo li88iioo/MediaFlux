@@ -36,6 +36,8 @@ from app.discovery.providers.base import (
     TimeoutValue,
 )
 from app.logger import get_logger
+from app.clients.douban_public import DOUBAN_IMAGE_HOSTS
+from app.clients.douban_frodo import FRODO_CREDENTIAL_SOURCES
 
 logger = get_logger(__name__)
 
@@ -45,9 +47,6 @@ _FALLBACK_AUTH_COOLDOWN_SECONDS = 1800.0
 _FRODO_AUTH_DISABLED_UNTIL_RESTART = math.inf
 _FALLBACK_FAILURE_THRESHOLD = 3
 _FALLBACK_COOLDOWN_SECONDS = 300.0
-_FRODO_CREDENTIAL_SOURCES = frozenset(
-    {"explicit", "environment", "compatibility_default"}
-)
 _FRODO_AUTH_STATE_CONDITION = threading.Condition()
 _FRODO_AUTH_DISABLED_CREDENTIALS: set[str] = set()
 _FRODO_AUTH_IN_FLIGHT: set[str] = set()
@@ -70,13 +69,6 @@ _FALLBACK_ERRORS = (
     ProviderUnavailable,
     ProviderInvalidResponse,
 )
-_DOUBAN_IMAGE_HOSTS = {
-    "img1.doubanio.com",
-    "img2.doubanio.com",
-    "img3.doubanio.com",
-    "img9.doubanio.com",
-    "qnmob3.doubanio.com",
-}
 _EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 _TRUE_VALUES = {"1", "true", "yes", "on", "y"}
@@ -121,7 +113,7 @@ def _disable_frodo_auth_for_process(client: Any) -> None:
 
 def _safe_frodo_credential_source(client: Any) -> str:
     source = str(getattr(client, "credential_source", "") or "").strip()
-    return source if source in _FRODO_CREDENTIAL_SOURCES else "unknown"
+    return source if source in FRODO_CREDENTIAL_SOURCES else "unknown"
 
 
 def _config_get(config: Mapping[str, Any] | None, key: str, default: str = "") -> str:
@@ -158,7 +150,7 @@ def _image_key(value: Any) -> str:
     host = (parsed.hostname or "").lower()
     if (
         parsed.scheme not in {"http", "https"}
-        or host not in _DOUBAN_IMAGE_HOSTS
+        or host not in DOUBAN_IMAGE_HOSTS
         or parsed.username
         or parsed.password
         or port not in {None, 80, 443}

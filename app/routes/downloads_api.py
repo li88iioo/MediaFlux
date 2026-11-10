@@ -17,7 +17,6 @@ from app.clients.qbittorrent import (
 )
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.modules.download_dispatcher import (
-    SUPPORTED_TARGETS,
     download_resubmit_capabilities,
     resubmit_download_request,
 )
@@ -38,6 +37,7 @@ from app.repositories.download_requests import (
     retry_download_local_import,
 )
 from app.web import api_error, api_response, require_api_login
+from app.repositories.download_requests import DOWNLOAD_TARGETS
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/downloads")
@@ -417,7 +417,7 @@ def resubmit_issues_batch(request: Request, data: dict | None = Body(default=Non
     if not isinstance(data, dict):
         return api_error("请求数据必须是 JSON 对象", 400)
     target = str(data.get("target") or "").strip().lower()
-    if target not in SUPPORTED_TARGETS:
+    if target not in DOWNLOAD_TARGETS:
         return api_error("下载目标无效", 400)
     try:
         request_ids = _normalize_record_ids(data.get("request_ids"), field="request_ids")
@@ -548,7 +548,7 @@ def resubmit_issue(
     if not isinstance(data, dict):
         return api_error("请求数据必须是 JSON 对象", 400)
     target = str(data.get("target") or "").strip().lower()
-    if target not in SUPPORTED_TARGETS:
+    if target not in DOWNLOAD_TARGETS:
         return api_error("下载目标无效", 400)
 
     row = download_requests_repo.get_download_request(request_id)
