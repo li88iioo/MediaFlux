@@ -6,16 +6,10 @@ import re
 import time
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
-
-
-def _database() -> "ModuleType":
-    """延迟取得数据库门面，保持测试 DB_PATH/configure_database 的唯一状态。"""
-    from app import database
-
-    return database
+    pass
 
 
 def current_agent_web_search_usage_date() -> str:
@@ -48,9 +42,8 @@ def reserve_agent_web_search_credits(
     if unit_cost < 1 or limit < unit_cost:
         return False
 
-    database = _database()
-    timestamp = database.now()
-    with database.get_conn() as conn:
+    timestamp = db.now()
+    with db.get_conn() as conn:
         # 必须保持为同一 IMMEDIATE 事务，防止并发请求透支每日额度。
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
@@ -76,14 +69,13 @@ def refund_agent_web_search_credits(
     day = _validate_agent_web_search_usage_date(usage_date)
     if isinstance(cost, bool) or cost < 1:
         raise ValueError("搜索额度参数无效")
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
             "UPDATE agent_web_search_daily_usage "
             "SET credits_used=MAX(0,credits_used-?),updated_at=? "
             "WHERE provider=? AND usage_date=?",
-            (cost, database.now(), provider_name, day),
+            (cost, db.now(), provider_name, day),
         )
         return cursor.rowcount == 1
 
@@ -98,7 +90,7 @@ def _validate_cache_key(value: str) -> str:
 def get_agent_web_search_cache(cache_key: str) -> dict[str, Any] | None:
     key = _validate_cache_key(cache_key)
     now_epoch = int(time.time())
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         row = conn.execute(
             "SELECT payload FROM agent_web_search_cache "
             "WHERE cache_key=? AND expires_at>?",
@@ -126,13 +118,12 @@ def set_agent_web_search_cache(
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     if len(encoded.encode("utf-8")) > 512 * 1024:
         raise ValueError("缓存内容过大")
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO agent_web_search_cache(cache_key,payload,expires_at,updated_at) "
             "VALUES(?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET "
             "payload=excluded.payload,expires_at=excluded.expires_at,updated_at=excluded.updated_at",
-            (key, encoded, int(time.time()) + ttl_seconds, database.now()),
+            (key, encoded, int(time.time()) + ttl_seconds, db.now()),
         )
         conn.execute(
             "DELETE FROM agent_web_search_cache WHERE expires_at<=?",
@@ -141,7 +132,7 @@ def set_agent_web_search_cache(
 
 
 def clear_agent_web_search_cache() -> None:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("DELETE FROM agent_web_search_cache")
 
 
@@ -150,7 +141,7 @@ def get_agent_web_search_daily_usage(*, provider: str, usage_date: str) -> int:
     if not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", provider_name):
         raise ValueError("provider 无效")
     day = _validate_agent_web_search_usage_date(usage_date)
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         row = conn.execute(
             "SELECT credits_used FROM agent_web_search_daily_usage "
             "WHERE provider=? AND usage_date=?",

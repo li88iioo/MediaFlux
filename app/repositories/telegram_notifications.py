@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any
+from app import database as db
 
 _MAX_ATTEMPTS = 7
 _LEASE_SECONDS = 120
@@ -679,7 +680,3 @@ def _enqueue_confirmation_delivery(
             timestamp,
         ),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

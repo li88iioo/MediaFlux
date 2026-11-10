@@ -11,19 +11,14 @@ import json
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Literal
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
+    pass
 
 _QUEUE_KEY = "media_refresh_queue:v1"
 _STATE_VERSION = 1
 _MAX_RECENT_TARGETS = 4096
-
-
-def _database() -> "ModuleType":
-    from app import database
-
-    return database
 
 
 def _empty_state() -> dict[str, Any]:
@@ -48,7 +43,6 @@ def _read_state(conn) -> dict[str, Any]:
 
 
 def _write_state(conn, state: dict[str, Any]) -> None:
-    database = _database()
     payload = json.dumps(
         state,
         ensure_ascii=False,
@@ -58,7 +52,7 @@ def _write_state(conn, state: dict[str, Any]) -> None:
     conn.execute(
         "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-        (_QUEUE_KEY, payload, database.now()),
+        (_QUEUE_KEY, payload, db.now()),
     )
 
 
@@ -189,8 +183,7 @@ def enqueue_media_refresh(
     now_value = float(time.time() if now_epoch is None else now_epoch)
     due_at = now_value + max(0.0, float(debounce_seconds or 0.0))
     key = _group_key(normalized_provider, normalized_ids, binding)
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         # 生产者只追加 pending，绝不依据时间回收 running；消费者可能仍在执行
@@ -253,8 +246,7 @@ def claim_due_media_refreshes(
         raise ValueError("媒体库刷新 worker owner 不能为空")
     now_value = float(time.time() if now_epoch is None else now_epoch)
     safe_limit = max(1, min((limit or 1), 64))
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         recovered = _recover_running_groups(state, now_value)
@@ -317,8 +309,7 @@ def settle_media_refresh(
     if outcome not in {"completed", "deferred", "failed"}:
         raise ValueError("媒体库刷新结算结果无效")
     now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         group = state["groups"].get(group_key or "")
@@ -366,8 +357,7 @@ def settle_media_refresh(
 def recover_media_refresh_leases(*, now_epoch: float | None = None) -> int:
     """在取得跨进程消费者锁后，立即恢复前一进程遗留的 running 租约。"""
     now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         recovered = _recover_running_groups(state, now_value, force=True)
@@ -382,8 +372,7 @@ def recent_media_refresh_target_ids(
 ) -> tuple[str, ...]:
     normalized_provider = _normalized_provider(provider)
     now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         before = len(state["recent"])
@@ -400,8 +389,7 @@ def recent_media_refresh_target_ids(
 
 def next_media_refresh_due_in(*, now_epoch: float | None = None) -> float | None:
     now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         state = _read_state(conn)
     due_values: list[float] = []
     for group in state["groups"].values():
@@ -422,8 +410,7 @@ def next_media_refresh_due_in(*, now_epoch: float | None = None) -> float | None
 
 def media_refresh_queue_status(*, now_epoch: float | None = None) -> dict[str, int]:
     now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         state = _read_state(conn)
     counts = {"queued": 0, "running": 0, "retry_wait": 0, "paths": 0, "recent": 0}
     for group in state["groups"].values():
@@ -448,6 +435,5 @@ def media_refresh_queue_status(*, now_epoch: float | None = None) -> dict[str, i
 
 def clear_media_refresh_queue() -> None:
     """仅供测试/维护显式清空刷新队列。"""
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("DELETE FROM settings_kv WHERE key=?", (_QUEUE_KEY,))

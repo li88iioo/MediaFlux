@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from app.modules.web_secret import get_web_secret
+from app import database as db
 
 _ALLOWED_JOB_TYPES = {"library_episode_audit"}
 _ACTIVE_STATUSES = {"pending", "running", "retry_wait"}
@@ -558,7 +559,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "updated_at=? WHERE status='running'",
         (timestamp, timestamp, timestamp),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

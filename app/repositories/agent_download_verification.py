@@ -16,6 +16,7 @@ from typing import Any, Protocol
 
 from app.modules.media_identity import normalize_episode_verification
 from app.modules.web_secret import get_web_secret
+from app import database as db
 
 
 def _target_identity(target: dict) -> tuple:
@@ -1010,11 +1011,3 @@ def _safe_date(value: Any) -> str:
     except (TypeError, ValueError):
         return ""
     return parsed.isoformat() if parsed <= datetime.now().astimezone().date() else ""
-
-
-
-
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db

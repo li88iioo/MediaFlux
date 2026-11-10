@@ -6,16 +6,10 @@ import sqlite3
 from typing import TYPE_CHECKING
 
 from app.modules.media_identity import confirmed_manual_position
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
-
-
-def _database() -> "ModuleType":
-    """延迟取得数据库门面，避免导入环并保持测试数据库补丁兼容。"""
-    from app import database
-
-    return database
+    pass
 
 
 def get_tmdb_lock(
@@ -25,7 +19,7 @@ def get_tmdb_lock(
     media_type: str,
     season: int,
 ) -> dict | None:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM tmdb_lock WHERE raw_name=? AND parent_path=? "
             "AND media_type=? AND season=? AND key_version=1 AND lock_source='manual'",
@@ -56,8 +50,7 @@ def upsert_tmdb_lock(
     season: int,
     lock_source: str,
 ) -> None:
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO tmdb_lock("
             "raw_name,parent_path,tmdb_id,title,year,media_type,season,key_version,"
@@ -68,7 +61,7 @@ def upsert_tmdb_lock(
             "locked_at=excluded.locked_at",
             (
                 raw_name, parent_path, tmdb_id, title, year,
-                media_type, season, 1, lock_source, database.now(),
+                media_type, season, 1, lock_source, db.now(),
             ),
         )
 
@@ -85,13 +78,13 @@ def list_tmdb_locks(keyword: str = "", limit: int = 200) -> list[sqlite3.Row]:
         params += [value, value, value, value]
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(sql, params).fetchall()
 
 
 def list_manual_episode_confirmations(tmdb_id: str) -> list[sqlite3.Row]:
     """独立的成功人工编号经验；清理整理日志不会删除学习事实。"""
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             "SELECT * FROM manual_episode_confirmations WHERE tmdb_id=? ORDER BY updated_at DESC,log_id DESC",
             (tmdb_id,),
@@ -163,6 +156,6 @@ def restore_manual_episode_confirmation(conn: sqlite3.Connection, log_id: int, r
 
 
 def delete_tmdb_lock(lock_id: int) -> bool:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         cur = conn.execute("DELETE FROM tmdb_lock WHERE id=?", (lock_id,))
         return cur.rowcount > 0

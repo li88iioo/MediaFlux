@@ -7,22 +7,16 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
+    pass
 
 
 logger = logging.getLogger(__name__)
 _PROBE_CACHE_MAINTENANCE_INTERVAL_SECONDS = 3600.0
 _probe_cache_maintenance_lock = threading.Lock()
 _probe_cache_next_maintenance = 0.0
-
-
-def _database() -> "ModuleType":
-    """延迟取得数据库门面，保持测试数据库与连接补丁兼容。"""
-    from app import database
-
-    return database
 
 
 _MEDIA_PROFILE_FIELDS = frozenset({
@@ -88,7 +82,7 @@ def get_media_probe_cache_many(
     file_ids = sorted({item[0] for item in requested})
     result: dict[tuple[str, str, int], str] = {}
     exact_fallbacks: dict[tuple[str, str, int], str] = {}
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         # SQLite 默认变量上限在不同发行版间存在差异，保守分块避免超限。
         for offset in range(0, len(file_ids), 400):
             chunk = file_ids[offset:offset + 400]
@@ -156,7 +150,7 @@ def prune_media_probe_cache(
     row_limit = max(1, max_rows)
     delete_limit = max(1, batch_size)
     deleted = 0
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         cursor = conn.execute(
             "DELETE FROM media_probe_cache WHERE file_id IN ("
             "SELECT file_id FROM media_probe_cache WHERE updated_at < ? "
@@ -164,7 +158,7 @@ def prune_media_probe_cache(
             ")",
             (expired_before, delete_limit),
         )
-        deleted += max(0, int(cursor.rowcount or 0))
+        deleted += max(0, (cursor.rowcount or 0))
         total = int(conn.execute(
             "SELECT COUNT(*) FROM media_probe_cache"
         ).fetchone()[0])
@@ -177,7 +171,7 @@ def prune_media_probe_cache(
                 ")",
                 (min(overflow, delete_limit),),
             )
-            deleted += max(0, int(cursor.rowcount or 0))
+            deleted += max(0, (cursor.rowcount or 0))
     return deleted
 
 
@@ -205,14 +199,13 @@ def _maybe_prune_media_probe_cache() -> None:
 
 
 def upsert_media_probe_cache(file_id: str, etag: str, size: int, payload: str) -> None:
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO media_probe_cache(file_id,etag,size,payload,updated_at) VALUES(?,?,?,?,?) "
             "ON CONFLICT(file_id) DO UPDATE SET etag=excluded.etag,size=excluded.size,"
             "payload=excluded.payload,updated_at=excluded.updated_at",
             (
-                file_id, (etag or ""), (size or 0), payload, database.now(),
+                file_id, (etag or ""), (size or 0), payload, db.now(),
             ),
         )
     _maybe_prune_media_probe_cache()
@@ -222,12 +215,11 @@ def upsert_media_probe_failure_cache(
     file_id: str, etag: str, size: int, payload: str
 ) -> bool:
     """原子写入失败缓存；同一文件版本的成功结果拥有永久优先级。"""
-    database = _database()
     normalized_file_id = file_id
     normalized_etag = (etag or "")
     normalized_size = (size or 0)
     normalized_payload = payload
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         # 锁住 read-check-write 窗口，防止迟到失败覆盖刚完成的成功探测。
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -247,7 +239,7 @@ def upsert_media_probe_failure_cache(
             "payload=excluded.payload,updated_at=excluded.updated_at",
             (
                 normalized_file_id, normalized_etag, normalized_size,
-                normalized_payload, database.now(),
+                normalized_payload, db.now(),
             ),
         )
     _maybe_prune_media_probe_cache()

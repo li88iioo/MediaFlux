@@ -6,9 +6,10 @@ import math
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
+    pass
 
 
 _MAX_ENTRIES = 512
@@ -17,13 +18,6 @@ _MAX_JSON_DEPTH = 64
 _MAX_POLICY_VERSION = 2**63 - 1
 _STATUSES = frozenset({"verified", "proposal", "negative"})
 _CACHE_KEY = re.compile(r"[0-9a-fA-F]{64}")
-
-
-def _database() -> ModuleType:
-    """只在调用时取得唯一连接状态，不在导入时读取配置或打开数据库。"""
-    from app import database
-
-    return database
 
 
 def _validate_key(value: object) -> str:
@@ -129,7 +123,7 @@ def get_episode_research_cache(
     """只读有效缓存；过期、策略版本不匹配或损坏记录一律视为 miss。"""
     key = _validate_key(cache_key)
     version = _validate_policy_version(policy_version)
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         row = conn.execute(
             "SELECT status,CAST(payload AS BLOB) AS payload,expires_at,updated_at,policy_version "
             "FROM episode_research_cache WHERE cache_key=? AND policy_version=? AND expires_at>? "
@@ -172,7 +166,7 @@ def put_episode_research_cache(
     if type(ttl_seconds) is not int or not 60 <= ttl_seconds <= 2_592_000:
         raise ValueError("ttl_seconds 必须是 60..2592000 的整数")
     encoded = _encode_payload(payload)
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         # 先获得跨连接写锁再取时间，避免并发 count/逐出越限或等待缩短 TTL。
         conn.execute("BEGIN IMMEDIATE")
         timestamp = time.time()
@@ -198,5 +192,5 @@ def put_episode_research_cache(
 def invalidate_episode_research_cache(cache_key: str) -> None:
     """幂等删除单个证据缓存，不清理其它研究或网页缓存。"""
     key = _validate_key(cache_key)
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("DELETE FROM episode_research_cache WHERE cache_key=?", (key,))

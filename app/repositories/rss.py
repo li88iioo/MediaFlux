@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from app.modules.media_identity import normalize_tmdb_id
+from app import database as db
 
 
 def add_rss_subscription(name: str, urls: str, exclude_keywords: str = "",
@@ -1526,7 +1527,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         (timestamp,),
     )
     _reconcile_rss_download_entries_conn(conn)
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

@@ -5,15 +5,10 @@ import json
 import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
-
-
-def _database() -> "ModuleType":
-    from app import database
-
-    return database
+    pass
 
 
 def _future_stamp(seconds: int) -> str:
@@ -99,12 +94,11 @@ def enqueue_organize_probe_completion(
     notification_context: dict | None = None,
 ) -> int:
     """登记整理成功但在线探测未完成的文件；同一日志幂等。"""
-    database = _database()
-    stamp = database.now()
+    stamp = db.now()
     next_attempt = _future_stamp(max(30, delay_seconds))
     payload = json.dumps(rules if isinstance(rules, dict) else {}, ensure_ascii=False)
     context_json = json.dumps(normalize_notification_context(notification_context), ensure_ascii=False)
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO organize_probe_queue(organize_log_id,provider,source_id,rel_dir,"
             "rules_json,notification_context_json,status,attempts,max_attempts,next_attempt_at,lease_owner,lease_until,"
@@ -128,11 +122,10 @@ def enqueue_organize_probe_completion(
 def claim_due_organize_probe_jobs(
     *, owner: str, lease_seconds: int = 900, limit: int = 1,
 ) -> list[dict]:
-    database = _database()
-    stamp = database.now()
+    stamp = db.now()
     lease_until = time.time() + max(30, (lease_seconds or 900))
     safe_limit = max(1, min((limit or 1), 20))
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT id FROM organize_probe_queue "
@@ -161,9 +154,8 @@ def complete_organize_probe_job(
     job_id: int, *, owner: str, handoff_completed: bool = False,
 ) -> bool:
     """只有有效执行者确认下游接管后，才清空待交接载荷并完成任务。"""
-    database = _database()
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         # 先获得 writer 再取 lease 校验时间，不能使用等待写锁前的过期快照。
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
@@ -180,8 +172,7 @@ def complete_organize_probe_job(
 def cancel_organize_probe_job(
     job_id: int, *, owner: str = "", reason: object = "",
 ) -> bool:
-    database = _database()
-    stamp = database.now()
+    stamp = db.now()
     sql = (
         "UPDATE organize_probe_queue SET status='cancelled',lease_owner='',lease_until=0,"
         "last_error_type='Cancelled',last_error=?,completed_at=?,updated_at=? WHERE id=?"
@@ -190,7 +181,7 @@ def cancel_organize_probe_job(
     if owner:
         sql += " AND status='running' AND lease_owner=?"
         params.append(owner)
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         cur = conn.execute(sql, params)
         return cur.rowcount == 1
 
@@ -198,9 +189,8 @@ def cancel_organize_probe_job(
 def release_organize_probe_job(
     job_id: int, *, owner: str, delay_seconds: int = 30, reason: object = "",
 ) -> bool:
-    database = _database()
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE organize_probe_queue SET status='retry_wait',next_attempt_at=?,"
             "lease_owner='',lease_until=0,last_error_type='Busy',last_error=?,updated_at=? "
@@ -221,9 +211,8 @@ def fail_or_retry_organize_probe_job(
     error: object,
     base_backoff_seconds: int = 600,
 ) -> str:
-    database = _database()
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT attempts,max_attempts FROM organize_probe_queue "
@@ -251,23 +240,21 @@ def fail_or_retry_organize_probe_job(
 
 
 def recover_stale_organize_probe_jobs(*, force: bool = False) -> int:
-    database = _database()
-    stamp = database.now()
+    stamp = db.now()
     where = "status='running'" if force else "status='running' AND lease_until<=?"
     params: list[object] = [] if force else [time.time()]
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE organize_probe_queue SET status='retry_wait',next_attempt_at=?,"
             "lease_owner='',lease_until=0,last_error_type='ProcessInterrupted',"
             "last_error='上次进程在媒体规格补全期间中断',updated_at=? WHERE " + where,
             (stamp, stamp, *params),
         )
-        return int(cur.rowcount or 0)
+        return (cur.rowcount or 0)
 
 
 def count_organize_probe_jobs() -> dict[str, int]:
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         rows = conn.execute(
             "SELECT status,COUNT(*) AS count FROM organize_probe_queue GROUP BY status"
         ).fetchall()
@@ -288,9 +275,8 @@ def commit_organize_probe_rename(
 ) -> bool:
     """同事务提交审计和待交接变化；队列调用必须持有未过期 lease。"""
     pending = json.dumps(changes, ensure_ascii=False)
-    database = _database()
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         job = conn.execute(
             "SELECT id FROM organize_probe_queue WHERE id=? AND organize_log_id=? "
@@ -382,8 +368,7 @@ def get_organize_probe_notification_progress(
             for ref in refs
         )
 
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         # 两个队列读取同一 SQLite 快照，不能把两次查询之间的交接误判为排空。
         conn.execute("BEGIN")
         jobs = conn.execute(

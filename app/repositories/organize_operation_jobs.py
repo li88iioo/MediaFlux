@@ -16,9 +16,10 @@ from typing import TYPE_CHECKING, Any
 from app.agent.public_safety import sanitize_public_text, sanitize_resource_title
 from app.modules.web_secret import get_web_secret
 from app.repositories.agent_jobs import agent_job_owner_digest
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
+    pass
 
 _ALLOWED_KINDS = {
     "agent_directory_scrape", "agent_guangya_cleanup",
@@ -90,18 +91,12 @@ class OrganizeOperationExpired(RuntimeError):
     """原执行期限已到；不得继续写入，不声称云端已受理操作被撤销。"""
 
 
-def _database() -> "ModuleType":
-    from app import database
-
-    return database
-
-
 def get_conn():
-    return _database().get_conn()
+    return db.get_conn()
 
 
 def now() -> str:
-    return _database().now()
+    return db.now()
 
 
 def organize_operation_owner_digest(owner: str) -> str:
@@ -971,9 +966,9 @@ def recover_orphaned_organize_operation_jobs() -> int:
             "AND status<>'running'"
         )
         return (
-            max(0, int(cancelled.rowcount or 0))
+            max(0, (cancelled.rowcount or 0))
             + len(resumed_job_ids)
-            + max(0, int(reviewed.rowcount or 0))
+            + max(0, (reviewed.rowcount or 0))
         )
 
 

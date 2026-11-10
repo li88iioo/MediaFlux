@@ -10,6 +10,7 @@ from typing import Any
 
 from app.logger import redact_sensitive_text
 from app.repositories.download_requests import _STRM_REQUEST_ACTIVE_SQL
+from app import database as db
 
 INTERRUPTED_ERROR = "上次进程在 STRM 同步或排队期间中断"
 REFRESH_PENDING_ERROR = "STRM 已完成，媒体库刷新等待后台重试"
@@ -17,12 +18,6 @@ REFRESH_PENDING_ERROR = "STRM 已完成，媒体库刷新等待后台重试"
 # lease 从 1 开始；0 仅由 init_db 的活跃归属恢复事务发放，-1 表示无凭据。
 # 通用 download_request 更新已有的 >=0 撤销逻辑同时覆盖启动凭据，无需 schema 变更。
 _INTERRUPTION_PROOF = 0
-
-
-def _db():
-    from app import database
-
-    return database
 
 
 def _snapshot(row) -> dict[str, Any]:
@@ -114,7 +109,7 @@ def current_strm_request_owners(request_ids: Iterable[int | str] | None) -> list
     )
     if not ids:
         return []
-    with _db().get_conn() as conn:
+    with db.get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM download_requests WHERE id IN ("
             + ",".join("?" for _ in ids)
@@ -156,7 +151,7 @@ def request_owners_for_work(
     keys = list(dict.fromkeys(str(key) for key in (work_keys or ())))
     if not keys:
         return []
-    with _db().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         claims = _claimed_change_leases(conn, claimed_targets)
         if claimed_targets is not None:
@@ -219,7 +214,7 @@ def request_owners_for_work(
                         "strm_error": "",
                         "strm_finished_at": None,
                     },
-                    _db().now(),
+                    db.now(),
                     resume_failure=True,
                 )
             owners.append(owner)
@@ -229,7 +224,7 @@ def request_owners_for_work(
 def has_pending_strm_request_refresh(owners: Iterable[dict[str, Any]] | None) -> bool:
     if not owners:
         return False
-    with _db().get_conn() as conn:
+    with db.get_conn() as conn:
         return any(
             _current_owner_row(conn, owner) is not None
             and conn.execute(
@@ -382,10 +377,10 @@ def _update_strm_owner_state(
 def update_strm_request_state(
     owner: dict[str, Any], *, claimed_targets: Iterable[dict[str, Any]] | None = None, **fields: Any
 ) -> bool:
-    with _db().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         return _update_strm_owner_state(
-            conn, owner, fields, _db().now(), claimed_targets=claimed_targets
+            conn, owner, fields, db.now(), claimed_targets=claimed_targets
         )
 
 

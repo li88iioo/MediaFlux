@@ -10,6 +10,7 @@ from typing import Any
 
 from app.agent.errors import AgentToolError
 from app.modules.web_secret import get_web_secret
+from app import database as db
 
 _PLAN_RE = re.compile(r"^PP-[0-9A-F]{24}$")
 
@@ -194,7 +195,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "WHERE status='prepared'",
         (timestamp, timestamp),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

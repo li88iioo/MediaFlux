@@ -6,6 +6,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from typing import Any
+from app import database as db
 
 
 def _ensure_patrol(conn: sqlite3.Connection, due_at: str, timestamp: str) -> sqlite3.Row:
@@ -523,7 +524,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "next_run_at=?,updated_at=? WHERE status='running'",
         (timestamp, timestamp),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

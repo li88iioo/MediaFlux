@@ -429,20 +429,12 @@ class EpisodeResearchCacheTests(unittest.TestCase):
 
 
 class EpisodeResearchRepositoryImportTests(unittest.TestCase):
-    def test_import_does_not_import_database_or_config_or_open_connections(self):
+    def test_import_does_not_open_connections(self):
+        # 仓储统一在模块顶部绑定 app.database；导入它本身不得打开连接。
         code = '''
-import importlib.abc
-import sys
 from unittest.mock import patch
-class ForbiddenImports(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname in {"app.database", "app.config"}:
-            raise AssertionError("eager database/config import")
-sys.meta_path.insert(0, ForbiddenImports())
 with patch("sqlite3.connect", side_effect=AssertionError("database opened")):
     from app.repositories import episode_research
-assert "app.database" not in sys.modules
-assert "app.config" not in sys.modules
 '''
         completed = subprocess.run(
             [sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],

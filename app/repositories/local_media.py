@@ -10,6 +10,8 @@ from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
 from typing import Any
+from app import database as db
+from app.repositories import organize_history as organize_history_repo
 
 _LOCAL_MEDIA_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed"})
 
@@ -1848,8 +1850,3 @@ def _recover_after_restart(conn, timestamp: str, *, writer_available: bool) -> N
             (timestamp,),
         )
     reconcile_local_media_downloads(conn)
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402
-from app.repositories import organize_history as organize_history_repo  # noqa: E402

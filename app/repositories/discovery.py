@@ -3,21 +3,14 @@ from __future__ import annotations
 
 import sqlite3
 from typing import TYPE_CHECKING, Any
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
-
-
-def _database() -> "ModuleType":
-    # 延迟导入避免 app.database 在加载兼容导出时形成循环依赖；同时保证
-    # DB_PATH/configure_database 的唯一状态仍由兼容门面持有。
-    from app import database
-
-    return database
+    pass
 
 
 def get_discovery_cache(cache_key: str) -> sqlite3.Row | None:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             "SELECT * FROM discovery_cache WHERE cache_key=?", (cache_key,)
         ).fetchone()
@@ -29,7 +22,7 @@ def get_discovery_cache_many(cache_keys: list[str]) -> dict[str, sqlite3.Row]:
     if not keys:
         return {}
     result: dict[str, sqlite3.Row] = {}
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         for offset in range(0, len(keys), 900):
             chunk = keys[offset:offset + 900]
             placeholders = ",".join("?" for _ in chunk)
@@ -52,7 +45,7 @@ def upsert_discovery_cache(
     status: str = "success",
 ) -> None:
     normalized_status = "error" if status == "error" else "success"
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO discovery_cache(cache_key,provider,payload,fetched_at,expires_at,stale_until,last_error,status) "
             "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET "
@@ -67,7 +60,7 @@ def upsert_discovery_cache(
 
 
 def update_discovery_cache_error(cache_key: str, last_error: str) -> None:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "UPDATE discovery_cache SET last_error=? WHERE cache_key=?",
             ((last_error or "")[:500], cache_key),
@@ -84,7 +77,7 @@ def purge_discovery_cache(
     row_limit = max(1, max_rows)
     delete_limit = max(1, batch_size)
     deleted = 0
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         cursor = conn.execute(
             "DELETE FROM discovery_cache WHERE cache_key IN ("
             "SELECT cache_key FROM discovery_cache WHERE stale_until < ? "
@@ -92,7 +85,7 @@ def purge_discovery_cache(
             ")",
             (expired_before, delete_limit),
         )
-        deleted += max(0, int(cursor.rowcount or 0))
+        deleted += max(0, (cursor.rowcount or 0))
         total = int(conn.execute(
             "SELECT COUNT(*) FROM discovery_cache"
         ).fetchone()[0])
@@ -105,14 +98,14 @@ def purge_discovery_cache(
                 ")",
                 (min(overflow, delete_limit),),
             )
-            deleted += max(0, int(cursor.rowcount or 0))
+            deleted += max(0, (cursor.rowcount or 0))
     return deleted
 
 
 def get_media_external_id(
     provider: str, external_id: str, media_type: str,
 ) -> sqlite3.Row | None:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             "SELECT * FROM media_external_ids WHERE provider=? AND external_id=? AND media_type=?",
             (provider, external_id, media_type),
@@ -132,7 +125,7 @@ def list_media_external_ids(
         return {}
     result: dict[tuple[str, str, str], sqlite3.Row] = {}
     # SQLite 常见变量上限为 999；每个 identity 使用三个绑定参数。
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         for offset in range(0, len(keys), 300):
             chunk = keys[offset:offset + 300]
             clauses = " OR ".join(
@@ -165,8 +158,7 @@ def upsert_media_external_id(
     confidence: float = 0,
     confirmed: bool = False,
 ) -> None:
-    database = _database()
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute(
             "INSERT INTO media_external_ids(provider,external_id,media_type,tmdb_id,title,year,confidence,confirmed,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) DO UPDATE SET "
@@ -178,7 +170,7 @@ def upsert_media_external_id(
                 provider, external_id, media_type, tmdb_id,
                 (title or ""), (year or ""),
                 max(0.0, min(float(confidence or 0), 1.0)),
-                1 if confirmed else 0, database.now(),
+                1 if confirmed else 0, db.now(),
             ),
         )
 
@@ -193,7 +185,6 @@ def confirm_media_external_id_if_unchanged(
     expected: dict | None,
 ) -> bool:
     """仅当来源映射仍与确认预检快照一致时写入 confirmed 映射。"""
-    database = _database()
     identity = (provider, external_id, media_type)
     values = (
         tmdb_id,
@@ -201,9 +192,9 @@ def confirm_media_external_id_if_unchanged(
         (year or ""),
         1.0,
         1,
-        database.now(),
+        db.now(),
     )
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         if expected is None:
             cur = conn.execute(
                 "INSERT INTO media_external_ids("
@@ -226,7 +217,7 @@ def confirm_media_external_id_if_unchanged(
                     1 if bool(expected.get("confirmed")) else 0,
                 ),
             )
-        return int(cur.rowcount or 0) == 1
+        return cur.rowcount == 1
 
 
 def _watchlist_key(provider: str, external_id: str, media_type: str) -> str:
@@ -239,7 +230,7 @@ def list_media_watchlist_keys(identities: list[tuple[str, str, str]]) -> set[str
     if not normalized:
         return set()
     watched: set[str] = set()
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN")
         for offset in range(0, len(normalized), 300):
             chunk = normalized[offset:offset + 300]
@@ -269,17 +260,16 @@ def add_media_watchlist(
     expected_absent: bool = False,
 ) -> int | None:
     """普通添加更新元数据；冻结预览只允许首次插入，冲突返回 None。"""
-    database = _database()
     conflict = "DO NOTHING" if expected_absent else (
         "DO UPDATE SET title=excluded.title,year=excluded.year,poster_key=excluded.poster_key"
     )
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         row = conn.execute(
             "INSERT INTO media_watchlist(provider,external_id,media_type,title,year,poster_key,created_at) "
             f"VALUES(?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) {conflict} RETURNING id",
             (
                 provider, external_id, media_type, (title or ""),
-                (year or ""), (poster_key or ""), database.now(),
+                (year or ""), (poster_key or ""), db.now(),
             ),
         ).fetchone()
         return int(row["id"]) if row is not None else None
@@ -288,7 +278,7 @@ def add_media_watchlist(
 def get_media_watchlist(
     provider: str, external_id: str, media_type: str
 ) -> sqlite3.Row | None:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             "SELECT * FROM media_watchlist WHERE provider=? AND external_id=? AND media_type=?",
             (provider, external_id, media_type),
@@ -297,7 +287,7 @@ def get_media_watchlist(
 
 def get_media_watchlist_by_id(watchlist_id: int) -> sqlite3.Row | None:
     """读取单管理员媒体工作区的共享收藏；会话 owner 不是权限主体。"""
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             "SELECT * FROM media_watchlist WHERE id=?",
             (watchlist_id,),
@@ -332,7 +322,7 @@ def delete_media_watchlist(
         parameters += tuple(expected_snapshot.get(key) for key in (
             "watchlist_number", "title", "year", "poster_key", "created_at",
         ))
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         cur = conn.execute(
             f"DELETE FROM media_watchlist WHERE {where}", parameters,
         )
@@ -347,7 +337,7 @@ def list_media_watchlist(
     parameters = (() if before_number is None else (before_number,)) + (
         max(1, min(limit, 1000)),
     )
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             f"SELECT * FROM media_watchlist{where} ORDER BY id DESC LIMIT ?",
             parameters,
@@ -356,7 +346,7 @@ def list_media_watchlist(
 
 def get_media_watchlist_statistics() -> list[sqlite3.Row]:
     """单次只读查询计算全库及各类型数量，并取各类型编号最新的三项。"""
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return conn.execute(
             "SELECT id,provider,media_type,title,year,total,type_count FROM ("
             "SELECT id,provider,media_type,title,year,"
@@ -369,5 +359,5 @@ def get_media_watchlist_statistics() -> list[sqlite3.Row]:
 
 
 def count_media_watchlist() -> int:
-    with _database().get_conn() as conn:
+    with db.get_conn() as conn:
         return int(conn.execute("SELECT COUNT(*) FROM media_watchlist").fetchone()[0])

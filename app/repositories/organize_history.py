@@ -7,6 +7,8 @@ from typing import Any
 
 from app.logger import get_logger
 from app.repositories import recognition
+from app import database as db
+from app.repositories import telegram_notifications
 
 logger = get_logger(__name__)
 
@@ -573,8 +575,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "WHERE status='pending'",
         (timestamp,),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402
-from app.repositories import telegram_notifications  # noqa: E402

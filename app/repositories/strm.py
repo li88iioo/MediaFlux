@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any, Literal, overload
+from app import database as db
 
 
 def strm_failure_selection(ids: list[int], *, status: str = "all") -> list[dict]:
@@ -1672,7 +1673,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "updated_at=?,resolved_at=NULL WHERE status='retrying'",
         (timestamp,),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

@@ -12,6 +12,8 @@ from typing import Any
 
 from app.logger import redact_sensitive_text
 from app.modules.local_media_models import LOCAL_TASK_STATUSES
+from app import database as db
+from app.repositories import local_media as local_media_repo
 
 _PLACEHOLDER_TITLES = ("", "磁力任务", "链接任务", "ED2K 任务", "未命名任务", "未命名下载请求", "离线下载", "torrent", "resource")
 
@@ -2047,8 +2049,3 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "WHERE notification_delivery_status='sending'",
         (timestamp, timestamp),
     )
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402
-from app.repositories import local_media as local_media_repo  # noqa: E402

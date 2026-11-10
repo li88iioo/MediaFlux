@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from app.modules.media_proxy_safety import safe_media_name
+from app import database as db
 
 
 def add_media_proxy_instance(
@@ -757,7 +758,3 @@ def _prune_playback_history(conn: sqlite3.Connection, *, retained_rows: int) -> 
         (retained_rows,),
     )
     _delete_orphan_media_proxy_playback_sessions(conn)
-
-
-# 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
-from app import database as db  # noqa: E402

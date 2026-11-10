@@ -10,24 +10,18 @@ from typing import TYPE_CHECKING, Any, Iterable, TypedDict
 
 from app.logger import redact_sensitive_text
 from app.repositories.download_requests import download_postprocess_failure, download_postprocess_issues
+from app import database as db
 
 if TYPE_CHECKING:
-    from types import ModuleType
-
-
-def _database() -> "ModuleType":
-    """延迟取得数据库门面，保持测试数据库与时间补丁兼容。"""
-    from app import database
-
-    return database
+    pass
 
 
 def get_conn():
-    return _database().get_conn()
+    return db.get_conn()
 
 
 def now() -> str:
-    return _database().now()
+    return db.now()
 
 
 def _json(value: Any, fallback: Any) -> str:
@@ -144,7 +138,8 @@ def add_media_subscription(
                 interval, stamp, stamp, stamp,
             ),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
 
 def media_subscription_identity_snapshot(conn: Any, tmdb_id: str, media_type: str) -> dict[str, Any]:
@@ -220,7 +215,8 @@ def upsert_media_subscription(
                     interval, stamp, "new" if enabled else "paused", 1, stamp, stamp,
                 ),
             )
-            return int(cur.lastrowid), True
+            assert cur.lastrowid is not None
+            return cur.lastrowid, True
 
         subscription_id = snapshot["subscription_id"]
         revision = int(snapshot["revision"] or 1) + 1
@@ -635,7 +631,8 @@ def claim_media_subscription_check_run(
             ") VALUES(?,?,?,'running',?)",
             (subscription_id, trigger, revision, stamp),
         )
-        return int(run.lastrowid)
+        assert run.lastrowid is not None
+        return run.lastrowid
 
 
 def media_subscription_check_is_active(
@@ -702,7 +699,7 @@ def recover_stale_media_subscription_checks(*, stale_minutes: int = 30) -> int:
                 *stale_ids,
             ),
         )
-        return int(cur.rowcount or 0)
+        return (cur.rowcount or 0)
 
 
 def add_media_subscription_run(subscription_id: int, trigger_type: str = "manual") -> int:
@@ -724,7 +721,8 @@ def add_media_subscription_run(subscription_id: int, trigger_type: str = "manual
                 now(),
             ),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
 
 def finish_media_subscription_run(
@@ -1302,9 +1300,8 @@ def _sync_media_download_admissions_conn(
 
 def sync_media_download_admission_for_request(request_id: int) -> int:
     """将下载请求的当前根状态即时投影到仍活跃的媒体订阅准入。"""
-    database = _database()
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         return _sync_media_download_admissions_conn(
             conn, request_id, stamp
         )
@@ -1317,11 +1314,10 @@ def reconcile_startup_media_download_admissions() -> tuple[int, int]:
     复用该请求。进入 ``submitting`` 后的请求由数据库启动迁移改为
     ``manual_review``，这里会继续保持媒体锁，避免重复后端任务。
     """
-    database = _database()
-    stamp = database.now()
+    stamp = db.now()
     projected = 0
     released = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         projected = _sync_media_download_admissions_conn(conn, None, stamp)
 
@@ -1338,7 +1334,7 @@ def reconcile_startup_media_download_admissions() -> tuple[int, int]:
                     stamp,
                 ),
             )
-            released = int(stale.rowcount or 0)
+            released = (stale.rowcount or 0)
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return 0, 0
@@ -1355,10 +1351,9 @@ def reconcile_media_download_admissions(
 ) -> int:
     """单连接批量读取并以状态/revision 守卫同步下载准入状态。"""
     keys = {value for value in local_keys if value}
-    database = _database()
-    stamp = database.now()
+    stamp = db.now()
     updated = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         # status/revision CAS 不保护同状态下的新错误和后处理字段；
         # 读取请求快照到准入发布必须共享同一个 SQLite writer 顺序。
         conn.execute("BEGIN IMMEDIATE")
@@ -1488,7 +1483,8 @@ def claim_media_download_admission(
                 subscription_id, subscription_revision, candidate_id, stamp, stamp,
             ),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
 
 def begin_media_download_dispatch(
@@ -1597,4 +1593,4 @@ def complete_media_download_admissions(media_keys: Iterable[str]) -> int:
             "('claimed','dispatching','submitted','downloading','processing')",
             [stamp, stamp, *keys],
         )
-        return int(cur.rowcount or 0)
+        return (cur.rowcount or 0)
