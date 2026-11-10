@@ -8,7 +8,7 @@ import secrets
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from functools import cache
+from functools import cache, partial
 from typing import TYPE_CHECKING, Any
 
 from app.agent.errors import ToolPipelineError
@@ -24,7 +24,7 @@ from app.sensitive_data import redact_sensitive_text
 
 from . import telegram_reference
 from .capabilities import ToolEffect
-from .conversation_context import persisted_conversation
+from .conversation_context import model_entry_messages, persisted_conversation
 from .events import AgentEventType
 from .model import (
     ModelEventType,
@@ -74,6 +74,7 @@ async def build_request(
 ) -> ModelRequest:
     lease = turn.tool_context.lease
     turn.refresh_model_tools()
+    project_messages = partial(model_entry_messages, available_names=turn.available_names)
     request_tools = () if turn.explaining else turn.tool_definitions
     parallel_reads = tuple(tool.model_name for tool in turn.selected_tools if independent_read(tool, turn.state.metadata.get("task"))) if (
         request_tools and not turn.confirming and not turn.tool_context.diagnostic_only
@@ -194,6 +195,7 @@ async def build_request(
             system_prompt=prompt, context_window_tokens=turn.context_window,
             output_tokens=turn.output_tokens, conservative=turn.conservative_budget,
             output_available=output_available,
+            message_projection=project_messages,
         )
 
     for _ in range(len(original_history) + 2):
@@ -237,7 +239,7 @@ async def build_request(
         raise ToolPipelineError("原始任务条件无法保真放入模型窗口", code="context_budget_exceeded")
     request = ModelRequest(
         system_prompt=prompt,
-        messages=request_messages,
+        messages=project_messages(request_messages),
         tools=request_tools,
         max_output_tokens=turn.output_tokens,
         round_index=turn.round_index,

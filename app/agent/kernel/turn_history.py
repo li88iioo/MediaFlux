@@ -50,11 +50,13 @@ def record_result(turn: AgentTurn,
     # 观察保留原 DTO；部分来源或失败不改造成回合异常。
     turn.has_tool_result = turn.has_tool_result or (error is None and result.get("ok") is not False)
     if error is None:
-        # 取得业务回执说明本次参数已被接纳；旧语法拒绝不掩盖真实执行结果。
-        # 已经开始执行的失败仍按对象保留，不因另一笔合法调用而消失。
+        # 取得当前模型入口回执，说明此前尚未执行的入口拒绝已经纠正。
+        # 语法拒绝仍按同工具清算；实际执行失败继续按对象保留。
         for previous, outcome in list(turn.unresolved_results.items()):
-            if (previous[0] == name and outcome.get("status") == "invalid_arguments"
-                    and outcome.get("execution_started") is not True):
+            if ((previous[0] == name and outcome.get("status") == "invalid_arguments"
+                    and outcome.get("execution_started") is not True)
+                    or (name in turn.available_names and outcome.get("status") == "tool_not_available"
+                        and outcome.get("execution_started") is False)):
                 turn.unresolved_results.pop(previous)
     incomplete = error is not None or result.get("status") == "rate_limited" or public_result_state(result) in {"failed", "warning", "pending"}
     if progress and (error is None or error.code != "invalid_arguments" or error.execution_started is True):

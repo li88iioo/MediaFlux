@@ -477,8 +477,9 @@ def bounded_model_messages(
     output_tokens: int,
     conservative: bool = False,
     output_available: Callable[[str], bool] | None = None,
+    message_projection: Callable[[Sequence[Any]], Sequence[Any]] | None = None,
 ) -> tuple[Any, ...]:
-    """保留最新完整回合，裁剪旧历史，并硬性阻止超窗口 Provider 请求。"""
+    """按出站视图预算，保留原结构供历史对账；裁剪旧历史并阻止超窗请求。"""
     groups, current, reserved_ids = protocol_history_groups(
         messages, history_end=history_end,
     )
@@ -500,6 +501,8 @@ def bounded_model_messages(
     )
 
     def cost(items: Sequence[Any]) -> int:
+        if message_projection is not None:
+            items = message_projection(items)
         return sum(8 + estimate(item.to_dict()) for item in items)
 
     total_cost = cost(history) + cost(current)
@@ -521,10 +524,14 @@ def bounded_model_messages(
         for index in range(eligible):
             original = group[index]
             archived = archive_native_output(original, output_available=output_available)
-            saving = cost([original]) - cost([archived])
-            if saving <= 0:
+            if archived is original:
                 continue
+            previous_cost = cost(group)
             group[index] = archived
+            saving = previous_cost - cost(group)
+            if saving <= 0:
+                group[index] = original
+                continue
             total_cost -= saving
             if total_cost <= message_budget:
                 return tuple([message for history_group in groups for message in history_group] + current)

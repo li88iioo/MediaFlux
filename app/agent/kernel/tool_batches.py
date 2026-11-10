@@ -20,7 +20,7 @@ from app.agent.public_view import (
 from .capabilities import ToolEffect
 from .continuation import _ContinuationAction
 from .conversation_codec import pending_content
-from .conversation_context import persisted_conversation, tool_error_message
+from .conversation_context import model_entry_messages, persisted_conversation, tool_error_message
 from .events import AgentEventType
 from .model import (
     ModelMessage,
@@ -103,6 +103,7 @@ def admit_calls(turn: AgentTurn, reply: _ModelRound) -> None:
         conservative=turn.conservative_budget,
         output_available=lambda path: workspace_output_available(
             turn.tool_context.owner, turn.tool_context.session_id, path),
+        message_projection=lambda messages: model_entry_messages(messages, available_names=turn.available_names),
     )
     turn.active_calls = tuple(calls)
     turn.completed_call_ids.clear()
@@ -153,6 +154,7 @@ async def execute_calls(turn: AgentTurn, reply: _ModelRound, round_task: Mapping
                 "该调用不在宿主提供的模型入口中；业务请通过工作区 mf --help、SDK 方法与 Skills 继续。",
                 code="tool_not_available",
             )
+            error.execution_started = False
             record_result(turn, call.name, call.arguments or {},
                           {"ok": False, "status": error.code, "summary": str(error)}, error=error,
                           rejected_call=call.call_id if call.argument_error else "")

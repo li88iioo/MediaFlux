@@ -97,6 +97,10 @@ def test_server_initial_read_executes_without_adding_its_schema_to_model():
         await collect(session.run(AgentInput(message='执行宿主固定只读接力',owner='owner',session_id='handoff',initial_read_tool=target.name)))
         read.assert_called_once()
         assert {tool['name'] for tool in model.requests[0].tools}=={workspace.model_name}
+        assert not any(message.tool_calls or message.role == 'tool' for message in model.requests[0].messages)
+        assert any('可信接力读取' in message.content for message in model.requests[0].messages)
+        saved = await states.load(owner='owner', session_id='handoff')
+        assert any(row.get('tool_name') == target.model_name for row in saved.conversation)
     asyncio.run(run())
 
 
