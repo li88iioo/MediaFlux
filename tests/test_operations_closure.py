@@ -230,7 +230,6 @@ def bot_stopped():
         for name in ("_bot", "_bot_thread", "_bot_thread_stop", "_progress_recovery_thread", "_progress_recovery_stop"):
             stack.enter_context(patch.object(handlers, name, None))
         agent_stop = stack.enter_context(patch.object(AGENT_EXECUTOR, "stop", return_value=True))
-        stack.enter_context(patch("app.bot.progress.stop_terminal_delivery_retries", return_value=True))
         yield handlers, agent_stop
 
 

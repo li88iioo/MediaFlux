@@ -1,9 +1,7 @@
 """RSS 订阅、条目状态机与诊断的数据访问。"""
 from __future__ import annotations
 
-import re
 import sqlite3
-import unicodedata
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -75,22 +73,6 @@ def list_enabled_rss_subscriptions() -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def list_enabled_rss_subscription_safe_targets() -> list[dict[str, Any]]:
-    """返回全部启用订阅的公开序号与名称，不读取地址、过滤词或路径。"""
-    with db.get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id,name FROM rss_items WHERE enabled=1 ORDER BY id ASC"
-        ).fetchall()
-    return [
-        {
-            "subscription_number": int(row["id"]),
-            "name": str(row["name"] or "").strip()[:120],
-            "enabled": True,
-        }
-        for row in rows
-    ]
-
-
 def get_rss_stats() -> dict[str, int]:
     with db.get_conn() as conn:
         subscriptions = conn.execute(
@@ -121,33 +103,6 @@ def get_rss_subscription(
         ).fetchone()
     with db.get_conn() as conn:
         return get_rss_subscription(sub_id, connection=conn)
-
-
-def find_rss_subscriptions_by_normalized_name(
-    normalized_name: str, *, limit: int = 3
-) -> list[sqlite3.Row]:
-    """按 NFKC/casefold 后的名称精确匹配；仅返回内部解析所需的 id/name。"""
-    target = re.sub(
-        r"\s+", " ", unicodedata.normalize("NFKC", (normalized_name or ""))
-    ).casefold().strip()
-    if not target:
-        return []
-    safe_limit = max(1, min((limit or 1), 10))
-    with db.get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id,name FROM rss_items ORDER BY id ASC"
-        ).fetchall()
-    matches: list[sqlite3.Row] = []
-    for row in rows:
-        candidate = unicodedata.normalize("NFKC", str(row["name"] or "")).strip(
-            " \t\r\n'\"“”‘’《》<>【】[]()（）.。!！?？,，:：;；"
-        )
-        candidate = re.sub(r"\s+", " ", candidate).casefold().strip()
-        if candidate == target:
-            matches.append(row)
-            if len(matches) >= safe_limit:
-                break
-    return matches
 
 
 def _update_rss_subscription_in_connection(

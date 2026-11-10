@@ -433,21 +433,6 @@ class TelegramCompatibilityTests(IsolatedDatabaseTestCase):
             self.assertTrue(progress.update("新进度"))
         self.assertEqual(bot.sent, [])
 
-    def test_retry_worker_waits_at_least_server_retry_after_and_can_be_stopped(self):
-        from app.bot.progress import _retry_terminal_until_delivered
-
-        progress = self.progress()
-        progress.bot.error = _api_error(429, "rate limited", retry_after=40)
-        with patch("app.bot.progress.time.time", return_value=1000.0):
-            self.assertFalse(progress.finish("最终结果"))
-            stop = Mock()
-            stop.wait.return_value = True
-            self.assertEqual(_retry_terminal_until_delivered(
-                progress.bot, telebot, progress.operation_id, stop, delays=(2.0,),
-            ), 0)
-            stop.wait.assert_called_once_with(40.0)
-            self.assertEqual(len(progress.bot.edits), 1)
-
     def test_repeated_terminal_429_extends_deadline_without_replaying_send(self):
         progress = self.progress()
         progress.bot.error = _api_error(429, "rate limited", retry_after=10)
@@ -482,26 +467,6 @@ class TelegramCompatibilityTests(IsolatedDatabaseTestCase):
                 self.assertNotIn("PRIVATE", output)
                 self.assertNotIn("https://", output)
         self.assertEqual(len(progress.bot.sent), 1)
-
-    def test_retry_worker_db_failure_does_not_guess_or_replay(self):
-        from app.bot.progress import _retry_terminal_until_delivered
-
-        progress = self.progress()
-        progress.bot.error = _api_error(429, "rate limited", retry_after=40)
-        self.assertFalse(progress.finish("最终结果"))
-        saved = db.kv_get("telegram_pending_operations_v1")
-        stop = Mock()
-        with (
-            patch("app.bot.progress._load_pending", side_effect=RuntimeError("PRIVATE_DB")),
-            self.assertLogs("app.bot.progress", level="INFO") as capture,
-        ):
-            self.assertEqual(_retry_terminal_until_delivered(
-                progress.bot, telebot, progress.operation_id, stop,
-            ), 0)
-        self.assertNotIn("PRIVATE", "\n".join(capture.output))
-        stop.wait.assert_not_called()
-        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), saved)
-        self.assertEqual(len(progress.bot.edits), 1)
 
     def test_display_boundary_contains_preview_constructor_failure_and_task_can_finish(self):
         progress = self.progress()

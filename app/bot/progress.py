@@ -36,10 +36,6 @@ _PENDING_KEY = "telegram_pending_operations_v1"
 _pending_lock = threading.RLock()
 _active_lock = threading.RLock()
 _active: dict[str, "TelegramProgress"] = {}
-_terminal_retry_lock = threading.RLock()
-_terminal_retry_stop = threading.Event()
-_terminal_retry_ids: set[str] = set()
-_terminal_retry_threads: set[threading.Thread] = set()
 _MAX_PENDING_OPERATIONS = 256
 _MAX_ACTIVE_OPERATIONS = 128
 _PENDING_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -1160,116 +1156,6 @@ def recover_stale_operations(
         except Exception as exc:
             logger.info("Telegram 中断任务状态清理失败 type=%s", type(exc).__name__)
     return recovered
-
-
-def _retry_terminal_until_delivered(
-    bot: Any,
-    telebot_module: Any,
-    operation_id: str,
-    stop_event: threading.Event,
-    *,
-    delays: tuple[float, ...] = (2.0, 8.0, 30.0, 120.0, 300.0),
-) -> int:
-    """在当前 Bot 代内重投一个已持久化终态；失败记录留给启动恢复。"""
-    target = ((operation_id or "").strip(),)
-    if not target[0]:
-        return 0
-    for delay in delays:
-        try:
-            with _pending_lock:
-                server_delay = max((
-                    _retry_wait_seconds(row) for row in _load_pending()
-                    if str(row.get("id") or "") == target[0]
-                ), default=0.0)
-        except Exception as exc:
-            logger.info("Telegram 终态重试时间读取失败 type=%s", type(exc).__name__)
-            # 无法确认服务端冷却期时不猜测重发，持久记录留给下次恢复。
-            return 0
-        if stop_event.wait(max(0.0, float(delay), server_delay)):
-            return 0
-        recovered = recover_stale_operations(
-            bot, telebot_module, operation_ids=target
-        )
-        if recovered:
-            return recovered
-        if pending_stale_operation_count(target) == 0:
-            return 0
-    return 0
-
-
-def reset_terminal_delivery_retry_generation() -> None:
-    """切换 Bot 客户端代，停止旧客户端上的运行期重投。"""
-    global _terminal_retry_stop
-    with _terminal_retry_lock:
-        _terminal_retry_stop.set()
-        _terminal_retry_stop = threading.Event()
-        _terminal_retry_ids.clear()
-        alive_threads = {
-            thread for thread in _terminal_retry_threads if thread.is_alive()
-        }
-        _terminal_retry_threads.clear()
-        _terminal_retry_threads.update(alive_threads)
-
-
-def schedule_terminal_delivery_retry(
-    bot: Any,
-    telebot_module: Any,
-    operation_id: str,
-    *,
-    delays: tuple[float, ...] = (2.0, 8.0, 30.0, 120.0, 300.0),
-) -> bool:
-    """为运行期新产生的 pending 终态启动一次去重、可停止的后台重投。"""
-    operation_id = (operation_id or "").strip()
-    if not operation_id:
-        return False
-    with _terminal_retry_lock:
-        if operation_id in _terminal_retry_ids:
-            return False
-        stop_event = _terminal_retry_stop
-        _terminal_retry_ids.add(operation_id)
-
-        def worker() -> None:
-            try:
-                recovered = _retry_terminal_until_delivered(
-                    bot,
-                    telebot_module,
-                    operation_id,
-                    stop_event,
-                    delays=delays,
-                )
-                if recovered:
-                    logger.info("Telegram 运行期终态已恢复投递")
-            finally:
-                current = threading.current_thread()
-                with _terminal_retry_lock:
-                    _terminal_retry_ids.discard(operation_id)
-                    _terminal_retry_threads.discard(current)
-
-        thread = threading.Thread(
-            target=worker,
-            name=f"tg-terminal-retry-{operation_id[:12]}",
-            daemon=True,
-        )
-        _terminal_retry_threads.add(thread)
-        try:
-            thread.start()
-        except Exception:
-            _terminal_retry_threads.discard(thread)
-            _terminal_retry_ids.discard(operation_id)
-            raise
-        return True
-
-
-def stop_terminal_delivery_retries(timeout: float = 5.0) -> None:
-    """停止当前 Bot 代的运行期终态重投线程。"""
-    with _terminal_retry_lock:
-        _terminal_retry_stop.set()
-        threads = tuple(_terminal_retry_threads)
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    for thread in threads:
-        if thread is threading.current_thread() or not thread.is_alive():
-            continue
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def cancel_active_operations(reason: str = "服务正在停止，本次操作已结束。") -> int:

@@ -1026,12 +1026,8 @@ def init_bot(stop_event: threading.Event | None = None):
                 import telebot
 
                 _register_commands(bot, telebot)
-                from app.bot.progress import (
-                    pending_stale_operation_ids,
-                    reset_terminal_delivery_retry_generation,
-                )
+                from app.bot.progress import pending_stale_operation_ids
 
-                reset_terminal_delivery_retry_generation()
                 # 必须在 init_bot 返回、polling 开始接收新任务前同步截取快照。
                 # 每代恢复线程持有独立停止事件，避免旧线程在重启清理事件后复活。
                 operation_ids = pending_stale_operation_ids()
@@ -4256,13 +4252,6 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
                 )
         except Exception as exc:
             logger.warning("收尾 Telegram 长任务失败 type=%s", type(exc).__name__)
-    try:
-        from app.bot.progress import stop_terminal_delivery_retries
-
-        # 先让运行中的操作持久化终态，再停止本代重投；下次 start 会创建新代恢复。
-        stop_terminal_delivery_retries(timeout=timeout)
-    except Exception as exc:
-        logger.warning("停止 Telegram 终态重投失败 type=%s", type(exc).__name__)
     if bot is not None:
         try:
             bot.stop_polling()

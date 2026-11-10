@@ -15,7 +15,6 @@ from app.bot.handlers import _recover_stale_progress_until_delivered
 from app.bot.progress import (
     TelegramProgress,
     _register_pending,
-    _retry_terminal_until_delivered,
     cancel_active_operations,
     recover_stale_operations,
 )
@@ -450,32 +449,6 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         recovery_bot = _EditBot()
         self.assertEqual(recover_stale_operations(recovery_bot), 1)
         self.assertEqual(recovery_bot.edits[-1][2], "<b>搜索完成</b>\n找到 3 项资源")
-        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
-
-    def test_runtime_terminal_retry_delivers_without_process_restart(self):
-        _register_pending({
-            "id": "runtime-terminal",
-            "chat_id": "100",
-            "label": "Agent 操作结果",
-            "mode": "edit",
-            "message_id": 44,
-            "message_thread_id": 77,
-            "started_at": 1,
-            "deadline": 2,
-            "terminal_text": "<b>操作已完成</b>",
-            "terminal_pending": True,
-            "clear_reply_markup": True,
-        })
-        bot = _FailingFinalEditBot()
-        stop_event = __import__("threading").Event()
-
-        recovered = _retry_terminal_until_delivered(
-            bot, _TELEBOT, "runtime-terminal", stop_event, delays=(0.0,)
-        )
-
-        self.assertEqual(recovered, 1)
-        self.assertEqual(bot.messages[-1][1], "<b>操作已完成</b>")
-        self.assertEqual(bot.messages[-1][2]["message_thread_id"], 77)
         self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
 
     def test_pending_operations_are_not_silently_truncated(self):

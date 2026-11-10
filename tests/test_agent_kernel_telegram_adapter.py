@@ -2078,8 +2078,6 @@ class TelegramAgentExecutorTests(unittest.TestCase):
             ), patch(
                 "app.bot.progress._remove_pending"
             ), patch(
-                "app.bot.progress.stop_terminal_delivery_retries"
-            ), patch(
                 "app.modules.telegram_resource_search.shutdown_telegram_indexer_worker"
             ):
                 job = executor.submit(

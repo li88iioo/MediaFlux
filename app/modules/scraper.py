@@ -526,7 +526,6 @@ _AVAILABILITY_TAG = re.compile(
     r"[^()（）\[\]【】]{1,24}(?:[\)）\]】]|$)",
     re.IGNORECASE,
 )
-_BRACKET_EPISODE_SUFFIX = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]\s*$")
 # 混合整包只在“集范围 + TV/完结状态”后接受完整的已知附加项；不能把
 # 真实括号副标题或独立 OVA/S00 当作整包范围。整段由既有清洗链记录到
 # noise_tokens，原始发布名和特别篇位置解析保持独立。

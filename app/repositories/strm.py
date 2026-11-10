@@ -323,14 +323,6 @@ def list_strm_path_cleanup_sources(file_ids: set[str]) -> list[str]:
         )]
 
 
-def list_strm_indexes_by_file_id(file_id: str) -> list[sqlite3.Row]:
-    """查询所有来源中引用同一远端文件的 STRM 索引。"""
-    with db.get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM strm_index WHERE file_id=? ORDER BY id", (file_id,)
-        ).fetchall()
-
-
 def list_strm_index_by_prefix(prefix: str) -> list[sqlite3.Row]:
     with db.get_conn() as conn:
         return conn.execute(
