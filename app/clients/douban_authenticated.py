@@ -22,6 +22,8 @@ from app.clients.douban_public import (
     _normalize_title,
     _plain_text,
     _safe_poster_url,
+    header_value,
+    sanitize_session,
     _score,
     _year,
 )
@@ -47,7 +49,6 @@ _USER_AGENT = (
 )
 _MAX_DBCL2_LENGTH = 512
 _DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-_SENSITIVE_SESSION_HEADERS = {"authorization", "proxy-authorization", "cookie"}
 _EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
 _AUTH_STATUS_PATH = "/mine"
 _AUTH_LOGIN_MARKER_RE = re.compile(
@@ -113,14 +114,6 @@ def _finite_timeout(value: TimeoutValue | None) -> TimeoutValue:
     raise ValueError("timeout must be finite and positive")
 
 
-def _header(headers: Mapping[str, Any], name: str) -> str:
-    wanted = name.lower()
-    for key, value in (headers or {}).items():
-        if key.lower() == wanted:
-            return str(value or "")
-    return ""
-
-
 def _safe_error(error: ProviderError) -> ProviderError:
     if isinstance(error, ProviderAuthenticationError):
         clean: ProviderError = ProviderAuthenticationError(
@@ -170,20 +163,8 @@ class DoubanAuthenticatedClient:
         return bool(self.dbcl2)
 
     def _prepare_session(self) -> None:
-        headers = getattr(self.session, "headers", None)
-        if headers is not None:
-            for key in list(headers):
-                if str(key).lower() in _SENSITIVE_SESSION_HEADERS:
-                    headers.pop(key, None)
-        if hasattr(self.session, "auth"):
-            self.session.auth = None
-        if hasattr(self.session, "trust_env"):
-            self.session.trust_env = False
-        cookies = getattr(self.session, "cookies", None)
-        clear = getattr(cookies, "clear", None)
-        if callable(clear):
-            clear()
-        set_cookie = getattr(cookies, "set", None)
+        sanitize_session(self.session)
+        set_cookie = getattr(getattr(self.session, "cookies", None), "set", None)
         if self.dbcl2 and callable(set_cookie):
             set_cookie(
                 "dbcl2",
@@ -207,7 +188,7 @@ class DoubanAuthenticatedClient:
         if 300 <= status < 400:
             # dbcl2 过期时豆瓣把受保护页面 302 到登录页；这是登录态失效，
             # 不是服务不可用，必须让用户看到可操作的原因。
-            location = _header(getattr(response, "headers", {}) or {}, "Location").lower()
+            location = header_value(getattr(response, "headers", {}) or {}, "Location").lower()
             if not classify_authentication and "sec.douban" in location:
                 # 安全验证/风控跳转没有足够证据判断 Cookie 是否失效。
                 return ProviderUnavailable("豆瓣认证状态暂时无法确认")
@@ -221,7 +202,7 @@ class DoubanAuthenticatedClient:
             return ProviderUnavailable("豆瓣认证状态暂时无法确认")
         if status == 429:
             try:
-                retry_after = int(_header(response.headers or {}, "Retry-After") or 0)
+                retry_after = int(header_value(response.headers or {}, "Retry-After") or 0)
             except ValueError:
                 retry_after = 0
             return ProviderRateLimited("豆瓣认证请求受限", retry_after=retry_after)
@@ -230,7 +211,7 @@ class DoubanAuthenticatedClient:
         return None
 
     def _read(self, response: Any, expected: str) -> tuple[bytes, str]:
-        content_type = _header(response.headers or {}, "Content-Type").split(";", 1)[0].strip().lower()
+        content_type = header_value(response.headers or {}, "Content-Type").split(";", 1)[0].strip().lower()
         valid_type = (
             content_type == "application/json" or content_type.endswith("+json")
             if expected == "json"
@@ -238,7 +219,7 @@ class DoubanAuthenticatedClient:
         )
         if not valid_type:
             raise ProviderInvalidResponse("豆瓣认证响应 Content-Type 无效")
-        content_length = _header(response.headers or {}, "Content-Length")
+        content_length = header_value(response.headers or {}, "Content-Length")
         if content_length:
             try:
                 length = int(content_length)

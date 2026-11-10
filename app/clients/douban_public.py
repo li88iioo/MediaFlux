@@ -610,7 +610,23 @@ def _html_detail(parser: _DetailHTMLParser) -> dict[str, Any]:
     }
 
 
-def _header(headers: Mapping[str, Any], name: str) -> str:
+def sanitize_session(session: Any) -> None:
+    """移除会话上的凭据头、认证与环境代理继承，并清空 cookie。"""
+    headers = getattr(session, "headers", None)
+    if headers is not None:
+        for key in list(headers):
+            if str(key).lower() in _SENSITIVE_SESSION_HEADERS:
+                headers.pop(key, None)
+    if hasattr(session, "auth"):
+        session.auth = None
+    if hasattr(session, "trust_env"):
+        session.trust_env = False
+    clear = getattr(getattr(session, "cookies", None), "clear", None)
+    if callable(clear):
+        clear()
+
+
+def header_value(headers: Mapping[str, Any], name: str) -> str:
     wanted = name.lower()
     for key, value in (headers or {}).items():
         if key.lower() == wanted:
@@ -655,25 +671,7 @@ class DoubanPublicClient:
             raise ValueError("min_interval must be finite and non-negative")
         self.clock = clock
         self.sleeper = sleeper
-        self._sanitize_session_credentials()
-
-    def _clear_cookies(self) -> None:
-        cookies = getattr(self.session, "cookies", None)
-        clear = getattr(cookies, "clear", None)
-        if callable(clear):
-            clear()
-
-    def _sanitize_session_credentials(self) -> None:
-        headers = getattr(self.session, "headers", None)
-        if headers is not None:
-            for key in list(headers):
-                if str(key).lower() in _SENSITIVE_SESSION_HEADERS:
-                    headers.pop(key, None)
-        if hasattr(self.session, "auth"):
-            self.session.auth = None
-        if hasattr(self.session, "trust_env"):
-            self.session.trust_env = False
-        self._clear_cookies()
+        sanitize_session(self.session)
 
     def _wait_for_slot(self) -> None:
         global _PROCESS_LAST_REQUEST_AT
@@ -712,7 +710,7 @@ class DoubanPublicClient:
 
     def _read_body(self, response: Any, expected: str) -> bytes:
         headers = getattr(response, "headers", {}) or {}
-        content_type = _header(headers, "Content-Type").split(";", 1)[0].strip().lower()
+        content_type = header_value(headers, "Content-Type").split(";", 1)[0].strip().lower()
         if expected == "json":
             valid_type = content_type == "application/json" or content_type.endswith("+json")
         else:
@@ -720,7 +718,7 @@ class DoubanPublicClient:
         if not valid_type:
             raise ProviderInvalidResponse("豆瓣公共响应 Content-Type 无效")
 
-        content_length = _header(headers, "Content-Length")
+        content_length = header_value(headers, "Content-Length")
         if content_length:
             try:
                 length = int(content_length)
@@ -761,7 +759,7 @@ class DoubanPublicClient:
         with _PROCESS_REQUEST_LOCK:
             for redirect_count in range(_MAX_REDIRECTS + 1):
                 self._wait_for_slot()
-                self._sanitize_session_credentials()
+                sanitize_session(self.session)
                 response = None
                 converted_error: ProviderTimeout | ProviderUnavailable | None = None
                 result: tuple[bytes, str] | None = None
@@ -778,10 +776,10 @@ class DoubanPublicClient:
                     if status in _REDIRECT_STATUSES:
                         if redirect_count >= _MAX_REDIRECTS:
                             raise ProviderUnavailable("豆瓣公共服务重定向过多")
-                        url = self._redirect_target(url, _header(response.headers, "Location"))
+                        url = self._redirect_target(url, header_value(response.headers, "Location"))
                         continue
                     if status == 429:
-                        retry_after_raw = _header(response.headers, "Retry-After")
+                        retry_after_raw = header_value(response.headers, "Retry-After")
                         try:
                             retry_after = int(retry_after_raw or 0)
                         except ValueError:
@@ -793,7 +791,7 @@ class DoubanPublicClient:
                         raise ProviderUnavailable("豆瓣公共服务暂不可用")
                     result = (
                         self._read_body(response, expected),
-                        _header(response.headers, "Content-Type"),
+                        header_value(response.headers, "Content-Type"),
                     )
                 except ProviderInvalidResponse:
                     raise

@@ -14,7 +14,6 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -36,20 +35,7 @@ from app.discovery.providers.base import (
 )
 from app.logger import get_logger
 
-try:
-    from app.clients.douban_public import DoubanPublicPage
-except ModuleNotFoundError as exc:  # Task 1 可在独立工作树中并行实现。
-    if exc.name != "app.clients.douban_public":
-        raise
-
-    @dataclass(frozen=True)
-    class DoubanPublicPage:  # type: ignore[no-redef]
-        items: tuple[dict[str, Any], ...] = field(default_factory=tuple)
-        has_more: bool = False
-        source: str = "frodo"
-
-        def __post_init__(self) -> None:
-            object.__setattr__(self, "items", tuple(self.items or ()))
+from app.clients.douban_public import DoubanPublicPage, header_value, sanitize_session
 
 
 logger = get_logger(__name__)
@@ -63,7 +49,6 @@ _USER_AGENT = (
     "iPhone/15.1.1 iPhone13,2 network/wifi model/unknown"
 )
 _DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-_SENSITIVE_SESSION_HEADERS = {"authorization", "proxy-authorization", "cookie"}
 _CREDENTIAL_SOURCES = frozenset({"explicit", "environment", "compatibility_default"})
 _COLLECTIONS = {
     "movie_showing": "movie_showing",
@@ -156,14 +141,6 @@ def _validated_user_agent(value: str | None) -> str:
     if not 8 <= len(user_agent) <= 256:
         raise ValueError("user_agent must be 8-256 characters")
     return user_agent
-
-
-def _header(headers: Mapping[str, Any], name: str) -> str:
-    wanted = name.lower()
-    for key, value in (headers or {}).items():
-        if key.lower() == wanted:
-            return str(value or "")
-    return ""
 
 
 def _detached_provider_error(error: ProviderError) -> ProviderError:
@@ -277,25 +254,7 @@ class DoubanFrodoClient:
             raise ValueError("max_response_bytes must be positive")
 
         self.page_size = max(1, min(page_size, 100))
-        self._sanitize_session_credentials()
-
-    def _clear_cookies(self) -> None:
-        cookies = getattr(self.session, "cookies", None)
-        clear = getattr(cookies, "clear", None)
-        if callable(clear):
-            clear()
-
-    def _sanitize_session_credentials(self) -> None:
-        headers = getattr(self.session, "headers", None)
-        if headers is not None:
-            for key in list(headers):
-                if str(key).lower() in _SENSITIVE_SESSION_HEADERS:
-                    headers.pop(key, None)
-        if hasattr(self.session, "auth"):
-            self.session.auth = None
-        if hasattr(self.session, "trust_env"):
-            self.session.trust_env = False
-        self._clear_cookies()
+        sanitize_session(self.session)
 
     @property
     def configured(self) -> bool:
@@ -330,11 +289,11 @@ class DoubanFrodoClient:
 
     def _read_json(self, response: Any) -> dict[str, Any]:
         headers = getattr(response, "headers", {}) or {}
-        content_type = _header(headers, "Content-Type").split(";", 1)[0].strip().lower()
+        content_type = header_value(headers, "Content-Type").split(";", 1)[0].strip().lower()
         if content_type != "application/json" and not content_type.endswith("+json"):
             raise ProviderInvalidResponse("豆瓣 Frodo 响应 Content-Type 无效")
 
-        content_length = _header(headers, "Content-Length")
+        content_length = header_value(headers, "Content-Length")
         if content_length:
             try:
                 length = int(content_length)
@@ -374,7 +333,7 @@ class DoubanFrodoClient:
             return ProviderAuthenticationError("豆瓣 Frodo 认证失败")
         if status == 429:
             try:
-                retry_after = int(_header(getattr(response, "headers", {}) or {}, "Retry-After") or 0)
+                retry_after = int(header_value(getattr(response, "headers", {}) or {}, "Retry-After") or 0)
             except ValueError:
                 retry_after = 0
             return ProviderRateLimited("豆瓣 Frodo 请求受限", retry_after=retry_after)
@@ -389,7 +348,7 @@ class DoubanFrodoClient:
         payload: dict[str, Any] | None = None
         failure: ProviderError | None = None
         try:
-            self._sanitize_session_credentials()
+            sanitize_session(self.session)
             response = self.session.get(
                 f"{_BASE_URL}{path}",
                 params=signed,
