@@ -753,37 +753,6 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
         self.assertIn("跳过 2", rendered)
         self.assertIn("失败 1", rendered)
 
-    def test_task_summary_uses_compact_sections_instead_of_inline_candidate_dump(self):
-        from app.modules.organize import Organizer
-
-        counts = {
-            "视频": 302,
-            "已移动": 187,
-            "需确认": 2,
-            "跳过": 113,
-        }
-        footer = Organizer._task_notification_footer(
-            {
-                "need_confirm": 2,
-                "skipped": 113,
-                "skip_reasons": [
-                    "同版本仍按冲突策略处理：保留现有版本并跳过新文件",
-                    "批内同版本冲突：由更优版本胜出，未执行云盘写入",
-                ],
-            },
-            confirmation_group_count=2,
-        )
-
-        self.assertEqual(
-            Organizer._notification_count_summary(counts, compact=True),
-            "视频 302 · 入库 187 · 待确认 2 · 跳过 113",
-        )
-        self.assertIn("⚠️ 待确认 2 组", footer)
-        self.assertIn("2 组可直接选择识别候选", footer)
-        self.assertIn("⏭️ 跳过 113 个", footer)
-        self.assertIn("• 同版本仍按冲突策略处理", footer)
-        self.assertNotIn("最佳候选", footer)
-
     def test_bad_numeric_media_data_does_not_block_later_directory_notifications(self):
         from app.modules.organize import Organizer, OrganizeRules
 
@@ -924,7 +893,6 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
         client.list_dir.return_value = []
         organizer = Organizer(client=client, scraper=cast(TMDBScraper, object()))
         organizer._ensure_dir_chain = Mock(return_value="target")
-        organizer._find_file = Mock(return_value=None)
         plan = OrganizePlan(
             file_id="file-1",
             original_name="Show.S02E04.2160p.WEB-DL.HDR.mkv",

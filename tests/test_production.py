@@ -236,7 +236,7 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
             "Show_ Name.2026.S01E02-WEB-DL.1080p.H.265.mkv",
         )
         self.assertEqual(
-            organizer.build_show_dir(match, rules),
+            organizer.build_media_dir(match, rules),
             "Show_ Name (2026) {tmdb-88}",
         )
 

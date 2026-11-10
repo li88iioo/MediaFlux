@@ -1263,10 +1263,6 @@ class Organizer:
             return NSFW_DIR_DEFAULT
         return rules.show_dir_template if match.media_type == "tv" else rules.movie_dir_template
 
-    def build_show_dir(self, match: MatchResult, rules: OrganizeRules | None = None) -> str:
-        """剧集与电影使用同一目录命名规则。"""
-        return self.build_media_dir(match, rules)
-
     def build_media_dir(self, match: MatchResult, rules: OrganizeRules | None = None) -> str:
         """电影和剧集共用的独立媒体目录入口。"""
         rules = enforce_fixed_organize_rules(rules or OrganizeRules())
@@ -4240,28 +4236,6 @@ class Organizer:
             logger.warning("整理通知失败 type=%s", type(exc).__name__)
 
     @staticmethod
-    def _notification_count_summary(counts: dict, *, compact: bool = False) -> str:
-        from app.notifier import safe_int
-
-        total = safe_int(
-            counts.get("视频", counts.get("总视频", 0)), 0, minimum=0
-        )
-        suffix = "" if compact else " 个"
-        parts = [f"视频 {total}{suffix}"]
-        labels = (
-            ("已移动", "入库" if compact else "成功入库"),
-            ("元数据", "元数据"),
-            ("需确认", "待确认" if compact else "需要确认"),
-            ("跳过", "跳过"),
-            ("失败", "失败"),
-        )
-        for key, label in labels:
-            value = safe_int(counts.get(key, 0), 0, minimum=0)
-            if value > 0:
-                parts.append(f"{label} {value}{suffix}")
-        return " · ".join(parts)
-
-    @staticmethod
     def _confirmation_scope_summary(group: dict) -> str:
         from app.notifier import safe_int
 
@@ -4316,116 +4290,6 @@ class Organizer:
             return
         if text not in reasons and len(reasons) < limit:
             reasons.append(text)
-
-    @staticmethod
-    def _task_notification_footer(
-        stats: dict,
-        *,
-        confirmation_group_count: int = 0,
-        actionable_confirmation_count: int | None = None,
-        candidate_group_count: int | None = None,
-        skip_only_group_count: int | None = None,
-    ) -> str:
-        """生成任务级提示，区分候选卡、无元数据跳过卡与不可操作项。"""
-        from app.notifier import safe_int
-
-        sections: list[str] = []
-        need_confirm = safe_int(stats.get("need_confirm", 0), 0, minimum=0)
-        actionable = min(
-            need_confirm,
-            (
-                need_confirm
-                if actionable_confirmation_count is None and confirmation_group_count > 0
-                else safe_int(actionable_confirmation_count, 0, minimum=0)
-            ),
-        )
-        candidate_groups = max(0, min(
-            confirmation_group_count,
-            confirmation_group_count if candidate_group_count is None
-            else safe_int(candidate_group_count, 0, minimum=0),
-        ))
-        skip_only_groups = max(0, min(
-            confirmation_group_count - candidate_groups,
-            (confirmation_group_count - candidate_groups)
-            if skip_only_group_count is None
-            else safe_int(skip_only_group_count, 0, minimum=0),
-        ))
-        if need_confirm:
-            if confirmation_group_count > 0:
-                lines = [
-                    (
-                        f"⚠️ 待确认 {need_confirm} 个文件"
-                        if need_confirm != confirmation_group_count
-                        else f"⚠️ 待确认 {confirmation_group_count} 组"
-                    ),
-                    (
-                        f"已按媒体合并为 {confirmation_group_count} 组，"
-                        f"下方将发送 {confirmation_group_count} 张处理卡。"
-                    ),
-                ]
-                if candidate_groups:
-                    lines.append(f"• {candidate_groups} 组可直接选择识别候选")
-                if skip_only_groups:
-                    lines.append(
-                        f"• {skip_only_groups} 组暂无可用元数据，可在 Telegram 直接跳过"
-                    )
-                without_cards = max(0, need_confirm - actionable)
-                if without_cards:
-                    lines.append(
-                        f"• {without_cards} 个缺少安全文件快照，请前往 Web 待确认队列处理"
-                    )
-                sections.append("\n".join(lines))
-            else:
-                sections.append(
-                    f"⚠️ 待确认 {need_confirm} 个\n"
-                    "本轮没有可安全操作的 Telegram 处理卡；"
-                    "请前往 Web 待确认队列搜索、匹配或清理记录。"
-                )
-
-        skipped = safe_int(stats.get("skipped", 0), 0, minimum=0)
-        reasons = []
-        for value in stats.get("skip_reasons") or []:
-            text = " ".join(str(value or "").split())
-            if not text or text in reasons:
-                continue
-            reasons.append(text if len(text) <= 96 else f"{text[:95].rstrip()}…")
-            if len(reasons) >= 3:
-                break
-        if skipped:
-            lines = [f"⏭️ 跳过 {skipped} 个"]
-            lines.extend(f"• {reason}" for reason in reasons)
-            sections.append("\n".join(lines))
-
-        cleaned = safe_int(stats.get("empty_dirs_cleaned", 0), 0, minimum=0)
-        retained = (
-            safe_int(stats.get("empty_dir_cleanup_not_empty", 0), 0, minimum=0)
-            + safe_int(stats.get("empty_dir_cleanup_unavailable", 0), 0, minimum=0)
-        )
-        cleanup_reasons = []
-        for value in stats.get("empty_dir_cleanup_reasons") or []:
-            text = " ".join(str(value or "").split())
-            if text and text not in cleanup_reasons:
-                cleanup_reasons.append(text)
-            if len(cleanup_reasons) >= 3:
-                break
-        if cleaned or retained or cleanup_reasons:
-            summary = [f"清理 {cleaned} 个空目录"]
-            if retained:
-                summary.append(f"保留 {retained} 个非空或状态变化目录")
-            lines = ["🧹 " + " · ".join(summary)]
-            lines.extend(f"• {reason}" for reason in cleanup_reasons)
-            sections.append("\n".join(lines))
-
-        failed = safe_int(stats.get("failed", 0), 0, minimum=0)
-        if failed:
-            sections.append(f"❌ 失败 {failed} 个\n请在整理日志中查看失败文件和原因。")
-        if (
-            stats.get("scan_errors")
-            or stats.get("scan_limited")
-            or stats.get("scan_complete") is False
-        ):
-            sections.append("⚠️ 目录扫描未完整结束，本季集数与缺集统计不是最终结论。")
-        return "\n\n".join(sections)
 
     @staticmethod
     def _confirmation_summary(match: MatchResult) -> str:
@@ -7712,16 +7576,3 @@ class Organizer:
                 f"归档目标存在重复同名目录：{name}，请先在网盘中合并或更名"
             )
         return matches[0].file_id if matches else None
-
-    def _find_file(self, dir_id: str, name: str) -> GuangYaFile | None:
-        try:
-            for f in self.client.list_dir(dir_id):
-                if not f.is_dir and f.name == name:
-                    return f
-        except Exception as exc:
-            logger.warning(
-                "读取目标文件失败 dir=%s name=%s type=%s",
-                dir_id, name, type(exc).__name__,
-            )
-            raise
-        return None

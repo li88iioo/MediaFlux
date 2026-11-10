@@ -50,7 +50,6 @@ class NsfwDirectoryNamingTests(unittest.TestCase):
                         match = self.match(provider, year=year, media_type=media_type)
                         expected = "SODAH-003 (2024)" if year else "SODAH-003"
                         self.assertEqual(self.organizer.build_media_dir(match, self.rules), expected)
-                        self.assertEqual(self.organizer.build_show_dir(match, self.rules), expected)
                         self.assertEqual(self.organizer._match_identity_key(match), f"{provider}:SODAH-003")
 
     def test_ordinary_tmdb_directory_keeps_identity_and_omits_empty_year(self):
