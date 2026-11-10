@@ -203,6 +203,9 @@ def test_synchronous_failed_confirm_uses_effect_wait_with_or_without_task(native
         candidate, = await case.cold_store().due_continuations()
         assert candidate["kind"] == "effect"
         session, resumed = rebuild(case, ["finish"], "sync-effect-cold")
+        if tracked_task:
+            # 冷恢复保留原工作区入口；本例不模拟工具退役。
+            session.catalog.register(run_code_tool(session.pipeline))
         assert await session.resume_wait(candidate=candidate)
         restored = await case.cold_store().load(owner=case.owner, session_id=case.sid)
         case.assert_source(restored, users)
