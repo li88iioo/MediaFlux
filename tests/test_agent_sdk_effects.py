@@ -66,6 +66,7 @@ def resources_backend(monkeypatch):
 
     with (isolated_test_database(),
           patch("app.agent.kernel.ports.sdk_effects.get_indexer_service", return_value=service),
+          patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1),
           patch("app.indexers.downloads.download_target_readiness", side_effect=lambda target: {
               name: True for name in ("qb", "guangya") if target in (name, "both")}),
           patch("app.indexers.downloads.submit_indexer_download_batch", new=AsyncMock(side_effect=submit)) as backend):
@@ -904,7 +905,8 @@ def test_native_url_edit_freezes_target_and_never_exposes_or_edits_url(retry_bac
         context = await context_for(store)
         effects = executor(store)
         url = 'https://fixture.invalid/download/Show.torrent?passkey=private'
-        with patch('app.indexers.downloads.download_target_readiness', side_effect=lambda target: {target: True}):
+        with (patch('app.indexers.downloads.download_target_readiness', side_effect=lambda target: {target: True}),
+              patch('app.indexers.downloads.guangya_download_credential_generation', return_value=1)):
             original = (await effects.prepare('downloads.submit', {'url': url}, context=context)).effect_plan
             assert original is not None and original.arguments['target'] == 'guangya'
             editing = original.public_dict()['editing']

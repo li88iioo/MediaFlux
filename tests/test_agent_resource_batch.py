@@ -176,6 +176,7 @@ def test_receiving_directory_change_invalidates_frozen_plan_without_any_download
         with patch("app.agent.kernel.ports.sdk_effects.get_indexer_service", return_value=FakeDownloadService(_resource_item())), \
              patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=preview), \
              patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}), \
+             patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1), \
              patch("app.modules.missing_resources.config.get_bool", return_value=True), \
              patch("app.modules.offline.OfflineRules.from_config", return_value=rules) as config, \
              patch("app.indexers.downloads.submit_download_input") as execute:

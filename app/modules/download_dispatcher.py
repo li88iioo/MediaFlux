@@ -15,6 +15,7 @@ from typing import Any, TypedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from app import database as db
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.clients.qbittorrent import (
     QBittorrentClient,
     QBTorrentExportError,
@@ -564,6 +565,7 @@ def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 class _DispatchOptions(TypedDict, total=False):
+    guangya_credential_generation: int
     qb_save_path: str
     qb_category: str
     qb_runtime_config: dict[str, Any]
@@ -582,6 +584,7 @@ class _QBSubmissionOptions(TypedDict, total=False):
 
 
 class _GuangYaSubmissionOptions(TypedDict, total=False):
+    expected_credential_generation: int
     target_dir_id: str
     target_dir_name: str
     qb_runtime_config: dict[str, Any]
@@ -823,7 +826,19 @@ _RETRY_CONFIG_KEYS = (
 )
 
 
-def _download_retry_snapshot(row, target: str) -> dict[str, Any]:
+def guangya_download_credential_generation() -> int:
+    """只冻结登录世代；同账号的 access token 刷新不会使确认失效。"""
+    client = GuangYaClient()
+    try:
+        generation = client.credential_generation
+        if not client.logged_in:
+            raise ValueError("光鸭尚未登录，请重新登录后预检")
+        return generation
+    finally:
+        close_guangya_client(client)
+
+
+def _download_retry_snapshot(row, target: str) -> tuple[dict[str, Any], int | None]:
     if row is None:
         raise ValueError("下载待处理记录不存在")
     if row["attention_cleared_at"]:
@@ -852,15 +867,17 @@ def _download_retry_snapshot(row, target: str) -> dict[str, Any]:
         "effects": ["会重试所选目标，保留未重试目标的任务；根据当前状态补投原请求或创建新的提交记录。",
                     "若提交失败或受理结果未知，保留原待处理事实；不会自动重复提交。"],
     }
+    generation = guangya_download_credential_generation() if target in {"guangya", "both"} else None
     private = {
         **state,
         **{key: hashlib.sha256(bytes(row[key]) if isinstance(row[key], (bytes, bytearray, memoryview))
                               else str(row[key] or "").encode()).hexdigest()
            for key in ("request_key", "title", "source_value", "torrent_data")},
         "runtime_config": {key: get(key, "") for key in _RETRY_CONFIG_KEYS},
+        **({"guangya_credential_generation": generation} if generation is not None else {}),
     }
     state["fingerprint"] = hashlib.sha256(json.dumps(private, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-    return state
+    return state, generation
 
 
 def prepare_download_retry(request_id: int, target: str) -> dict[str, Any]:
@@ -869,7 +886,7 @@ def prepare_download_retry(request_id: int, target: str) -> dict[str, Any]:
         raise ValueError("request_id 必须是大于 0 的整数")
     if not isinstance(target, str) or target.strip().lower() not in SUPPORTED_TARGETS:
         raise ValueError("target 仅支持 qb、guangya 或 both")
-    return _download_retry_snapshot(db.get_download_request(request_id), target.strip().lower())
+    return _download_retry_snapshot(db.get_download_request(request_id), target.strip().lower())[0]
 
 
 def public_download_retry_result(result: dict, *, source_request_id: int, target: str) -> dict:
@@ -898,18 +915,22 @@ def resubmit_download_request(
     log_path: str | None = None,
     expected_fingerprint: str | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     """安全重试指定目标；活动请求仅补投失败目标，其余创建历史 successor。"""
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     source_row = db.get_download_request(source_request_id)
+    generation = guangya_credential_generation
     if expected_fingerprint is not None:
         try:
-            snapshot = _download_retry_snapshot(source_row, targets)
+            snapshot, current_generation = _download_retry_snapshot(source_row, targets)
         except ValueError as exc:
             raise DownloadRetryChanged("下载待处理记录已变化，请重新预检") from exc
-        if snapshot["fingerprint"] != expected_fingerprint:
+        if (snapshot["fingerprint"] != expected_fingerprint
+                or generation is not None and generation != current_generation):
             raise DownloadRetryChanged("下载来源、状态或服务配置已变化，请重新预检")
+        generation = current_generation
     if not source_row:
         return {"ok": False, "error": "原下载请求不存在"}
 
@@ -926,6 +947,8 @@ def resubmit_download_request(
         }
 
     dispatch_kwargs: _DispatchOptions = {}
+    if generation is not None:
+        dispatch_kwargs["guangya_credential_generation"] = generation
     if check_cancelled is not None:
         check_cancelled()
         dispatch_kwargs["check_cancelled"] = check_cancelled
@@ -1156,6 +1179,7 @@ def dispatch_missing_targets(
     log_path: str | None = None,
     prepared_input: DownloadInput | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     """向已有资源请求补充尚未提交的后端，不重置已成功目标。"""
     if targets not in SUPPORTED_TARGETS:
@@ -1196,6 +1220,7 @@ def dispatch_missing_targets(
         qb_runtime_config=qb_runtime_config, qb_task_id_hint=qb_task_id_hint,
         rss_item_id=rss_item_id, log_path=log_path,
         check_cancelled=check_cancelled,
+        guangya_credential_generation=guangya_credential_generation,
     )
     return {"handled": True, "duplicate": False, **result}
 
@@ -1213,6 +1238,7 @@ def dispatch_request(
     rss_item_id: int | None = None,
     log_path: str | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
@@ -1232,6 +1258,7 @@ def dispatch_request(
         qb_runtime_config=qb_runtime_config, qb_task_id_hint=qb_task_id_hint,
         rss_item_id=rss_item_id, log_path=log_path,
         check_cancelled=check_cancelled,
+        guangya_credential_generation=guangya_credential_generation,
     )
 
 
@@ -1248,6 +1275,7 @@ def _dispatch_claimed_targets(
     rss_item_id: int | None = None,
     log_path: str | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     """第一提交、补投与 successor 共用目标级受理链，根状态由仓储原子归并。"""
     request_id = int(row["id"])
@@ -1267,6 +1295,8 @@ def _dispatch_claimed_targets(
         "target_dir_id": gy_target_dir,
         "target_dir_name": gy_target_name,
     }
+    if guangya_credential_generation is not None:
+        guangya_options["expected_credential_generation"] = guangya_credential_generation
     if qb_runtime_config is not None:
         guangya_options["qb_runtime_config"] = qb_runtime_config
     submissions = {
@@ -1749,6 +1779,7 @@ def _submit_guangya(
     row, *, target_dir_id: str = "", target_dir_name: str = "",
     qb_runtime_config: dict[str, Any] | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    expected_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     from app.modules.organize_sources import list_nsfw_download_sources
 
@@ -1808,17 +1839,28 @@ def _submit_guangya(
 
     if check_cancelled is not None:
         check_cancelled()
-    result = submit_offline(
-        str(row["source_value"] or ""),
-        title=str(row["title"] or ""),
-        target_dir_id=target_dir_id,
-        target_dir_name=target_dir_name,
-        isolate_task=True,
-        task_key=str(row["id"]),
-        torrent_data=torrent_data,
-        on_staging_created=persist_staging,
-        public_magnet_title=_public_magnet_title(row),
-    )
+    client = GuangYaClient() if expected_credential_generation is not None else None
+    try:
+        if client is not None and (
+            client.credential_generation != expected_credential_generation or not client.logged_in
+        ):
+            return {"ok": False, "error": "光鸭登录凭据已变化，未提交下载，请重新预检",
+                    "failure_code": "guangya_credentials_changed", "retryable": False}
+        # 使用刚复验的同一客户端，不能在写入时重新加载另一个账号的凭据。
+        result = submit_offline(
+            str(row["source_value"] or ""),
+            title=str(row["title"] or ""),
+            **({"client": client} if client is not None else {}),
+            target_dir_id=target_dir_id,
+            target_dir_name=target_dir_name,
+            isolate_task=True,
+            task_key=str(row["id"]),
+            torrent_data=torrent_data,
+            on_staging_created=persist_staging,
+            public_magnet_title=_public_magnet_title(row),
+        )
+    finally:
+        close_guangya_client(client)
     task_ids = [str(item) for item in (result.get("task_ids") or []) if str(item)]
     return {**result, "task_id": task_ids[0] if task_ids else ""}
 

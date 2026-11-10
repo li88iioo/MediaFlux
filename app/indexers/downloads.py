@@ -30,6 +30,7 @@ from app.modules.download_dispatcher import (
     dispatch_missing_targets,
     dispatch_request,
     download_resubmit_capabilities,
+    guangya_download_credential_generation,
     normalize_download_url,
     prepare_download_input,
     public_dispatch_summary,
@@ -267,11 +268,14 @@ def preflight_indexer_download(service, result_id: str, target: str, *, scope: s
             "target_dir_id", "target_dir_name", "secondary_enabled", "secondary_dir_id", "secondary_dir_name",
         )}
         routing["secondary_keywords"] = list(rules.secondary_keywords)
+    backends = download_target_readiness(target)
+    credentials = ({"guangya_credential_generation": guangya_download_credential_generation()}
+                   if target in {"guangya", "both"} and backends.get("guangya") else {})
     return {
         "result_id": result_id, "target": target,
         "site_id": str(item.site_id), "site_name": str(item.site_name), "title": str(item.title),
         "download_state": str(item.download_state), "download_kinds": sorted(item.download_kinds),
-        "backends": download_target_readiness(target), "destination": destination, "routing": routing,
+        "backends": backends, "destination": destination, "routing": routing, **credentials,
     }
 
 
@@ -508,8 +512,11 @@ def _persist_and_dispatch(
     verification_targets: list[dict] | None = None,
     verification_owner: str = "",
     check_cancelled: Callable[[], None] | None = None,
+    guangya_credential_generation: int | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, Any]]:
     dispatch_kwargs: dict[str, Any] = {}
+    if guangya_credential_generation is not None:
+        dispatch_kwargs["guangya_credential_generation"] = guangya_credential_generation
     if check_cancelled is not None:
         check_cancelled()
         dispatch_kwargs["check_cancelled"] = check_cancelled
@@ -720,6 +727,7 @@ def submit_download_input(
     verification_targets: list[dict] | None = None,
     verification_owner: str = "",
     check_cancelled: Callable[[], None] | None = None,
+    guangya_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     """持久化并分发一个已规范化下载输入。
 
@@ -750,6 +758,7 @@ def submit_download_input(
         verification_targets=verification_targets,
         verification_owner=verification_owner,
         check_cancelled=check_cancelled,
+        guangya_credential_generation=guangya_credential_generation,
     )
     return {
         "request_id": request_id,
@@ -784,7 +793,10 @@ def preview_download_url(url: str, target: str) -> tuple[dict, dict]:
         "title": safe_download_text(item.title), "target": target, "backends": readiness,
         "effects": ["创建幂等下载请求", "提交到所选下载后端", "保留后续整理与 STRM 跟踪"],
     }
-    return preview, {"identity": request_key(item), "target": target, "backends": readiness}
+    snapshot: dict[str, Any] = {"identity": request_key(item), "target": target, "backends": readiness}
+    if target in {"guangya", "both"}:
+        snapshot["guangya_credential_generation"] = guangya_download_credential_generation()
+    return preview, snapshot
 
 
 def submit_download_url(url: str, target: str, *, origin: str,
@@ -799,7 +811,9 @@ def submit_download_url(url: str, target: str, *, origin: str,
     created = create_request(normalize_download_url(url), "", "", origin=origin)
     request_id = int(created["id"])
     try:
-        dispatch = dispatch_request(request_id, target, check_cancelled=check_cancelled)
+        credentials = ({"guangya_credential_generation": snapshot["guangya_credential_generation"]}
+                       if target in {"guangya", "both"} else {})
+        dispatch = dispatch_request(request_id, target, check_cancelled=check_cancelled, **credentials)
     except asyncio.CancelledError:
         if created["created"]:
             db.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
@@ -858,6 +872,8 @@ async def _submit_indexer_download(service, resolved: _ResolvedIndexerDownload, 
     target = snapshot["target"]
     if preflight_indexer_download(service, snapshot["result_id"], target, scope=scope) != snapshot:
         raise DownloadSnapshotChanged()
+    if "guangya_credential_generation" in snapshot:
+        options["guangya_credential_generation"] = snapshot["guangya_credential_generation"]
     submitted = await asyncio.to_thread(
         submit_download_input, resolved.item, target,
         origin=f"{origin_namespace}:{snapshot['site_id']}", **resolved.destination, **options,

@@ -25,6 +25,7 @@ MAGNET = "magnet:?xt=urn:btih:" + "a" * 40
 class BatchConvergenceTests(unittest.TestCase):
     def setUp(self):
         self.db_path = self.enterContext(isolated_test_database())
+        self.enterContext(patch.object(downloads, "guangya_download_credential_generation", return_value=1))
         self.enterContext(patch("socket.socket.connect", side_effect=AssertionError("禁止外联")))
         self.enterContext(patch.object(downloads, "download_target_readiness",
                                       side_effect=lambda target: {name: True for name in ("qb", "guangya") if target in {name, "both"}}))

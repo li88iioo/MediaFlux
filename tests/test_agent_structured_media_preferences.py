@@ -346,6 +346,7 @@ def test_native_missing_resource_rejects_invalid_quality_fields(invalid):
 def download_environment(preference_db):
     with patch("app.indexers.downloads.download_target_readiness", side_effect=lambda target: {
             name: True for name in (["qb", "guangya"] if target == "both" else [target])}), \
+            patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1), \
             patch("app.indexers.downloads.create_request", return_value={"id": 42, "created": True}) as create, \
             patch("app.indexers.downloads.dispatch_request",
                   side_effect=lambda number, target: {"ok": True, "status": "submitted", "succeeded": [target], "failed": []}) as dispatch:

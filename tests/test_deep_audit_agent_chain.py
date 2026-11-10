@@ -74,6 +74,7 @@ def offline_chain():
         service.enabled_site_ids = ("demo",)
         with (
             patch.object(indexer_config, "get_bool", return_value=True),
+            patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1),
             patch(
                 "app.indexers.downloads.download_target_readiness",
                 return_value={"qb": True, "guangya": True},

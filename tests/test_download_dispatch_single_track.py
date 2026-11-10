@@ -19,6 +19,7 @@ from tests.support import isolated_test_database
 class DownloadDispatchSingleTrackTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
+        self.enterContext(patch.object(downloads, 'guangya_download_credential_generation', return_value=1))
         self.serial = 0
 
     def request(self):

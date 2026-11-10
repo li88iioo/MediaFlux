@@ -437,6 +437,9 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
 class IndexerReceivingSourceTests(unittest.TestCase):
     """合成资源，仅验证来源路由，不访问索引站或下载后端。"""
 
+    def setUp(self):
+        self.enterContext(patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1))
+
     def test_classified_cloud_resource_uses_configured_source_on_shared_dispatch(self):
         for site, target, routed in (("sukebei", "guangya", True), ("sukebei", "both", True),
                                      ("sukebei", "qb", False), ("nyaa", "guangya", False)):

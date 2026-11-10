@@ -103,6 +103,7 @@ def test_native_search_file_cli_cold_batch_confirmation_and_original_verificatio
         "download_target_readiness",
         lambda target: {"qb": True, "guangya": True},
     )
+    monkeypatch.setattr(downloads, "guangya_download_credential_generation", lambda: 1)
     monkeypatch.setattr(missing_resources.config, "get_bool", lambda *a, **k: True)
     monkeypatch.setattr(
         sandbox,

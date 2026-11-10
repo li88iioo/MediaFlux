@@ -346,7 +346,8 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
 
     def test_agent_confirmation_does_not_promise_a_successor_for_partial_retry(self):
         request_id = self.request()
-        result = dispatcher.prepare_download_retry(request_id, "guangya")
+        with patch.object(dispatcher, "guangya_download_credential_generation", return_value=1):
+            result = dispatcher.prepare_download_retry(request_id, "guangya")
         effects = "".join(result["effects"])
         self.assertIn("重试所选目标", effects)
         self.assertIn("保留未重试目标的任务", effects)
