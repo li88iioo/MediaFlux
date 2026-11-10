@@ -695,13 +695,16 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text["stdout"].splitlines(), ["alpha", "3 /work/rows.txt", "beta"])
         skill = await self.execute('from pathlib import Path\n'
             'print("\\n".join(str(p) for p in sorted(Path("/skills").glob("*/SKILL.md"))))\n'
-            'path = Path("/skills/media-research/SKILL.md")\n'
-            'print("watchlist.list" in path.read_text())\n'
-            'try: path.write_text("override")\n'
-            'except OSError as exc:\n'
-            '    assert exc.errno in (13, 30)\n    print("builtin-readonly")')
+            'print("watchlist-present", "watchlist.list" in Path("/skills/media-research/SKILL.md").read_text())\n'
+            'for name in ("media-research/SKILL.md", "cloud-files/references/examples.md"):\n'
+            '    path = Path("/skills") / name\n'
+            '    print(bool(path.read_text()))\n'
+            '    try: path.write_text("override")\n'
+            '    except OSError as exc:\n'
+            '        assert exc.errno in (13, 30)\n        print("builtin-readonly")')
         self.assertEqual(skill["exit_code"], 0, skill["stderr"])
-        self.assertIn("True\nbuiltin-readonly", skill["stdout"])
+        self.assertIn("watchlist-present True", skill["stdout"])
+        self.assertEqual(skill["stdout"].count("True\nbuiltin-readonly"), 2)
         for installed in sandbox._SKILLS.glob("*/SKILL.md"):
             self.assertIn(f"/skills/{installed.parent.name}/SKILL.md", skill["stdout"])
 
