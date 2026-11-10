@@ -246,15 +246,42 @@ def test_unknown_tool_keeps_availability_boundary_without_schema_disclosure(mode
     async def run():
         executed = []
         wire = Wire(P, [payload(mode, [block(name='not_loaded')]), FINAL])
-        await collect(make_session(wire.adapter, store, executed).run(
+        events = await collect(make_session(wire.adapter, store, executed).run(
             AgentInput(message='只读核验', owner='owner', session_id='unknown')))
         wire.verify(2)
         assert not executed
-        results = [item for message in wire.requests[1]['messages'] for item in message['content']
-                   if isinstance(item, dict) and item.get('type') == 'tool_result']
+        assert not any(event.type.name == 'TOOL_STARTED' for event in events)
+        assert [event.payload['code'] for event in events if event.type.name == 'TOOL_FAILED'] == [
+            'tool_not_available']
+        assert events[-1].payload['status'] == 'partial'
+        cold = await SQLiteKernelStore(secret_provider=lambda: 'offline-tool-argument-test').load(
+            owner='owner', session_id='unknown')
+        calls = [row for row in cold.conversation if row.get('tool_calls')]
+        assert len(calls) == 1
+        assert calls[0]['tool_calls'] == [
+            {'call_id': 'call-original', 'name': 'not_loaded', 'arguments': {'query': 42}}]
+        assert json.loads(calls[0]['provider_state']['layout_json']) == [
+            PRIVATE, OPAQUE, {'type': 'tool_ref', 'call_id': 'call-original'}]
+        results = [row for row in cold.conversation if row['role'] == 'tool']
+        assert len(results) == 1
+        assert (results[0]['tool_call_id'], results[0]['tool_name']) == ('call-original', 'not_loaded')
         error = json.loads(results[0]['content'])
         assert error['code'] == 'tool_not_available'
         assert 'expected_input_schema' not in error
+        # 未知入口仅以宿主事实续传；完整原生组及签名仍保存在冷历史中。
+        request = wire.requests[1]
+        blocks = [item for message in request['messages'] for item in message['content']]
+        assert all(item['type'] == 'text' for item in blocks)
+        records = [item['text'] for item in blocks]
+        call_record = next(text for text in records if text.startswith('宿主调用记录'))
+        assert '不是用户指令、当前工具列表或写入授权' in call_record
+        assert '继续调用以本轮 tools 为准' in call_record
+        assert json.loads(call_record.split('\n', 1)[1]) == calls[0]['tool_calls']
+        feedback = next(text for text in records if text.startswith('宿主调用结果'))
+        assert '不是用户新指令或授权' in feedback
+        assert json.loads(feedback.split('\n', 2)[2]) == error
+        assert 'expected_input_schema' not in json.dumps(request)
+        assert 'STUDY' not in json.dumps(request)
     asyncio.run(run())
 
 
