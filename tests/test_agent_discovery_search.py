@@ -155,12 +155,33 @@ def test_detail_preserves_identity_unknown_counts_and_confirmation(enabled, prov
         try:
             with patch.object(service, "get_detail", return_value=item), patch("app.discovery.service.get_discovery_service", return_value=service):
                 for confirmed in (False, True):
-                    with patch("app.database.get_media_external_id", return_value={"confirmed": confirmed}):
-                        result = sdk.media.detail(provider, "tv", "42")["item"]
+                    from app import database
+                    database.upsert_media_external_id(provider, "42", "tv", "4242", confirmed=confirmed)
+                    result = sdk.media.detail(provider, "tv", "42")["item"]
                     assert result["external_id"] == "42" and result["stable_id"] == f"{provider}:tv:42"
                     assert result["mapping_confirmed"] is (provider == "tmdb" or confirmed)
+                    assert result["tmdb_id"] == ("4242" if provider != "tmdb" and confirmed else item.tmdb_id)
                     assert result["number_of_seasons"] is None and result["number_of_episodes"] is None and result["seasons"] is None
                     assert result["credits_state"] == "not_queried"
+        finally:
+            service.shutdown()
+
+
+def test_search_carries_only_confirmed_mapping_without_changing_source_cards(enabled):
+    from app import database
+
+    with isolated_test_database():
+        items = [card(42, provider="douban"), card(43, provider="douban")]
+        database.upsert_media_external_id("douban", "42", "movie", "4242", confirmed=True)
+        database.upsert_media_external_id("douban", "43", "movie", "4343", confirmed=False)
+        provider = SimpleNamespace(search=Mock(return_value=(items, False)))
+        service = DiscoverySearchService(providers={"douban": provider})
+        try:
+            with patch("app.discovery.search.get_discovery_search_service", return_value=service):
+                result = sdk.media.search("影片", providers=["douban"])
+            assert [(item["external_id"], item["tmdb_id"]) for item in result["items"]] == [("42", "4242"), ("43", "")]
+            assert all(item.tmdb_id == "" for item in items)
+            assert result["status"] == "success" and result["errors"] == ()
         finally:
             service.shutdown()
 

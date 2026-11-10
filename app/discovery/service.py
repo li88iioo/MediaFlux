@@ -86,13 +86,25 @@ def _watchlist_text(value: str, limit: int) -> str:
     return " ".join(cleaned.split())[:limit]
 
 
+def confirmed_tmdb_mappings(items: tuple[MediaCard, ...]) -> dict[tuple[str, str, str], str]:
+    """按来源身份批量读取已确认映射；未确认候选不成为作品事实。"""
+    mappings = database.list_media_external_ids([
+        (item.provider, item.external_id, item.media_type)
+        for item in items if item.provider != "tmdb"
+    ])
+    return {key: str(row["tmdb_id"]) for key, row in mappings.items()
+            if row["confirmed"] and row["tmdb_id"]}
+
+
 def project_watchlist_state(items: tuple[MediaCard, ...]) -> tuple[MediaCard, ...]:
     """列表与搜索共用读取时的批量收藏投影，不污染来源卡片或缓存。"""
     watched = database.list_media_watchlist_keys([
         (item.provider, item.external_id, item.media_type) for item in items
     ])
+    mappings = confirmed_tmdb_mappings(items)
     return tuple(replace(
         item, state="watchlisted" if item.stable_id in watched else item.state,
+        tmdb_id=mappings.get((item.provider, item.external_id, item.media_type), item.tmdb_id),
     ) for item in items)
 
 
@@ -532,8 +544,9 @@ class DiscoveryService:
         card = self.get_detail(provider, media_type, external_id)
         if card is None:
             return None
-        mapping = None if provider == "tmdb" else database.get_media_external_id(provider, external_id, media_type)
-        return {**card.to_dict(), "mapping_confirmed": provider == "tmdb" or bool(mapping and mapping["confirmed"]),
+        mapping = confirmed_tmdb_mappings((card,)).get((provider, external_id, media_type))
+        return {**card.to_dict(), "tmdb_id": mapping or card.tmdb_id,
+                "mapping_confirmed": provider == "tmdb" or bool(mapping),
                 "credits_state": "not_queried"}
 
     def prepare_watchlist_add(self, provider: str, media_type: str, external_id: str) -> dict[str, Any] | None:

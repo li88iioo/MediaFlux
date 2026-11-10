@@ -337,6 +337,31 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertEqual(page.items[0].release_date, "2026-03-04")
         self.assertEqual(provider.detail_calls, 1)
 
+    def test_confirmed_mapping_is_projected_on_fresh_cached_and_detail_reads(self):
+        provider = FakeProvider()
+        provider.name = "douban"
+        source = MediaCard("douban", "1", "movie", "映射电影", year="2026")
+        provider.list_items = Mock(return_value=DiscoveryPage(items=(source,), provider=ProviderHealth(name="douban")))
+        provider.detail_card = source
+        service = DiscoveryService(registry=ProviderRegistry({"douban": provider}), cache=self.cache)
+        self.addCleanup(service.shutdown)
+        page = service.list_items("douban", "movie_hot", "movie")
+        self.assertEqual(page.items[0].tmdb_id, "")
+        database.upsert_media_external_id("douban", "1", "movie", "550", confirmed=False)
+        database.upsert_media_external_id("douban", "1", "tv", "999", confirmed=True)
+        self.assertEqual(service.list_items("douban", "movie_hot", "movie").items[0].tmdb_id, "")
+        for identity in ("550", "551"):
+            database.upsert_media_external_id("douban", "1", "movie", identity, confirmed=True)
+            page = service.list_items("douban", "movie_hot", "movie")
+            self.assertTrue(page.cached)
+            self.assertEqual((page.items[0].external_id, page.items[0].tmdb_id), ("1", identity))
+            detail = service.describe_media("douban", "movie", "1")
+            self.assertEqual((detail["tmdb_id"], detail["mapping_confirmed"]), (identity, True))
+        self.assertEqual(source.tmdb_id, "")
+        provider.list_items.assert_called_once()
+        cached = self.cache.get(self.cache.make_key("douban", "movie_hot", "movie", 1, {}))
+        self.assertEqual(cached.payload["items"][0]["tmdb_id"], "")
+
     def test_detail_metadata_preserves_nonempty_fields_and_fills_empty_ones(self):
         self.provider.detail_card = MediaCard(
             provider="tmdb", external_id="1", media_type="movie", title="Detail",

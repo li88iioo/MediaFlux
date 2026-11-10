@@ -7,7 +7,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping
 
 import requests
@@ -51,9 +51,13 @@ class DiscoverySearchResult:
     errors: tuple[dict[str, Any], ...]
 
     def to_dict(self) -> dict[str, Any]:
+        from app.discovery.service import confirmed_tmdb_mappings
+
+        mappings = confirmed_tmdb_mappings(self.items)
         partial = bool(self.errors and self.providers_succeeded)
         status = ("partial" if partial else "success" if self.items else "empty") if self.providers_succeeded else "unavailable"
-        return {**asdict(self), "items": [card.to_dict() for card in self.items],
+        return {**asdict(self), "items": [replace(card, tmdb_id=mappings.get(
+                    (card.provider, card.external_id, card.media_type), card.tmdb_id)).to_dict() for card in self.items],
                 "ok": bool(self.providers_succeeded), "status": status, "partial": partial}
 
 
