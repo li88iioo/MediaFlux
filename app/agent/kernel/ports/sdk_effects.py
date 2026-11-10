@@ -3049,7 +3049,7 @@ def release_format_save_tool() -> KernelToolSpec:
                             "description": "目录范围使用用户明确提供或工具核实的实际父目录上下文。目录整理按“整理起点目录名/起点下的相对父目录”匹配，不能用来源显示别名或直接照抄磁盘绝对路径；先确认本次整理起点，或在目录教学页选择后自动带入。保留已有规则原值，不猜测、不自动改写历史范围；跨作品release时填空字符串。",
                         },
                     },
-                    "required": ["name", "template", "scope", "parent_path"],
+                    "required": ["name", "template"],
                     "additionalProperties": False,
                 },
                 "examples": {

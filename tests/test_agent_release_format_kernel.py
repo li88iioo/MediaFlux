@@ -54,12 +54,16 @@ def executor(store, *, cls=EffectExecutor, confirmation_store=None):
         effect_store=ConfirmationEffectPlanStore(confirmation_store or SQLiteConfirmationStore()))
 
 
-def test_cold_confirmation_executes_original_preview_once_and_keeps_secrets_private(runtime):
+@pytest.mark.parametrize("scope,omitted", [("directory", None), ("directory", "scope"), ("release", "parent_path")])
+def test_cold_confirmation_executes_original_preview_once_and_keeps_secrets_private(runtime, scope, omitted):
     async def check():
         store = SQLiteKernelStore()
         context = await context_for(store)
         effects = executor(store)
-        arguments = teaching()
+        arguments = teaching(scope=scope)
+        if omitted is not None:
+            arguments["draft"].pop(omitted)
+        assert recognition_service.preview_release_format(**arguments)["can_save"]
         plan = (await effects.prepare(SAVE, arguments, context=context)).effect_plan
         assert plan is not None and plan.effect is ToolEffect.WRITE
         public = json.dumps(plan.public_dict(), ensure_ascii=False)
@@ -84,6 +88,8 @@ def test_cold_confirmation_executes_original_preview_once_and_keeps_secrets_priv
                 await rebuilt.execute_confirmed(plan.plan_id, context=context)
             assert save.call_count == 1
         assert len(formats.list_rules()) == 1
+        assert formats.list_rules()[0]["scope"] == scope
+        assert formats.list_rules()[0]["parent_path"] == (PARENT if scope == "directory" else "")
         assert _parse_release_core(filename(15), PARENT).context.episode == 15
     asyncio.run(check())
 
@@ -139,7 +145,7 @@ def test_cancellation_after_preflight_and_before_submit_stays_read_only(runtime)
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("invalid", ["confirmed", "preview_token", "missing_sample", "same_episode", "cross_title", "wrong_label"])
+@pytest.mark.parametrize("invalid", ["confirmed", "preview_token", "missing_sample", "same_episode", "cross_title", "wrong_label", "missing_parent"])
 def test_native_preflight_cannot_invent_samples_or_bypass_teaching_contract(runtime, invalid):
     async def check():
         store = SQLiteKernelStore()
@@ -154,6 +160,9 @@ def test_native_preflight_cannot_invent_samples_or_bypass_teaching_contract(runt
             value["examples"][1]["episode"] = value["examples"][0]["episode"]
         elif invalid == "cross_title":
             value["examples"][1]["title"] = value["examples"][0]["title"]
+        elif invalid == "missing_parent":
+            value["draft"].pop("scope")
+            value["draft"].pop("parent_path")
         else:
             value["examples"][0]["episode"] = 999
         with pytest.raises(ToolPipelineError):
