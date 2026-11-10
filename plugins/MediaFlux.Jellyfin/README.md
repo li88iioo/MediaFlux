@@ -1,6 +1,6 @@
 # MediaFlux Jellyfin 插件
 
-版本 **0.1.3**（程序集 / manifest：**0.1.3.0**）。验证 **Jellyfin 12.2 / 12.3，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
+版本 **0.1.4**（程序集 / manifest：**0.1.4.0**）。验证 **Jellyfin 12.2 / 12.3，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
 
 插件默认关闭，仅拦截用户明确发起的 Jellyfin `DELETE /Items/{itemId}`、`DELETE /Items?ids=...`。扫描发现 STRM 消失、清库或定时任务不会触发 MF 云端删除；插件关闭或请求完全不涉及映射内 STRM 时，继续原生删除行为。
 
@@ -96,4 +96,4 @@ DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 ```
 
-脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.3.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。
+脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.4.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。

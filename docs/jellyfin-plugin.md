@@ -15,7 +15,7 @@
 ### 支持范围与边界
 
 - 已验证平台：**Jellyfin 12.2 / 12.3，.NET 10**。官方源码分别为 `v12.2` / `v12.3`；插件仍以 NuGet `Jellyfin.Controller`／`Jellyfin.Model` **12.2.0** 编译，TFM 为 `net10.0`。最低 ABI 不是只允许一个小版本；12.3 不再被误拦截。未来版本仍需独立验收，跨主版本不直接放行。
-- 插件版本：**0.1.3**（清单版本 `0.1.3.0`），`targetAbi=12.2.0.0`；插件 GUID 保持不变。
+- 插件版本：**0.1.4**（清单版本 `0.1.4.0`），`targetAbi=12.2.0.0`；插件 GUID 保持不变。
 - 支持 MF 纳管的光鸭 **电影／单集／整季／整剧／明确文件夹**，以及明确选择多项的原生批量删除；最多 1000 个 STRM，目录文件清单另有规模限制。
 - 删除独立电影（含 NSFW 作品）时，若原生删除拥有该作品目录且云端没有未选择的视频，会回收视频、NFO、字幕、图片等目录内容，最终回收空作品目录。
 - 删除单集时，只回收该集视频和明确同名的伴随文件（包括语言字幕、NFO、缩略图），保留其他集、`tvshow.nfo`、共享海报等。最后一集删除不等于整剧授权，仍有共享素材时保留目录。
@@ -50,7 +50,7 @@
 ### 离线安装
 
 1. 停止 Jellyfin，备份插件配置。
-2. 解压 `MediaFlux.Jellyfin-0.1.3.0.zip` 到 Jellyfin **数据目录**下的 `plugins/MediaFlux/`。目录内直接包含 `MediaFlux.Jellyfin.dll`、`meta.json`、`logo.png`、README 和 LICENSE。升级时替换原插件目录内容，不要并排保留两份 DLL；保留独立的插件 XML 配置。
+2. 解压 `MediaFlux.Jellyfin-0.1.4.0.zip` 到 Jellyfin **数据目录**下的 `plugins/MediaFlux/`。目录内直接包含 `MediaFlux.Jellyfin.dll`、`meta.json`、`logo.png`、README 和 LICENSE。升级时替换原插件目录内容，不要并排保留两份 DLL；保留独立的插件 XML 配置。
 3. 不要复制构建目录中的 Jellyfin、ASP.NET 或测试 DLL；宿主提供这些程序集。
 4. 重启 Jellyfin，进入管理后台 → 插件 → MediaFlux，按下述步骤配置。先用可恢复的测试条目验证。
 
@@ -67,8 +67,8 @@ bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 可用 `DOTNET_BIN=/path/to/dotnet` 指定 SDK 可执行文件。产物：
 
 ```text
-plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.3.0.zip
-plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.3.0.zip.sha256
+plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.4.0.zip
+plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.4.0.zip.sha256
 ```
 
 产物、`bin/`、`obj/` 均不纳入 Git。打包脚本从 csproj 读取插件版本及 TFM，核对清单版本、插件 GUID、`net10.0` 与两个 Jellyfin NuGet 包的 `12.2.0` 基线；`targetAbi` 按 NuGet 版本加 `.0` 核对，并生成 SHA256 校验文件，不创建 Git 标签或上传包。
