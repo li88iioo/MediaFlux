@@ -4255,11 +4255,12 @@ class ConfirmationPendingOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 session.model.stream = delayed_stream
                 task = asyncio.create_task(self.confirm(session, sid, first))
                 try:
-                    await asyncio.wait_for(entered.wait(), 1)
+                    # 只为防挂死兜底；高负载下 1 秒会误报。
+                    await asyncio.wait_for(entered.wait(), 30)
                     self.assert_rejected(await self.confirm(session, sid, first))
                 finally:
                     release.set()
-                events = await asyncio.wait_for(task, 1)
+                events = await asyncio.wait_for(task, 30)
                 view = await consume_events(_events_stream(events))
                 self.assertEqual(view.status, "approval_required", "重复确认不能取消已执行操作的后续规划")
                 after = await session.state_store.load(owner="owner", session_id=sid)

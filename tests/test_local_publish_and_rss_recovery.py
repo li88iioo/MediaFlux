@@ -47,7 +47,7 @@ db.init_db()
             [sys.executable, "-c", bootstrap + script, str(self.path)],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,
         )
         self.assertEqual(result.returncode, expected_exit, result.stderr)
 

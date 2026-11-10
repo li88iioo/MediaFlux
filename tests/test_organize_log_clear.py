@@ -117,12 +117,14 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual(db.clear_organize_logs()["deleted"], 2)
 
     def test_restart_recovers_legacy_skipped_member_and_clear_is_idempotent(self):
-        loser = self.cloud("manual", "loser")
-        winner = self.cloud("confirmed", "winner")
-        db.add_organize_log_items(loser, [{"file_id": "loser", "status": "manual"}])
-        self.confirmation("legacy", ["loser", "winner"], status="completed", result={
-            "total": 2, "moved": 1, "skipped": 1, "failed": 0, "need_confirm": 0,
-        })
+        # 生产中入库成员与确认完成在同一事务写入同一时间戳，恢复以此识别入库成员。
+        with patch.object(db, "now", return_value="2026-11-09 01:00:00"):
+            loser = self.cloud("manual", "loser")
+            winner = self.cloud("confirmed", "winner")
+            db.add_organize_log_items(loser, [{"file_id": "loser", "status": "manual"}])
+            self.confirmation("legacy", ["loser", "winner"], status="completed", result={
+                "total": 2, "moved": 1, "skipped": 1, "failed": 0, "need_confirm": 0,
+            })
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET payload_json=json_remove(payload_json,'$._organize_log_upper_bound')")
             conn.execute("UPDATE organize_log SET created_at='2026-10-01 00:00:00'")
