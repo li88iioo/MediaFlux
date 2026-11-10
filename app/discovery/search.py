@@ -26,9 +26,9 @@ from app.discovery.providers.douban import DoubanProvider
 from app.discovery.providers.tmdb import TMDBProvider
 from app.logger import get_logger
 from app.discovery.models import DISCOVERY_PROVIDERS
+from app.discovery.models import normalize_search_query
 
 logger = get_logger(__name__)
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _SAFE_ERROR_MESSAGES = {
     "timeout": "数据源请求超时",
@@ -291,10 +291,7 @@ class DiscoverySearchService:
     def _normalize(self, query: str, page: int, provider_names: list[str] | tuple[str, ...] | None):
         if not isinstance(query, str):
             raise ValueError("搜索关键词必须是字符串")
-        normalized_query = unicodedata.normalize("NFKC", (query or "")).strip()
-        has_control = any(unicodedata.category(char).startswith("C") for char in normalized_query)
-        if not normalized_query or len(normalized_query) > 120 or has_control or _CONTROL_RE.search(normalized_query):
-            raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
+        normalized_query = normalize_search_query(query)
 
         if type(page) is not int or page < 1 or page > 100:
             raise ValueError("页码必须在 1 到 100 之间")

@@ -10,7 +10,8 @@ from fastapi.responses import RedirectResponse
 
 from app import config
 from app.agent.feature_gate import is_agent_enabled
-from app.modules.global_search import build_global_search, normalize_search_query
+from app.discovery.models import normalize_search_query
+from app.modules.global_search import build_global_search
 from app.services import (
     build_automation_summary,
     build_recent_media,

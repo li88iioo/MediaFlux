@@ -664,8 +664,11 @@ class MediaSubscriptionService:
             for row in rows
         ]
 
-    def list_subscriptions(self, *, status: str = "", enabled: bool | None = None,
-                           limit: int = 200, before: tuple[str, int] | None = None) -> dict[str, Any]:
+    def list_subscriptions(self, *, status: str = "", enabled: bool | None = None, limit: int = 200,
+                           before_updated_at: str | None = None, before_id: int | None = None) -> dict[str, Any]:
+        if (before_updated_at is None) != (before_id is None):
+            raise MediaSubscriptionError("订阅续页必须同时提供时间和编号")
+        before = (before_updated_at, before_id) if before_updated_at is not None and before_id is not None else None
         limit = max(1, min(limit, 200))
         rows = media_subscriptions_repo.list_media_subscriptions(status=status, enabled=enabled, limit=limit + 1, before=before)
         has_more = len(rows) > limit
@@ -700,9 +703,7 @@ class MediaSubscriptionService:
             rows = [self.get_subscription(strict_subscription_id(subscription_id))]
             page = {"total": 1, "has_more": False, "next": None}
         else:
-            if (before_updated_at is None) != (before_id is None):
-                raise MediaSubscriptionError("订阅续页必须同时提供时间和编号")
-            page = self.list_subscriptions(limit=limit, before=(before_updated_at, before_id) if before_updated_at is not None and before_id is not None else None)
+            page = self.list_subscriptions(limit=limit, before_updated_at=before_updated_at, before_id=before_id)
             rows = page["items"]
             if page["next"] is not None:
                 page["next"] = {key: page["next"][key] for key in ("before_updated_at", "before_id", "limit")}

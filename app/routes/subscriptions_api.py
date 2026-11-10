@@ -123,12 +123,10 @@ def list_media_subscriptions(
         normalized_status = (status or "").strip().lower()
         if normalized_status not in _ALLOWED_LIST_STATUS:
             raise MediaSubscriptionError("status 查询参数无效")
-        if (before_id is None) != (before_updated_at is None):
-            raise MediaSubscriptionError("订阅续页必须同时提供时间和编号")
         return api_response(get_media_subscription_service().list_subscriptions(
             status=normalized_status,
             enabled=_optional_bool(enabled),
-            limit=limit, before=(before_updated_at, before_id) if before_updated_at is not None and before_id is not None else None,
+            limit=limit, before_updated_at=before_updated_at, before_id=before_id,
         ))
     except MediaSubscriptionError as exc:
         return _service_error(exc)

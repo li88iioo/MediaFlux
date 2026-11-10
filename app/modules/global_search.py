@@ -15,19 +15,9 @@ from app.logger import get_logger
 from app.routes.discovery_image import encode_poster_token
 from app.services import search_media_servers
 from app.database import row_value
+from app.discovery.models import normalize_search_query
 
 logger = get_logger(__name__)
-
-
-def normalize_search_query(value: str | int) -> str:
-    query = unicodedata.normalize("NFKC", str(value or "")).strip()
-    if (
-        not query
-        or len(query) > 120
-        or any(unicodedata.category(char).startswith("C") for char in query)
-    ):
-        raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
-    return query
 
 
 def _type_label(value: str) -> str:

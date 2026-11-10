@@ -169,12 +169,10 @@ class Subscriptions:
         """分页返回完整持久订阅及revision、已保存last_error/缺失/策略；按next续读，id是真实订阅编号。列表是持久快照，实时已播/库存差异用check_updates。"""
         from app.modules.media_subscriptions import get_media_subscription_service
 
-        if (before_updated_at is None) != (before_id is None):
-            raise ValueError("订阅续页必须同时提供时间和编号")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200 or (enabled is not None and not isinstance(enabled, bool)):
             raise ValueError("limit须为1到200整数，enabled须为布尔值或null")
         result = get_media_subscription_service().list_subscriptions(status=status, enabled=enabled, limit=limit,
-            before=(before_updated_at, before_id) if before_updated_at is not None and before_id is not None else None)
+            before_updated_at=before_updated_at, before_id=before_id)
         if result["next"] is not None:
             result["next"]["enabled"] = enabled
         return result

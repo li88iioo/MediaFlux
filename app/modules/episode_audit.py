@@ -20,6 +20,7 @@ from app.modules.media_identity import normalize_audit_date, normalize_episode_v
 from app.services import (
     inspect_library_series_sources, inspect_series_episode_sources, media_server_config_key, search_media_servers,
 )
+from app.discovery.models import normalize_search_query
 
 logger = get_logger(__name__)
 
@@ -45,9 +46,7 @@ def normalize_episode_audit_arguments(arguments: dict[str, Any]) -> dict[str, An
     raw_query = arguments.get("query")
     if not isinstance(raw_query, str):
         raise ValueError("query 必须是字符串")
-    query = unicodedata.normalize("NFKC", raw_query).strip()
-    if not query or len(query) > 120 or any(unicodedata.category(char).startswith("C") for char in query):
-        raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
+    query = normalize_search_query(raw_query)
 
     tmdb_id = arguments.get("tmdb_id", "")
     if not isinstance(tmdb_id, str):

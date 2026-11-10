@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -15,6 +16,18 @@ _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+")
 _CREDENTIAL_RE = re.compile(
     r"(?i)((?:api[_-]?key|apikey|token|secret|authorization|_sig)\s*[=:]\s*)([^&\s]+)"
 )
+
+
+def normalize_search_query(value: str | int) -> str:
+    """搜索关键词的唯一可见性规则：NFKC 后 1 到 120 个非控制字符。"""
+    query = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if (
+        not query
+        or len(query) > 120
+        or any(unicodedata.category(char).startswith("C") for char in query)
+    ):
+        raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
+    return query
 
 
 def redact_provider_message(message: str) -> str:

@@ -11,6 +11,7 @@ from typing import Any
 from app import database as db
 from app.logger import get_logger
 from app.services import search_library
+from app.discovery.models import normalize_search_query
 
 logger = get_logger(__name__)
 
@@ -65,13 +66,7 @@ def _now() -> str:
 
 
 def _normalize_query(value: str) -> str:
-    query = unicodedata.normalize("NFKC", value).strip()
-    if (
-        not query
-        or len(query) > 120
-        or any(unicodedata.category(char).startswith("C") for char in query)
-    ):
-        raise ValueError("搜索关键词必须为 1 到 120 个可见字符")
+    query = normalize_search_query(value)
     if _contains_sensitive_text(query):
         raise ValueError("搜索关键词疑似包含路径、链接、凭据、哈希或业务标识")
     return query

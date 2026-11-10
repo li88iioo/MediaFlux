@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from app.clients.base import MediaItem
 from app.discovery.models import MediaCard
-from app.modules.global_search import _local_section, build_global_search, normalize_search_query
+from app.discovery.models import normalize_search_query
+from app.modules.global_search import _local_section, build_global_search
 
 
 class GlobalSearchTests(unittest.TestCase):
