@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.logger import get_logger
 from app.modules.local_media_cleanup import is_probable_sample_video
 from app.modules.local_path_mapping import (
     LEGACY_SOURCE_PATH_ERROR,
@@ -21,6 +22,8 @@ from app.modules.local_storage import (
     is_ignored_local_media_directory,
     move_entry_no_replace_at,
 )
+
+logger = get_logger(__name__)
 
 LOCAL_MEDIA_TRASH_DIR = ".mediaflux-trash"
 
@@ -380,8 +383,11 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
                     target_dir_fd=root_fd,
                     is_directory=is_directory,
                 )
-            except Exception:
-                pass
+            except Exception as restore_exc:
+                logger.error(
+                    "本地回收失败且未能恢复原位置，条目滞留回收区 trash=%s name=%s type=%s",
+                    LOCAL_MEDIA_TRASH_DIR, destination_name, type(restore_exc).__name__,
+                )
         raise
     finally:
         if trash_fd is not None:

@@ -152,13 +152,10 @@ def _reject_unsafe_parts(path: PurePath) -> None:
 
 def _is_symlink_or_junction(path: Path) -> bool:
     try:
-        if path.is_symlink():
-            return True
-        if hasattr(path, "is_junction") and path.is_junction():
-            return True
-    except Exception:
-        pass
-    return False
+        return path.is_symlink() or path.is_junction()
+    except OSError:
+        # Python 3.13 对 EACCES 等错误会抛出；无法 lstat 时与 3.14 一样不判定为链接。
+        return False
 
 
 def assert_within(path: Path, root: Path, *, reject_symlinks: bool = True) -> Path:

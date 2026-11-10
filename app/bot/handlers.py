@@ -127,6 +127,16 @@ def _configuration_complete() -> bool:
     return bool(get("TG_BOT_TOKEN", "").strip() and get("TG_CHAT_ID", "").strip())
 
 
+def _send_rejection(bot, msg_or_call, text: str) -> None:
+    try:
+        if getattr(msg_or_call, "id", None):
+            bot.answer_callback_query(msg_or_call.id, text, show_alert=True)
+        else:
+            _reply_to_source(bot, msg_or_call, text)
+    except Exception as exc:
+        logger.info("Telegram 拒绝提示未送达 type=%s", type(exc).__name__)
+
+
 def _reject_unauthorized(bot, msg_or_call) -> bool:
     chat = getattr(getattr(msg_or_call, "message", None), "chat", None) or getattr(
         msg_or_call, "chat", None
@@ -135,70 +145,32 @@ def _reject_unauthorized(bot, msg_or_call) -> bool:
     if _authorized(chat_id):
         return False
     logger.warning(f"拒绝未授权 Telegram 会话: {chat_id}")
-    try:
-        if getattr(msg_or_call, "id", None):
-            bot.answer_callback_query(msg_or_call.id, "未授权会话", show_alert=True)
-        else:
-            _reply_to_source(bot,msg_or_call, "未授权会话")
-    except Exception:
-        pass
+    _send_rejection(bot, msg_or_call, "未授权会话")
+    return True
+
+
+def _reject_group_user(bot, msg_or_call, *, action: str, text: str) -> bool:
+    """群组中额外要求用户白名单，私聊保持会话级授权。"""
+    if _reject_unauthorized(bot, msg_or_call):
+        return True
+    chat_id, user_id = _telegram_identity(msg_or_call)
+    if not chat_id.startswith("-"):
+        return False
+    from app.bot.agent_adapter import telegram_user_is_allowed
+
+    if telegram_user_is_allowed(user_id):
+        return False
+    logger.warning("拒绝未授权 Telegram 群组%s: chat=%s user=%s", action, chat_id, user_id)
+    _send_rejection(bot, msg_or_call, text)
     return True
 
 
 def _reject_unauthorized_group_write(bot, msg_or_call) -> bool:
-    """写操作在群组中必须同时通过用户白名单，私聊保持旧行为。"""
-    if _reject_unauthorized(bot, msg_or_call):
-        return True
-    chat_id, user_id = _telegram_identity(msg_or_call)
-    if not chat_id.startswith("-"):
-        return False
-    from app.bot.agent_adapter import telegram_user_is_allowed
-
-    if telegram_user_is_allowed(user_id):
-        return False
-    logger.warning(
-        "拒绝未授权 Telegram 群组写操作: chat=%s user=%s",
-        chat_id,
-        user_id,
-    )
-    try:
-        if getattr(msg_or_call, "id", None):
-            bot.answer_callback_query(
-                msg_or_call.id,
-                "你无权在此群组执行该操作",
-                show_alert=True,
-            )
-        else:
-            _reply_to_source(bot,msg_or_call, "你无权在此群组执行该操作")
-    except Exception:
-        pass
-    return True
+    return _reject_group_user(bot, msg_or_call, action="写操作", text="你无权在此群组执行该操作")
 
 
 def _reject_unauthorized_resource_search(bot, msg_or_call) -> bool:
-    """资源搜索在群组中额外要求用户白名单，私聊保持旧行为。"""
-    if _reject_unauthorized(bot, msg_or_call):
-        return True
-    chat_id, user_id = _telegram_identity(msg_or_call)
-    if not chat_id.startswith("-"):
-        return False
-    from app.bot.agent_adapter import telegram_user_is_allowed
-
-    if telegram_user_is_allowed(user_id):
-        return False
-    logger.warning(
-        "拒绝未授权 Telegram 群组资源搜索: chat=%s user=%s", chat_id, user_id
-    )
-    try:
-        if getattr(msg_or_call, "id", None):
-            bot.answer_callback_query(
-                msg_or_call.id, "你无权在此群组使用资源搜索", show_alert=True
-            )
-        else:
-            _reply_to_source(bot,msg_or_call, "你无权在此群组使用资源搜索")
-    except Exception:
-        pass
-    return True
+    return _reject_group_user(bot, msg_or_call, action="资源搜索", text="你无权在此群组使用资源搜索")
 
 
 def _configured_organize_sources() -> list[dict[str, str]]:
@@ -459,8 +431,8 @@ def _edit_write_confirmation_message(
         if callable(clear_markup):
             try:
                 clear_markup(chat_id, message_id, reply_markup=None)
-            except Exception:
-                pass
+            except Exception as clear_exc:
+                logger.info("Telegram 确认卡按钮清除失败 type=%s", type(clear_exc).__name__)
         return False
 
 
@@ -2340,8 +2312,8 @@ def _run_telegram_resource_search(
                 progress.finish(text)
             else:
                 _reply_to_source(bot,msg, text)
-        except Exception:
-            pass
+        except Exception as reply_exc:
+            logger.info("Telegram 失败提示未送达 type=%s", type(reply_exc).__name__)
 
 
 def _handle_resource_search_callback(bot, call, telebot) -> None:
@@ -2804,8 +2776,8 @@ def _dispatch_resource_download(
             bot.edit_message_text(
                 "下载处理失败，请稍后重试", chat_id, message_id, reply_markup=None
             )
-        except Exception:
-            pass
+        except Exception as reply_exc:
+            logger.info("Telegram 失败提示未送达 type=%s", type(reply_exc).__name__)
 
 
 def _handle_organize_confirmation_callback(bot, call) -> None:
@@ -3100,8 +3072,8 @@ def _dispatch_share_transfer_callback(
             bot.edit_message_text(
                 "光鸭分享转存失败，请稍后查看任务状态", message_chat_id, message_id
             )
-        except Exception:
-            pass
+        except Exception as reply_exc:
+            logger.info("Telegram 失败提示未送达 type=%s", type(reply_exc).__name__)
 
 
 def _download_follow_up_text(succeeded: list[str]) -> str:

@@ -3735,8 +3735,8 @@ class Organizer:
                     season, episode = self.scraper.parse_source_position(
                         plan.original_name, plan.original_path
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("来源季集解析失败，沿用识别结果 type=%s", type(exc).__name__)
             if not is_nsfw and season is None:
                 season = getattr(context, "season", None)
             if not is_nsfw and episode is None:
@@ -5033,8 +5033,8 @@ class Organizer:
             if callable(clean_title):
                 try:
                     owner_identity = str(clean_title(owner_identity) or owner_identity)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("归属标题清洗失败，沿用原标题 type=%s", type(exc).__name__)
             # 用 source 下第一层物理树隔离互不相关的作品；若第一层本身就是
             # Extra/SPs 等特殊目录，则它仍归属于当前 source 根作品。这样既
             # 避免相同清洗标题跨树串号，又保留同作品 Extra/SPs 的连续编号。

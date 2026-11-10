@@ -258,7 +258,9 @@ class LocalMediaCandidateTests(unittest.TestCase):
             with patch(
                 "app.modules.local_media_candidates.os.replace",
                 side_effect=recreate_after_move,
-            ), self.assertRaises(Exception):
+            ), self.assertRaises(Exception), self.assertLogs(
+                "app.modules.local_media_candidates", level="ERROR",
+            ) as logs:
                 move_candidate_to_trash(
                     SimpleNamespace(local_root=str(root)), candidate, identity,
                 )
@@ -267,6 +269,8 @@ class LocalMediaCandidateTests(unittest.TestCase):
             retained = list((root / ".mediaflux-trash").iterdir())
             self.assertEqual(len(retained), 1)
             self.assertEqual(retained[0].read_bytes(), b"changed trash data")
+            # 滞留回收区的条目必须可追溯，不能静默。
+            self.assertIn(retained[0].name, "\n".join(logs.output))
 
     def test_transient_trash_path_swap_cannot_redirect_media_outside_source(self) -> None:
         with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:

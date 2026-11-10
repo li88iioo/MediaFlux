@@ -509,10 +509,7 @@ class OrganizeTaskManager:
                 if validation_succeeded and owns_client:
                     # 校验器把内部创建的光鸭 Client 移交给后台任务；
                     # 自身的 TMDB/MetaTube 资源仍在当前调用中释放。
-                    try:
-                        validator._owns_client = False
-                    except Exception:
-                        pass
+                    validator._owns_client = False
                 close = getattr(validator, "close", None)
                 if callable(close):
                     close()
