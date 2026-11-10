@@ -14,6 +14,119 @@ namespace MediaFlux.Jellyfin.Tests;
 
 public sealed class ScopeDeleteTests
 {
+    [Fact]
+    public async Task NativeFullNamesAndSelectedPathsUseTheSameNormalizedIdentity()
+    {
+        using var f = new TestFixture(); var movie = f.Movie().Object;
+        var original = movie.Path;
+        // FileSystemInfo.FullName 规范化重复分隔符；库内路径仍可保留另一种拼写。
+        // Windows UNC 的正反斜杠差异落在同一个比较边界，不能扩大删除集合。
+        movie.Path = original.Replace("movie" + Path.DirectorySeparatorChar,
+            "movie" + Path.DirectorySeparatorChar + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+        using var response = await f.Delete(movie);
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(1, f.NativeDeletes);
+        using var payload = JsonDocument.Parse(f.Handler.DeleteBody!);
+        Assert.Equal(MappingSet.Normalize(original), Assert.Single(payload.RootElement.GetProperty("paths").EnumerateArray()).GetString());
+    }
+
+    [Fact]
+    public async Task ExplicitIndexedFolderAuthorizesItsCompleteNativeMediaRange()
+    {
+        using var f = new TestFixture(); var folder = f.Folder("光鸭云盘/Source/selected");
+        var a = f.Episode("光鸭云盘/Source/selected/a.strm", parent: folder).Object;
+        var b = f.Episode("光鸭云盘/Source/selected/b.strm", parent: folder).Object;
+        using var response = await f.Delete(folder);
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(1, f.NativeDeletes);
+        using var payload = JsonDocument.Parse(f.Handler.DeleteBody!);
+        Assert.Equal(new[] { a.Path, b.Path }.Order(), payload.RootElement.GetProperty("paths").EnumerateArray().Select(p => p.GetString()).Order());
+        Assert.Equal(folder.Path, Assert.Single(payload.RootElement.GetProperty("scopes").EnumerateArray()).GetProperty("root").GetString());
+        Assert.Equal("folder", Assert.Single(payload.RootElement.GetProperty("scopes").EnumerateArray()).GetProperty("kind").GetString());
+        ExportMfContract(f, "folder");
+    }
+
+    [Fact]
+    public async Task SelectedMovieIncludesIndexedNativeAdditionalPartsButNeverAnUnrelatedSibling()
+    {
+        using var f = new TestFixture(); var movie = f.Movie("光鸭云盘/Source/parts/film-CD1.strm").Object;
+        var part = f.Part(movie, "光鸭云盘/Source/parts/film-CD2.strm").Object;
+        movie.AdditionalParts = [part.Path];
+        Assert.Null(f.Library.Object.FindByPath(part.Path, false)); // 官方普通路径查询不返回 owned 部件。
+        using var response = await f.Delete(movie);
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(1, f.NativeDeletes);
+        using var payload = JsonDocument.Parse(f.Handler.DeleteBody!);
+        Assert.Equal(new[] { movie.Path, part.Path }.Order(), payload.RootElement.GetProperty("paths").EnumerateArray().Select(p => p.GetString()).Order());
+        Assert.Equal(2, payload.RootElement.GetProperty("fingerprints").EnumerateObject().Count());
+        ExportMfContract(f, "movie-parts");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OverlappingExplicitFolderAndChildAlwaysKeepTheCompleteFolderScope(bool childFirst)
+    {
+        using var f = new TestFixture(); var folder = f.Folder("光鸭云盘/Source/selected");
+        var first = f.Episode("光鸭云盘/Source/selected/a.strm", parent: folder).Object;
+        var second = f.Episode("光鸭云盘/Source/selected/b.strm", parent: folder).Object;
+        using var response = childFirst ? await f.Batch(first, folder) : await f.Batch(folder, first);
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(2, f.NativeDeletes);
+        using var payload = JsonDocument.Parse(f.Handler.DeleteBody!);
+        var scope = Assert.Single(payload.RootElement.GetProperty("scopes").EnumerateArray());
+        Assert.Equal("folder", scope.GetProperty("kind").GetString());
+        Assert.Equal(new[] { first.Path, second.Path }.Order(), scope.GetProperty("paths").EnumerateArray().Select(p => p.GetString()).Order());
+        ExportMfContract(f, childFirst ? "child-first" : "folder-first");
+    }
+
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("sibling")]
+    [InlineData("local")]
+    [InlineData("denied")]
+    [InlineData("hidden")]
+    [InlineData("outside")]
+    public async Task ProvenAdditionalPartsNeverBypassIndexPermissionOrNativeRange(string change)
+    {
+        using var f = new TestFixture(); var movie = f.Movie("parts/CD1.strm").Object;
+        var part = f.Part(movie, change == "outside" ? "outside/CD2.strm" : "parts/CD2.strm");
+        movie.AdditionalParts = [part.Object.Path];
+        switch (change)
+        {
+            case "unknown": f.Items.Remove(part.Object.Id); break;
+            case "sibling": f.Movie("parts/unrelated.strm"); break;
+            case "local": File.WriteAllText(Path.Combine(Path.GetDirectoryName(movie.Path)!, "local.mp4"), "local"); break;
+            case "denied": part.Setup(i => i.CanDelete(It.IsAny<User>())).Returns(false); break;
+            case "hidden": f.Hidden.Add(part.Object.Id); break;
+        }
+        using var response = await f.Delete(movie);
+        Assert.False(response.IsSuccessStatusCode); AssertNoWrites(f);
+    }
+
+    [Fact]
+    public async Task FolderCapabilityMustBeAdvertisedBeforeAnyDeletePost()
+    {
+        using var f = new TestFixture(); var folder = f.Folder();
+        f.Episode("series/a.strm", parent: folder);
+        f.Handler.Capabilities = "{\"scope_version\":1,\"kinds\":[\"movie\",\"episode\",\"season\",\"series\"]}";
+        using var response = await f.Delete(folder);
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal(0, f.Handler.DeletePosts); Assert.Equal(0, f.NativeDeletes);
+    }
+
+    private static void ExportMfContract(TestFixture f, string name)
+    {
+        // 本地验收可把真实发送字节交给 Python 的真实 MF 校验/执行函数。
+        var output = Environment.GetEnvironmentVariable("MEDIAFLUX_DELETE_CONTRACT_DIR");
+        if (string.IsNullOrEmpty(output)) return;
+        Directory.CreateDirectory(output);
+        using var payload = JsonDocument.Parse(f.Handler.DeleteBody!);
+        var files = Directory.EnumerateFiles(f.Root, "*", SearchOption.AllDirectories)
+            .Where(DeletePlanner.IsStrm).ToDictionary(MappingSet.Normalize, p => Convert.ToBase64String(File.ReadAllBytes(p)));
+        File.WriteAllText(Path.Combine(output, name + ".json"), JsonSerializer.Serialize(new { root = f.Root, payload = payload.RootElement, files }));
+    }
+
     [Theory]
     [InlineData("episode", false)]
     [InlineData("movie", false)]
@@ -75,7 +188,7 @@ public sealed class ScopeDeleteTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
         Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(4, f.NativeDeletes);
         using var payload = JsonDocument.Parse(f.Handler.DeleteBody!);
-        Assert.Equal(new[] { "movie", "episode", "season", "series" }, payload.RootElement.GetProperty("scopes").EnumerateArray().Select(s => s.GetProperty("kind").GetString()));
+        Assert.Equal(new[] { "movie", "episode", "season", "series" }.Order(), payload.RootElement.GetProperty("scopes").EnumerateArray().Select(s => s.GetProperty("kind").GetString()).Order());
         Assert.Equal(4, payload.RootElement.GetProperty("fingerprints").EnumerateObject().Count());
     }
 

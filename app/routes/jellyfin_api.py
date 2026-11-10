@@ -10,7 +10,7 @@ from app.modules.directory_scrape_errors import (
     DirectoryScrapePublicError,
     public_error_message,
 )
-from app.modules.jellyfin_delete import delete_key, execute_delete, prepare_delete
+from app.modules.jellyfin_delete import DELETE_SCOPE_KINDS, delete_key, execute_delete, prepare_delete
 from app.modules.organize_tasks import get_organize_manager
 from app.web import require_api_login
 
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api/jellyfin")
 @router.get("/delete-capabilities")
 def delete_capabilities(request: Request):
     require_api_login(request)
-    return {"scope_version": 1, "kinds": ["movie", "episode", "season", "series"]}
+    return {"scope_version": 1, "kinds": list(DELETE_SCOPE_KINDS)}
 
 
 @router.post("/delete")

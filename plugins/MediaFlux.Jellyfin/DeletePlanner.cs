@@ -19,7 +19,21 @@ public sealed record SelectedItem(ItemIdentity Item, FileSystemMetadata[] Delete
     ItemIdentity[] Children, FileSystemMetadata[] Entries, DeleteScope? Scope);
 public sealed record DeletePlan(Dictionary<string, string> Fingerprints, SelectedItem[] Items, ItemIdentity[] StrmItems)
 {
-    public DeleteScope[] Scopes => Items.Where(i => i.Scope is not null).Select(i => i.Scope!).ToArray();
+    public DeleteScope[] Scopes
+    {
+        get
+        {
+            var claimed = new HashSet<string>(Fingerprints.Comparer);
+            // 完整目录先认领其全部成员，父目录先于子目录；不依赖用户勾选顺序。
+            return Items.Where(i => i.Scope is not null).Select(i => i.Scope!)
+                .OrderBy(s => s.Root is null ? 1 : 0)
+                .ThenBy(s => s.Root?.Length ?? int.MaxValue)
+                .ThenBy(s => s.Root, StringComparer.Ordinal)
+                .ThenBy(s => s.Kind, StringComparer.Ordinal)
+                .Select(s => s with { Paths = s.Paths.Where(claimed.Add).ToArray() })
+                .Where(s => s.Paths.Length > 0).ToArray();
+        }
+    }
 }
 
 public static class DeletePlanner
@@ -48,8 +62,21 @@ public static class DeletePlanner
         var strmItems = new Dictionary<Guid, ItemIdentity>();
         var paths = new HashSet<string>(PathComparer);
         var previousOwners = previous?.StrmItems.ToHashSet();
-        var explicitlySelected = items.Where(i => i is Movie or Episode && IsManaged(i.Path, mappings))
-            .Select(i => i.Path).ToHashSet(PathComparer);
+        var nativeChildren = items.ToDictionary(i => i.Id, i =>
+        {
+            if (i is not Folder folder) return Array.Empty<BaseItem>();
+            folder.ReleaseCachedChildren();
+            var children = folder.GetRecursiveChildren(false).ToArray();
+            if (children.Length > 10000) throw new PluginFault("原生删除对象过多；请在 MF 中操作。");
+            return children;
+        });
+        var members = MediaMembers(items, nativeChildren, mappings, library, user);
+        var ownedMedia = members.Values.SelectMany(v => v).DistinctBy(v => v.Id).ToDictionary(v => v.Id);
+        var ownersByPath = new Dictionary<string, Video>(PathComparer);
+        foreach (var member in ownedMedia.Values)
+            if (!ownersByPath.TryAdd(PathKey(member.Path), member))
+                throw new PluginFault("同一 STRM 对应多个媒体对象，无法确认归属；整批删除已取消。");
+        var explicitlySelected = members.Values.SelectMany(v => v).Select(v => PathKey(v.Path)).ToHashSet(PathComparer);
         foreach (var item in items)
         {
             token.ThrowIfCancellationRequested();
@@ -70,15 +97,10 @@ public static class DeletePlanner
                 // 原生文件系统在目录消失后可能报告 IsDirectory=false；仍复核最初的完整范围。
                 roots = old.DeletePaths;
             }
-            BaseItem[] children = [];
-            if (item is Folder folder)
-            {
-                // 原生删除读取 Children；不能让旧缓存隐藏等待期间新增的数据库对象。
-                folder.ReleaseCachedChildren();
-                children = folder.GetRecursiveChildren(false).ToArray();
-                if (children.Length > 10000) throw new PluginFault("原生删除对象过多；请在 MF 中操作。");
-            }
-            var childIdentities = children.Select(Identity).ToArray();
+            // 同时冻结原生子项和有索引的分段归属；等待期间不能借关系变化扩张范围。
+            var children = nativeChildren[item.Id];
+            var nativeItems = children.Append(item).Concat(members[item.Id]).DistinctBy(i => i.Id).ToArray();
+            var childIdentities = nativeItems.Select(Identity).ToArray();
             if (old is not null && !childIdentities.ToHashSet().IsSubsetOf(old.Children.ToHashSet()))
                 throw new PluginFault("等待期间原生递归删除出现新增或变化的媒体对象；本地删除已取消。请核对 MF 日志。");
             var relevant = roots.Any(r => mappings.Overlaps(r.FullName)) || children.Append(item).Any(i => IsManaged(i.Path, mappings));
@@ -90,7 +112,7 @@ public static class DeletePlanner
                     throw new PluginFault("等待期间原生目录出现新增文件、STRM 或目录；本地删除已取消。请核对 MF 日志。");
             }
             var managed = scan.Entries.Where(e => !e.IsDirectory && IsManaged(e.FullName, mappings))
-                .Select(e => e.FullName).Concat(children.Append(item).Where(i => IsManaged(i.Path, mappings)).Select(i => i.Path))
+                .Select(e => e.FullName).Concat(nativeItems.Where(i => IsManaged(i.Path, mappings)).Select(i => PathKey(i.Path)))
                 .ToHashSet(PathComparer);
             if (old?.Scope is not null) managed.UnionWith(old.Scope.Paths);
             DeleteScope? scope = null;
@@ -101,10 +123,11 @@ public static class DeletePlanner
                 if (scan.Links.Count > 0) throw new PluginFault("原生删除目录包含符号链接或重解析点，不能安全确认 STRM 范围。");
                 if (!allowMissing && scan.MissingDirectories.Count > 0)
                     throw new PluginFault("无法读取原生删除目录；不能确认完整 STRM 范围，本地删除已取消。");
-                scope = Scope(item, roots, managed, mappings, explicitlySelected);
+                scope = Scope(item, roots, managed, mappings, explicitlySelected,
+                    members[item.Id].Select(v => PathKey(v.Path)).ToHashSet(PathComparer));
                 if (old is not null && (old.Scope is null || old.Scope.Kind != scope.Kind || !PathComparer.Equals(old.Scope.Root, scope.Root)))
                     throw new PluginFault("等待期间纳管删除范围发生变化；本地删除已取消。请核对 MF 日志。");
-                var nativeIds = children.Append(item).Select(i => i.Id).ToHashSet();
+                var nativeIds = nativeItems.Select(i => i.Id).ToHashSet();
                 foreach (var entry in scan.Entries)
                 {
                     if (IsStrm(entry.FullName) && !entry.IsDirectory)
@@ -121,18 +144,18 @@ public static class DeletePlanner
                     if (owner is not null && (!entry.IsDirectory || !nativeIds.Contains(owner.Id)))
                         throw new PluginFault("原生删除目录包含库内其它归属对象；不能扩大目录删除。");
                 }
-                foreach (var native in children.Append(item))
+                foreach (var native in nativeItems)
                 {
                     var current = Authorize(native, library, user);
-                    if (!current.IsFileProtocol || current is not (Movie or Episode or Season or Series))
+                    if (!current.IsFileProtocol || (current is not Folder
+                        && (current is not Video || !members[item.Id].Any(v => v.Id == current.Id))))
                         throw new PluginFault("原生递归删除含未知媒体对象或非文件对象；不能扩大目录删除。");
                     if (scope.Root is not null && !Within(current.Path, scope.Root))
                         throw new PluginFault("原生递归删除对象位于所选目录之外；不能扩大目录删除。");
-                    if (current is Video video)
+                    if (current is Video)
                     {
-                        if (!IsManaged(current.Path, mappings) || !scope.Paths.Contains(current.Path, PathComparer))
+                        if (!IsManaged(current.Path, mappings) || !scope.Paths.Contains(PathKey(current.Path), PathComparer))
                             throw new PluginFault("原生递归删除混放本地视频或范围外 STRM；不能扩大目录删除。");
-                        CheckVersions(video, library);
                         strmItems[current.Id] = Identity(current);
                     }
                 }
@@ -154,17 +177,17 @@ public static class DeletePlanner
                 fingerprints.Add(path, previous!.Fingerprints[path]);
                 continue;
             }
-            var owner = library.FindByPath(path, false)
-                ?? throw new PluginFault("原生删除目录存在未知、未入库 STRM；不能扩大目录删除。");
+            if (!ownersByPath.TryGetValue(path, out var owner))
+                throw new PluginFault("原生删除目录存在未知、未入库 STRM；不能扩大目录删除。");
             var current = Authorize(owner, library, user!);
-            if (!PathComparer.Equals(current.Path, path) || !current.IsFileProtocol || current is not (Movie or Episode))
+            if (!PathComparer.Equals(PathKey(current.Path), path) || !current.IsFileProtocol
+                || current is not Video || !ownedMedia.ContainsKey(current.Id))
                 throw new PluginFault("STRM 没有对应可授权的电影或单集对象；本地删除已取消。");
             var identity = Identity(current);
             if (!strmItems.ContainsKey(current.Id))
                 throw new PluginFault("STRM 属于所选作品之外的库对象；不能扩大目录删除。");
             if (previous is not null && !previousOwners!.Contains(identity))
                 throw new PluginFault("等待期间 STRM 对应的媒体对象发生变化；本地删除已取消。请核对 MF 日志。");
-            CheckVersions((Video)current, library);
             strmItems[current.Id] = identity;
             var fingerprint = await FingerprintAsync(path, token).ConfigureAwait(false);
             if (previous is not null && previous.Fingerprints[path] != fingerprint)
@@ -174,18 +197,19 @@ public static class DeletePlanner
         return new DeletePlan(fingerprints, snapshots.ToArray(), strmItems.Values.ToArray());
     }
 
-    private static DeleteScope Scope(BaseItem item, FileSystemMetadata[] roots, HashSet<string> managed, MappingSet mappings, HashSet<string> explicitlySelected)
+    private static DeleteScope Scope(BaseItem item, FileSystemMetadata[] roots, HashSet<string> managed, MappingSet mappings,
+        HashSet<string> explicitlySelected, HashSet<string> ownMedia)
     {
         var directories = roots.Where(r => r.IsDirectory).ToArray();
         var kind = item switch
         {
-            Movie => "movie", Episode => "episode", Season => "season", Series => "series",
+            Movie => "movie", Episode => "episode", Season => "season", Series => "series", Folder => "folder",
             _ => throw new PluginFault("已映射 STRM 仅支持明确选择的电影、单集、季或剧；此媒体类型不能安全联动删除。")
         };
         string? root = null;
-        if (item is Season or Series)
+        if (item is Folder)
         {
-            if (directories.Length != 1 || !PathComparer.Equals(directories[0].FullName, item.Path))
+            if (directories.Length != 1 || !PathComparer.Equals(directories[0].FullName, PathKey(item.Path)))
                 throw new PluginFault("季/剧没有唯一原生目录范围；不能扩大目录删除。");
             root = directories[0].FullName;
         }
@@ -196,7 +220,7 @@ public static class DeletePlanner
             if (directories.Length > 0)
             {
                 if (item is not Movie || directories.Length != 1
-                    || !PathComparer.Equals(directories[0].FullName, Path.GetDirectoryName(item.Path)))
+                    || !PathComparer.Equals(directories[0].FullName, PathKey(Path.GetDirectoryName(PathKey(item.Path)))))
                     throw new PluginFault("电影/单集原生删除范围不是独立电影父目录；不能扩大目录删除。");
                 root = directories[0].FullName;
             }
@@ -213,7 +237,8 @@ public static class DeletePlanner
             throw new PluginFault("STRM 不在原生删除范围内；本地删除已取消。");
         // 同目录多项明确选择仍是一次合法批量删除；每个 scope 只认领自身，
         // MF 按共同目录合并授权，不能把未选择的邻居带进某个电影 scope。
-        var scopePaths = item is Movie or Episode ? new[] { item.Path } : managed.OrderBy(p => p, PathComparer).ToArray();
+        // 显式 Folder 使用独立协议类型，不冒充整剧；每个原生子项仍需逐项授权。
+        var scopePaths = (item is Video ? ownMedia : managed).OrderBy(p => p, PathComparer).ToArray();
         return new DeleteScope(kind, root, scopePaths);
     }
 
@@ -226,12 +251,51 @@ public static class DeletePlanner
         return current;
     }
 
-    // 12.2 的主版本和关联版本索引存放在 LinkedChildren，而非旧内存数组。
-    private static void CheckVersions(Video video, ILibraryManager library)
+    private static Dictionary<Guid, Video[]> MediaMembers(IReadOnlyList<BaseItem> items,
+        Dictionary<Guid, BaseItem[]> children, MappingSet mappings, ILibraryManager library, User? user)
     {
-        if (video.IsStacked || video.PrimaryVersionId.HasValue || video.OwnerId != Guid.Empty
-            || library.GetLocalAlternateVersionIds(video).Any() || library.GetLinkedAlternateVersions(video).Any())
-            throw new PluginFault("该电影/单集含多版本、分段或关联媒体，或等待期间关联已变化；本地删除已取消。若云任务已成功，请核对 MF 日志。");
+        var result = new Dictionary<Guid, Video[]>();
+        foreach (var item in items)
+        {
+            var pending = new Queue<Video>(children[item.Id].Append(item).OfType<Video>()
+                .Where(v => (v is Movie or Episode) && IsManaged(v.Path, mappings)));
+            var owned = new Dictionary<Guid, Video>();
+            while (pending.TryDequeue(out var video))
+            {
+                if (user is null) throw new PluginFault("已管理 STRM 必须由真实 Jellyfin 用户发起，并通过 CanDelete 权限检查；不允许 API key 绕过。", 403);
+                var current = Authorize(video, library, user);
+                if (current is not Video member || !current.IsFileProtocol
+                    || !IsManaged(current.Path, mappings))
+                    throw new PluginFault("分段媒体没有可授权的纳管电影或单集身份；整批删除已取消。");
+                if (!owned.TryAdd(current.Id, member)) continue;
+                if (owned.Count > 1000) throw new PluginFault("一次最多删除 1000 个 STRM 文件。");
+                if (member is not (Movie or Episode) && member.AdditionalParts.Length > 0)
+                    throw new PluginFault("额外部件不能自行扩大分段范围；整批删除已取消。");
+                foreach (var partPath in member.AdditionalParts)
+                {
+                    // FindByPath 默认排除 owned 部件；按官方分片 ID 规则读取真实索引。
+                    var part = library.GetItemById<BaseItem>(library.GetNewItemId(partPath, typeof(Video)), user);
+                    if (part is not Video partVideo || part.Id == member.Id
+                        || part.Id == Guid.Empty || part.OwnerId != member.Id
+                        || !PathComparer.Equals(PathKey(part.Path), PathKey(partPath)))
+                        throw new PluginFault("分段媒体存在未入库或归属不明的 STRM；整批删除已取消。若云任务已成功，请核对 MF 日志。");
+                    pending.Enqueue(partVideo);
+                }
+            }
+            result[item.Id] = owned.Values.ToArray();
+        }
+        var selected = result.Values.SelectMany(v => v).DistinctBy(v => v.Id).ToDictionary(v => v.Id);
+        foreach (var video in selected.Values)
+        {
+            var ownsPart = ((video is Movie or Episode) && video.OwnerId == Guid.Empty)
+                || (selected.TryGetValue(video.OwnerId, out var owner) && owner is (Movie or Episode)
+                && owner.AdditionalParts.Any(p => PathComparer.Equals(PathKey(p), PathKey(video.Path))));
+            // 只接纳所选条目明确声明且有索引的分段；版本合并仍不推断授权。
+            if (!ownsPart || video.PrimaryVersionId.HasValue || library.GetLocalAlternateVersionIds(video).Any()
+                || library.GetLinkedAlternateVersions(video).Any())
+                throw new PluginFault("该电影/单集含未明确授权的版本或关联媒体；本地删除已取消。若云任务已成功，请核对 MF 日志。");
+        }
+        return result;
     }
 
     private sealed class ScanResult
@@ -264,20 +328,22 @@ public static class DeletePlanner
                 // 快照记录真实存在的节点和类型，不能授权原本不存在的伴随文件或节点替换。
                 var directory = Directory.Exists(entry.FullName);
                 if (File.Exists(entry.FullName) || directory)
-                    result.Entries.Add(new FileSystemMetadata { FullName = entry.FullName, IsDirectory = directory });
+                    result.Entries.Add(new FileSystemMetadata { FullName = PathKey(entry.FullName), IsDirectory = directory });
                 if (!entry.IsDirectory) continue;
                 if (!directory) { result.MissingDirectories.Add(entry.FullName); continue; }
                 foreach (var child in new DirectoryInfo(entry.FullName).EnumerateFileSystemInfos())
-                    pending.Push(new FileSystemMetadata { FullName = child.FullName, IsDirectory = child is DirectoryInfo });
+                    pending.Push(new FileSystemMetadata { FullName = PathKey(child.FullName), IsDirectory = child is DirectoryInfo });
             }
         }
         return result;
     }
 
-    private static ItemIdentity Identity(BaseItem item) => new(item.Id, item.Path ?? "", item.GetType().FullName!);
-    private static FileSystemMetadata CopyPath(FileSystemMetadata path) => new() { FullName = path.FullName, IsDirectory = path.IsDirectory };
+    private static string PathKey(string? path) => string.IsNullOrEmpty(path) ? "" : MappingSet.IsAbsolute(path) ? MappingSet.Normalize(path) : path;
+    private static ItemIdentity Identity(BaseItem item) => new(item.Id, PathKey(item.Path), item.GetType().FullName!);
+    private static FileSystemMetadata CopyPath(FileSystemMetadata path) => new() { FullName = PathKey(path.FullName), IsDirectory = path.IsDirectory };
     private static bool IsCompanion(string path, string itemPath)
     {
+        path = PathKey(path); itemPath = PathKey(itemPath);
         if (!PathComparer.Equals(Path.GetDirectoryName(path), Path.GetDirectoryName(itemPath))) return false;
         var stem = Path.GetFileNameWithoutExtension(itemPath);
         var name = Path.GetFileNameWithoutExtension(path);

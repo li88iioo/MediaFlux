@@ -21,7 +21,7 @@ https://github.com/li88iioo/MediaFlux/releases/download/manifest/manifest.json
 
 ## 删除协议与范围
 
-每次删除在同一已登录 MF 会话中先请求 `GET api/jellyfin/delete-capabilities`，必须返回 `scope_version: 1`，且 `kinds` 包含全部 `movie / episode / season / series`。能力不缓存；接口不存在、鉴权失败、返回格式或版本 / kind 不匹配均不发送删除 POST。
+每次删除在同一已登录 MF 会话中先请求 `GET api/jellyfin/delete-capabilities`，必须返回 `scope_version: 1`，且 `kinds` 包含全部 `movie / episode / season / series`；所选范围包含文件夹时，还必须支持 `folder`。能力不缓存；接口不存在、鉴权失败、返回格式或版本 / kind 不匹配均不发送删除 POST。
 
 通过握手并再次复核本地状态后，调用原有 `POST api/jellyfin/delete`，固定使用 `mapping_mode=mf`，发送路径、指纹及范围：
 
@@ -41,16 +41,19 @@ https://github.com/li88iioo/MediaFlux/releases/download/manifest/manifest.json
 | `episode` | `null` | 仅自身 STRM；本地原生删除还可移除同目录、同名且明确归属的伴随文件，不扩大到父目录 |
 | `movie` | 独立直接父目录，或 `null` | 只有原生 `GetDeletePaths()` 已删除独立直接父目录时才授权目录；原生文件级删除传 `null`，仅自身 STRM 与明确伴随文件 |
 | `season` / `series` | 原生所选季 / 剧目录 | 枚举全部纳管 STRM，核对每个文件对应的电影 / 单集及全部原生递归删除对象的当前用户权限 |
+| `folder` | 明确选中的原生文件夹 | 校验完整目录和全部已入库媒体，不能使用映射根、来源根或归档根 |
+
+Jellyfin 在所选电影／单集中明确记录的 `AdditionalParts` 可一并授权；每个分片必须已入库、归属一致、对用户可见且可删除，并位于原生删除范围内。不会只按 CD1/CD2 文件名猜测归属。父目录与子媒体同时勾选时，由完整目录统一认领成员，不受勾选顺序影响。Windows UNC 正反斜杠和原生文件枚举使用统一路径比较。
 
 明确独立目录授权包括其**全部已有非媒体伴生内容**，如 `1`、`1.X`、NFO、封面及其它非媒体扩展名；不会将未知非媒体扩展名一律拒绝。仍拒绝以下不确定或扩大范围的请求：
 
 - 映射根或包含映射根的目录、虚拟 / 非文件对象、没有唯一原生目录的季 / 剧。
 - 目录混放 Jellyfin 12.2 官方命名规则识别的本地视频 / 音频，或库内其它归属对象。
-- 未入库、不可见、无删除权限或不属于所选作品的 STRM；电影 / 单集范围出现其它 STRM。
+- 未入库、不可见、无删除权限或不属于所选作品的 STRM；电影 / 单集范围出现未选中且没有明确分片归属的 STRM。
 - 符号链接、悬空链接、重解析点，以及路径经过链接。
-- 主版本、关联版本、OwnerId、分段媒体；使用 12.2 的关联索引检查，不依赖旧内存版本数组。
+- 多版本、关联版本和归属不明的分片；使用当前关联索引检查，不依赖旧内存版本数组。
 
-云端目录绑定由 MF 按祖先链和既有 STRM 生成规则核对，插件不猜测云端目录。压缩 / 折叠层级无法对应的季 / 剧会被 MF 拒绝；电影云端目录存在未选视频时，MF 可降为同名伴随精确删除，季 / 剧则整批拒绝。插件不会自行创建另一套云端删除执行器。
+云端目录绑定由 MF 按祖先链和既有 STRM 生成规则核对，插件不猜测云端目录。压缩 / 折叠层级无法对应的季 / 剧 / 文件夹会被 MF 拒绝；电影云端目录存在未选视频时，MF 可降为同名伴随精确删除，季 / 剧 / 文件夹则整批拒绝。插件不会自行创建另一套云端删除执行器。
 
 ## 等待和复核
 
@@ -75,7 +78,15 @@ DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
 
 可用 `DOTNET_BIN` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定官方源码缓存。脚本复用已下载源码，不改变生产插件 12.2.0 的编译基线。
 
-测试在 ASP.NET TestServer 中分别加载**真实官方 12.2 / 12.3 `LibraryController` / `PluginsController`**，不是复制控制器；底层媒体库 / 用户存储和 MF HTTP 响应为可控测试替身。覆盖四种范围、完整指纹、能力握手、权限 / 版本保护、文件竞态、失败不重放、配置迁移和 Logo HTTP 接口。不启动生产 Jellyfin，不连接生产 MF / 云盘。
+测试在 ASP.NET TestServer 中分别加载**真实官方 12.2 / 12.3 `LibraryController` / `PluginsController`**，不是复制控制器；底层媒体库 / 用户存储和 MF HTTP 响应为可控测试替身。覆盖五种范围、分片归属、完整指纹、能力握手、权限 / 版本保护、文件竞态、失败不重放、配置迁移和 Logo HTTP 接口。不启动生产 Jellyfin，不连接生产 MF / 云盘。
+
+需要核验插件与 MF 的请求契约时，设置 `MEDIAFLUX_DELETE_CONTRACT_DIR` 后运行上述验证脚本，再用 MF 测试环境执行：
+
+```bash
+.venv/bin/python -B -m tests.jellyfin_plugin_contract "$MEDIAFLUX_DELETE_CONTRACT_DIR"
+```
+
+该步骤把 C# 实际发送的文件夹、分片及重叠选择请求交给 MF 的真实校验与删除规划，云盘及文件均为隔离夹具。
 
 ## 打包
 

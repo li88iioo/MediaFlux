@@ -38,7 +38,7 @@ public sealed class MfClient
     {
         await ExecuteAsync(c, async session =>
         {
-            using var data = await session.GetJsonAsync("api/media-libraries/overview", token).ConfigureAwait(false);
+            using var data = await session.GetJsonAsync("api/media-libraries/overview", "媒体库读取", token).ConfigureAwait(false);
             if (!data.RootElement.TryGetProperty("servers", out var servers) || servers.ValueKind != JsonValueKind.Array)
                 throw new PluginFault("MF overview 响应缺少 servers 列表。", 502);
             return true;
@@ -48,7 +48,7 @@ public sealed class MfClient
     public Task<MfOverview> OverviewAsync(PluginConfiguration c, CancellationToken token) =>
         ExecuteAsync(c, async session =>
         {
-            using var data = await session.GetJsonAsync("api/media-libraries/overview", token).ConfigureAwait(false);
+            using var data = await session.GetJsonAsync("api/media-libraries/overview", "媒体库读取", token).ConfigureAwait(false);
             if (!data.RootElement.TryGetProperty("servers", out var servers) || servers.ValueKind != JsonValueKind.Array)
                 throw new PluginFault("MF overview 响应缺少 servers 列表。", 502);
             var candidates = servers.EnumerateArray().Where(s => Text(s, "server_type") == "jellyfin").ToArray();
@@ -83,13 +83,14 @@ public sealed class MfClient
             deadline.CancelAfter(TimeSpan.FromSeconds(c.TaskTimeoutSeconds));
             var waitToken = deadline.Token;
             // 每次在同一登录会话握手，绝不让旧 MF 忽略 scopes 后假成功。
-            using var capabilities = await session.GetJsonAsync("api/jellyfin/delete-capabilities", waitToken).ConfigureAwait(false);
+            using var capabilities = await session.GetJsonAsync("api/jellyfin/delete-capabilities", "删除能力检查", waitToken).ConfigureAwait(false);
             var capability = capabilities.RootElement;
             if (capability.ValueKind != JsonValueKind.Object
                 || !capability.TryGetProperty("scope_version", out var version) || !version.TryGetInt32(out var number) || number != 1
                 || !capability.TryGetProperty("kinds", out var kinds) || kinds.ValueKind != JsonValueKind.Array
                 || kinds.EnumerateArray().Any(k => k.ValueKind != JsonValueKind.String)
-                || !new[] { "movie", "episode", "season", "series" }.All(k => kinds.EnumerateArray().Any(v => v.GetString() == k)))
+                || !new[] { "movie", "episode", "season", "series" }.Concat(plan.Scopes.Select(s => s.Kind)).Distinct()
+                    .All(k => kinds.EnumerateArray().Any(v => v.GetString() == k)))
                 throw new PluginFault("MF 不支持完整 scopes v1 删除协议；请升级 MF。本地删除已取消，未提交云任务。", 502);
             await beforeSubmit(waitToken).ConfigureAwait(false);
             var payload = new DeleteRequest(plan.Fingerprints.Keys.ToArray(), "mf", plan.Fingerprints, plan.Scopes);
@@ -100,14 +101,14 @@ public sealed class MfClient
             request.Headers.Add("X-CSRF-Token", session.Csrf);
             // Send exactly once. Never re-login/replay this write after a 403, timeout, or disconnect.
             using var response = await session.Http.SendAsync(request, waitToken).ConfigureAwait(false);
-            Session.CheckStatus(response, HttpStatusCode.Accepted);
+            await session.CheckStatusAsync(response, HttpStatusCode.Accepted, "删除提交", waitToken).ConfigureAwait(false);
             using var accepted = JsonDocument.Parse(await response.Content.ReadAsStringAsync(waitToken).ConfigureAwait(false));
             var taskId = Text(accepted.RootElement, "task_id");
             if (!Regex.IsMatch(taskId, @"^[A-Za-z0-9_.-]{1,128}$"))
                 throw new PluginFault("MF 已接收请求，但没有返回有效 task_id；请核对 MF 日志，勿盲目重试。", 502);
             while (true)
             {
-                using var status = await session.GetJsonAsync("api/guangya/organize/status?task_id=" + Uri.EscapeDataString(taskId), waitToken).ConfigureAwait(false);
+                using var status = await session.GetJsonAsync("api/guangya/organize/status?task_id=" + Uri.EscapeDataString(taskId), "删除状态查询", waitToken).ConfigureAwait(false);
                 var root = status.RootElement;
                 var state = Text(root, "status");
                 if (state == "completed" && root.TryGetProperty("result", out var result) && True(result, "ok"))
@@ -167,7 +168,7 @@ public sealed class MfClient
         public async Task LoginAsync(CancellationToken token)
         {
             using var initial = await Http.GetAsync("login", token).ConfigureAwait(false);
-            CheckStatus(initial, HttpStatusCode.OK);
+            await CheckStatusAsync(initial, HttpStatusCode.OK, "登录页面读取", token).ConfigureAwait(false);
             var loginCsrf = HtmlToken(await initial.Content.ReadAsStringAsync(token).ConfigureAwait(false), "input", "csrf_token", "value");
             using var form = new FormUrlEncodedContent(new Dictionary<string, string>
             {
@@ -183,7 +184,7 @@ public sealed class MfClient
                 || redirect.AbsolutePath.TrimEnd('/').EndsWith("/setup", StringComparison.Ordinal))
                 throw new PluginFault("MF 登录未进入已认证页面；本地删除未执行。", 502);
             using var home = await Http.GetAsync(redirect, token).ConfigureAwait(false);
-            CheckStatus(home, HttpStatusCode.OK);
+            await CheckStatusAsync(home, HttpStatusCode.OK, "登录会话确认", token).ConfigureAwait(false);
             Csrf = HtmlToken(await home.Content.ReadAsStringAsync(token).ConfigureAwait(false), "meta", "csrf-token", "content");
             if (Csrf == loginCsrf) throw new PluginFault("MF 登录没有刷新 CSRF；已取消本地删除。", 502);
         }
@@ -191,23 +192,46 @@ public sealed class MfClient
         private bool SameService(Uri uri) => uri.Scheme == Http.BaseAddress!.Scheme && uri.Authority == Http.BaseAddress.Authority
             && uri.AbsolutePath.StartsWith(Http.BaseAddress.AbsolutePath, StringComparison.Ordinal);
 
-        public async Task<JsonDocument> GetJsonAsync(string path, CancellationToken token)
+        public async Task<JsonDocument> GetJsonAsync(string path, string stage, CancellationToken token)
         {
             using var response = await Http.GetAsync(path, token).ConfigureAwait(false);
-            CheckStatus(response, HttpStatusCode.OK);
+            await CheckStatusAsync(response, HttpStatusCode.OK, stage, token).ConfigureAwait(false);
             return JsonDocument.Parse(await response.Content.ReadAsStringAsync(token).ConfigureAwait(false));
         }
 
-        public static void CheckStatus(HttpResponseMessage response, HttpStatusCode expected)
+        public async Task CheckStatusAsync(HttpResponseMessage response, HttpStatusCode expected, string stage, CancellationToken token)
         {
-            if (response.StatusCode != expected)
-                throw new PluginFault($"MF 返回 HTTP {(int)response.StatusCode}，未获得授权或未确认操作；本地删除已取消。请核对 MF 日志，勿盲目重试。", 502);
+            if (response.StatusCode == expected) return;
+            var reason = "未获得授权或未确认操作";
+            // 只接受业务拒绝的公开 error 字段；鉴权失败/代理错误不展示响应体。
+            if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Conflict)
+            {
+                reason = "服务端拒绝请求，未提供可公开原因";
+                using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+                var buffer = new byte[8193];
+                var read = await stream.ReadAtLeastAsync(buffer, buffer.Length, throwOnEndOfStream: false, cancellationToken: token).ConfigureAwait(false);
+                if (read < buffer.Length)
+                {
+                    try
+                    {
+                        using var data = JsonDocument.Parse(buffer.AsMemory(0, read), new JsonDocumentOptions { MaxDepth = 16 });
+                        var error = Text(data.RootElement, "error");
+                        if (!string.IsNullOrWhiteSpace(error)) reason = SafeError(error).Trim();
+                    }
+                    catch (JsonException) { /* 空、非 JSON 或未知结构只给通用拒绝原因。 */ }
+                }
+            }
+            throw new PluginFault($"MF {stage}返回 HTTP {(int)response.StatusCode}：{reason}；本地删除已取消。请核对 MF 日志，勿盲目重试。", 502);
         }
 
         public string SafeError(string text)
         {
             foreach (var secret in new[] { c.Password, Uri.EscapeDataString(c.Password), WebUtility.UrlEncode(c.Password), Csrf })
                 if (!string.IsNullOrEmpty(secret)) text = text.Replace(secret, "[已隐藏]", StringComparison.Ordinal);
+            text = Regex.Replace(text, @"(?i)\b(?:authorization|proxy-authorization|(?:set-)?cookie)\s*[:=]\s*[^\r\n]+", "[已隐藏]");
+            text = Regex.Replace(text, @"(?i)\b(?:bearer|basic)\s+[a-z0-9+/_.=~-]+", "[已隐藏]");
+            text = Regex.Replace(text, @"(?i)\b(?:(?:x[-_])?api[-_ ]?key|access[-_]?token|refresh[-_]?token|token|password|passwd|(?:x[-_])?csrf[-_]?token|session(?:id)?|sig(?:nature)?|secret)\b['""]?\s*[:=]\s*(?:""[^""]*""|'[^']*'|[^\s,;}&]+)", "[已隐藏]");
+            text = Regex.Replace(text, @"(?i)https?://[^\s<>""']+", "[链接已隐藏]");
             text = new string(text.Select(ch => char.IsControl(ch) ? ' ' : ch).ToArray());
             return text.Length > 512 ? text[..512] + "…" : text;
         }

@@ -293,6 +293,29 @@ class JellyfinScopedDeleteTests(IsolatedDatabaseTestCase):
         self.fx.assert_retired(*sources)
         self.fx.close.assert_called_once_with(self.cloud.provider)
 
+    def test_explicit_folder_scope_recycles_all_indexed_members_and_companions(self):
+        first, root = self.movie()
+        second = self.video("second-part", "Movie.CD2.mkv", "movie")
+        self.file("poster", "poster.jpg", "movie")
+        result = self.execute(self.payload("folder", root, first, second))
+        self.assert_success(result, {"movie-video", "second-part", "poster"})
+        self.assertIn("movie", self.cloud.deleted_directories)
+
+    def test_movie_multiple_paths_are_one_complete_directory_scope(self):
+        first, root = self.movie()
+        second = self.video("second-part", "Movie.CD2.mkv", "movie")
+        result = self.execute(self.payload("movie", root, first, second))
+        self.assert_success(result, {"movie-video", "second-part"})
+        self.assertIn("movie", self.cloud.deleted_directories)
+
+    def test_folder_scope_requires_every_video_and_rejects_duplicate_scope_members(self):
+        first, root = self.movie()
+        second = self.video("second-part", "Movie.CD2.mkv", "movie")
+        self.assert_rejected(self.payload("folder", root, first))
+        payload = self.payload("folder", root, first, second)
+        payload["scopes"].append(dict(payload["scopes"][0]))
+        self.assert_rejected(payload)
+
     def test_movie_dedicated_directory_recycles_every_file_and_removes_tree(self):
         for mode in ("mf", "manual"):
             with self.subTest(mode=mode):
@@ -512,7 +535,7 @@ class JellyfinScopedDeleteTests(IsolatedDatabaseTestCase):
 
     def test_unauthorized_scope_kinds_are_rejected_before_any_cloud_write(self):
         path, root = self.movie()
-        for kind in ("file", "folder", "boxset", "music", "Movie", "", None, 1, [], {}):
+        for kind in ("file", "boxset", "music", "Movie", "", None, 1, [], {}):
             with self.subTest(kind=kind):
                 payload = self.payload("movie", root, path)
                 payload["scopes"][0]["kind"] = kind
@@ -1072,7 +1095,7 @@ class JellyfinScopedDeleteTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(
             response.json(),
-            {"scope_version": 1, "kinds": ["movie", "episode", "season", "series"]},
+            {"scope_version": 1, "kinds": ["movie", "episode", "season", "series", "folder"]},
         )
         self.fx.manager.start_operation.assert_not_called()
         self.fx.factory.assert_not_called()

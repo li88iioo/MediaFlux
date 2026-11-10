@@ -115,7 +115,9 @@ internal sealed class TestFixture : IDisposable
         Library.Setup(l => l.GetItemById<BaseItem>(It.IsAny<Guid>(), It.IsAny<User?>()))
             .Returns((Guid id, User? user) => user is not null && Hidden.Contains(id) ? null : Items.GetValueOrDefault(id));
         Library.Setup(l => l.FindByPath(It.IsAny<string>(), It.IsAny<bool?>()))
-            .Returns((string path, bool? folder) => Items.Values.FirstOrDefault(i => i.Path == path && (!folder.HasValue || i.IsFolder == folder)));
+            .Returns((string path, bool? folder) => Items.Values.FirstOrDefault(i => i.OwnerId == Guid.Empty && MappingSet.Equal(MappingSet.Normalize(i.Path), MappingSet.Normalize(path)) && (!folder.HasValue || i.IsFolder == folder)));
+        Library.Setup(l => l.GetNewItemId(It.IsAny<string>(), typeof(Video)))
+            .Returns((string path, Type _) => Items.Values.FirstOrDefault(i => i is Video && MappingSet.Equal(MappingSet.Normalize(i.Path), MappingSet.Normalize(path)))?.Id ?? Guid.Empty);
         Library.Setup(l => l.DeleteItem(It.IsAny<BaseItem>(), It.IsAny<DeleteOptions>(), true))
             .Callback((BaseItem item, DeleteOptions options, bool _) =>
             {
@@ -182,6 +184,18 @@ internal sealed class TestFixture : IDisposable
         return item;
     }
 
+    public Mock<Video> Part(Video owner, string name)
+    {
+        var path = Path.Combine(Root, name); Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "https://example.invalid/part\n");
+        // 官方 Video.RefreshedOwnedItems 使用 typeof(Video)，额外部件不是 Movie。
+        var part = new Mock<Video> { CallBase = true };
+        part.Object.Id = Guid.NewGuid(); part.Object.Path = path; part.Object.OwnerId = owner.Id;
+        part.Setup(i => i.CanDelete(It.IsAny<User>())).Returns(true);
+        Items[part.Object.Id] = part.Object;
+        return part;
+    }
+
     public Folder Folder(string directory = "series") => DirectoryItem<Folder>(directory, null);
     public Series Series(string directory = "series") => DirectoryItem<Series>(directory, null);
     public Season Season(string directory = "series/Season 1", Folder? parent = null) => DirectoryItem<Season>(directory, parent);
@@ -228,12 +242,13 @@ internal sealed class FakeMfHandler : HttpMessageHandler
     public int DeletePosts { get; private set; }
     public int LoginPosts { get; private set; }
     public int CapabilityGets { get; private set; }
-    public string Capabilities { get; set; } = "{\"scope_version\":1,\"kinds\":[\"movie\",\"episode\",\"season\",\"series\"]}";
+    public string Capabilities { get; set; } = "{\"scope_version\":1,\"kinds\":[\"movie\",\"episode\",\"season\",\"series\",\"folder\"]}";
     public HttpStatusCode CapabilityCode { get; set; } = HttpStatusCode.OK;
     public List<string> Requests { get; } = [];
     public Action? OnCapabilities { get; set; }
     public string? DeleteBody { get; private set; }
     public HttpStatusCode DeleteCode { get; set; } = HttpStatusCode.Accepted;
+    public string DeleteResponse { get; set; } = "{\"task_id\":\"writer-test-1\"}";
     public string State { get; set; } = "completed";
     public bool Ok { get; set; } = true;
     public string Error { get; set; } = "后端已拒绝文件身份校验";
@@ -272,7 +287,7 @@ internal sealed class FakeMfHandler : HttpMessageHandler
             DeletePosts++;
             Assert.Equal("after-login", request.Headers.GetValues("X-CSRF-Token").Single());
             DeleteBody = await request.Content!.ReadAsStringAsync(token);
-            return Reply("{\"task_id\":\"writer-test-1\"}", DeleteCode);
+            return Reply(DeleteResponse, DeleteCode);
         }
         if (path == "/api/guangya/organize/status")
         {

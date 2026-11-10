@@ -160,14 +160,73 @@ public sealed class DeleteFlowTests
         Assert.Contains("已隐藏", f.Plugin.LastDeleteError);
     }
 
-    [Fact]
-    public async Task Mf403NeverReplaysWriteOrContinuesNativeDelete()
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task MfAuthorizationFailureNeverExposesBodyOrReplaysWrite(HttpStatusCode code)
     {
-        using var f = new TestFixture(); f.Handler.DeleteCode = HttpStatusCode.Forbidden;
+        using var f = new TestFixture(); f.Handler.DeleteCode = code;
+        f.Handler.DeleteResponse = "{\"error\":\"private-auth-body api_key=private-auth-key\"}";
         using var response = await f.Delete(f.Episode().Object);
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
-        Assert.Contains("403", await response.Content.ReadAsStringAsync());
+        Assert.Contains(((int)code).ToString(), f.Plugin.LastDeleteError);
+        Assert.Contains("未获得授权", f.Plugin.LastDeleteError);
+        Assert.DoesNotContain("private-auth", await response.Content.ReadAsStringAsync());
         Assert.Equal(1, f.Handler.LoginPosts); Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(0, f.NativeDeletes);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.BadRequest)]
+    [InlineData(HttpStatusCode.Conflict)]
+    public async Task MfPublicRequestRejectionsPreserveStageStatusAndReason(HttpStatusCode code)
+    {
+        using var f = new TestFixture(); f.Handler.DeleteCode = code;
+        f.Handler.DeleteResponse = JsonSerializer.Serialize(new { error = "STRM 索引缺失，请先同步核对", api_key = "ignored-private-key" });
+        using var response = await f.Delete(f.Episode().Object);
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Contains("删除提交", f.Plugin.LastDeleteError);
+        Assert.Contains(((int)code).ToString(), f.Plugin.LastDeleteError);
+        Assert.Contains("STRM 索引缺失", f.Plugin.LastDeleteError);
+        Assert.DoesNotContain("未获得授权", f.Plugin.LastDeleteError);
+        Assert.DoesNotContain("ignored-private-key", await response.Content.ReadAsStringAsync());
+        Assert.Equal(1, f.Handler.LoginPosts); Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(0, f.NativeDeletes);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("<html>api_key=do-not-render</html>")]
+    [InlineData("{\"error\":{\"api_key\":\"do-not-render\"}}")]
+    [InlineData("{\"detail\":\"do-not-render\"}")]
+    public async Task UnknownErrorBodiesOnlyProduceTheSafeFallback(string body)
+    {
+        using var f = new TestFixture(); f.Handler.DeleteCode = HttpStatusCode.Conflict; f.Handler.DeleteResponse = body;
+        using var response = await f.Delete(f.Episode().Object);
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Contains("未提供可公开原因", f.Plugin.LastDeleteError);
+        Assert.DoesNotContain("do-not-render", await response.Content.ReadAsStringAsync());
+        Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(0, f.NativeDeletes);
+    }
+
+    [Fact]
+    public async Task PublicErrorsAreRedactedBeforeTruncationAndOversizedBodiesAreIgnored()
+    {
+        using var f = new TestFixture(); f.Handler.DeleteCode = HttpStatusCode.Conflict;
+        var item = f.Episode().Object;
+        var message = "归属冲突 private-password after-login api_key=key-secret access_token=access-secret "
+            + "refreshToken=refresh-secret https://service.invalid/path?key=url-secret\n"
+            + "Authorization: Bearer bearer-secret\nCookie: session=cookie-secret\n" + new string('长', 800);
+        f.Handler.DeleteResponse = JsonSerializer.Serialize(new { error = message });
+        using var response = await f.Delete(item);
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Contains("归属冲突", f.Plugin.LastDeleteError); Assert.Contains("已隐藏", f.Plugin.LastDeleteError);
+        foreach (var secret in new[] { "private-password", "after-login", "key-secret", "access-secret", "refresh-secret", "url-secret", "bearer-secret", "cookie-secret" })
+            Assert.DoesNotContain(secret, await response.Content.ReadAsStringAsync());
+        Assert.True(f.Plugin.LastDeleteError.Length < 700);
+        f.Handler.DeleteResponse = JsonSerializer.Serialize(new { error = new string('a', 9000) + "do-not-render" });
+        using var oversized = await f.Delete(item);
+        Assert.Contains("未提供可公开原因", f.Plugin.LastDeleteError);
+        Assert.DoesNotContain("do-not-render", await oversized.Content.ReadAsStringAsync());
+        Assert.Equal(2, f.Handler.DeletePosts); Assert.Equal(0, f.NativeDeletes);
     }
 
     [Fact]

@@ -41,6 +41,7 @@ from app.repositories.strm import list_strm_file_owners, list_strm_path_owners, 
 
 logger = get_logger(__name__)
 MAX_DELETE_PATHS = 1000
+DELETE_SCOPE_KINDS = ("movie", "episode", "season", "series", "folder")
 
 
 @dataclass(frozen=True)
@@ -72,15 +73,15 @@ def _scopes(payload: dict, mappings, local_paths: dict[str, str]) -> dict[str, t
         raise DirectoryScrapeRequestError("媒体删除范围无效")
     result = {}
     for scope in scopes:
-        if not isinstance(scope, dict) or scope.get("kind") not in ("movie", "episode", "season", "series"):
-            raise DirectoryScrapeRequestError("请选择电影、单集、整季或整剧删除范围")
+        if not isinstance(scope, dict) or scope.get("kind") not in DELETE_SCOPE_KINDS:
+            raise DirectoryScrapeRequestError("请选择电影、单集、整季、整剧或明确文件夹删除范围")
         kind, raw_root, members = scope["kind"], scope.get("root"), scope.get("paths")
         if raw_root is not None and (not isinstance(raw_root, str) or not raw_root.strip()):
             raise DirectoryScrapeRequestError("作品目录必须是有效路径或 null")
         if not isinstance(members, list) or not members or len(members) > MAX_DELETE_PATHS:
             raise DirectoryScrapeRequestError("删除范围缺少 STRM 文件")
-        if (kind == "episode" and raw_root) or (kind in {"season", "series"} and not raw_root):
-            raise DirectoryScrapeRequestError("单集不能授权目录，整季/整剧必须指定作品目录")
+        if (kind == "episode" and raw_root) or (kind in {"season", "series", "folder"} and not raw_root):
+            raise DirectoryScrapeRequestError("单集不能授权目录，整季/整剧/文件夹必须指定作品目录")
         root = ""
         try:
             if raw_root:
@@ -317,8 +318,8 @@ def _cloud_plan(client, expected, candidates, listings, parents):
                 if _strm_target(item, "/".join(rel_parts), strm_root) != Path(target.path):
                     raise DirectoryScrapeConflictError("作品目录与当前云端路径不一致，请先同步核对")
                 steps = len(Path(target.path).relative_to(local_root).parts) - 1
-                if kind in {"season", "series"} and len(Path(target.path).relative_to(Path(strm_root) / STRM_SUBDIR).parts) != len(rel_parts) + 1:
-                    raise DirectoryScrapeConflictError("STRM 路径已折叠，不能据此扩大整季/整剧删除范围")
+                if kind in {"season", "series", "folder"} and len(Path(target.path).relative_to(Path(strm_root) / STRM_SUBDIR).parts) != len(rel_parts) + 1:
+                    raise DirectoryScrapeConflictError("STRM 路径已折叠，不能据此扩大整季/整剧/文件夹删除范围")
                 for _ in range(steps):
                     if directory_id in protected or directory_id == target.source_id:
                         raise DirectoryScrapeConflictError("不能扩大删除到来源根或归档根目录")
