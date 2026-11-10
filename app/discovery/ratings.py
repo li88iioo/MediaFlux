@@ -13,10 +13,12 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app import config
-from app.concurrency import AsyncBridgeUnavailable, run_awaitable_sync
+from app.concurrency import run_awaitable_sync
 from app.modules.web_evidence import search_web
 from app.clients.http import FixedHostHttpClient, HttpError
-from app.discovery.models import MediaCard
+from app.discovery.models import (
+    MediaCard, ProviderAuthenticationError, ProviderError, ProviderRateLimited, ProviderUnavailable,
+)
 from app.discovery.search import get_discovery_search_service
 from app.discovery.service import get_discovery_service
 from app.logger import get_logger
@@ -133,17 +135,11 @@ def _select_card(
     if not ranked:
         return None
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    # 用户没有给出类型或年份时，同名电影/剧集不能靠搜索顺序猜测。
-    # 上一轮本地媒体结果会携带这两个身份字段，因此自然续问不会受影响。
-    if not media_type and not year:
-        exact_candidates = [
-            card
-            for _score, _index, card in ranked
-            if query_key in {_match_text(card.title), _match_text(card.original_title)}
-        ]
-        identities = {(card.media_type, card.year) for card in exact_candidates}
-        if len(identities) > 1:
-            return None
+    # 应用已有身份条件后仍并列的不同作品，不能靠搜索顺序猜测。
+    identities = {(card.provider, card.media_type, card.external_id)
+                  for score, _index, card in ranked if score == ranked[0][0]}
+    if len(identities) > 1:
+        return None
     return ranked[0][2]
 
 
@@ -153,6 +149,7 @@ def _success_result(
     *,
     source_method: str,
     web_fallback_used: bool,
+    evidence: list[dict[str, Any]],
 ) -> dict[str, Any]:
     media_label = _media_type_label(card.media_type)
     year_text = f"（{card.year}，{media_label}）" if card.year else f"（{media_label}）"
@@ -171,18 +168,7 @@ def _success_result(
             "source_method": source_method,
             "web_fallback_used": web_fallback_used,
         },
-        "evidence": [
-            {
-                "source": "douban" if not web_fallback_used else "web_search",
-                "description": {
-                    "douban_search": "豆瓣结构化媒体数据",
-                    "douban_detail": "豆瓣结构化媒体详情",
-                    "web_search": "豆瓣网页搜索摘要",
-                    "web_fetch": "豆瓣公开条目页",
-                }.get(source_method, "豆瓣公开媒体数据"),
-                "collected_at": _now(),
-            }
-        ],
+        "evidence": evidence,
         "suggestions": ["如果要继续检查缺集或更新，直接说“检查这部剧有没有缺集”。"],
     }
 
@@ -290,8 +276,14 @@ async def _fetch_douban_rating_async(
     )
     try:
         response = await client.get(verified_url, max_redirects=0)
-        if response.status_code != 200:
+        if response.status_code in {401, 403}:
+            raise ProviderAuthenticationError("豆瓣公开条目页要求登录或拒绝访问")
+        if response.status_code == 429:
+            raise ProviderRateLimited("豆瓣公开条目页限制访问频率")
+        if response.status_code in {404, 410}:
             return None
+        if response.status_code != 200:
+            raise ProviderUnavailable("豆瓣公开条目页当前不可用")
         return _rating_from_douban_html(
             response.text,
             query=query,
@@ -302,38 +294,15 @@ async def _fetch_douban_rating_async(
         await client.aclose()
 
 
-def _fetch_douban_rating(
-    url: str,
-    *,
-    query: str,
-    year: str,
-    media_type: str,
-) -> float | None:
-    try:
-        return run_awaitable_sync(
-            _fetch_douban_rating_async(
-                url,
-                query=query,
-                year=year,
-                media_type=media_type,
-            )
-        )
-    except AsyncBridgeUnavailable:
-        logger.info("豆瓣条目页抓取跳过 reason=active_event_loop")
-    except (HttpError, httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-        logger.info("豆瓣条目页抓取失败 type=%s", type(exc).__name__)
-    return None
-
-
 def _web_rating(
     *,
     query: str,
     media_type: str,
     year: str,
-) -> tuple[float, dict[str, Any], str] | None:
+) -> tuple[tuple[float, str] | None, list[dict[str, Any]]]:
     # 没有类型时无法可靠地区分同名电影与剧集，宁可要求补充信息也不猜。
     if media_type not in _ALLOWED_MEDIA_TYPES:
-        return None
+        return None, []
     qualifiers = [query]
     if year:
         qualifiers.append(year)
@@ -341,10 +310,15 @@ def _web_rating(
         [_media_type_label(media_type), "豆瓣评分", "site:movie.douban.com"]
     )
     result = search_web(" ".join(qualifiers), max_results=5)
+    evidence = [{"source": "web_search", "status": result["status"], "ok": result["ok"],
+                 "description": "已尝试网页补查。" if result["ok"] else f"已尝试网页补查，搜索未完成（{result['status']}）。",
+                 "collected_at": _now()}]
     if not result["ok"]:
-        return None
+        return None, evidence
     query_key = _match_text(query)
     fetch_attempts = 0
+    candidates = set()
+    matches = {}
     for item in result["data"].get("results") or []:
         if not isinstance(item, dict):
             continue
@@ -367,27 +341,43 @@ def _web_rating(
             token in lowered for token in ("电视剧", "剧集")
         ):
             continue
+        candidates.add(verified_url)
         match = _SCORE_NEAR_LABEL_RE.search(combined) or _SCORE_BEFORE_LABEL_RE.search(
             combined
         )
         if match and (not year or year in combined):
             rating = _valid_rating(match.group(1))
             if rating is not None:
-                return rating, item, "web_search"
+                matches[verified_url] = (rating, "web_search")
+                continue
         # 搜索摘要可能没有年份或分数；最多读取两个已验证条目页，并由页面元数据
         # 再次核对片名、年份和媒体类型，避免多个候选造成长时间串行等待。
         if fetch_attempts >= 2:
             continue
         fetch_attempts += 1
-        rating = _fetch_douban_rating(
-            verified_url,
-            query=query,
-            year=year,
-            media_type=media_type,
-        )
+        try:
+            rating = run_awaitable_sync(_fetch_douban_rating_async(
+                verified_url, query=query, year=year, media_type=media_type,
+            ))
+        except (ProviderError, HttpError, httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            status = "timeout" if isinstance(exc, (TimeoutError, httpx.TimeoutException)) else getattr(exc, "code", "unavailable")
+            evidence.append({"source": "web_fetch", "url": verified_url, "status": status, "ok": False,
+                             "description": f"豆瓣公开条目页读取未完成（{status}）。", "collected_at": _now()})
+            continue
+        evidence.append({"source": "web_fetch", "url": verified_url, "status": "success" if rating is not None else "not_found",
+                         "ok": True, "description": "已读取豆瓣公开条目页并核对作品身份与评分。", "collected_at": _now()})
         if rating is not None:
-            return rating, item, "web_fetch"
-    return None
+            matches[verified_url] = (rating, "web_fetch")
+    if not matches:
+        return None, evidence
+    if len(matches) > 1 or not year and len(candidates) > 1:
+        evidence.append({"source": "web_search", "status": "ambiguous", "ok": True,
+                         "description": "同名条目身份仍有歧义，未按搜索顺序选择。", "collected_at": _now()})
+        return None, evidence
+    selected_url, selected = next(iter(matches.items()))
+    if selected[1] == "web_search":
+        evidence[0]["url"] = selected_url
+    return selected, evidence
 
 
 def lookup_rating(
@@ -432,6 +422,10 @@ def lookup_rating(
     provider_error = False
     web_fallback_attempted = False
     structured_attempted = config.get_bool("DISCOVERY_ENABLED")
+    ambiguous = False
+    evidence = [{"source": "douban", "status": "not_queried", "ok": None,
+                 "description": "已尝试豆瓣结构化查询。" if structured_attempted else "结构化查询未启用，本次未调用。",
+                 "collected_at": _now()}]
 
     if structured_attempted:
         try:
@@ -445,18 +439,27 @@ def lookup_rating(
             provider_error = bool(search_result.errors) and not bool(
                 search_result.providers_succeeded
             )
+            ambiguous = selected is None and any(
+                _candidate_score(card, query_key=_match_text(query), media_type=media_type, year=year) is not None
+                for card in search_result.items
+            )
+            evidence[0].update(ok=not provider_error,
+                               status=search_result.errors[0]["code"] if provider_error else
+                               "ambiguous" if ambiguous else "available" if search_result.items else "empty")
         except Exception as exc:  # 辅助评分失败只报告该来源，不中断调用方。
             logger.warning("豆瓣评分结构化查询失败 type=%s", type(exc).__name__)
             provider_error = True
+            evidence[0].update(ok=False, status=getattr(exc, "code", "unavailable"))
 
     if selected is not None:
         rating = _valid_rating(selected.rating)
-        if rating is not None:
+        if rating is not None and (not year or selected.year == year):
             return _success_result(
                 selected,
                 rating,
                 source_method="douban_search",
                 web_fallback_used=False,
+                evidence=evidence,
             )
         try:
             detail = get_discovery_service().get_detail(
@@ -466,22 +469,34 @@ def lookup_rating(
             logger.warning("豆瓣评分详情查询失败 type=%s", type(exc).__name__)
             detail = None
             provider_error = True
+            evidence.append({"source": "douban_detail", "status": getattr(exc, "code", "unavailable"), "ok": False,
+                             "description": "豆瓣结构化详情查询未完成。", "collected_at": _now()})
         if detail is not None:
+            verified = ((detail.provider, detail.media_type, detail.external_id)
+                        == (selected.provider, selected.media_type, selected.external_id)
+                        and _candidate_score(detail, query_key=_match_text(query), media_type=media_type, year=year) is not None
+                        and (not year or detail.year == year))
+            evidence.append({"source": "douban_detail", "status": "available" if verified else "identity_mismatch", "ok": True,
+                             "description": "已核对豆瓣结构化详情的作品身份和年份。", "collected_at": _now()})
             rating = _valid_rating(detail.rating)
-            if rating is not None:
+            if rating is not None and verified:
                 return _success_result(
                     detail,
                     rating,
                     source_method="douban_detail",
                     web_fallback_used=False,
+                    evidence=evidence,
                 )
 
-    if allow_web_fallback and media_type in _ALLOWED_MEDIA_TYPES:
+    if allow_web_fallback and media_type in _ALLOWED_MEDIA_TYPES and not ambiguous:
         web_fallback_attempted = True
-        web_match = _web_rating(query=query, media_type=media_type, year=year)
+        web_match, web_evidence = _web_rating(query=query, media_type=media_type, year=year)
+        evidence.extend(web_evidence)
+        provider_error |= any(item["ok"] is False for item in web_evidence)
+        ambiguous = any(item["status"] == "ambiguous" for item in web_evidence)
         if web_match is not None:
-            rating, _item, source_method = web_match
-            fallback_card = selected or MediaCard(
+            rating, source_method = web_match
+            fallback_card = MediaCard(
                 provider="douban",
                 external_id="web-search-result",
                 media_type=media_type,
@@ -495,6 +510,7 @@ def lookup_rating(
                 rating,
                 source_method=source_method,
                 web_fallback_used=True,
+                evidence=evidence,
             )
 
     media_label = _media_type_label(media_type)
@@ -504,7 +520,10 @@ def lookup_rating(
             value for value in (year, media_label if media_type else "") if value
         )
         identity += f"（{qualifiers}）"
-    if not media_type:
+    if ambiguous:
+        reason = "同名作品仍有歧义，尚未核实要查询哪一个条目"
+        suggestions = ["请补充作品年份或更完整的片名；不会按搜索顺序猜选评分。"]
+    elif not media_type:
         reason = "尚未明确要查询电影还是电视剧，无法核验评分"
         suggestions = ["请补充“电影”或“电视剧”，我会继续查询同一作品。"]
     else:
@@ -515,9 +534,11 @@ def lookup_rating(
             else "；未进行网页补查"
         )
         suggestions = ["稍后直接说“重试”，我会继续查询同一部作品。"]
+    if not web_fallback_attempted:
+        evidence[0]["description"] += "本次未进行网页补查。"
     return {
         "ok": False,
-        "status": "unavailable" if provider_error else "not_found",
+        "status": "ambiguous" if ambiguous else "unavailable" if provider_error else "not_found",
         "summary": f"{identity}{reason}。",
         "data": {
             "query": query,
@@ -530,22 +551,7 @@ def lookup_rating(
             "source_method": "none",
             "web_fallback_used": web_fallback_attempted,
         },
-        "evidence": [
-            {
-                "source": "douban",
-                "description": (
-                    "已尝试豆瓣结构化查询。"
-                    if structured_attempted
-                    else "结构化查询未启用，本次未调用。"
-                )
-                + (
-                    "已尝试网页补查，未取得可核验评分。"
-                    if web_fallback_attempted
-                    else "本次未进行网页补查。"
-                ),
-                "collected_at": _now(),
-            }
-        ],
+        "evidence": evidence,
         "suggestions": suggestions,
-        "error": "rating_unavailable" if provider_error else "rating_not_found",
+        "error": "rating_ambiguous" if ambiguous else "rating_unavailable" if provider_error else "rating_not_found",
     }
