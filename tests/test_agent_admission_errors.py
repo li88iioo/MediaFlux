@@ -159,7 +159,8 @@ def test_discovery_or_a_different_call_cannot_clear_the_original_admission_error
             "implicit-context": [(rejected, {}), (HEALTH, {}), FIND, (LOOKUP, {})],
             "different-raw-default": [(rejected, X), FIND, (LOOKUP, {**X, "limit": 20})],
         }[case]
-        events, state, _wire = await run_calls(store, protocol, [reader(HEALTH, calls), target], steps)
+        tools = [reader(HEALTH, calls)] if case == "health-only" else [reader(HEALTH, calls), target]
+        events, state, _wire = await run_calls(store, protocol, tools, steps)
         assert_unfinished(events, state, partial=True)
         if case == "health-only":
             assert calls == [(HEALTH, {})]
