@@ -30,7 +30,7 @@ def file_location(client: GuangYaClient, file_id: str, *, check_cancelled: Calla
     if item is None or item.file_id != file_id:
         raise GuangYaWorkspaceStale("文件或目录不存在，不能按名称替代")
     located = locate_file_in_roots(client, {"file_id": file_id, "is_dir": item.is_dir},
-        [{"file_id": "0", "path": "/", "is_dir": True}], cache={}, check_cancelled=check_cancelled)
+        [{"file_id": "0", "path": "/", "is_dir": True}], cache={file_id: item}, check_cancelled=check_cancelled)
     if located is None:
         raise GuangYaWorkspaceStale("无法完整核对对象父目录，请重新读取")
     return {**asdict(item), "parent_path": located["parent_path"],
@@ -56,7 +56,17 @@ def list_files(client: GuangYaClient, parent_id: str = "0", *, recursive: bool =
             raise InterruptedError("云盘目录读取已停止，未返回完整清单")
 
     check_cancelled()
-    root = file_location(client, parent_id, check_cancelled=check_cancelled) if parent_id != "0" else {"file_id": "0", "is_dir": True, "path": "/"}
+    root: dict[str, Any] = {"file_id": "0", "is_dir": True, "path": "/"}
+    if parent_id.startswith(("/", "\\")):
+        path = _normalize_path(parent_id, allow_root=True)
+        if path == "/":
+            parent_id = "0"
+        else:
+            item, parent_path = _resolve_path(client, path, should_stop=should_stop, check_cancelled=check_cancelled)
+            parent_id = item.file_id
+            root = {**asdict(item), "parent_path": parent_path, "path": parent_path.rstrip("/") + "/" + item.name}
+    elif parent_id != "0":
+        root = file_location(client, parent_id, check_cancelled=check_cancelled)
     if not root["is_dir"]:
         raise GuangYaWorkspaceError("list只能读取目录；单个文件使用cloud.info")
     queue = deque([(parent_id, root["path"], "", 0)])
@@ -82,7 +92,7 @@ def list_files(client: GuangYaClient, parent_id: str = "0", *, recursive: bool =
                 if directories + len(queue) >= max_dirs:
                     raise GuangYaWorkspaceError(
                         f"范围超过 {max_dirs} 个目录的读取预算，未返回不完整清单；"
-                        "请缩小parent_id范围。query只过滤结果，不减少目录扫描。"
+                        "请用目录ID或绝对路径缩小parent_id范围。query只过滤结果，不减少目录扫描。"
                     )
                 queue.append((item.file_id, row["path"], child_relative, depth + 1))
         check_cancelled()  # iter_dir取消时可提前结束，不能把半份目录当成完整快照。
@@ -110,13 +120,16 @@ def _normalize_path(value: object, *, allow_root: bool = False) -> str:
     return "/" + "/".join(parts)
 
 
-def _resolve_path(client: GuangYaClient, path: str) -> tuple[GuangYaFile, str]:
+def _resolve_path(client: GuangYaClient, path: str, *, should_stop: Callable[[], bool] | None = None,
+                  check_cancelled: Callable[[], None] = lambda: None) -> tuple[GuangYaFile, str]:
     components = _normalize_path(path).strip("/").split("/")
     current: GuangYaFile | None = None
     parent_id = "0"
     parent_path = "/"
     for index, component in enumerate(components):
-        items = client.list_dir(parent_id)
+        check_cancelled()
+        items = list(client.iter_dir(parent_id, should_stop=should_stop))
+        check_cancelled()
         exact = [item for item in items if item.name == component]
         matches = exact or [
             item for item in items if item.name.casefold() == component.casefold()
@@ -125,10 +138,11 @@ def _resolve_path(client: GuangYaClient, path: str) -> tuple[GuangYaFile, str]:
             raise GuangYaWorkspaceError(
                 f"路径不存在或名称不唯一：/{'/'.join(components[: index + 1])}"
             )
+        if current is not None:
+            parent_path = parent_path.rstrip("/") + "/" + current.name
         current = matches[0]
         if index < len(components) - 1 and not current.is_dir:
             raise GuangYaWorkspaceError("光鸭路径的中间组件不是目录")
-        parent_path = "/" + "/".join(components[:index]) if index else "/"
         parent_id = current.file_id
     assert current is not None
     return current, parent_path

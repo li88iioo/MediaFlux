@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.modules.process_lock import CrossProcessLock
 from threading import Thread
 from copy import deepcopy
+from collections import Counter
 from functools import partial
 from dataclasses import asdict
 
@@ -250,6 +251,133 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
         self.assertNotIn("observation_ref", plan)
         self.assertNotIn("observation_source", plan)
         json.dumps(plan, allow_nan=False)
+
+    def test_readonly_preflight_shares_source_and_target_details(self):
+        client, plan = self._file_id_plan(operations=[
+            {"op": "relocate", "file_id": "rename", "target_path": "/target", "new_name": "New.mp4"},
+            {"op": "move", "file_id": "move", "target_path": "/target"},
+        ])
+        before = deepcopy(client.directories)
+        outcomes = [{"status": "not_started"} for _ in plan["operations"]]
+        with mock.patch.object(client, "file_info", wraps=client.file_info) as info:
+            guangya_fs_change._preflight_fs_change_plan(client, plan["operations"], outcomes, None)
+        self.assertEqual(Counter(call.args[0] for call in info.call_args_list),
+                         {"rename": 1, "move": 1, "source": 1, "target": 1})
+        self.assertEqual(client.directories, before)
+
+    def test_deep_batch_preflight_bounds_total_provider_reads(self):
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        client = FakeGatewayClient()
+        source, target = "source", "target"
+        target_path = "/target"
+        for depth in range(6):
+            source = client.create_dir(f"source-{depth}", source)
+            target = client.create_dir(f"target-{depth}", target)
+            target_path += f"/target-{depth}"
+        client.directories[source] = [
+            GuangYaFile(f"file-{i}", f"Old-{i}.mp4", False, parent_id=source, size=10, etag=str(i))
+            for i in range(20)
+        ]
+        _, plan = self._file_id_plan(client, [
+            {"op": "relocate", "file_id": f"file-{i}", "target_path": target_path, "new_name": f"New-{i}.mp4"}
+            for i in range(20)
+        ])
+        before = deepcopy(client.directories)
+        with mock.patch.object(client, "file_info", wraps=client.file_info) as info, \
+             mock.patch.object(client, "list_dir", wraps=client.list_dir) as listing:
+            guangya_fs_change._preflight_fs_change_plan(
+                client, plan["operations"], [{"status": "not_started"} for _ in plan["operations"]], None)
+        # 20 个源对象及两侧各 7 层目录；原实现共 114 次详情/列表请求。
+        self.assertLessEqual(info.call_count, 34)
+        self.assertEqual(Counter(call.args[0] for call in listing.call_args_list), {source: 1, target: 1})
+        self.assertEqual(client.directories, before)
+
+    def test_preflight_fallback_reuses_one_parent_listing_for_conflicts(self):
+        client, plan = self._file_id_plan()
+        original_info = client.file_info
+
+        def info(file_id):
+            if file_id == "rename":
+                raise TimeoutError("detail unavailable")
+            return original_info(file_id)
+
+        with mock.patch.object(client, "file_info", side_effect=info) as details, \
+             mock.patch.object(client, "list_dir", wraps=client.list_dir) as listing:
+            guangya_fs_change._preflight_operation(cast(GuangYaClient, client), plan["operations"][0])
+        self.assertEqual(Counter(call.args[0] for call in details.call_args_list), {"rename": 1, "source": 1})
+        listing.assert_called_once_with("source")
+
+    def test_next_write_rechecks_shared_ancestor_after_first_write(self):
+        client, plan = self._file_id_plan(operations=[
+            {"op": "move", "file_id": file_id, "target_path": "/target"}
+            for file_id in ("rename", "move")
+        ])
+        task = self._submit_shared(plan)
+        claimed = claim_organize_operation_job(task["task_id"])
+        assert claimed is not None
+        original_move = client.move
+
+        def move(file_ids, parent_id):
+            result = original_move(file_ids, parent_id)
+            client.directories["0"][0].name = "external-rename"
+            return result
+
+        with mock.patch.object(client, "move", side_effect=move) as moved:
+            result = guangya_fs_change.execute_fs_change_plan(
+                json.loads(claimed["payload_json"]), client_factory=lambda: cast(GuangYaClient, client),
+                lease_generation=claimed["lease_generation"])
+        moved.assert_called_once_with(["rename"], "target")
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.assertEqual(result["operation_items"][1]["status"], "blocked")
+        self.assertEqual(result["operation_items"][1]["reason"], "precondition_failed")
+
+    def test_copy_half_preflight_reuses_target_details_and_replica_listing(self):
+        client, plan = self._file_id_plan(operations=[
+            {"op": "copy", "file_id": "move", "target_path": "/target", "new_name": "Backup.mp4"},
+        ])
+        client.copy(["move"], "target")
+        replica = asdict(client.list_dir("target")[0])
+        before = deepcopy(client.directories)
+        with mock.patch.object(client, "file_info", wraps=client.file_info) as info, \
+             mock.patch.object(client, "list_dir", wraps=client.list_dir) as listing:
+            guangya_fs_change._preflight_operation(cast(GuangYaClient, client), plan["operations"][0], source_snapshot=replica)
+        self.assertEqual(Counter(call.args[0] for call in info.call_args_list),
+                         {replica["file_id"]: 1, "move": 1, "target": 1})
+        listing.assert_called_once_with("target")
+        self.assertEqual(client.directories, before)
+        # 目录缓存不能吞掉 Provider 的重复行，从而误认副本身份唯一。
+        with mock.patch.object(client, "list_dir", return_value=client.list_dir("target") * 2):
+            with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                guangya_fs_change._preflight_operation(cast(GuangYaClient, client),
+                                                      plan["operations"][0], source_snapshot=replica)
+
+    def test_target_path_error_explains_directory_contract_without_writes(self):
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        for target in ("/source/Move.mp4", "/target/new/Backup.mp4"):
+            with self.subTest(target=target):
+                client = FakeGatewayClient()
+                before = deepcopy(client.directories)
+                operations = [
+                    {"op": "create_directory", "parent_path": "/target", "name": "new"},
+                    {"op": "copy", "file_id": "move", "target_path": target, "new_name": "Backup.mp4"},
+                ]
+                original_operations = deepcopy(operations)
+                with self.assertRaises((guangya_fs_change.GuangYaFSChangeError,
+                                        guangya_fs_change.GuangYaWorkspaceError)) as error:
+                    self._file_id_plan(client, operations)
+                for text in ("target_path", "目录", "new_name", "预检未执行云端写入"):
+                    self.assertIn(text, str(error.exception))
+                self.assertEqual(client.directories, before)
+                self.assertEqual(operations, original_operations)
+                self.assertFalse(self.plan_dir.exists())
+        _, valid = self._file_id_plan(operations=[
+            {"op": "create_directory", "parent_path": "/target", "name": "new"},
+            {"op": "copy", "file_id": "move", "target_path": "/target/new", "new_name": "Backup.mp4"},
+        ])
+        self.assertEqual([item["op"] for item in valid["operations"]], ["create_directory", "copy"])
 
     def test_file_id_preflight_rejects_missing_root_and_ambiguous_parameters(self):
         for operation in (

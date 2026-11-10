@@ -429,7 +429,7 @@ def test_cloud_reads_keep_provider_identity_and_do_not_hide_failure():
     client.delete.assert_not_called()
 
 
-@pytest.mark.parametrize("stop_at", ["before", "page", "location"])
+@pytest.mark.parametrize("stop_at", ["before", "page", "location", "path"])
 def test_cloud_listing_cancellation_stops_provider_pages_without_complete_result(stop_at):
     from tests.test_guangya_read_contracts import ReadClient
 
@@ -457,9 +457,43 @@ def test_cloud_listing_cancellation_stops_provider_pages_without_complete_result
     raw = client.raw
     with patch("app.clients.guangya.GuangYaClient", return_value=client), sdk.call_owner("reader", cancelled=stopped.is_set):
         with pytest.raises(InterruptedError, match="停止"):
-            sdk.cloud.list("source" if stop_at == "location" else "0", recursive=True)
-    assert pages == ([(None, 0)] if stop_at == "page" else [])
+            sdk.cloud.list("source" if stop_at == "location" else "/目录" if stop_at == "path" else "0", recursive=True)
+    assert pages == ([(None, 0)] if stop_at in {"page", "path"} else [])
     assert raw.fs_detail.call_count == (1 if stop_at == "location" else 0)
+
+
+def test_cloud_path_listing_resolves_only_selected_tree_and_returns_real_names_and_ids():
+    client = Mock(logged_in=True)
+    root = GuangYaFile("anime", "Anime", True, parent_id="0")
+    show = GuangYaFile("show", "某剧", True, parent_id="anime")
+    season = GuangYaFile("season", "Season 01", True, parent_id="show")
+    video = GuangYaFile("video", "某剧.S01E01.mkv", False, parent_id="season")
+    directories = {"0": [root, GuangYaFile("other", "Other", True, parent_id="0")],
+                   "anime": [show], "show": [season], "season": [video]}
+    client.iter_dir.side_effect = lambda identifier, **kwargs: iter(directories[identifier])
+    with patch("app.clients.guangya.GuangYaClient", return_value=client):
+        result = sdk.cloud.list("/anime/某剧", recursive=True)
+        assert result["parent_id"] == "show" and result["root"]["path"] == "/Anime/某剧"
+        assert result["items"][-1]["file_id"] == "video"
+        assert result["items"][-1]["path"] == "/Anime/某剧/Season 01/某剧.S01E01.mkv"
+        assert result["scanned_dirs"] == 2 and result["scan_complete"]
+        assert [call.args[0] for call in client.iter_dir.call_args_list] == ["0", "anime", "show", "season"]
+        client.file_info.assert_not_called()
+        assert sdk.cloud.list("/")["parent_id"] == "0"
+        with pytest.raises(RuntimeError, match="单个文件"):
+            sdk.cloud.list("/Anime/某剧/Season 01/某剧.S01E01.mkv")
+        with pytest.raises(RuntimeError, match="不存在"):
+            sdk.cloud.list("/Anime/不存在")
+        with pytest.raises(RuntimeError, match="相对组件"):
+            sdk.cloud.list("/Anime/../Other")
+        directories["0"].append(GuangYaFile("ambiguous", "ANIME", True, parent_id="0"))
+        assert sdk.cloud.list("/Anime/某剧")["parent_id"] == "show"
+        with pytest.raises(RuntimeError, match="不唯一"):
+            sdk.cloud.list("/anime/某剧")
+        client.iter_dir.side_effect = RuntimeError("路径目录第二页失败")
+        with pytest.raises(RuntimeError, match="第二页失败"):
+            sdk.cloud.list("/Anime/某剧")
+    client.delete.assert_not_called()
 
 
 def test_cloud_recursive_listing_stops_before_reading_an_oversized_tree():

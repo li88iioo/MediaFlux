@@ -1370,7 +1370,7 @@ class Cloud:
     def list(parent_id: str = "0", *, recursive: bool = False, query: str = "",
              kinds: builtins.list[str] | None = None, limit: int | None = None, offset: int = 0,
              max_items: int = 100_000, max_depth: int = 64, max_dirs: int = 64) -> dict:
-        """按真实目录ID完整读取后过滤/分页；0为根目录。items含真实file_id/parent_id、路径及原属性，total为实际匹配总数。默认最多读取64个目录（含根），max_dirs上限5000。预算不足或翻页失败报错，不返回不完整清单；query按名称字面包含，仍会扫描全部选定范围。"""
+        """按目录ID或绝对路径读取，如cloud.list('/动漫/某剧', recursive=True)；0或/为根。先按路径逐级定位，只扫描选定目录；返回的parent_id及items均为真实ID。完整读取后按query名称包含过滤/分页，total为匹配总数。默认最多64个目录（含所选根），max_dirs上限5000；预算不足或翻页失败报错。"""
         from app.modules.guangya_workspace import list_files
 
         with _cloud_client() as client:
@@ -1515,7 +1515,7 @@ class Cloud:
     @staticmethod
     @sdk_method('write')
     def change(operations: builtins.list[dict], trigger_strm: bool = True) -> dict:
-        """批量操作真实file_id：rename(new_name)、move/copy(target_path)、relocate(target_path,new_name)、trash；create_directory使用parent_path/name。trash只移入回收站；batch_files(file_id,trash_filter/target_path/cleanup_empty_dirs)按真实非根目录完整展开原批量规则，重名默认保留两份。工作区生成完整确认卡，确认后执行冻结计划并返回持久operation_ref；脚本不会重跑。"""
+        """同批变更提交一份operations，每项用op指定动作，如{'op':'copy','file_id':file_id,'target_path':'/备份','new_name':'副本.mkv'}。target_path是目录，文件新名另用new_name；rename改名，move移动，copy复制（可给副本新名），relocate移动并改名。缺失的每层目录用create_directory及parent_path/name列入同一批，随后即可move/copy到新目录。trash移入回收站；batch_files按非根目录及trash_filter/target_path/cleanup_empty_dirs完整展开，重名默认保留两份。预检不写云盘；确认后执行冻结计划，返回operation_ref，原脚本不重跑。"""
         from app.modules.guangya_fs_change import build_fs_change_plan, submit_fs_change_plan
         from app.repositories.organize_operation_jobs import organize_operation_public_ref
 

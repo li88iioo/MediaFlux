@@ -25,10 +25,10 @@ print({"total": root["total"], "sample": [
     (item["file_id"], item["name"], item["is_dir"]) for item in root["items"][:20]]})
 ```
 
-从结果选择用户指定的 `directory_id`，仅遍历这个范围查视频和字幕：
+已知用户给出的绝对目录路径时，直接定位并读取；也可传上一步的真实目录 ID：
 
 ```python
-files = mf.cloud.list(directory_id, recursive=True, kinds=["video", "subtitle"])
+files = mf.cloud.list("/动漫/某剧", recursive=True, kinds=["video", "subtitle"])
 with open("/work/cloud-files.json", "w") as stream:
     json.dump(files, stream, ensure_ascii=False)
 print({"total": files["total"], "sample": [row["path"] for row in files["items"][:10]]})
@@ -42,18 +42,18 @@ print(mf.cloud.info(file_id))
 
 ## 03 批量改名、移动、复制、建目录与回收
 
-从第 02 节得到实际对象，将用户要求转换为 `operations`；同批同目标放一份计划。下面是各操作的构造示例，**按任务选用，不整段提交**。`file_id` 来自文件清单；路径和新名来自用户要求或已核实的归档规则：
+从第 02 节得到实际对象，将用户要求转换为一份 `operations`。`target_path` 是目标**目录**绝对路径，文件新名另放 `new_name`。缺失的各层目录用 `create_directory` 列入同一批，后续即可移动或复制到它们。以下按任务选用，`file_id` 来自真实清单：
 
 ```python
 rename = {"op": "rename", "file_id": file_id, "new_name": new_name}
 move = {"op": "move", "file_id": file_id, "target_path": target_path}
-copy = {"op": "copy", "file_id": file_id, "target_path": target_path}
+copy = {"op": "copy", "file_id": file_id, "target_path": target_path, "new_name": new_name}
 relocate = {"op": "relocate", "file_id": file_id, "target_path": target_path, "new_name": new_name}
 trash = {"op": "trash", "file_id": file_id}
 mkdir = {"op": "create_directory", "parent_path": parent_path, "name": directory_name}
 ```
 
-例如只改名时 `operations = [rename]`；批量时按选中对象逐条构造。先保存完整操作，再作为本脚本最后一个调用提交：
+复制省略 `new_name` 则保留原名；复制改名作用于副本，源文件不变。例如只改名时 `operations = [rename]`；批量时按选中对象逐条构造。先保存完整操作，再作为本脚本最后一个调用提交：
 
 ```python
 with open("/work/cloud-operations.json", "w") as stream:

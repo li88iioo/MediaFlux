@@ -820,9 +820,14 @@ def _resolve_directory(
     normalized = _normalize_path(path)
     if normalized == "/":
         return "0", None
-    target = resolve_workspace_path(client, normalized)
+    error = (f"目录路径解析失败：{normalized}；target_path/parent_path 必须是目录路径，"
+             "目标文件名请使用 new_name；本次预检未执行云端写入")
+    try:
+        target = resolve_workspace_path(client, normalized)
+    except GuangYaWorkspaceError as exc:
+        raise type(exc)(f"{error}。{exc}") from exc
     if not target.is_dir:
-        raise GuangYaFSChangeError("目标路径不是光鸭目录")
+        raise GuangYaFSChangeError(error)
     observed = observed_directories.get(normalized)
     if observed is None:
         matches = [item for path, item in observed_directories.items() if path.casefold() == normalized.casefold()]
@@ -1620,29 +1625,39 @@ def _guard_tree_matches(client: GuangYaClient, root: dict, expected: list, cance
     return sorted(rows, key=lambda item: item["file_id"]) == sorted(expected, key=lambda item: item.get("file_id", ""))
 
 
-def _find_current(client: GuangYaClient, snapshot: dict[str, Any]) -> GuangYaFile | None:
+def _find_current(
+    client: GuangYaClient, snapshot: dict[str, Any], *,
+    cache: dict[str, GuangYaFile | None] | None = None,
+    directory_cache: dict[str, dict[str, GuangYaFile]] | None = None,
+) -> GuangYaFile | None:
+    cache = cache if cache is not None else {}
+    file_id = str(snapshot.get("file_id") or "")
+    if file_id in cache:
+        return cache[file_id]
     try:
         # 明确的当前详情（包括对象不存在）不能被较旧的列表翻案。
-        return client.file_info(str(snapshot.get("file_id") or ""))
+        current = client.file_info(file_id)
     except Exception:  # noqa: BLE001 - Provider/SDK 可抛出多种传输异常
-        pass  # 只有详情读取失败才使用父目录列表回退。
-    try:
-        return {
-            item.file_id: item
-            for item in client.list_dir(str(snapshot.get("parent_id") or "0"))
-        }.get(str(snapshot.get("file_id") or ""))
-    except Exception:  # noqa: BLE001 - 只读回退失败按对象不存在处理
-        return None
+        # 只有详情读取失败才使用父目录列表回退；同次核对可复用冲突清单。
+        try:
+            current = _list_map(client, str(snapshot.get("parent_id") or "0"),
+                                directory_cache if directory_cache is not None else {}).get(file_id)
+        except Exception:  # noqa: BLE001 - 只读回退失败按对象不存在处理
+            current = None
+    cache[file_id] = current
+    return current
 
 
 def _verify_directory_snapshot(
-    client: GuangYaClient, directory_id: str, snapshot: dict[str, Any] | None
+    client: GuangYaClient, directory_id: str, snapshot: dict[str, Any] | None, *,
+    cache: dict[str, GuangYaFile | None] | None = None,
+    directory_cache: dict[str, dict[str, GuangYaFile]] | None = None,
 ) -> bool:
     if directory_id == "0":
         return True
     if not isinstance(snapshot, dict):
         return False
-    current = _find_current(client, snapshot)
+    current = _find_current(client, snapshot, cache=cache, directory_cache=directory_cache)
     # 目录内容变化可能更新 etag/utime；目标目录只冻结身份、名称与位置，
     # 同名占用会在每一项写入前另行完整读取。
     return bool(
@@ -1688,8 +1703,7 @@ def _frozen_path_matches(client, snapshot, path, cache, cancel_check):
     file_id = str(snapshot.get("file_id") or "")
     if file_id == "0" and snapshot.get("is_dir"):
         return path == "/"
-    if file_id not in cache:
-        cache[file_id] = _find_current(client, snapshot)
+    _find_current(client, snapshot, cache=cache)
     entry = locate_file_in_roots(
         client, snapshot, [{"file_id": "0", "path": "/", "is_dir": True}],
         cache=cache, check_cancelled=cancel_check or (lambda: None),
@@ -1718,15 +1732,19 @@ def _preflight_operation(
     source_snapshot: dict[str, Any] | None = None,
     cancel_check: Callable[[], None] | None = None,
     path_cache: dict[str, GuangYaFile | None] | None = None,
+    directory_cache: dict[str, dict[str, GuangYaFile]] | None = None,
 ) -> None:
     op = str(item.get("op") or "")
+    # 整单只读预检可共享；每项真正写前、写后阶段和轮询均另用新缓存。
     path_cache = path_cache if path_cache is not None else {}
+    directory_cache = directory_cache if directory_cache is not None else {}
     # 新建目录没有预先存在的快照：沿本次已核验创建链检查名称和位置，
     # 防止外部搬走父目录后，后续操作仍按旧 ID 写入错误的归档路径。
     dependency = str(item.get("parent_create_path" if op == "create_directory" else "target_create_path") or "")
     while dependency and created_targets is not None:
         directory = created_targets.get(dependency) or {}
-        if not _verify_directory_snapshot(client, str(directory.get("file_id") or ""), directory):
+        if not _verify_directory_snapshot(client, str(directory.get("file_id") or ""), directory,
+                                          cache=path_cache, directory_cache=directory_cache):
             raise GuangYaFSChangeStale("计划中新建目录尚未就绪或位置已变化，请重新预览")
         dependency = str(directory.get("parent_create_path") or "")
     if op == "create_directory":
@@ -1734,11 +1752,12 @@ def _preflight_operation(
         if not parent_id:
             return
         if (not item.get("parent_create_path") and not _verify_directory_snapshot(
-                client, parent_id, item.get("parent_snapshot"))
+                client, parent_id, item.get("parent_snapshot"),
+                cache=path_cache, directory_cache=directory_cache)
                 or not _frozen_path_matches(client, {"file_id": parent_id, "is_dir": True},
                                             item["parent_path"], path_cache, cancel_check)):
             raise GuangYaFSChangeStale("新建目录的父目录已变化，请重新预览")
-        siblings = {row.file_id: row for row in client.list_dir(parent_id)}
+        siblings = _list_map(client, parent_id, directory_cache)
         if _name_conflict(siblings, str(item.get("name") or "")):
             raise GuangYaFSChangeStale("新建目录名称已被占用，请重新预览")
         return
@@ -1750,10 +1769,11 @@ def _preflight_operation(
         raise GuangYaFSChangeStale("前置子项变更未全部成功，未执行父目录操作")
     if dependencies and completed_objects is not None and source_snapshot is None:
         # 初次执行允许已批准子项更新目录版本；半步恢复必须符合后置快照。
-        source_matches = _verify_directory_snapshot(client, str((source or {}).get("file_id") or ""), source)
+        source_matches = _verify_directory_snapshot(client, str((source or {}).get("file_id") or ""), source,
+                                                    cache=path_cache, directory_cache=directory_cache)
     else:
         source_matches = isinstance(source, dict) and _snapshot_matches(
-            _find_current(client, source), source,
+            _find_current(client, source, cache=path_cache, directory_cache=directory_cache), source,
             exact_updated_at=source_snapshot is not None)
     if not source_matches:
         raise GuangYaFSChangeStale("光鸭对象已变化，请重新预览")
@@ -1767,7 +1787,8 @@ def _preflight_operation(
         raise GuangYaFSChangeStale("光鸭对象父路径已变化，请重新预览")
     if op == "copy" and source_snapshot is not None:
         if _verified_copy(client, item, created_targets, "", cancel_check,
-                          name=source_snapshot["name"], copied_id=source_snapshot["file_id"]) is None:
+                          name=source_snapshot["name"], copied_id=source_snapshot["file_id"],
+                          cache=path_cache, directory_cache=directory_cache) is None:
             raise GuangYaFSChangeStale("复制源或副本内容已变化，请重新预览")
     elif op == "copy" and source["is_dir"]:
         if not isinstance(item.get("copy_snapshot"), dict):
@@ -1775,13 +1796,10 @@ def _preflight_operation(
         if _copy_tree_snapshot(client, source["file_id"], cancel_check) != item["copy_snapshot"]:
             raise GuangYaFSChangeStale("复制源目录内容已变化，请重新预览")
     if item.get("require_empty") and (completed_objects is not None or not dependencies):
-        if client.list_dir(str(source["file_id"])):
+        if _list_map(client, str(source["file_id"]), directory_cache):
             raise GuangYaFSChangeStale("目录仍包含内容，未执行空目录清理")
     if op in {"rename", "relocate"} and not item.get("move_first"):
-        siblings = {
-            row.file_id: row
-            for row in client.list_dir(str(source.get("parent_id") or "0"))
-        }
+        siblings = _list_map(client, str(source.get("parent_id") or "0"), directory_cache)
         if _name_conflict(
             siblings,
             str(item.get("new_name") or ""),
@@ -1797,11 +1815,12 @@ def _preflight_operation(
         if not target_id:
             return
         if (not item.get("target_create_path") and not _verify_directory_snapshot(
-                client, target_id, item.get("target_snapshot"))
+                client, target_id, item.get("target_snapshot"),
+                cache=path_cache, directory_cache=directory_cache)
                 or not _frozen_path_matches(client, {"file_id": target_id, "is_dir": True},
                                             item["target_path"], path_cache, cancel_check)):
             raise GuangYaFSChangeStale("目标目录已变化，请重新预览")
-        siblings = {row.file_id: row for row in client.list_dir(target_id)}
+        siblings = _list_map(client, target_id, directory_cache)
         target_name = str(item.get("new_name") or source.get("name") or "")
         exclude_id = str(source.get("file_id") or "") if op != "copy" or source_snapshot else ""
         if _name_conflict(siblings, target_name, exclude_id=exclude_id) or (
@@ -1861,7 +1880,8 @@ def _verify_after(
     return False
 
 
-def _verified_copy(client, item, created_targets, task_id, cancel_check, *, name, copied_id=""):
+def _verified_copy(client, item, created_targets, task_id, cancel_check, *, name, copied_id="",
+                   cache=None, directory_cache=None):
     """Provider终态和完整副本共同核验，返回副本身份供同计划的后续改名使用。"""
     if task_id:
         state = guangya_provider_task_state(client.task_status(task_id))
@@ -1872,18 +1892,23 @@ def _verified_copy(client, item, created_targets, task_id, cancel_check, *, name
         if state != "completed":
             return None
     source = item["source"]
-    if not _snapshot_matches(_find_current(client, source), source):
+    if not _snapshot_matches(_find_current(client, source, cache=cache, directory_cache=directory_cache), source):
         return None
-    copied = _copy_output(client, item, created_targets, cancel_check, name=name, copied_id=copied_id)
+    copied = _copy_output(client, item, created_targets, cancel_check, name=name, copied_id=copied_id,
+                          directory_cache=directory_cache)
     if copied is not None and source["is_dir"] and _copy_tree_snapshot(client, source["file_id"], cancel_check) != item["copy_snapshot"]:
         return None
     return copied
 
 
-def _copy_output(client, item, created_targets, cancel_check, *, name, copied_id=""):
+def _copy_output(client, item, created_targets, cancel_check, *, name, copied_id="", directory_cache=None):
     """按冻结内容核对副本；已完成复制的源可以被同一计划后续合法修改。"""
     source = item["source"]
-    matches = [row for row in client.list_dir(_directory_id(item, created_targets))
+    target_id = _directory_id(item, created_targets)
+    rows = client.list_dir(target_id)
+    if directory_cache is not None:
+        directory_cache[target_id] = {row.file_id: row for row in rows}
+    matches = [row for row in rows
                if row.name == name and row.is_dir == bool(source["is_dir"])]
     if len(matches) != 1 or matches[0].file_id == source["file_id"]:
         return None
@@ -2088,13 +2113,14 @@ def _apply_fs_operation(
 
 def _preflight_fs_change_plan(client, operations, outcomes, cancel_check):
     """首次执行需整单通过写前核对；中断恢复则按已记录的阶段逐项核对。"""
-    path_cache = {}  # 整单只读核对共享父链；每项实际写前另用新缓存。
+    path_cache = {}
+    directory_cache = {}
     for item, outcome in zip(operations, outcomes):
         if cancel_check is not None:
             cancel_check()
         try:
-            _preflight_operation(client, item, allow_pending_target=True,
-                                 cancel_check=cancel_check, path_cache=path_cache)
+            _preflight_operation(client, item, allow_pending_target=True, cancel_check=cancel_check,
+                                 path_cache=path_cache, directory_cache=directory_cache)
         except GuangYaFSChangeStale:
             outcome.update(status="blocked", reason="precondition_failed")
             raise
