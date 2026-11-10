@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, nullcontext
 import hashlib
 import json
+import time
 from typing import Any
 
 from app import config
@@ -129,10 +130,91 @@ def prepare_feature(feature: str, enabled: bool) -> dict[str, Any]:
         return _prepare(feature, enabled)[1]
 
 
-def reload_runtime(changed_keys: Iterable[str]) -> tuple[list[str], bool]:
-    """发布结束并释放配置 guard 后关闭旧服务，允许旧 worker 读取配置后退出。"""
+AGENT_EPISODE_RESEARCH_KEYS = frozenset({
+    "AGENT_EPISODE_RESEARCH_ENABLED",
+    "AGENT_EPISODE_RESEARCH_DAILY_LIMIT",
+})
+MEDIA_SERVER_PROFILE_KEYS = frozenset({
+    "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
+    "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "EMBY_USER_ID",
+})
+NSFW_ORGANIZE_KEYS = frozenset({
+    "GY_ORGANIZE_NSFW_ENABLED",
+    "GY_ORGANIZE_NSFW_SOURCE_IDS",
+    "GY_ORGANIZE_NSFW_METATUBE_ENDPOINT",
+    "GY_ORGANIZE_NSFW_METATUBE_TOKEN",
+    "GY_ORGANIZE_NSFW_CATEGORY_NAME",
+    "GY_ORGANIZE_NSFW_STRIP_DOMAINS",
+    "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS",
+})
+AI_RECOGNITION_KEYS = frozenset({
+    "AI_RECOGNITION_ENABLED",
+    "AI_RECOGNITION_CONFIDENCE_THRESHOLD",
+    "AI_RECOGNITION_REQUESTS_PER_MINUTE",
+    "AI_RECOGNITION_DAILY_REQUEST_LIMIT",
+    "AI_RECOGNITION_MAX_CONCURRENCY",
+    "AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS",
+})
+ORGANIZE_TAVILY_KEYS = frozenset({
+    "ORGANIZE_TAVILY_HINTS_ENABLED",
+    "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT",
+})
+_RECOGNITION_WEB_RUNTIME_KEYS = ORGANIZE_TAVILY_KEYS | {
+    "TAVILY_API_KEY", "TAVILY_TIMEOUT_SECONDS", "TAVILY_CACHE_TTL_SECONDS",
+}
+_REVIEW_DISPATCHER_KEYS = AGENT_EPISODE_RESEARCH_KEYS | {
+    "AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_NSFW_CLEAN_REVIEW_ENABLED",
+}
+
+
+class _Reload:
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+        self.restart = False
+
+    def warn(self, message: str, *, restart: bool = True) -> None:
+        self.warnings.append(message)
+        self.restart = self.restart or restart
+
+
+def reload_runtime(
+    changed_keys: Iterable[str], *, background_services: bool,
+    retired_source_ids: Iterable[str] = (), retry_keys: Iterable[str] = (),
+) -> tuple[list[str], bool]:
+    """配置落盘后的唯一运行时刷新入口；Web 保存与 Agent 写入共用同一规则。
+
+    ``retry_keys`` 是值未变但已提交的键，只用于重试本地媒体运行时切换。
+    """
     keys = set(changed_keys)
-    warnings = []
+    outcome = _Reload()
+    _refresh_recognition_caches(keys)
+    _refresh_discovery_and_web(keys, outcome)
+    _refresh_local_media(keys | set(retry_keys), outcome)
+    _refresh_bot_and_agent(keys, outcome, background_services=background_services)
+    _refresh_media_servers(keys, outcome, background_services=background_services)
+    _refresh_schedulers(keys, outcome, background_services=background_services,
+                        retired_source_ids=tuple(retired_source_ids))
+    return outcome.warnings, outcome.restart
+
+
+def _refresh_recognition_caches(keys: set[str]) -> None:
+    if AI_RECOGNITION_KEYS & keys:
+        try:
+            from app.modules.ai_recognition_governance import clear_ai_recognition_governance
+
+            clear_ai_recognition_governance()
+        except Exception as exc:
+            logger.warning("AI 识别治理状态重置失败 type=%s", type(exc).__name__)
+    if _RECOGNITION_WEB_RUNTIME_KEYS & keys:
+        try:
+            from app.modules.recognition_web_hints import clear_recognition_web_hint_cache
+
+            clear_recognition_web_hint_cache()
+        except Exception as exc:
+            logger.warning("整理标题线索缓存重置失败 type=%s", type(exc).__name__)
+
+
+def _refresh_discovery_and_web(keys: set[str], outcome: _Reload) -> None:
     if DISCOVERY_RUNTIME_KEYS & keys:
         try:
             from app.discovery.search import shutdown_discovery_search_service
@@ -142,16 +224,17 @@ def reload_runtime(changed_keys: Iterable[str]) -> tuple[list[str], bool]:
             results = (shutdown_discovery_service(), shutdown_discovery_search_service())
             clear_recognition_hint_cache()
             if False in results:
-                warnings.append("发现页配置已保存，但运行中实例未能热更新；重启后生效")
+                outcome.warn("发现页配置已保存，但运行中实例未能热更新；重启后生效")
         except Exception as exc:
             logger.warning("发现页运行时配置热更新失败 type=%s", type(exc).__name__)
-            warnings.append("发现页配置已保存，但运行中实例未能热更新；重启后生效")
+            outcome.warn("发现页配置已保存，但运行中实例未能热更新；重启后生效")
     if any(key.startswith("INDEXER_") for key in keys):
         from app.indexers.runtime import refresh_indexer_configuration
 
         runtime = refresh_indexer_configuration()
-        warnings.extend(f"{label} 索引器配置已保存，但运行中实例未能热更新；重启后生效"
-                        for name, label in (("web", "Web"), ("telegram", "Telegram")) if not runtime[name])
+        for name, label in (("web", "Web"), ("telegram", "Telegram")):
+            if not runtime[name]:
+                outcome.warn(f"{label} 索引器配置已保存，但运行中实例未能热更新；重启后生效")
     if {"LOGIN_WALLPAPER_MODE", "TMDB_API_KEY"} & keys:
         try:
             from app.modules.login_wallpaper import schedule_login_wallpaper_refresh
@@ -159,15 +242,161 @@ def reload_runtime(changed_keys: Iterable[str]) -> tuple[list[str], bool]:
             schedule_login_wallpaper_refresh(force=True)
         except Exception as exc:  # noqa: BLE001 -- 已保存配置，刷新异常须与发布结果区分
             logger.warning("登录壁纸后台刷新失败 type=%s", type(exc).__name__)
-            warnings.append("壁纸配置已保存，后台刷新失败")
+            outcome.warn("壁纸配置已保存，后台刷新失败")
     if WEB_CACHE_KEYS & keys:
         try:
             from app.modules.web_evidence import clear_web_cache
             clear_web_cache()
         except Exception as exc:  # noqa: BLE001 -- 保存已完成，必须记录刷新失败而不是误报未写
             logger.warning("网页缓存重置失败 type=%s", type(exc).__name__)
-            warnings.append("网页策略已保存，但缓存未完整刷新；重启后生效")
-    return warnings, bool(warnings)
+            outcome.warn("网页策略已保存，但缓存未完整刷新；重启后生效")
+
+
+def _refresh_local_media(keys: set[str], outcome: _Reload) -> None:
+    """正式发布和原值重试共用同一切换结果，不能用 no-op 掩盖待切换状态。"""
+    from app.modules.local_media_service import LOCAL_MEDIA_RUNTIME_KEYS
+
+    if not set(LOCAL_MEDIA_RUNTIME_KEYS) & keys:
+        return
+    try:
+        from app.modules.local_media_scheduler import reload_local_media_scheduler_config
+        from app.modules.local_media_service import reload_local_media_service
+
+        web_updated = reload_local_media_service()
+        scheduler_updated = reload_local_media_scheduler_config()
+        if not (web_updated and scheduler_updated):
+            outcome.warn(
+                "本地媒体配置已保存，运行时切换尚未完成；在途操作不受影响，新操作会重试切换，请稍后重试",
+                restart=False,
+            )
+    except Exception as exc:  # noqa: BLE001 - 已落盘配置的切换边界必须报告 warning，不能伪报成功。
+        logger.warning("本地媒体配置热更新失败 type=%s", type(exc).__name__)
+        outcome.warn("本地媒体配置已保存，但运行时切换失败；请重试或重启服务")
+
+
+def _refresh_bot_and_agent(keys: set[str], outcome: _Reload, *, background_services: bool) -> None:
+    if {"TG_BOT_TOKEN", "TG_CHAT_ID"} & keys:
+        started = time.perf_counter()
+        try:
+            if background_services:
+                from app.bot import restart_bot
+
+                if not restart_bot():
+                    outcome.warn("Telegram Bot 配置已保存，但旧连接未及时退出；请稍后重试或重启 MediaFlux 服务")
+                    logger.warning("Telegram Bot 配置热更新未完成：旧 polling 仍在退出")
+            else:
+                from app.notifier import reset
+
+                reset()
+        except Exception as exc:
+            outcome.warn("Telegram Bot 配置已保存，但运行中实例热更新失败；请稍后重试或重启 MediaFlux 服务")
+            logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
+        finally:
+            logger.info("Telegram Bot 配置热更新 ms=%s", max(1, round((time.perf_counter() - started) * 1000)))
+    elif background_services and {"AGENT_ENABLED", "TG_AGENT_ENABLED"} & keys:
+        try:
+            from app.bot.handlers import request_command_menu_refresh
+
+            request_command_menu_refresh()
+        except Exception as exc:
+            logger.warning("Telegram Bot 命令菜单后台刷新失败 type=%s", type(exc).__name__)
+    if "AGENT_ENABLED" in keys and background_services:
+        try:
+            from app.modules.agent_runtime import request_agent_runtime_reconcile
+
+            request_agent_runtime_reconcile()
+        except Exception as exc:
+            logger.warning("Agent 总开关后台热更新启动失败 type=%s", type(exc).__name__)
+
+
+def _refresh_media_servers(keys: set[str], outcome: _Reload, *, background_services: bool) -> None:
+    if not MEDIA_SERVER_PROFILE_KEYS & keys:
+        return
+    from app.services import clear_dashboard_cache
+
+    clear_dashboard_cache()
+    if not background_services:
+        return
+    from app.modules.media_proxy import get_media_proxy_manager
+
+    try:
+        if not get_media_proxy_manager().request_reconcile():
+            outcome.warn("媒体反代配置已保存，但运行中实例未接受热更新；重启后生效")
+    except Exception as exc:
+        outcome.warn("媒体反代配置已保存，但运行中实例未能热更新；重启后生效")
+        logger.warning("媒体反代配置热加载失败 type=%s", type(exc).__name__)
+
+
+def _refresh_schedulers(
+    keys: set[str], outcome: _Reload, *, background_services: bool, retired_source_ids: tuple[str, ...],
+) -> None:
+    if any(key.startswith(("STRM_", "GY_STRM_")) for key in keys):
+        try:
+            from app.modules.scheduler import get_scheduler
+
+            scheduler = get_scheduler()
+            scheduler.reload()
+            if retired_source_ids and background_services:
+                result = scheduler.trigger("config-retirement")
+                if not result.get("ok"):
+                    logger.info("STRM 退役来源已入队，等待下次同步处理: %s", result.get("error", "任务繁忙"))
+        except Exception as exc:
+            outcome.warn("STRM 调度配置已保存，但运行中调度器未能热更新；重启后生效")
+            logger.warning("STRM 调度配置热加载失败: %s", exc)
+    if any(key.startswith("GY_ORGANIZE_") for key in keys):
+        try:
+            from app.modules.organize_scheduler import get_organize_scheduler
+
+            get_organize_scheduler().reload()
+        except Exception as exc:
+            outcome.warn("整理调度配置已保存，但运行中调度器未能热更新；重启后生效")
+            logger.warning("整理调度配置热加载失败: %s", exc)
+        if NSFW_ORGANIZE_KEYS & keys:
+            try:
+                from app.modules.nsfw import clear_nsfw_cache
+
+                clear_nsfw_cache()
+            except Exception as exc:
+                logger.warning("MetaTube 识别缓存重置失败: %s", exc)
+    if any(key.startswith("AGENT_LIBRARY_PATROL_") for key in keys):
+        started = time.perf_counter()
+        try:
+            from app.modules.agent_library_patrol_scheduler import get_agent_library_patrol_scheduler
+
+            get_agent_library_patrol_scheduler().reload(immediate=False)
+        except Exception as exc:
+            outcome.warn("Agent 巡检配置已保存，但运行中调度器未能热更新；重启后生效")
+            logger.warning("Agent 全库缺集巡检配置热加载失败 type=%s", type(exc).__name__)
+        finally:
+            logger.info("Agent 巡检配置热更新 ms=%s", max(1, round((time.perf_counter() - started) * 1000)))
+    if _REVIEW_DISPATCHER_KEYS & keys:
+        try:
+            from app.modules.organize_confirmations import wake_recognition_review_dispatcher
+
+            wake_recognition_review_dispatcher()
+        except Exception as exc:
+            logger.warning("Agent 主动识别复核配置热加载失败 type=%s", type(exc).__name__)
+    if any(key.startswith("AGENT_DOWNLOAD_VERIFICATION_") for key in keys):
+        try:
+            from app.modules.agent_download_verification_scheduler import (
+                get_download_library_verification_scheduler,
+            )
+
+            get_download_library_verification_scheduler().reload()
+        except Exception as exc:
+            if background_services:
+                outcome.warn("下载后复核配置已保存，但运行中调度器未能热更新；重启后生效")
+                logger.warning("Agent 下载后媒体库复核配置热加载失败 type=%s", type(exc).__name__)
+            else:
+                logger.debug("后台服务未启动，跳过下载后媒体库复核调度器热加载结果 type=%s", type(exc).__name__)
+    if "DOWNLOAD_TORRENT_RETENTION_DAYS" in keys:
+        try:
+            from app.modules.download_tracker import get_download_tracker
+
+            get_download_tracker().reload(reset_torrent_cleanup=True)
+        except Exception as exc:
+            outcome.warn("种子保留期配置已保存，但下载跟踪器未能热更新；重启后生效")
+            logger.warning("原始种子保留期配置热加载失败 type=%s", type(exc).__name__)
 
 
 def set_feature(feature: str, enabled: bool, *, expected_fingerprint: str,
@@ -188,7 +417,8 @@ def set_feature(feature: str, enabled: bool, *, expected_fingerprint: str,
             config.update_runtime_env_file(config.ENV_FILE, {key: normalize_boolean(key, enabled)}, expected=raw)
         except (config.ConcurrentConfigUpdateError, config.ExternalConfigOverrideError) as exc:
             raise FeatureConflict("配置或部署覆盖已变化，请重新预检") from exc
-    warnings, restart = reload_runtime({key})
+    # Agent 写入只发生在运行中的服务内。
+    warnings, restart = reload_runtime({key}, background_services=True)
     _, persisted = config.read_env_snapshot(config.ENV_FILE)
     verified = persisted.get(key) == ("1" if enabled else "0")
     ok = verified and not restart

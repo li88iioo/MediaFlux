@@ -143,6 +143,37 @@ def test_reload_releases_confirmation_and_config_guards_before_waiting_for_old_w
         assert item("discovery")["enabled"]
 
 
+@pytest.mark.parametrize("writer", ["sdk", "web"])
+@pytest.mark.parametrize("feature, scheduler_factory", [
+    ("strm_metadata", "app.modules.scheduler.get_scheduler"),
+    ("download_verification_notify",
+     "app.modules.agent_download_verification_scheduler.get_download_library_verification_scheduler"),
+])
+def test_agent_and_web_writes_refresh_the_same_runtime_component(backend, monkeypatch, writer, feature, scheduler_factory):
+    """Agent 写入曾只刷新发现页等少数组件；调度器配置需与 Web 保存同样热更新。"""
+    key, _, default = service.FEATURES[feature]
+    enabled = not default
+    scheduler = SimpleNamespace(reload=lambda: reloads.append(key))
+    reloads: list[str] = []
+    monkeypatch.setattr(scheduler_factory, lambda: scheduler)
+    if writer == "web":
+        from app.routes.api import save_config
+
+        request = Request({"type": "http", "session": {"logged_in": True},
+            "app": SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))})
+        assert save_config(request, {key: "1" if enabled else "0"}) == {"success": True}
+    else:
+        async def check():
+            effects = executor()
+            context = await context_for(effects.state_store, owner=OWNER)
+            plan = (await effects.prepare(WRITE, {"feature": feature, "enabled": enabled}, context=context)).effect_plan
+            assert plan is not None
+            done = await effects.execute_confirmed(plan.plan_id, context=context)
+            assert done.outcome.public_content["ok"]
+        asyncio.run(check())
+    assert reloads == [key]
+
+
 @pytest.mark.parametrize("condition", ["environment", "sites", "tavily"])
 def test_dependency_and_deployment_preconditions_never_issue_card(backend, monkeypatch, condition):
     feature = "discovery"

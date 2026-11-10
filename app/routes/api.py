@@ -32,7 +32,16 @@ from app.indexers.config import (
     normalize_persisted_indexer_site_ids,
 )
 from app.logger import get_logger
-from app.modules.feature_config import BOOLEAN_VALUES, normalize_boolean, reload_runtime
+from app.modules.feature_config import (
+    AGENT_EPISODE_RESEARCH_KEYS,
+    AI_RECOGNITION_KEYS,
+    BOOLEAN_VALUES,
+    MEDIA_SERVER_PROFILE_KEYS,
+    NSFW_ORGANIZE_KEYS,
+    ORGANIZE_TAVILY_KEYS,
+    normalize_boolean,
+    reload_runtime,
+)
 from app.security import redact_config
 from app.services import build_dashboards
 from app.web import api_error, config_write_api_error, require_api_login
@@ -101,20 +110,11 @@ _AGENT_LIBRARY_PATROL_KEYS = {
     "AGENT_NSFW_CLEAN_REVIEW_ENABLED",
 }
 
-_AGENT_EPISODE_RESEARCH_KEYS = {
-    "AGENT_EPISODE_RESEARCH_ENABLED",
-    "AGENT_EPISODE_RESEARCH_DAILY_LIMIT",
-}
-
 _MEDIA_SERVER_REFRESH_KEYS = {
     "JELLYFIN_PATH_MAPPINGS",
     "JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK",
     "EMBY_PATH_MAPPINGS",
     "EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK",
-}
-_MEDIA_SERVER_PROFILE_KEYS = {
-    "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
-    "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "EMBY_USER_ID",
 }
 _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_ENABLED": "0",
@@ -146,27 +146,6 @@ _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_LIBRARY_PATROL_MAX_SERIES": "50",
 }
 
-_NSFW_ORGANIZE_KEYS = {
-    "GY_ORGANIZE_NSFW_ENABLED",
-    "GY_ORGANIZE_NSFW_SOURCE_IDS",
-    "GY_ORGANIZE_NSFW_METATUBE_ENDPOINT",
-    "GY_ORGANIZE_NSFW_METATUBE_TOKEN",
-    "GY_ORGANIZE_NSFW_CATEGORY_NAME",
-    "GY_ORGANIZE_NSFW_STRIP_DOMAINS",
-    "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS",
-}
-_AI_RECOGNITION_KEYS = {
-    "AI_RECOGNITION_ENABLED",
-    "AI_RECOGNITION_CONFIDENCE_THRESHOLD",
-    "AI_RECOGNITION_REQUESTS_PER_MINUTE",
-    "AI_RECOGNITION_DAILY_REQUEST_LIMIT",
-    "AI_RECOGNITION_MAX_CONCURRENCY",
-    "AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS",
-}
-_ORGANIZE_TAVILY_KEYS = {
-    "ORGANIZE_TAVILY_HINTS_ENABLED",
-    "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT",
-}
 _ORGANIZE_POLICY_KEYS = {
     "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET",
 }
@@ -183,7 +162,7 @@ _FIXED_ORGANIZE_NAMING_KEYS = frozenset({
 })
 _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     "ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD", "LOGIN_WALLPAPER_MODE",
-    *_MEDIA_SERVER_PROFILE_KEYS,
+    *MEDIA_SERVER_PROFILE_KEYS,
     *_MEDIA_SERVER_REFRESH_KEYS,
     "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
     "DOWNLOAD_TORRENT_RETENTION_DAYS",
@@ -191,14 +170,14 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     "TMDB_API_KEY", "TMDB_API_URL",
     "TMDB_MATCH_MODE", "PROXY_URL", "TG_BOT_TOKEN", "TG_CHAT_ID",
     "TG_NOTIFICATION_ENABLED", "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS", "AGENT_ENABLED",
-    *_AI_RECOGNITION_KEYS,
-    *_ORGANIZE_TAVILY_KEYS,
+    *AI_RECOGNITION_KEYS,
+    *ORGANIZE_TAVILY_KEYS,
     *_ORGANIZE_POLICY_KEYS,
     *_AGENT_LLM_KEYS,
     "AGENT_STREAM_DISPLAY_ENABLED",
-    *_AGENT_EPISODE_RESEARCH_KEYS,
+    *AGENT_EPISODE_RESEARCH_KEYS,
     *_WEB_ACCESS_KEYS,
-    *_NSFW_ORGANIZE_KEYS,
+    *NSFW_ORGANIZE_KEYS,
     "DISCOVERY_ENABLED", "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS",
     "DISCOVERY_RESOURCE_RESULTS_ENABLED",
     "DISCOVERY_DOUBAN_ENABLED", "DOUBAN_DBCL2", "DOUBAN_CACHE_TTL_SECONDS", "BANGUMI_USER_AGENT",
@@ -677,7 +656,7 @@ def _validate_organize_tavily_updates(data: dict[str, Any]) -> dict[str, str]:
 
 
 def _validate_nsfw_organize_updates(data: dict[str, Any]) -> dict[str, str]:
-    if not (_NSFW_ORGANIZE_KEYS & data.keys()):
+    if not (NSFW_ORGANIZE_KEYS & data.keys()):
         return {}
     normalized: dict[str, str] = {}
     if "GY_ORGANIZE_NSFW_ENABLED" in data:
@@ -1028,7 +1007,7 @@ def get_config(request: Request):
         _AGENT_SETTINGS_DEFAULTS["AGENT_NSFW_CLEAN_REVIEW_ENABLED"],
     )
     # 季集研究是新的独立授权，旧主动复核开关不能隐式开启。
-    for key in _AGENT_EPISODE_RESEARCH_KEYS:
+    for key in AGENT_EPISODE_RESEARCH_KEYS:
         items.setdefault(key, _AGENT_SETTINGS_DEFAULTS[key])
     # 旧配置缺少该展示偏好时，统一按流式显示开启处理。
     items.setdefault(
@@ -1125,29 +1104,6 @@ def _normalize_organize_extensions(value: object, *, defaults: tuple[str, ...], 
     if not normalized:
         raise ValueError(f"{label}至少保留一个扩展名")
     return ",".join(normalized)
-
-
-def _reload_local_media_config() -> tuple[list[str], bool]:
-    """正式发布和原值重试共用同一切换结果，不能用 no-op 掩盖待切换状态。"""
-    try:
-        from app.modules.local_media_scheduler import (
-            reload_local_media_scheduler_config,
-        )
-        from app.modules.local_media_service import reload_local_media_service
-
-        web_updated = reload_local_media_service()
-        scheduler_updated = reload_local_media_scheduler_config()
-        if not (web_updated and scheduler_updated):
-            return [
-                (
-                    "本地媒体配置已保存，运行时切换尚未完成；在途操作不受影响，"
-                    "新操作会重试切换，请稍后重试"
-                ),
-            ], False
-        return [], False
-    except Exception as exc:  # noqa: BLE001 - 已落盘配置的切换边界必须报告 warning，不能伪报成功。
-        logger.warning("本地媒体配置热更新失败 type=%s", type(exc).__name__)
-        return ["本地媒体配置已保存，但运行时切换失败；请重试或重启服务"], True
 
 
 @router.post("/config")
@@ -1565,239 +1521,16 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 )
             persist_ms = max(1, round((time.perf_counter() - persist_started) * 1000))
 
-    if not persisted_updates:
-        logger.info(
-            "配置保存完成 changed=0 total_ms=%s",
-            max(1, round((time.perf_counter() - request_started) * 1000)),
-        )
-        unchanged_result: dict[str, object] = {"success": True}
-        if local_media_keys:
-            warnings, restart_required = _reload_local_media_config()
-            if warnings:
-                unchanged_result["warnings"] = warnings
-            if restart_required:
-                unchanged_result["restart_required"] = True
-        return unchanged_result
-
-    warnings: list[str] = []
-    restart_required = False
-    if _AI_RECOGNITION_KEYS & changed_keys:
-        try:
-            from app.modules.ai_recognition_governance import (
-                clear_ai_recognition_governance,
-            )
-
-            clear_ai_recognition_governance()
-        except Exception as exc:
-            logger.warning(
-                "AI 识别治理状态重置失败 type=%s", type(exc).__name__
-            )
-    recognition_web_runtime_keys = _ORGANIZE_TAVILY_KEYS | {
-        "TAVILY_API_KEY",
-        "TAVILY_TIMEOUT_SECONDS",
-        "TAVILY_CACHE_TTL_SECONDS",
-    }
-    if recognition_web_runtime_keys & changed_keys:
-        try:
-            from app.modules.recognition_web_hints import (
-                clear_recognition_web_hint_cache,
-            )
-
-            clear_recognition_web_hint_cache()
-        except Exception as exc:
-            logger.warning(
-                "整理标题线索缓存重置失败 type=%s", type(exc).__name__
-            )
-    feature_warnings, feature_restart = reload_runtime(changed_keys)
-    warnings.extend(feature_warnings)
-    restart_required = restart_required or feature_restart
-    if local_media_keys:
-        local_warnings, local_restart_required = _reload_local_media_config()
-        warnings.extend(local_warnings)
-        restart_required = restart_required or local_restart_required
-    bot_restart_ms = 0
-    background_services_enabled = getattr(
-        request.app.state, "background_services_enabled", False
+    warnings, restart_required = reload_runtime(
+        changed_keys,
+        background_services=bool(getattr(request.app.state, "background_services_enabled", False)),
+        retired_source_ids=retired_source_ids,
+        retry_keys=local_media_keys,
     )
-    bot_connection_keys = {"TG_BOT_TOKEN", "TG_CHAT_ID"}
-    bot_agent_menu_keys = {"AGENT_ENABLED", "TG_AGENT_ENABLED"}
-    if bot_connection_keys & changed_keys:
-        bot_restart_started = time.perf_counter()
-        try:
-            if background_services_enabled:
-                from app.bot import restart_bot
-
-                if not restart_bot():
-                    warning = (
-                        "Telegram Bot 配置已保存，但旧连接未及时退出；"
-                        "请稍后重试或重启 MediaFlux 服务"
-                    )
-                    warnings.append(warning)
-                    restart_required = True
-                    logger.warning("Telegram Bot 配置热更新未完成：旧 polling 仍在退出")
-            else:
-                from app.notifier import reset
-
-                reset()
-        except Exception as exc:
-            warnings.append(
-                "Telegram Bot 配置已保存，但运行中实例热更新失败；"
-                "请稍后重试或重启 MediaFlux 服务"
-            )
-            restart_required = True
-            logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
-        finally:
-            bot_restart_ms = max(1, round((time.perf_counter() - bot_restart_started) * 1000))
-    elif background_services_enabled and bot_agent_menu_keys & changed_keys:
-        try:
-            from app.bot.handlers import request_command_menu_refresh
-
-            request_command_menu_refresh()
-        except Exception as exc:
-            logger.warning(
-                "Telegram Bot 命令菜单后台刷新失败 type=%s", type(exc).__name__
-            )
-    if "AGENT_ENABLED" in changed_keys:
-        try:
-            if background_services_enabled:
-                from app.modules.agent_runtime import request_agent_runtime_reconcile
-
-                request_agent_runtime_reconcile()
-        except Exception as exc:
-            logger.warning(
-                "Agent 总开关后台热更新启动失败 type=%s", type(exc).__name__
-            )
-    from app.services import clear_dashboard_cache
-
-    if _MEDIA_SERVER_PROFILE_KEYS & changed_keys:
-        clear_dashboard_cache()
-    media_proxy_keys = {
-        "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
-        "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "EMBY_USER_ID",
-    }
-    if media_proxy_keys & changed_keys:
-        manager = getattr(request.app.state, "media_proxy_manager", None)
-        if manager is not None and getattr(request.app.state, "background_services_enabled", False):
-            try:
-                if not manager.request_reconcile():
-                    warnings.append(
-                        "媒体反代配置已保存，但运行中实例未接受热更新；重启后生效"
-                    )
-                    restart_required = True
-            except Exception as exc:
-                warnings.append("媒体反代配置已保存，但运行中实例未能热更新；重启后生效")
-                restart_required = True
-                logger.warning("媒体反代配置热加载失败 type=%s", type(exc).__name__)
-    strm_keys = {
-        key for key in changed_keys
-        if key.startswith(("STRM_", "GY_STRM_"))
-    }
-    organize_keys = {key for key in changed_keys if key.startswith("GY_ORGANIZE_")}
-    agent_patrol_keys = {
-        key for key in changed_keys if key.startswith("AGENT_LIBRARY_PATROL_")
-    }
-    agent_download_verification_keys = {
-        key for key in changed_keys
-        if key.startswith("AGENT_DOWNLOAD_VERIFICATION_")
-    }
-    if strm_keys:
-        try:
-            from app.modules.scheduler import get_scheduler
-            scheduler = get_scheduler()
-            scheduler.reload()
-            if retired_source_ids and getattr(
-                request.app.state, "background_services_enabled", False
-            ):
-                result = scheduler.trigger("config-retirement")
-                if not result.get("ok"):
-                    logger.info(
-                        "STRM 退役来源已入队，等待下次同步处理: %s",
-                        result.get("error", "任务繁忙"),
-                    )
-        except Exception as exc:
-            warnings.append("STRM 调度配置已保存，但运行中调度器未能热更新；重启后生效")
-            restart_required = True
-            logger.warning("STRM 调度配置热加载失败: %s", exc)
-    if organize_keys:
-        try:
-            from app.modules.organize_scheduler import get_organize_scheduler
-            get_organize_scheduler().reload()
-        except Exception as exc:
-            warnings.append("整理调度配置已保存，但运行中调度器未能热更新；重启后生效")
-            restart_required = True
-            logger.warning("整理调度配置热加载失败: %s", exc)
-        if _NSFW_ORGANIZE_KEYS & changed_keys:
-            try:
-                from app.modules.nsfw import clear_nsfw_cache
-                clear_nsfw_cache()
-            except Exception as exc:
-                logger.warning("MetaTube 识别缓存重置失败: %s", exc)
-    patrol_reload_ms = 0
-    if agent_patrol_keys:
-        patrol_reload_started = time.perf_counter()
-        try:
-            from app.modules.agent_library_patrol_scheduler import (
-                get_agent_library_patrol_scheduler,
-            )
-
-            get_agent_library_patrol_scheduler().reload(immediate=False)
-        except Exception as exc:
-            warnings.append("Agent 巡检配置已保存，但运行中调度器未能热更新；重启后生效")
-            restart_required = True
-            logger.warning(
-                "Agent 全库缺集巡检配置热加载失败 type=%s",
-                type(exc).__name__,
-            )
-        finally:
-            patrol_reload_ms = max(1, round((time.perf_counter() - patrol_reload_started) * 1000))
-    if ({"AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_NSFW_CLEAN_REVIEW_ENABLED"} | _AGENT_EPISODE_RESEARCH_KEYS) & changed_keys:
-        try:
-            from app.modules.organize_confirmations import (
-                wake_recognition_review_dispatcher,
-            )
-
-            wake_recognition_review_dispatcher()
-        except Exception as exc:
-            logger.warning(
-                "Agent 主动识别复核配置热加载失败 type=%s",
-                type(exc).__name__,
-            )
-    if agent_download_verification_keys:
-        try:
-            from app.modules.agent_download_verification_scheduler import (
-                get_download_library_verification_scheduler,
-            )
-
-            get_download_library_verification_scheduler().reload()
-        except Exception as exc:
-            if getattr(request.app.state, "background_services_enabled", False):
-                warnings.append("下载后复核配置已保存，但运行中调度器未能热更新；重启后生效")
-                restart_required = True
-                logger.warning(
-                    "Agent 下载后媒体库复核配置热加载失败 type=%s",
-                    type(exc).__name__,
-                )
-            else:
-                logger.debug(
-                    "后台服务未启动，跳过下载后媒体库复核调度器热加载结果 type=%s",
-                    type(exc).__name__,
-                )
-    if "DOWNLOAD_TORRENT_RETENTION_DAYS" in changed_keys:
-        try:
-            from app.modules.download_tracker import get_download_tracker
-
-            get_download_tracker().reload(reset_torrent_cleanup=True)
-        except Exception as exc:
-            warnings.append("种子保留期配置已保存，但下载跟踪器未能热更新；重启后生效")
-            restart_required = True
-            logger.warning(
-                "原始种子保留期配置热加载失败 type=%s",
-                type(exc).__name__,
-            )
-    total_ms = max(1, round((time.perf_counter() - request_started) * 1000))
     logger.info(
-        "配置保存完成 changed=%s persist_ms=%s bot_restart_ms=%s patrol_reload_ms=%s total_ms=%s",
-        len(persisted_updates), persist_ms, bot_restart_ms, patrol_reload_ms, total_ms,
+        "配置保存完成 changed=%s persist_ms=%s total_ms=%s",
+        len(persisted_updates), persist_ms,
+        max(1, round((time.perf_counter() - request_started) * 1000)),
     )
     result: dict[str, object] = {"success": True}
     if warnings:

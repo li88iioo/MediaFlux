@@ -395,7 +395,8 @@ def set_policy(
             config.ExternalConfigOverrideError,
         ) as exc:
             raise PolicyConflict("策略配置或部署覆盖已变化，请重新预检") from exc
-    warnings, restart = reload_runtime({definition.key})
+    # Agent 写入只发生在运行中的服务内。
+    warnings, restart = reload_runtime({definition.key}, background_services=True)
     _, persisted = config.read_env_snapshot(config.ENV_FILE)
     verified = persisted.get(definition.key) == requested
     ok = verified and (not restart)
