@@ -39,10 +39,10 @@ class SignedUrlExpiryBusinessTests(unittest.IsolatedAsyncioTestCase):
         cache = self._cache()
         valid = mock.AsyncMock(return_value="https://cdn.invalid/valid.mkv?expires=1700000060")
         expired = mock.AsyncMock(return_value="https://cdn.invalid/expired.mkv?expires=1699999999")
-        await cache.get_or_fetch("valid", valid)
-        await cache.get_or_fetch("expired", expired)
-        await cache.get_or_fetch("valid", valid)
-        await cache.get_or_fetch("expired", expired)
+        (await cache.get_or_fetch_result("valid", valid)).url
+        (await cache.get_or_fetch_result("expired", expired)).url
+        (await cache.get_or_fetch_result("valid", valid)).url
+        (await cache.get_or_fetch_result("expired", expired)).url
         self.assertEqual(cache.entry_count, 1)
         self.assertEqual(valid.await_count, 1)
         self.assertEqual(expired.await_count, 2)

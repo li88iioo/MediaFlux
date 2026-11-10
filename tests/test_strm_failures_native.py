@@ -12,7 +12,7 @@ import pytest
 
 from app import database as db, sdk
 from app.agent.confirmation import SQLiteConfirmationStore
-from app.agent.kernel.bootstrap import build_agent_kernel
+from app.agent.kernel.bootstrap import build_agent_kernel_runtime
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
 from app.agent.kernel.capabilities import ToolCatalog, ToolEffect
@@ -59,7 +59,7 @@ def executor():
 
 def test_single_native_catalog_and_sdk_contract():
     with initialized_web_runtime():
-        kernel = build_agent_kernel(model=ScriptedModel([]))
+        kernel = build_agent_kernel_runtime(model=ScriptedModel([])).session
         assert kernel.catalog.get("strm.failures").effect is ToolEffect.READ
         assert kernel.catalog.get("strm.retry_failures").effect is ToolEffect.DANGER
         assert "strm.triage_failures" not in {spec.name for spec in kernel.catalog.visible()}

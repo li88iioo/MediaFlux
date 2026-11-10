@@ -296,14 +296,14 @@ class RecognitionInspectionTests(IsolatedDatabaseTestCase):
 
 
     def test_sdk_help_has_one_native_contract_and_complete_hundred_row_result(self):
-        from app.agent.kernel.bootstrap import build_agent_kernel
+        from app.agent.kernel.bootstrap import build_agent_kernel_runtime
         from app.agent.kernel.capabilities import ToolEffect
         from tests.support import initialized_web_runtime
         from tests.test_agent_kernel_core import ScriptedModel
 
         names = {"recognition.inspect_filenames", "recognition.preview_release_format", "recognition.save_release_format"}
         with initialized_web_runtime():
-            kernel = build_agent_kernel(model=ScriptedModel([]))
+            kernel = build_agent_kernel_runtime(model=ScriptedModel([])).session
             self.assertIs(kernel.catalog.get("recognition.save_release_format").effect, ToolEffect.WRITE)
             model_names = {spec.name for spec in kernel.visible_model_tools({})}
             self.assertEqual(model_names, {"agent.run_code"})

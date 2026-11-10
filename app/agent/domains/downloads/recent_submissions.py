@@ -236,7 +236,7 @@ def _safe_submission(
         duplicate=duplicate,
         result_status=(result.status),
         captured_at=_safe_timestamp(captured_at),
-        verification=_safe_verification(verification_context),
+        verification=parse_recent_download_verification_context(verification_context),
     )
 
 
@@ -273,7 +273,7 @@ def _submission_from_payload(value: Any) -> RecentDownloadSubmission | None:
     succeeded = _safe_backend_tuple(value.get("succeeded"))
     failed = _safe_backend_tuple(value.get("failed"))
     verification_value = value.get("verification")
-    verification = _safe_verification(verification_value)
+    verification = parse_recent_download_verification_context(verification_value)
     if (
         target not in _ALLOWED_TARGETS
         or dispatch_status not in _ALLOWED_DISPATCH_STATUSES
@@ -304,18 +304,12 @@ def _submission_from_payload(value: Any) -> RecentDownloadSubmission | None:
     )
 
 
-def _safe_verification(value: Any) -> RecentDownloadVerification | None:
+def parse_recent_download_verification_context(value: Any) -> RecentDownloadVerification | None:
+    """严格解析核验上下文；失败时安全返回 ``None``。"""
     # 工作流票据保留随机引用；最近记录只消费公共最小目标投影。
     source = value.get("verification", value) if isinstance(value, dict) else value
     normalized = normalize_episode_verification(source)
     return RecentDownloadVerification(**normalized) if normalized is not None else None
-
-
-def parse_recent_download_verification_context(
-    value: Any,
-) -> RecentDownloadVerification | None:
-    """公开复用严格核验上下文解析器；失败时安全返回 ``None``。"""
-    return _safe_verification(value)
 
 
 def _verification_payload(value: RecentDownloadVerification | None) -> dict[str, Any] | None:

@@ -32,9 +32,6 @@ class _FakeMediaClient:
     def __exit__(self, *_args):
         return None
 
-    def server_identity(self):
-        return "Dev Jellyfin", "Jellyfin", "12.0.0"
-
     def _user_id(self):
         return "viewer-1"
 

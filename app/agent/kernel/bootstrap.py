@@ -279,20 +279,6 @@ def _build_agent_kernel_runtime(
     )
 
 
-def build_agent_kernel(
-    *,
-    model: ModelAdapter | None = None,
-    store: SQLiteKernelStore | None = None,
-    confirmation_store: SQLiteConfirmationStore | None = None,
-) -> AgentSession:
-    """测试与嵌入式调用的便捷入口。"""
-    return build_agent_kernel_runtime(
-        model=model,
-        store=store,
-        confirmation_store=confirmation_store,
-    ).session
-
-
 def get_agent_kernel_runtime() -> AgentKernelRuntime:
     """读取持久授权并获取运行态；包含阻塞锁/I/O，异步入口须在线程执行。"""
     global _runtime

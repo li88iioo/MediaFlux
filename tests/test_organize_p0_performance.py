@@ -410,10 +410,7 @@ class StrmBatchPerformanceTests(IsolatedDatabaseTestCase):
 
         with tempfile.TemporaryDirectory() as root, patch.object(
             db, "resolve_strm_failures_for_items", wraps=original_batch
-        ) as batch_resolve, patch.object(
-            db, "resolve_strm_failure_for_item",
-            side_effect=AssertionError("不得逐文件关闭失败台账"),
-        ):
+        ) as batch_resolve:
             stats = sync_strm(
                 source_id, "http://example", root,
                 client=cast(GuangYaClient, client), clean_invalid=False,

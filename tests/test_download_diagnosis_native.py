@@ -11,7 +11,7 @@ import pytest
 from app import sdk
 from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.kernel import sandbox
-from app.agent.kernel.bootstrap import build_agent_kernel
+from app.agent.kernel.bootstrap import build_agent_kernel_runtime
 from app.agent.kernel.capabilities import ToolCatalog, ToolEffect
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
@@ -33,7 +33,7 @@ def test_download_diagnosis_has_one_native_read_entry_and_no_old_action():
     assert "downloads.diagnose" not in sdk.WRITE_METHODS
     assert any(item["name"] == "downloads.diagnose" for item in sdk.describe_methods())
     with initialized_web_runtime():
-        kernel = build_agent_kernel(model=ScriptedModel([]))
+        kernel = build_agent_kernel_runtime(model=ScriptedModel([])).session
         assert {spec.name for spec in kernel.visible_model_tools({})} == {"agent.run_code"}
         catalog = kernel.catalog
     assert not catalog.has(retired) and not catalog.has(retired.replace(".", "__"))

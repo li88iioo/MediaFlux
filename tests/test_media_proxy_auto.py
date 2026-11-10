@@ -3273,11 +3273,11 @@ class HybridMediaProxyTests(unittest.TestCase):
             return f"https://signed.invalid/{file_id}{suffix}"
 
         async def scenario():
-            await cache.get_or_fetch("file-a", lambda: fetch("file-a"))
-            await cache.get_or_fetch("file-b", lambda: fetch("file-b"))
-            await cache.get_or_fetch("file-a", lambda: fetch("file-a", "-unexpected"))
-            await cache.get_or_fetch("file-c", lambda: fetch("file-c"))
-            return await cache.get_or_fetch("file-b", lambda: fetch("file-b", "-refetched"))
+            (await cache.get_or_fetch_result("file-a", lambda: fetch("file-a"))).url
+            (await cache.get_or_fetch_result("file-b", lambda: fetch("file-b"))).url
+            (await cache.get_or_fetch_result("file-a", lambda: fetch("file-a", "-unexpected"))).url
+            (await cache.get_or_fetch_result("file-c", lambda: fetch("file-c"))).url
+            return (await cache.get_or_fetch_result("file-b", lambda: fetch("file-b", "-refetched"))).url
 
         refetched = asyncio.run(scenario())
         self.assertEqual(refetched, "https://signed.invalid/file-b-refetched")
@@ -8927,9 +8927,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         cache = media_proxy.SignedUrlCache(ttl_seconds=10, clock=lambda: now[0])
 
         async def scenario():
-            await cache.get_or_fetch("old-file", lambda: _async_value("https://signed.invalid/old"))
+            (await cache.get_or_fetch_result("old-file", lambda: _async_value("https://signed.invalid/old"))).url
             now[0] = 111.0
-            await cache.get_or_fetch("new-file", lambda: _async_value("https://signed.invalid/new"))
+            (await cache.get_or_fetch_result("new-file", lambda: _async_value("https://signed.invalid/new"))).url
 
         async def _async_value(value: str) -> str:
             return value
@@ -8947,7 +8947,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 async def fetch(value=file_id):
                     return f"https://signed.invalid/{value}"
 
-                await cache.get_or_fetch(file_id, fetch)
+                (await cache.get_or_fetch_result(file_id, fetch)).url
 
         asyncio.run(scenario())
         self.assertLessEqual(cache.lock_count, 64)
@@ -8986,12 +8986,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             return "https://signed.invalid/file"
 
         async def scenario():
-            first, second = await asyncio.gather(
-                cache.get_or_fetch("file", fetch),
-                cache.get_or_fetch("file", fetch),
-            )
+            first, second = (result.url for result in await asyncio.gather(
+                cache.get_or_fetch_result("file", fetch),
+                cache.get_or_fetch_result("file", fetch),
+            ))
             now[0] = 111.0
-            third = await cache.get_or_fetch("file", fetch)
+            third = (await cache.get_or_fetch_result("file", fetch)).url
             return first, second, third
 
         first, second, third = asyncio.run(scenario())

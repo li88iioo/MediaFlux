@@ -2374,14 +2374,6 @@ def _resolve_strm_failure_for_item_conn(
     return cur.rowcount
 
 
-def resolve_strm_failure_for_item(source_id: str, file_id: str, action: str) -> int:
-    timestamp = now()
-    with get_conn() as conn:
-        return _resolve_strm_failure_for_item_conn(
-            conn, source_id, file_id, action, timestamp=timestamp,
-        )
-
-
 def get_strm_failure_resolution_snapshot(source_id: str) -> dict[str, dict[str, sqlite3.Row]]:
     """在文件校验/安装前冻结待确认失败，后发失败不能被旧成功批次覆盖。"""
     snapshot: dict[str, dict[str, sqlite3.Row]] = {"generate": {}, "metadata": {}}

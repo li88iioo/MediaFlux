@@ -693,24 +693,6 @@ class SignedUrlCache:
     def lock_count(self) -> int:
         return len(self._locks)
 
-    async def get_or_fetch(
-        self,
-        file_id: str,
-        fetcher: Callable[[], Awaitable[str | None]],
-        *,
-        scope: str = "",
-        user_agent: str = "",
-        ua_bound: bool = False,
-    ) -> str | None:
-        result = await self.get_or_fetch_result(
-            file_id,
-            fetcher,
-            scope=scope,
-            user_agent=user_agent,
-            ua_bound=ua_bound,
-        )
-        return result.url
-
     async def get_or_fetch_result(
         self,
         file_id: str,
