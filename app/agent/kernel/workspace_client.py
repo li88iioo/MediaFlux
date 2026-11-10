@@ -16,11 +16,14 @@ from typing import Any, get_args, get_origin
 
 
 class Error(RuntimeError):
-    """业务服务返回的失败；代码可捕获、检查 code 并正常重试。"""
+    """业务失败；code与execution_started说明原因和本次调用是否已开始写入。"""
 
-    def __init__(self, message, *, code="error"):
-        super().__init__(f"{code}: {message}")
+    def __init__(self, message, *, code="error", execution_started=None):
+        state = ("；本次调用未开始写入" if execution_started is False else
+                 "；本次调用已开始写入，须核验原操作结果" if execution_started is True else "")
+        super().__init__(f"{code}: {message}{state}")
         self.code = code
+        self.execution_started = execution_started
 
 
 def _request(method, arguments):
@@ -53,7 +56,7 @@ def _request(method, arguments):
                     raise Error("invalid response file", code="invalid_response")
                 reply = json.load(stream)
             if reply.get("error"):
-                raise Error(reply["error"]["message"], code=reply["error"]["code"])
+                raise Error(**reply["error"])
             return reply["result"]
     finally:
         for item in (temporary, name):

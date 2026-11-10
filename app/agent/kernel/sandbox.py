@@ -380,7 +380,12 @@ class _SDKRequests:
             code = str(getattr(exc, "code", None) or type(exc).__name__)
             call = {"method": str(method), "ok": False, "status": code}
             self.calls.append(call)
-            encoded = json.dumps({**observation, "error": {"code": code, "message": message}}, ensure_ascii=False).encode()
+            error: dict[str, Any] = {"code": code, "message": message}
+            execution_started = getattr(exc, "execution_started", None)
+            if isinstance(execution_started, bool):
+                error["execution_started"] = execution_started
+                call["execution_started"] = execution_started
+            encoded = json.dumps({**observation, "error": error}, ensure_ascii=False).encode()
             if method in METHODS:
                 activity = _sdk_activity(activity_id, method, arguments if isinstance(arguments, dict) else {},
                                          status="failed", error=message)

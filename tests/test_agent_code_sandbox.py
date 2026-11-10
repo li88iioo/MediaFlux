@@ -609,6 +609,31 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final["exit_code"], 0, final["stderr"])
             self.assertEqual(final["stdout"].strip(), "3 False")
 
+    async def test_sdk_error_preserves_known_write_state_in_python_cli_and_observation(self):
+        from app.agent.errors import ToolPipelineError
+        from app.agent.kernel.effects import EffectExecutor
+
+        for started in (False, True, None):
+            with self.subTest(started=started):
+                error = ToolPipelineError("目标参数无效", code="precondition_failed")
+                if started is not None:
+                    error.mark_execution_started(started)
+                with patch.object(EffectExecutor, "prepare", side_effect=error):
+                    result = await self.execute(
+                        'try: mf.cloud.change([])\n'
+                        'except mf.Error as e: print(e.code, e.execution_started, str(e))')
+                    cli = await self.execute('mf cloud.change --operations "[]"', language="shell")
+                self.assertEqual(result["exit_code"], 0, result["stderr"])
+                self.assertIn(f"precondition_failed {started}", result["stdout"])
+                self.assertEqual(cli["exit_code"], 1)
+                self.assertEqual(result["sdk_calls"][0].get("execution_started"), started)
+                if started is not None:
+                    text = "未开始写入" if started is False else "已开始写入"
+                    self.assertIn(text, result["stdout"])
+                    self.assertIn(text, cli["stderr"])
+                else:
+                    self.assertNotIn("开始写入", result["stdout"] + cli["stderr"])
+
     async def test_sdk_errors_are_observations_and_normal_retry_keeps_full_result(self):
         def read(query: str):
             if query == "bad":
