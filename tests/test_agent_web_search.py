@@ -184,7 +184,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             "password=$abcdefgh123456",
         )
         with (
-            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)),
             patch("app.modules.web_evidence._search_tavily") as provider,
         ):
             for message in messages:
@@ -210,7 +210,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             return result
 
         with (
-            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)),
             patch(
                 "app.modules.web_evidence._search_tavily", side_effect=provider
             ) as call,
@@ -236,7 +236,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             {}, {"include_domains": ["example.com"]}, {"exclude_domains": ["example.com"]},
             {"start_date": "2026-01-01"}, {"end_date": "2026-11-08"}, {"time_range": "week"},
         ]
-        with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
+        with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)), patch(
             "app.modules.web_evidence._search_tavily", side_effect=provider,
         ) as call:
             for scope in scopes:
@@ -270,7 +270,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             {"title": "完整来源", "content": snippet, "url": "https://example.com/page"},
             {"title": "第二项", "content": "other", "url": "https://example.com/other"},
         ]}, {"query": "source", "topic": "general", "max_results": 1}, 1)
-        with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
+        with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)), patch(
             "app.modules.web_evidence._search_tavily", return_value=mapped,
         ) as provider:
             full = search_web("source", max_results=1)
@@ -300,7 +300,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             with self.subTest(layout=legacy.get("kind", "direct_toolresult")):
                 clear_web_cache()
                 agent_web_search_repo.set_agent_web_search_cache(key, legacy, ttl_seconds=900)
-                with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
+                with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)), patch(
                     "app.modules.web_evidence._search_tavily", return_value=fresh,
                 ) as provider:
                     first, second = search_web("fresh source"), search_web("fresh source")
@@ -363,7 +363,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             )
 
         with (
-            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)),
             patch("app.modules.web_evidence._search_tavily", side_effect=provider),
             patch.object(web_request_singleflight, "reserve", side_effect=reserve),
         ):
@@ -403,7 +403,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             return make_result(False, "timeout", "网页搜索服务响应超时")
 
         with (
-            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)),
             patch("app.modules.web_evidence._search_tavily", side_effect=provider),
             patch.object(web_request_singleflight, "reserve", side_effect=reserve),
         ):
@@ -424,7 +424,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             return make_result(False, "timeout", "网页搜索服务响应超时")
 
         with (
-            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)),
             patch("app.modules.web_evidence._search_tavily", side_effect=provider),
         ):
             result = search_web(**{"query": "temporary failure"})
@@ -524,7 +524,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             )
         )
         with (
-            patch("app.modules.web_evidence.get", side_effect=_config(self.values)),
+            patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch("app.config.get", side_effect=_config(self.values)),
             patch("app.modules.web_evidence._search_tavily") as provider,
         ):
             result = search_web(**{"query": "different"})

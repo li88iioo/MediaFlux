@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from typing import Callable
 
-from app.config import get
+from app import config
 
 
 class AIRecognitionGovernanceError(RuntimeError):
@@ -59,28 +59,12 @@ _states: dict[str, _ProviderState] = {}
 _states_lock = threading.RLock()
 
 
-def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        value = int(str(get(name, str(default)) or default).strip())
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(value, maximum))
-
-
 def governance_config() -> AIRecognitionGovernanceConfig:
     return AIRecognitionGovernanceConfig(
-        requests_per_minute=_bounded_int(
-            "AI_RECOGNITION_REQUESTS_PER_MINUTE", 6, minimum=1, maximum=30
-        ),
-        daily_request_limit=_bounded_int(
-            "AI_RECOGNITION_DAILY_REQUEST_LIMIT", 100, minimum=1, maximum=100_000
-        ),
-        max_concurrency=_bounded_int(
-            "AI_RECOGNITION_MAX_CONCURRENCY", 2, minimum=1, maximum=8
-        ),
-        circuit_breaker_seconds=_bounded_int(
-            "AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS", 60, minimum=10, maximum=600
-        ),
+        requests_per_minute=config.get_int_clamped("AI_RECOGNITION_REQUESTS_PER_MINUTE", 6, 1, 30),
+        daily_request_limit=config.get_int_clamped("AI_RECOGNITION_DAILY_REQUEST_LIMIT", 100, 1, 100_000),
+        max_concurrency=config.get_int_clamped("AI_RECOGNITION_MAX_CONCURRENCY", 2, 1, 8),
+        circuit_breaker_seconds=config.get_int_clamped("AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS", 60, 10, 600),
     )
 
 

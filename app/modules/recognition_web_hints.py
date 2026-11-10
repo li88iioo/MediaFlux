@@ -22,7 +22,9 @@ from app.concurrency import (
     run_awaitable_sync,
 )
 from app.concurrency import KeyedSingleFlight
+from app import config
 from app.config import get, get_bool
+from app.modules.policy_config import policy_int
 from app.logger import get_logger
 from app.sensitive_data import contains_sensitive_credential
 
@@ -52,14 +54,6 @@ class RecognitionWebHintResult:
     cached: bool = False
     status: str = "disabled"
     error: str = ""
-
-
-def _bounded_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        value = int(str(get(name, str(default)) or default).strip())
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(value, maximum))
 
 
 def _safe_text(value: object, maximum: int) -> str:
@@ -122,7 +116,7 @@ def _store(
 ) -> bool:
     if ttl_seconds is None:
         ttl_seconds = float(
-            _bounded_int("TAVILY_CACHE_TTL_SECONDS", 900, minimum=30, maximum=86400)
+            policy_int("TAVILY_CACHE_TTL_SECONDS")
         )
     expires_at = time.monotonic() + max(1.0, float(ttl_seconds))
     with _cache_lock:
@@ -160,9 +154,7 @@ async def _request_titles(
         client_factory = FixedHostHttpClient
     client = client_factory(
         allowed_hosts={"api.tavily.com"},
-        timeout_seconds=_bounded_int(
-            "TAVILY_TIMEOUT_SECONDS", 10, minimum=2, maximum=30
-        ),
+        timeout_seconds=policy_int("TAVILY_TIMEOUT_SECONDS"),
         max_response_bytes=128 * 1024,
         max_redirects=0,
         user_agent="MediaFlux-RecognitionHints/1.0",
@@ -280,12 +272,7 @@ def search_recognition_titles(
         result = RecognitionWebHintResult(status="unavailable")
         awaitable: object | None = None
         try:
-            daily_limit = _bounded_int(
-                "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT",
-                20,
-                minimum=1,
-                maximum=100_000,
-            )
+            daily_limit = config.get_int_clamped("ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT", 20, 1, 100_000)
             if not reserve_daily(daily_limit):
                 result = RecognitionWebHintResult(status="budget_exhausted")
             else:

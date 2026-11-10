@@ -14,6 +14,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, TypeVar
 
 from app import config
+from app.modules.policy_config import policy_int
 from app.logger import get_logger
 
 from .config import (
@@ -473,10 +474,6 @@ async def run_indexer_awaitable(
         raise TimeoutError("索引器调用超时") from None
 
 
-def _bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
-    return max(minimum, min(config.get_int(key, default), maximum))
-
-
 def _user_agent() -> str:
     raw = (config.get("INDEXER_USER_AGENT", "MediaFlux/1.0") or "")
     value = raw.strip()
@@ -486,9 +483,9 @@ def _user_agent() -> str:
 
 
 def build_indexer_service() -> IndexerService:
-    site_timeout_seconds = _bounded_int("INDEXER_SITE_TIMEOUT_SECONDS", 10, 2, 60)
-    cache_ttl_seconds = _bounded_int("INDEXER_CACHE_TTL_SECONDS", 120, 30, 600)
-    max_results_per_site = _bounded_int("INDEXER_MAX_RESULTS_PER_SITE", 40, 1, 100)
+    site_timeout_seconds = config.get_int_clamped("INDEXER_SITE_TIMEOUT_SECONDS", 10, 2, 60)
+    cache_ttl_seconds = config.get_int_clamped("INDEXER_CACHE_TTL_SECONDS", 120, 30, 600)
+    max_results_per_site = config.get_int_clamped("INDEXER_MAX_RESULTS_PER_SITE", 40, 1, 100)
     # Nyaa 有主站和镜像两个端点；单端点预算必须显著短于总站点预算，
     # 否则主站卡满后服务层会取消整个适配器，镜像永远没有执行机会。
     nyaa_endpoint_timeout_seconds = max(0.5, min(4.0, site_timeout_seconds * 0.4))
@@ -496,9 +493,7 @@ def build_indexer_service() -> IndexerService:
         user_agent=_user_agent(),
         nyaa_endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
         mikan_endpoint_timeout_seconds=site_timeout_seconds,
-        btbtla_min_interval_seconds=_bounded_int(
-            "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS", 5, 0, 60
-        ),
+        btbtla_min_interval_seconds=policy_int("INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"),
         btbtla_page_size=max_results_per_site,
         btbtla_cache_ttl_seconds=cache_ttl_seconds,
     )
@@ -510,13 +505,13 @@ def build_indexer_service() -> IndexerService:
     return IndexerService(
         registry=registry,
         result_store=IndexerResultStore(
-            ttl_seconds=_bounded_int("INDEXER_RESULT_TTL_SECONDS", 600, 60, 3600),
+            ttl_seconds=config.get_int_clamped("INDEXER_RESULT_TTL_SECONDS", 600, 60, 3600),
             max_entries=10_000,
         ),
         site_timeout_seconds=site_timeout_seconds,
-        total_timeout_seconds=_bounded_int("INDEXER_TOTAL_TIMEOUT_SECONDS", 15, 3, 120),
+        total_timeout_seconds=config.get_int_clamped("INDEXER_TOTAL_TIMEOUT_SECONDS", 15, 3, 120),
         max_results_per_site=max_results_per_site,
-        max_concurrency=_bounded_int("INDEXER_MAX_CONCURRENCY", 5, 1, 10),
+        max_concurrency=config.get_int_clamped("INDEXER_MAX_CONCURRENCY", 5, 1, 10),
         cache_ttl_seconds=cache_ttl_seconds,
         enabled_site_ids=enabled,
         sukebei_authorized=sukebei_authorized,

@@ -139,6 +139,7 @@ _POLICIES: dict[str, SafePolicyDefinition] = {
         maximum=60,
     ),
 }
+POLICY_BY_KEY: dict[str, SafePolicyDefinition] = {item.key: item for item in _POLICIES.values()}
 
 
 def _read_value(definition: SafePolicyDefinition) -> str | int:
@@ -146,8 +147,12 @@ def _read_value(definition: SafePolicyDefinition) -> str | int:
         value = config.get(definition.key, str(definition.default)) or ""
         normalized = value.strip().lower()
         return normalized if normalized in definition.choices else definition.default
-    value = config.get_int(definition.key, int(definition.default))
-    return max(definition.minimum, min(value, definition.maximum))
+    return config.get_int_clamped(definition.key, int(definition.default), definition.minimum, definition.maximum)
+
+
+def policy_int(key: str) -> int:
+    """运行时、Web 校验与 Agent 写入共用的整数策略读取。"""
+    return int(_read_value(POLICY_BY_KEY[key]))
 
 
 def _public_item(policy: str, value: str | int) -> dict[str, Any]:

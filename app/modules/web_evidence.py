@@ -28,6 +28,7 @@ from app.concurrency import (
     ensure_sync_bridge_available, run_awaitable_sync,
 )
 from app.config import get
+from app.modules.policy_config import policy_int
 from app.logger import get_logger
 from app.sensitive_data import contains_sensitive_credential, is_sensitive_key, redact_sensitive_text
 
@@ -91,7 +92,7 @@ def _cached_result(key: str) -> dict[str, Any] | None:
 
 
 def _store_cached_result(key: str, result: dict[str, Any], *, ttl_key: str) -> None:
-    ttl = _int_config(ttl_key, 900, minimum=30, maximum=86_400)
+    ttl = policy_int(ttl_key)
     agent_web_search_repo.set_agent_web_search_cache(key, {"kind": _CACHE_KIND, "result": result}, ttl_seconds=ttl)
 
 
@@ -99,14 +100,6 @@ def clear_web_cache() -> None:
     """失效搜索与正文缓存，并释放本进程中等待相同请求的调用方。"""
     web_request_singleflight.clear(clear_cache=agent_web_search_repo.clear_agent_web_search_cache)
 
-
-
-def _int_config(name: str, default: int, *, minimum: int, maximum: int) -> int:
-    try:
-        value = int(str(get(name, str(default)) or default).strip())
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(value, maximum))
 
 
 def _search_enabled() -> bool:
@@ -557,9 +550,7 @@ async def _search_tavily(
 ) -> dict[str, Any]:
     client = client_factory(
         allowed_hosts={"api.tavily.com"},
-        timeout_seconds=_int_config(
-            "TAVILY_TIMEOUT_SECONDS", 10, minimum=2, maximum=30
-        ),
+        timeout_seconds=policy_int("TAVILY_TIMEOUT_SECONDS"),
         max_response_bytes=512 * 1024,
         max_redirects=0,
         user_agent="MediaFlux-Agent/1.0",
@@ -613,7 +604,7 @@ async def _read_local(
     *,
     client_factory: Callable[..., FixedHostHttpClient] = FixedHostHttpClient,
 ) -> dict[str, Any]:
-    timeout = _int_config("WEB_READ_TIMEOUT_SECONDS", 10, minimum=2, maximum=30)
+    timeout = policy_int("WEB_READ_TIMEOUT_SECONDS")
     started = time.monotonic()
     current = arguments["url"]
     visited: set[str] = set()
@@ -674,7 +665,7 @@ def search_web(
         "include_domains": include_domains, "exclude_domains": exclude_domains,
         "start_date": start_date, "end_date": end_date,
     })
-    provider_cap = _int_config("TAVILY_MAX_RESULTS", 5, minimum=1, maximum=10)
+    provider_cap = policy_int("TAVILY_MAX_RESULTS")
     normalized["max_results"] = min(normalized["max_results"], provider_cap)
     if not _search_enabled():
         return _result(
@@ -712,9 +703,7 @@ def search_web(
         usage_date = agent_web_search_repo.current_agent_web_search_usage_date()
         charged = False
         try:
-            daily_limit = _int_config(
-                "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
-            )
+            daily_limit = policy_int("TAVILY_DAILY_CREDIT_LIMIT")
             if not agent_web_search_repo.reserve_agent_web_search_credits(
                 provider="tavily",
                 usage_date=usage_date,

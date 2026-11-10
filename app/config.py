@@ -174,6 +174,11 @@ def get_int(key: str, default: int = 0) -> int:
         return default
 
 
+def get_int_clamped(key: str, default: int, minimum: int, maximum: int) -> int:
+    """读取整数配置；无效值回退默认值，越界截断到允许范围。"""
+    return max(minimum, min(get_int(key, default), maximum))
+
+
 def get_bool(key: str, default: bool | None = None) -> bool:
     """读取布尔配置；已登记键在未显式配置时使用唯一权威默认值。"""
     if default is None:

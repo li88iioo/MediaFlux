@@ -43,6 +43,20 @@ class DiscoveryConfigTests(unittest.TestCase):
             response = save_config(self.request, data)
         return response, persist, shutdown
 
+    def test_unset_cache_ttls_use_the_declared_policy_defaults_at_runtime(self):
+        """运行时曾以 3600 兜底，而设置页与 Agent 声明的默认值是 21600。"""
+        from unittest.mock import Mock
+
+        from app.discovery.service import DiscoveryService
+        from app.modules.policy_config import POLICY_BY_KEY
+
+        with patch("app.config.get", side_effect=lambda key, default="": default):
+            service = DiscoveryService(registry=Mock(), cache=Mock())
+            douban_ttl = service._provider_ttl("douban")
+        self.assertEqual(service.cache_ttl_seconds, POLICY_BY_KEY["DISCOVERY_CACHE_TTL_SECONDS"].default)
+        self.assertEqual(service.stale_ttl_seconds, POLICY_BY_KEY["DISCOVERY_STALE_TTL_SECONDS"].default)
+        self.assertEqual(douban_ttl, POLICY_BY_KEY["DOUBAN_CACHE_TTL_SECONDS"].default)
+
     def test_accepts_all_discovery_configuration_keys_and_normalizes_dbcl2(self):
         values = {
             "DISCOVERY_ENABLED": "1",

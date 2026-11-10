@@ -301,6 +301,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         self.addCleanup(clear_web_cache)
         self.values = {"WEB_READ_ENABLED": "1", "WEB_SEARCH_ENABLED": "0", "TAVILY_API_KEY": ""}
         self.enterContext(patch(f"{MODULE}.get", side_effect=_config(self.values)))
+        self.enterContext(patch("app.config.get", side_effect=_config(self.values)))
 
     def test_disabled_reader_never_calls_network_even_if_search_is_enabled(self):
         self.values.update(WEB_READ_ENABLED="0", WEB_SEARCH_ENABLED="1", TAVILY_API_KEY="test")
@@ -491,7 +492,7 @@ class LocalReaderTransportTests(unittest.IsolatedAsyncioTestCase):
             self.clients.append(client)
             return client
 
-        with patch(f"{MODULE}.get", side_effect=_config(config or {})):
+        with patch(f"{MODULE}.get", side_effect=_config(config or {})), patch("app.config.get", side_effect=_config(config or {})):
             try:
                 return await _read_local(ARGS, client_factory=factory)
             finally:

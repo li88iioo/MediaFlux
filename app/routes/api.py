@@ -32,6 +32,7 @@ from app.indexers.config import (
     normalize_persisted_indexer_site_ids,
 )
 from app.logger import get_logger
+from app.modules.policy_config import POLICY_BY_KEY, policy_int
 from app.modules.feature_config import (
     AGENT_EPISODE_RESEARCH_KEYS,
     AI_RECOGNITION_KEYS,
@@ -70,22 +71,20 @@ _DISCOVERY_BOOLEAN_KEYS = {
     "ORGANIZE_DOUBAN_HINTS_ENABLED",
     "ORGANIZE_BANGUMI_HINTS_ENABLED",
 }
-_DISCOVERY_TTL_LIMITS = {
-    "DISCOVERY_CACHE_TTL_SECONDS": (60, 604_800),
-    "DISCOVERY_STALE_TTL_SECONDS": (300, 2_592_000),
-    "DOUBAN_CACHE_TTL_SECONDS": (300, 604_800),
-}
-_DISCOVERY_TTL_DEFAULTS = {
-    "DISCOVERY_CACHE_TTL_SECONDS": 21_600,
-    "DISCOVERY_STALE_TTL_SECONDS": 604_800,
-    "DOUBAN_CACHE_TTL_SECONDS": 21_600,
-}
+_DISCOVERY_TTL_KEYS = frozenset({
+    "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS", "DOUBAN_CACHE_TTL_SECONDS",
+})
 _WEB_ACCESS_KEYS = {
     "WEB_READ_ENABLED", "WEB_READ_TIMEOUT_SECONDS", "WEB_READ_CACHE_TTL_SECONDS",
     "WEB_SEARCH_ENABLED", "TAVILY_API_KEY", "TAVILY_SEARCH_DEPTH",
     "TAVILY_MAX_RESULTS", "TAVILY_CACHE_TTL_SECONDS",
     "TAVILY_DAILY_CREDIT_LIMIT", "TAVILY_TIMEOUT_SECONDS",
 }
+
+_WEB_ACCESS_INTEGER_KEYS = (
+    "WEB_READ_TIMEOUT_SECONDS", "WEB_READ_CACHE_TTL_SECONDS", "TAVILY_MAX_RESULTS",
+    "TAVILY_CACHE_TTL_SECONDS", "TAVILY_DAILY_CREDIT_LIMIT", "TAVILY_TIMEOUT_SECONDS",
+)
 
 _AGENT_LLM_KEYS = {
     "AGENT_LLM_ENABLED",
@@ -127,13 +126,13 @@ _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_LLM_REASONING_EFFORT": "",
     "WEB_SEARCH_ENABLED": "0",
     "WEB_READ_ENABLED": "1",
-    "WEB_READ_TIMEOUT_SECONDS": "10",
-    "WEB_READ_CACHE_TTL_SECONDS": "900",
-    "TAVILY_SEARCH_DEPTH": "basic",
-    "TAVILY_MAX_RESULTS": "5",
-    "TAVILY_CACHE_TTL_SECONDS": "900",
-    "TAVILY_DAILY_CREDIT_LIMIT": "100",
-    "TAVILY_TIMEOUT_SECONDS": "10",
+    "WEB_READ_TIMEOUT_SECONDS": str(POLICY_BY_KEY["WEB_READ_TIMEOUT_SECONDS"].default),
+    "WEB_READ_CACHE_TTL_SECONDS": str(POLICY_BY_KEY["WEB_READ_CACHE_TTL_SECONDS"].default),
+    "TAVILY_SEARCH_DEPTH": str(POLICY_BY_KEY["TAVILY_SEARCH_DEPTH"].default),
+    "TAVILY_MAX_RESULTS": str(POLICY_BY_KEY["TAVILY_MAX_RESULTS"].default),
+    "TAVILY_CACHE_TTL_SECONDS": str(POLICY_BY_KEY["TAVILY_CACHE_TTL_SECONDS"].default),
+    "TAVILY_DAILY_CREDIT_LIMIT": str(POLICY_BY_KEY["TAVILY_DAILY_CREDIT_LIMIT"].default),
+    "TAVILY_TIMEOUT_SECONDS": str(POLICY_BY_KEY["TAVILY_TIMEOUT_SECONDS"].default),
     "AGENT_LIBRARY_PATROL_ENABLED": "0",
     "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED": "0",
     "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "1",
@@ -313,18 +312,10 @@ def _normalize_discovery_ttl(key: str, value: Any) -> str:
         seconds = int(text)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{key} 必须是整数秒数") from exc
-    minimum, maximum = _DISCOVERY_TTL_LIMITS[key]
-    if not minimum <= seconds <= maximum:
-        raise ValueError(f"{key} 必须在 {minimum} 到 {maximum} 秒之间")
+    policy = POLICY_BY_KEY[key]
+    if not policy.minimum <= seconds <= policy.maximum:
+        raise ValueError(f"{key} 必须在 {policy.minimum} 到 {policy.maximum} 秒之间")
     return str(seconds)
-
-
-def _existing_ttl(key: str) -> int:
-    default = _DISCOVERY_TTL_DEFAULTS[key]
-    try:
-        return int(config.get(key, str(default)) or default)
-    except (TypeError, ValueError):
-        return default
 
 
 def _validate_indexer_updates(
@@ -337,12 +328,13 @@ def _validate_indexer_updates(
         )
     key = "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"
     if key in data:
+        low, high = POLICY_BY_KEY[key].minimum, POLICY_BY_KEY[key].maximum
         try:
             interval = int(str(data[key]).strip())
         except (TypeError, ValueError) as exc:
-            raise ValueError("BTBTLA 最小请求间隔必须是 0 到 60 的整数") from exc
-        if not 0 <= interval <= 60:
-            raise ValueError("BTBTLA 最小请求间隔必须在 0 到 60 秒之间")
+            raise ValueError(f"BTBTLA 最小请求间隔必须是 {low} 到 {high} 的整数") from exc
+        if not low <= interval <= high:
+            raise ValueError(f"BTBTLA 最小请求间隔必须在 {low} 到 {high} 秒之间")
         normalized[key] = str(interval)
     if "INDEXER_ENABLED_SITES" in data:
         sites = encode_indexer_site_ids(str(data.get("INDEXER_ENABLED_SITES") or ""))
@@ -372,7 +364,7 @@ def _validate_discovery_updates(data: dict[str, Any]) -> dict[str, str]:
         } and str(value or "").strip() == "":
             value = "0"
         normalized[key] = normalize_boolean(key, value)
-    for key in _DISCOVERY_TTL_LIMITS.keys() & data.keys():
+    for key in _DISCOVERY_TTL_KEYS & data.keys():
         normalized[key] = _normalize_discovery_ttl(key, data[key])
 
     if "BANGUMI_USER_AGENT" in data:
@@ -390,11 +382,11 @@ def _validate_discovery_updates(data: dict[str, Any]) -> dict[str, str]:
     if {"DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS"} & data.keys():
         cache_ttl = int(normalized.get(
             "DISCOVERY_CACHE_TTL_SECONDS",
-            _existing_ttl("DISCOVERY_CACHE_TTL_SECONDS"),
+            policy_int("DISCOVERY_CACHE_TTL_SECONDS"),
         ))
         stale_ttl = int(normalized.get(
             "DISCOVERY_STALE_TTL_SECONDS",
-            _existing_ttl("DISCOVERY_STALE_TTL_SECONDS"),
+            policy_int("DISCOVERY_STALE_TTL_SECONDS"),
         ))
         if stale_ttl < cache_ttl:
             raise ValueError("DISCOVERY_STALE_TTL_SECONDS 不能小于 DISCOVERY_CACHE_TTL_SECONDS")
@@ -415,20 +407,13 @@ def _validate_web_access_updates(data: dict[str, Any]) -> dict[str, str]:
         normalized["TAVILY_API_KEY"] = key
     if "TAVILY_SEARCH_DEPTH" in data:
         depth = str(data["TAVILY_SEARCH_DEPTH"] or "basic").strip().lower()
-        if depth not in {"basic", "advanced"}:
+        if depth not in POLICY_BY_KEY["TAVILY_SEARCH_DEPTH"].choices:
             raise ValueError("TAVILY_SEARCH_DEPTH 仅支持 basic 或 advanced")
         normalized["TAVILY_SEARCH_DEPTH"] = depth
-    limits = {
-        "WEB_READ_TIMEOUT_SECONDS": (2, 30),
-        "WEB_READ_CACHE_TTL_SECONDS": (30, 86400),
-        "TAVILY_MAX_RESULTS": (1, 10),
-        "TAVILY_CACHE_TTL_SECONDS": (30, 86400),
-        "TAVILY_DAILY_CREDIT_LIMIT": (1, 100000),
-        "TAVILY_TIMEOUT_SECONDS": (2, 30),
-    }
-    for key, (minimum, maximum) in limits.items():
+    for key in _WEB_ACCESS_INTEGER_KEYS:
         if key not in data:
             continue
+        minimum, maximum = POLICY_BY_KEY[key].minimum, POLICY_BY_KEY[key].maximum
         try:
             value = int(str(data[key]).strip())
         except (TypeError, ValueError) as exc:
@@ -754,7 +739,7 @@ def _validate_login_wallpaper_updates(data: dict[str, Any]) -> dict[str, str]:
         )
         or ""
     ).strip().lower()
-    if mode not in {"default", "tmdb"}:
+    if mode not in POLICY_BY_KEY["LOGIN_WALLPAPER_MODE"].choices:
         raise ValueError("登录页壁纸模式无效")
     submitted_key = data.get("TMDB_API_KEY")
     if submitted_key is None or _is_config_mask(submitted_key):

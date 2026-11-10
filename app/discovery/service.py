@@ -16,6 +16,7 @@ from itertools import groupby
 from typing import Any
 
 from app import config
+from app.modules.policy_config import policy_int
 from app.repositories import discovery as discovery_repo
 from app.discovery.cache import CacheLookup, DiscoveryCache
 from app.discovery.models import (
@@ -123,10 +124,10 @@ class DiscoveryService:
     ):
         self.registry = registry or build_default_registry()
         self.cache = cache or DiscoveryCache()
-        self.cache_ttl_seconds = max(60, (cache_ttl_seconds or config.get_int("DISCOVERY_CACHE_TTL_SECONDS", 3600)))
+        self.cache_ttl_seconds = max(60, (cache_ttl_seconds or policy_int("DISCOVERY_CACHE_TTL_SECONDS")))
         self.stale_ttl_seconds = max(
             self.cache_ttl_seconds,
-            (stale_ttl_seconds or config.get_int("DISCOVERY_STALE_TTL_SECONDS", 604800)),
+            (stale_ttl_seconds or policy_int("DISCOVERY_STALE_TTL_SECONDS")),
         )
         self._refresh_guard = threading.Condition(threading.RLock())
         self._pending_refreshes: set[str] = set()
@@ -430,7 +431,7 @@ class DiscoveryService:
 
     def _provider_ttl(self, provider: str) -> int:
         if provider == "douban":
-            return max(300, config.get_int("DOUBAN_CACHE_TTL_SECONDS", 21600))
+            return policy_int("DOUBAN_CACHE_TTL_SECONDS")
         if provider == "bangumi":
             return max(300, config.get_int("BANGUMI_CACHE_TTL_SECONDS", 21600))
         return self.cache_ttl_seconds

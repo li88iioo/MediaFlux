@@ -46,6 +46,7 @@ from app.clients.openai_compatible import (
 from app.logger import get_logger, redact_sensitive_text
 from app.modules import gcid_import, recognition_preprocess_rules, tmdb_regex_rules
 from app.modules.gcid_manifest import ManifestValidationError, validate_manifest
+from app.modules.policy_config import POLICY_BY_KEY, policy_int
 from app.modules.scraper import (
     Candidate,
     MatchResult,
@@ -1475,12 +1476,13 @@ async def tavily_test(request: Request, data: dict | None = Body(default=None)):
     api_key = api_key.strip()
     if not api_key:
         return api_error("请先填写 Tavily API Key", 400)
+    timeout_policy = POLICY_BY_KEY["TAVILY_TIMEOUT_SECONDS"]
     try:
-        timeout = int(str(data.get("timeout_seconds", config.get("TAVILY_TIMEOUT_SECONDS", "10"))))
-        if not 2 <= timeout <= 30:
+        timeout = int(str(data.get("timeout_seconds", policy_int("TAVILY_TIMEOUT_SECONDS"))))
+        if not timeout_policy.minimum <= timeout <= timeout_policy.maximum:
             raise ValueError
     except (TypeError, ValueError):
-        return api_error("请求超时须为 2–30 秒的整数", 400)
+        return api_error(f"请求超时须为 {timeout_policy.minimum}–{timeout_policy.maximum} 秒的整数", 400)
 
     client = FixedHostHttpClient(
         allowed_hosts={"api.tavily.com"}, timeout_seconds=timeout,
