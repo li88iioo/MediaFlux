@@ -2861,7 +2861,7 @@ def strm_status(run_id: int | None = None) -> dict:
     running, configured = bool(raw.get("running")), not bool(raw.get("config_error"))
     last = raw.get("last_run") or {}
     last_run = _public_strm_run(last, raw) if last.get("id") else {}
-    status = "not_configured" if not configured else "running" if running else "attention" if last.get("status") == "failed" else "ready"
+    status = "not_configured" if not configured else "running" if running else "attention" if last_run.get("status") in {"partial", "failed"} else "ready"
     return {"ok": status not in {"not_configured", "attention"}, "status": status,
             "summary": {"not_configured": "STRM配置尚不完整", "running": "STRM同步正在运行",
                         "attention": "最近一次STRM同步未成功", "ready": "STRM当前空闲"}[status],

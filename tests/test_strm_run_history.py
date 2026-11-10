@@ -133,3 +133,22 @@ class StrmRunHistoryTests(IsolatedDatabaseTestCase):
         self.assertEqual(data[0]["result"]["sources"], ["PRIVATE"])
         row = db.get_last_task_run("strm_sync")
         self.assertEqual(STRMScheduler._row_to_dict(row)["result"], data[0]["result"])
+
+    def test_overview_preserves_attention_for_partial_and_failed_runs(self):
+        from app import sdk
+        from app.modules import scheduler
+
+        runtime = scheduler.STRMScheduler()
+        with (
+            patch.object(scheduler, "get_scheduler", return_value=runtime),
+            patch.object(runtime, "validate_config", return_value=""),
+            patch.object(scheduler, "configured_strm_source_plans", return_value=([], "")),
+        ):
+            for status, expected in (("partial", "attention"), ("failed", "attention"), ("success", "ready")):
+                with self.subTest(status=status):
+                    run_id = db.add_task_run("strm_sync", "manual")
+                    db.finish_task_run(run_id, status, result=json.dumps({"stats": {"failed": int(status != "success")}}))
+                    overview = sdk.strm.status()
+                    self.assertEqual(overview["status"], expected)
+                    self.assertEqual(overview["ok"], expected == "ready")
+                    self.assertEqual(overview["data"]["last_run"], sdk.strm.status(run_id)["data"]["task"])
