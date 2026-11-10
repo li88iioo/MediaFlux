@@ -248,6 +248,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
             {
                 "title",
                 "request",
+                "organize_evidence",
                 "kind",
                 "stages",
                 "explanation",
@@ -264,6 +265,63 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         )
         native = sdk.activity.timeline("download", identifier)
         self.assertEqual(native["data"]["activities"], result["data"]["activities"])
+
+    def test_download_exposes_only_its_bound_source_receipt(self):
+        identifier = self.make_request()
+        other = self.make_request("other")
+        def source(source_id, request_ids, title):
+            return {"id": source_id, "stats": {
+                "scan_complete": True,
+                "notification_context": {"download_request_ids": request_ids, "chat_id": "secret-chat"},
+                "media_items": [{"title": title, "tmdb_id": "123", "media_type": "tv", "season": 2,
+                                 "episode": 6, "filename": "renamed.S02E06.mkv", "private": "secret"}],
+                "strm_changes": [{"file_id": "video-1", "parent_id": "season-2", "name": "renamed.S02E06.mkv",
+                                  "kind": "video", "action": "upsert", "etag": "secret-etag"}],
+            }}
+        payload = {"task_id": "bound-task", "sources": [
+            source("mine", [identifier], "请求对应媒体"), source("other", [other], "不属于当前请求"),
+        ]}
+        run_id = db.add_task_run("guangya_organize", "download")
+        db.finish_task_run(run_id, "success", result=json.dumps(payload))
+        db.update_download_request(identifier, organize_run_id=run_id, organize_task_id="bound-task",
+                                   gy_target_dir="mine", gy_isolated=1, organize_status="completed")
+        result = sdk.activity.timeline("download", identifier)
+        evidence = result["data"]["organize_evidence"]
+        self.assertEqual(evidence["status"], "recorded")
+        self.assertEqual(evidence["media"][0]["episode"], 6)
+        self.assertEqual(evidence["files"][0]["file_id"], "video-1")
+        self.assertFalse(evidence["truncated"])
+        self.assertEqual(evidence["freshness"], "persisted_snapshot")
+        public = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("不属于当前请求", public)
+        self.assertNotIn("secret", public)
+        self.assertIn("未建立媒体库可见性复核", public)
+        db.update_download_request(identifier, gy_isolated=0)
+        shared = sdk.activity.timeline("download", identifier)["data"]["organize_evidence"]
+        self.assertEqual(shared["status"], "unavailable")
+        self.assertEqual(shared["files"], [])
+        db.update_download_request(identifier, gy_isolated=1)
+
+        for invalid in (
+            {**payload, "task_id": "old-task"},
+            {"task_id": "bound-task", "sources": [source("mine", [identifier, other], "共享来源")]},
+            {"task_id": "bound-task", "sources": [source("mine", [], "旧数据未记录归属")]},
+            {"task_id": "bound-task", "sources": [source("other", [identifier], "目录已改变")]},
+        ):
+            with self.subTest(payload=invalid):
+                db.finish_task_run(run_id, "success", result=json.dumps(invalid))
+                missing = sdk.activity.timeline("download", identifier)["data"]["organize_evidence"]
+                self.assertEqual(missing["status"], "unavailable")
+                self.assertEqual(missing["media"], [])
+
+        stats = payload["sources"][0]["stats"]
+        stats["media_items"] *= 51
+        db.finish_task_run(run_id, "success", result=json.dumps(payload))
+        db.update_download_request(identifier, organize_status="resubmitted")
+        bounded = sdk.activity.timeline("download", identifier)["data"]["organize_evidence"]
+        self.assertEqual((len(bounded["media"]), bounded["media_count"]), (50, 51))
+        self.assertTrue(bounded["truncated"])
+        self.assertTrue(bounded["historical"])
 
     def test_pack_timeline_keeps_each_target_result_after_restart(self):
         identifier = self.make_request()

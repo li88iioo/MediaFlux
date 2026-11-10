@@ -212,9 +212,10 @@ def snapshot(kind: str, identifier: int) -> dict | None:
             result["runs"] = [
                 dict(item)
                 for item in conn.execute(
-                    "SELECT id,task_name,status,started_at,finished_at,error FROM task_runs "
+                    "SELECT id,task_name,status,started_at,finished_at,error,"
+                    "CASE WHEN id=? AND task_name='guangya_organize' THEN result END AS result FROM task_runs "
                     "WHERE id IN (?,?) ORDER BY id",
-                    (row["organize_run_id"], row["strm_run_id"]),
+                    (row["organize_run_id"], row["organize_run_id"], row["strm_run_id"]),
                 )
             ]
             verification = conn.execute(
@@ -324,6 +325,66 @@ def _stage(
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _download_organize_evidence(stored: dict) -> dict:
+    """只投影绑定运行中独占该请求的来源，不能按标题或整个批次推断归属。"""
+    from app.modules.organize_results import read_organize_result
+
+    row = stored["record"]
+    evidence: dict[str, Any] = {
+        "status": "unavailable", "freshness": "persisted_snapshot",
+        "message": "未保存可独立归属此请求的整理明细；不能按标题猜测关联。",
+        "media": [], "files": [],
+    }
+    run = next((run for run in stored["runs"]
+                if run["id"] == row.get("organize_run_id")
+                and run["task_name"] == "guangya_organize"), None)
+    if (run is None or not row.get("organize_task_id") or row.get("gy_isolated") != 1
+            or not row.get("gy_target_dir") or row["gy_target_dir"] == "0"):
+        return evidence
+    try:
+        result = read_organize_result(json.loads(run["result"] or "{}"))
+    except (ValueError, TypeError):
+        return evidence
+    if result["task_id"] != row["organize_task_id"]:
+        return evidence
+    sources = result.get("sources")
+    if not isinstance(sources, list):
+        return evidence
+    selected = [source for source in sources if isinstance(source, dict)
+                and source.get("id") == row.get("gy_target_dir")]
+    if len(selected) != 1:
+        return evidence
+    stats = selected[0].get("stats")
+    if not isinstance(stats, dict):
+        return evidence
+    context = stats.get("notification_context")
+    if not isinstance(context, dict) or context.get("download_request_ids") != [row["id"]]:
+        return evidence
+
+    def project(key: str, fields: tuple[str, ...]) -> tuple[list[dict], int]:
+        items = stats.get(key)
+        items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        return [{field: redact_sensitive_text(item[field]) if isinstance(item[field], str)
+                 else item[field] for field in fields if field in item}
+                for item in items[:50]], len(items)
+
+    media, media_count = project("media_items", (
+        "title", "year", "media_type", "tmdb_id", "season", "episode", "filename",
+    ))
+    files, file_count = project("strm_changes", (
+        "file_id", "parent_id", "name", "rel_dir", "kind", "action",
+    ))
+    return {
+        **evidence, "status": "recorded", "run_id": run["id"],
+        "source_dir_id": selected[0]["id"], "recorded_at": _stamp(run["finished_at"]),
+        "historical": row.get("organize_status") == "resubmitted",
+        "message": "以下是该请求的持久整理回执；未实时检查云盘文件或媒体库可见性。",
+        "scan_complete": stats.get("scan_complete") is True,
+        "media": media, "media_count": media_count, "files": files, "file_count": file_count,
+        "truncated": media_count > len(media) or file_count > len(files),
+    }
 
 
 def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
@@ -541,7 +602,8 @@ def timeline_snapshot(kind: str, identifier: int) -> dict[str, Any]:
         "error": "",
         "data": {
             "title": public_text(download_display_title(row) if kind == "download" else row.get("title"), 120),
-            **({"request": download_request_public_summary(row)} if kind == "download" else {}),
+            **({"request": download_request_public_summary(row),
+                "organize_evidence": _download_organize_evidence(stored)} if kind == "download" else {}),
             "kind": kind,
             "stages": stages,
             "explanation": explanation,

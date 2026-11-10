@@ -2007,6 +2007,7 @@ class Activity:
         直接传 timeline("download", request_id)，无需搜索或匹配云盘列表。
         返回 ok/status/message/data；data.title 是已补全的文件名，data.request 是下载请求摘要，
         data.stages 是阶段列表（stage/status/task_bound/progress/updated_at/reason），不是 events。
+        data.organize_evidence 提供本请求绑定来源的媒体身份及文件ID；它是持久整理回执，不是实时云盘/媒体库查询。
         下载阶段 task_bound=True 表示该请求已绑定后端任务；False 表示尚未记录关联，不证明后端没有任务。
         data.gaps 标明未复核范围，freshness=persisted_snapshot；下载完成不等于媒体库已入库。
         """
