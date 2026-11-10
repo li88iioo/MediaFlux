@@ -58,6 +58,22 @@ def _workspace_call(operation, arguments, language):
     return shlex.join(words)
 
 
+@pytest.mark.parametrize("operation", ["download", "retry"])
+def test_sourceless_entries_fail_before_confirmation_without_claiming_the_batch(operation):
+    with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")):
+        sid = feed()
+        valid = entry(sid, 1)
+        invalid = db.add_rss_entry_with_media(sid, "没有下载来源", "no-source", payload="{}")["id"]
+        ids = [valid, invalid]
+        if operation == "retry":
+            for eid in ids:
+                db.record_rss_entry_failure(eid, "qb_unavailable", True)
+        before = [dict(assert_present(db.get_rss_entry(eid))) for eid in ids]
+        with pytest.raises(rss_delivery.RSSSubscriptionError, match=f"{invalid}.*下载链接"):
+            rss_delivery.prepare(operation, {"entry_ids": ids})
+        assert [dict(assert_present(db.get_rss_entry(eid))) for eid in ids] == before
+
+
 @pytest.mark.parametrize("operation,scope,language", [
     ("refresh", "selected", "python"), ("refresh", "all", "shell"),
     ("download", "selected", "python"), ("download", "pending", "shell"),
@@ -331,6 +347,9 @@ def test_cloud_confirmation_freezes_account_through_original_and_retry_dispatch(
             bind_rss_entry_download(eid, download_dispatcher.request_key(item), "guangya")
             request = download_dispatcher.create_request(item, "", "", origin=f"rss:{sid}")
             db.update_download_request(request["id"], targets="guangya", status="failed", gy_status="failed")
+            # 已绑定请求的重试从原请求读取来源，不要求 RSS 再保留链接。
+            with db.get_conn() as conn:
+                conn.execute("UPDATE rss_entries SET payload='{}' WHERE id=?", (eid,))
         if operation == "retry":
             db.record_rss_entry_failure(eid, "guangya_unavailable", True)
         args = {"entry_ids": [eid]}

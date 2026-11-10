@@ -238,6 +238,13 @@ def _capture(operation: str, arguments: dict) -> dict:
         raise RSSSubscriptionError("所选 RSS 条目不是完整的可投递集合", code="conflict")
     has_more = not selected and len(rows) > arguments["limit"]
     rows = rows if selected else rows[: arguments["limit"]]
+    missing_source = [str(row["id"]) for row in rows
+                      if not row["download_request_key"] and not RSSEngine._entry_torrent_url(row)]
+    if missing_source:
+        raise RSSSubscriptionError(
+            f"RSS 条目 {', '.join(missing_source)} 缺少下载链接，请刷新订阅源或调整所选条目",
+            code="missing_torrent_url",
+        )
     snapshot = (
         db.rss_pending_entry_snapshot
         if operation == "download"
