@@ -147,6 +147,7 @@ def test_direct_submission_receipt_matches_real_dispatch(
         patch.dict(os.environ, {"QB_URL": "http://qb.invalid"}),
         patch("socket.socket.connect", side_effect=AssertionError("禁止外联")),
         patch("app.indexers.downloads.GuangYaClient") as cloud_client,
+        patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1),
         patch.object(dispatcher, "_submit_qb", return_value={"ok": qb_ok}) as qb,
         patch.object(dispatcher, "_submit_guangya", return_value={"ok": gy_ok}) as gy,
     ):

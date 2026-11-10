@@ -237,6 +237,7 @@ def _process_confirm(db_path, plan, pipe):
             patch.object(indexer_config, "get_bool", return_value=True),
             isolated_indexer_results() as service,
             patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}),
+            patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1),
             patch.object(dispatcher, "_submit_guangya", side_effect=remote_write),
         ):
             service.resolve = resolve
