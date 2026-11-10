@@ -30,6 +30,7 @@ from app.defaults import (
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
 from app.logger import get_logger, log_throttled
+from app.modules.offline import DEFAULT_TARGET_DIR_NAME
 from app.modules.naming import sanitize_name
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
@@ -1025,7 +1026,7 @@ class DownloadTracker:
                 request_id,
                 gy_target_dir=parent_id, gy_target_name=str(
                     row_value(row, "gy_staging_parent_name", "")
-                    or get("OFFLINE_TARGET_DIR_NAME", "离线目录")
+                    or get("OFFLINE_TARGET_DIR_NAME", DEFAULT_TARGET_DIR_NAME)
                 ),
                 gy_isolated=0, gy_staging_cleanup_status="completed",
                 gy_staging_cleanup_error="",

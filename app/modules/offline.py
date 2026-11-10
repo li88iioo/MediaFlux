@@ -29,6 +29,9 @@ DEFAULT_VIDEO_EXTS = (
 DEFAULT_VIDEO_EXTS_CSV = ",".join(DEFAULT_VIDEO_EXTS)
 _DEFAULT_VIDEO_EXT_SET = frozenset(DEFAULT_VIDEO_EXTS)
 
+# 离线目录未命名时的唯一展示名；规则、下载记录与跟踪器共用。
+DEFAULT_TARGET_DIR_NAME = "默认目录"
+
 
 @dataclass(frozen=True)
 class OfflineRules:
@@ -52,7 +55,7 @@ class OfflineRules:
             ed2k_enabled=get_bool("OFFLINE_ED2K_ENABLED", True),
             http_enabled=get_bool("OFFLINE_HTTP_ENABLED", False),
             target_dir_id=get("OFFLINE_TARGET_DIR", get("RSS_GY_TARGET_DIR", "0")) or "0",
-            target_dir_name=get("OFFLINE_TARGET_DIR_NAME", "默认目录"),
+            target_dir_name=get("OFFLINE_TARGET_DIR_NAME", DEFAULT_TARGET_DIR_NAME),
             secondary_enabled=get_bool("OFFLINE_SECONDARY_ENABLED", False),
             secondary_dir_id=get("OFFLINE_SECONDARY_DIR", "0") or "0",
             secondary_dir_name=get("OFFLINE_SECONDARY_DIR_NAME", "二次分流目录"),
@@ -71,7 +74,7 @@ class OfflineRules:
             ed2k_enabled=_to_bool(data.get("ed2k_enabled"), base.ed2k_enabled),
             http_enabled=_to_bool(data.get("http_enabled"), base.http_enabled),
             target_dir_id=str(data.get("target_dir_id", base.target_dir_id) or "0"),
-            target_dir_name=str(data.get("target_dir_name", base.target_dir_name) or "默认目录"),
+            target_dir_name=str(data.get("target_dir_name", base.target_dir_name) or DEFAULT_TARGET_DIR_NAME),
             secondary_enabled=_to_bool(data.get("secondary_enabled"), base.secondary_enabled),
             secondary_dir_id=str(data.get("secondary_dir_id", base.secondary_dir_id) or "0"),
             secondary_dir_name=str(data.get("secondary_dir_name", base.secondary_dir_name) or "二次分流目录"),
