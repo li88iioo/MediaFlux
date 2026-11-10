@@ -38,6 +38,7 @@ from app.repositories.download_requests import (
     download_display_title,
     usable_download_title,
 )
+from app.database import row_value
 
 logger = get_logger(__name__)
 
@@ -352,14 +353,14 @@ class DownloadTracker:
         matched_gy_tasks = []
         gy_error = ""
         local_import_pending = str(
-            self._row_value(row, "local_import_status", "") or ""
+            row_value(row, "local_import_status", "") or ""
         ) in {"", "pending"}
         tracking_completed_qb = qb_status == "completed" and local_import_pending
         if qb_status in {"submitted", "downloading", "outcome_unknown"} or tracking_completed_qb:
             from app.modules.download_dispatcher import torrent_identity
 
-            identity = str(self._row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
-            if qb_available and identity and not self._row_value(row, "qb_task_id", ""):
+            identity = str(row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
+            if qb_available and identity and not row_value(row, "qb_task_id", ""):
                 updates["qb_task_id"] = identity
             task = qb_tasks.by_hash.get(identity) if qb_available and identity else None
             matched_qb_task = task
@@ -383,7 +384,7 @@ class DownloadTracker:
                 and qb_available
                 and identity
             ):
-                missing_since = self._row_value(row, "qb_task_missing_since", "")
+                missing_since = row_value(row, "qb_task_missing_since", "")
                 if not missing_since:
                     updates["qb_task_missing_since"] = db.now()
                 elif self._missing_expired(missing_since):
@@ -398,7 +399,7 @@ class DownloadTracker:
 
         if gy_available and gy_status in {"submitted", "downloading", "outcome_unknown"}:
             task_ids = self._parse_gy_task_ids(row)
-            expected_batches = max(len(task_ids), int(self._row_value(row, "gy_batch_count", 0) or 0))
+            expected_batches = max(len(task_ids), int(row_value(row, "gy_batch_count", 0) or 0))
             if task_ids or expected_batches > 1:
                 task_by_id = gy_tasks.by_id
                 matched = [task_by_id[task_id] for task_id in task_ids if task_id in task_by_id]
@@ -413,7 +414,7 @@ class DownloadTracker:
                         "请核对云端任务，勿直接重复提交"
                     )
                 elif len(matched) < expected_batches:
-                    missing_since = self._row_value(row, "gy_task_missing_since", "")
+                    missing_since = row_value(row, "gy_task_missing_since", "")
                     if not missing_since:
                         updates["gy_task_missing_since"] = db.now()
                     elif self._missing_expired(missing_since):
@@ -435,7 +436,7 @@ class DownloadTracker:
                         gy_error = "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
                 backend_logs.append((
                     "guangya", updates.get("gy_status", gy_status), progress,
-                    task_ids[0] if task_ids else str(self._row_value(row, "gy_task_id", "") or ""),
+                    task_ids[0] if task_ids else str(row_value(row, "gy_task_id", "") or ""),
                 ))
             else:
                 task = self._match_gy(row, gy_tasks)
@@ -451,12 +452,12 @@ class DownloadTracker:
                     if task.get("id"):
                         matched_task_id = str(task["id"])
                         updates["gy_task_id"] = matched_task_id
-                        if int(self._row_value(row, "gy_isolated", 0) or 0):
+                        if int(row_value(row, "gy_isolated", 0) or 0):
                             updates["gy_task_ids"] = json.dumps([matched_task_id], ensure_ascii=False)
                             updates["gy_batch_count"] = 1
                     backend_logs.append((
                         "guangya", updates["gy_status"], progress,
-                        str(task.get("id") or self._row_value(row, "gy_task_id", "") or ""),
+                        str(task.get("id") or row_value(row, "gy_task_id", "") or ""),
                     ))
                 elif gy_status == "outcome_unknown":
                     updates["gy_status"] = "manual_review"
@@ -468,7 +469,7 @@ class DownloadTracker:
                     # 提交时没有拿到任务 ID，且云端任务列表中也匹配不到
                     # （可能已快速完成并从列表消失）。与批量路径对称：先记
                     # 缺失时间，宽限期后升级人工核验，禁止永远停在 submitted。
-                    missing_since = self._row_value(row, "gy_task_missing_since", "")
+                    missing_since = row_value(row, "gy_task_missing_since", "")
                     if not missing_since:
                         updates["gy_task_missing_since"] = db.now()
                     elif self._missing_expired(missing_since):
@@ -533,8 +534,8 @@ class DownloadTracker:
                 "event_status": next_root_status,
                 "qb_status": str(effective_qb or ""),
                 "gy_status": str(effective_gy or ""),
-                "chat_id": str(self._row_value(row, "chat_id", "") or ""),
-                "error": str(updates.get("error", self._row_value(row, "error", "")) or ""),
+                "chat_id": str(row_value(row, "chat_id", "") or ""),
+                "error": str(updates.get("error", row_value(row, "error", "")) or ""),
             }
             updates.update({
                 "notification_event_status": next_root_status,
@@ -576,12 +577,12 @@ class DownloadTracker:
     @classmethod
     def _persisted_qb_import_task(cls, row) -> TorrentTask | None:
         """qB 自动删种后，继续用已持久化的完成路径重试本地入库。"""
-        content_path = str(cls._row_value(row, "qb_content_path", "") or "").strip()
+        content_path = str(row_value(row, "qb_content_path", "") or "").strip()
         if not content_path:
             return None
         return TorrentTask(
-            hash=str(cls._row_value(row, "qb_task_id", "") or ""),
-            name=str(cls._row_value(row, "title", "") or ""),
+            hash=str(row_value(row, "qb_task_id", "") or ""),
+            name=str(row_value(row, "title", "") or ""),
             progress=1.0,
             state="completed",
             save_path="",
@@ -598,7 +599,7 @@ class DownloadTracker:
 
     @staticmethod
     def _linked_local_media_task_id(row) -> int | None:
-        target = str(DownloadTracker._row_value(row, "local_import_target", "") or "")
+        target = str(row_value(row, "local_import_target", "") or "")
         prefix = "local-media-task:"
         if not target.startswith(prefix):
             return None
@@ -686,7 +687,7 @@ class DownloadTracker:
 
     def _record_local_import_probe_retry(self, row, task, error: Exception) -> None:
         request_id = int(row["id"])
-        attempts = int(self._row_value(row, "local_import_attempts", 0) or 0) + 1
+        attempts = int(row_value(row, "local_import_attempts", 0) or 0) + 1
         exhausted = attempts >= _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS
         timestamp = db.now()
         message = str(error or "本地媒体路径暂时不可读")[:1000]
@@ -696,7 +697,7 @@ class DownloadTracker:
             local_import_status="failed" if exhausted else "pending",
             local_import_attempts=attempts,
             local_import_error=message,
-            local_import_started_at=self._row_value(row, "local_import_started_at", "") or timestamp,
+            local_import_started_at=row_value(row, "local_import_started_at", "") or timestamp,
             local_import_completed_at=timestamp if exhausted else None,
         )
         if exhausted:
@@ -717,10 +718,10 @@ class DownloadTracker:
 
     def _staging_ready_for_organize(self, row) -> bool:
         """等待隔离目录中的异步云端写入落稳，避免只整理首批可见文件。"""
-        if not int(self._row_value(row, "gy_isolated", 0) or 0):
+        if not int(row_value(row, "gy_isolated", 0) or 0):
             return True
         request_id = int(row["id"])
-        staging_id = str(self._row_value(row, "gy_target_dir", "") or "")
+        staging_id = str(row_value(row, "gy_target_dir", "") or "")
         if not staging_id:
             self._fail_settle(row, "下载隔离目录缺失，无法确认文件是否落稳")
             return False
@@ -730,8 +731,8 @@ class DownloadTracker:
             if not client.logged_in:
                 raise RuntimeError("光鸭未登录")
             info = client.file_info(staging_id)
-            expected_parent = str(self._row_value(row, "gy_staging_parent_dir", "") or "")
-            expected_name = str(self._row_value(row, "gy_staging_name", "") or "")
+            expected_parent = str(row_value(row, "gy_staging_parent_dir", "") or "")
+            expected_name = str(row_value(row, "gy_staging_name", "") or "")
             if (
                 info is None or not info.is_dir
                 or (expected_parent and (info.parent_id or "") != expected_parent)
@@ -746,9 +747,9 @@ class DownloadTracker:
         finally:
             close_guangya_client(client)
 
-        expected = max(0, int(self._row_value(row, "gy_expected_file_count", 0) or 0))
-        previous = str(self._row_value(row, "gy_settle_snapshot", "") or "")
-        stable_count = int(self._row_value(row, "gy_settle_stable_count", 0) or 0)
+        expected = max(0, int(row_value(row, "gy_expected_file_count", 0) or 0))
+        previous = str(row_value(row, "gy_settle_snapshot", "") or "")
+        stable_count = int(row_value(row, "gy_settle_stable_count", 0) or 0)
         stable_count = stable_count + 1 if snapshot and snapshot == previous else (1 if snapshot else 0)
         # 仅“数量达到预期”仍不足以证明云端写入完成：光鸭可能先暴露目录项，
         # 随后继续更新大小/etag。统一要求两次快照一致，避免整理到半写入文件。
@@ -800,13 +801,13 @@ class DownloadTracker:
         self, row, *, observed: int, snapshot: str, error: str, stable_count: int = 0,
     ) -> None:
         request_id = int(row["id"])
-        attempts = int(self._row_value(row, "gy_settle_attempts", 0) or 0) + 1
+        attempts = int(row_value(row, "gy_settle_attempts", 0) or 0) + 1
         if attempts > 8:
             self._fail_settle(row, f"云端文件长时间未落稳；{error}")
             return
         delay = self._settle_delay(attempts)
         next_retry = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
-        first_notice = str(self._row_value(row, "organize_status", "") or "") != "settling"
+        first_notice = str(row_value(row, "organize_status", "") or "") != "settling"
         download_requests_repo.update_download_request(
             request_id, organize_started=0, organize_status="settling", organize_error=error,
             organize_next_retry_at=next_retry, gy_settle_attempts=attempts,
@@ -849,12 +850,12 @@ class DownloadTracker:
 
     def _finalize_staging_without_organize(self, row) -> bool:
         """通过统一光鸭 Writer 收口未配置自动入库的隔离目录。"""
-        if not int(self._row_value(row, "gy_isolated", 0) or 0):
+        if not int(row_value(row, "gy_isolated", 0) or 0):
             return False
         request_id = int(row["id"])
-        staging_id = str(self._row_value(row, "gy_target_dir", "") or "")
-        parent_id = str(self._row_value(row, "gy_staging_parent_dir", "") or "0")
-        expected_name = str(self._row_value(row, "gy_staging_name", "") or "")
+        staging_id = str(row_value(row, "gy_target_dir", "") or "")
+        parent_id = str(row_value(row, "gy_staging_parent_dir", "") or "0")
+        expected_name = str(row_value(row, "gy_staging_name", "") or "")
         if not staging_id or not expected_name:
             self._retain_staging_without_organize(
                 row,
@@ -879,10 +880,10 @@ class DownloadTracker:
             if current is None:
                 return {"ok": True, "stats": {"skipped": 1}}
             if (
-                not int(self._row_value(current, "gy_isolated", 0) or 0)
-                or str(self._row_value(current, "gy_target_dir", "") or "") != staging_id
-                or str(self._row_value(current, "gy_staging_parent_dir", "") or "0") != parent_id
-                or str(self._row_value(current, "gy_staging_name", "") or "") != expected_name
+                not int(row_value(current, "gy_isolated", 0) or 0)
+                or str(row_value(current, "gy_target_dir", "") or "") != staging_id
+                or str(row_value(current, "gy_staging_parent_dir", "") or "0") != parent_id
+                or str(row_value(current, "gy_staging_name", "") or "") != expected_name
             ):
                 logger.info(
                     "光鸭下载暂存目录已由其他任务收口 request=%s",
@@ -1023,7 +1024,7 @@ class DownloadTracker:
             download_requests_repo.update_download_request(
                 request_id,
                 gy_target_dir=parent_id, gy_target_name=str(
-                    self._row_value(row, "gy_staging_parent_name", "")
+                    row_value(row, "gy_staging_parent_name", "")
                     or get("OFFLINE_TARGET_DIR_NAME", "离线目录")
                 ),
                 gy_isolated=0, gy_staging_cleanup_status="completed",
@@ -1040,7 +1041,7 @@ class DownloadTracker:
             return True
 
         try:
-            final_name = sanitize_name(str(self._row_value(row, "title", "") or "离线下载"))[:180]
+            final_name = sanitize_name(str(row_value(row, "title", "") or "离线下载"))[:180]
         except ValueError:
             final_name = f"离线下载-{request_id}"
         if has_conflict(final_name, ignore_id=staging_id):
@@ -1122,7 +1123,7 @@ class DownloadTracker:
                 if not already_queued:
                     self._publish_lifecycle(int(row["id"]))
             else:
-                attempts = int(self._row_value(row, "organize_attempts", 0) or 0) + 1
+                attempts = int(row_value(row, "organize_attempts", 0) or 0) + 1
                 permanent = any(marker in error for marker in (
                     "目标目录不能", "无法校验光鸭整理目录", "至少选择一个源目录",
                     "未配置", "无效的光鸭整理",
@@ -1152,7 +1153,7 @@ class DownloadTracker:
     @staticmethod
     def _organize_retry_due(row) -> bool:
         retry_at = str(
-            DownloadTracker._row_value(row, "organize_next_retry_at", "") or ""
+            row_value(row, "organize_next_retry_at", "") or ""
         ).strip()
         if not retry_at:
             return True
@@ -1184,16 +1185,16 @@ class DownloadTracker:
         """领取下载终态投递租约，并更新唯一的下载事务消息。"""
         delivery_status = str(
             updates.get("notification_delivery_status")
-            or DownloadTracker._row_value(row, "notification_delivery_status", "")
+            or row_value(row, "notification_delivery_status", "")
             or ""
         )
         event_status = str(
             updates.get("notification_event_status")
-            or DownloadTracker._row_value(row, "notification_event_status", "")
+            or row_value(row, "notification_event_status", "")
             or updates.get("status")
             or ""
         )
-        request_id = int(DownloadTracker._row_value(row, "id", 0) or 0)
+        request_id = int(row_value(row, "id", 0) or 0)
         if (
             delivery_status not in {"pending", "retry_wait", "sending"}
             or event_status not in {"completed", "failed", "manual_review", "submitting", "submitted", "downloading"}
@@ -1287,16 +1288,9 @@ class DownloadTracker:
         finally:
             close_guangya_client(client)
 
-    @staticmethod
-    def _row_value(row, key: str, default=None):
-        try:
-            return row[key]
-        except (KeyError, IndexError, TypeError):
-            return default
-
     @classmethod
     def _parse_gy_task_ids(cls, row) -> list[str]:
-        raw = cls._row_value(row, "gy_task_ids", "[]")
+        raw = row_value(row, "gy_task_ids", "[]")
         try:
             values = json.loads(str(raw or "[]"))
         except (TypeError, ValueError):
@@ -1314,16 +1308,16 @@ class DownloadTracker:
         index = tasks if isinstance(tasks, _QBTaskIndex) else _QBTaskIndex(tasks)
         from app.modules.download_dispatcher import torrent_identity
 
-        identity = str(cls._row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
+        identity = str(row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
         return index.by_hash.get(identity) if identity else None
 
     @staticmethod
     def _match_gy(row, tasks: list[dict] | _GYTaskIndex):
         index = tasks if isinstance(tasks, _GYTaskIndex) else _GYTaskIndex(tasks)
-        task_id = str(DownloadTracker._row_value(row, "gy_task_id", "") or "")
-        source_value = str(DownloadTracker._row_value(row, "source_value", "") or "")
-        target_dir = str(DownloadTracker._row_value(row, "gy_target_dir", "") or "")
-        isolated = bool(int(DownloadTracker._row_value(row, "gy_isolated", 0) or 0))
+        task_id = str(row_value(row, "gy_task_id", "") or "")
+        source_value = str(row_value(row, "source_value", "") or "")
+        target_dir = str(row_value(row, "gy_target_dir", "") or "")
+        isolated = bool(int(row_value(row, "gy_isolated", 0) or 0))
         if task_id:
             return index.by_id.get(task_id)
         # 隔离目录只能唯一匹配；历史非隔离任务按来源/独有目录核验，不凭标题认领。

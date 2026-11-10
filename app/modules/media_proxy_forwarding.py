@@ -5,17 +5,11 @@ import ipaddress
 import json
 import re
 from typing import Any, Mapping
+from app.database import row_value
 
 
 MAX_TRUSTED_PROXY_CIDRS = 64
 _SPLIT_RE = re.compile(r"[\n,]+")
-
-
-def _row_value(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
-    try:
-        return row[key]
-    except (KeyError, IndexError, TypeError):
-        return default
 
 
 def _raw_values(value: Any) -> list[Any]:
@@ -89,10 +83,10 @@ def media_proxy_forwarding_config(
 ) -> tuple[bool, tuple[str, ...]]:
     """读取实例运行配置；启用时缺少有效可信来源即拒绝启动。"""
     trust_forwarded_headers = bool(
-        int(_row_value(row, "trust_forwarded_headers", 0) or 0)
+        int(row_value(row, "trust_forwarded_headers", 0) or 0)
     )
     trusted_proxy_cidrs = decode_trusted_proxy_cidrs(
-        _row_value(row, "trusted_proxy_cidrs_json", "[]"),
+        row_value(row, "trusted_proxy_cidrs_json", "[]"),
         strict=trust_forwarded_headers,
     )
     if trust_forwarded_headers and not trusted_proxy_cidrs:

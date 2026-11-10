@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import secrets
 import time
@@ -16,6 +15,7 @@ from app.agent.model_catalog import (
     normalize_provider_model_id,
     provider_channel_fingerprint,
 )
+from app.modules.telegram_topic_routing import expiry_is_live
 
 if TYPE_CHECKING:
     from app.agent.kernel.provider_model import ProviderSettings
@@ -42,14 +42,6 @@ def _key(owner: str, session_id: str) -> str:
 def _callback_key(owner: str, token: str) -> str:
     owner_digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()
     return f"telegram_model_callback:v1:{owner_digest}:{token}"
-
-
-def _expiry_is_live(value: Any) -> bool:
-    try:
-        expires_at = float(value or 0)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return math.isfinite(expires_at) and expires_at > time.time()
 
 
 def create_model_callback(
@@ -111,7 +103,7 @@ def resolve_model_callback(
         return None
     if (
         not isinstance(route, dict)
-        or not _expiry_is_live(route.get("expires_at"))
+        or not expiry_is_live(route.get("expires_at"))
         or str(route.get("thread_id") or "") != str(thread_id or "")
         or route.get("channel") != provider_channel_fingerprint(config.get_many((
             "AGENT_LLM_API_URL", "AGENT_LLM_PROTOCOL", "AGENT_LLM_API_KEY",

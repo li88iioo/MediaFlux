@@ -14,6 +14,7 @@ from typing import Any
 from app.clients.guangya import file_extension, GuangYaClient, GuangYaFile
 from app.modules.guangya_rename import GuangYaNamingError
 from app.modules.organize import DEFAULT_ORGANIZE_VIDEO_EXTS
+from app.clients.guangya import file_snapshot
 
 _MAX_SCANNED_ITEMS = 100_000
 _MAX_SCANNED_DIRS = 5_000
@@ -130,17 +131,6 @@ def _is_cleanup_review_candidate(item: GuangYaFile) -> bool:
         return True
     return False
 
-def _snapshot(item: GuangYaFile) -> dict[str, Any]:
-    return {
-        "file_id": item.file_id,
-        "parent_id": item.parent_id,
-        "name": item.name,
-        "is_dir": item.is_dir,
-        "size": max(0, (item.size or 0)),
-        "etag": (item.etag or ""),
-        "updated_at": max(0, (item.updated_at or 0)),
-    }
-
 def _signature(entries: list[dict[str, Any]]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -166,8 +156,8 @@ def _collect_tree_entries(
     while stack:
         current_id = stack.pop()
         node = nodes[current_id]
-        entries.append(_snapshot(node.item))
-        entries.extend(_snapshot(item) for item in node.files)
+        entries.append(file_snapshot(node.item))
+        entries.extend(file_snapshot(item) for item in node.files)
         stack.extend(reversed(node.children))
     return entries
 
@@ -297,11 +287,11 @@ def inspect_cleanup(
     for node_id in residual_ids:
         node = nodes[node_id]
         tree = _collect_tree_entries(node_id, nodes)
-        candidates.append({"file_id": node_id, "root": _snapshot(node.item), "tree": tree,
+        candidates.append({"file_id": node_id, "root": file_snapshot(node.item), "tree": tree,
                            "signature": _signature(tree), "source_id": sources[node.source_index - 1]["id"],
                            "file_count": summaries[node_id].file_count, "total_size": summaries[node_id].total_size,
                            "file_names": [entry["name"] for entry in tree if not entry["is_dir"]]})
-    empties = [{"file_id": node_id, "root": _snapshot(nodes[node_id].item), "depth": nodes[node_id].path.count("/")}
+    empties = [{"file_id": node_id, "root": file_snapshot(nodes[node_id].item), "depth": nodes[node_id].path.count("/")}
                for node_id in empty_ids]
     empties.sort(key=lambda row: (-row["depth"], row["root"]["name"].casefold()))
     return {"sources": sources, "candidates": candidates, "empty_directories": empties,

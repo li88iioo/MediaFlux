@@ -14,6 +14,7 @@ from app.discovery.search import get_discovery_search_service
 from app.logger import get_logger
 from app.routes.discovery_image import encode_poster_token
 from app.services import search_media_servers
+from app.database import row_value
 
 logger = get_logger(__name__)
 
@@ -121,14 +122,6 @@ def _local_media_payload(item: MediaItem, source: dict) -> dict | None:
     }
 
 
-def _row_value(row, key: str, default=""):
-    try:
-        value = row[key]
-    except (KeyError, IndexError, TypeError):
-        value = default
-    return default if value is None else value
-
-
 def _local_section(query: str) -> dict:
     sources = search_media_servers(query, limit=_LOCAL_MEDIA_SOURCE_FETCH_LIMIT)
     items: list[dict] = []
@@ -227,23 +220,23 @@ def _rss_section(query: str) -> dict:
     folded = query.casefold()
     items = []
     for row in rss_repo.list_rss_subscriptions():
-        haystack = " ".join(str(_row_value(row, key)) for key in (
+        haystack = " ".join(str(row_value(row, key, "")) for key in (
             "name", "urls", "parser", "exclude_keywords"
         )).casefold()
         if folded not in haystack:
             continue
-        enabled = bool(_row_value(row, "enabled", 0))
-        parser = str(_row_value(row, "parser", "RSS") or "RSS").upper()
-        action = str(_row_value(row, "action", "subscribe") or "subscribe").lower()
-        method = str(_row_value(row, "download_method", "") or "").lower()
+        enabled = bool(row_value(row, "enabled", 0))
+        parser = str(row_value(row, "parser", "RSS") or "RSS").upper()
+        action = str(row_value(row, "action", "subscribe") or "subscribe").lower()
+        method = str(row_value(row, "download_method", "") or "").lower()
         rules = ["自动下载" if action == "download" else "仅订阅"]
         if method:
             rules.append({"qb": "QB", "guangya": "光鸭"}.get(method, method.upper()))
-        excluded = str(_row_value(row, "exclude_keywords", "") or "").strip()
+        excluded = str(row_value(row, "exclude_keywords", "") or "").strip()
         if excluded:
             rules.append(f"排除 {excluded}")
         items.append({
-            "title": str(_row_value(row, "name", "未命名订阅")),
+            "title": str(row_value(row, "name", "未命名订阅")),
             "subtitle": "已启用" if enabled else "已停用",
             "meta": parser,
             "url": "/rss",
@@ -254,7 +247,7 @@ def _rss_section(query: str) -> dict:
             "enabled": enabled,
             "parser": parser,
             "rules": rules,
-            "last_refreshed_at": str(_row_value(row, "last_refreshed_at", "") or ""),
+            "last_refreshed_at": str(row_value(row, "last_refreshed_at", "") or ""),
         })
         if len(items) >= 8:
             break
@@ -281,10 +274,10 @@ def _downloads_section(query: str) -> dict:
     }
     source_labels = {"qb": "qBittorrent", "guangya": "光鸭", "guangya_share": "光鸭分享转存"}
     for row in rows:
-        source = str(_row_value(row, "source", "download") or "download").lower()
-        status = str(_row_value(row, "status", "submitted") or "submitted").lower()
+        source = str(row_value(row, "source", "download") or "download").lower()
+        status = str(row_value(row, "status", "submitted") or "submitted").lower()
         items.append({
-            "title": str(_row_value(row, "title", "未命名任务") or "未命名任务"),
+            "title": str(row_value(row, "title", "未命名任务") or "未命名任务"),
             "subtitle": source_labels.get(source, source.upper()),
             "meta": status_labels.get(status, status),
             "url": f"/downloads?keyword={quote_plus(query)}",
@@ -294,10 +287,10 @@ def _downloads_section(query: str) -> dict:
             "source_label": source_labels.get(source, source.upper()),
             "status": status,
             "status_label": status_labels.get(status, status),
-            "progress_percent": _progress_percent(_row_value(row, "progress", 0)),
-            "path": str(_row_value(row, "path", "") or ""),
-            "created_at": str(_row_value(row, "created_at", "") or ""),
-            "error": str(_row_value(row, "error", "") or ""),
+            "progress_percent": _progress_percent(row_value(row, "progress", 0)),
+            "path": str(row_value(row, "path", "") or ""),
+            "created_at": str(row_value(row, "created_at", "") or ""),
+            "error": str(row_value(row, "error", "") or ""),
         })
     return _section(
         "downloads", "下载任务", f"/downloads?keyword={quote_plus(query)}", items
@@ -309,12 +302,12 @@ def _logs_section(query: str) -> dict:
     items = []
     for row in rows:
         title = str(
-            _row_value(row, "current_name")
-            or _row_value(row, "original_name")
-            or _row_value(row, "new_path")
+            row_value(row, "current_name", "")
+            or row_value(row, "original_name", "")
+            or row_value(row, "new_path", "")
             or "整理记录"
         )
-        status = str(_row_value(row, "status", "unknown") or "unknown").lower()
+        status = str(row_value(row, "status", "unknown") or "unknown").lower()
         status_label = {
             "success": "成功", "failed": "失败", "running": "处理中",
             "pending": "等待中", "interrupted": "已中断", "rolled_back": "已回滚",
@@ -327,7 +320,7 @@ def _logs_section(query: str) -> dict:
             tone = "success"
         else:
             tone = "neutral"
-        path = str(_row_value(row, "new_path") or _row_value(row, "original_path"))
+        path = str(row_value(row, "new_path", "") or row_value(row, "original_path", ""))
         items.append({
             "title": title,
             "subtitle": path,
@@ -341,7 +334,7 @@ def _logs_section(query: str) -> dict:
             "status_label": status_label,
             "tone": tone,
             "path": path,
-            "created_at": str(_row_value(row, "created_at", "") or ""),
+            "created_at": str(row_value(row, "created_at", "") or ""),
         })
     return _section("logs", "整理日志", f"/logs?q={quote_plus(query)}", items)
 

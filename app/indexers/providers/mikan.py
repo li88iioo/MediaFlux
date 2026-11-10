@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import html
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -190,14 +189,6 @@ class MikanAdapter(DirectResultAdapter):
             torrent_url=torrent_url,
         )
 
-
-    def _base_for_url(self, candidate: str) -> str:
-        safe_url = self._join_known_host(candidate)
-        host = urlsplit(safe_url).hostname
-        for base_url in self._host_bases:
-            if urlsplit(base_url).hostname == host:
-                return base_url
-        raise HttpSecurityError("provider result escaped its registered host")
 
     @staticmethod
     def _extract_size(row) -> tuple[str | None, int | None]:

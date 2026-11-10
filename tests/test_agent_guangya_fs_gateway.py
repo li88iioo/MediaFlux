@@ -368,7 +368,7 @@ class GuangYaFSGatewayTests(unittest.TestCase):
                 plan, payload = self._interrupted_relocation(client, move_first=move_first)
                 progress = guangya_fs_change._read_fs_checkpoints(guangya_fs_change._read(plan['plan_id']))
                 self.assertEqual(progress['operation_items'][0]['completed_actions'], ['move' if move_first else 'rename'])
-                self.assertEqual(progress['stage_sources']['1'], guangya_fs_change._snapshot(cast(GuangYaFile, client.file_info('rename'))))
+                self.assertEqual(progress['stage_sources']['1'], guangya_fs_change.file_snapshot(cast(GuangYaFile, client.file_info('rename'))))
                 with mock.patch.object(client, 'move', wraps=client.move) as moved, mock.patch.object(client, 'rename', wraps=client.rename) as renamed:
                     result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: cast(GuangYaClient, client), lease_generation=3)
                 self.assertFalse(result['partial'])

@@ -56,7 +56,7 @@ def telegram_session_scope(owner: str, thread_id: object) -> str:
     return owner_scope
 
 
-def _expiry_is_live(value: Any) -> bool:
+def expiry_is_live(value: Any) -> bool:
     try:
         expires_at = float(value or 0)
     except (TypeError, ValueError, OverflowError):
@@ -144,7 +144,7 @@ def resolve_session_callback_route(
         return ""
     if (
         not isinstance(route, dict)
-        or not _expiry_is_live(route.get("expires_at"))
+        or not expiry_is_live(route.get("expires_at"))
         or route.get("thread_id") != _thread(thread_id)
     ):
         return ""

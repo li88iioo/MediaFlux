@@ -33,6 +33,7 @@ from app.discovery.registry import COLLECTION_CATEGORIES, list_filter_definition
 from app.logger import get_logger, log_throttled
 from app.modules.media_server_profiles import list_configured_profiles
 from app.sensitive_data import contains_sensitive_credential
+from app.modules.media_library import visible_text
 
 logger = get_logger(__name__)
 
@@ -1715,13 +1716,6 @@ def summarize_media_identity_batch(
     }
 
 
-def _media_presence_text(value: object, *, limit: int) -> str:
-    normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
-    if any(unicodedata.category(char).startswith("C") for char in normalized):
-        return ""
-    return " ".join(normalized.split())[:limit]
-
-
 def normalize_media_presence_items(raw_items: object) -> list[dict[str, str]]:
     """从完整媒体条目校验、提取身份；忽略描述与旧库存状态，批量不受展示条数限制。"""
     if not isinstance(raw_items, list) or not raw_items:
@@ -1737,7 +1731,7 @@ def normalize_media_presence_items(raw_items: object) -> list[dict[str, str]]:
         media_type = str(raw.get("media_type") or "").strip().casefold()
         if media_type not in {"movie", "tv"}:
             raise ValueError("media_type 仅支持 movie 或 tv")
-        title = _media_presence_text(raw.get("title"), limit=240)
+        title = visible_text(raw.get("title"), limit=240)
         if raw.get("title") and not title:
             raise ValueError("提供 title 时必须是可见文本")
         year = str(raw.get("year") or "").strip()

@@ -551,6 +551,14 @@ def _try_acquire_local_media_recovery_lock():
     return recovery_lock
 
 
+def row_value(row, key: str, default=None):
+    """读取 Row/Mapping 字段；缺字段或非容器时返回默认值。"""
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
 def init_db() -> None:
     """初始化首个正式数据库基线，并恢复上次异常中断的运行状态。"""
     from app.repositories import (

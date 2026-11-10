@@ -28,6 +28,7 @@ from app.modules.media_server_profiles import (
     resolve_proxy_instance,
 )
 from app.web import api_error, api_response, require_api_login
+from app.database import row_value
 
 router = APIRouter(prefix="/api/media-proxy")
 _MASK = "********"
@@ -35,13 +36,6 @@ _MASK = "********"
 
 def _manager(request: Request):
     return getattr(request.app.state, "media_proxy_manager", get_media_proxy_manager())
-
-
-def _row_value(row, key: str, default=None):
-    try:
-        return row[key]
-    except (KeyError, IndexError, TypeError):
-        return default
 
 
 def _boolean_value(value, *, default: bool = False) -> bool:
@@ -86,11 +80,11 @@ def _instance_json(row, runtime: dict | None = None) -> dict:
         "listen_port": int(row["listen_port"]),
         "local_root": row["local_root"] or "",
         "trust_forwarded_headers": bool(
-            int(_row_value(row, "trust_forwarded_headers", 0) or 0)
+            int(row_value(row, "trust_forwarded_headers", 0) or 0)
         ),
         "trusted_proxy_cidrs": list(
             decode_trusted_proxy_cidrs(
-                _row_value(row, "trusted_proxy_cidrs_json", "[]")
+                row_value(row, "trusted_proxy_cidrs_json", "[]")
             )
         ),
         "enabled": bool(row["enabled"]),
@@ -147,7 +141,7 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
         local_root = str(root.resolve(strict=False))
 
     existing_trust = bool(
-        int(_row_value(existing, "trust_forwarded_headers", 0) or 0)
+        int(row_value(existing, "trust_forwarded_headers", 0) or 0)
     )
     try:
         trust_forwarded_headers = _boolean_value(
@@ -157,7 +151,7 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
         trusted_proxy_cidrs = normalize_trusted_proxy_cidrs(
             data.get(
                 "trusted_proxy_cidrs",
-                _row_value(existing, "trusted_proxy_cidrs_json", "[]"),
+                row_value(existing, "trusted_proxy_cidrs_json", "[]"),
             )
         )
     except ValueError as exc:

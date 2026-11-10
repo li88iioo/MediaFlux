@@ -79,6 +79,13 @@ class IndexerAdapter(ABC):
         assert last_error is not None
         raise last_error
 
+    def _base_for_url(self, candidate: str) -> str:
+        safe_url = self._join_known_host(candidate)
+        host = urlsplit(safe_url).hostname
+        for base_url in getattr(self, "_host_bases", (self.base_url,)):
+            if urlsplit(base_url).hostname == host:
+                return base_url
+        raise HttpSecurityError("provider result escaped its registered host")
 
     def http_client_for_result(self, stored_result: IndexerItem):
         """外围读取来源链接/种子时，使用该冻结结果所属的客户端。"""

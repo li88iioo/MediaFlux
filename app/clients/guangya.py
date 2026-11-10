@@ -827,6 +827,18 @@ def file_extension(item: GuangYaFile) -> str:
     return match.group(1).lower() if match else ""
 
 
+def file_snapshot(item: GuangYaFile) -> dict[str, Any]:
+    return {
+        "file_id": item.file_id,
+        "parent_id": item.parent_id,
+        "name": item.name,
+        "is_dir": item.is_dir,
+        "size": max(0, (item.size or 0)),
+        "etag": (item.etag or ""),
+        "updated_at": max(0, (item.updated_at or 0)),
+    }
+
+
 def cached_list_dir(
     client: "GuangYaClient",
     cache: dict[str, list[GuangYaFile]],

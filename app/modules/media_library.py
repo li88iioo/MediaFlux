@@ -161,7 +161,7 @@ def resume(server="auto", *, limit=8) -> dict:
     return _watching(server, limit, history=False)
 
 
-def _visible_text(value: object, *, limit: int) -> str:
+def visible_text(value: object, *, limit: int) -> str:
     normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
     if any(unicodedata.category(char).startswith("C") for char in normalized):
         return ""
@@ -175,7 +175,7 @@ def _term_list(value: object, *, name: str, maximum: int) -> list[str]:
         raise MediaLibraryError(f"{name} 必须是最多 {maximum} 项的数组", code="invalid_arguments")
     result: list[str] = []
     for raw in value:
-        term = _visible_text(raw, limit=80)
+        term = visible_text(raw, limit=80)
         alternatives = [item.strip() for item in term.split("|")]
         if not term or any(not item for item in alternatives):
             raise MediaLibraryError(f"{name} 中包含无效匹配词", code="invalid_arguments")

@@ -16,19 +16,13 @@ from urllib.parse import urlsplit, urlunsplit
 from app import config
 from app.modules.media_server_profiles import resolve_proxy_instance
 from app.sensitive_data import contains_sensitive_credential
+from app.database import row_value
 
 logger = logging.getLogger(__name__)
 
 _WILDCARD_OR_LOOPBACK_HOSTS = frozenset(
     {"", "0.0.0.0", "127.0.0.1", "::", "::1", "localhost"}
 )
-
-
-def _row_value(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
-    try:
-        return row[key]
-    except (KeyError, IndexError, TypeError):
-        return default
 
 
 def _origin(parsed) -> tuple[str, str, int] | None:
@@ -159,11 +153,11 @@ def _proxy_base_url(row: Mapping[str, Any], runtime: Mapping[str, Any]) -> str:
     if not bool(runtime.get("running")):
         return ""
     host = _public_mediaflux_host(
-        runtime.get("listen_host", _row_value(row, "listen_host", ""))
+        runtime.get("listen_host", row_value(row, "listen_host", ""))
     )
     if not host:
         return ""
-    raw_port = runtime.get("listen_port", _row_value(row, "listen_port", 0))
+    raw_port = runtime.get("listen_port", row_value(row, "listen_port", 0))
     try:
         port = int(raw_port)
     except (TypeError, ValueError, OverflowError):
@@ -196,9 +190,9 @@ def _matching_proxy_base(*, server_type: str, server_url: str) -> str:
     for raw_row in rows:
         row = dict(raw_row)
         try:
-            if not bool(int(_row_value(row, "enabled", 0) or 0)):
+            if not bool(int(row_value(row, "enabled", 0) or 0)):
                 continue
-            instance_id = int(_row_value(row, "id", 0) or 0)
+            instance_id = int(row_value(row, "id", 0) or 0)
             runtime = runtime_by_id.get(instance_id) or runtime_by_id.get(
                 str(instance_id), {}
             )

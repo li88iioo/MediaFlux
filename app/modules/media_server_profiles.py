@@ -17,6 +17,7 @@ import requests
 
 from app import config
 from app.sensitive_data import contains_sensitive_credential
+from app.database import row_value
 
 if TYPE_CHECKING:
     from app.clients.base import MediaServerClient
@@ -302,17 +303,10 @@ def connection(server: str = "all") -> dict:
             "error": "" if ok else summary}
 
 
-def _row_value(row: Mapping[str, Any] | Row, key: str, default: Any = "") -> Any:
-    try:
-        return row[key]
-    except (KeyError, IndexError, TypeError):
-        return default
-
-
 def resolve_proxy_instance(row: Mapping[str, Any] | Row) -> dict[str, Any]:
     """解析当前上游；配置凭据仅供管理探测，不替代下游用户令牌。"""
     resolved = dict(row)
-    source = str(_row_value(row, "config_source", "custom") or "custom").strip()
+    source = str(row_value(row, "config_source", "custom") or "custom").strip()
     resolved["config_source"] = source
     if source == "custom":
         return resolved

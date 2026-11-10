@@ -48,6 +48,7 @@ from app.repositories.organize_operation_jobs import (
     organize_operation_queue_position,
     sanitize_organize_operation_result,
 )
+from app.clients.guangya import file_snapshot
 
 _PLAN_VERSION = 1
 _PLAN_TTL_SECONDS = 10 * 60
@@ -776,18 +777,6 @@ def _validate_name(value: object) -> str:
     return name
 
 
-def _snapshot(item: GuangYaFile) -> dict[str, Any]:
-    return {
-        "file_id": item.file_id,
-        "parent_id": item.parent_id,
-        "name": item.name,
-        "is_dir": item.is_dir,
-        "size": max(0, (item.size or 0)),
-        "etag": (item.etag or ""),
-        "updated_at": max(0, (item.updated_at or 0)),
-    }
-
-
 def _snapshot_matches(item: GuangYaFile | None, snapshot: dict[str, Any], *, exact_updated_at: bool = False) -> bool:
     if item is None:
         return False
@@ -838,7 +827,7 @@ def _resolve_directory(
         observed = next(iter(identified or matches), None)
     if observed is not None and not _snapshot_matches(target, observed):
         raise GuangYaFSChangeStale("目标目录与已观察对象不一致，请重新读取后再生成计划")
-    return target.file_id, _snapshot(target)
+    return target.file_id, file_snapshot(target)
 
 
 def _list_map(
@@ -1351,7 +1340,7 @@ def build_fs_change_plan(
             raise GuangYaWorkspaceStale("光鸭对象已变化，请重新读取后再生成计划")
         base: dict[str, Any] = {
             "op": op,
-            "source": _snapshot(current),
+            "source": file_snapshot(current),
             "source_parent_path": str(observed.get("parent_path") or "/"),
             "source_path": _full_path(
                 str(observed.get("parent_path") or "/"), current.name
@@ -1373,7 +1362,7 @@ def build_fs_change_plan(
             if not current.is_dir:
                 raise GuangYaFSChangeError("完整目录守卫只能用于目录")
             base["expected_tree"] = raw["expected_tree"]
-            if not _guard_tree_matches(client, _snapshot(current), raw["expected_tree"]):
+            if not _guard_tree_matches(client, file_snapshot(current), raw["expected_tree"]):
                 raise GuangYaFSChangeStale("目录内容已不符合预览，未冻结任何写操作")
         if batch_rule is not None and op == "trash" and current.is_dir:
             base["require_empty"] = True
@@ -1587,7 +1576,7 @@ def _copy_tree_snapshot(client, root_id, cancel_check=None):
                 raise GuangYaFSChangeStale("复制目录清单不一致，请重新读取")
             seen.add(entry.file_id)
             paths.add(relative)
-            rows.append((relative, _snapshot(entry)))
+            rows.append((relative, file_snapshot(entry)))
             if len(rows) > _MAX_COPY_ITEMS:
                 raise GuangYaFSChangeError("复制目录超过完整核验预算，请拆分子目录处理")
             if entry.is_dir:
@@ -1617,7 +1606,7 @@ def _guard_tree_matches(client: GuangYaClient, root: dict, expected: list, cance
             if item.file_id in seen or item.parent_id != identifier:
                 raise GuangYaFSChangeStale("目录清单父子关系或身份发生变化")
             seen.add(item.file_id)
-            rows.append(_snapshot(item))
+            rows.append(file_snapshot(item))
             if len(rows) > _MAX_COPY_ITEMS:
                 raise GuangYaFSChangeError("目录守卫超过完整核验预算")
             if item.is_dir:
@@ -2016,13 +2005,13 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
         raise GuangYaFSCopyPending()
     if verified and observed is not None:
         if action == "copy":
-            return True, _snapshot(observed)
+            return True, file_snapshot(observed)
         source = item["source"]
         expected = {**source, "name": item["new_name"] if action == "rename" else source["name"],
                     "parent_id": source["parent_id"] if action == "rename" else _directory_id(item, created_targets),
                     "updated_at": observed.updated_at}
         if _snapshot_matches(observed, expected):
-            return True, _snapshot(observed)
+            return True, file_snapshot(observed)
     return verified, None
 
 
@@ -2175,7 +2164,7 @@ def _reconcile_fs_operations(client, operations, outcomes, created_targets, stat
                 copied = _verified_copy(client, item, created_targets, copy_task_id, cancel_check,
                                         name=item["source"]["name"])
                 if copied is not None:
-                    snapshot = stage_sources[position] = _snapshot(copied)
+                    snapshot = stage_sources[position] = file_snapshot(copied)
                     outcome.update(status="partial", completed_actions=["copy"])
                     outcome.pop("reason", None)
                     if _can_continue_operation(client, item, outcome, snapshot, created_targets, completed_objects):

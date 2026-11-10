@@ -451,7 +451,7 @@ def _safe_generic_candidate(
     if not isinstance(value, dict):
         return None
     result_id = str(value.get("result_id") or "").strip()
-    title = _safe_text(value.get("title"), 300)
+    title = safe_text(value.get("title"), 300)
     download_state = str(value.get("download_state") or "").strip().lower()
     raw_kinds = value.get("download_kinds")
     download_kinds = (
@@ -478,13 +478,13 @@ def _safe_generic_candidate(
     return {
         "result_id": result_id,
         "title": title,
-        "site_id": _safe_text(value.get("site_id"), 32),
-        "site_name": _safe_text(value.get("site_name"), 80),
-        "size_text": _safe_text(value.get("size_text"), 32),
+        "site_id": safe_text(value.get("site_id"), 32),
+        "site_name": safe_text(value.get("site_name"), 80),
+        "size_text": safe_text(value.get("size_text"), 32),
         "download_state": download_state,
         "download_kinds": download_kinds,
-        "media_title": _safe_text(value.get("media_title"), 160),
-        "episode_label": _safe_text(value.get("episode_label"), 24),
+        "media_title": safe_text(value.get("media_title"), 160),
+        "episode_label": safe_text(value.get("episode_label"), 24),
         "subscription_number": subscription_number,
         "_verification_context": None,
     }
@@ -506,7 +506,7 @@ def _safe_quality_messages(value: Any, *, maximum: int) -> list[str]:
         return []
     result: list[str] = []
     for raw in value[:maximum]:
-        text = _safe_text(raw, 120)
+        text = safe_text(raw, 120)
         if text and text not in result:
             result.append(text)
     return result
@@ -517,7 +517,7 @@ def _safe_quality_tags(value: Any) -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     for key in sorted(_ALLOWED_QUALITY_TAGS):
-        text = _safe_text(value.get(key), 64)
+        text = safe_text(value.get(key), 64)
         if text:
             result[key] = text
     return result
@@ -534,7 +534,7 @@ def _safe_candidate(
     if not isinstance(value, dict):
         return None
     result_id = str(value.get("result_id") or "").strip()
-    title = _safe_text(value.get("title"), 300)
+    title = safe_text(value.get("title"), 300)
     download_state = str(value.get("download_state") or "").strip()
     confidence = str(value.get("confidence") or "").strip()
     match = str(value.get("match") or "").strip()
@@ -556,8 +556,8 @@ def _safe_candidate(
         "episode_label": episode_label,
         "result_id": result_id,
         "title": title,
-        "site_id": _safe_text(value.get("site_id"), 32),
-        "site_name": _safe_text(value.get("site_name"), 80),
+        "site_id": safe_text(value.get("site_id"), 32),
+        "site_name": safe_text(value.get("site_name"), 80),
         "rank": rank,
         "score": score,
         "confidence": confidence,
@@ -622,7 +622,7 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
     search_id = normalize_resource_search_id(value.get("search_id"))
     if not search_id:
         return None
-    search_status = _safe_text(value.get("search_status"), 40)
+    search_status = safe_text(value.get("search_status"), 40)
     raw_candidates = value.get("candidates")
     if (
         search_status != value.get("search_status")
@@ -673,7 +673,7 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
                 raw,
                 season=season,
                 episode=episode,
-                episode_label=_safe_text(raw.get("episode_label"), 24),
+                episode_label=safe_text(raw.get("episode_label"), 24),
                 verification_context=safe_verification,
             )
             if projected is None:
@@ -706,7 +706,7 @@ def _safe_verification_context(
         require_verified_missing and value.get("verified_missing") is not True
     ):
         return None
-    title = _safe_text(value.get("title"), 120)
+    title = safe_text(value.get("title"), 120)
     tmdb_id = str(value.get("tmdb_id") or "").strip()
     as_of = str(value.get("as_of") or "").strip()
     if (
@@ -729,13 +729,13 @@ def _safe_verification_context(
         "episode": episode,
         "as_of": parsed_as_of.isoformat(),
     }
-    library_name = _safe_text(value.get("library_name"), 80)
+    library_name = safe_text(value.get("library_name"), 80)
     if library_name:
         context["library_name"] = library_name
     return context
 
 
-def _safe_text(value: Any, maximum: int) -> str:
+def safe_text(value: Any, maximum: int) -> str:
     if not isinstance(value, str):
         return ""
     text = " ".join(unicodedata.normalize("NFKC", value).split())

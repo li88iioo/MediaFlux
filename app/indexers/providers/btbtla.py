@@ -580,14 +580,6 @@ class BTBtlaAdapter(IndexerAdapter):
             raise HttpInvalidResponse("result detail URL is missing")
 
 
-    def _base_for_url(self, candidate: str) -> str:
-        safe_url = self._join_known_host(candidate)
-        host = urlsplit(safe_url).hostname
-        for base_url in self._host_bases:
-            if urlsplit(base_url).hostname == host:
-                return base_url
-        raise HttpSecurityError("provider result escaped its registered host")
-
     @staticmethod
     def _extract_magnet(body: bytes, *, required: bool = True) -> str:
         text = html.unescape(body.decode("utf-8", errors="replace"))

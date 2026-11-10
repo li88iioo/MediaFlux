@@ -7,7 +7,6 @@ import json
 import re
 import secrets
 import sqlite3
-import unicodedata
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -17,6 +16,7 @@ from typing import Any, Protocol
 from app.modules.media_identity import normalize_episode_verification
 from app.modules.web_secret import get_web_secret
 from app import database as db
+from app.modules.resource_candidates import safe_text
 
 
 def _target_identity(target: dict) -> tuple:
@@ -563,7 +563,7 @@ class SQLiteMissingMediaWorkflowRepository:
     ) -> MissingWorkflowRef | None:
         owner_digest = self._owner_digest(owner)
         safe_verification = _verification_projection(verification)
-        safe_candidate = _safe_text(candidate_title, 300)
+        safe_candidate = safe_text(candidate_title, 300)
         safe_target = (target or "").strip().lower()
         if (
             safe_verification is None
@@ -897,7 +897,7 @@ def verification_from_followup_context(value: Any) -> dict[str, Any] | None:
 def _base_verification_projection(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    title = _safe_text(value.get("title"), 120)
+    title = safe_text(value.get("title"), 120)
     tmdb_id = str(value.get("tmdb_id") or "").strip()
     season = _positive_int(value.get("season"), maximum=100)
     as_of = _safe_date(value.get("as_of"))
@@ -911,7 +911,7 @@ def _base_verification_projection(value: Any) -> dict[str, Any] | None:
     if season is None or not as_of:
         return None
     projection = {"title": title, "tmdb_id": tmdb_id, "season": season, "as_of": as_of}
-    library_name = _safe_text(value.get("library_name"), 80)
+    library_name = safe_text(value.get("library_name"), 80)
     if library_name:
         projection["library_name"] = library_name
     return projection
@@ -984,15 +984,6 @@ def _rollup_state(states: tuple[str, ...]) -> str:
         "cancelled",
     )
     return next((state for state in priority if state in normalized), normalized[0])
-
-
-def _safe_text(value: Any, maximum: int) -> str:
-    if not isinstance(value, str):
-        return ""
-    text = " ".join(unicodedata.normalize("NFKC", value).split())
-    if not text or any(unicodedata.category(char).startswith("C") for char in text):
-        return ""
-    return text[:maximum]
 
 
 def _positive_int(value: Any, *, maximum: int) -> int | None:
