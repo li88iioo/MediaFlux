@@ -88,6 +88,8 @@ from app.modules.scraper import (
 )
 from app.modules.strm import STRM_SUBDIR, sync_strm
 from tests.support import (
+    FakeTelegramBot,
+    fake_telebot_types,
     ReleaseParseFields,
     InitializedWebTestCase,
     IsolatedDatabaseTestCase,
@@ -3280,63 +3282,12 @@ class DashboardCacheTests(unittest.TestCase):
 
 
 class TelegramBotTests(unittest.TestCase):
-    class FakeBot:
-        def __init__(self):
-            self.message_handlers = []
-            self.callback_handlers = []
-            self.replies = []
-            self.commands = []
-
-        def message_handler(self, **filters):
-            def decorate(handler):
-                self.message_handlers.append((filters, handler))
-                return handler
-
-            return decorate
-
-        def callback_query_handler(self, **filters):
-            def decorate(handler):
-                self.callback_handlers.append((filters, handler))
-                return handler
-
-            return decorate
-
-        def reply_to(self, message, text, **kwargs):
-            self.replies.append((message, text, kwargs))
-
-        def set_my_commands(self, commands):
-            self.commands = commands
-
-    @staticmethod
-    def _telebot_types():
-        class Markup:
-            def __init__(self, row_width=2):
-                self.row_width = row_width
-                self.buttons = []
-
-            def add(self, *buttons):
-                self.buttons.extend(buttons)
-
-        return SimpleNamespace(
-            types=SimpleNamespace(
-                InlineKeyboardMarkup=Markup,
-                InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(
-                    text=text,
-                    callback_data=callback_data,
-                ),
-                BotCommand=lambda command, description: SimpleNamespace(
-                    command=command,
-                    description=description,
-                ),
-            )
-        )
-
     def test_handlers_register_commands_without_emoji_and_reject_unauthorized_chat(
         self,
     ):
         from app.bot import handlers
 
-        bot = self.FakeBot()
+        bot = FakeTelegramBot()
         values = {"TG_CHAT_ID": "100"}
         with (
             patch(
@@ -3345,7 +3296,7 @@ class TelegramBotTests(unittest.TestCase):
             ),
             patch("app.bot.handlers.get_bool", return_value=True),
         ):
-            handlers._register_commands(bot, self._telebot_types())
+            handlers._register_commands(bot, fake_telebot_types())
             start = next(
                 handler
                 for filters, handler in bot.message_handlers
@@ -3403,7 +3354,7 @@ class TelegramBotTests(unittest.TestCase):
     def test_disabled_agent_keeps_control_entry_and_classic_commands(self):
         from app.bot import handlers
 
-        bot = self.FakeBot()
+        bot = FakeTelegramBot()
         values = {"TG_CHAT_ID": "100"}
         with (
             patch(
@@ -3412,7 +3363,7 @@ class TelegramBotTests(unittest.TestCase):
             ),
             patch("app.bot.handlers.get_bool", return_value=False),
         ):
-            handlers._register_commands(bot, self._telebot_types())
+            handlers._register_commands(bot, fake_telebot_types())
             start = next(
                 handler
                 for filters, handler in bot.message_handlers
@@ -3460,7 +3411,7 @@ class TelegramBotTests(unittest.TestCase):
     def test_status_command_reports_runtime_state_and_escapes_current_source(self):
         from app.bot import handlers
 
-        bot = self.FakeBot()
+        bot = FakeTelegramBot()
         values = {"TG_CHAT_ID": "100"}
         manager = SimpleNamespace(
             task_status=lambda: {
@@ -3483,7 +3434,7 @@ class TelegramBotTests(unittest.TestCase):
             ),
             patch.object(handlers, "_sync_running", True),
         ):
-            handlers._register_commands(bot, self._telebot_types())
+            handlers._register_commands(bot, fake_telebot_types())
             status = next(
                 handler
                 for filters, handler in bot.message_handlers
@@ -3520,7 +3471,7 @@ class TelegramBotTests(unittest.TestCase):
     def test_invalid_download_inputs_return_feedback_without_creating_request(self):
         from app.bot import handlers
 
-        bot = self.FakeBot()
+        bot = FakeTelegramBot()
         setattr(bot, "send_chat_action", lambda *_args, **_kwargs: None)
         setattr(bot, "get_file", lambda _file_id: SimpleNamespace(file_path="bad.torrent"))
         setattr(bot, "download_file", lambda _path: b"")
@@ -3532,7 +3483,7 @@ class TelegramBotTests(unittest.TestCase):
             ),
             patch("app.modules.download_dispatcher.create_request") as create_request,
         ):
-            handlers._register_commands(bot, self._telebot_types())
+            handlers._register_commands(bot, fake_telebot_types())
             link_handler = [
                 handler
                 for filters, handler in bot.message_handlers
@@ -3575,8 +3526,8 @@ class TelegramBotTests(unittest.TestCase):
     def test_handlers_register_agent_patrol_callback_and_delegate_after_chat_auth(self):
         from app.bot import handlers
 
-        bot = self.FakeBot()
-        telebot = self._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         values = {"TG_CHAT_ID": "100"}
         with patch(
             "app.bot.handlers.get",

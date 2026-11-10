@@ -135,7 +135,7 @@ class DatabaseIsolationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "生产数据库"):
             db.configure_database(db.production_db_path(), test_mode=True)
 
-    def test_agent_search_does_not_boot_web_after_database_test(self):
+    def test_non_web_tests_do_not_boot_web_after_database_test(self):
         # 新进程避免全量收集已导入 app.main 后掩盖跨测试模块的启动副作用。
         probe = textwrap.dedent(
             """
@@ -159,10 +159,7 @@ class DatabaseIsolationTests(unittest.TestCase):
             env_before = config.ENV_FILE.read_bytes()
             assert 'app.main' not in sys.modules
 
-            suite = unittest.defaultTestLoader.loadTestsFromName(
-                'tests.test_agent_discovery_search.AgentDiscoveryIdentityRegressionTests.'
-                'test_tmdb_agent_search_keeps_chinese_query_on_single_http_request'
-            )
+            suite = unittest.defaultTestLoader.loadTestsFromName(sys.argv[1])
             result = unittest.TextTestRunner().run(suite)
             assert result.wasSuccessful()
             assert 'app.main' not in sys.modules
@@ -170,15 +167,25 @@ class DatabaseIsolationTests(unittest.TestCase):
             assert config.ENV_FILE.read_bytes() == env_before
             """
         )
-        completed = subprocess.run(
-            [sys.executable, "-B", "-c", probe],
-            cwd=Path(__file__).resolve().parent.parent,
-            env={**os.environ, "MEDIAFLUX_INITIALIZED": "0"},
-            capture_output=True,
-            text=True,
-            timeout=30,
+        cases = (
+            "tests.test_agent_discovery_search.AgentDiscoveryIdentityRegressionTests."
+            "test_tmdb_agent_search_keeps_chinese_query_on_single_http_request",
+            "tests.test_telegram_group_authorization.TelegramGroupWriteAuthorizationTests."
+            "test_allowlisted_group_member_cannot_use_another_users_download_picker",
+            "tests.test_agent_kernel_telegram_adapter.TelegramAgentExecutorTests."
+            "test_registered_handlers_return_while_queries_run_and_controls_still_dispatch",
         )
-        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        for case in cases:
+            with self.subTest(case=case):
+                completed = subprocess.run(
+                    [sys.executable, "-B", "-c", probe, case],
+                    cwd=Path(__file__).resolve().parent.parent,
+                    env={**os.environ, "MEDIAFLUX_INITIALIZED": "0"},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_environment_test_path_is_only_used_in_test_mode(self):
         production = db.production_db_path()

@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tests.support import FakeTelegramBot, fake_telebot_types
+
 
 class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
     @staticmethod
@@ -51,9 +53,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         self,
     ):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -89,10 +90,9 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
     def test_group_member_cannot_invoke_legacy_write_commands_or_torrent_handler(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         first, second = self._patch_values(self._values())
         with first, second:
             handlers._register_commands(bot, telebot)
@@ -128,10 +128,9 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
     def test_group_member_cannot_submit_plain_download_link(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         first, second = self._patch_values(self._values())
         with (
             first,
@@ -165,10 +164,9 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
     def test_plain_web_page_is_not_created_as_download_request(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         values = {"TG_CHAT_ID": "100", "TG_AGENT_ALLOWED_USER_IDS": ""}
         first, second = self._patch_values(values)
         message = self._message(
@@ -202,9 +200,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
     def test_stale_plain_web_picker_cannot_dispatch_after_routing_fix(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -269,10 +266,9 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
     def test_private_write_callback_keeps_legacy_chat_only_authorization(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         values = {"TG_CHAT_ID": "100", "TG_AGENT_ALLOWED_USER_IDS": ""}
         with (
             patch(
@@ -293,9 +289,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
     def test_group_member_cannot_use_legacy_write_callbacks(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -304,7 +299,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 self.answers.append((args, kwargs))
 
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         first, second = self._patch_values(self._values())
         with (
             first,
@@ -339,9 +334,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             get_telegram_write_confirmation_store,
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -355,7 +349,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         values = {
             "TG_CHAT_ID": "-100",
             "TG_AGENT_ALLOWED_USER_IDS": "9,10",
@@ -433,11 +427,10 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
         reset_telegram_write_confirmation_store_for_tests()
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         values = self._values(group=False)
         first, second = self._patch_values(values)
         persisted = {
@@ -494,9 +487,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -506,7 +498,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         first, second = self._patch_values(self._values(group=False))
         row = {
             "id": 77,
@@ -560,9 +552,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -580,7 +571,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         ]
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         with patch(
             "app.bot.handlers._nsfw_download_sources",
             return_value=sources,
@@ -642,7 +633,6 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             get_telegram_write_confirmation_store,
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
         reset_telegram_write_confirmation_store_for_tests()
         source = {"id": "adult-only", "name": "成人专区"}
@@ -651,7 +641,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             return_value=[source],
         ):
             markup = handlers._download_target_picker_markup(
-                TelegramBotTests._telebot_types(),
+                fake_telebot_types(),
                 request_id=77,
                 chat_id="100",
                 user_id="9",
@@ -673,9 +663,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def answer_callback_query(self, *_args, **_kwargs):
                 return None
 
@@ -683,7 +672,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 return None
 
         reset_telegram_write_confirmation_store_for_tests()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         row = {
             "id": 77,
             "status": "pending",
@@ -735,9 +724,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -751,7 +739,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         with patch(
             "app.bot.handlers._nsfw_download_sources",
             return_value=[],
@@ -804,9 +792,8 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -820,7 +807,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
 
         reset_telegram_write_confirmation_store_for_tests()
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         current_sources = [{"id": "adult-old", "name": "旧来源"}]
         with patch(
             "app.bot.handlers._nsfw_download_sources",

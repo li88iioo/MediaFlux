@@ -15,7 +15,7 @@ from app.agent.kernel.state_types import SessionBusyError
 from app.bot import agent_adapter as adapter
 from app.bot import agent_candidates
 from app.bot.telegram_markdown import telegram_html_text_length
-from tests import test_production
+from tests.support import FakeTelegramBot, fake_telebot_types
 
 
 class Button:
@@ -119,13 +119,13 @@ class RegisteredFakeBot(FakeBot):
 
     message_handlers: list[tuple[dict, Callable[..., object]]]
     callback_handlers: list[tuple[dict, Callable[..., object]]]
-    message_handler = test_production.TelegramBotTests.FakeBot.message_handler
-    callback_query_handler = test_production.TelegramBotTests.FakeBot.callback_query_handler
-    set_my_commands = test_production.TelegramBotTests.FakeBot.set_my_commands
+    message_handler = FakeTelegramBot.message_handler
+    callback_query_handler = FakeTelegramBot.callback_query_handler
+    set_my_commands = FakeTelegramBot.set_my_commands
 
     def __init__(self):
         FakeBot.__init__(self)
-        test_production.TelegramBotTests.FakeBot.__init__(cast(test_production.TelegramBotTests.FakeBot, self))
+        FakeTelegramBot.__init__(cast(FakeTelegramBot, self))
 
 
 class FakeDraftBot(FakeBot):
@@ -1609,7 +1609,7 @@ class TelegramAgentExecutorTests(unittest.TestCase):
         ), patch.object(executor, "submit", side_effect=record_submit), patch.object(
             executor, "_finished", side_effect=record_finished
         ):
-            handlers._register_commands(bot, test_production.TelegramBotTests._telebot_types())
+            handlers._register_commands(bot, fake_telebot_types())
             try:
                 yield bot, executor, submissions, finished
             finally:
@@ -1948,8 +1948,8 @@ class TelegramAgentExecutorTests(unittest.TestCase):
         from app.bot import handlers
 
         executor = adapter.TelegramAgentExecutor(max_queries=2, max_controls=1)
-        bot = test_production.TelegramBotTests.FakeBot()
-        telebot = test_production.TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         release = threading.Event()
         entered = [threading.Event(), threading.Event()]
         returned = [threading.Event(), threading.Event()]

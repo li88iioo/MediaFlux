@@ -6,6 +6,8 @@ from types import CoroutineType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
+from tests.support import FakeTelegramBot, fake_telebot_types
+
 from app.bot.handlers import (
     _dispatch_resource_download,
     _handle_resource_search_callback,
@@ -493,9 +495,8 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
         self,
     ):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -547,9 +548,8 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
 
     def test_group_resource_callback_rechecks_allowlist_before_resolving_action(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        class Bot(TelegramBotTests.FakeBot):
+        class Bot(FakeTelegramBot):
             def __init__(self):
                 super().__init__()
                 self.answers = []
@@ -558,7 +558,7 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
                 self.answers.append((args, kwargs))
 
         bot = Bot()
-        telebot = TelegramBotTests._telebot_types()
+        telebot = fake_telebot_types()
         values = {"TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "8"}
         with (
             patch(
@@ -590,10 +590,9 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
 
     def test_chinese_command_and_media_search_command_are_registered(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": (
@@ -611,10 +610,9 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
 
     def test_media_search_without_query_replies_with_safe_actionable_example(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": (
@@ -643,10 +641,9 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
 
     def test_media_search_fallback_matches_bot_username_suffix(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": (
@@ -678,10 +675,9 @@ class TelegramResourceSearchCommandTests(InitializedWebTestCase):
 
     def test_start_help_groups_commands_and_formats_chinese_alias_consistently(self):
         from app.bot import handlers
-        from tests.test_production import TelegramBotTests
 
-        bot = TelegramBotTests.FakeBot()
-        telebot = TelegramBotTests._telebot_types()
+        bot = FakeTelegramBot()
+        telebot = fake_telebot_types()
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": (

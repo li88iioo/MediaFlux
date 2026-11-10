@@ -20,6 +20,60 @@ from app.modules.scraper import Candidate, MatchResult
 _TEST_DATABASE_LOCK = threading.RLock()
 
 
+class FakeTelegramBot:
+    """记录Telegram注册与回复，不导入Web应用或触发运行态初始化。"""
+
+    def __init__(self):
+        self.message_handlers = []
+        self.callback_handlers = []
+        self.replies = []
+        self.commands = []
+
+    def message_handler(self, **filters):
+        def decorate(handler):
+            self.message_handlers.append((filters, handler))
+            return handler
+
+        return decorate
+
+    def callback_query_handler(self, **filters):
+        def decorate(handler):
+            self.callback_handlers.append((filters, handler))
+            return handler
+
+        return decorate
+
+    def reply_to(self, message, text, **kwargs):
+        self.replies.append((message, text, kwargs))
+
+    def set_my_commands(self, commands):
+        self.commands = commands
+
+
+def fake_telebot_types():
+    class Markup:
+        def __init__(self, row_width=2):
+            self.row_width = row_width
+            self.buttons = []
+
+        def add(self, *buttons):
+            self.buttons.extend(buttons)
+
+    return SimpleNamespace(
+        types=SimpleNamespace(
+            InlineKeyboardMarkup=Markup,
+            InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(
+                text=text,
+                callback_data=callback_data,
+            ),
+            BotCommand=lambda command, description: SimpleNamespace(
+                command=command,
+                description=description,
+            ),
+        )
+    )
+
+
 class FakeJsonResponse:
     """仅提供 JSON HTTP 响应，不依赖 Web 应用或运行时初始化。"""
 
