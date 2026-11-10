@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app import config
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import cached_list_dir, file_extension, GuangYaClient, GuangYaFile
 from app.modules.guangya_rename import (
     GuangYaNamingError,
     preview_explicit_names,
@@ -55,19 +55,6 @@ class _DirectoryNode:
 
 
 
-def _cached_list_dir(
-    client: GuangYaClient,
-    cache: dict[str, list[GuangYaFile]],
-    parent_id: str,
-) -> list[GuangYaFile]:
-    key = parent_id
-    if key not in cache:
-        cache[key] = client.list_dir(key)
-    return cache[key]
-
-
-
-
 def _configured_exts(key: str, defaults: tuple[str, ...]) -> set[str]:
     raw = (config.get(key, "") or "")
     if not raw.strip():
@@ -80,16 +67,8 @@ def _configured_exts(key: str, defaults: tuple[str, ...]) -> set[str]:
     return values or set(defaults)
 
 
-def _extension(item: GuangYaFile) -> str:
-    declared = (item.extension or "").strip().lower().lstrip(".")
-    if declared:
-        return declared
-    match = re.search(r"[.。．]([A-Za-z0-9]{1,10})$", item.name)
-    return match.group(1).lower() if match else ""
-
-
 def _stem(item: GuangYaFile) -> str:
-    ext = _extension(item)
+    ext = file_extension(item)
     if ext:
         match = re.search(rf"[.。．]{re.escape(ext)}$", item.name, re.IGNORECASE)
         if match:
@@ -173,7 +152,7 @@ def _canonical_stem(
 
 def _companion_suffix(item: GuangYaFile) -> str:
     stem = _stem(item)
-    ext = _extension(item)
+    ext = file_extension(item)
     if ext in SUBTITLE_EXTS:
         match = _SUBTITLE_SUFFIX_RE.search(stem)
         return match.group(1).replace(" ", ".") if match else ""
@@ -228,7 +207,7 @@ def preview_media_hygiene(
             scanned_dirs += 1
             if scanned_dirs > _MAX_SCANNED_DIRS:
                 raise GuangYaNamingError("媒体名称清理目录数量超过安全上限")
-            items = _cached_list_dir(client, cache, directory_id)
+            items = cached_list_dir(client, cache, directory_id)
             for child in items:
                 scanned_items += 1
                 if scanned_items > _MAX_SCANNED_ITEMS:
@@ -259,7 +238,7 @@ def preview_media_hygiene(
 
         for directory_id, node in nodes.items():
             for item in node.files:
-                if _extension(item) not in video_exts:
+                if file_extension(item) not in video_exts:
                     continue
                 video_counts[directory_id] += 1
                 identifier = extract_nsfw_identifier(item.name, strip_domains)
@@ -276,7 +255,7 @@ def preview_media_hygiene(
                     cache=canonical_cache,
                 )
                 metadata_enriched += int(enriched)
-                target_name = f"{canonical}.{_extension(item)}"
+                target_name = f"{canonical}.{file_extension(item)}"
                 video_rows[directory_id].append((item, code, target_name))
                 if _contains_domain(_stem(item), strip_domains):
                     if target_name != item.name:
@@ -293,7 +272,7 @@ def preview_media_hygiene(
             canonical_base = video_target.rsplit(".", 1)[0]
             node = nodes[directory_id]
             for item in node.files:
-                ext = _extension(item)
+                ext = file_extension(item)
                 if item.file_id == video.file_id or ext not in metadata_exts:
                     continue
                 identifier = extract_nsfw_identifier(item.name, strip_domains)

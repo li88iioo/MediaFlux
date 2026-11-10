@@ -2202,7 +2202,7 @@ def local_source_payload(source, targets) -> dict:
     }
 
 
-def _source_text(payload: dict, key: str, *, required: bool = False, max_length: int = 2048) -> str:
+def payload_text(payload: dict, key: str, *, required: bool = False, max_length: int = 2048) -> str:
     value = payload.get(key, "")
     if value is None:
         value = ""
@@ -2218,7 +2218,7 @@ def _source_text(payload: dict, key: str, *, required: bool = False, max_length:
     return text
 
 
-def _source_boolean(payload: dict, key: str, default: bool) -> bool:
+def payload_boolean(payload: dict, key: str, default: bool) -> bool:
     value = payload.get(key, default)
     if not isinstance(value, bool):
         raise ValueError(f"{key} 必须是布尔值")
@@ -2236,15 +2236,15 @@ def _source_targets(payload: dict) -> list[dict[str, str]] | None:
     for item in targets:
         if not isinstance(item, dict):
             raise ValueError("目标配置格式错误")
-        category = _source_text(item, "category", required=True, max_length=32).lower()
+        category = payload_text(item, "category", required=True, max_length=32).lower()
         if category not in LOCAL_MEDIA_CATEGORIES or category in submitted:
             raise ValueError("目标分类无效或重复")
         submitted.add(category)
-        path = _source_text(item, "path", required=True)
-        provider = _source_text(item, "provider", max_length=32).lower()
-        library_id = _source_text(item, "library_id", max_length=256)
-        library_name = _source_text(item, "library_name", max_length=128)
-        server_path = _source_text(item, "server_path", max_length=2048)
+        path = payload_text(item, "path", required=True)
+        provider = payload_text(item, "provider", max_length=32).lower()
+        library_id = payload_text(item, "library_id", max_length=256)
+        library_name = payload_text(item, "library_name", max_length=128)
+        server_path = payload_text(item, "server_path", max_length=2048)
         if provider not in {"", "jellyfin", "emby"}:
             raise ValueError("目标媒体服务器类型无效")
         if provider and not library_name:
@@ -2340,15 +2340,15 @@ def _local_source_plan(operation: str, source_id: int | None, changes: dict) -> 
         return {"snapshot": snapshot, "payload": {}}
     targets = _source_targets(changes)
     effective_targets = targets if targets is not None else snapshot.get("targets", [])
-    local_root = _source_text(changes, "local_root", required=True) if "local_root" in changes else str(current.get("local_root") or "")
+    local_root = payload_text(changes, "local_root", required=True) if "local_root" in changes else str(current.get("local_root") or "")
     local_root, normalized_targets = _source_paths(local_root, effective_targets)
-    payload = {"name": _source_text(changes, "name", required=True, max_length=128) if "name" in changes else current.get("name", ""),
+    payload = {"name": payload_text(changes, "name", required=True, max_length=128) if "name" in changes else current.get("name", ""),
                "local_root": local_root,
-               "qb_profile": _source_text(changes, "qb_profile", max_length=64) if "qb_profile" in changes else current.get("qb_profile", "configured:qb"),
-               "qb_path_prefix": _source_text(changes, "qb_path_prefix") if "qb_path_prefix" in changes else current.get("qb_path_prefix", ""),
-               "enabled": _source_boolean(changes, "enabled", bool(current.get("enabled", True))),
-               "media_type": _source_text(changes, "media_type", max_length=16) if "media_type" in changes else current.get("media_type", "auto"),
-               "mode": _source_text(changes, "mode", max_length=16) if "mode" in changes else current.get("mode", "move"),
+               "qb_profile": payload_text(changes, "qb_profile", max_length=64) if "qb_profile" in changes else current.get("qb_profile", "configured:qb"),
+               "qb_path_prefix": payload_text(changes, "qb_path_prefix") if "qb_path_prefix" in changes else current.get("qb_path_prefix", ""),
+               "enabled": payload_boolean(changes, "enabled", bool(current.get("enabled", True))),
+               "media_type": payload_text(changes, "media_type", max_length=16) if "media_type" in changes else current.get("media_type", "auto"),
+               "mode": payload_text(changes, "mode", max_length=16) if "mode" in changes else current.get("mode", "move"),
                "targets": normalized_targets if targets is not None or operation == "create" else None}
     if operation == "create":
         payload["qb_profile"] = payload["qb_profile"] or "configured:qb"

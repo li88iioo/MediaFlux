@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from collections import Counter, deque
 from typing import Any
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import cached_list_dir, GuangYaClient, GuangYaFile
 
 _MAX_TARGETS = 32
 _MAX_RENAMES = 10_000
@@ -60,13 +60,13 @@ def remove_legacy_bitrate(name: str) -> str:
     updated = _COMPACT_BITRATE_RE.sub("", updated)
     return updated
 
-def _extension(name: str) -> str:
+def file_extension(name: str) -> str:
     match = re.search(r"[.。．]([A-Za-z0-9]{1,10})$", (name or ""))
     return match.group(1).casefold() if match else ""
 
 def _item_extension(item: GuangYaFile) -> str:
     declared = (item.extension or "").strip().lstrip(".").casefold()
-    return declared or _extension(item.name)
+    return declared or file_extension(item.name)
 
 def _transformed_name(
     item: GuangYaFile,
@@ -83,20 +83,9 @@ def _transformed_name(
         candidate = _validate_name(item.name.replace(find_text, replace_text))
     else:
         raise GuangYaNamingError("不支持的重命名方式")
-    if not item.is_dir and _extension(candidate) != _item_extension(item):
+    if not item.is_dir and file_extension(candidate) != _item_extension(item):
         raise GuangYaNamingError("批量重命名不允许修改文件扩展名")
     return candidate
-
-def _cached_list_dir(
-    client: GuangYaClient,
-    cache: dict[str, list[GuangYaFile]],
-    parent_id: str,
-) -> list[GuangYaFile]:
-    key = parent_id
-    if key not in cache:
-        cache[key] = client.list_dir(key)
-    return cache[key]
-
 
 def _entry(item: GuangYaFile, *, parent_path: str, new_name: str) -> dict[str, Any]:
     old_path = (
@@ -119,7 +108,7 @@ def _entry(item: GuangYaFile, *, parent_path: str, new_name: str) -> dict[str, A
         "is_dir": item.is_dir,
         "size": max(0, (item.size or 0)),
         "etag": (item.etag or ""),
-        "extension": (item.extension or _extension(item.name)).casefold(),
+        "extension": (item.extension or file_extension(item.name)).casefold(),
         "updated_at": max(0, item.updated_at or 0),
     }
 
@@ -154,7 +143,7 @@ def _finalize_rename_plan(
         if len(group) > 1:
             reason = "多个文件会映射到同一目标名称"
         else:
-            siblings = _cached_list_dir(
+            siblings = cached_list_dir(
                 client,
                 cache,
                 str(first["parent_id"]),
@@ -236,7 +225,7 @@ def preview_explicit_names(
         if not file_id or file_id in seen_ids:
             raise GuangYaNamingError("显式重命名计划包含重复或无效对象")
         candidate = _validate_name(proposed_name)
-        if not item.is_dir and _extension(candidate) != _item_extension(item):
+        if not item.is_dir and file_extension(candidate) != _item_extension(item):
             raise GuangYaNamingError("媒体名称清理不允许修改文件扩展名")
         if candidate == item.name:
             continue
@@ -329,7 +318,7 @@ def preview_rename(
             scanned_dirs += 1
             if scanned_dirs > _MAX_SCANNED_DIRS:
                 raise GuangYaNamingError("递归目录数量超过安全上限")
-            items = _cached_list_dir(client, cache, directory_id)
+            items = cached_list_dir(client, cache, directory_id)
             for child in items:
                 scanned_items += 1
                 if scanned_items > _MAX_SCANNED_ITEMS:

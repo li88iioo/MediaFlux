@@ -29,6 +29,8 @@ from app.modules.local_media_scheduler import get_local_media_scheduler
 from app.modules.local_media_service import (
     LocalMediaServiceError,
     get_local_media_service,
+    payload_boolean,
+    payload_text,
 )
 from app.modules.local_path_mapping import (
     LEGACY_SOURCE_PATH_ERROR,
@@ -42,22 +44,6 @@ from app.web import api_error, require_api_login
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/local-media")
 _OWNER = "admin"
-
-
-def _text(payload: dict, key: str, *, required: bool = False, max_length: int = 2048) -> str:
-    value = payload.get(key, "")
-    if value is None:
-        value = ""
-    if isinstance(value, (dict, list, tuple, bool)):
-        raise ValueError(f"{key} 必须是字符串")
-    text = str(value).strip()
-    if "\x00" in text:
-        raise ValueError(f"{key} 包含非法字符")
-    if required and not text:
-        raise ValueError(f"{key} 不能为空")
-    if len(text) > max_length:
-        raise ValueError(f"{key} 过长")
-    return text
 
 
 def _integer_value(value: Any, error: str) -> int:
@@ -74,13 +60,6 @@ def _integer(payload: dict, key: str, default: int, minimum: int, maximum: int) 
     if not minimum <= number <= maximum:
         raise ValueError(f"{key} 超出允许范围")
     return number
-
-
-def _boolean(payload: dict, key: str, default: bool) -> bool:
-    value = payload.get(key, default)
-    if not isinstance(value, bool):
-        raise ValueError(f"{key} 必须是布尔值")
-    return value
 
 
 def _optional_integer(
@@ -325,7 +304,7 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
             source = local_media_repo.get_local_media_source(source_id, owner=_OWNER)
             if source is None:
                 return api_error("本地媒体来源不存在", 404)
-            selected_path = _text({"path": path}, "path", max_length=4096) or source.local_root
+            selected_path = payload_text({"path": path}, "path", max_length=4096) or source.local_root
             candidates, error, current = discover_local_media_directory_candidates(
                 source, selected_path,
             )
@@ -397,7 +376,7 @@ def delete_media_item(request: Request, data: dict | None = Body(default=None)):
         destination = get_local_media_service().move_media_item_to_trash(
             _OWNER,
             source_id,
-            _text(payload, "path", required=True),
+            payload_text(payload, "path", required=True),
             identity,
         )
         logger.info("本地媒体条目已移入回收区 source_id=%s name=%s", source_id, destination.name)
@@ -443,7 +422,7 @@ def clear_tasks(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
     payload = data or {}
     try:
-        if _text(payload, "confirm", max_length=16) != "CLEAR":
+        if payload_text(payload, "confirm", max_length=16) != "CLEAR":
             raise ValueError("清除本地整理日志需要确认")
         raw_ids = payload.get("ids")
         if not isinstance(raw_ids, list) or not raw_ids:
@@ -486,7 +465,7 @@ def inspect_path(request: Request, data: dict | None = Body(default=None)):
         source = local_media_repo.get_local_media_source(source_id, owner=_OWNER)
         if source is None:
             return api_error("本地媒体来源不存在", 404)
-        path = _text(payload, "path") or source.local_root
+        path = payload_text(payload, "path") or source.local_root
         return get_local_media_service().inspect_source(_OWNER, source_id, path)
     except Exception as exc:
         return _safe_error(exc)
@@ -497,14 +476,14 @@ def search_media(request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
     payload = data or {}
     try:
-        query = _text(payload, "query", required=True, max_length=256)
-        media_type = _text(payload, "media_type", max_length=16) or "auto"
+        query = payload_text(payload, "query", required=True, max_length=256)
+        media_type = payload_text(payload, "media_type", max_length=16) or "auto"
         if media_type not in {"auto", "movie", "tv"}:
             raise ValueError("媒体类型必须是 auto、movie 或 tv")
-        inspection_id = _text(payload, "inspection_id", max_length=64)
+        inspection_id = payload_text(payload, "inspection_id", max_length=64)
         return {"candidates": get_local_media_service().search(
             query,
-            _text(payload, "year", max_length=4),
+            payload_text(payload, "year", max_length=4),
             media_type,
             owner=_OWNER,
             inspection_id=inspection_id,
@@ -519,8 +498,8 @@ def preview_media(request: Request, data: dict | None = Body(default=None)):
     payload = data or {}
     try:
         result = get_local_media_service().preview(
-            _OWNER, _text(payload, "inspection_id", required=True, max_length=64),
-            _text(payload, "tmdb_id", max_length=32), _text(payload, "media_type", max_length=16),
+            _OWNER, payload_text(payload, "inspection_id", required=True, max_length=64),
+            payload_text(payload, "tmdb_id", max_length=32), payload_text(payload, "media_type", max_length=16),
             payload.get("overrides") if isinstance(payload.get("overrides"), dict) else None,
             season_override=_optional_integer(
                 payload, "season", minimum=0, maximum=99, label="季数",
@@ -528,7 +507,7 @@ def preview_media(request: Request, data: dict | None = Body(default=None)):
             episode_override=_optional_integer(
                 payload, "episode", minimum=1, maximum=999, label="集数",
             ),
-            numbering_mode=_text(payload, "numbering_mode", max_length=32) or "auto",
+            numbering_mode=payload_text(payload, "numbering_mode", max_length=32) or "auto",
         )
         return {key: value for key, value in result.items() if not key.startswith("_")}
     except Exception as exc:
@@ -542,9 +521,9 @@ def external_hints(request: Request, data: dict | None = Body(default=None)):
     try:
         return get_local_media_service().external_hints(
             _OWNER,
-            _text(payload, "inspection_id", required=True, max_length=64),
-            _text(payload, "query", required=True, max_length=256),
-            _text(payload, "media_type", max_length=16) or "auto",
+            payload_text(payload, "inspection_id", required=True, max_length=64),
+            payload_text(payload, "query", required=True, max_length=256),
+            payload_text(payload, "media_type", max_length=16) or "auto",
         )
     except Exception as exc:
         return _safe_error(exc)
@@ -557,12 +536,12 @@ def execute_media(request: Request, data: dict | None = Body(default=None)):
     qb_client = None
     notification_task_id: int | None = None
     try:
-        if not _text(payload, "preview_digest", max_length=144):
+        if not payload_text(payload, "preview_digest", max_length=144):
             raise LocalMediaServiceError("缺少预览确认，请重新检查并生成预览后确认")
         service = get_local_media_service()
         task_id = service.create_manual_task(
-            _OWNER, _text(payload, "inspection_id", required=True, max_length=64),
-            preview_digest=_text(payload, "preview_digest", max_length=144),
+            _OWNER, payload_text(payload, "inspection_id", required=True, max_length=64),
+            preview_digest=payload_text(payload, "preview_digest", max_length=144),
         )
         notification_task_id = task_id
         if not local_media_repo.claim_local_media_task(task_id, expected="waiting_stable", owner=_OWNER):
@@ -608,9 +587,9 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
     try:
         retry_fields: dict[str, Any] = {}
         if "tmdb_id" in payload:
-            retry_fields["tmdb_id"] = _text(payload, "tmdb_id", max_length=32)
+            retry_fields["tmdb_id"] = payload_text(payload, "tmdb_id", max_length=32)
         if "media_type" in payload:
-            retry_fields["media_type"] = _text(payload, "media_type", max_length=16)
+            retry_fields["media_type"] = payload_text(payload, "media_type", max_length=16)
         if "season" in payload:
             retry_fields["season_override"] = _optional_integer(
                 payload, "season", minimum=0, maximum=99, label="季数",
@@ -621,9 +600,9 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
             )
         if "numbering_mode" in payload:
             retry_fields["numbering_mode"] = (
-                _text(payload, "numbering_mode", max_length=32) or "auto"
+                payload_text(payload, "numbering_mode", max_length=32) or "auto"
             )
-        confirm_interrupted_write = _boolean(
+        confirm_interrupted_write = payload_boolean(
             payload, "confirm_interrupted_write", False,
         )
         task = local_media_repo.get_local_media_task(task_id, owner=_OWNER)

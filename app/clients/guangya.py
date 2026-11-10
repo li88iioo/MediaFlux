@@ -818,6 +818,25 @@ class GuangYaFile:
     extension: str = ""
 
 
+def file_extension(item: GuangYaFile) -> str:
+    """优先使用云端声明的扩展名，缺失时从文件名推断。"""
+    declared = (item.extension or "").strip().lower().lstrip(".")
+    if declared:
+        return declared
+    match = re.search(r"[.。．]([A-Za-z0-9]{1,10})$", item.name)
+    return match.group(1).lower() if match else ""
+
+
+def cached_list_dir(
+    client: "GuangYaClient",
+    cache: dict[str, list[GuangYaFile]],
+    parent_id: str,
+) -> list[GuangYaFile]:
+    if parent_id not in cache:
+        cache[parent_id] = client.list_dir(parent_id)
+    return cache[parent_id]
+
+
 def _to_int(value) -> int:
     try:
         return int(float(value or 0))

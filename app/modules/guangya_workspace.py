@@ -1,11 +1,10 @@
 """光鸭真实身份读取、完整分页与路径边界；不保存目录观察或会话状态。"""
 from __future__ import annotations
-import re
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from typing import Any
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import file_extension, GuangYaClient, GuangYaFile
 from app.modules.organize import DEFAULT_ORGANIZE_METADATA_EXTS, DEFAULT_ORGANIZE_VIDEO_EXTS
 from app.modules.organize_postprocess import SUBTITLE_EXTS
 
@@ -154,18 +153,10 @@ def resolve_workspace_path(client: GuangYaClient, path: object) -> GuangYaFile:
     return target
 
 
-def _extension(item: GuangYaFile) -> str:
-    declared = (item.extension or "").strip().lower().lstrip(".")
-    if declared:
-        return declared
-    match = re.search(r"[.。．]([A-Za-z0-9]{1,10})$", item.name)
-    return match.group(1).lower() if match else ""
-
-
 def _media_kind(item: GuangYaFile) -> str:
     if item.is_dir:
         return "directory"
-    ext = _extension(item)
+    ext = file_extension(item)
     if ext in DEFAULT_ORGANIZE_VIDEO_EXTS:
         return "video"
     if ext in SUBTITLE_EXTS:
@@ -188,7 +179,7 @@ def _snapshot(
         "size": max(0, (item.size or 0)),
         "etag": (item.etag or ""),
         "updated_at": max(0, (item.updated_at or 0)),
-        "extension": _extension(item),
+        "extension": file_extension(item),
         "media_kind": _media_kind(item),
         "parent_path": parent_path,
         "relative_parent": relative_parent,

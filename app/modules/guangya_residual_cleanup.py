@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import file_extension, GuangYaClient, GuangYaFile
 from app.modules.guangya_rename import GuangYaNamingError
 from app.modules.organize import DEFAULT_ORGANIZE_VIDEO_EXTS
 
@@ -84,13 +84,6 @@ class _TreeSummary:
             and self.total_size <= _MAX_RESIDUAL_BYTES
         )
 
-def _extension(item: GuangYaFile) -> str:
-    declared = (item.extension or "").strip().lower().lstrip(".")
-    if declared:
-        return declared
-    match = re.search(r"[.。．]([A-Za-z0-9]{1,10})$", item.name)
-    return match.group(1).lower() if match else ""
-
 def _safe_public_name(value: object, fallback: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = _FORBIDDEN_NAME_RE.sub(" ", text)
@@ -124,7 +117,7 @@ def _is_cleanup_review_candidate(item: GuangYaFile) -> bool:
     lowered = name.casefold()
     if lowered in _SYSTEM_JUNK:
         return True
-    ext = _extension(item)
+    ext = file_extension(item)
     stem = re.sub(r"[.。．][^.。．]+$", "", name).strip().casefold()
     if ext in _LINK_EXTS:
         return True
@@ -256,7 +249,7 @@ def inspect_cleanup(
         for item in node.files:
             summary.file_count += 1
             summary.total_size += max(0, (item.size or 0))
-            if _extension(item) in video_exts:
+            if file_extension(item) in video_exts:
                 summary.has_video = True
             elif not _is_cleanup_review_candidate(item):
                 summary.has_unsafe = True
