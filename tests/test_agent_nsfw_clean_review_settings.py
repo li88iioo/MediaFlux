@@ -124,7 +124,10 @@ class NsfwCleanReviewSettingsTests(unittest.TestCase):
             self.assertIn(text, option)
         self.assertIn('aria-describedby="nsfwCleanReviewDescription nsfwCleanReviewDependency"', option)
         self.assertIn('aria-label="允许光鸭 NSFW 清洗入库"', option)
-        self.assertIn(f"{KEY}:'0'", script)
+        from app.routes.api import _UI_DEFAULTS
+
+        self.assertEqual(_UI_DEFAULTS[KEY], "0")
+        self.assertNotIn(f"{KEY}:'1'", script)
         self.assertNotIn(" hidden", option)
         self.assertLess(metadata.index(f'data-key="{PARENT_KEY}"'), metadata.index(f'data-key="{KEY}"'))
         self.assertEqual(html.count(f'data-key="{KEY}"'), 1)

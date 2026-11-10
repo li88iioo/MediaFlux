@@ -167,6 +167,16 @@ class DiscoveryConfigTests(unittest.TestCase):
         self.assertIn("不允许", self._payload(response)["error"])
         persist.assert_not_called()
 
+    def test_unconfigured_fields_are_returned_with_backend_defaults(self):
+        """设置页只按后端回填未配置字段的默认值，不再自带一份副本。"""
+        with patch("app.routes.api.config.all_items", return_value={}):
+            response = get_config(self.request)
+        self.assertEqual(response["DISCOVERY_CACHE_TTL_SECONDS"], "21600")
+        self.assertEqual(response["DISCOVERY_DOUBAN_ENABLED"], "1")
+        self.assertEqual(response["AGENT_ENABLED"], "0")
+        with patch("app.routes.api.config.all_items", return_value={"DISCOVERY_CACHE_TTL_SECONDS": "900"}):
+            self.assertEqual(get_config(self.request)["DISCOVERY_CACHE_TTL_SECONDS"], "900")
+
     def test_retired_indexer_settings_are_hidden_and_no_longer_writable(self):
         retired = {"INDEXER_1LOU_GOOGLE_ENABLED": "1", "INDEXER_1LOU_MIN_INTERVAL_SECONDS": "5"}
         with patch("app.routes.api.config.all_items", return_value={**retired, "INDEXER_ENABLED_SITES": "nyaa,1lou"}):

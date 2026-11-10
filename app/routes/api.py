@@ -16,6 +16,7 @@ from app.clients.douban_authenticated import (
     normalize_dbcl2,
 )
 from app.defaults import (
+    DEFAULT_BOOL_CONFIG_VALUES,
     DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT,
     DEFAULT_AGENT_EPISODE_RESEARCH_ENABLED,
     DEFAULT_AGENT_LLM_ENABLED,
@@ -37,6 +38,7 @@ from app.modules.feature_config import (
     AGENT_EPISODE_RESEARCH_KEYS,
     AI_RECOGNITION_KEYS,
     BOOLEAN_VALUES,
+    FEATURES,
     MEDIA_SERVER_PROFILE_KEYS,
     NSFW_ORGANIZE_KEYS,
     ORGANIZE_TAVILY_KEYS,
@@ -967,6 +969,18 @@ def dashboard_data(request: Request, refresh: bool = False):
     ]
 
 
+def _ui_defaults() -> dict[str, str]:
+    """页面字段的唯一默认值表；后加入的来源优先级更高且不得与先前来源冲突。"""
+    defaults = {key: "1" if value else "0" for key, value in DEFAULT_BOOL_CONFIG_VALUES.items()}
+    defaults.update({key: "1" if default else "0" for key, _, default in FEATURES.values()})
+    defaults.update({key: str(policy.default) for key, policy in POLICY_BY_KEY.items()})
+    defaults.update(_AGENT_SETTINGS_DEFAULTS)
+    return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
+
+
+_UI_DEFAULTS = _ui_defaults()
+
+
 @router.get("/config")
 def get_config(request: Request):
     require_api_login(request)
@@ -986,31 +1000,10 @@ def get_config(request: Request):
         managed_field_set.add("INDEXER_ENABLED_SITES")
     managed_fields = sorted(managed_field_set)
     managed_field_set = set(managed_fields)
-    # 新授权独立默认关闭，不能继承旧的主动复核权限。
-    items.setdefault(
-        "AGENT_NSFW_CLEAN_REVIEW_ENABLED",
-        _AGENT_SETTINGS_DEFAULTS["AGENT_NSFW_CLEAN_REVIEW_ENABLED"],
-    )
-    # 季集研究是新的独立授权，旧主动复核开关不能隐式开启。
-    for key in AGENT_EPISODE_RESEARCH_KEYS:
-        items.setdefault(key, _AGENT_SETTINGS_DEFAULTS[key])
-    # 旧配置缺少该展示偏好时，统一按流式显示开启处理。
-    items.setdefault(
-        "AGENT_STREAM_DISPLAY_ENABLED",
-        _AGENT_SETTINGS_DEFAULTS["AGENT_STREAM_DISPLAY_ENABLED"],
-    )
-    items.setdefault(
-        "AGENT_LLM_GENERATION_PROFILES",
-        _AGENT_SETTINGS_DEFAULTS["AGENT_LLM_GENERATION_PROFILES"],
-    )
-    items.setdefault(
-        "AGENT_LLM_BUDGET_PROFILES",
-        _AGENT_SETTINGS_DEFAULTS["AGENT_LLM_BUDGET_PROFILES"],
-    )
-    items.setdefault(
-        "AGENT_LLM_REASONING_EFFORT",
-        _AGENT_SETTINGS_DEFAULTS["AGENT_LLM_REASONING_EFFORT"],
-    )
+    # 未配置的页面字段以后端权威默认值展示；新授权（成人复核、季集研究等）
+    # 独立默认关闭，不继承旧开关。
+    for key, default in _UI_DEFAULTS.items():
+        items.setdefault(key, default)
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
     retention_key = "DOWNLOAD_TORRENT_RETENTION_DAYS"

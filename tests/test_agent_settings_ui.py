@@ -72,8 +72,10 @@ class AgentSettingsUiTests(unittest.TestCase):
             self.assertFalse(is_agent_enabled())
         get_bool.assert_called_once_with("AGENT_ENABLED", False)
 
+        from app.routes.api import _UI_DEFAULTS
+
+        self.assertEqual(_UI_DEFAULTS["AGENT_ENABLED"], "0")
         html = (Path("app/templates/settings.html").read_text(encoding="utf-8") + Path("app/static/js/settings.js").read_text(encoding="utf-8"))
-        self.assertIn("AGENT_ENABLED:'0'", html)
         self.assertNotIn("AGENT_ENABLED:'1'", html)
 
     def test_agent_stream_display_defaults_on_for_legacy_config(self):
@@ -126,7 +128,9 @@ class AgentSettingsUiTests(unittest.TestCase):
             '<small title="关闭后只隐藏 Web 与 Telegram 的模型增量文本；任务仍继续，进度、最终答案和确认不受影响。保存后下一轮生效。">Web / Telegram · 下一轮生效</small>',
             html,
         )
-        self.assertIn("AGENT_STREAM_DISPLAY_ENABLED:'1'", html)
+        from app.routes.api import _UI_DEFAULTS
+
+        self.assertEqual(_UI_DEFAULTS["AGENT_STREAM_DISPLAY_ENABLED"], "1")
         self.assertIn(
             "const streamDisplayToggle=form.querySelector('[data-key=\"AGENT_STREAM_DISPLAY_ENABLED\"]')",
             html,
@@ -150,17 +154,17 @@ class AgentSettingsUiTests(unittest.TestCase):
             '<option value="anthropic_messages">Anthropic Messages API</option>',
         ):
             self.assertIn(protocol, html)
-        for default in (
-            "TAVILY_CACHE_TTL_SECONDS:'900'",
-            "TAVILY_TIMEOUT_SECONDS:'10'",
-            "AGENT_LIBRARY_PATROL_ENABLED:'0'",
-            "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED:'1'",
-            "AGENT_RECOGNITION_REVIEW_ENABLED:'0'",
-            "AGENT_NSFW_CLEAN_REVIEW_ENABLED:'0'",
-            "AGENT_LIBRARY_PATROL_INTERVAL_HOURS:'24'",
-            "AGENT_LIBRARY_PATROL_MAX_SERIES:'50'",
-        ):
-            self.assertIn(default, html)
+        self.assertEqual({key: _UI_DEFAULTS[key] for key in (
+            "TAVILY_CACHE_TTL_SECONDS", "TAVILY_TIMEOUT_SECONDS", "AGENT_LIBRARY_PATROL_ENABLED",
+            "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", "AGENT_RECOGNITION_REVIEW_ENABLED",
+            "AGENT_NSFW_CLEAN_REVIEW_ENABLED", "AGENT_LIBRARY_PATROL_INTERVAL_HOURS",
+            "AGENT_LIBRARY_PATROL_MAX_SERIES",
+        )}, {
+            "TAVILY_CACHE_TTL_SECONDS": "900", "TAVILY_TIMEOUT_SECONDS": "10",
+            "AGENT_LIBRARY_PATROL_ENABLED": "0", "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "1",
+            "AGENT_RECOGNITION_REVIEW_ENABLED": "0", "AGENT_NSFW_CLEAN_REVIEW_ENABLED": "0",
+            "AGENT_LIBRARY_PATROL_INTERVAL_HOURS": "24", "AGENT_LIBRARY_PATROL_MAX_SERIES": "50",
+        })
         self.assertIn("不会立即扫描全库", html)
         self.assertIn("Agent 主动复核", html)
         self.assertIn("不确定则保留人工按钮", html)

@@ -68,7 +68,7 @@ def _load_settings_api(config) -> dict[str, Any]:
     exec(compile(defaults_path.read_text("utf-8"), str(defaults_path), "exec"), namespace)
     path = ROOT / "app/routes/api.py"
     tree = ast.parse(path.read_text("utf-8"), filename=str(path))
-    functions = {"_is_config_mask", VALIDATOR, "get_config", "save_config"}
+    functions = {"_is_config_mask", "_ui_defaults", VALIDATOR, "get_config", "save_config"}
     nodes: list[ast.stmt] = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib", "app.modules.feature_config", "app.modules.policy_config"}:
@@ -254,8 +254,11 @@ class EpisodeResearchSettingsUiTests(unittest.TestCase):
 
     def test_javascript_defaults_and_readiness_hooks(self):
         script = (ROOT / "app/static/js/settings.js").read_text("utf-8")
-        self.assertIn(f"{ENABLED}:'0'", script)
-        self.assertIn(f"{LIMIT}:'10'", script)
+        from app.routes.api import _UI_DEFAULTS
+
+        # 未配置时由 /api/config 回填后端唯一默认值；前端不得另写一份。
+        self.assertEqual((_UI_DEFAULTS[ENABLED], _UI_DEFAULTS[LIMIT]), ("0", "10"))
+        self.assertNotIn(f"{ENABLED}:", script)
         ready = script.split("function setConfigReady(){", 1)[1].split("function setConfigLoadError", 1)[0]
         self.assertLess(ready.index("syncEpisodeResearchAvailability()"), ready.index("revealConfigFields()"))
         normalize = script.split("loadAppConfig().then(config=>{", 1)[1].split("fillConfigFields(form,config)", 1)[0]
