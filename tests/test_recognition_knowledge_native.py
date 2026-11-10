@@ -26,7 +26,7 @@ from app.agent.kernel.ports.sdk_effects import recognition_knowledge_tools
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.modules import recognition_knowledge as knowledge
-from tests.support import initialized_web_runtime
+from tests.support import assert_present, initialized_web_runtime
 from tests.test_agent_kernel_core import ScriptedModel
 
 OWNER = "webk:v1:" + "c" * 64
@@ -150,6 +150,33 @@ def test_rpc_cold_confirm_crud_once_and_cache(backend, tmp_path):
         await executor().execute_confirmed(remove.plan_id, context=context)
         assert knowledge.get_entry(row["id"]) is None
         assert knowledge.lookup_any("Agent Test Group") is None
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("legacy_key", [False, True], ids=["new-user-key", "legacy-name-key"])
+def test_native_rename_releases_old_name_without_changing_persistent_identity(backend, legacy_key):
+    original_args = {"knowledge_type": "release_group", "canonical_value": "RenameOriginalTeam"}
+    original = knowledge.create_entry({**original_args, **({"knowledge_key": "release_group:renameoriginalteam"} if legacy_key else {})})
+
+    async def check():
+        effects = executor()
+        context = await context_for(effects)
+        rename = (await effects.prepare("recognition.update_knowledge", {
+            "entry_id": original["id"], "canonical_value": "RenameNewTeam", "aliases": [],
+        }, context=context)).effect_plan
+        assert rename is not None
+        renamed = (await executor().execute_confirmed(rename.plan_id, context=context)).outcome.public_content["data"]["item"]
+        assert renamed["id"] == original["id"] and renamed["knowledge_key"] == original["knowledge_key"]
+        assert knowledge.lookup("RenameOriginalTeam") is None
+        assert assert_present(knowledge.lookup("RenameNewTeam"))["id"] == original["id"]
+        create = (await effects.prepare("recognition.create_knowledge", original_args, context=context)).effect_plan
+        assert create is not None
+        replacement = (await executor().execute_confirmed(create.plan_id, context=context)).outcome.public_content["data"]["item"]
+        assert replacement["id"] != original["id"] and replacement["knowledge_key"] != original["knowledge_key"]
+        assert assert_present(knowledge.lookup("RenameOriginalTeam"))["id"] == replacement["id"]
+        with pytest.raises(ToolPipelineError):
+            await effects.prepare("recognition.create_knowledge", original_args, context=context)
+
     asyncio.run(check())
 
 

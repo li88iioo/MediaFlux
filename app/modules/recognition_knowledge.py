@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 import unicodedata
@@ -449,6 +450,9 @@ def prepare_entry(operation: str, data: dict[str, Any], *, entry_id: int | None 
 def create_entry(data: dict[str, Any], *, check_write: Callable[[Any], None] | None = None) -> dict[str, Any]:
     ensure_seed_knowledge()
     normalized = _validate_values({**data, "source": data.get("source") or "user"})
+    # 用户名称可以修改；独立分配身份，旧名称键也不会阻止名称再次使用。
+    if normalized["source"] == "user" and not str(data.get("knowledge_key", "")).strip():
+        normalized["knowledge_key"] = "user:" + secrets.token_hex(16)
     timestamp = now()
     try:
         with get_conn() as conn:
