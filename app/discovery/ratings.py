@@ -423,7 +423,7 @@ def lookup_rating(
     web_fallback_attempted = False
     structured_attempted = config.get_bool("DISCOVERY_ENABLED")
     ambiguous = False
-    evidence = [{"source": "douban", "status": "not_queried", "ok": None,
+    evidence: list[dict[str, Any]] = [{"source": "douban", "status": "not_queried", "ok": None,
                  "description": "已尝试豆瓣结构化查询。" if structured_attempted else "结构化查询未启用，本次未调用。",
                  "collected_at": _now()}]
 

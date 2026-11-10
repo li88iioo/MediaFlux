@@ -356,10 +356,12 @@ class DiscoveryServiceTests(unittest.TestCase):
             self.assertTrue(page.cached)
             self.assertEqual((page.items[0].external_id, page.items[0].tmdb_id), ("1", identity))
             detail = service.describe_media("douban", "movie", "1")
+            assert detail is not None
             self.assertEqual((detail["tmdb_id"], detail["mapping_confirmed"]), (identity, True))
         self.assertEqual(source.tmdb_id, "")
         provider.list_items.assert_called_once()
         cached = self.cache.get(self.cache.make_key("douban", "movie_hot", "movie", 1, {}))
+        assert cached.payload is not None
         self.assertEqual(cached.payload["items"][0]["tmdb_id"], "")
 
     def test_detail_metadata_preserves_nonempty_fields_and_fills_empty_ones(self):
