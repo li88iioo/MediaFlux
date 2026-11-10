@@ -17,7 +17,6 @@ from app.bot.progress import (
     _register_pending,
     _retry_terminal_until_delivered,
     cancel_active_operations,
-    deliver_terminal_to_existing_message,
     recover_stale_operations,
 )
 from tests.support import IsolatedDatabaseTestCase
@@ -171,16 +170,6 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
             self.assertNotIn(confirmed.operation_id, active)
             self.assertEqual(bot.edits[-1][2], "<b>确认写操作已完成</b>")
             self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
-
-    def test_existing_message_terminal_uses_edit_then_send_fallback(self):
-        bot = _FailingFinalEditBot()
-        source = SimpleNamespace(chat=SimpleNamespace(id="100"), message_id=44)
-        delivered = deliver_terminal_to_existing_message(
-            bot, _TELEBOT, source, "<b>操作完成</b>", label="Agent 操作结果"
-        )
-        self.assertTrue(delivered)
-        self.assertEqual(bot.messages[-1][1], "<b>操作完成</b>")
-        self.assertEqual(json.loads(db.kv_get("telegram_pending_operations_v1", "[]")), [])
 
     def test_prefers_rich_draft_and_persists_rich_final_message(self):
         bot = _RichBot()
@@ -577,28 +566,6 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(progress.finish("刷新中"))
         self.assertEqual(len(bot.messages), 1)
-        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
-
-    def test_runtime_retry_is_not_scheduled_for_unknown_edit(self):
-        class ReadTimeoutBot(_EditBot):
-            def edit_message_text(self, *_args, **_kwargs):
-                raise requests.ReadTimeout("response lost after edit")
-
-        bot = ReadTimeoutBot()
-        source = SimpleNamespace(chat=SimpleNamespace(id="100"), message_id=44)
-        with patch("app.bot.progress.schedule_terminal_delivery_retry") as retry:
-            delivered = deliver_terminal_to_existing_message(
-                bot,
-                _TELEBOT,
-                source,
-                "<b>操作完成</b>",
-                label="Agent 操作结果",
-                runtime_retry=True,
-            )
-
-        self.assertFalse(delivered)
-        retry.assert_not_called()
-        self.assertEqual(bot.messages, [])
         self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
 
     def test_bind_task_run_updates_only_the_existing_pending_operation(self):

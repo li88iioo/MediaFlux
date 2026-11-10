@@ -64,7 +64,6 @@ from app.modules.media_proxy import (
     _parse_range,
     _websocket_upstream_url,
     media_content_type,
-    resolve_local_binding,
     rewrite_playback_info,
     validate_listen_host,
     validate_upstream_url,
@@ -482,7 +481,7 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
 
 
 class MediaProxyTests(InitializedWebTestCase):
-    def test_validation_rejects_ssrf_and_path_escape(self):
+    def test_validation_rejects_ssrf_and_unsafe_listen_hosts(self):
         self.assertEqual(
             validate_upstream_url("http://127.0.0.1:8096/"), "http://127.0.0.1:8096"
         )
@@ -492,13 +491,6 @@ class MediaProxyTests(InitializedWebTestCase):
             validate_upstream_url("http://user:pass@127.0.0.1:8096")
         with self.assertRaises(ValueError):
             validate_listen_host("192.168.88.10")
-        with tempfile.TemporaryDirectory() as root:
-            resolved = resolve_local_binding(root, "Movies/video.mkv")
-            self.assertEqual(resolved, (Path(root) / "Movies/video.mkv").resolve())
-            with self.assertRaisesRegex(ValueError, "越界"):
-                resolve_local_binding(root, "../secret.mkv")
-            with self.assertRaisesRegex(ValueError, "相对路径"):
-                resolve_local_binding(root, str(Path(root).resolve() / "video.mkv"))
 
     def test_range_parser_supports_standard_and_suffix_ranges(self):
         self.assertEqual(_parse_range("bytes=2-5", 10), (2, 5))

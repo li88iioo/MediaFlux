@@ -2608,19 +2608,6 @@ class _PinnedResolver(AbstractResolver):
         return None
 
 
-def resolve_local_binding(local_root: str, relative_path: str) -> Path:
-    root = Path(local_root or "").expanduser().resolve(strict=False)
-    relative = Path(relative_path or "")
-    if not (local_root or "").strip() or relative.is_absolute():
-        raise ValueError("本地绑定必须使用已配置根目录下的相对路径")
-    candidate = (root / relative).resolve(strict=False)
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("本地绑定路径越界") from exc
-    return candidate
-
-
 def _connection_header_tokens(headers: Any) -> set[str]:
     """返回 Connection 声明的动态 hop-by-hop 字段名。"""
     values: list[str] = []

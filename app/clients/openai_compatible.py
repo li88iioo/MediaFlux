@@ -1376,25 +1376,3 @@ def parse_native_tool_turn(envelope: object, protocol: str, *, allow_argument_er
         usage=usage,
         private_layout_json=anthropic_private_layout(content),
     )
-
-
-def append_native_tool_results(
-    protocol: str,
-    history: list[dict[str, Any]],
-    turn: NativeToolTurn,
-    outputs: list[tuple[NativeToolCall, str]],
-) -> list[dict[str, Any]]:
-    """追加完整、已校验工具结果；调用方必须先完成服务端安全投影。"""
-    updated = list(history)
-    results = [native_tool_result(protocol, call.call_id, output) for call, output in outputs]
-    if protocol == "responses":
-        assistant_items = turn.assistant_entry
-        if isinstance(assistant_items, list):
-            updated.extend(item for item in assistant_items if isinstance(item, dict))
-    elif isinstance(turn.assistant_entry, dict):
-        updated.append(turn.assistant_entry)
-    if protocol in {"responses", "chat_completions"}:
-        updated.extend(results)
-    else:
-        updated.append({"role": "user", "content": results})
-    return updated

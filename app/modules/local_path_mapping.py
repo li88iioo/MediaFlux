@@ -143,28 +143,6 @@ class PathMapping:
         return parts
 
 
-class PathMappingSet:
-    def __init__(self, items: Iterable[PathMapping]):
-        self.items = tuple(items)
-        if not self.items:
-            raise PathMappingError("至少需要一条路径映射")
-        seen: set[str] = set()
-        for item in self.items:
-            key = item.comparison_prefix
-            if key in seen:
-                raise PathMappingError("存在重复或大小写歧义的 qB 路径前缀")
-            seen.add(key)
-
-    def map_qb_path(self, raw_path: str) -> Path:
-        normalized = normalize_qb_path(raw_path)
-        matches = [item for item in self.items if item.matches(normalized)]
-        if not matches:
-            raise PathMappingError("qB 路径没有匹配的本地来源")
-        selected = max(matches, key=lambda item: len(item.comparison_prefix))
-        candidate = selected.local_root.joinpath(*selected.relative_parts(normalized))
-        return assert_within(candidate, selected.local_root)
-
-
 def _reject_unsafe_parts(path: PurePath) -> None:
     if any(part == ".." for part in path.parts):
         raise PathMappingError("路径不允许包含 ..")

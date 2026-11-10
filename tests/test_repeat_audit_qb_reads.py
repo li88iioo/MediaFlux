@@ -15,12 +15,10 @@ class QBReadContractTests(unittest.TestCase):
         with patch.object(self.client, '_get', return_value=Mock(json=lambda: [])):
             self.assertEqual(self.client.list_torrents(), [])
             self.assertEqual(self.client.get_torrent_files('a' * 40), [])
-            self.assertFalse(self.client.get_completion('a' * 40))
 
     def test_invalid_envelope_never_becomes_an_empty_success(self):
         readers = [self.client.list_torrents,
-                   lambda: self.client.get_torrent_files('a' * 40),
-                   lambda: self.client.get_completion('a' * 40)]
+                   lambda: self.client.get_torrent_files('a' * 40)]
         for payload in (None, {}, {'error': 'unavailable'}, '', 0, [None], ['invalid']):
             for index, reader in enumerate(readers):
                 with self.subTest(payload=payload, reader=index), patch.object(
@@ -29,7 +27,7 @@ class QBReadContractTests(unittest.TestCase):
                     with self.assertRaises((ValueError, TypeError, KeyError, AttributeError)):
                         reader()
 
-    def test_valid_files_and_torrent_completion_preserve_existing_projection(self):
+    def test_valid_files_and_torrent_list_preserve_existing_projection(self):
         with patch.object(self.client, '_get', return_value=Mock(json=lambda: [
             {'index': 7, 'name': 'Show/E01.mkv', 'size': 1024, 'progress': .5},
             {'name': 'Show/E02.mkv', 'size': 2048, 'progress': 1},
@@ -40,7 +38,6 @@ class QBReadContractTests(unittest.TestCase):
         with patch.object(self.client, '_get', return_value=Mock(json=lambda: [
             {'hash': 'a' * 40, 'name': 'Show', 'state': 'stoppedUP', 'progress': 1},
         ])):
-            self.assertTrue(self.client.get_completion('a' * 40))
             self.assertEqual(self.client.list_torrents()[0].name, 'Show')
 
     def test_sdk_reports_invalid_response_instead_of_zero_files_and_closes_client(self):

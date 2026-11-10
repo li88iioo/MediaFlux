@@ -9,7 +9,6 @@ from pathlib import Path
 from app.modules.local_path_mapping import (
     PathMapping,
     PathMappingError,
-    PathMappingSet,
     assert_within,
     is_windows_or_unc_path,
     normalize_qb_path,
@@ -32,16 +31,6 @@ class LocalPathMappingTests(unittest.TestCase):
             self.assertLessEqual(normalize.call_count, 102)
         self.assertEqual(asdict(mapping), {"qb_prefix": raw, "local_root": Path("/mnt/library")})
 
-    def test_longest_prefix_mapping(self):
-        mappings = PathMappingSet([
-            PathMapping("/downloads", Path("/mnt/all")),
-            PathMapping("/downloads/1", Path("/mnt/fast")),
-        ])
-        self.assertEqual(
-            mappings.map_qb_path("/downloads/1/Movies/A.mkv"),
-            Path("/mnt/fast/Movies/A.mkv").resolve(strict=False),
-        )
-
     def test_windows_or_unc_path_detection_does_not_reject_container_paths(self):
         self.assertTrue(is_windows_or_unc_path(r"D:\Downloads"))
         self.assertTrue(is_windows_or_unc_path(r"\\NAS\Media"))
@@ -59,12 +48,14 @@ class LocalPathMappingTests(unittest.TestCase):
                     require_container_absolute_path(value)
 
     def test_windows_drive_and_unc_are_case_insensitive(self):
-        mappings = PathMappingSet([
-            PathMapping(r"D:\Downloads", Path("/mnt/d")),
-            PathMapping(r"\\NAS\Media", Path("/mnt/nas")),
-        ])
-        self.assertEqual(mappings.map_qb_path(r"d:\DOWNLOADS\TV\A.mkv"), Path("/mnt/d/TV/A.mkv").resolve(strict=False))
-        self.assertEqual(mappings.map_qb_path(r"\\nas\media\Movie\B.mkv"), Path("/mnt/nas/Movie/B.mkv").resolve(strict=False))
+        drive = PathMapping(r"D:\Downloads", Path("/mnt/d"))
+        unc = PathMapping(r"\\NAS\Media", Path("/mnt/nas"))
+        self.assertEqual(drive.relative_parts(r"d:\DOWNLOADS\TV\A.mkv"), ("TV", "A.mkv"))
+        self.assertEqual(unc.relative_parts(r"\\nas\media\Movie\B.mkv"), ("Movie", "B.mkv"))
+        self.assertEqual(
+            PathMapping(r"D:\Downloads", Path("/mnt/a")).comparison_prefix,
+            PathMapping(r"d:/downloads", Path("/mnt/b")).comparison_prefix,
+        )
 
     def test_unicode_casefold_does_not_corrupt_windows_or_unc_suffix(self):
         drive = PathMapping(r"C:\Straße", Path("/mnt/drive"))
@@ -77,15 +68,12 @@ class LocalPathMappingTests(unittest.TestCase):
             ("Show", "Episode.mkv"),
         )
 
-    def test_prefix_boundary_and_ambiguous_prefix_are_rejected(self):
-        mappings = PathMappingSet([PathMapping("/downloads/1", Path("/mnt/one"))])
-        with self.assertRaisesRegex(PathMappingError, "没有匹配"):
-            mappings.map_qb_path("/downloads/10/A.mkv")
-        with self.assertRaisesRegex(PathMappingError, "重复"):
-            PathMappingSet([
-                PathMapping(r"D:\Downloads", Path("/mnt/a")),
-                PathMapping(r"d:/downloads", Path("/mnt/b")),
-            ])
+    def test_prefix_boundary_is_rejected(self):
+        mapping = PathMapping("/downloads/1", Path("/mnt/one"))
+        self.assertTrue(mapping.matches("/downloads/1/A.mkv"))
+        self.assertFalse(mapping.matches("/downloads/10/A.mkv"))
+        with self.assertRaisesRegex(PathMappingError, "不匹配"):
+            mapping.relative_parts("/downloads/10/A.mkv")
 
     def test_dotdot_nul_and_unc_root_are_rejected(self):
         for value in ("/downloads/../etc/passwd", "bad\x00path", r"\\server"):

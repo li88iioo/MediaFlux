@@ -46,15 +46,20 @@ def _patch_proxy_state(monkeypatch, *, rows, runtime, public_base):
     )
 
 
+def _open_url(item_url: str) -> str:
+    profile = _profile()
+    return media_links.media_open_url_resolver(
+        server_type=profile.server_type, server_url=profile.url,
+    )(item_url)
+
+
 def test_media_link_falls_back_to_trusted_server_url(monkeypatch):
     _patch_proxy_state(monkeypatch, rows=[], runtime={}, public_base="")
     direct = "http://media.local:8096/web/index.html#!/details?id=item-1"
 
-    assert media_links.resolve_media_open_url(_profile(), direct) == direct
+    assert _open_url(direct) == direct
     assert (
-        media_links.resolve_media_open_url(
-            _profile(),
-            "http://other.local:8096/web/index.html#!/details?id=item-1",
+        _open_url("http://other.local:8096/web/index.html#!/details?id=item-1",
         )
         == ""
     )
@@ -82,9 +87,7 @@ def test_media_link_prefers_running_matching_proxy(monkeypatch):
         public_base="http://192.168.0.195:1258",
     )
 
-    result = media_links.resolve_media_open_url(
-        _profile(),
-        "http://media.local:8096/web/index.html#!/details?id=item-1",
+    result = _open_url("http://media.local:8096/web/index.html#!/details?id=item-1",
     )
 
     assert result == "http://192.168.0.195:18096/web/index.html#!/details?id=item-1"
@@ -113,9 +116,7 @@ def test_media_link_uses_explicit_proxy_host_without_public_base(monkeypatch):
         public_base="",
     )
 
-    result = media_links.resolve_media_open_url(
-        _profile(),
-        "http://media.local:8096/web/index.html#!/details?id=item-1",
+    result = _open_url("http://media.local:8096/web/index.html#!/details?id=item-1",
     )
 
     assert result == "http://192.168.0.195:18096/web/index.html#!/details?id=item-1"
@@ -151,7 +152,7 @@ def test_media_link_ignores_stopped_or_mismatched_proxy(monkeypatch):
     )
     direct = "http://media.local:8096/web/index.html#!/details?id=item-1"
 
-    assert media_links.resolve_media_open_url(_profile(), direct) == direct
+    assert _open_url(direct) == direct
 
 
 def test_media_link_rejects_credentials_and_sensitive_query_values():
@@ -207,7 +208,7 @@ def test_media_link_ignores_invalid_proxy_runtime(monkeypatch):
     )
     direct = "http://media.local:8096/web/index.html#!/details?id=item-1"
 
-    assert media_links.resolve_media_open_url(_profile(), direct) == direct
+    assert _open_url(direct) == direct
 
 
 def test_library_search_includes_verified_open_url(monkeypatch):

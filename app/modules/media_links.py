@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from app import config
-from app.modules.media_server_profiles import MediaServerProfile, resolve_proxy_instance
+from app.modules.media_server_profiles import resolve_proxy_instance
 from app.sensitive_data import contains_sensitive_credential
 
 logger = logging.getLogger(__name__)
@@ -249,15 +249,3 @@ def media_open_url_resolver(
         return sanitize_media_open_url(proxied, expected_base=proxy_base)
 
     return resolve
-
-
-def resolve_media_open_url(
-    profile: MediaServerProfile,
-    item_url: object,
-) -> str:
-    """优先返回匹配的运行中媒体反代链接，否则返回服务器原始页面链接。"""
-
-    return media_open_url_resolver(
-        server_type=profile.server_type,
-        server_url=profile.url,
-    )(item_url)

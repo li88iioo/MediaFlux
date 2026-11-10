@@ -423,8 +423,4 @@ def consume_agent_tool(
     )
 
 
-def allow_agent_tool(identity: str, tool_name: str, *, scope_suffix: str = "") -> bool:
-    return consume_agent_tool(identity, tool_name, scope_suffix=scope_suffix).allowed
-
-
 agent_rate_limiter = AgentRateLimiter(shared=True)

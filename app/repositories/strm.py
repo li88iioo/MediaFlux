@@ -430,7 +430,6 @@ def retire_deleted_strm_files(files: Iterable[dict[str, Any]]) -> dict[str, int]
 
 DEFAULT_STRM_METADATA_LEASE_SECONDS = 900
 DEFAULT_STRM_METADATA_MAX_ATTEMPTS = 6
-_METADATA_ACTIVE_STATUSES = ("queued", "running", "retry_wait")
 
 
 def _metadata_snapshot(item: dict[str, Any]) -> tuple[str, ...]:

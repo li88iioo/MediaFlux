@@ -513,15 +513,3 @@ class QBittorrentClient:
                 raise
             self._post(legacy, {"hashes": hashes})
         return True
-
-    def get_completion(self, torrent_hash: str) -> bool:
-        """查询任务是否完成。"""
-        if not self.api_key:
-            self.login()
-        resp = self._get_list("/torrents/info", params={"hashes": torrent_hash})
-        if not resp:
-            return False
-        return is_qb_torrent_complete(
-            str(resp[0].get("state") or ""),
-            resp[0].get("progress", 0),
-        )

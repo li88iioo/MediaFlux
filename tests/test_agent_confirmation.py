@@ -14,7 +14,6 @@ from app.agent.confirmation import (
     ConfirmationExpiredError,
     ConfirmationStore,
     SQLiteConfirmationStore,
-    confirmation_reply_intent,
 )
 from app.agent.confirmation_contract import (
     build_confirmation_contract,
@@ -266,14 +265,6 @@ class ConfirmationStoreTests(unittest.TestCase):
                 preview=ToolResult(True, "preview", "预检通过"),
                 preflight_at="not-a-time",
             )
-
-    def test_confirmation_reply_intent_is_explicit_and_non_ambiguous(self):
-        for value in ("确认", "好的帮我执行。", "YES", "取消", "算了！"):
-            with self.subTest(value=value):
-                assert (confirmation_reply_intent(value)) is not None
-        for value in ("请确认状态", "确认第三个", "好的，但是先检查", "不要取消"):
-            with self.subTest(value=value):
-                self.assertIsNone(confirmation_reply_intent(value))
 
     def test_listing_unknown_owner_is_read_only(self):
         store = ConfirmationStore()

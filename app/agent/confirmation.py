@@ -7,7 +7,6 @@ import math
 import secrets
 import threading
 import time
-import unicodedata
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -39,50 +38,6 @@ class ConfirmationExpiredError(AgentToolError):
     def __init__(self, ticket: ConfirmationTicket) -> None:
         super().__init__("确认请求已过期", code="confirmation_invalid")
         self.ticket = ticket
-
-
-_CONFIRMATION_REPLY_PHRASES = frozenset(
-    {
-        "确认",
-        "确认执行",
-        "确定",
-        "确定执行",
-        "同意",
-        "执行",
-        "开始执行",
-        "好的",
-        "好的执行",
-        "好的帮我执行",
-        "好，执行",
-        "好,执行",
-        "确认吧",
-        "确认执行吧",
-        "执行吧",
-        "可以执行",
-        "就这样执行",
-        "ok",
-        "yes",
-        "confirm",
-    }
-)
-_CANCELLATION_REPLY_PHRASES = frozenset(
-    {
-        "取消",
-        "取消执行",
-        "算了",
-        "不要了",
-        "不执行",
-        "放弃",
-        "先别执行",
-        "别执行",
-        "不用了",
-        "撤销",
-        "撤销操作",
-        "停止执行",
-        "cancel",
-        "no",
-    }
-)
 
 
 def _normalize_expected_owner_generation(value: Any) -> int | None:
@@ -163,20 +118,6 @@ def _copy_ticket(
         followup_context=deepcopy(ticket.followup_context),
         confirmation_contract=deepcopy(ticket.confirmation_contract),
     )
-
-
-def confirmation_reply_intent(value: Any) -> str | None:
-    """只识别无附加条件的明确确认/取消短句，避免自然语言误触发写操作。"""
-    if not isinstance(value, str):
-        return None
-    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
-    normalized = normalized.rstrip("。.!！")
-    normalized = " ".join(normalized.split())
-    if normalized in _CONFIRMATION_REPLY_PHRASES:
-        return "confirm"
-    if normalized in _CANCELLATION_REPLY_PHRASES:
-        return "cancel"
-    return None
 
 
 class ConfirmationStore:

@@ -15,12 +15,12 @@ from app.clients.openai_compatible import (
     infer_protocol_from_url,
     is_protocol_fallback_error,
     is_reasoning_model,
-    append_native_tool_results,
     iter_provider_text_deltas,
     native_tool_definitions,
     native_tool_initial_history,
     native_tool_request_body,
     normalize_provider_location,
+    native_tool_result,
     parse_native_tool_turn,
     protocol_attempts,
     provider_headers,
@@ -413,7 +413,7 @@ class LLMProviderProtocolTests(unittest.TestCase):
                             self.assertIs(body["parallel_tool_calls"], enabled)
                             self.assertNotIn("disable_parallel_tool_use", body)
 
-    def test_parse_and_append_responses_native_tool_turn(self):
+    def test_parse_responses_native_tool_turn_and_build_result(self):
         turn = parse_native_tool_turn({
             "status": "completed",
             "output": [{
@@ -425,13 +425,11 @@ class LLMProviderProtocolTests(unittest.TestCase):
         }, "responses")
         self.assertEqual(turn.tool_calls[0].name, "mf_workspace_health")
         self.assertEqual(turn.finish_reason, "stop")
-        history = append_native_tool_results(
-            "responses", [], turn, [(turn.tool_calls[0], '{"ok":true}')],
-        )
-        self.assertEqual(history[-1]["type"], "function_call_output")
-        self.assertEqual(history[-1]["call_id"], "call_1")
+        result = native_tool_result("responses", turn.tool_calls[0].call_id, '{"ok":true}')
+        self.assertEqual(result["type"], "function_call_output")
+        self.assertEqual(result["call_id"], "call_1")
 
-    def test_parse_and_append_chat_native_tool_turn(self):
+    def test_parse_chat_native_tool_turn_and_build_result(self):
         turn = parse_native_tool_turn({
             "choices": [{"finish_reason": "tool_calls", "message": {
                 "role": "assistant",
@@ -448,13 +446,11 @@ class LLMProviderProtocolTests(unittest.TestCase):
         }, "chat_completions")
         self.assertEqual(turn.tool_calls[0].arguments, {"limit": 5})
         self.assertEqual(turn.finish_reason, "tool_calls")
-        history = append_native_tool_results(
-            "chat_completions", [], turn, [(turn.tool_calls[0], '{"ok":true}')],
-        )
-        self.assertEqual(history[-1]["role"], "tool")
-        self.assertEqual(history[-1]["tool_call_id"], "call_2")
+        result = native_tool_result("chat_completions", turn.tool_calls[0].call_id, '{"ok":true}')
+        self.assertEqual(result["role"], "tool")
+        self.assertEqual(result["tool_call_id"], "call_2")
 
-    def test_parse_and_append_anthropic_native_tool_turn(self):
+    def test_parse_anthropic_native_tool_turn_and_build_result(self):
         turn = parse_native_tool_turn({
             "type": "message",
             "stop_reason": "tool_use",
@@ -467,11 +463,9 @@ class LLMProviderProtocolTests(unittest.TestCase):
         }, "anthropic_messages")
         self.assertEqual(turn.tool_calls[0].call_id, "toolu_1")
         self.assertEqual(turn.finish_reason, "tool_use")
-        history = append_native_tool_results(
-            "anthropic_messages", [], turn, [(turn.tool_calls[0], '{"ok":true}')],
-        )
-        self.assertEqual(history[-1]["role"], "user")
-        self.assertEqual(history[-1]["content"][0]["type"], "tool_result")
+        result = native_tool_result("anthropic_messages", turn.tool_calls[0].call_id, '{"ok":true}')
+        self.assertEqual(result["type"], "tool_result")
+        self.assertEqual(result["tool_use_id"], "toolu_1")
 
     def test_native_tool_turn_rejects_missing_or_truncated_finish_reason(self):
         chat_call = {

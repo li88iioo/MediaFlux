@@ -195,12 +195,12 @@ def test_atomic_decisions_concurrency():
     assert all((d.remaining,d.retry_after_seconds,d.retry_at_epoch)==(0,67.75,188) for d in denied)
 
 
-def test_authoritative_cost_and_bool_wrapper_same_bucket():
+def test_authoritative_cost_and_direct_consumption_share_bucket():
     limiter=AgentRateLimiter(shared=True,wall_clock=lambda:120.0);limiter.reset()
     async def go():
         port=policy.MediaFluxToolRateLimiter()
         await port.acquire(owner='cost-owner',tool_name='subscriptions.check_updates',cost=999,arguments={})
-        assert rates.allow_agent_tool('cost-owner','subscriptions.check_updates') is True
+        assert rates.consume_agent_tool('cost-owner','subscriptions.check_updates').allowed is True
         with pytest.raises(ToolRateLimitError) as raised:
             await port.acquire(owner='cost-owner',tool_name='subscriptions.check_updates',cost=0,arguments={})
         assert dict(raised.value.rate_limit)=={'limit':4,'cost':2,'remaining':0,'retry_after_seconds':90.0,'retry_at_epoch':210.0,'reason':'quota'}
@@ -280,18 +280,18 @@ def test_real_port_public_values_are_immutable_json_scalars(denial):
     with patch.object(rates,'agent_rate_limiter',limiter):asyncio.run(exercise())
 
 
-def test_real_decision_and_bool_wrapper_share_exact_single_consumption():
+def test_each_decision_consumes_exactly_once():
     limiter=rates.AgentRateLimiter(shared=True,wall_clock=lambda:120.0)
     limiter.reset()
     with patch.object(rates,'agent_rate_limiter',limiter):
         first=rates.consume_agent_tool('owner','subscriptions.check_updates')
         assert first.allowed is True and first.remaining==2 and first.cost==2
         with pytest.raises(FrozenInstanceError):setattr(first, 'remaining', 999)
-        assert rates.allow_agent_tool('owner','subscriptions.check_updates') is True
+        assert rates.consume_agent_tool('owner','subscriptions.check_updates').allowed is True
         denied=rates.consume_agent_tool('owner','subscriptions.check_updates')
         assert denied.allowed is False and denied.remaining==0
         assert denied.retry_after_seconds==90.0 and denied.retry_at_epoch==210.0
-        assert rates.allow_agent_tool('owner','subscriptions.check_updates') is False
+        assert rates.consume_agent_tool('owner','subscriptions.check_updates').allowed is False
         with db.get_conn() as conn:
             rows=conn.execute('SELECT count,previous_count FROM agent_rate_limit_buckets').fetchall()
         assert [tuple(row) for row in rows]==[(4,0)]
