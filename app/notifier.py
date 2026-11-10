@@ -433,17 +433,6 @@ def _tmdb_image_url(items: Sequence[object]) -> str:
     return f"{_TMDB_IMAGE_BASE}/{path.lstrip('/')}"
 
 
-def build_stats_event(title: object, stats: Mapping[object, object], *,
-                      footer: object = "", image_url: str = "") -> NotificationEvent:
-    """构造数据不足时使用的结构化统计卡片。"""
-    return NotificationEvent(
-        title=str(title or ""),
-        fields=tuple((label, value) for label, value in stats.items() if value not in (None, "")),
-        image_url=image_url,
-        footer="" if footer is None else str(footer),
-    )
-
-
 def build_media_events(
     items: Sequence[object], *, layout: str = "default", inventory_final: bool = True
 ) -> list[NotificationEvent]:
@@ -911,74 +900,6 @@ def _photo_failure_allows_text_fallback(result: TelegramSendResult) -> bool:
     """仅在 Telegram 明确拒绝图片请求时回退文本，避免未知结果重复通知。"""
     status = (result.status_code or 0)
     return 400 <= status < 500 and status not in {408, 429}
-
-
-def send_result(
-    text: str,
-    chat_id: Optional[str] = None,
-    *,
-    image_url: str = "",
-) -> TelegramSendResult:
-    """发送兼容 HTML 结果，可选封面并保留 429 等可重试信息。"""
-    bot = get_bot()
-    target = (chat_id or _chat_id or "").strip()
-    if not bot or not target:
-        _log_notification_fallback(text)
-        return TelegramSendResult(
-            ok=False, error="Telegram Bot 或 Chat ID 未配置", status_code=503,
-        )
-    image = (image_url or "").strip()
-    if not image:
-        result = _send_text_result(bot, target, text)
-        if not result.ok:
-            logger.error(
-                "Telegram 发送失败 status=%s retry_after=%s error=%s",
-                result.status_code or "-", result.retry_after_seconds or "-",
-                result.error,
-            )
-        return result
-
-    chunks = split_message(text, _CAPTION_LIMIT)
-    try:
-        photo_message = bot.send_photo(target, image, caption=chunks[0])
-        try:
-            last_message_id = int(getattr(photo_message, "message_id", 0) or 0)
-        except (TypeError, ValueError):
-            last_message_id = 0
-    except Exception as exc:
-        result = _telegram_send_error(exc)
-        if not _photo_failure_allows_text_fallback(result):
-            logger.warning(
-                "Telegram 结果封面发送结果未知，停止文本回退 "
-                "type=%s status=%s",
-                type(exc).__name__, result.status_code or "-",
-            )
-            return result
-        logger.warning(
-            "Telegram 明确拒绝结果封面，回退文本 type=%s status=%s",
-            type(exc).__name__, result.status_code,
-        )
-        return _send_text_result(bot, target, text)
-
-    try:
-        for chunk in chunks[1:]:
-            message = bot.send_message(target, chunk)
-            try:
-                last_message_id = int(getattr(message, "message_id", 0) or 0)
-            except (TypeError, ValueError):
-                pass
-        return TelegramSendResult(ok=True, message_id=last_message_id)
-    except Exception as exc:
-        result = _partial_delivery(
-            _telegram_send_error(exc), message_id=last_message_id,
-        )
-        logger.error(
-            "Telegram 结果续发失败 type=%s status=%s retry_after=%s error=%s",
-            type(exc).__name__, result.status_code or "-",
-            result.retry_after_seconds or "-", result.error,
-        )
-        return result
-
 
 
 def _telegram_message_is_unchanged(exc: Exception) -> bool:

@@ -3663,13 +3663,11 @@ class TelegramBotTests(unittest.TestCase):
         ):
             self.assertIs(notifier.get_bot(), bot)
             self.assertIs(notifier.get_bot(), bot)
-            message = notifier.render_event(
-                notifier.NotificationEvent("任务", lines=("<unsafe>",))
-            )
-            self.assertTrue(notifier.send_result(message).ok)
+            event = notifier.NotificationEvent("任务", lines=("<unsafe>",))
+            self.assertTrue(notifier.send_event_result(event).ok)
         constructor.assert_called_once_with("token", parse_mode="HTML")
-        self.assertIn("&lt;unsafe&gt;", message)
-        bot.send_message.assert_called_once_with("100", message)
+        self.assertIn("&lt;unsafe&gt;", notifier.render_event(event))
+        bot.send_message.assert_called_once_with("100", notifier.render_event(event))
         notifier.reset()
 
 

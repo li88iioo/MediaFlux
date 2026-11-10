@@ -90,7 +90,7 @@ class NotificationSendingTests(unittest.TestCase):
 
         self.assertEqual(bot.messages, [("test-chat", "<b>ℹ️ 测试通知</b>")])
 
-    def test_send_result_preserves_telegram_retry_after(self):
+    def test_send_event_preserves_telegram_retry_after(self):
         class TelegramRateLimitError(RuntimeError):
             result_json = {
                 "error_code": 429,
@@ -103,13 +103,13 @@ class NotificationSendingTests(unittest.TestCase):
         ))
         self._install_bot(bot, "test-chat")
 
-        result = notifier.send_result("测试通知")
+        result = notifier.send_event_result(notifier.NotificationEvent("测试通知"))
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status_code, 429)
         self.assertEqual(result.retry_after_seconds, 37)
         self.assertEqual(result.error, "Too Many Requests: retry later")
-        self.assertFalse(notifier.send_result("未配置通知").ok)
+        self.assertFalse(notifier.send_event_result(notifier.NotificationEvent("再次通知")).ok)
 
     def test_connect_timeout_is_safe_to_retry(self):
         result = notifier._telegram_send_error(notifier.requests.ConnectTimeout("connect"))
@@ -174,35 +174,6 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(result.status_code, 503)
         self.assertFalse(result.outcome_unknown)
 
-    def test_send_result_uses_cover_and_falls_back_to_text(self):
-        class TelegramPhotoRejected(RuntimeError):
-            result_json = {
-                "error_code": 400,
-                "description": "Bad Request: failed to get HTTP URL content",
-            }
-
-        bot = FakeBot()
-        self._install_bot(bot, "test-chat")
-
-        result = notifier.send_result(
-            "<b>整理完成</b>", image_url="https://image.example/poster.jpg",
-        )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(bot.photos, [(
-            "test-chat", "https://image.example/poster.jpg", "<b>整理完成</b>",
-        )])
-        self.assertEqual(bot.messages, [])
-
-        fallback = FakeBot(photo_error=TelegramPhotoRejected("image unavailable"))
-        self._install_bot(fallback, "test-chat")
-        result = notifier.send_result(
-            "<b>整理完成</b>", image_url="https://image.example/missing.jpg",
-        )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(fallback.messages, [("test-chat", "<b>整理完成</b>")])
-
     def test_edit_event_updates_existing_message_with_structured_markup(self):
         bot = FakeBot()
         self._install_bot(bot, "configured-chat")
@@ -246,12 +217,12 @@ class NotificationSendingTests(unittest.TestCase):
         ), patch.object(
             notifier, "get", side_effect=lambda key, default="": config.get(key, default)
         ), patch("app.bot.client.TopicRoutingBot", return_value=bot) as constructor:
-            self.assertTrue(notifier.send_result("opt-in").ok)
+            self.assertTrue(notifier.send_event_result(notifier.NotificationEvent("opt-in")).ok)
 
         constructor.assert_called_once_with(
             "dummy-token-final-fix", parse_mode="HTML"
         )
-        self.assertEqual(bot.messages, [("opt-in-chat", "opt-in")])
+        self.assertEqual(bot.messages, [("opt-in-chat", "<b>ℹ️ opt-in</b>")])
 
     def test_send_event_uses_photo_and_escapes_all_dynamic_content(self):
         """若事件渲染漏掉转义或没有走 sendPhoto，本测试必须失败。"""
@@ -311,9 +282,9 @@ class NotificationSendingTests(unittest.TestCase):
         bot = FakeBot(photo_error=TimeoutError("delivery outcome unknown"))
         self._install_bot(bot, "201")
 
-        result = notifier.send_result(
-            "<b>整理完成</b>", image_url="https://image.example/poster.jpg",
-        )
+        result = notifier.send_event_result(notifier.NotificationEvent(
+            "整理完成", image_url="https://image.example/poster.jpg",
+        ))
 
         self.assertFalse(result.ok)
         self.assertEqual(bot.messages, [])
@@ -355,16 +326,18 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(result.status_code, 429)
         self.assertEqual(len(bot.messages), 1)
 
-    def test_legacy_send_splits_at_natural_line_boundaries(self):
+    def test_send_event_splits_at_natural_line_boundaries(self):
         """若长消息再次按固定字符切断自然行，本测试必须失败。"""
         bot = FakeBot()
         self._install_bot(bot, "300")
         first = "A" * 2500
         second = "B" * 2500
 
-        self.assertTrue(notifier.send_result(f"{first}\n{second}").ok)
+        event = notifier.NotificationEvent("长消息", lines=(first, second))
+        self.assertTrue(notifier.send_event_result(event).ok)
 
-        self.assertEqual(bot.messages, [("300", first), ("300", second)])
+        header = notifier.render_event(notifier.NotificationEvent("长消息"))
+        self.assertEqual(bot.messages, [("300", f"{header}\n{first}"), ("300", second)])
         self.assertTrue(all(len(text) <= 4000 for _, text in bot.messages))
 
     def test_non_bmp_text_is_split_by_telegram_utf16_units(self):
@@ -614,39 +587,6 @@ class MediaCardTests(unittest.TestCase):
         self.assertNotIn("缺集：", rendered)
         self.assertIn("目录扫描未完整结束", rendered)
         self.assertIn("不是最终缺集结论", rendered)
-
-    def test_media_card_without_identification_data_falls_back_to_stats(self):
-        """若业务数据不足时卡片为空或报错，而非结构化统计，本测试必须失败。"""
-        build_stats_event = getattr(notifier, "build_stats_event", None)
-        assert (build_stats_event) is not None, "build_stats_event 尚未实现"
-
-        event = build_stats_event(
-            "光鸭整理完成 <A>",
-            {
-                "总视频": 5,
-                "已移动": 3,
-                "失败": 1,
-                "空值": "",
-            },
-            footer="目录：来源&一",
-        )
-        rendered = notifier.render_event(event)
-
-        self.assertIn("光鸭整理完成 &lt;A&gt;", rendered)
-        self.assertIn("<b>🎞️ 总视频：</b>5", rendered)
-        self.assertIn("<b>📥 已移动：</b>3", rendered)
-        self.assertIn("<b>❌ 失败：</b>1", rendered)
-        self.assertNotIn("空值", rendered)
-        self.assertIn("目录：来源&amp;一", rendered)
-
-    def test_stats_footer_preserves_false_values(self):
-        for footer, expected in ((0, "0"), (False, "False"), (None, "")):
-            with self.subTest(footer=footer):
-                event = notifier.build_stats_event("统计", {}, footer=footer)
-                self.assertEqual(event.footer, expected)
-                rendered = notifier.render_event(event)
-                self.assertEqual(rendered.splitlines()[1:], [expected] if expected else [])
-
 
 class BusinessNotificationIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
