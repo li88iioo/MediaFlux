@@ -1369,13 +1369,13 @@ class Cloud:
     @sdk_method('read')
     def list(parent_id: str = "0", *, recursive: bool = False, query: str = "",
              kinds: builtins.list[str] | None = None, limit: int | None = None, offset: int = 0,
-             max_items: int = 100_000, max_depth: int = 64) -> dict:
-        """按真实目录ID完整读取后过滤/分页；0为根目录。items含真实file_id/parent_id、路径及原属性，total为实际匹配总数。预算不足或翻页失败直接报错，不能把一页当全量；query按名称字面包含。"""
+             max_items: int = 100_000, max_depth: int = 64, max_dirs: int = 64) -> dict:
+        """按真实目录ID完整读取后过滤/分页；0为根目录。items含真实file_id/parent_id、路径及原属性，total为实际匹配总数。默认最多读取64个目录（含根），max_dirs上限5000。预算不足或翻页失败报错，不返回不完整清单；query按名称字面包含，仍会扫描全部选定范围。"""
         from app.modules.guangya_workspace import list_files
 
         with _cloud_client() as client:
             return list_files(client, parent_id, recursive=recursive, query=query, kinds=kinds,
-                              limit=limit, offset=offset, max_items=max_items, max_depth=max_depth,
+                              limit=limit, offset=offset, max_items=max_items, max_depth=max_depth, max_dirs=max_dirs,
                               should_stop=_CALL_CANCELLED.get())
 
     @staticmethod

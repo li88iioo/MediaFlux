@@ -462,6 +462,29 @@ def test_cloud_listing_cancellation_stops_provider_pages_without_complete_result
     assert raw.fs_detail.call_count == (1 if stop_at == "location" else 0)
 
 
+def test_cloud_recursive_listing_stops_before_reading_an_oversized_tree():
+    client = Mock(logged_in=True)
+    children = [GuangYaFile(f"dir-{i}", f"目录{i}", True, parent_id="0") for i in range(64)]
+    client.iter_dir.side_effect = lambda identifier, **kwargs: iter(children if identifier == "0" else [])
+    with patch("app.clients.guangya.GuangYaClient", return_value=client):
+        # 即使query完全不匹配也会遍历目录；输出分页不能降低读取成本。
+        with pytest.raises(RuntimeError, match="64.*目录.*预算"):
+            sdk.cloud.list(recursive=True, query="不存在的文件", limit=1)
+        assert client.iter_dir.call_count == 1
+        client.iter_dir.reset_mock()
+        complete = sdk.cloud.list(recursive=True, max_dirs=65)
+        assert complete["scan_complete"] and complete["scanned_dirs"] == 65
+        assert complete["total"] == 64
+        assert client.iter_dir.call_count == 65
+        client.iter_dir.reset_mock()
+        shallow = sdk.cloud.list()
+        assert shallow["total"] == 64 and shallow["scanned_dirs"] == 1
+        for invalid in (True, 0, 5001):
+            with pytest.raises(RuntimeError, match="预算无效"):
+                sdk.cloud.list(recursive=True, max_dirs=invalid)
+        assert client.iter_dir.call_count == 1
+
+
 def test_recycle_preserves_complete_pages_and_distinct_provider_ids(recycle_client):
     raw = recycle_client.raw
     result = sdk.cloud.recycle()

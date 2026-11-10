@@ -39,14 +39,15 @@ def file_location(client: GuangYaClient, file_id: str, *, check_cancelled: Calla
 
 def list_files(client: GuangYaClient, parent_id: str = "0", *, recursive: bool = False, query: str = "",
                kinds: list[str] | None = None, limit: int | None = None, offset: int = 0,
-               max_items: int = 100_000, max_depth: int = 64,
+               max_items: int = 100_000, max_depth: int = 64, max_dirs: int = 5_000,
                should_stop: Callable[[], bool] | None = None) -> dict:
     """完整读取所选范围后过滤/分页；深度或数量预算不足时抛错，绝不伪装全量。"""
     if not isinstance(parent_id, str) or not parent_id or type(recursive) is not bool or not isinstance(query, str):
         raise GuangYaWorkspaceError("目录ID、recursive或query参数无效")
     if (type(offset) is not int or offset < 0 or (limit is not None and (type(limit) is not int or not 1 <= limit <= 10_000))
             or type(max_items) is not int or not 1 <= max_items <= 100_000
-            or type(max_depth) is not int or not 0 <= max_depth <= 64):
+            or type(max_depth) is not int or not 0 <= max_depth <= 64
+            or type(max_dirs) is not int or not 1 <= max_dirs <= 5_000):
         raise GuangYaWorkspaceError("分页或扫描预算无效")
     if kinds is not None and (not isinstance(kinds, list) or any(kind not in {"directory", "video", "subtitle", "image", "metadata", "other"} for kind in kinds)):
         raise GuangYaWorkspaceError("kinds包含未知媒体类型")
@@ -64,8 +65,6 @@ def list_files(client: GuangYaClient, parent_id: str = "0", *, recursive: bool =
         check_cancelled()
         identifier, path, relative, depth = queue.popleft()
         directories += 1
-        if directories > 5_000:
-            raise GuangYaWorkspaceError("目录数量超过完整读取预算，请缩小范围")
         for item in client.iter_dir(identifier, should_stop=should_stop):
             check_cancelled()
             if item.file_id in seen or item.parent_id != identifier:
@@ -80,6 +79,11 @@ def list_files(client: GuangYaClient, parent_id: str = "0", *, recursive: bool =
             if recursive and item.is_dir:
                 if depth >= max_depth:
                     raise GuangYaWorkspaceError("递归深度超过完整读取预算，请缩小范围")
+                if directories + len(queue) >= max_dirs:
+                    raise GuangYaWorkspaceError(
+                        f"范围超过 {max_dirs} 个目录的读取预算，未返回不完整清单；"
+                        "请缩小parent_id范围。query只过滤结果，不减少目录扫描。"
+                    )
                 queue.append((item.file_id, row["path"], child_relative, depth + 1))
         check_cancelled()  # iter_dir取消时可提前结束，不能把半份目录当成完整快照。
     matches = [row for row in rows if (not query or query.casefold() in row["name"].casefold())
