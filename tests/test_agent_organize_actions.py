@@ -86,6 +86,11 @@ def _atomic_clean_client(*, credential_generation: int = 0):
 
 
 class GuangYaOrganizeActionTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch(
+            "app.modules.organize_tasks.db.list_protected_guangya_staging_ids", return_value=set(),
+        ))
+
     def test_configured_sources_normalize_and_deduplicate(self):
         values = {
             "GY_ORGANIZE_SOURCE_DIRS": '[{"id":"source-a","name":"A"},"source-b",{"id":"source-a","name":"Duplicate"}]'
@@ -401,6 +406,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             max_files=100,
             post_actions=False,
             protected_source_ids={"secret-source-id"},
+            protected_staging_ids=set(),
         )
         manager.start.assert_not_called()
         serialized = str(result)
@@ -442,6 +448,33 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             self.assertEqual(
                 call.kwargs["protected_source_ids"], {"parent-source", "child-source"}
             )
+
+    def test_protected_staging_preview_reports_blockage_and_preserves_safe_work(self):
+        sources = [{"id": "source", "name": "动漫"}]
+        rules = OrganizeRules(target_dir_id="target")
+        manager = Mock()
+        manager.task_status.return_value = {"status": "idle"}
+        blocked = {"file_id": "stage", "source_dir_id": "source", "path": "动漫/MF-557-release",
+                   "reason": "下载隔离目录仍可能被写入或等待核验"}
+        for total in (0, 1):
+            with self.subTest(safe_media=total):
+                organizer = Mock()
+                organizer.organize.return_value = (
+                    [_preview_plan()] if total else [],
+                    {**_preview_stats(total=total), "scan_complete": False, "protected_staging_dirs": [blocked]},
+                )
+                with patch("app.modules.organize_service.configured_inputs", return_value=(sources, rules, "")), patch(
+                    "app.modules.organize_service.get_organize_manager", return_value=manager,
+                ), patch("app.modules.organize_service.GuangYaClient", return_value=_atomic_clean_client()), patch(
+                    "app.modules.organize_service.Organizer", return_value=organizer,
+                ):
+                    result, _context = prepare_run()
+
+                self.assertEqual(result["status"], "preview" if total else "inconclusive")
+                self.assertEqual(result["ok"], bool(total))
+                self.assertIn("受保护下载目录", result["summary"])
+                self.assertEqual(result["data"]["stats"]["protected_staging_dirs"], [blocked])
+                self.assertEqual(result["data"]["sampled_files"], total)
 
     def test_incomplete_scan_and_empty_confirmation_do_not_create_action_preview(self):
         sources = [{"id": "secret-source-id", "name": "Secret Source"}]

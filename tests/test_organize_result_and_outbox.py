@@ -6,10 +6,14 @@
 """
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import Mock, patch
 from app.modules.organize_results import (
     ORGANIZE_RESULT_SCHEMA_VERSION,
     build_organize_result,
+    observe_organize_task,
+    organize_status,
     read_organize_result,
 )
 from app.modules.strm_notifications import build_strm_detail_messages
@@ -84,6 +88,82 @@ class OrganizeResultSchemaTests(unittest.TestCase):
         self.assertEqual(read_organize_result(result)["protected_staging_dirs"], blocked)
         self.assertEqual(build_organize_result({}, status="completed")["protected_staging_dirs"], [])
         self.assertTrue(build_organize_result({}, status="completed")["scan_complete"])
+
+    def test_status_explains_protected_staging_in_live_and_persisted_results(self):
+        stats = {"total": 0, "matched": 0, "moved": 0, "scan_complete": False,
+                 "protected_staging_dirs": [{
+                     "file_id": "private-stage-id", "source_dir_id": "private-source-id",
+                     "path": "/private/Anime/MF-557-release",
+                     "reason": "受保护下载目录未扫描 token=private-provider-token",
+                 }]}
+        for persisted in (False, True):
+            with self.subTest(persisted=persisted):
+                manager = Mock()
+                manager.status.return_value = {"status": "partial", "stats": stats}
+                row = {"task_name": "guangya_organize", "status": "partial",
+                       "result": json.dumps(build_organize_result(stats, status="partial")),
+                       "trigger_type": "manual", "started_at": "", "finished_at": ""}
+                with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), patch(
+                    "app.database.get_task_run", return_value=row,
+                ):
+                    result = organize_status(557 if persisted else None)
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], "attention")
+                self.assertIn("受保护下载目录", result["summary"])
+                self.assertIn("仍可能被写入或等待核验", result["error"])
+                self.assertNotIn("已移动目录", result["error"])
+                self.assertIn("原整理日志查看详情并纠正后重新整理", str(result["suggestions"]))
+                self.assertEqual(result["data"]["task"]["protected_staging_count"], 1)
+                self.assertFalse(result["data"]["task"]["scan_complete"])
+                for private in ("private-stage-id", "private-source-id", "/private/", "private-provider-token"):
+                    self.assertNotIn(private, str(result))
+
+    def test_protected_staging_cannot_claim_completion_and_keeps_continuation_guidance(self):
+        from app.modules.organize_results import project_organize_status
+
+        for resumed in ([], [557]):
+            with self.subTest(resumed=bool(resumed)):
+                result = project_organize_status({"status": "completed", "stats": {
+                    "moved": 1, "strm_scope_unknown": 1, "scan_complete": False,
+                    "protected_staging_dirs": [{"file_id": "stage"}], "resumed_download_ids": resumed,
+                }}, overview={})
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["data"]["task"]["status"], "partial")
+                self.assertEqual(result["data"]["task"]["stats"]["moved"], 1)
+                self.assertIn("同步范围未能确认", str(result["suggestions"]))
+                if resumed:
+                    self.assertIn("尚不代表入库完成", result["summary"])
+                    self.assertIn("无需再次提交", str(result["suggestions"]))
+                    self.assertNotIn("未自动接管", result["error"])
+                else:
+                    self.assertIn("原整理日志", str(result["suggestions"]))
+
+    def test_reorganize_stop_and_undo_observe_the_named_task_without_following_latest(self):
+        from app.modules.organize_tasks import OrganizeTaskManager
+
+        for operation in ("reorganize", "stop", "undo"):
+            with self.subTest(operation=operation):
+                manager = OrganizeTaskManager()
+                manager._task = {"id": "later-task", "status": "completed", "stats": {"moved": 99}}
+                manager._task_history.append({
+                    "id": "original-task", "status": "partial", "operation": operation,
+                    "stats": {"moved": 1, "failed": 1},
+                })
+                with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), patch.object(
+                    manager, "status", return_value={"status": "completed", "stats": {"moved": 99}},
+                ), patch("app.modules.organize_tasks.get_organize_operation_job", return_value=None):
+                    result = observe_organize_task({
+                        "kind": "guangya_organize_task", "operation": operation, "task_id": "original-task",
+                    })
+                    missing = observe_organize_task({"operation": operation, "task_id": "missing-task"})
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["status"], "attention")
+                self.assertEqual(result["data"]["task"]["status"], "partial")
+                self.assertEqual(result["data"]["task"]["stats"], {"moved": 1, "failed": 1})
+                self.assertEqual(missing["status"], "unknown")
 
     def test_protected_download_prevents_a_success_notification(self):
         from app.modules.organize import Organizer

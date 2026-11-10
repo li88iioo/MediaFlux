@@ -202,12 +202,13 @@ def project_organize_status(
     safe_result = _safe_operation_result(raw)
     stats = safe_result.get("stats", {})
     handoff_error = organize_strm_error(stats)
-    if handoff_error and task_status == "completed":
-        task_status = "partial"
     # 整源扫描与下载后续整理是同一业务的两个阶段；保留入队事实，而非伪报入库完成。
     result = raw.get("result") or raw.get("stats") or {}
     resumed_ids = result.get("resumed_download_ids", []) if isinstance(result, dict) else []
     resumed_count = len({value for value in resumed_ids if type(value) is int and value > 0}) if isinstance(resumed_ids, list) else 0
+    protected_count = len(_dict_list(result.get("protected_staging_dirs"))) if isinstance(result, dict) else 0
+    if (handoff_error or protected_count) and task_status == "completed":
+        task_status = "partial"
     schedule_raw = (
         overview.get("schedule") if isinstance(overview.get("schedule"), dict) else {}
     )
@@ -246,6 +247,8 @@ def project_organize_status(
             ["已恢复的下载整理会由下载跟踪器重新核验落稳后继续，无需再次提交整理；可查询下载任务进度。其他未恢复或失败项仍需单独核对。"]
             if resumed_count else ["请到网盘整理页核对失败项后再决定是否重试。"]
         )
+        if protected_count and not resumed_count:
+            suggestions = ["请先核对下载任务状态；已完成下载的待确认项可从原整理日志查看详情并纠正后重新整理。"]
     elif task_status in {"stopped", "cancelled"}:
         ok, status, summary = True, "stopped", "最近一次光鸭整理任务已停止"
         suggestions = []
@@ -268,6 +271,10 @@ def project_organize_status(
 
     # 只公开有明确统计依据的故障阶段，不转发 Provider 原始异常或私有路径。
     problems = []
+    if protected_count:
+        summary += f"；受保护下载目录 {protected_count} 个未扫描"
+        if task_status in {"partial", "failed", "manual_review"}:
+            problems.append(f"{protected_count} 个受保护下载目录未扫描：下载隔离目录仍可能被写入或等待核验")
     if handoff_error:
         problems.append(handoff_error)
         suggestions.append("已完成的云端变更无需重复执行；恢复 STRM 调度后执行同步补齐，不要重新下载或整理。")
@@ -296,6 +303,9 @@ def project_organize_status(
         "finished_at": _status_timestamp(raw.get("finished_at")),
         "stats": stats,
     }
+    if protected_count:
+        task_data["protected_staging_count"] = protected_count
+        task_data["scan_complete"] = False
     if resumed_count:
         task_data["resumed_download_count"] = resumed_count
         summary += f"；本轮已恢复 {resumed_count} 个下载整理任务，尚不代表入库完成"
@@ -467,7 +477,7 @@ def organize_status(run_id: int | None = None, *, expected_task_id: str | None =
 
 
 def observe_organize_task(completion: dict[str, Any]) -> dict:
-    """回执绑定原运行及任务；旧停止、回退仍读取原任务，不替换为当前运行。"""
+    """回执绑定原运行及任务；停止、回退、纠正均读取原任务，不替换为当前运行。"""
     run_id = completion.get("run_id")
     task_id = str(completion.get("task_id") or "").strip()
     operation = str(completion.get("operation") or "")
@@ -475,7 +485,7 @@ def observe_organize_task(completion: dict[str, Any]) -> dict:
         return organize_status(run_id, expected_task_id=task_id)
     raw = None
     overview: dict[str, Any] = {}
-    if operation in {"stop", "undo"} and task_id:
+    if operation in {"stop", "undo", "reorganize"} and task_id:
         from app.modules.organize_tasks import get_organize_manager
 
         manager = get_organize_manager()

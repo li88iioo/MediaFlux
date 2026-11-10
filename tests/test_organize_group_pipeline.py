@@ -1012,6 +1012,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
     def _run(self, *, gy_status="completed", safe_media=False):
         from app import database as db
         from app.modules import organize_tasks as tasks_module
+        from app.modules.organize_service import preview_sources
 
         request_id, _ = db.create_download_request("staging-scan-fixture", "magnet")
         db.update_download_request(
@@ -1031,6 +1032,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
             tree["root"].append(_video("safe", "Normal.mkv", "root"))
         client = _TreeClient(tree, root_name="NewNsfw")
         harness = _PipelineHarness(client)
+        harness.plan_hook = lambda _group, stats: stats.update(matched=stats["total"])
         manager = tasks_module.OrganizeTaskManager()
         run_id = db.add_task_run("guangya_organize", "telegram", result=json.dumps({"task_id": "protected-task"}))
         manager._task = {"id": "protected-task", "run_id": run_id, "status": "running", "stats": {}}
@@ -1042,16 +1044,34 @@ class ProtectedStagingTaskTests(unittest.TestCase):
         ), patch.object(manager, "_wake_download_tracker"), patch.object(
             tasks_module, "resolve_organize_workers", return_value=1,
         ):
+            preview = preview_sources(
+                [{"id": "root", "name": "NewNsfw"}], harness.rules, client=client,
+            )
             manager._run(
                 "protected-task", run_id, [{"id": "root", "name": "NewNsfw"}],
                 harness.rules, trigger_type="telegram", client=client,
             )
-        return manager.task_status(), client, db.get_download_request(request_id)
+        return manager.task_status(), client, db.get_download_request(request_id), preview
+
+    def test_preview_and_execution_share_staging_exclusions_and_keep_safe_media(self):
+        for safe_media in (False, True):
+            with self.subTest(safe_media=safe_media):
+                task, client, _row, preview = self._run(safe_media=safe_media)
+
+                self.assertEqual(preview["sampled_files"], task["stats"]["total"])
+                self.assertEqual(preview["stats"]["matched"], int(safe_media))
+                self.assertEqual(len(preview["plans"]), int(safe_media))
+                self.assertFalse(preview["stats"]["scan_complete"])
+                self.assertEqual(preview["stats"]["protected_staging_dirs"],
+                                 task["stats"]["protected_staging_dirs"])
+                self.assertEqual(preview["scan_errors"], 0)
+                self.assertNotIn("stage", client.calls)
+                self.assertNotIn("inner", client.calls)
 
     def test_completed_moved_staging_is_explicitly_partial_without_releasing_protection(self):
         from app import database as db
 
-        task, client, row = self._run()
+        task, client, row, _preview = self._run()
 
         self.assertEqual(task["status"], "partial")
         self.assertEqual(task["stats"]["total"], 0)
@@ -1075,7 +1095,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
         self.assertIn("MF-101-FixtureRelease", _organize_terminal_progress(task))
 
     def test_active_download_stays_blocked_while_ordinary_media_can_be_organized(self):
-        task, client, _row = self._run(gy_status="downloading", safe_media=True)
+        task, client, _row, _preview = self._run(gy_status="downloading", safe_media=True)
 
         self.assertEqual(task["status"], "partial")
         self.assertEqual(task["stats"]["moved"], 1)
@@ -1083,7 +1103,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
         self.assertNotIn("inner", client.calls)
 
     def test_unknown_download_is_not_admitted_even_with_old_stable_snapshot(self):
-        task, client, _row = self._run(gy_status="")
+        task, client, _row, _preview = self._run(gy_status="")
 
         self.assertEqual(task["status"], "partial")
         self.assertEqual(task["stats"]["moved"], 0)

@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from typing import Any
 
-from app import config
+from app import config, database as db
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot
@@ -14,7 +15,7 @@ from app.modules.organize_sources import (
     configured_organize_sources,
     normalize_organize_source_ids,
 )
-from app.modules.organize_tasks import get_organize_manager
+from app.modules.organize_tasks import _protected_source_ids, get_organize_manager
 
 logger = get_logger(__name__)
 
@@ -79,11 +80,12 @@ def preview_sources(sources, rules, *, max_files=100, client=None) -> dict:
     """Web 与 SDK 共用 dry-run；上限仅约束预览，不缩减随后触发的来源范围。"""
     if type(max_files) is not int or not 1 <= max_files <= 1000:
         raise OrganizeServiceError("预览数量上限必须是 1-1000 的整数")
-    aggregate: dict[str, int] = {}
+    aggregate: dict[str, Any] = {"scan_complete": True, "protected_staging_dirs": []}
     plans_out = []
     scan_errors = 0
     remaining = max_files
-    protected = {source["id"] for source in sources}
+    protected_staging_ids = db.list_protected_guangya_staging_ids()
+    protected = _protected_source_ids(sources, staging_ids=protected_staging_ids)
     for source in sources:
         if remaining <= 0:
             break
@@ -100,13 +102,18 @@ def preview_sources(sources, rules, *, max_files=100, client=None) -> dict:
                 max_files=remaining,
                 post_actions=False,
                 protected_source_ids=protected,
+                protected_staging_ids=protected_staging_ids,
             )
         finally:
             organizer.close()
         scan_errors += len(stats.get("scan_errors") or [])
         for key, value in stats.items():
-            if isinstance(value, int):
+            if isinstance(value, int) and not isinstance(value, bool):
                 aggregate[key] = aggregate.get(key, 0) + value
+        aggregate["scan_complete"] = bool(
+            aggregate["scan_complete"] and stats.get("scan_complete", True)
+        )
+        aggregate["protected_staging_dirs"].extend(stats.get("protected_staging_dirs") or [])
         remaining -= int(stats.get("total", 0))
         for plan in plans:
             plans_out.append(
@@ -190,6 +197,16 @@ def _preview(
             "data": data,
             "error": "部分目录无法读取，本次不会创建执行确认。",
         }
+    protected_count = len(data["stats"].get("protected_staging_dirs") or [])
+    protected_summary = f"受保护下载目录 {protected_count} 个未扫描" if protected_count else ""
+    if protected_count and data["sampled_files"] == 0:
+        return {
+            "ok": False,
+            "status": "inconclusive",
+            "summary": f"光鸭整理预览受阻：{protected_summary}",
+            "data": data,
+            "error": "下载隔离目录仍可能被写入或等待核验；已完成下载的待确认项可从原整理日志查看详情并纠正后重新整理。",
+        }
     if for_confirmation and data["sampled_files"] == 0:
         return {
             "ok": True,
@@ -200,7 +217,8 @@ def _preview(
     return {
         "ok": True,
         "status": "preview",
-        "summary": "只读预览已生成；确认后整理所选来源的全部文件，预览数量不限制执行范围",
+        "summary": "只读预览已生成；确认后整理所选来源的全部可整理文件，预览数量不限制执行范围"
+        + (f"；{protected_summary}" if protected_summary else ""),
         "data": data,
     }
 
