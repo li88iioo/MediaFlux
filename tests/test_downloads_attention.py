@@ -303,12 +303,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         item = download_dispatcher.DownloadInput(
             "magnet", "Transferred query fixture", "magnet:?xt=urn:btih:" + "a" * 40
         )
-        request_id = int(download_dispatcher.create_request(item, "", "", origin="agent")["id"])
-        download_requests_repo.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
-        with patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "a" * 40}) as submit:
-            result = download_dispatcher.resubmit_download_request(
-                request_id, "qb", qb_runtime_config={"url": "http://fixture.invalid"}
-            )
+        # 活动按更新时间排序、同秒再按 id；固定时钟避免跨秒时旧请求的移交标记排到新请求前。
+        with patch.object(db, "now", return_value="2026-11-09 01:00:00"):
+            request_id = int(download_dispatcher.create_request(item, "", "", origin="agent")["id"])
+            download_requests_repo.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
+            with patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "a" * 40}) as submit:
+                result = download_dispatcher.resubmit_download_request(
+                    request_id, "qb", qb_runtime_config={"url": "http://fixture.invalid"}
+                )
         self.assertTrue(result["ok"], result)
         submit.assert_called_once()
         successor_id = result["request_id"]

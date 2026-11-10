@@ -1046,20 +1046,22 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     finished.set()
 
+        # 搜索被闸门挂住，只能由取消结束；超时仅防挂死。若站点超时先触发，
+        # 搜索会作为已完成读调用留下结果文件，测试就不再覆盖“进行中取消”。
         service = IndexerService(registry=IndexerRegistry({"nyaa": GatedAdapter("nyaa")}),
                                  result_store=IndexerResultStore(),
-                                 site_timeout_seconds=3, total_timeout_seconds=4)
+                                 site_timeout_seconds=60, total_timeout_seconds=90)
         loop = asyncio.get_running_loop()
         runtime.bind_indexer_event_loop(loop)
         task = None
         try:
             with patch.object(runtime, "get_indexer_service", return_value=service):
                 task = asyncio.create_task(self.execute('mf.resources.search("Demo", sites=["nyaa"])'))
-                await asyncio.wait_for(entered.wait(), 2)
+                await asyncio.wait_for(entered.wait(), 30)
                 self.context.cancellation.cancel()
                 with self.assertRaises(asyncio.CancelledError):
-                    await asyncio.wait_for(task, 2)
-                await asyncio.wait_for(finished.wait(), 1)
+                    await asyncio.wait_for(task, 30)
+                await asyncio.wait_for(finished.wait(), 30)
             workspace, _ = sandbox._workspace_location(self.context.owner, self.context.session_id)
             self.assertEqual(list((workspace / "output").glob("*.sdk.json")), [])
             self.assertFalse(self.background_processes())
