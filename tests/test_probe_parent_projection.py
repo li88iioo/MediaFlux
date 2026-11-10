@@ -5,6 +5,9 @@ import json
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
+from app.repositories import organize_probe as organize_probe_repo
 from app.modules import telegram_notification_center as center
 from app.modules.organize_probe_notifications import (
     build_notification_context,
@@ -35,8 +38,8 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
         self.enterContext(patch("app.modules.telegram_download_lifecycle.config.get_bool", return_value=True))
         self.send = self.enterContext(patch.object(center, "send_event_result", return_value=TelegramSendResult(ok=True, message_id=101)))
         self.edit = self.enterContext(patch.object(center, "edit_event_result", return_value=TelegramSendResult(ok=True, message_id=101)))
-        self.request_id, _ = db.create_download_request("projection-synthetic", "magnet", chat_id="chat-a")
-        db.update_download_request(self.request_id, status="completed", gy_status="completed", organize_status="completed", strm_status="completed")
+        self.request_id, _ = download_requests_repo.create_download_request("projection-synthetic", "magnet", chat_id="chat-a")
+        download_requests_repo.update_download_request(self.request_id, status="completed", gy_status="completed", organize_status="completed", strm_status="completed")
         self.context = build_notification_context(download_request_ids=[self.request_id])
         publish_download_lifecycle(self.request_id)
 
@@ -48,7 +51,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
 
     def job(self, status: str, *, context=None, file_id="synthetic-file") -> int:
         log_id = db.add_organize_log("guangya", "old", "new", file_id, "success", "1")
-        job_id = db.enqueue_organize_probe_completion(log_id, source_id="synthetic-source", rel_dir="series", rules={}, notification_context=context or self.context)
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(log_id, source_id="synthetic-source", rel_dir="series", rules={}, notification_context=context or self.context)
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_probe_queue SET status=?,pending_strm_changes_json='[]' WHERE id=?", (status, job_id))
         return job_id
@@ -65,7 +68,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
         self.assertIn("⚠️", self.snapshot()["event"]["title"])
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT status FROM organize_probe_queue WHERE id=?", (job_id,)).fetchone()[0], "failed")
-        get_download_request_result = db.get_download_request(self.request_id)
+        get_download_request_result = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["strm_status"], "completed")
         self.assertNotIn("private-provider-error", self.snapshot()["event_json"])
@@ -89,7 +92,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
     def test_failed_strm_handoff_is_not_downgraded_to_success_or_processing(self) -> None:
         self.job("completed")
         change = {"source_id": "synthetic-source", "rel_dir": "series", "file_id": "synthetic-file", "kind": "video", "name": "file.mkv"}
-        db.enqueue_strm_change_targets(tag_probe_changes([change], self.context, notify_enabled=True))
+        strm_repo.enqueue_strm_change_targets(tag_probe_changes([change], self.context, notify_enabled=True))
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_change_queue SET state='failed',last_error='synthetic read error'")
         self.probe_error()
@@ -112,7 +115,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
 
     def test_action_priority_is_preserved_alongside_probe_failure(self) -> None:
         self.job("failed")
-        db.update_download_request(self.request_id, organize_status="requires_manual")
+        download_requests_repo.update_download_request(self.request_id, organize_status="requires_manual")
         publish_download_lifecycle(self.request_id)
         self.assertEqual(self.snapshot()["importance"], "action")
         self.assertIn("需要处理", self.snapshot()["event"]["title"])
@@ -126,7 +129,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
         publish_download_lifecycle(self.request_id)
         self.assertEqual(self.snapshot()["importance"], "result")
         self.assertIn("✅", self.snapshot()["event"]["title"])
-        db.update_download_request(self.request_id, organize_status="failed", organize_error="original business failure")
+        download_requests_repo.update_download_request(self.request_id, organize_status="failed", organize_error="original business failure")
         publish_download_lifecycle(self.request_id)
         self.assertEqual(self.snapshot()["importance"], "error")
         self.assertIn("original business failure", self.snapshot()["event_json"])
@@ -134,9 +137,9 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
     def test_persisted_silent_handoff_override_cannot_promote_parent_error(self) -> None:
         self.job("completed")
         change = {"source_id": "synthetic-source", "rel_dir": "series", "file_id": "synthetic-file", "kind": "video", "name": "file.mkv"}
-        db.enqueue_strm_change_targets(tag_probe_changes([change], self.context, notify_enabled=False))
-        target = db.claim_strm_change_targets(owner="silent-test")[0]
-        db.fail_strm_change_target(target["id"], expected_owner="silent-test", expected_lease_generation=target["lease_generation"], error="private silent failure", max_attempts=1)
+        strm_repo.enqueue_strm_change_targets(tag_probe_changes([change], self.context, notify_enabled=False))
+        target = strm_repo.claim_strm_change_targets(owner="silent-test")[0]
+        strm_repo.fail_strm_change_target(target["id"], expected_owner="silent-test", expected_lease_generation=target["lease_generation"], error="private silent failure", max_attempts=1)
         publish_download_lifecycle(self.request_id)
         self.assertEqual(self.snapshot()["importance"], "result")
         self.assertNotIn("需要复核", self.snapshot()["event_json"])
@@ -153,7 +156,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
     def test_success_callback_preserves_existing_unresolved_failure_payload(self) -> None:
         self.job("completed")
         change = {"source_id": "synthetic-source", "rel_dir": "series", "file_id": "synthetic-file", "kind": "video", "name": "file.mkv"}
-        db.enqueue_strm_change_targets(tag_probe_changes([change], self.context, notify_enabled=True))
+        strm_repo.enqueue_strm_change_targets(tag_probe_changes([change], self.context, notify_enabled=True))
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_change_queue SET state='failed',last_error='still failed'")
         self.probe_error()
@@ -163,7 +166,7 @@ class ProbeParentProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.snapshot()["event_json"], before)
 
     def test_unavailable_download_route_does_not_guess_default_recipient(self) -> None:
-        with (patch.object(db, "get_download_request", side_effect=OSError("route unavailable")),
+        with (patch.object(download_requests_repo, "get_download_request", side_effect=OSError("route unavailable")),
               patch("app.modules.organize_probe_notifications.get", return_value="admin")):
             context = build_notification_context(download_request_ids=[self.request_id])
         publish_probe_scope({"probe": True, "context": context, "notify_override": True}, strm_status="失败", media_refresh="", partial=True, error="private failure")

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_move_transaction import LocalMoveError, LocalMoveTransaction
 from app.modules.local_storage import LocalFileSnapshot, LocalFilesystemAdapter
 from tests.support import IsolatedDatabaseTestCase
@@ -27,11 +27,11 @@ class Plan:
 
 class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
     def _task(self, source_root: Path) -> int:
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"source-{uuid.uuid4().hex}", qb_profile="", qb_path_prefix="",
             local_root=str(source_root), owner="admin",
         )
-        return db.create_local_media_task(
+        return local_media_repo.create_local_media_task(
             source_id, "", str(source_root), owner="admin", trigger="manual"
         )
 
@@ -51,7 +51,7 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
             self.assertEqual(result.status, "completed")
             self.assertFalse(source.exists())
             self.assertEqual(target.read_bytes(), b"movie-data")
-            steps = db.list_local_media_operation_steps(task_id, owner="admin")
+            steps = local_media_repo.list_local_media_operation_steps(task_id, owner="admin")
             self.assertEqual((steps[0]["action"], steps[0]["status"]), ("rename", "completed"))
 
     def test_replace_action_commits_new_file_and_removes_temporary_backup(self):
@@ -337,7 +337,7 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
                     transaction.execute([Plan(snapshot, target_root / source.name)])
             self.assertTrue(source.exists())
             self.assertFalse((target_root / source.name).exists())
-            steps = db.list_local_media_operation_steps(task_id, owner="admin")
+            steps = local_media_repo.list_local_media_operation_steps(task_id, owner="admin")
             self.assertEqual(steps[0]["status"], "rolled_back")
 
     def test_cross_filesystem_final_verification_failure_keeps_source_and_removes_target(self):

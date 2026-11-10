@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 from typing import Any
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.repositories.activity import prepare_follow, follow, prepare_unfollow, unfollow, follows
 from app.agent.models import ToolContext
 from app.agent.owner_routes import web_kernel_owner
@@ -25,8 +26,8 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
             conn.execute('DELETE FROM download_log')
             conn.execute('DELETE FROM download_requests')
         self.context = ToolContext(owner=web_kernel_owner('follow-test'), session_id='one')
-        identifier, _ = db.create_download_request('follow-request', 'magnet', title='测试剧集')
-        db.update_download_request(identifier, status='downloading', gy_status='downloading')
+        identifier, _ = download_requests_repo.create_download_request('follow-request', 'magnet', title='测试剧集')
+        download_requests_repo.update_download_request(identifier, status='downloading', gy_status='downloading')
         self.identifier = identifier
         self.arguments: dict[str, Any] = {'kind': 'download', 'identifier': identifier, 'hours': 24}
         get = config.get
@@ -51,7 +52,7 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
         with patch.object(config, 'get', side_effect=lambda key, default='': values.get(key, current_get(key, default))), patch('app.modules.telegram_notification_center.send_event_result', side_effect=[TelegramSendResult(ok=False, status_code=429, retry_after_seconds=1), TelegramSendResult(ok=True, message_id=1234)]) as send:
             token = prepare_follow(**self.arguments, owner=context.owner, delivery_route=context.delivery_route)['snapshot']
             saved = follow(**self.arguments, owner=context.owner, delivery_route=context.delivery_route, expected_snapshot=token)
-            db.update_download_request(self.identifier, status='completed', gy_status='completed')
+            download_requests_repo.update_download_request(self.identifier, status='completed', gy_status='completed')
             self.assertEqual(drain_automation_rules(now=datetime.now().astimezone() + timedelta(seconds=1)), 1)
             self.assertFalse(drain_telegram_notifications())
             with db.get_conn() as conn:
@@ -148,7 +149,7 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
         with patch('app.modules.media_automation_rules.publish_notification_event', return_value=Mock(status='queued')) as send:
             self.assertEqual(drain_automation_rules(now=now), 1)
             send.assert_not_called()
-            db.update_download_request(self.identifier, status='completed', gy_status='completed')
+            download_requests_repo.update_download_request(self.identifier, status='completed', gy_status='completed')
             self.assertEqual(drain_automation_rules(now=now + timedelta(minutes=6)), 1)
             send.assert_called_once()
             event = send.call_args.args[1]
@@ -161,13 +162,13 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
 
     def test_resubmission_ends_follow_once_without_claiming_download_or_library_completion(self):
         self.save()
-        successor, _ = db.create_download_request('follow-successor', 'magnet', title='测试剧集')
-        db.update_download_request(successor, targets='guangya', status='downloading', gy_status='downloading')
+        successor, _ = download_requests_repo.create_download_request('follow-successor', 'magnet', title='测试剧集')
+        download_requests_repo.update_download_request(successor, targets='guangya', status='downloading', gy_status='downloading')
         run = db.add_task_run('organize', 'follow-resubmission')
         db.finish_task_run(run, 'failed', error='旧整理运行失败')
-        db.update_download_request(self.identifier, targets='guangya', status='failed', gy_status='failed',
+        download_requests_repo.update_download_request(self.identifier, targets='guangya', status='failed', gy_status='failed',
                                    organize_status='failed', organize_run_id=run)
-        db.mark_download_request_resubmitted(self.identifier, successor_request_id=successor, targets='guangya')
+        download_requests_repo.mark_download_request_resubmitted(self.identifier, successor_request_id=successor, targets='guangya')
         now = datetime.now().astimezone() + timedelta(seconds=1)
         with patch('app.modules.media_automation_rules.publish_notification_event', return_value=Mock(status='queued')) as send:
             self.assertEqual(drain_automation_rules(now=now), 1)
@@ -181,22 +182,22 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
             self.assertIn('未建立媒体库可见性复核', str(event.fields))
             self.assertEqual(drain_automation_rules(now=now + timedelta(minutes=6)), 0)
         self.assertFalse(follows(owner=self.context.owner)['data']['items'][0]['enabled'])
-        successor_row = db.get_download_request(successor)
+        successor_row = download_requests_repo.get_download_request(successor)
         assert successor_row is not None
         self.assertEqual(successor_row['status'], 'downloading')
 
     def test_resubmission_keeps_follow_until_the_other_backend_finishes(self):
         self.save()
-        successor, _ = db.create_download_request('follow-successor', 'magnet', title='测试剧集')
-        db.update_download_request(self.identifier, targets='both', status='manual_review',
+        successor, _ = download_requests_repo.create_download_request('follow-successor', 'magnet', title='测试剧集')
+        download_requests_repo.update_download_request(self.identifier, targets='both', status='manual_review',
                                    qb_status='downloading', gy_status='failed')
-        db.mark_download_request_resubmitted(self.identifier, successor_request_id=successor, targets='guangya')
+        download_requests_repo.mark_download_request_resubmitted(self.identifier, successor_request_id=successor, targets='guangya')
         now = datetime.now().astimezone() + timedelta(seconds=1)
         with patch('app.modules.media_automation_rules.publish_notification_event', return_value=Mock(status='queued')) as send:
             self.assertEqual(drain_automation_rules(now=now), 1)
             send.assert_not_called()
             self.assertTrue(follows(owner=self.context.owner)['data']['items'][0]['enabled'])
-            db.update_download_request(self.identifier, qb_status='completed')
+            download_requests_repo.update_download_request(self.identifier, qb_status='completed')
             self.assertEqual(drain_automation_rules(now=now + timedelta(minutes=6)), 1)
             send.assert_called_once()
             self.assertIn('移交', str(send.call_args.args[1].fields))
@@ -223,7 +224,7 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
 
     def test_failure_notification_once_and_no_retained_provider_secrets(self):
         self.save()
-        db.update_download_request(self.identifier, status='failed', gy_status='failed', error='token=secret /private/file')
+        download_requests_repo.update_download_request(self.identifier, status='failed', gy_status='failed', error='token=secret /private/file')
         with patch('app.modules.media_automation_rules.publish_notification_event', return_value=Mock(status='queued')) as send:
             drain_automation_rules(now=datetime.now().astimezone() + timedelta(seconds=1))
             self.assertNotIn('secret', str(send.call_args.args))

@@ -29,6 +29,12 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
+from app.repositories import local_media as local_media_repo
+from app.repositories import rss as rss_repo
+from app.repositories import media_proxy as media_proxy_repo
+from app.repositories import organize_history as organize_history_repo
 from app.clients.base import DashboardData
 from app.clients.emby import EmbyClient
 from app.clients.guangya import GuangYaFile
@@ -536,7 +542,7 @@ class MediaProxyTests(InitializedWebTestCase):
             "guangya_file_id": "file-1",
         }
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=binding,
         ):
             rewritten, changed = rewrite_playback_info(payload, 1, "item-1")
@@ -555,7 +561,7 @@ class MediaProxyTests(InitializedWebTestCase):
             media_root.mkdir()
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                instance_id = db.add_media_proxy_instance(
+                instance_id = media_proxy_repo.add_media_proxy_instance(
                     name="Test Jellyfin",
                     server_type="jellyfin",
                     upstream_url="http://127.0.0.1:8096",
@@ -565,23 +571,23 @@ class MediaProxyTests(InitializedWebTestCase):
                     local_root=str(media_root),
                     enabled=1,
                 )
-                get_media_proxy_instance_result = db.get_media_proxy_instance(instance_id)
+                get_media_proxy_instance_result = media_proxy_repo.get_media_proxy_instance(instance_id)
                 assert get_media_proxy_instance_result is not None
                 self.assertEqual(
                     get_media_proxy_instance_result["name"], "Test Jellyfin"
                 )
-                binding_id = db.add_media_proxy_binding(
+                binding_id = media_proxy_repo.add_media_proxy_binding(
                     instance_id=instance_id,
                     media_item_id="item-1",
                     media_source_id="source-1",
                     source_type="local",
                     local_relative_path="Movies/video.mkv",
                 )
-                binding = db.get_media_proxy_binding(instance_id, "item-1", "source-1")
+                binding = media_proxy_repo.get_media_proxy_binding(instance_id, "item-1", "source-1")
                 assert binding is not None
                 self.assertEqual(int(binding["id"]), binding_id)
-                self.assertTrue(db.delete_media_proxy_instance(instance_id))
-                self.assertEqual(db.list_media_proxy_bindings(instance_id), [])
+                self.assertTrue(media_proxy_repo.delete_media_proxy_instance(instance_id))
+                self.assertEqual(media_proxy_repo.list_media_proxy_bindings(instance_id), [])
 
     def test_management_api_masks_secret_and_rejects_absolute_binding(self):
         with tempfile.TemporaryDirectory() as root:
@@ -675,8 +681,8 @@ class DatabaseMigrationTests(unittest.TestCase):
             test_db = Path(root) / "stale-rss.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                sub_id = db.add_rss_subscription("Legacy", "https://example.com/rss")
-                entry_id = db.add_rss_entry_with_media(
+                sub_id = rss_repo.add_rss_subscription("Legacy", "https://example.com/rss")
+                entry_id = rss_repo.add_rss_entry_with_media(
                     sub_id,
                     "Interrupted submit",
                     "interrupted-guid",
@@ -689,7 +695,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                         (entry_id,),
                     )
                 db.init_db()
-                row = db.get_rss_entry(entry_id)
+                row = rss_repo.get_rss_entry(entry_id)
                 assert row is not None
                 self.assertEqual(row["status"], "failed")
                 self.assertEqual(row["failure_code"], "submission_outcome_unknown")
@@ -722,21 +728,21 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request("local-key", "magnet")
-                db.update_download_request(
+                request_id, _ = download_requests_repo.create_download_request("local-key", "magnet")
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
-                source_id = db.create_local_media_source(
+                source_id = local_media_repo.create_local_media_source(
                     name="linked-source", qb_profile="", qb_path_prefix="",
                     local_root="/downloads", owner="admin",
                 )
-                task_id = db.create_local_media_task(source_id, "", "/downloads/Movie.mkv")
+                task_id = local_media_repo.create_local_media_task(source_id, "", "/downloads/Movie.mkv")
                 tracker = DownloadTracker()
                 scheduler = Mock()
 
                 def enqueue(_task, *, wake, request_id):
                     self.assertFalse(wake)
-                    db.link_download_request_to_local_media_task(
+                    download_requests_repo.link_download_request_to_local_media_task(
                         request_id,
                         task_id,
                         "/downloads/Movie.mkv",
@@ -751,31 +757,31 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                         return_value=scheduler,
                     ),
                     patch(
-                        "app.database.get_local_media_task", return_value=linked_task
+                        "app.repositories.local_media.get_local_media_task", return_value=linked_task
                     ),
                 ):
                     tracker._start_local_import(
                         {"id": request_id},
                         self._task("/downloads/Movie.mkv", "/downloads"),
                     )
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["local_import_status"], "pending")
                 self.assertEqual(row["local_import_target"], f"local-media-task:{task_id}")
-                self.assertTrue(db.update_local_media_task(task_id, status="completed"))
+                self.assertTrue(local_media_repo.update_local_media_task(task_id, status="completed"))
                 self.assertFalse(
-                    db.link_download_request_to_local_media_task(
+                    download_requests_repo.link_download_request_to_local_media_task(
                         request_id, task_id, "/downloads/Movie.mkv"
                     )
                 )
-                get_download_request_result = db.get_download_request(request_id)
+                get_download_request_result = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result is not None
                 self.assertEqual(
                     get_download_request_result["local_import_status"],
                     "completed",
                 )
                 self.assertEqual(
-                    db.list_active_download_requests(include_local_import=True), []
+                    download_requests_repo.list_active_download_requests(include_local_import=True), []
                 )
 
     def test_linked_terminal_task_is_reconciled_without_reprobing_moved_path(self):
@@ -783,13 +789,13 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request("linked-terminal", "magnet")
-                source_id = db.create_local_media_source(
+                request_id, _ = download_requests_repo.create_download_request("linked-terminal", "magnet")
+                source_id = local_media_repo.create_local_media_source(
                     name="terminal-source", qb_profile="", qb_path_prefix="",
                     local_root="/downloads", owner="admin",
                 )
-                task_id = db.create_local_media_task(source_id, "", "/downloads/Movie.mkv")
-                db.link_download_request_to_local_media_task(
+                task_id = local_media_repo.create_local_media_task(source_id, "", "/downloads/Movie.mkv")
+                download_requests_repo.link_download_request_to_local_media_task(
                     request_id,
                     task_id,
                     "/downloads/Movie.mkv",
@@ -806,11 +812,11 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     ),
                 ):
                     tracker._start_local_import(
-                        db.get_download_request(request_id),
+                        download_requests_repo.get_download_request(request_id),
                         self._task("/downloads/Movie.mkv", "/downloads"),
                     )
 
-                request = db.get_download_request(request_id)
+                request = download_requests_repo.get_download_request(request_id)
                 assert request is not None
                 self.assertEqual(request["local_import_status"], "completed")
                 scheduler.enqueue_completed_torrent.assert_not_called()
@@ -821,7 +827,7 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request("binding-conflict", "magnet")
+                request_id, _ = download_requests_repo.create_download_request("binding-conflict", "magnet")
                 tracker = DownloadTracker()
                 scheduler = Mock()
                 scheduler.enqueue_completed_torrent.side_effect = ValueError(
@@ -832,11 +838,11 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     return_value=scheduler,
                 ):
                     tracker._start_local_import(
-                        db.get_download_request(request_id),
+                        download_requests_repo.get_download_request(request_id),
                         self._task("/downloads/Movie.mkv", "/downloads"),
                     )
 
-                request = db.get_download_request(request_id)
+                request = download_requests_repo.get_download_request(request_id)
                 assert request is not None
                 self.assertEqual(request["local_import_status"], "failed")
                 self.assertIn("内容路径不一致", request["local_import_error"])
@@ -846,8 +852,8 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request("retryable-key", "magnet")
-                db.update_download_request(
+                request_id, _ = download_requests_repo.create_download_request("retryable-key", "magnet")
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
                 tracker = DownloadTracker()
@@ -858,7 +864,7 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     self.assertFalse(wake)
                     if next(attempts) == "retry":
                         raise LocalMediaProbeRetryable("扫描路径不存在: Movie.mkv")
-                    db.link_download_request_to_local_media_task(
+                    download_requests_repo.link_download_request_to_local_media_task(
                         request_id,
                         77,
                         "/downloads/Movie.mkv",
@@ -874,24 +880,24 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                         return_value=scheduler,
                     ),
                     patch(
-                        "app.database.get_local_media_task", return_value=linked_task
+                        "app.repositories.local_media.get_local_media_task", return_value=linked_task
                     ),
                 ):
                     tracker._start_local_import(
-                        db.get_download_request(request_id), task
+                        download_requests_repo.get_download_request(request_id), task
                     )
-                    waiting = db.get_download_request(request_id)
+                    waiting = download_requests_repo.get_download_request(request_id)
                     assert waiting is not None
                     self.assertEqual(waiting["local_import_status"], "pending")
                     self.assertEqual(waiting["local_import_attempts"], 1)
                     self.assertIn("扫描路径不存在", waiting["local_import_error"])
                     self.assertTrue(
-                        db.list_active_download_requests(include_local_import=True)
+                        download_requests_repo.list_active_download_requests(include_local_import=True)
                     )
 
                     tracker._start_local_import(waiting, task)
 
-                recovered = db.get_download_request(request_id)
+                recovered = download_requests_repo.get_download_request(request_id)
                 assert recovered is not None
                 self.assertEqual(recovered["local_import_status"], "pending")
                 self.assertEqual(
@@ -904,8 +910,8 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request("retry-limit-key", "magnet")
-                db.update_download_request(
+                request_id, _ = download_requests_repo.create_download_request("retry-limit-key", "magnet")
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
                 tracker = DownloadTracker()
@@ -920,16 +926,16 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                 ):
                     for _ in range(8):
                         tracker._start_local_import(
-                            db.get_download_request(request_id), task
+                            download_requests_repo.get_download_request(request_id), task
                         )
 
-                failed = db.get_download_request(request_id)
+                failed = download_requests_repo.get_download_request(request_id)
                 assert failed is not None
                 self.assertEqual(failed["local_import_status"], "failed")
                 self.assertEqual(failed["local_import_attempts"], 8)
                 self.assertIn("暂时不可完整读取", failed["local_import_error"])
                 self.assertEqual(
-                    db.list_active_download_requests(include_local_import=True), []
+                    download_requests_repo.list_active_download_requests(include_local_import=True), []
                 )
 
     def test_legacy_local_media_source_is_visible_configuration_failure(self):
@@ -937,10 +943,10 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request(
+                request_id, _ = download_requests_repo.create_download_request(
                     "legacy-source-key", "magnet"
                 )
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
                 tracker = DownloadTracker()
@@ -957,16 +963,16 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     return_value=scheduler,
                 ):
                     tracker._start_local_import(
-                        db.get_download_request(request_id), task
+                        download_requests_repo.get_download_request(request_id), task
                     )
 
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["local_import_status"], "failed")
                 self.assertIn("Windows/UNC", row["local_import_error"])
                 self.assertIn("Docker 容器路径", row["local_import_error"])
                 self.assertEqual(
-                    db.list_active_download_requests(include_local_import=True), []
+                    download_requests_repo.list_active_download_requests(include_local_import=True), []
                 )
 
     def test_legacy_source_failure_does_not_overwrite_terminal_import_state(self):
@@ -986,16 +992,16 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     for index, terminal_status in enumerate(
                         ("completed", "skipped"), start=1
                     ):
-                        request_id, _ = db.create_download_request(
+                        request_id, _ = download_requests_repo.create_download_request(
                             f"terminal-legacy-{index}", "magnet"
                         )
-                        db.update_download_request(
+                        download_requests_repo.update_download_request(
                             request_id,
                             local_import_status="pending",
                             local_import_error="pending",
                         )
-                        stale_row = db.get_download_request(request_id)
-                        db.update_download_request(
+                        stale_row = download_requests_repo.get_download_request(request_id)
+                        download_requests_repo.update_download_request(
                             request_id,
                             local_import_status=terminal_status,
                             local_import_error="terminal",
@@ -1007,7 +1013,7 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                             self._task(r"D:\Downloads\Movie.mkv", r"D:\Downloads"),
                         )
 
-                        current = db.get_download_request(request_id)
+                        current = download_requests_repo.get_download_request(request_id)
                         assert current is not None
                         self.assertEqual(
                             current["local_import_status"], terminal_status
@@ -1027,14 +1033,14 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             local_media.write_bytes(b"movie")
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                source_id = db.create_local_media_source(
+                source_id = local_media_repo.create_local_media_source(
                     name="下载", qb_profile="configured:qb", qb_path_prefix="",
                     local_root=str(source_root), stable_seconds=0, owner="admin",
                 )
-                request_id, _ = db.create_download_request(
+                request_id, _ = download_requests_repo.create_download_request(
                     "implicit-qb-save-path", "magnet"
                 )
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
                 tracker = DownloadTracker()
@@ -1047,11 +1053,11 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     return_value=scheduler,
                 ):
                     tracker._start_local_import(
-                        db.get_download_request(request_id),
+                        download_requests_repo.get_download_request(request_id),
                         self._task(qb_path, qb_root),
                     )
 
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["local_import_status"], "pending")
                 self.assertEqual(row["qb_content_path"], str(local_media))
@@ -1060,7 +1066,7 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     "local-media-task:"
                 ))
                 task_id = int(row["local_import_target"].split(":", 1)[1])
-                local_task = db.get_local_media_task(task_id, owner="admin")
+                local_task = local_media_repo.get_local_media_task(task_id, owner="admin")
                 assert local_task is not None
                 self.assertEqual(local_task.source_id, source_id)
                 self.assertEqual(local_task.qb_hash, "hash")
@@ -1075,14 +1081,14 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
             (source_root / media_name).write_bytes(b"movie")
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                db.create_local_media_source(
+                local_media_repo.create_local_media_source(
                     name="下载", qb_profile="configured:qb", qb_path_prefix="",
                     local_root=str(source_root), stable_seconds=0, owner="admin",
                 )
-                request_id, _ = db.create_download_request(
+                request_id, _ = download_requests_repo.create_download_request(
                     "unmatched-qb-path", "magnet"
                 )
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
                 tracker = DownloadTracker()
@@ -1094,24 +1100,24 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     return_value=scheduler,
                 ):
                     tracker._start_local_import(
-                        db.get_download_request(request_id),
+                        download_requests_repo.get_download_request(request_id),
                         self._task(qb_path, ""),
                     )
 
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["local_import_status"], "failed")
                 self.assertEqual(row["qb_content_path"], qb_path)
                 self.assertIn("qB 路径前缀", row["local_import_error"])
-                self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+                self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_unmatched_completed_request_is_marked_skipped(self):
         with tempfile.TemporaryDirectory() as root:
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request("unmatched-key", "magnet")
-                db.update_download_request(
+                request_id, _ = download_requests_repo.create_download_request("unmatched-key", "magnet")
+                download_requests_repo.update_download_request(
                     request_id, qb_status="completed", status="completed"
                 )
                 tracker = DownloadTracker()
@@ -1125,12 +1131,12 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                         {"id": request_id},
                         self._task("/downloads/Movie.mkv", "/downloads"),
                     )
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["local_import_status"], "skipped")
                 self.assertIn("未命中", row["local_import_error"])
                 self.assertEqual(
-                    db.list_active_download_requests(include_local_import=True), []
+                    download_requests_repo.list_active_download_requests(include_local_import=True), []
                 )
 
 
@@ -1212,8 +1218,8 @@ class OrganizeCorrectionTests(unittest.TestCase):
         with (
             patch("app.database.get_organize_log", return_value=row),
             patch("app.database.list_organize_log_items", return_value=items),
-            patch("app.database.list_related_organize_logs", return_value=[]),
-            patch("app.database.list_organize_operation_steps", return_value=[]),
+            patch("app.repositories.organize_history.list_related_organize_logs", return_value=[]),
+            patch("app.repositories.organize_history.list_organize_operation_steps", return_value=[]),
             patch("app.database.list_organize_delete_audits", return_value=[]),
         ):
             detail = service.detail(5)
@@ -2542,7 +2548,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 get_organize_log_result_3 = db.get_organize_log(log_id)
                 assert get_organize_log_result_3 is not None
                 self.assertEqual(get_organize_log_result_3["status"], "failed")
-                steps = db.list_organize_operation_steps(log_id)
+                steps = organize_history_repo.list_organize_operation_steps(log_id)
                 self.assertEqual(steps[0]["status"], "failed")
 
     def test_return_to_source_rolls_back_completed_members(self):
@@ -2591,7 +2597,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                     (remote["sub"].parent_id, remote["sub"].name),
                     ("target-id", "电影.zh.ass"),
                 )
-                steps = db.list_organize_operation_steps(log_id)
+                steps = organize_history_repo.list_organize_operation_steps(log_id)
                 statuses = {row["file_id"]: row["status"] for row in steps}
                 self.assertEqual(statuses, {"video": "rolled_back", "sub": "failed"})
 
@@ -2791,7 +2797,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 assert get_organize_log_result_4 is not None
                 self.assertEqual(get_organize_log_result_4["status"], "failed")
                 self.assertEqual(
-                    db.list_organize_operation_steps(log_id)[0]["status"], "failed"
+                    organize_history_repo.list_organize_operation_steps(log_id)[0]["status"], "failed"
                 )
 
     def test_delete_snapshot_drift_does_not_claim_log(self):
@@ -2817,7 +2823,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
             test_db = Path(root) / "organize.db"
             log_id = self._make_correction_log(test_db)
             with patch("app.database.DB_PATH", test_db):
-                db.add_organize_operation_step(
+                organize_history_repo.add_organize_operation_step(
                     log_id,
                     "previous",
                     1,
@@ -2829,7 +2835,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                     to_name="电影.mkv",
                     status="success",
                 )
-                db.add_organize_operation_step(
+                organize_history_repo.add_organize_operation_step(
                     log_id,
                     "previous",
                     2,
@@ -2901,7 +2907,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                         log_id, "busy-token", "returning", ("success",), version
                     )
                 )
-                step_id = db.add_organize_operation_step(
+                step_id = organize_history_repo.add_organize_operation_step(
                     log_id,
                     "busy-token",
                     1,
@@ -2915,7 +2921,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 self.assertEqual(get_organize_log_result_8["status"], "interrupted")
                 step = next(
                     row
-                    for row in db.list_organize_operation_steps(log_id)
+                    for row in organize_history_repo.list_organize_operation_steps(log_id)
                     if row["id"] == step_id
                 )
                 self.assertEqual(step["status"], "interrupted")
@@ -3039,7 +3045,7 @@ class STRMIndexTests(IsolatedDatabaseTestCase):
                 self.assertEqual(second["cleaned"], 1)
                 self.assertFalse((Path(root) / STRM_SUBDIR / "Gone.strm").exists())
         finally:
-            db.delete_strm_index_ids(source_key, ["keep", "gone"])
+            strm_repo.delete_strm_index_ids(source_key, ["keep", "gone"])
 
 
 class JellyfinDashboardTests(unittest.TestCase):
@@ -3375,7 +3381,7 @@ class TelegramBotTests(unittest.TestCase):
                 if filters.get("commands") == ["rss_refresh"]
             )
             start(SimpleNamespace(chat=SimpleNamespace(id=100)))
-            with patch("app.bot.handlers.db.list_rss_subscriptions", return_value=[]):
+            with patch("app.repositories.rss.list_rss_subscriptions", return_value=[]):
                 rss_refresh(
                     SimpleNamespace(
                         chat=SimpleNamespace(id=100),
@@ -3429,7 +3435,7 @@ class TelegramBotTests(unittest.TestCase):
                 return_value=manager,
             ),
             patch(
-                "app.bot.handlers.db.count_download_requests_requiring_attention",
+                "app.repositories.download_requests.count_download_requests_requiring_attention",
                 return_value=2,
             ),
             patch.object(handlers, "_sync_running", True),
@@ -3583,7 +3589,7 @@ class TelegramBotTests(unittest.TestCase):
                 "app.bot.handlers.get",
                 side_effect=lambda key, default="": values.get(key, default),
             ),
-            patch("app.bot.handlers.db.list_local_media_sources", return_value=[]),
+            patch("app.repositories.local_media.list_local_media_sources", return_value=[]),
         ):
             text = handlers._download_follow_up_text(["guangya", "qb"])
         self.assertIn("启动整理", text)
@@ -3690,7 +3696,7 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
 
                 def create_one(index: int) -> None:
                     try:
-                        result = db.create_download_request(
+                        result = download_requests_repo.create_download_request(
                             "same-request-key",
                             "magnet",
                             title="Demo",
@@ -3758,14 +3764,14 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                request_id, _ = db.create_download_request(
+                request_id, _ = download_requests_repo.create_download_request(
                     "supplement-key",
                     "magnet",
                     title="Demo",
                     source_value="magnet:?xt=urn:btih:supplement",
                 )
-                self.assertTrue(db.claim_download_request(request_id, "both"))
-                db.update_download_request(
+                self.assertTrue(download_requests_repo.claim_download_request(request_id, "both"))
+                download_requests_repo.update_download_request(
                     request_id,
                     status="submitted",
                     qb_status="submitted",
@@ -3774,16 +3780,16 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                     attention_clear_note="已确认",
                 )
                 self.assertEqual(
-                    db.claim_download_request_targets(request_id, "guangya"),
+                    download_requests_repo.claim_download_request_targets(request_id, "guangya"),
                     ("guangya",),
                 )
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["qb_status"], "submitted")
                 self.assertEqual(row["gy_status"], "submitting")
                 self.assertFalse(row["attention_cleared_at"])
 
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     request_id,
                     status="completed",
                     qb_status="completed",
@@ -3791,9 +3797,9 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                     completed_at=db.now(),
                 )
                 self.assertEqual(
-                    db.claim_download_request_targets(request_id, "guangya"), ()
+                    download_requests_repo.claim_download_request_targets(request_id, "guangya"), ()
                 )
-                terminal = db.get_download_request(request_id)
+                terminal = download_requests_repo.get_download_request(request_id)
                 assert terminal is not None
                 self.assertEqual(terminal["status"], "completed")
                 self.assertEqual(terminal["qb_status"], "completed")
@@ -3805,14 +3811,14 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                first_id, first_created = db.create_download_request(
+                first_id, first_created = download_requests_repo.create_download_request(
                     "retry-key",
                     "magnet",
                     title="Demo",
                     source_value="magnet:?xt=urn:btih:retry",
                 )
                 self.assertTrue(first_created)
-                duplicate_id, duplicate_created = db.create_download_request(
+                duplicate_id, duplicate_created = download_requests_repo.create_download_request(
                     "retry-key",
                     "magnet",
                     title="Demo",
@@ -3821,13 +3827,13 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                 self.assertEqual(duplicate_id, first_id)
                 self.assertFalse(duplicate_created)
 
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     first_id,
                     status="completed",
                     gy_status="completed",
                     completed_at=db.now(),
                 )
-                retry_id, retry_created = db.create_download_request(
+                retry_id, retry_created = download_requests_repo.create_download_request(
                     "retry-key",
                     "magnet",
                     title="Demo",
@@ -3835,18 +3841,18 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                 )
                 self.assertTrue(retry_created)
                 self.assertNotEqual(retry_id, first_id)
-                current = db.get_download_request(retry_id)
+                current = download_requests_repo.get_download_request(retry_id)
                 assert current is not None
                 self.assertEqual(current["request_key"], "retry-key")
                 self.assertEqual(current["status"], "pending")
-                old = db.get_download_request(first_id)
+                old = download_requests_repo.get_download_request(first_id)
                 assert old is not None
                 self.assertIn(":history:", old["request_key"])
 
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     retry_id, status="cancelled", completed_at=db.now()
                 )
-                after_cancel_id, after_cancel_created = db.create_download_request(
+                after_cancel_id, after_cancel_created = download_requests_repo.create_download_request(
                     "retry-key",
                     "magnet",
                     title="Demo",
@@ -3854,7 +3860,7 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                 )
                 self.assertTrue(after_cancel_created)
                 self.assertNotEqual(after_cancel_id, retry_id)
-                get_download_request_result_2 = db.get_download_request(retry_id)
+                get_download_request_result_2 = download_requests_repo.get_download_request(retry_id)
                 assert get_download_request_result_2 is not None
                 self.assertIn(
                     ":history:", get_download_request_result_2["request_key"]
@@ -3878,7 +3884,7 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                 self.assertFalse(duplicate["created"])
                 self.assertEqual(duplicate["id"], initial["id"])
 
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     initial["id"],
                     status="completed",
                     qb_status="completed",
@@ -3887,13 +3893,13 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                 retry = create_request(equivalent, "chat", "3")
                 self.assertTrue(retry["created"])
                 self.assertNotEqual(retry["id"], initial["id"])
-                get_download_request_result_3 = db.get_download_request(retry["id"])
+                get_download_request_result_3 = download_requests_repo.get_download_request(retry["id"])
                 assert get_download_request_result_3 is not None
                 self.assertEqual(
                     get_download_request_result_3["request_key"],
                     request_keys(equivalent)[0],
                 )
-                get_download_request_result_4 = db.get_download_request(initial["id"])
+                get_download_request_result_4 = download_requests_repo.get_download_request(initial["id"])
                 assert get_download_request_result_4 is not None
                 self.assertIn(
                     ":history:", get_download_request_result_4["request_key"]
@@ -3904,10 +3910,10 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
             test_db = Path(root) / "downloads.db"
             with patch("app.database.DB_PATH", test_db):
                 db.init_db()
-                owned_id, _ = db.create_download_request(
+                owned_id, _ = download_requests_repo.create_download_request(
                     "owned-key", "magnet", chat_id="-100", user_id="9"
                 )
-                bind_pending_download_request_owner_result = db.bind_pending_download_request_owner(
+                bind_pending_download_request_owner_result = download_requests_repo.bind_pending_download_request_owner(
                         owned_id, chat_id="-100", user_id="9"
                     )
                 assert bind_pending_download_request_owner_result is not None
@@ -3916,24 +3922,24 @@ class DownloadRequestConcurrencyTests(unittest.TestCase):
                     "9",
                 )
                 self.assertIsNone(
-                    db.bind_pending_download_request_owner(
+                    download_requests_repo.bind_pending_download_request_owner(
                         owned_id, chat_id="-100", user_id="10"
                     )
                 )
 
-                incomplete_id, _ = db.create_download_request(
+                incomplete_id, _ = download_requests_repo.create_download_request(
                     "incomplete-owner-key", "magnet", chat_id="-100"
                 )
                 self.assertIsNone(
-                    db.bind_pending_download_request_owner(
+                    download_requests_repo.bind_pending_download_request_owner(
                         incomplete_id, chat_id="-100", user_id="10"
                     )
                 )
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     owned_id, status="cancelled", completed_at=db.now()
                 )
                 self.assertIsNone(
-                    db.bind_pending_download_request_owner(
+                    download_requests_repo.bind_pending_download_request_owner(
                         owned_id, chat_id="-100", user_id="9"
                     )
                 )
@@ -4156,7 +4162,7 @@ class SecurityTests(InitializedWebTestCase):
         with (
             patch("app.database.get_organize_log", return_value=legacy),
             patch("app.database.list_organize_log_items", return_value=[]),
-            patch("app.database.list_organize_operation_steps", return_value=[]),
+            patch("app.repositories.organize_history.list_organize_operation_steps", return_value=[]),
             patch("app.database.list_organize_delete_audits", return_value=[]),
         ):
             detail = self.client.get("/api/logs/organize/9", headers=headers)
@@ -4973,43 +4979,43 @@ class SecurityTests(InitializedWebTestCase):
                         }
                     ],
                 )
-                db.add_organize_operation_step(
+                organize_history_repo.add_organize_operation_step(
                     removable, "token", 1, "rename", file_id="file-a"
                 )
-                source_id = db.create_local_media_source(
+                source_id = local_media_repo.create_local_media_source(
                     "本地测试", "", "", "/downloads", owner="admin"
                 )
-                removable_local = db.create_local_media_task(
+                removable_local = local_media_repo.create_local_media_task(
                     source_id,
                     "",
                     "/downloads/finished.mkv",
                     owner="admin",
                     trigger="manual",
                 )
-                busy_local = db.create_local_media_task(
+                busy_local = local_media_repo.create_local_media_task(
                     source_id,
                     "",
                     "/downloads/running.mkv",
                     owner="admin",
                     trigger="manual",
                 )
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     removable_local, owner="admin", status="completed"
                 )
-                db.update_local_media_task(busy_local, owner="admin", status="moving")
-                db.add_local_media_task_item(
+                local_media_repo.update_local_media_task(busy_local, owner="admin", status="moving")
+                local_media_repo.add_local_media_task_item(
                     removable_local,
                     "/downloads/finished.mkv",
                     "/media/finished.mkv",
                     role="video",
                     owner="admin",
                 )
-                get_local_media_task_result = db.get_local_media_task(
+                get_local_media_task_result = local_media_repo.get_local_media_task(
                     removable_local, owner="admin"
                 )
                 assert get_local_media_task_result is not None
                 local_token = get_local_media_task_result.operation_token
-                db.add_local_media_operation_step(
+                local_media_repo.add_local_media_operation_step(
                     removable_local,
                     local_token,
                     1,
@@ -5034,13 +5040,13 @@ class SecurityTests(InitializedWebTestCase):
                 self.assertIsNone(db.get_organize_log(removable))
                 assert (db.get_organize_log(busy)) is not None
                 self.assertEqual(db.list_organize_log_items(removable), [])
-                self.assertEqual(db.list_organize_operation_steps(removable), [])
+                self.assertEqual(organize_history_repo.list_organize_operation_steps(removable), [])
                 self.assertIsNone(
-                    db.get_local_media_task(removable_local, owner="admin")
+                    local_media_repo.get_local_media_task(removable_local, owner="admin")
                 )
-                assert (db.get_local_media_task(busy_local, owner="admin")) is not None
+                assert (local_media_repo.get_local_media_task(busy_local, owner="admin")) is not None
                 self.assertEqual(
-                    db.list_local_media_task_items(removable_local, owner="admin"), []
+                    local_media_repo.list_local_media_task_items(removable_local, owner="admin"), []
                 )
                 with db.get_conn() as conn:
                     local_steps = conn.execute(
@@ -5792,7 +5798,7 @@ class SecurityTests(InitializedWebTestCase):
     def test_rss_batch_mark_and_download_contracts(self):
         headers = self._authenticated()
         with patch(
-            "app.database.update_rss_entries_processed", return_value=2
+            "app.repositories.rss.update_rss_entries_processed", return_value=2
         ) as update:
             marked = self.client.post(
                 "/api/rss/entries/mark",
@@ -5822,13 +5828,13 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(downloaded.json()["result"]["failure_count"], 1)
         download_many.assert_called_once_with([11, 12])
 
-        log_id = db.add_download_log("qb", title="download-page-contract")
+        log_id = download_requests_repo.add_download_log("qb", title="download-page-contract")
         try:
             searched = self.client.get(
                 "/api/downloads/logs?keyword=download-page-contract", headers=headers
             )
         finally:
-            db.delete_download_logs([log_id])
+            download_requests_repo.delete_download_logs([log_id])
         self.assertEqual(searched.status_code, 200)
         self.assertEqual(searched.json()["page_size"], 20)
         self.assertEqual(searched.json()["total"], 1)
@@ -5893,7 +5899,7 @@ class SecurityTests(InitializedWebTestCase):
             status="success", keyword="demo", limit=20, offset=20
         )
 
-        with patch("app.database.list_rss_entries", return_value=db.RSSEntryPage([], 0)) as entries:
+        with patch("app.repositories.rss.list_rss_entries", return_value=rss_repo.RSSEntryPage([], 0)) as entries:
             searched = self.client.get("/api/rss/entries?q=episode", headers=headers)
         self.assertEqual(searched.status_code, 200)
         entries.assert_called_once_with(
@@ -5904,7 +5910,7 @@ class SecurityTests(InitializedWebTestCase):
 
         scheduler = RSSScheduler()
         with patch(
-            "app.modules.rss_scheduler.db.purge_processed_rss_entries", return_value=4
+            "app.repositories.rss.purge_processed_rss_entries", return_value=4
         ) as purge:
             self.assertEqual(scheduler._run_cleanup_if_due(), 4)
             self.assertEqual(scheduler._run_cleanup_if_due(), 0)
@@ -5916,12 +5922,12 @@ class SecurityTests(InitializedWebTestCase):
             db.DB_PATH = Path(root) / "rss-retention.db"
             try:
                 db.init_db()
-                sub_id = db.add_rss_subscription("Demo", "https://example.com/rss")
-                old_processed = db.add_rss_entry_with_media(sub_id, "Old processed", "old")["id"]
-                recent_processed = db.add_rss_entry_with_media(
+                sub_id = rss_repo.add_rss_subscription("Demo", "https://example.com/rss")
+                old_processed = rss_repo.add_rss_entry_with_media(sub_id, "Old processed", "old")["id"]
+                recent_processed = rss_repo.add_rss_entry_with_media(
                     sub_id, "Recent processed", "recent"
                 )["id"]
-                old_pending = db.add_rss_entry_with_media(sub_id, "Old pending", "pending")["id"]
+                old_pending = rss_repo.add_rss_entry_with_media(sub_id, "Old pending", "pending")["id"]
                 with db.get_conn() as conn:
                     conn.execute(
                         "UPDATE rss_entries SET status='downloaded',processed=1,processed_at='2026-07-01 00:00:00' WHERE id=?",
@@ -5935,10 +5941,10 @@ class SecurityTests(InitializedWebTestCase):
                         "UPDATE rss_entries SET created_at='2026-07-01 00:00:00' WHERE id=?",
                         (old_pending,),
                     )
-                self.assertEqual(db.purge_processed_rss_entries(7), 1)
-                self.assertIsNone(db.get_rss_entry(old_processed))
-                assert (db.get_rss_entry(recent_processed)) is not None
-                assert (db.get_rss_entry(old_pending)) is not None
+                self.assertEqual(rss_repo.purge_processed_rss_entries(7), 1)
+                self.assertIsNone(rss_repo.get_rss_entry(old_processed))
+                assert (rss_repo.get_rss_entry(recent_processed)) is not None
+                assert (rss_repo.get_rss_entry(old_pending)) is not None
             finally:
                 db.DB_PATH = original
 
@@ -5972,13 +5978,13 @@ class SecurityTests(InitializedWebTestCase):
         }
         engine = RSSEngine()
         with (
-            patch("app.database.get_rss_entry", return_value=entry),
-            patch("app.database.claim_rss_entry", side_effect=[True, False]) as claim,
+            patch("app.repositories.rss.get_rss_entry", return_value=entry),
+            patch("app.repositories.rss.claim_rss_entry", side_effect=[True, False]) as claim,
             patch(
                 "app.indexers.downloads.submit_download_input", return_value=submission
             ) as submit,
             patch(
-                "app.database.get_download_request",
+                "app.repositories.download_requests.get_download_request",
                 return_value={
                     "status": "submitted",
                     "qb_status": "submitted",
@@ -6030,11 +6036,11 @@ class SecurityTests(InitializedWebTestCase):
 
         with (
             patch(
-                "app.database.create_download_request",
+                "app.repositories.download_requests.create_download_request",
                 side_effect=[(9, True), (9, False)],
             ),
             patch(
-                "app.database.get_download_request", return_value={"status": "pending"}
+                "app.repositories.download_requests.get_download_request", return_value={"status": "pending"}
             ),
         ):
             first = create_request(item, "chat", "1")
@@ -6052,8 +6058,8 @@ class SecurityTests(InitializedWebTestCase):
             "torrent_data": None,
         }
         with (
-            patch("app.database.get_download_request", return_value=row),
-            patch("app.database.claim_download_request", side_effect=[True, False]),
+            patch("app.repositories.download_requests.get_download_request", return_value=row),
+            patch("app.repositories.download_requests.claim_download_request", side_effect=[True, False]),
             patch(
                 "app.modules.download_dispatcher._submit_qb",
                 return_value={"ok": True, "task_id": "abc", "error": ""},
@@ -6068,10 +6074,10 @@ class SecurityTests(InitializedWebTestCase):
                 },
             ),
             patch(
-                "app.database.finalize_download_request_submission",
+                "app.repositories.download_requests.finalize_download_request_submission",
                 return_value="submitted",
             ) as finalize,
-            patch("app.database.add_download_log") as add_log,
+            patch("app.repositories.download_requests.add_download_log") as add_log,
         ):
             first = dispatch_request(31, "both")
             second = dispatch_request(31, "both")
@@ -6092,8 +6098,8 @@ class SecurityTests(InitializedWebTestCase):
             "torrent_data": None,
         }
         with (
-            patch("app.database.get_download_request", return_value=row),
-            patch("app.database.claim_download_request", return_value=True),
+            patch("app.repositories.download_requests.get_download_request", return_value=row),
+            patch("app.repositories.download_requests.claim_download_request", return_value=True),
             patch(
                 "app.modules.download_dispatcher._submit_qb",
                 side_effect=RuntimeError("qB unavailable"),
@@ -6111,10 +6117,10 @@ class SecurityTests(InitializedWebTestCase):
                 },
             ),
             patch(
-                "app.database.finalize_download_request_submission",
+                "app.repositories.download_requests.finalize_download_request_submission",
                 return_value="submitted",
             ) as finalize,
-            patch("app.database.add_download_log") as add_log,
+            patch("app.repositories.download_requests.add_download_log") as add_log,
         ):
             result = dispatch_request(32, "both")
         self.assertTrue(result["ok"])
@@ -6152,20 +6158,20 @@ class SecurityTests(InitializedWebTestCase):
             hash="hash-1", name="Broken", progress=0.2, state="error"
         )
         # 检查真实日志结果，不绑定私有函数是否显式传入默认参数。
-        db.add_download_log(
+        download_requests_repo.add_download_log(
             source="qb", title="Broken", request_id=41, error="qB 原有错误"
         )
         with (
             patch(
                 "app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}
             ) as update,
-            patch("app.database.update_download_request"),
+            patch("app.repositories.download_requests.update_download_request"),
             patch(
-                "app.database.claim_download_request_notification",
+                "app.repositories.download_requests.claim_download_request_notification",
                 return_value={"token": "notice-41", "attempts": 0},
             ),
             patch(
-                "app.database.finalize_download_request_notification",
+                "app.repositories.download_requests.finalize_download_request_notification",
                 return_value=True,
             ),
             patch(
@@ -6175,7 +6181,7 @@ class SecurityTests(InitializedWebTestCase):
             tracker._update_request(row, [task], [])
         self.assertEqual(update.call_args.kwargs["qb_status"], "failed")
         self.assertEqual(update.call_args.kwargs["status"], "failed")
-        log, = db.list_download_logs(source="qb")
+        log, = download_requests_repo.list_download_logs(source="qb")
         self.assertEqual((log["request_id"], log["status"], log["progress"], log["backend_task_id"]),
                          (41, "failed", 0.2, "hash-1"))
         self.assertEqual(log["error"], "qB 原有错误")
@@ -6206,9 +6212,9 @@ class SecurityTests(InitializedWebTestCase):
             patch(
                 "app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}
             ) as update,
-            patch("app.database.update_download_request"),
+            patch("app.repositories.download_requests.update_download_request"),
             patch.object(tracker, "_update_backend_log"),
-            patch("app.database.claim_download_request_organize", return_value=True),
+            patch("app.repositories.download_requests.claim_download_request_organize", return_value=True),
             patch(
                 "app.modules.download_tracker.get",
                 side_effect=lambda key, default="": {
@@ -6224,11 +6230,11 @@ class SecurityTests(InitializedWebTestCase):
                 return_value=manager,
             ),
             patch(
-                "app.database.claim_download_request_notification",
+                "app.repositories.download_requests.claim_download_request_notification",
                 return_value={"token": "notice-42", "attempts": 0},
             ),
             patch(
-                "app.database.finalize_download_request_notification",
+                "app.repositories.download_requests.finalize_download_request_notification",
                 return_value=True,
             ),
             patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"),
@@ -6275,8 +6281,8 @@ class SecurityTests(InitializedWebTestCase):
                 "app.modules.download_tracker.get_organize_manager",
                 return_value=manager,
             ),
-            patch("app.database.claim_download_request_organize", return_value=True),
-            patch("app.database.update_download_request") as update,
+            patch("app.repositories.download_requests.claim_download_request_organize", return_value=True),
+            patch("app.repositories.download_requests.update_download_request") as update,
             patch(
                 "app.modules.download_tracker.DownloadTracker._publish_lifecycle"
             ) as notify,

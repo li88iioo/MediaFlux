@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from tests.support import IsolatedDatabaseTestCase
 from tests.test_strm_index_diagnostics import _api_client
 from tests.test_strm_metadata_queue import _job
@@ -18,7 +19,7 @@ class MetadataManagementApiTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM strm_metadata_queue")
 
     def test_disabled_queue_preview_confirm_replay_and_files_preserved(self):
-        db.enqueue_strm_metadata_jobs([_job()])
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
         with tempfile.TemporaryDirectory() as root:
             existing = Path(root) / "present.nfo"
             existing.write_text("keep")
@@ -31,7 +32,7 @@ class MetadataManagementApiTests(IsolatedDatabaseTestCase):
                 )
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["preview"]["count"], 1)
-                self.assertEqual(db.count_strm_metadata_jobs()["queued"], 1)
+                self.assertEqual(strm_repo.count_strm_metadata_jobs()["queued"], 1)
                 token = response.json()["confirmation_token"]
                 invalid = client.post(
                     "/api/strm/metadata/cancel-pending",
@@ -96,7 +97,7 @@ class MetadataManagementApiTests(IsolatedDatabaseTestCase):
             )
 
     def test_no_snapshot_no_mutation(self):
-        db.enqueue_strm_metadata_jobs([_job()])
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
         with (
             tempfile.TemporaryDirectory() as root,
             _api_client(Path(root)) as (client, csrf),
@@ -107,4 +108,4 @@ class MetadataManagementApiTests(IsolatedDatabaseTestCase):
                 headers={"X-CSRF-Token": csrf},
             )
             self.assertEqual(response.status_code, 409)
-        self.assertEqual(db.count_strm_metadata_jobs()["queued"], 1)
+        self.assertEqual(strm_repo.count_strm_metadata_jobs()["queued"], 1)

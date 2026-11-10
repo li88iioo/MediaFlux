@@ -22,6 +22,10 @@ from typing import Any, Callable, Iterable, Optional, TypedDict
 from croniter import croniter
 
 from app import config, database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
+from app.repositories import organize_probe as organize_probe_repo
+from app.repositories import strm_request_ownership as strm_request_ownership_repo
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, log_throttled
 from app.modules.media_refresh import plan_refresh_targets
@@ -132,11 +136,11 @@ def _update_strm_requests(options: dict[str, Any], **fields) -> None:
         owner = owners.get(request_id)
         if owner is None:
             # 历史内存入口仍可使用，但不能接管已进入新围栏的请求。
-            legacy = db.current_strm_request_owners([request_id])
+            legacy = strm_request_ownership_repo.current_strm_request_owners([request_id])
             if not legacy or int(legacy[0]["generation"]) != 0:
                 continue
             owner = legacy[0]
-        db.update_strm_request_state(
+        strm_request_ownership_repo.update_strm_request_state(
             owner, claimed_targets=options.get("strm_claimed_targets"), **fields
         )
 
@@ -365,7 +369,7 @@ class _ChangeTargetLeaseHeartbeat:
         interval = max(5.0, float(self._lease_seconds) / 3.0)
         while not self._stop.wait(interval):
             try:
-                renewed = db.renew_strm_change_target_leases(
+                renewed = strm_repo.renew_strm_change_target_leases(
                     self._claimed, owner=self._owner, lease_seconds=self._lease_seconds
                 )
                 if renewed != len(self._claimed):
@@ -445,8 +449,8 @@ class STRMScheduler:
     def _recover_change_queue(self) -> None:
         """启动时恢复上次进程中断遗留的变化目标，避免变化永久卡在队列里。"""
         try:
-            recovered = db.recover_stale_strm_change_targets()
-            pending = db.count_pending_strm_change_targets()
+            recovered = strm_repo.recover_stale_strm_change_targets()
+            pending = strm_repo.count_pending_strm_change_targets()
         except Exception:
             logger.exception("恢复 STRM 变化目标队列失败")
             return
@@ -456,7 +460,7 @@ class STRMScheduler:
             return
         logger.info("检测到待同步 STRM 变化目标 count=%s，已排队恢复执行", pending)
         try:
-            delay = db.seconds_until_next_strm_change_target()
+            delay = strm_repo.seconds_until_next_strm_change_target()
             self._schedule_persisted_change_queue(delay)
         except Exception:
             logger.exception("恢复 STRM 变化目标触发失败")
@@ -466,7 +470,7 @@ class STRMScheduler:
     ) -> dict:
         """静默排队持久变化目标；内部等待不受实时 debounce 的 120 秒上限约束。"""
         if delay_seconds is None:
-            delay_seconds = db.seconds_until_next_strm_change_target()
+            delay_seconds = strm_repo.seconds_until_next_strm_change_target()
         if delay_seconds is None:
             return {"ok": True, "queued": False, "message": "没有待同步 STRM 变化目标"}
         try:
@@ -512,7 +516,7 @@ class STRMScheduler:
             worker = self._worker
             if worker and worker.is_alive():
                 return
-        delay = db.seconds_until_next_strm_change_target()
+        delay = strm_repo.seconds_until_next_strm_change_target()
         if delay is None:
             return
         result = self._schedule_persisted_change_queue(delay)
@@ -764,9 +768,9 @@ class STRMScheduler:
             if quiet_seconds > 0:
                 changes = list(pending.get("organize_changes") or [])
                 if changes:
-                    expected = len(db.group_changes_by_target(changes))
+                    expected = len(strm_repo.group_changes_by_target(changes))
                     try:
-                        updated = db.reschedule_strm_change_targets(
+                        updated = strm_repo.reschedule_strm_change_targets(
                             changes, not_before_seconds=quiet_seconds,
                         )
                     except Exception:
@@ -984,14 +988,14 @@ class STRMScheduler:
             return True
         try:
             if download_request_ids:
-                _count, owners = db.enqueue_strm_change_targets(
+                _count, owners = strm_repo.enqueue_strm_change_targets(
                     organize_changes, not_before_seconds=not_before_seconds,
                     download_request_ids=download_request_ids, with_owners=True,
                 )
                 if request_owners is not None:
                     request_owners.extend(owners)
             else:
-                db.enqueue_strm_change_targets(
+                strm_repo.enqueue_strm_change_targets(
                     organize_changes, not_before_seconds=not_before_seconds,
                 )
             return True
@@ -1004,7 +1008,7 @@ class STRMScheduler:
         if trigger_type != "organize" and sync_mode != "fast":
             return []
         lease_seconds = max(30, get_int("STRM_CHANGE_LEASE_SECONDS", 900))
-        return db.claim_strm_change_targets(
+        return strm_repo.claim_strm_change_targets(
             owner=f"strm-sync-{threading.get_ident()}",
             lease_seconds=lease_seconds,
             source_ids=source_ids,
@@ -1020,13 +1024,13 @@ class STRMScheduler:
         try:
             if outcome == "stopped":
                 if rows:
-                    db.release_strm_change_targets(
+                    strm_repo.release_strm_change_targets(
                         rows, reason="服务停止，STRM 变化目标已退回队列"
                     )
                 return
             if outcome == "failed" and rows:
                 for item in rows:
-                    state = db.fail_strm_change_target(
+                    state = strm_repo.fail_strm_change_target(
                         int(item["id"]),
                         expected_owner=str(item.get("lease_owner") or ""),
                         expected_lease_generation=int(item.get("lease_generation") or 0),
@@ -1036,7 +1040,7 @@ class STRMScheduler:
                         logger.warning("忽略迟到的 STRM 失败结算 target=%s", item["id"])
             elif rows:
                 for item in rows:
-                    state = db.complete_strm_change_target(
+                    state = strm_repo.complete_strm_change_target(
                         int(item["id"]),
                         expected_owner=str(item.get("lease_owner") or ""),
                         expected_lease_generation=int(item.get("lease_generation") or 0),
@@ -1050,7 +1054,7 @@ class STRMScheduler:
             return
         if not self._stop_event.is_set():
             try:
-                delay = db.seconds_until_next_strm_change_target()
+                delay = strm_repo.seconds_until_next_strm_change_target()
                 if delay is not None:
                     if not rows and delay <= 0:
                         try:
@@ -1096,7 +1100,7 @@ class STRMScheduler:
                 logger, logging.WARNING, "strm-metadata-queue-status",
                 "读取 STRM 元数据队列状态失败 type=%s", type(exc).__name__,
             )
-            metadata_queue = db.count_strm_metadata_jobs()
+            metadata_queue = strm_repo.count_strm_metadata_jobs()
         try:
             from app.modules.organize_probe_worker import get_organize_probe_worker
 
@@ -1106,7 +1110,7 @@ class STRMScheduler:
                 logger, logging.WARNING, "organize-probe-queue-status",
                 "读取整理媒体规格补全队列状态失败 type=%s", type(exc).__name__,
             )
-            organize_probe_queue = db.count_organize_probe_jobs()
+            organize_probe_queue = organize_probe_repo.count_organize_probe_jobs()
         return {
             "enabled": enabled,
             "cron": cron_expr,
@@ -1623,7 +1627,7 @@ class STRMScheduler:
             self._set_progress("retirement", 0, 1, "清理已移除的 STRM 来源")
             try:
                 aggregate["metadata_queue_cancelled"] += (
-                    db.cancel_retired_strm_metadata_jobs(
+                    strm_repo.cancel_retired_strm_metadata_jobs(
                         {source["id"] for source in sources}
                     ) or 0
                 )
@@ -1798,7 +1802,7 @@ class STRMScheduler:
             # 领取结果会补齐上一次进程中断或失败重试遗留的变化目标。
             claimed_targets = self._claim_change_targets(trigger_type, requested_mode, source_ids=selected_source_ids or None)
             options["strm_claimed_targets"] = claimed_targets
-            recovered_owners = db.request_owners_for_work(
+            recovered_owners = strm_request_ownership_repo.request_owners_for_work(
                 "change", [item["id"] for item in claimed_targets if item.get("id")],
                 claimed_targets=claimed_targets,
             )
@@ -2058,7 +2062,7 @@ class STRMScheduler:
             )
             refresh_pending = any(
                 value in {False, "failed", "pending"} for value in media_refresh.values()
-            ) or db.has_pending_strm_request_refresh(options.get("download_request_owners"))
+            ) or strm_request_ownership_repo.has_pending_strm_request_refresh(options.get("download_request_owners"))
             partial = (strm_partial or refresh_pending)
             result["strm_partial"] = strm_partial
             result["refresh_pending"] = refresh_pending
@@ -2237,7 +2241,7 @@ class STRMScheduler:
         # STRM 已经落盘，媒体库刷新必须独立交接。先写 durable outbox，再尝试
         # 投递统一刷新队列；投递失败只重试刷新，绝不重新生成 STRM。
         owner_kwargs: _RefreshOwnerOptions = {"request_owners": request_owners} if request_owners else {}
-        entries = db.enqueue_strm_refresh_paths(targets, allow_emby=allow_emby, **owner_kwargs)
+        entries = strm_repo.enqueue_strm_refresh_paths(targets, allow_emby=allow_emby, **owner_kwargs)
         if handoff_entries is not None:
             handoff_entries.extend(entries)
         if persist_only:
@@ -2260,7 +2264,7 @@ class STRMScheduler:
         )
         if refresh_handed_off:
             try:
-                db.acknowledge_strm_refresh_paths(entries)
+                strm_repo.acknowledge_strm_refresh_paths(entries)
             except Exception:
                 # 统一刷新队列已经持久接管；保留 outbox 只会触发幂等补投，
                 # 不能反向把本轮 STRM 标记为失败。
@@ -2414,7 +2418,7 @@ class STRMScheduler:
                 try:
                     from app.modules.telegram_download_lifecycle import _chat_id
 
-                    row = db.get_download_request(request_id)
+                    row = download_requests_repo.get_download_request(request_id)
                     if row is not None:
                         request_chats[request_id] = _chat_id(row) or default_chat
                 except Exception as exc:

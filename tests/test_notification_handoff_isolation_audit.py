@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules import media_subscription_notifications as handoff
 from app.modules.telegram_notification_center import NotificationPublishResult
 from app.notifier import TelegramSendResult
@@ -24,7 +25,7 @@ class NotificationHandoffIsolationAuditTests(unittest.TestCase):
 
     def enqueue(self, payload=None):
         self.counter += 1
-        sid = db.add_media_subscription(
+        sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id=str(self.counter),
             tmdb_id=str(self.counter),

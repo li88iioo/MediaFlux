@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.media_probe import MediaProfile
 from app.modules.organize import OrganizeRules
@@ -57,7 +58,7 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
         self.enterContext(patch("socket.socket.connect", side_effect=AssertionError("禁止外联")))
 
     def enqueue(self, *, link_strm=True):
-        self.job_id = db.enqueue_organize_probe_completion(
+        self.job_id = organize_probe_repo.enqueue_organize_probe_completion(
             self.log_id, source_id="target", rel_dir="动漫/示例/Season 1",
             rules=asdict(OrganizeRules(target_dir_id="target", link_strm=link_strm)),
         )
@@ -169,12 +170,12 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
 
     def test_expired_lease_at_commit_rolls_back_remote_without_audit_update(self):
         self.enqueue()
-        original_commit = db.commit_organize_probe_rename
+        original_commit = organize_probe_repo.commit_organize_probe_rename
         def expire_then_commit(*args, **kwargs):
             with db.get_conn() as conn:
                 conn.execute("UPDATE organize_probe_queue SET lease_until=0 WHERE id=?", (self.job_id,))
             return original_commit(*args, **kwargs)
-        with patch.object(db, "commit_organize_probe_rename", side_effect=expire_then_commit):
+        with patch.object(organize_probe_repo, "commit_organize_probe_rename", side_effect=expire_then_commit):
             self.worker._process_one()
         self.scheduler.trigger.assert_not_called()
         self.assertEqual(self.client.files["video-15"].name, self.old_name)
@@ -188,7 +189,7 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
         self.enqueue()
         for _ in range(3):
             self.make_due()
-            with patch.object(db, "complete_organize_probe_job", side_effect=sqlite3.OperationalError("busy")):
+            with patch.object(organize_probe_repo, "complete_organize_probe_job", side_effect=sqlite3.OperationalError("busy")):
                 self.worker._process_one()
             self.assert_pending()
         self.make_due()
@@ -208,7 +209,7 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
         self.assertNotEqual(self.row()["status"], "completed")
         self.assertEqual(len(json.loads(self.row()["pending_strm_changes_json"])), 2)
         self.scheduler.trigger.side_effect = None
-        db.recover_stale_organize_probe_jobs()
+        organize_probe_repo.recover_stale_organize_probe_jobs()
         self.make_due()
         OrganizeProbeWorker()._process_one()
         self.assertEqual(self.row()["status"], "completed")
@@ -216,14 +217,14 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
 
     def test_repository_rejects_stale_wrong_owner_and_wrong_log_commits(self):
         self.enqueue()
-        job = db.claim_due_organize_probe_jobs(owner="owner")[0]
+        job = organize_probe_repo.claim_due_organize_probe_jobs(owner="owner")[0]
         items = [dict(item) for item in db.list_organize_log_items(self.log_id)]
         updates = [{"id": item["id"], "expected_name": item["current_name"], "current_name": "new-" + item["current_name"]} for item in items]
         for owner, log_id, lease_until in [("other", self.log_id, job["lease_until"]), ("owner", self.log_id + 999, job["lease_until"]), ("owner", self.log_id, 0)]:
             with self.subTest(owner=owner, log_id=log_id, lease_until=lease_until):
                 with db.get_conn() as conn:
                     conn.execute("UPDATE organize_probe_queue SET lease_until=? WHERE id=?", (lease_until, self.job_id))
-                self.assertFalse(db.commit_organize_probe_rename(
+                self.assertFalse(organize_probe_repo.commit_organize_probe_rename(
                     log_id, current_name="new-name", new_path="new-path", item_updates=updates,
                     job_id=self.job_id, owner=owner, changes=[{"file_id": "video-15"}],
                 ))
@@ -234,10 +235,10 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
 
     def test_completion_without_handoff_ack_cannot_discard_pending(self):
         self.enqueue()
-        db.claim_due_organize_probe_jobs(owner="owner")
+        organize_probe_repo.claim_due_organize_probe_jobs(owner="owner")
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_probe_queue SET pending_strm_changes_json=? WHERE id=?", ('[{"file_id":"video-15"}]', self.job_id))
-        self.assertFalse(db.complete_organize_probe_job(self.job_id, owner="owner"))
+        self.assertFalse(organize_probe_repo.complete_organize_probe_job(self.job_id, owner="owner"))
         self.assertEqual(self.row()["status"], "running")
         self.assertNotEqual(self.row()["pending_strm_changes_json"], "[]")
 
@@ -249,7 +250,7 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.row()["status"], "running")
         self.assertEqual(len(json.loads(self.row()["pending_strm_changes_json"])), 2)
         self.scheduler.trigger.assert_not_called()
-        self.assertEqual(db.recover_stale_organize_probe_jobs(force=True), 1)
+        self.assertEqual(organize_probe_repo.recover_stale_organize_probe_jobs(force=True), 1)
         self.probe.side_effect = AssertionError("已提交后不再探测")
         OrganizeProbeWorker()._process_one()
         self.assertEqual(self.row()["status"], "completed")
@@ -364,7 +365,7 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
         from app.repositories import organize_probe
 
         self.enqueue()
-        db.claim_due_organize_probe_jobs(owner="owner")
+        organize_probe_repo.claim_due_organize_probe_jobs(owner="owner")
         pending = '[{"file_id":"video-15"}]'
         with db.get_conn() as conn:
             conn.execute(
@@ -388,7 +389,7 @@ class OrganizeProbeHandoffTests(IsolatedDatabaseTestCase):
         with patch.object(db, "get_conn", side_effect=delayed_writer_connection), patch.object(
             organize_probe, "time", SimpleNamespace(time=lambda: clock[0]),
         ):
-            self.assertFalse(db.complete_organize_probe_job(
+            self.assertFalse(organize_probe_repo.complete_organize_probe_job(
                 self.job_id, owner="owner", handoff_completed=True,
             ))
         self.assertEqual(self.row()["status"], "running")

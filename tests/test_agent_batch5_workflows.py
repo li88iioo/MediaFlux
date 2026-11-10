@@ -14,6 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import config, database as db, sdk
+from app.repositories import rss as rss_repo
+from app.repositories import discovery as discovery_repo
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.discovery.service import DiscoveryService
 from app.modules.web_secret import signed_context_fingerprint
 from app.agent.confirmation import SQLiteConfirmationStore
@@ -49,19 +52,19 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
 
 
     def _rss(self) -> tuple[int, int, int]:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             name="安全订阅",
             urls="https://secret.invalid/feed?token=PRIVATE",
             download_method="qb",
             qb_save_path="/private/rss",
         )
-        first = db.add_rss_entry_with_media(
+        first = rss_repo.add_rss_entry_with_media(
             sid,
             "公开标题 1",
             "SECRET-GUID-1",
             payload=json.dumps({"torrent_url": "magnet:?xt=urn:btih:PRIVATE1"}),
         )["id"]
-        second = db.add_rss_entry_with_media(
+        second = rss_repo.add_rss_entry_with_media(
             sid,
             "公开标题 2",
             "SECRET-GUID-2",
@@ -91,10 +94,10 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         self.assertTrue(preview["ok"])
         marked = rss_delivery.execute("mark", mark_args, fingerprint)
         self.assertEqual(marked["data"]["affected"], 2)
-        get_rss_entry_result = db.get_rss_entry(first)
+        get_rss_entry_result = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result is not None
         self.assertEqual(str(get_rss_entry_result["status"]), "skipped")
-        db.update_rss_entries_processed([first, second], False)
+        rss_repo.update_rss_entries_processed([first, second], False)
         runtime = {
             "url": "http://qb.internal",
             "username": "u",
@@ -119,7 +122,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["data"]["submitted"], 2)
         self.assertIs(
-            submit.call_args.kwargs["claim"], db.claim_pending_rss_entries
+            submit.call_args.kwargs["claim"], rss_repo.claim_pending_rss_entries
         )
         submitted_rows = submit.call_args.args[0]
         self.assertEqual({row["id"] for row in submitted_rows}, {first, second})
@@ -181,22 +184,22 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         _sid, first, _second = self._rss()
         args = {"entry_ids": [first], "processed": True}
         _preview, fingerprint = rss_delivery.prepare("mark", args)
-        original_update = db.update_rss_entries_processed_snapshot
+        original_update = rss_repo.update_rss_entries_processed_snapshot
 
         def race_then_update(snapshot, processed):
-            db.record_rss_entry_failure(first, "qb_unavailable", True)
+            rss_repo.record_rss_entry_failure(first, "qb_unavailable", True)
             return original_update(snapshot, processed)
 
         with (
             patch(
-                "app.modules.rss_delivery.db.update_rss_entries_processed_snapshot",
+                "app.repositories.rss.update_rss_entries_processed_snapshot",
                 side_effect=race_then_update,
             ),
             self.assertRaises(RSSSubscriptionError) as caught,
         ):
             rss_delivery.execute("mark", args, fingerprint)
         self.assertEqual(caught.exception.code, "confirmation_stale")
-        row = db.get_rss_entry(first)
+        row = rss_repo.get_rss_entry(first)
         assert row is not None
         self.assertEqual(str(row["status"]), "failed")
         self.assertEqual(str(row["failure_code"]), "qb_unavailable")
@@ -292,7 +295,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         with patch.object(service, "get_detail", return_value=card), patch("app.discovery.service.get_discovery_service", return_value=service):
             detail = sdk.media.detail("douban", "movie", "1292052")
             candidates = sdk.media.resolve("douban", "1292052", "movie", card.title, card.year)
-            self.assertIsNone(db.get_media_external_id("douban", "1292052", "movie"))
+            self.assertIsNone(discovery_repo.get_media_external_id("douban", "1292052", "movie"))
             prepared = service.prepare_tmdb_mapping("douban", "1292052", "movie", "278")
             assert prepared is not None
             confirmed = service.confirm_tmdb_mapping_if_unchanged(
@@ -303,7 +306,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         self.assertEqual(candidates["candidates"][0]["tmdb_id"], "278")
         assert confirmed is not None
         self.assertTrue(confirmed["confirmed"])
-        stored = db.get_media_external_id("douban", "1292052", "movie")
+        stored = discovery_repo.get_media_external_id("douban", "1292052", "movie")
         assert stored is not None
         self.assertEqual((stored["tmdb_id"], stored["confirmed"]), ("278", 1))
 
@@ -320,7 +323,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             barrier.wait(timeout=2)
             outcomes = [future.result(timeout=3) for future in futures]
         self.assertEqual(sum(outcomes), 1)
-        stored = db.get_media_external_id("douban", "race-source", "movie")
+        stored = discovery_repo.get_media_external_id("douban", "race-source", "movie")
         assert stored is not None
         self.assertIn(str(stored["tmdb_id"]), {"101", "202"})
         self.assertTrue(bool(stored["confirmed"]))
@@ -343,13 +346,13 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             assert prepared.effect_plan is not None
             for field in ("vote_count", "popularity"):
                 self.assertNotIn(field, prepared.effect_plan.metadata["mapping_snapshot"]["source"])
-            self.assertIsNone(db.get_media_external_id("douban", "persisted-source", "movie"))
+            self.assertIsNone(discovery_repo.get_media_external_id("douban", "persisted-source", "movie"))
             cold = effects(SQLiteKernelStore())
             pending = await cold.get_pending_plan(owner=context.owner, session_id=context.session_id)
             assert pending is not None and pending.plan_id == prepared.effect_plan.plan_id
             completed = await cold.execute_confirmed(pending.plan_id, context=context)
             self.assertTrue(completed.outcome.public_content["ok"])
-            row = db.get_media_external_id("douban", "persisted-source", "movie")
+            row = discovery_repo.get_media_external_id("douban", "persisted-source", "movie")
             assert row is not None and row["tmdb_id"] == "909" and row["confirmed"]
             with self.assertRaises(ToolPipelineError):
                 await cold.execute_confirmed(pending.plan_id, context=context)
@@ -362,18 +365,18 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
     def test_discovery_mapping_cas_preserves_concurrently_confirmed_mapping(self) -> None:
         service = self._mapping_service()
         card = MediaCard(provider="douban", external_id="race-existing", media_type="movie", title="原始来源", year="2025")
-        db.upsert_media_external_id("douban", "race-existing", "movie", "100", "旧候选", "2025", 0.8, False)
+        discovery_repo.upsert_media_external_id("douban", "race-existing", "movie", "100", "旧候选", "2025", 0.8, False)
         with patch.object(service, "get_detail", return_value=card):
             prepared = service.prepare_tmdb_mapping("douban", "race-existing", "movie", "300")
             assert prepared is not None
             with patch("app.database.now", return_value=prepared["mapping"]["updated_at"]):
-                db.upsert_media_external_id("douban", "race-existing", "movie", "200", "并发确认候选", "2026", 1.0, True)
+                discovery_repo.upsert_media_external_id("douban", "race-existing", "movie", "200", "并发确认候选", "2026", 1.0, True)
                 saved = service.confirm_tmdb_mapping_if_unchanged(
                     "douban", "race-existing", "movie", "300", prepared["mapping"],
                     expected_source=prepared["source"], expected_target=prepared["target"],
                 )
         self.assertIsNone(saved)
-        stored = db.get_media_external_id("douban", "race-existing", "movie")
+        stored = discovery_repo.get_media_external_id("douban", "race-existing", "movie")
         assert stored is not None
         self.assertEqual((stored["tmdb_id"], stored["title"], stored["confirmed"]), ("200", "并发确认候选", 1))
 
@@ -384,7 +387,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
 
         def concurrent_confirmation(tmdb_id, media_type):
             verified = verify(tmdb_id, media_type)
-            db.upsert_media_external_id("douban", "race-agent", "movie", "404", "并发确认", "2026", 1.0, True)
+            discovery_repo.upsert_media_external_id("douban", "race-agent", "movie", "404", "并发确认", "2026", 1.0, True)
             return verified
 
         async def exercise():
@@ -401,7 +404,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
                     await effects.execute_confirmed(prepared.effect_plan.plan_id, context=context)
             self.assertEqual(caught.exception.code, "confirmation_stale")
             self.assertFalse(caught.exception.execution_started)
-            row = db.get_media_external_id("douban", "race-agent", "movie")
+            row = discovery_repo.get_media_external_id("douban", "race-agent", "movie")
             assert row is not None and row["tmdb_id"] == "404" and row["confirmed"]
 
         with patch.object(service, "get_detail", return_value=card), patch("app.agent.kernel.ports.sdk_effects.get_discovery_service", return_value=service):
@@ -452,7 +455,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         ):
             pending = rss_delivery._capture("download", {"limit": 1})
             pending_fingerprint = rss_delivery.prepare("download", {"limit": 1})[1]
-            db.record_rss_entry_failure(second_entry, "qb_unavailable", True)
+            rss_repo.record_rss_entry_failure(second_entry, "qb_unavailable", True)
             retryable = rss_delivery._capture("retry", {"limit": 1})
             retry_fingerprint = rss_delivery.prepare("retry", {"limit": 1})[1]
 
@@ -494,7 +497,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             self.assertEqual(result["status"], "accepted")
             self.assertTrue(result["data"]["queued"])
             run_id = result["data"]["run_id"]
-            claimed = db.claim_due_agent_library_patrol(current_time=scheduler._now())
+            claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=scheduler._now())
             assert claimed is not None and claimed["cycle_run_id"] == run_id
             second = await effects.prepare("library.run_patrol", {}, context=context)
             assert second.effect_plan is not None

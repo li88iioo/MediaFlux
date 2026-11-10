@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.clients.guangya import GuangYaClient
 from app.indexers.downloads import _persist_and_dispatch
 from app.modules import download_dispatcher
@@ -24,12 +26,12 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM download_requests")
 
     def _seed(self):
-        subscription_id = db.add_media_subscription(
+        subscription_id = media_subscriptions_repo.add_media_subscription(
             provider="tmdb", external_id="1", tmdb_id="1", media_type="tv",
             title="闭环测试", monitor_mode="missing", action="confirm",
             download_target="both", check_interval_minutes=60,
         )
-        candidate_id = db.replace_media_subscription_candidates(
+        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
             subscription_id, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{"result_id":"result-1","title":"闭环资源","download_state":"ready","relevance_score":99}],
             expires_at="2099-01-01 00:00:00",
@@ -37,7 +39,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         return subscription_id, candidate_id
 
     def _claim_dispatching(self, subscription_id: int, candidate_id: int) -> int:
-        admission_id = db.claim_media_download_admission(
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key=f"tmdb:{subscription_id}:tv:S01E001",
             tmdb_id=str(subscription_id),
             media_type="tv",
@@ -48,7 +50,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             subscription_revision=1,
         )
         assert isinstance(admission_id, int)
-        self.assertTrue(db.begin_media_download_dispatch(
+        self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
             admission_id,
             subscription_id=subscription_id,
             subscription_revision=1,
@@ -58,12 +60,12 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
     def _seed_failed_subscription_request(self, suffix: int = 86034):
         tmdb_id = str(suffix)
         media_key = f"tmdb:{tmdb_id}:tv:S01E001"
-        subscription_id = db.add_media_subscription(
+        subscription_id = media_subscriptions_repo.add_media_subscription(
             provider="tmdb", external_id=tmdb_id, tmdb_id=tmdb_id, media_type="tv",
             title="重试准入闭环", monitor_mode="missing", action="confirm",
             download_target="qb", check_interval_minutes=4320,
         )
-        candidate_id = db.replace_media_subscription_candidates(
+        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
             subscription_id, media_key, season=1, episode=1,
             candidates=[{
                 "result_id": f"retry-{suffix}", "title": "同集旧资源",
@@ -71,13 +73,13 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             }],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        admission_id = db.claim_media_download_admission(
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key=media_key, tmdb_id=tmdb_id, media_type="tv",
             subscription_id=subscription_id, candidate_id=candidate_id,
             season=1, episode=1, subscription_revision=1,
         )
         self.assertTrue(admission_id)
-        self.assertTrue(db.begin_media_download_dispatch(
+        self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
             admission_id, subscription_id=subscription_id,
             subscription_revision=1,
         ))
@@ -89,21 +91,21 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             item, "", "subscription", origin="indexer:test", admission_id=admission_id,
         )
         request_id = int(created["id"])
-        db.update_media_subscription_candidate(
+        media_subscriptions_repo.update_media_subscription_candidate(
             candidate_id, status="submitted", request_id=request_id,
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="qb", status="failed", qb_status="failed",
             error="模拟的确定失败",
         )
-        db.sync_media_download_admission_for_request(request_id)
+        media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
         return subscription_id, candidate_id, admission_id, request_id, media_key
 
     def test_new_subscription_admission_binds_when_same_hash_failed_owner_is_archived(self):
         subscription, _old_candidate, old_admission, old_request, media_key = (
             self._seed_failed_subscription_request(86080)
         )
-        candidate = db.replace_media_subscription_candidates(
+        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
             subscription, media_key, season=1, episode=1,
             candidates=[{
                 "result_id": "retry-new-candidate", "title": "同 hash 新候选",
@@ -111,16 +113,16 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             }],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        new_admission = db.claim_media_download_admission(
+        new_admission = media_subscriptions_repo.claim_media_download_admission(
             media_key=media_key, tmdb_id="86080", media_type="tv",
             subscription_id=subscription, candidate_id=candidate,
             season=1, episode=1, subscription_revision=1,
         )
         self.assertTrue(new_admission)
-        self.assertTrue(db.begin_media_download_dispatch(
+        self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
             new_admission, subscription_id=subscription, subscription_revision=1,
         ))
-        source = db.get_download_request(old_request)
+        source = download_requests_repo.get_download_request(old_request)
         assert source is not None
         item = DownloadInput(
             kind="magnet", title=str(source["title"]),
@@ -157,7 +159,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                 "WHERE id=(SELECT subscription_id FROM media_download_admissions WHERE id=?)",
                 (admission_id,),
             )
-        source = db.get_download_request(source_id)
+        source = download_requests_repo.get_download_request(source_id)
         assert source is not None
         item = DownloadInput(
             kind="magnet", title=str(source["title"]),
@@ -182,7 +184,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         subscription_id, candidate_id = self._seed()
         admission_id = self._claim_dispatching(subscription_id, candidate_id)
 
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "admission-bound", "magnet", title="闭环资源", admission_id=admission_id
         )
 
@@ -197,7 +199,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
     def test_request_creation_rolls_back_when_admission_cannot_bind(self):
         subscription_id, candidate_id = self._seed()
-        admission_id = db.claim_media_download_admission(
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key="tmdb:1:tv:S01E001",
             tmdb_id="1",
             media_type="tv",
@@ -210,17 +212,17 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
         assert admission_id is not None
         with self.assertRaises(RuntimeError):
-            db.create_download_request(
+            download_requests_repo.create_download_request(
                 "admission-rollback", "magnet", title="闭环资源",
                 admission_id=admission_id,
             )
 
-        self.assertIsNone(db.get_download_request_by_request_key("admission-rollback"))
+        self.assertIsNone(download_requests_repo.get_download_request_by_request_key("admission-rollback"))
 
     def test_request_and_admission_projection_roll_back_together(self):
         subscription_id, candidate_id = self._seed()
         admission_id = self._claim_dispatching(subscription_id, candidate_id)
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "admission-atomic", "magnet", title="闭环资源", admission_id=admission_id
         )
         with db.get_conn() as conn:
@@ -230,14 +232,14 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             )
         try:
             with self.assertRaises(Exception):
-                db.update_download_request_and_sync_media_admission(
+                download_requests_repo.update_download_request_and_sync_media_admission(
                     request_id, status="failed", error="提交失败"
                 )
         finally:
             with db.get_conn() as conn:
                 conn.execute("DROP TRIGGER IF EXISTS reject_admission_failure")
 
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["status"], "pending")
         with db.get_conn() as conn:
@@ -256,19 +258,19 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                 (old_stamp, first_admission),
             )
 
-        second_subscription = db.add_media_subscription(
+        second_subscription = media_subscriptions_repo.add_media_subscription(
             provider="tmdb", external_id="2", tmdb_id="2", media_type="tv",
             title="闭环测试 2", monitor_mode="missing", action="confirm",
             download_target="both", check_interval_minutes=60,
         )
-        second_candidate = db.replace_media_subscription_candidates(
+        second_candidate = media_subscriptions_repo.replace_media_subscription_candidates(
             second_subscription, "tmdb:2:tv:S01E001", season=1, episode=1,
             candidates=[{"result_id":"result-2","title":"闭环资源 2","download_state":"ready"}],
             expires_at="2099-01-01 00:00:00",
         )[0]
         second_admission = self._claim_dispatching(second_subscription, second_candidate)
 
-        projected, released = db.reconcile_startup_media_download_admissions()
+        projected, released = media_subscriptions_repo.reconcile_startup_media_download_admissions()
 
         self.assertEqual(projected, 0)
         self.assertEqual(released, 2)
@@ -286,7 +288,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             kind="magnet", title="待恢复资源",
             source_value="magnet:?xt=urn:btih:pending-recovery",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             request_key(item), "magnet", title=item.title,
             source_value=item.source_value, admission_id=original_admission,
         )
@@ -299,17 +301,17 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                 "UPDATE media_download_admissions SET updated_at=? WHERE id=?",
                 (old_stamp, original_admission),
             )
-        _projected, released = db.reconcile_startup_media_download_admissions()
+        _projected, released = media_subscriptions_repo.reconcile_startup_media_download_admissions()
         self.assertEqual(released, 1)
 
-        retry_admission = db.claim_media_download_admission(
+        retry_admission = media_subscriptions_repo.claim_media_download_admission(
             media_key=f"tmdb:{subscription_id}:tv:S01E001",
             tmdb_id=str(subscription_id), media_type="tv",
             subscription_id=subscription_id, candidate_id=candidate_id,
             season=1, episode=1, subscription_revision=1,
         )
         assert retry_admission is not None
-        self.assertTrue(db.begin_media_download_dispatch(
+        self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
             retry_admission, subscription_id=subscription_id,
             subscription_revision=1,
         ))
@@ -342,13 +344,13 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
     def test_startup_reconcile_immediately_releases_fresh_bound_pending_request(self):
         subscription_id, candidate_id = self._seed()
         admission_id = self._claim_dispatching(subscription_id, candidate_id)
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "fresh-bound-pending", "magnet", title="刚创建的待提交资源",
             admission_id=admission_id,
         )
         self.assertTrue(created)
 
-        projected, released = db.reconcile_startup_media_download_admissions()
+        projected, released = media_subscriptions_repo.reconcile_startup_media_download_admissions()
 
         self.assertEqual(projected, 0)
         self.assertEqual(released, 1)
@@ -369,7 +371,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         )
 
         def fail_after_claim(request_id, targets, **_kwargs):
-            self.assertTrue(db.claim_download_request(request_id, targets))
+            self.assertTrue(download_requests_repo.claim_download_request(request_id, targets))
             raise RuntimeError("persist after backend failed")
 
         with patch(
@@ -383,7 +385,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         self.assertTrue(created["created"])
         self.assertEqual(result["status"], "manual_review")
         self.assertEqual(result["request_id"], request_id)
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["status"], "manual_review")
         self.assertEqual(request["qb_status"], "manual_review")
@@ -403,7 +405,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             source_value="magnet:?xt=urn:btih:backend-accepted",
         )
         finalize_calls = 0
-        real_finalize = db.finalize_download_request_submission
+        real_finalize = download_requests_repo.finalize_download_request_submission
 
         def fail_finalize(_request_id, _claimed_targets, **_fields):
             nonlocal finalize_calls
@@ -416,7 +418,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             "app.modules.download_dispatcher._submit_qb",
             return_value={"ok": True, "task_id": "qb-accepted"},
         ), patch(
-            "app.modules.download_dispatcher.db.finalize_download_request_submission",
+            "app.repositories.download_requests.finalize_download_request_submission",
             side_effect=fail_finalize,
         ):
             _created, request_id, result = _persist_and_dispatch(
@@ -426,7 +428,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(finalize_calls, 2)
         self.assertEqual(result["status"], "manual_review")
         self.assertEqual(result["request_id"], request_id)
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["status"], "manual_review")
         self.assertEqual(request["qb_status"], "manual_review")
@@ -441,9 +443,9 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
     def test_late_dispatch_result_cannot_reopen_completed_admission(self):
         subscription_id, candidate_id = self._seed()
         admission_id = self._claim_dispatching(subscription_id, candidate_id)
-        db.complete_media_download_admissions([f"tmdb:{subscription_id}:tv:S01E001"])
+        media_subscriptions_repo.complete_media_download_admissions([f"tmdb:{subscription_id}:tv:S01E001"])
 
-        updated = db.update_media_download_admission(
+        updated = media_subscriptions_repo.update_media_download_admission(
             admission_id,
             expected_statuses=("dispatching",),
             status="submitted",
@@ -460,15 +462,15 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
     def test_startup_reconcile_projects_linked_manual_review(self):
         subscription_id, candidate_id = self._seed()
         admission_id = self._claim_dispatching(subscription_id, candidate_id)
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "admission-manual-review", "magnet", title="闭环资源",
             admission_id=admission_id,
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="manual_review", error="提交结果未知，请人工核验"
         )
 
-        projected, released = db.reconcile_startup_media_download_admissions()
+        projected, released = media_subscriptions_repo.reconcile_startup_media_download_admissions()
 
         self.assertEqual(projected, 1)
         self.assertEqual(released, 0)
@@ -482,23 +484,23 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
     def test_refresh_preserves_submitted_candidate_identity_and_admission_link(self):
         subscription_id, candidate_id = self._seed()
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "submitted-refresh", "magnet", title="闭环资源"
         )
-        admission_id = db.claim_media_download_admission(
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key="tmdb:1:tv:S01E001", tmdb_id="1", media_type="tv",
             subscription_id=subscription_id, candidate_id=candidate_id,
             season=1, episode=1, subscription_revision=1,
         )
-        db.update_media_subscription_candidate(
+        media_subscriptions_repo.update_media_subscription_candidate(
             candidate_id, status="submitted", request_id=request_id
         )
         assert admission_id is not None
-        db.update_media_download_admission(
+        media_subscriptions_repo.update_media_download_admission(
             admission_id, status="submitted", request_id=request_id
         )
 
-        refreshed_id = db.replace_media_subscription_candidates(
+        refreshed_id = media_subscriptions_repo.replace_media_subscription_candidates(
             subscription_id, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{
                 "result_id": "result-1", "title": "闭环资源（刷新）",
@@ -509,7 +511,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         )[0]
 
         self.assertEqual(refreshed_id, candidate_id)
-        candidate = db.get_media_subscription_candidate(candidate_id)
+        candidate = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
         assert candidate is not None
         self.assertEqual(candidate["status"], "submitted")
         self.assertEqual(int(candidate["request_id"]), request_id)
@@ -535,24 +537,24 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
     def test_tracker_backfills_isolated_task_identity_and_syncs_admission(self):
         subscription_id, candidate_id = self._seed()
-        request_id, _ = db.create_download_request("closure-key", "magnet", title="闭环资源")
-        admission_id = db.claim_media_download_admission(
+        request_id, _ = download_requests_repo.create_download_request("closure-key", "magnet", title="闭环资源")
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key="tmdb:1:tv:S01E001", tmdb_id="1", media_type="tv",
             subscription_id=subscription_id, candidate_id=candidate_id, season=1, episode=1,
             subscription_revision=1,
         )
         assert admission_id is not None
-        db.update_media_download_admission(admission_id, status="submitted", request_id=request_id)
-        db.update_download_request(
+        media_subscriptions_repo.update_media_download_admission(admission_id, status="submitted", request_id=request_id)
+        download_requests_repo.update_download_request(
             request_id, targets="guangya", status="submitted", gy_status="submitted",
             gy_isolated=1, gy_target_dir="stage-1", gy_task_ids="[]", gy_batch_count=0,
         )
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         task = {"id":"gy-1","name":"闭环资源","target_dir":"stage-1","status":0,"progress":0.4,"raw":{}}
         tracker = DownloadTracker()
         with patch.object(tracker, "_update_backend_log"), patch.object(tracker, "_notify_completion"):
             tracker._update_request(row, [], [task], qb_available=False, gy_available=True)
-        updated = db.get_download_request(request_id)
+        updated = download_requests_repo.get_download_request(request_id)
         assert updated is not None
         self.assertEqual(updated["gy_task_id"], "gy-1")
         self.assertEqual(updated["gy_task_ids"], '["gy-1"]')
@@ -563,10 +565,10 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
     def test_both_is_one_download_admission_and_candidate_exposes_delivery(self):
         subscription_id, candidate_id = self._seed()
-        request_id, _ = db.create_download_request("both-key", "magnet", title="闭环资源")
-        db.update_download_request(request_id, targets="both", status="submitted", qb_status="submitted", gy_status="submitted")
+        request_id, _ = download_requests_repo.create_download_request("both-key", "magnet", title="闭环资源")
+        download_requests_repo.update_download_request(request_id, targets="both", status="submitted", qb_status="submitted", gy_status="submitted")
         async def submit(_service, _result_id, _target, *, admission_id):
-            db.bind_media_download_admission_request(admission_id, request_id)
+            download_requests_repo.bind_media_download_admission_request(admission_id, request_id)
             return downloader.return_value
 
         downloader = AsyncMock(side_effect=submit, return_value={
@@ -588,18 +590,18 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(subscription["workflow"]["primary"], "submitted")
         self.assertEqual(subscription["workflow"]["submitted_count"], 1)
         self.assertEqual(subscription["candidate_count"], 1)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="downloading", qb_status="downloading", gy_status="downloading"
         )
-        db.sync_media_download_admission_for_request(request_id)
+        media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
         self.assertEqual(
             service.get_subscription(subscription_id)["workflow"]["primary"], "downloading"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="completed", qb_status="completed", gy_status="completed",
             organize_status="queued", local_import_status="pending",
         )
-        db.sync_media_download_admission_for_request(request_id)
+        media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
         self.assertEqual(
             service.get_subscription(subscription_id)["workflow"]["primary"], "processing"
         )
@@ -609,19 +611,19 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
     def test_completed_download_with_failed_postprocess_releases_media_key(self):
         subscription_id, candidate_id = self._seed()
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "postprocess-failure", "magnet", title="后处理失败资源"
         )
-        admission_id = db.claim_media_download_admission(
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key="tmdb:1:tv:S01E001", tmdb_id="1", media_type="tv",
             subscription_id=subscription_id, candidate_id=candidate_id,
             season=1, episode=1, subscription_revision=1,
         )
         assert admission_id is not None
-        db.update_media_download_admission(
+        media_subscriptions_repo.update_media_download_admission(
             admission_id, status="submitted", request_id=request_id
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -629,7 +631,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             local_import_error="目标目录不可写",
         )
 
-        self.assertEqual(db.sync_media_download_admission_for_request(request_id), 1)
+        self.assertEqual(media_subscriptions_repo.sync_media_download_admission_for_request(request_id), 1)
         with db.get_conn() as conn:
             admission = conn.execute(
                 "SELECT status,error,completed_at FROM media_download_admissions WHERE id=?",
@@ -641,16 +643,16 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
 
     def test_manual_review_result_keeps_candidate_and_admission_bound(self):
         subscription_id, candidate_id = self._seed()
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "manual-review-result", "magnet", title="结果未知资源",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb", status="manual_review", qb_status="manual_review",
             error="提交结果未知，请人工核验",
         )
         async def submit(_service, _result_id, _target, *, admission_id):
-            db.bind_media_download_admission_request(admission_id, request_id)
+            download_requests_repo.bind_media_download_admission_request(admission_id, request_id)
             return downloader.return_value
 
         downloader = AsyncMock(side_effect=submit, return_value={
@@ -671,7 +673,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             )
 
         self.assertEqual(result["status"], "manual_review")
-        candidate = db.get_media_subscription_candidate(candidate_id)
+        candidate = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
         assert candidate is not None
         self.assertEqual(candidate["status"], "submitted")
         self.assertEqual(int(candidate["request_id"]), request_id)
@@ -724,11 +726,11 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(observed_before_submit, [(
             successor_id, "dispatching", successor_id, successor_id,
         )])
-        get_download_request_result = db.get_download_request(successor_id)
+        get_download_request_result = download_requests_repo.get_download_request(successor_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["status"], "submitted")
 
-        second_candidate_id = db.replace_media_subscription_candidates(
+        second_candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
             subscription_id, media_key, season=1, episode=1,
             candidates=[{
                 "result_id": "retry-different-hash", "title": "同集新资源",
@@ -736,7 +738,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             }],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        second_admission_id = db.claim_media_download_admission(
+        second_admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key=media_key, tmdb_id="86034", media_type="tv",
             subscription_id=subscription_id, candidate_id=second_candidate_id,
             season=1, episode=1, subscription_revision=1,
@@ -776,10 +778,10 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                     backend_result.get("failure_code") == "qb_outcome_unknown",
                 )
                 successor_id = int(result["request_id"])
-                get_download_request_result_2 = db.get_download_request(successor_id)
+                get_download_request_result_2 = download_requests_repo.get_download_request(successor_id)
                 assert get_download_request_result_2 is not None
                 self.assertEqual(get_download_request_result_2["status"], request_status)
-                candidate = db.get_media_subscription_candidate(candidate_id)
+                candidate = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
                 assert candidate is not None
                 self.assertEqual(int(candidate["request_id"]), successor_id)
                 with db.get_conn() as conn:
@@ -789,7 +791,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                     ).fetchone()
                 self.assertEqual(int(admission["request_id"]), successor_id)
                 self.assertEqual(admission["status"], admission_status)
-                replacement_candidate = db.replace_media_subscription_candidates(
+                replacement_candidate = media_subscriptions_repo.replace_media_subscription_candidates(
                     _subscription, _media_key, season=1, episode=1,
                     candidates=[{
                         "result_id": f"retry-alternate-{offset}",
@@ -797,7 +799,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                     }],
                     expires_at="2099-01-01 00:00:00",
                 )[0]
-                next_admission = db.claim_media_download_admission(
+                next_admission = media_subscriptions_repo.claim_media_download_admission(
                     media_key=_media_key, tmdb_id=str(86040 + offset), media_type="tv",
                     subscription_id=_subscription, candidate_id=replacement_candidate,
                     season=1, episode=1, subscription_revision=1,
@@ -811,11 +813,11 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         _subscription, candidate_id, admission_id, source_id, _media_key = (
             self._seed_failed_subscription_request(86049)
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             source_id, status="manual_review", qb_status="manual_review",
             error="历史结果待人工核验",
         )
-        db.update_media_download_admission(
+        media_subscriptions_repo.update_media_download_admission(
             admission_id, status="failed", error="待重试准入",
         )
         capabilities = {
@@ -848,7 +850,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["ok"], result)
         successor_id = int(result["request_id"])
         self.assertEqual(observed, [(successor_id, "dispatching", successor_id, successor_id)])
-        get_download_request_result_3 = db.get_download_request(source_id)
+        get_download_request_result_3 = download_requests_repo.get_download_request(source_id)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["status"], "resubmitted")
 
@@ -899,10 +901,10 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             first = download_dispatcher.resubmit_download_request(source_id, "qb")
             first_successor = int(first["request_id"])
             self.assertFalse(first["ok"])
-            get_download_request_result_4 = db.get_download_request(source_id)
+            get_download_request_result_4 = download_requests_repo.get_download_request(source_id)
             assert get_download_request_result_4 is not None
             self.assertEqual(get_download_request_result_4["status"], "failed")
-            get_download_request_result_5 = db.get_download_request(first_successor)
+            get_download_request_result_5 = download_requests_repo.get_download_request(first_successor)
             assert get_download_request_result_5 is not None
             self.assertEqual(get_download_request_result_5["status"], "failed")
             with db.get_conn() as conn:
@@ -916,10 +918,10 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             second = download_dispatcher.resubmit_download_request(source_id, "guangya")
             second_successor = int(second["request_id"])
             self.assertFalse(second["ok"])
-            get_download_request_result_6 = db.get_download_request(source_id)
+            get_download_request_result_6 = download_requests_repo.get_download_request(source_id)
             assert get_download_request_result_6 is not None
             self.assertEqual(get_download_request_result_6["status"], "failed")
-            get_download_request_result_7 = db.get_download_request(second_successor)
+            get_download_request_result_7 = download_requests_repo.get_download_request(second_successor)
             assert get_download_request_result_7 is not None
             self.assertEqual(get_download_request_result_7["status"], "failed")
             with db.get_conn() as conn:
@@ -935,7 +937,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         third_successor = int(third["request_id"])
         self.assertTrue(third["ok"])
         self.assertNotIn(third_successor, {source_id, first_successor, second_successor})
-        get_download_request_result_8 = db.get_download_request(source_id)
+        get_download_request_result_8 = download_requests_repo.get_download_request(source_id)
         assert get_download_request_result_8 is not None
         self.assertEqual(get_download_request_result_8["status"], "resubmitted")
         self.assertEqual(
@@ -959,7 +961,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             ).fetchone()[0], 4)
         self.assertEqual((int(admission["request_id"]), admission["status"]),
                          (third_successor, "submitted"))
-        get_media_subscription_candidate_result = db.get_media_subscription_candidate(candidate_id)
+        get_media_subscription_candidate_result = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
         assert get_media_subscription_candidate_result is not None
         self.assertEqual(
             int(get_media_subscription_candidate_result["request_id"]),
@@ -989,7 +991,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                 self.assertTrue(result["retry_blocked"])
                 self.assertTrue(result["source_attention_preserved"])
                 submit.assert_not_called()
-                get_download_request_result_9 = db.get_download_request(source_id)
+                get_download_request_result_9 = download_requests_repo.get_download_request(source_id)
                 assert get_download_request_result_9 is not None
                 self.assertEqual(get_download_request_result_9["status"], "failed")
                 with db.get_conn() as conn:
@@ -1002,7 +1004,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                     ).fetchone()
                 self.assertEqual((int(row["request_id"]), row["status"]),
                                  (source_id, "failed"))
-                get_media_subscription_candidate_result_2 = db.get_media_subscription_candidate(candidate)
+                get_media_subscription_candidate_result_2 = media_subscriptions_repo.get_media_subscription_candidate(candidate)
                 assert get_media_subscription_candidate_result_2 is not None
                 self.assertEqual(int(get_media_subscription_candidate_result_2["request_id"]),
                                  source_id)
@@ -1016,7 +1018,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         create = download_dispatcher.create_request
 
         def cancel_before_create(*args, **kwargs):
-            db.update_download_request(source_id, status="cancelled", qb_status="cancelled")
+            download_requests_repo.update_download_request(source_id, status="cancelled", qb_status="cancelled")
             return create(*args, **kwargs)
 
         with (
@@ -1027,7 +1029,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             result = download_dispatcher.resubmit_download_request(source_id, "qb")
         self.assertTrue(result["retry_blocked"])
         submit.assert_not_called()
-        get_download_request_result_10 = db.get_download_request(source_id)
+        get_download_request_result_10 = download_requests_repo.get_download_request(source_id)
         assert get_download_request_result_10 is not None
         self.assertEqual(get_download_request_result_10["status"], "cancelled")
         with db.get_conn() as conn:
@@ -1062,28 +1064,28 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             ).fetchone()
         self.assertEqual((int(admission["request_id"]), admission["status"]),
                          (successor, "submitted"))
-        get_media_subscription_candidate_result_3 = db.get_media_subscription_candidate(candidate)
+        get_media_subscription_candidate_result_3 = media_subscriptions_repo.get_media_subscription_candidate(candidate)
         assert get_media_subscription_candidate_result_3 is not None
         self.assertEqual(int(get_media_subscription_candidate_result_3["request_id"]), successor)
 
     def test_candidate_count_matches_visible_rows_after_retrying_same_episode(self):
         subscription_id, first_candidate_id = self._seed()
-        first_request_id, _ = db.create_download_request(
+        first_request_id, _ = download_requests_repo.create_download_request(
             "first-failed", "magnet", title="失败候选"
         )
-        first_admission_id = db.claim_media_download_admission(
+        first_admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key="tmdb:1:tv:S01E001", tmdb_id="1", media_type="tv",
             subscription_id=subscription_id, candidate_id=first_candidate_id, season=1, episode=1,
             subscription_revision=1,
         )
-        db.update_media_subscription_candidate(
+        media_subscriptions_repo.update_media_subscription_candidate(
             first_candidate_id, status="submitted", request_id=first_request_id
         )
         assert first_admission_id is not None
-        db.update_media_download_admission(
+        media_subscriptions_repo.update_media_download_admission(
             first_admission_id, status="failed", request_id=first_request_id, error="下载失败"
         )
-        second_candidate_id = db.replace_media_subscription_candidates(
+        second_candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
             subscription_id, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{
                 "result_id": "result-2", "title": "替代候选",
@@ -1091,19 +1093,19 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             }],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        second_request_id, _ = db.create_download_request(
+        second_request_id, _ = download_requests_repo.create_download_request(
             "second-submitted", "magnet", title="替代候选"
         )
-        second_admission_id = db.claim_media_download_admission(
+        second_admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key="tmdb:1:tv:S01E001", tmdb_id="1", media_type="tv",
             subscription_id=subscription_id, candidate_id=second_candidate_id, season=1, episode=1,
             subscription_revision=1,
         )
-        db.update_media_subscription_candidate(
+        media_subscriptions_repo.update_media_subscription_candidate(
             second_candidate_id, status="submitted", request_id=second_request_id
         )
         assert second_admission_id is not None
-        db.update_media_download_admission(
+        media_subscriptions_repo.update_media_download_admission(
             second_admission_id, status="submitted", request_id=second_request_id
         )
 

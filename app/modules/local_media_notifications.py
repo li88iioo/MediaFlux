@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from app import config
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
 from app.modules.local_media_outcomes import local_media_refresh_status
@@ -224,10 +224,10 @@ def schedule_local_media_task_review(
     preview = _value(result, "preview", {})
     if not isinstance(preview, Mapping):
         return False
-    task = db.get_local_media_task(task_id, owner=owner)
+    task = local_media_repo.get_local_media_task(task_id, owner=owner)
     if task is None or str(getattr(task, "status", "")) != "requires_manual":
         return False
-    source = db.get_local_media_source(task.source_id, owner=owner)
+    source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
     if source is None:
         return False
     try:
@@ -268,10 +268,10 @@ def notify_local_media_task(
             task_id, result, owner=owner, chat_id=chat_id
         )
         return False
-    task = db.get_local_media_task(task_id, owner=owner)
+    task = local_media_repo.get_local_media_task(task_id, owner=owner)
     if task is None:
         return False
-    source = db.get_local_media_source(task.source_id, owner=owner)
+    source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
     event = build_local_media_event(
         task,
         source,
@@ -279,7 +279,7 @@ def notify_local_media_task(
         error=error,
         chat_id=chat_id,
     )
-    linked_requests = db.list_download_requests_for_local_media_task(task_id)
+    linked_requests = local_media_repo.list_download_requests_for_local_media_task(task_id)
     if linked_requests:
         from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 

@@ -5,6 +5,8 @@ from unittest.mock import patch
 from typing import Any, cast
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app import sdk
 from app.agent.models import ToolResult
 from app.repositories import activity
@@ -25,10 +27,10 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM task_runs")
 
     def make_request(self, key="a", title="示例剧"):
-        identifier, _ = db.create_download_request(
+        identifier, _ = download_requests_repo.create_download_request(
             key, "magnet", title=title, origin="agent"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             identifier, targets="guangya", status="downloading", gy_status="downloading"
         )
         return identifier
@@ -38,13 +40,13 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         unrelated = self.make_request("b")
         run_id = db.add_task_run("strm", "organize")
         db.finish_task_run(run_id, "failed", error="索引站点响应超时")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             identifier,
             strm_run_id=run_id,
             strm_status="failed",
             strm_error="索引站点响应超时",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             unrelated, organize_status="failed", organize_error="不属于当前请求"
         )
         value = sdk.activity.timeline("download", identifier)
@@ -57,7 +59,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
 
     def test_no_in_library_claim_when_only_download_completed(self):
         identifier = self.make_request()
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             identifier, status="completed", gy_status="completed"
         )
         value = sdk.activity.timeline("download", identifier)
@@ -68,9 +70,9 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
     def test_resubmitted_stages_end_the_original_attempt_without_claiming_completion(self):
         identifier = self.make_request()
         successor = self.make_request("successor")
-        db.update_download_request(identifier, status="failed", gy_status="failed",
+        download_requests_repo.update_download_request(identifier, status="failed", gy_status="failed",
                                    organize_status="failed", strm_status="failed")
-        self.assertTrue(db.mark_download_request_resubmitted(
+        self.assertTrue(download_requests_repo.mark_download_request_resubmitted(
             identifier, successor_request_id=successor, targets="guangya"
         ))
         result = sdk.activity.timeline("download", identifier)
@@ -86,12 +88,12 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
     def test_resubmitted_request_waits_for_the_backend_that_was_not_transferred(self):
         identifier = self.make_request()
         successor = self.make_request("successor")
-        db.update_download_request(identifier, targets="both", status="manual_review",
+        download_requests_repo.update_download_request(identifier, targets="both", status="manual_review",
                                    qb_status="downloading", gy_status="failed")
-        db.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="guangya")
+        download_requests_repo.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="guangya")
         for qb_status, expected, terminal in (("downloading", "in_progress", False), ("completed", "completed", True)):
             with self.subTest(qb_status=qb_status):
-                db.update_download_request(identifier, qb_status=qb_status)
+                download_requests_repo.update_download_request(identifier, qb_status=qb_status)
                 result = sdk.activity.timeline("download", identifier)
                 self.assertEqual((result["status"], result["data"]["terminal"]), (expected, terminal))
                 self.assertFalse(result["data"]["needs_attention"])
@@ -104,13 +106,13 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         runs = {prefix: db.add_task_run(prefix, "resubmit-fixture") for prefix in ("organize", "strm")}
         for prefix, run_id in runs.items():
             db.finish_task_run(run_id, "failed", error=f"{prefix} 原运行失败")
-        db.update_download_request(identifier, status="completed", gy_status="completed",
+        download_requests_repo.update_download_request(identifier, status="completed", gy_status="completed",
                                    organize_status="failed", organize_run_id=runs["organize"],
                                    strm_status="failed", strm_run_id=runs["strm"])
-        db.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="guangya")
+        download_requests_repo.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="guangya")
         for transferred in ({"organize", "strm"}, {"organize"}, {"strm"}):
             with self.subTest(transferred=transferred):
-                db.update_download_request(identifier, status="resubmitted", **{
+                download_requests_repo.update_download_request(identifier, status="resubmitted", **{
                     prefix + "_status": "resubmitted" if prefix in transferred else "failed"
                     for prefix in runs
                 })
@@ -128,9 +130,9 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         identifier = self.make_request()
         successor = self.make_request("successor")
         qb_hash = "a" * 40
-        db.update_download_request(identifier, targets="qb", status="failed", qb_status="failed",
+        download_requests_repo.update_download_request(identifier, targets="qb", status="failed", qb_status="failed",
                                    qb_task_id=qb_hash, local_import_status="failed")
-        db.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="qb")
+        download_requests_repo.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="qb")
         previous = 0
         for total in (1, 21):
             with db.get_conn() as conn:
@@ -147,7 +149,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
             previous = total
             for status, expected in (("resubmitted", "completed"), ("failed", "attention")):
                 with self.subTest(total=total, local_import_status=status):
-                    db.update_download_request(identifier, local_import_status=status)
+                    download_requests_repo.update_download_request(identifier, local_import_status=status)
                     result = sdk.activity.timeline("download", identifier)
                     self.assertEqual((result["status"], result["data"]["terminal"]), (expected, True))
                     linked = [stage for stage in result["data"]["stages"] if stage["stage"].startswith("关联本地任务")]
@@ -158,16 +160,16 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
     def test_handoff_does_not_hide_independent_library_verification(self):
         identifier = self.make_request()
         successor = self.make_request("successor")
-        db.update_download_request(identifier, status="failed", gy_status="failed")
-        db.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="guangya")
+        download_requests_repo.update_download_request(identifier, status="failed", gy_status="failed")
+        download_requests_repo.mark_download_request_resubmitted(identifier, successor_request_id=successor, targets="guangya")
         targets = [{"title": "示例剧", "tmdb_id": "123", "season": 2, "episode": 3,
                     "as_of": "2026-11-01", "library_name": "剧集"}]
-        self.assertEqual(db.enqueue_agent_download_verification(identifier, targets=targets, owner="fixture"), "queued")
+        self.assertEqual(agent_download_verification_repo.enqueue_agent_download_verification(identifier, targets=targets, owner="fixture"), "queued")
         pending = sdk.activity.timeline("download", identifier)
         self.assertEqual((pending["status"], pending["data"]["terminal"]), ("in_progress", False))
-        job = db.claim_due_agent_download_verification()
+        job = agent_download_verification_repo.claim_due_agent_download_verification()
         assert job is not None
-        self.assertTrue(db.update_agent_download_verification(
+        self.assertTrue(agent_download_verification_repo.update_agent_download_verification(
             identifier, status="attention", result="missing", attempts=3, next_check_at=db.now(),
             expected_lease_generation=job["lease_generation"], targets=[{**targets[0], "result": "missing"}],
         ))
@@ -192,7 +194,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
 
     def test_errors_do_not_publish_paths_or_tokens(self):
         identifier = self.make_request()
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             identifier,
             status="failed",
             gy_status="failed",
@@ -283,7 +285,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         ]}
         run_id = db.add_task_run("guangya_organize", "download")
         db.finish_task_run(run_id, "success", result=json.dumps(payload))
-        db.update_download_request(identifier, organize_run_id=run_id, organize_task_id="bound-task",
+        download_requests_repo.update_download_request(identifier, organize_run_id=run_id, organize_task_id="bound-task",
                                    gy_target_dir="mine", gy_isolated=1, organize_status="completed")
         result = sdk.activity.timeline("download", identifier)
         evidence = result["data"]["organize_evidence"]
@@ -296,11 +298,11 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         self.assertNotIn("不属于当前请求", public)
         self.assertNotIn("secret", public)
         self.assertIn("未建立媒体库可见性复核", public)
-        db.update_download_request(identifier, gy_isolated=0)
+        download_requests_repo.update_download_request(identifier, gy_isolated=0)
         shared = sdk.activity.timeline("download", identifier)["data"]["organize_evidence"]
         self.assertEqual(shared["status"], "unavailable")
         self.assertEqual(shared["files"], [])
-        db.update_download_request(identifier, gy_isolated=1)
+        download_requests_repo.update_download_request(identifier, gy_isolated=1)
 
         for invalid in (
             {**payload, "task_id": "old-task"},
@@ -317,7 +319,7 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         stats = payload["sources"][0]["stats"]
         stats["media_items"] *= 51
         db.finish_task_run(run_id, "success", result=json.dumps(payload))
-        db.update_download_request(identifier, organize_status="resubmitted")
+        download_requests_repo.update_download_request(identifier, organize_status="resubmitted")
         bounded = sdk.activity.timeline("download", identifier)["data"]["organize_evidence"]
         self.assertEqual((len(bounded["media"]), bounded["media_count"]), (50, 51))
         self.assertTrue(bounded["truncated"])
@@ -327,11 +329,11 @@ class ActivityClosureTests(IsolatedDatabaseTestCase):
         identifier = self.make_request()
         targets = [{"title": "示例剧", "tmdb_id": "123", "season": 2, "episode": episode,
                     "as_of": "2026-11-01", "library_name": "剧集"} for episode in (3, 4)]
-        self.assertEqual(db.enqueue_agent_download_verification(identifier, targets=targets, owner="a"), "queued")
-        job = db.claim_due_agent_download_verification()
+        self.assertEqual(agent_download_verification_repo.enqueue_agent_download_verification(identifier, targets=targets, owner="a"), "queued")
+        job = agent_download_verification_repo.claim_due_agent_download_verification()
         assert job is not None
         outcomes = [{**target, "result": "visible" if target["episode"] == 3 else "missing"} for target in job["targets"]]
-        self.assertTrue(db.update_agent_download_verification(
+        self.assertTrue(agent_download_verification_repo.update_agent_download_verification(
             identifier, status="attention", result="missing", attempts=3, next_check_at=db.now(),
             expected_lease_generation=job["lease_generation"], targets=outcomes,
         ))

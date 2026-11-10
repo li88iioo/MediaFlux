@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.clients.qbittorrent import TorrentAddResult, TorrentTask
 from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
@@ -51,7 +53,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
         )
         request_id = dispatcher.create_request(item, "", "cancel-race")["id"]
         if path in {"supplement", "retry"}:
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id, status="downloading", targets="both",
                 qb_status=("submitted" if target == "both" else "failed" if path == "retry" else ""),
                 qb_task_id=torrent_hash if target == "both" else "",
@@ -60,7 +62,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 gy_task_ids='["kept-cloud"]' if target == "qb" else "[]",
             )
         elif path == "successor":
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id, status="failed", targets=target, qb_status="failed",
                 gy_status="failed" if target == "both" else "",
             )
@@ -106,11 +108,11 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             patch.object(tracker, "_start_organize"),
             patch.object(tracker, "_notify_completion"),
         ):
-            row = db.get_download_request(request_id)
+            row = download_requests_repo.get_download_request(request_id)
             assert row is not None
             tracker._update_request(row, [], [], qb_available=True, gy_available=False)
         local_import.assert_not_called()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["qb_status"], "cancelled")
         self.assertIsNone(row["qb_task_missing_since"])
@@ -148,7 +150,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                             return {}
 
                         def delete(hashes, *, delete_files):
-                            current = db.get_download_request_by_request_key(dispatcher.request_key(item))
+                            current = download_requests_repo.get_download_request_by_request_key(dispatcher.request_key(item))
                             assert current is not None
                             self.assertEqual(current["qb_status"], "cancelled")
                             self.assertFalse(delete_files)
@@ -162,7 +164,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                             removing = None
                             try:
                                 self.assertTrue(entered.wait(5))
-                                current = db.get_download_request_by_request_key(dispatcher.request_key(item))
+                                current = download_requests_repo.get_download_request_by_request_key(dispatcher.request_key(item))
                                 assert current is not None
                                 self.assertEqual((current["qb_status"], current["qb_task_id"]), ("submitting", ""))
                                 self.assertEqual(remote_tasks, {torrent_hash})
@@ -182,10 +184,10 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                                     self.finish(removing)
                         request_id = result["request_id"]
                         self.assertTrue(result["ok"], result)
-                        row = db.get_download_request(request_id)
+                        row = download_requests_repo.get_download_request(request_id)
                         assert row is not None
                         self.assertEqual((row["qb_status"], row["qb_task_id"]), ("cancelled", torrent_hash))
-                        logs = [row for row in db.list_download_logs() if row["request_id"] == request_id]
+                        logs = [row for row in download_requests_repo.list_download_logs() if row["request_id"] == request_id]
                         self.assertEqual([(row["source"], row["status"]) for row in logs], [("qb", "cancelled")])
                         self.assert_qb_not_tracked(request_id)
                         self.assertEqual(remote_tasks, set())
@@ -202,16 +204,16 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             for receipt in receipts:
                 with self.subTest(path=path, receipt=receipt):
                     _source_id, item, torrent_hash, operation = self.prepare(path, target="both")
-                    sid = db.add_rss_subscription(f"取消 {self.serial}", f"https://rss.invalid/{self.serial}", download_method="guangya")
-                    eid = db.add_rss_entry_with_media(sid, "Cloud", f"cancel-{self.serial}")["id"]
-                    self.assertTrue(db.claim_rss_entry(eid))
+                    sid = rss_repo.add_rss_subscription(f"取消 {self.serial}", f"https://rss.invalid/{self.serial}", download_method="guangya")
+                    eid = rss_repo.add_rss_entry_with_media(sid, "Cloud", f"cancel-{self.serial}")["id"]
+                    self.assertTrue(rss_repo.claim_rss_entry(eid))
                     bind_rss_entry_download(eid, dispatcher.request_key(item), "guangya")
                     entered, release = threading.Event(), threading.Event()
                     seen = {}
 
                     def cloud(row, **_kwargs):
                         seen["request_id"] = row["id"]
-                        current = db.get_download_request(int(row["id"]))
+                        current = download_requests_repo.get_download_request(int(row["id"]))
                         assert current is not None
                         self.assertEqual((current["status"], current["qb_status"], current["gy_status"]),
                                          ("submitting", "submitted", "submitting"))
@@ -223,7 +225,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                         submitting = self.start(operation)
                         try:
                             self.assertTrue(entered.wait(5))
-                            row = db.get_download_request(seen["request_id"])
+                            row = download_requests_repo.get_download_request(seen["request_id"])
                             assert row is not None
                             self.assertEqual((row["qb_status"], row["qb_task_id"]), ("submitted", torrent_hash))
                             contender = CrossProcessLock("qb-control-write")
@@ -237,19 +239,19 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                             release.set()
                             result = self.finish(submitting)
                     request_id = result["request_id"]
-                    row = db.get_download_request(request_id)
+                    row = download_requests_repo.get_download_request(request_id)
                     assert row is not None
                     self.assertEqual(row["qb_status"], "cancelled")
                     self.assertEqual(row["gy_status"], "submitted" if receipt["ok"] else "outcome_unknown" if receipt.get("outcome_unknown") else "failed")
                     self.assertFalse(result.get("stale_result"), result)
                     self.assertEqual(result["results"]["guangya"], receipt)
-                    entry = db.get_rss_entry(eid)
+                    entry = rss_repo.get_rss_entry(eid)
                     assert entry is not None
                     self.assertEqual((entry["status"], entry["processed"]), ("downloaded", 1) if receipt["ok"] else ("submitting", 0))
                     self.assertEqual(entry["download_request_id"], request_id)
                     before = dict(row)
                     db.init_db()
-                    recovered = db.get_download_request(request_id)
+                    recovered = download_requests_repo.get_download_request(request_id)
                     assert recovered is not None
                     self.assertEqual(dict(recovered), before)
                     self.assert_qb_not_tracked(request_id)
@@ -261,7 +263,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 source_id, _item, _hash, operation = self.prepare("first", target="both")
 
                 def lose_claim(row, **_kwargs):
-                    db.update_download_request(row["id"], **{("qb" if stale == "qb" else "gy") + "_status": "manual_review"})
+                    download_requests_repo.update_download_request(row["id"], **{("qb" if stale == "qb" else "gy") + "_status": "manual_review"})
                     return {"ok": True, "task_id": "late"}
 
                 with (
@@ -271,7 +273,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                                  return_value={"ok": True, "task_id": "normal-cloud"}),
                 ):
                     result = operation()
-                row = db.get_download_request(source_id)
+                row = download_requests_repo.get_download_request(source_id)
                 assert row is not None
                 self.assertEqual(row["qb_status"], "manual_review" if stale == "qb" else "submitted")
                 self.assertEqual(row["gy_status"], "manual_review" if stale == "guangya" else "submitted")
@@ -279,15 +281,15 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
 
     def test_target_receipt_cannot_write_cancelled_peer_fields(self):
         request_id, _item, torrent_hash, _operation = self.prepare("first", target="both")
-        self.assertTrue(db.claim_download_request(request_id, "both"))
-        db.update_download_request(request_id, qb_task_id=torrent_hash)
+        self.assertTrue(download_requests_repo.claim_download_request(request_id, "both"))
+        download_requests_repo.update_download_request(request_id, qb_task_id=torrent_hash)
         with qb_control_write_lease():
             remove_qb_tasks(self.client, [torrent_hash])
-        self.assertEqual(db.finalize_download_request_submission(
+        self.assertEqual(download_requests_repo.finalize_download_request_submission(
             request_id, ("guangya",), gy_status="submitted", gy_task_id="normal-cloud",
             qb_status="submitted", qb_task_id="b" * 40,
         ), "submitted")
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row["qb_status"], row["qb_task_id"]), ("cancelled", torrent_hash))
 
@@ -303,7 +305,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 ):
                     result = operation()
                 self.assertTrue(result["ok"], result)
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["error"], f"{failed}: {error}")
 
@@ -321,10 +323,10 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                     size=100, downloaded=int(100 * progress), dlspeed=0, upspeed=0,
                     eta=0, ratio=0.0, category="", added_on=0,
                 )
-                current = db.get_download_request(request_id)
+                current = download_requests_repo.get_download_request(request_id)
                 assert current is not None
                 tracker._update_request(current, [task], [], gy_available=False)
-                current = db.get_download_request(request_id)
+                current = download_requests_repo.get_download_request(request_id)
                 assert current is not None
                 observed.append((current["status"], current["qb_status"], current["gy_status"]))
             return {"ok": True, "task_id": "cloud-after-tracking"}
@@ -335,7 +337,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             self.assertTrue(operation()["ok"])
         self.assertEqual(observed, [("submitting", "downloading", "submitting"),
                                     ("submitting", "completed", "submitting")])
-        current = db.get_download_request(request_id)
+        current = download_requests_repo.get_download_request(request_id)
         assert current is not None
         self.assertEqual((current["status"], current["qb_status"], current["gy_status"]),
                          ("submitted", "completed", "submitted"))
@@ -363,7 +365,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             finally:
                 release.set()
                 result = self.finish(submitting)
-        row = db.get_download_request(result["request_id"])
+        row = download_requests_repo.get_download_request(result["request_id"])
         assert row is not None
         self.assertEqual((row["qb_status"], row["gy_status"]), ("cancelled", "manual_review"))
         self.assertTrue(result["dispatch"].get("review_required"))
@@ -374,7 +376,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             with self.subTest(read_fails=read_fails), isolated_test_database():
                 _request_id, item, torrent_hash, _operation = self.prepare("first")
                 backend_returned = False
-                real_read = db.get_download_request
+                real_read = download_requests_repo.get_download_request
 
                 def add(**_kwargs):
                     nonlocal backend_returned
@@ -392,7 +394,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                         "WHEN NEW.qb_status='submitted' BEGIN SELECT RAISE(ABORT,'qb receipt fault'); END"
                     )
                 self.client.add_torrent_detailed.side_effect = add
-                with patch.object(db, "get_download_request", side_effect=read), patch("app.indexers.downloads.logger") as logger:
+                with patch.object(download_requests_repo, "get_download_request", side_effect=read), patch("app.indexers.downloads.logger") as logger:
                     result = submit_download_input(item, "qb", origin="read-fault")
                 self.assertFalse(result["summary"]["ok"])
                 self.assertEqual(result["summary"]["status"], "manual_review")
@@ -402,7 +404,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 if read_fails:
                     self.assertEqual(logger.error.call_args.args[-1], "OperationalError")
                     self.assertIn("读取失败", logger.error.call_args.args[0])
-                row = db.get_download_request(result["request_id"])
+                row = download_requests_repo.get_download_request(result["request_id"])
                 assert row is not None
                 self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", torrent_hash))
                 self.assertTrue(submit_download_input(item, "qb", origin="read-fault")["summary"].get("duplicate"))
@@ -417,7 +419,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 _request_id, item, torrent_hash, operation = self.prepare(path, kind=kind)
                 lock_name = "qb-control-write" if kind == "http" else f"qb-submit-{torrent_hash}"
                 observed = []
-                finalize = db.finalize_download_request_submission
+                finalize = download_requests_repo.finalize_download_request_submission
 
                 def observe_finalize(request_id, targets, **fields):
                     status = finalize(request_id, targets, **fields)
@@ -426,7 +428,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                         acquired = contender.acquire(blocking=False)
                         if acquired:
                             contender.release()
-                        row = db.get_download_request(request_id)
+                        row = download_requests_repo.get_download_request(request_id)
                         assert row is not None
                         observed.append((acquired, row["qb_task_id"]))
                     return status
@@ -437,7 +439,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                         "WHEN NEW.qb_status='submitted' BEGIN SELECT RAISE(ABORT,'receipt write fault'); END"
                     )
                 try:
-                    with patch.object(db, "finalize_download_request_submission", side_effect=observe_finalize):
+                    with patch.object(download_requests_repo, "finalize_download_request_submission", side_effect=observe_finalize):
                         if path == "first":
                             result = submit_download_input(item, "qb", origin="receipt-fault")
                             self.assertFalse(result["summary"]["ok"])
@@ -451,7 +453,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 self.client.add_torrent_detailed.assert_called_once()
                 self.assertEqual(observed, [(False, torrent_hash)],
                                  "已验证身份必须在原 lease 释放前随核验状态提交")
-                row = db.get_download_request_by_request_key(dispatcher.request_key(item))
+                row = download_requests_repo.get_download_request_by_request_key(dispatcher.request_key(item))
                 assert row is not None
                 self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", torrent_hash))
                 if path in {"supplement", "retry"}:
@@ -467,12 +469,12 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
 
                 def commit_then_fault(request_id, targets, updates):
                     # 模拟事务已经结算/被接管，随后调用方才收到异常。
-                    self.assertIsNotNone(db.finalize_download_request_submission(request_id, targets, **updates))
+                    self.assertIsNotNone(download_requests_repo.finalize_download_request_submission(request_id, targets, **updates))
                     if status == "cancelled":
-                        db.cancel_qb_download_tracking([torrent_hash])
+                        download_requests_repo.cancel_qb_download_tracking([torrent_hash])
                     elif status == "completed":
-                        db.update_download_request(request_id, status="completed", qb_status="completed")
-                    row = db.get_download_request(request_id)
+                        download_requests_repo.update_download_request(request_id, status="completed", qb_status="completed")
+                    row = download_requests_repo.get_download_request(request_id)
                     assert row is not None
                     committed.update(dict(row))
                     raise original_error
@@ -481,7 +483,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError) as raised:
                         operation()
                 self.assertIs(raised.exception, original_error)
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(dict(row), committed)
                 self.client.add_torrent_detailed.assert_called_once()
@@ -490,7 +492,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
         request_id, _item, _torrent_hash, operation = self.prepare("first")
         original_error = sqlite3.OperationalError("original receipt commit failure")
         recovery_error = sqlite3.OperationalError("identity recovery failure")
-        with patch.object(db, "finalize_download_request_submission", side_effect=[
+        with patch.object(download_requests_repo, "finalize_download_request_submission", side_effect=[
             original_error, recovery_error,
         ]) as finalize:
             with self.assertRaises(sqlite3.OperationalError) as raised:
@@ -498,7 +500,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
         self.assertIs(raised.exception, original_error)
         self.assertEqual([call.kwargs["qb_status"] for call in finalize.call_args_list],
                          ["submitted", "manual_review"])
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row["status"], row["qb_status"], row["qb_task_id"]), ("submitting", "submitting", ""))
         self.client.add_torrent_detailed.assert_called_once()
@@ -515,7 +517,7 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
         self.assertFalse(result["summary"]["ok"])
         self.assertEqual(result["summary"]["status"], "manual_review")
         self.assertEqual(result["dispatch"]["succeeded"], [])
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", ""))
         self.assertTrue(submit_download_input(item, "qb", origin="unknown-receipt-fault")["summary"]["duplicate"])
@@ -524,8 +526,8 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
     def test_qb_receipt_persistence_failure_can_be_cancelled_and_release_rss_claim(self):
         request_id, item, torrent_hash, _operation = self.prepare("first")
         media_key = "tmdb:900006:tv:S01E001"
-        sid = db.add_rss_subscription("Receipt fault", "https://rss.invalid/receipt-fault", download_method="qb")
-        eid = db.add_rss_entry_with_media(
+        sid = rss_repo.add_rss_subscription("Receipt fault", "https://rss.invalid/receipt-fault", download_method="qb")
+        eid = rss_repo.add_rss_entry_with_media(
             sid, item.title, "receipt-fault", media_key=media_key,
             payload=json.dumps({"torrent_url": item.source_value}),
         )["id"]
@@ -549,14 +551,14 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             self.assertTrue(remove_qb_tasks(self.client, [torrent_hash]))
         self.client.delete_torrents.assert_called_once_with(torrent_hash, delete_files=False)
         db.init_db()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row["status"], row["qb_status"], row["qb_task_id"]),
                          ("cancelled", "cancelled", torrent_hash))
-        entry = db.get_rss_entry(eid)
+        entry = rss_repo.get_rss_entry(eid)
         assert entry is not None
         self.assertEqual(entry["download_request_id"], request_id)
-        alternative = db.add_rss_entry_with_media(
+        alternative = rss_repo.add_rss_entry_with_media(
             sid, "Alternative", "receipt-alternative", media_key=media_key,
             payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{'b' * 40}"}),
         )

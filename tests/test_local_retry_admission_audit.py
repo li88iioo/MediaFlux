@@ -15,6 +15,7 @@ from unittest.mock import patch
 from starlette.requests import Request
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_scheduler import LocalMediaScheduler
 from app.modules.local_media_service import LocalMediaService
 from app.modules.local_move_transaction import LocalMoveTransaction
@@ -38,7 +39,7 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
         self.library.mkdir()
         self.incoming = self.incoming_root / "Movie.2026.mkv"
         self.incoming.write_bytes(b"new-media-for-regression")
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media_repo.create_local_media_source(
             name="Retry audit",
             qb_profile="",
             qb_path_prefix="",
@@ -46,7 +47,7 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
             owner="admin",
             media_type="movie",
         )
-        db.upsert_local_library_target(
+        local_media_repo.upsert_local_library_target(
             self.source_id, "movie", str(self.library), owner="admin"
         )
         self.enterContext(
@@ -67,14 +68,14 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                 self.calls += 1
                 if self.calls == 1:
                     raise OSError("temporary recognition failure")
-                db.update_local_media_task(task_id, owner=owner, status="completed")
+                local_media_repo.update_local_media_task(task_id, owner=owner, status="completed")
                 return {"status": "completed"}
 
         service = Service()
         scheduler = LocalMediaScheduler(service=service)
         task_id = scheduler.enqueue_manual_scan_candidates()["task_ids"][0]
         scheduler.run_once()
-        previous = db.get_local_media_task(task_id)
+        previous = local_media_repo.get_local_media_task(task_id)
         assert previous is not None
         self.assertEqual(previous.status, "failed")
         with patch.object(api, "get_local_media_scheduler", return_value=scheduler):
@@ -82,14 +83,14 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                 api.retry_task(task_id, request(), {}),
                 {"queued": True, "task_id": task_id},
             )
-        waiting = db.get_local_media_task(task_id)
+        waiting = local_media_repo.get_local_media_task(task_id)
         self.assertTrue(scheduler._is_manual_scan_task(waiting))
         assert previous is not None
         assert waiting is not None
         self.assertNotEqual(waiting.operation_token, previous.operation_token)
         scheduler.run_once()
         self.assertEqual(service.calls, 2)
-        get_local_media_task_result = db.get_local_media_task(task_id)
+        get_local_media_task_result = local_media_repo.get_local_media_task(task_id)
         assert get_local_media_task_result is not None
         self.assertEqual(get_local_media_task_result.status, "completed")
 
@@ -101,7 +102,7 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                 with self.subTest(prefix=prefix, entry=entry):
                     path = self.incoming_root / f"{prefix.replace(':', '')}-{entry}.mkv"
                     old_token = prefix + "old-attempt"
-                    task_id = db.create_local_media_task(
+                    task_id = local_media_repo.create_local_media_task(
                         self.source_id,
                         "",
                         str(path),
@@ -109,19 +110,19 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                         trigger="scan",
                         operation_token=old_token,
                     )
-                    db.update_local_media_task(task_id, status="failed")
+                    local_media_repo.update_local_media_task(task_id, status="failed")
                     if entry == "retry":
                         self.assertTrue(
-                            db.reset_local_media_task(task_id, owner="admin")
+                            local_media_repo.reset_local_media_task(task_id, owner="admin")
                         )
                     else:
                         self.assertEqual(
-                            db.prepare_manual_local_media_task(
+                            local_media_repo.prepare_manual_local_media_task(
                                 self.source_id, str(path), snapshot_digest="preview:fixture", owner="admin"
                             ),
                             task_id,
                         )
-                    after = db.get_local_media_task(task_id)
+                    after = local_media_repo.get_local_media_task(task_id)
                     assert after is not None
                     self.assertNotEqual(after.operation_token, old_token)
                     self.assertEqual(after.trigger, "scan")
@@ -132,13 +133,13 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                         LocalMediaScheduler._is_silent_task(after),
                         prefix == "silent-manual-scan:",
                     )
-                    db.update_local_media_task(task_id, status="completed")
+                    local_media_repo.update_local_media_task(task_id, status="completed")
 
     def test_failed_and_requires_manual_interruption_markers_block_plain_prepare(self):
         for status in ("failed", "requires_manual"):
             with self.subTest(status=status):
                 path = self.incoming_root / f"{status}.mkv"
-                task_id = db.create_local_media_task(
+                task_id = local_media_repo.create_local_media_task(
                     self.source_id,
                     "",
                     str(path),
@@ -146,30 +147,30 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
                     trigger="scan",
                     operation_token="manual-scan:interrupted",
                 )
-                db.update_local_media_task(task_id, status="moving")
+                local_media_repo.update_local_media_task(task_id, status="moving")
                 db.init_db()
-                db.update_local_media_task(task_id, status=status)
-                before = db.get_local_media_task(task_id)
+                local_media_repo.update_local_media_task(task_id, status=status)
+                before = local_media_repo.get_local_media_task(task_id)
                 assert before is not None
                 self.assertTrue(db.is_interrupted_local_media_write_error(before.error))
                 with self.assertRaisesRegex(ValueError, "核验"):
-                    db.prepare_manual_local_media_task(
+                    local_media_repo.prepare_manual_local_media_task(
                         self.source_id, str(path), snapshot_digest="preview:fixture", owner="admin"
                     )
-                self.assertEqual(db.get_local_media_task(task_id), before)
+                self.assertEqual(local_media_repo.get_local_media_task(task_id), before)
                 self.assertTrue(
-                    db.reset_local_media_task(
+                    local_media_repo.reset_local_media_task(
                         task_id, owner="admin", confirm_interrupted_write=True
                     )
                 )
-                after = db.get_local_media_task(task_id)
+                after = local_media_repo.get_local_media_task(task_id)
                 self.assertTrue(LocalMediaScheduler._is_manual_scan_task(after))
                 self.assertFalse(
-                    db.reset_local_media_task(
+                    local_media_repo.reset_local_media_task(
                         task_id, owner="admin", confirm_interrupted_write=True
                     )
                 )
-                db.update_local_media_task(task_id, status="completed")
+                local_media_repo.update_local_media_task(task_id, status="completed")
 
     def test_inspect_execute_cannot_erase_unconfirmed_retired_target_attempt(self):
         service = LocalMediaService(
@@ -219,7 +220,7 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
             "admin", inspection["inspection_id"],
             preview_digest=preview["preview_digest"],
         )
-        self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
         original_backup = LocalMoveTransaction._backup_replaced_target
 
         def crash_after_backup(transaction, *args, **kwargs):
@@ -234,8 +235,8 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
         backups = list(target.parent.glob(".*.mediaflux-replaced-*"))
         self.assertEqual(len(backups), 1)
         db.init_db()
-        recovered = db.get_local_media_task(task_id, owner="admin")
-        before_steps = db.list_local_media_operation_steps(task_id, owner="admin")
+        recovered = local_media_repo.get_local_media_task(task_id, owner="admin")
+        before_steps = local_media_repo.list_local_media_operation_steps(task_id, owner="admin")
         retry_response = api.retry_task(task_id, request(), {})
         assert isinstance(retry_response, JSONResponse)
         self.assertEqual(retry_response.status_code, 409)
@@ -253,8 +254,8 @@ class LocalRetryAdmissionAuditTests(unittest.TestCase):
             )
         self.assertNotIsInstance(result, dict, result)
         self.assertIn(result.status_code, (400, 409))
-        self.assertEqual(db.get_local_media_task(task_id), recovered)
-        self.assertEqual(db.list_local_media_operation_steps(task_id), before_steps)
+        self.assertEqual(local_media_repo.get_local_media_task(task_id), recovered)
+        self.assertEqual(local_media_repo.list_local_media_operation_steps(task_id), before_steps)
         self.assertTrue(self.incoming.exists())
         self.assertFalse(target.exists())
         self.assertEqual(backups[0].read_bytes(), b"old-library-media")

@@ -12,6 +12,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.bot import handlers
 from app.main import create_app
 from app.modules.rss import (
@@ -48,11 +49,11 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
         ))
 
     def _subscription(self) -> int:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "C03", "https://example.invalid/old", action="download",
             media_tmdb_id="105556", skip_existing_episodes=1,
         )
-        db.update_rss_subscription(sid, {"last_refreshed_at": "2000-01-01 00:00:00"})
+        rss_repo.update_rss_subscription(sid, {"last_refreshed_at": "2000-01-01 00:00:00"})
         return sid
 
     @staticmethod
@@ -78,10 +79,10 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
                     # 同秒修改也必须由配置内容识别，不能只比较 updated_at。
                     with patch("app.database.now", return_value="2000-01-01 00:00:00"):
                         sid = self._subscription()
-                        revision = rss_subscription_refresh_revision(db.get_rss_subscription(sid))
+                        revision = rss_subscription_refresh_revision(rss_repo.get_rss_subscription(sid))
 
                         def parse(_url):
-                            db.update_rss_subscription(sid, changes)
+                            rss_repo.update_rss_subscription(sid, changes)
                             return self.entries
 
                         self.engine.parser.parse = Mock(side_effect=parse)
@@ -89,7 +90,7 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
                             sid, expected_revision=revision if explicit_revision else "",
                         )
                     self.assertEqual(result, {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True})
-                    current = assert_present(db.get_rss_subscription(sid))
+                    current = assert_present(rss_repo.get_rss_subscription(sid))
                     self.assertEqual(current["last_refreshed_at"], "2000-01-01 00:00:00")
                     for key, value in changes.items():
                         self.assertEqual(current[key], value)
@@ -101,10 +102,10 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
             for explicit_revision in (False, True):
                 with self.subTest(entries=len(entries), explicit_revision=explicit_revision):
                     sid = self._subscription()
-                    revision = rss_subscription_refresh_revision(db.get_rss_subscription(sid))
+                    revision = rss_subscription_refresh_revision(rss_repo.get_rss_subscription(sid))
 
                     def parse(_url):
-                        db.delete_rss_subscription(sid)
+                        rss_repo.delete_rss_subscription(sid)
                         return entries
 
                     self.engine.parser.parse = Mock(side_effect=parse)
@@ -112,20 +113,20 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
                         sid, expected_revision=revision if explicit_revision else "",
                     )
                     self.assertEqual(result, {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True})
-                    self.assertIsNone(db.get_rss_subscription(sid))
+                    self.assertIsNone(rss_repo.get_rss_subscription(sid))
                     self.assertTrue(all(not rows for rows in self._stored_state().values()))
 
     def test_empty_feed_does_not_mark_changed_configuration_refreshed(self):
         sid = self._subscription()
 
         def parse(_url):
-            db.update_rss_subscription(sid, {"urls": "https://example.invalid/new"})
+            rss_repo.update_rss_subscription(sid, {"urls": "https://example.invalid/new"})
             return []
 
         self.engine.parser.parse = Mock(side_effect=parse)
         result = self.engine.refresh(sid)
         self.assertEqual(result, {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True})
-        self.assertEqual(assert_present(db.get_rss_subscription(sid))["last_refreshed_at"], "2000-01-01 00:00:00")
+        self.assertEqual(assert_present(rss_repo.get_rss_subscription(sid))["last_refreshed_at"], "2000-01-01 00:00:00")
 
     def test_configuration_changes_during_network_identification_are_fenced(self):
         for stage in ("_bound_tv_title_keys", "_existing_library_episodes"):
@@ -135,9 +136,9 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
 
                     def identify(_tmdb_id):
                         if deleted:
-                            db.delete_rss_subscription(sid)
+                            rss_repo.delete_rss_subscription(sid)
                         else:
-                            db.update_rss_subscription(sid, {"media_default_season": 2})
+                            rss_repo.update_rss_subscription(sid, {"media_default_season": 2})
                         return getattr(self.engine, stage).return_value
 
                     # 回调通过独立连接修改配置，证明识别请求期间未持有写事务。
@@ -147,7 +148,7 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
                     ):
                         result = self.engine.refresh(sid)
                     self.assertEqual(result, {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True})
-                    current = db.get_rss_subscription(sid)
+                    current = rss_repo.get_rss_subscription(sid)
                     if deleted:
                         self.assertIsNone(current)
                     else:
@@ -159,11 +160,11 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
     def test_batch_failure_rolls_back_entries_media_reopens_and_refresh_marker(self):
         sid = self._subscription()
         key = "tmdb:105556:tv:S01E001"
-        blocker = db.add_rss_entry_with_media(sid, "blocker", "blocker", media_key=key)["id"]
-        self.assertTrue(db.claim_rss_entry(blocker))
-        reopened = db.add_rss_entry_with_media(sid, "semantic duplicate", "guid-1", media_key=key)
+        blocker = rss_repo.add_rss_entry_with_media(sid, "blocker", "blocker", media_key=key)["id"]
+        self.assertTrue(rss_repo.claim_rss_entry(blocker))
+        reopened = rss_repo.add_rss_entry_with_media(sid, "semantic duplicate", "guid-1", media_key=key)
         self.assertEqual(reopened["status"], "skipped")
-        db.record_rss_entry_failure(blocker, "torrent_invalid", False)
+        rss_repo.record_rss_entry_failure(blocker, "torrent_invalid", False)
         self.engine.parser.parse = Mock(return_value=[
             self.entries[0], RSSEntry(title="plain entry", guid="plain"), self.entries[1],
         ])
@@ -190,20 +191,20 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
         result = self.engine.refresh(sid)
         self.assertEqual(result["new"], 2)
         self.assertEqual(result["library_skipped"], 1)
-        self.assertEqual(assert_present(db.get_rss_entry(reopened["id"]))["status"], "pending")
+        self.assertEqual(assert_present(rss_repo.get_rss_entry(reopened["id"]))["status"], "pending")
 
     def test_stable_refresh_publishes_entries_and_timestamp_together(self):
         sid = self._subscription()
         self.engine.parser.parse = Mock(return_value=[*self.entries, self.entries[0]])
         before = self._stored_state()
-        update = db.update_rss_subscription
+        update = rss_repo.update_rss_subscription
 
         def observe_before_marker(*args, **kwargs):
             # 外部连接在本批次更新刷新标记前不能读到任何半批条目。
             self.assertEqual(self._stored_state(), before)
             return update(*args, **kwargs)
 
-        with patch("app.database.update_rss_subscription", side_effect=observe_before_marker), patch(
+        with patch("app.repositories.rss.update_rss_subscription", side_effect=observe_before_marker), patch(
             "app.database.now", return_value="2000-01-02 00:00:00",
         ):
             result = self.engine.refresh(sid)
@@ -227,7 +228,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _subscription(suffix: str) -> int:
-        return db.add_rss_subscription(
+        return rss_repo.add_rss_subscription(
             f"subscription-{suffix}",
             f"https://example.invalid/{suffix}",
         )
@@ -287,12 +288,12 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_revision_is_rechecked_after_gate_acquisition(self):
         sid = self._subscription("revision")
-        expected = rss_subscription_refresh_revision(db.get_rss_subscription(sid))
+        expected = rss_subscription_refresh_revision(rss_repo.get_rss_subscription(sid))
         engine = RSSEngine()
         engine.parser.parse = Mock(return_value=[])
 
         def acquire_after_change(_sub_id):
-            db.update_rss_subscription(sid, {
+            rss_repo.update_rss_subscription(sid, {
                 "urls": "https://changed.invalid/revision",
             })
             return True
@@ -337,12 +338,12 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         rows = [{"id": item, "title": f"Episode {item}"} for item in range(1, 26)]
 
         with patch(
-            "app.modules.rss.db.list_rss_entries", return_value=SimpleNamespace(items=rows, total=len(rows)),
+            "app.repositories.rss.list_rss_entries", return_value=SimpleNamespace(items=rows, total=len(rows)),
         ), patch(
-            "app.modules.rss.db.get_rss_subscription",
+            "app.repositories.rss.get_rss_subscription",
             return_value={"id": 7, "enabled": 1, "action": "download", "exclude_keywords": ""},
         ), patch(
-            "app.modules.rss.db.skip_pending_rss_entries", return_value=0,
+            "app.repositories.rss.skip_pending_rss_entries", return_value=0,
         ):
             result = engine.auto_download(7)
 
@@ -365,12 +366,12 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         rows = [{"id": item, "title": f"Episode {item}"} for item in range(1, 106)]
 
         with patch(
-            "app.modules.rss.db.list_rss_entries", return_value=SimpleNamespace(items=rows, total=len(rows)),
+            "app.repositories.rss.list_rss_entries", return_value=SimpleNamespace(items=rows, total=len(rows)),
         ), patch(
-            "app.modules.rss.db.get_rss_subscription",
+            "app.repositories.rss.get_rss_subscription",
             return_value={"id": 7, "enabled": 1, "action": "download", "exclude_keywords": ""},
         ), patch(
-            "app.modules.rss.db.skip_pending_rss_entries", return_value=0,
+            "app.repositories.rss.skip_pending_rss_entries", return_value=0,
         ):
             result = engine.auto_download(7)
 
@@ -380,7 +381,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_all_failed_sources_do_not_advance_last_refresh_time(self):
         sid = self._subscription("all-failed")
-        db.update_rss_subscription(sid, {
+        rss_repo.update_rss_subscription(sid, {
             "urls": "https://example.invalid/a\nhttps://example.invalid/b",
         })
         engine = RSSEngine()
@@ -394,7 +395,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(result["error_code"], "all_sources_failed")
         self.assertEqual(result["failed_sources"], 2)
-        get_rss_subscription_result = db.get_rss_subscription(sid)
+        get_rss_subscription_result = rss_repo.get_rss_subscription(sid)
         assert get_rss_subscription_result is not None
         self.assertIsNone(get_rss_subscription_result["last_refreshed_at"])
 
@@ -408,7 +409,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
         engine.parser.parse = Mock(side_effect=empty_parse)
         self.assertEqual(engine.refresh(sid), {"total": 0, "new": 0, "skipped": 0})
-        get_rss_subscription_result_2 = db.get_rss_subscription(sid)
+        get_rss_subscription_result_2 = rss_repo.get_rss_subscription(sid)
         assert get_rss_subscription_result_2 is not None
         self.assertTrue(get_rss_subscription_result_2["last_refreshed_at"])
 
@@ -430,7 +431,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
                 started.append(self)
 
         scheduler = RSSScheduler()
-        with patch("app.modules.rss_scheduler.db.list_due_rss_subscriptions", return_value=rows), \
+        with patch("app.repositories.rss.list_due_rss_subscriptions", return_value=rows), \
                 patch("app.modules.rss_scheduler.threading.Thread", FakeThread), \
                 patch.object(scheduler, "_run_cleanup_if_due", return_value=0):
             self.assertEqual(scheduler.run_due(), 4)
@@ -441,10 +442,10 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
     def test_scheduler_runs_stale_submission_recovery_each_cycle(self):
         scheduler = RSSScheduler()
         with patch.object(scheduler, "_run_cleanup_if_due"), patch(
-            "app.modules.rss_scheduler.db.recover_stale_submitting_rss_entries",
+            "app.repositories.rss.recover_stale_submitting_rss_entries",
             return_value=0,
         ) as recover, patch(
-            "app.modules.rss_scheduler.db.list_due_rss_subscriptions", return_value=[]
+            "app.repositories.rss.list_due_rss_subscriptions", return_value=[]
         ):
             self.assertEqual(scheduler.run_due(), 0)
 
@@ -475,10 +476,10 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             return [{"id": 9, "action": "download"}]
 
         with patch.object(scheduler, "_run_cleanup_if_due", return_value=0), patch(
-            "app.modules.rss_scheduler.db.recover_stale_submitting_rss_entries",
+            "app.repositories.rss.recover_stale_submitting_rss_entries",
             return_value=0,
         ), patch(
-            "app.modules.rss_scheduler.db.list_due_rss_subscriptions",
+            "app.repositories.rss.list_due_rss_subscriptions",
             side_effect=delayed_due_rows,
         ), patch.object(scheduler, "_execute") as execute:
             runner = threading.Thread(target=lambda: results.append(scheduler.run_due()))
@@ -495,7 +496,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         self.assertEqual(scheduler._workers, {})
 
     def test_scheduler_cancels_queued_refresh_when_subscription_is_paused(self):
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "queued-pause",
             "https://example.invalid/queued-pause",
             refresh_interval_minutes=10,
@@ -511,19 +512,19 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
                 queued.append(self)
 
         scheduler = RSSScheduler()
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         with patch(
-            "app.modules.rss_scheduler.db.list_due_rss_subscriptions", return_value=[row]
+            "app.repositories.rss.list_due_rss_subscriptions", return_value=[row]
         ), patch(
             "app.modules.rss_scheduler.threading.Thread", FakeThread
         ), patch.object(
             scheduler, "_run_cleanup_if_due", return_value=0
         ), patch(
-            "app.modules.rss_scheduler.db.recover_stale_submitting_rss_entries", return_value=0
+            "app.repositories.rss.recover_stale_submitting_rss_entries", return_value=0
         ):
             self.assertEqual(scheduler.run_due(), 1)
 
-        db.update_rss_subscription(sid, {"enabled": 0})
+        rss_repo.update_rss_subscription(sid, {"enabled": 0})
         with patch("app.modules.rss.MikanParser.parse") as parse:
             queued[0].target(*queued[0].args)
 
@@ -620,12 +621,12 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_auto_download_preserves_unknown_outcome_summary(self):
         sid = self._subscription("auto-unknown")
-        db.update_rss_subscription(sid, {"action": "download"})
+        rss_repo.update_rss_subscription(sid, {"action": "download"})
         engine = RSSEngine()
         with patch.object(
             engine, "refresh", return_value={"total": 1, "new": 1, "skipped": 0}
         ), patch(
-            "app.modules.rss.db.list_rss_entries", return_value=SimpleNamespace(items=[{"id": 17, "title": "普通资源"}], total=1)
+            "app.repositories.rss.list_rss_entries", return_value=SimpleNamespace(items=[{"id": 17, "title": "普通资源"}], total=1)
         ), patch.object(
             engine,
             "download_many",
@@ -646,14 +647,14 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_auto_download_applies_current_exclude_keywords_to_existing_pending_rows(self):
         sid = self._subscription("historical-filter")
-        db.update_rss_subscription(sid, {"exclude_keywords": "合集", "action": "download"})
+        rss_repo.update_rss_subscription(sid, {"exclude_keywords": "合集", "action": "download"})
         # 历史普通条目可能没有 rss_entry_media；过滤时也必须补写可解释原因。
-        excluded_id = db.add_rss_entry_with_media(
+        excluded_id = rss_repo.add_rss_entry_with_media(
             sid,
             "作品 合集 01-12",
             "excluded-guid",
         )["id"]
-        accepted_id = db.add_rss_entry_with_media(
+        accepted_id = rss_repo.add_rss_entry_with_media(
             sid,
             "作品 S01E13",
             "accepted-guid",
@@ -678,7 +679,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["filtered"], 1)
         download_many.assert_called_once_with([accepted_id], auto_guard=ANY)
         self.assertTrue(download_many.call_args.kwargs["auto_guard"]())
-        excluded = db.get_rss_entry(int(excluded_id))
+        excluded = rss_repo.get_rss_entry(int(excluded_id))
         assert excluded is not None
         self.assertEqual(excluded["status"], "skipped")
         self.assertTrue(excluded["processed"])
@@ -725,9 +726,9 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_scheduler_retries_unresolved_alert_and_persists_delivery_signature(self):
         sid = self._subscription("scheduler-durable-alert")
-        entry_id = db.add_rss_entry_with_media(sid, "待核对资源", "durable-alert-guid")["id"]
+        entry_id = rss_repo.add_rss_entry_with_media(sid, "待核对资源", "durable-alert-guid")["id"]
         assert (entry_id) is not None
-        db.record_rss_entry_failure(int(entry_id), "qb_outcome_unknown", False)
+        rss_repo.record_rss_entry_failure(int(entry_id), "qb_outcome_unknown", False)
         issue = {
             "refresh": {"total": 1, "new": 1, "skipped": 0},
             "downloaded": 0,
@@ -760,7 +761,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             restarted._execute(sid, "subscribe")
         publisher.assert_not_called()
 
-        db.update_rss_entries_processed([int(entry_id)], True)
+        rss_repo.update_rss_entries_processed([int(entry_id)], True)
         with patch("app.modules.rss_scheduler.RSSEngine") as engine:
             engine.return_value.refresh.return_value = healthy
             restarted._execute(sid, "subscribe")
@@ -768,8 +769,8 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_exhausted_retry_alert_survives_empty_refresh_and_scheduler_restart(self):
         sid = self._subscription("scheduler-exhausted")
-        eid = int(db.add_rss_entry_with_media(sid, "耗尽重试", "exhausted")["id"])
-        db.record_rss_entry_failure(eid, "qb_unavailable", True)
+        eid = int(rss_repo.add_rss_entry_with_media(sid, "耗尽重试", "exhausted")["id"])
+        rss_repo.record_rss_entry_failure(eid, "qb_unavailable", True)
         with db.get_conn() as conn:
             conn.execute("UPDATE rss_entries SET retry_count=5 WHERE id=?", (eid,))
         scheduler = RSSScheduler()
@@ -785,7 +786,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
                 instance._execute(sid, "subscribe")
                 self.assertEqual(db.kv_get(scheduler._alert_key(sid), ""), before)
             publisher.assert_called_once()
-            db.update_rss_entries_processed([eid], True)
+            rss_repo.update_rss_entries_processed([eid], True)
             scheduler._execute(sid, "subscribe")
             self.assertEqual(db.kv_get(scheduler._alert_key(sid), "missing"), "")
 
@@ -796,7 +797,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             json.dumps(["old_issue", "旧错误"], ensure_ascii=False),
         )
         with patch(
-            "app.modules.rss_scheduler.db.get_rss_subscription",
+            "app.repositories.rss.get_rss_subscription",
             return_value={"name": "测试订阅"},
         ), patch(
             "app.modules.telegram_notification_center.publish_notification_event",
@@ -985,9 +986,9 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default,
-        ), patch("app.database.list_rss_subscriptions", return_value=[{
+        ), patch("app.repositories.rss.list_rss_subscriptions", return_value=[{
             "id": 1, "name": "mikanani", "enabled": 1,
-        }]), patch("app.database.list_rss_entries", return_value=SimpleNamespace(items=[{
+        }]), patch("app.repositories.rss.list_rss_entries", return_value=SimpleNamespace(items=[{
             "id": 9, "title": "示例 RSS 条目",
         }], total=1)):
             handlers._register_commands(bot, self._telebot_types())
@@ -1018,7 +1019,7 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default,
-        ), patch("app.database.list_rss_subscriptions", return_value=[]):
+        ), patch("app.repositories.rss.list_rss_subscriptions", return_value=[]):
             handlers._register_commands(bot, self._telebot_types())
             fallback_filter, fallback_handler = next(
                 (filters, handler) for filters, handler in bot.message_handlers
@@ -1061,8 +1062,8 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             "app.bot.handlers.get",
             side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default,
         ), patch("app.bot.handlers.threading.Thread", self.ImmediateThread), patch(
-            "app.database.get_rss_subscription", return_value=subscription,
-        ), patch("app.database.get_rss_entry", return_value=entry), patch(
+            "app.repositories.rss.get_rss_subscription", return_value=subscription,
+        ), patch("app.repositories.rss.get_rss_entry", return_value=entry), patch(
             "app.modules.rss.RSSEngine.refresh",
             return_value={"total": 8, "new": 3, "skipped": 5},
         ) as refresh, patch(
@@ -1355,7 +1356,7 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             "task_results": {7: result},
         }
         with patch(
-            "app.bot.handlers.db.get_local_media_task", return_value=task,
+            "app.repositories.local_media.get_local_media_task", return_value=task,
         ), patch(
             "app.modules.local_media_notifications.notify_local_media_task",
             return_value=True,
@@ -1507,7 +1508,7 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default,
         ), patch(
             "app.bot.handlers.threading.Thread", self.FailingThread
-        ), patch("app.database.get_rss_subscription", return_value=subscription):
+        ), patch("app.repositories.rss.get_rss_subscription", return_value=subscription):
             handlers._register_commands(bot, telebot)
             refresh_handler = next(
                 handler for filters, handler in bot.message_handlers

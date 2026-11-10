@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app import database as db
+from app.repositories import rss as rss_repo
 from app.agent.kernel.bootstrap import build_tool_catalog
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
@@ -91,7 +91,7 @@ def test_rss_mutually_exclusive_scopes_are_rejected_by_actual_sdk_prepare():
         store = SQLiteKernelStore()
         context = await context_for(store)
         effects = executor(store)
-        sid = db.add_rss_subscription("scope fixture", "https://feed.invalid/rss")
+        sid = rss_repo.add_rss_subscription("scope fixture", "https://feed.invalid/rss")
         with patch.object(rss_delivery, "execute", side_effect=AssertionError("未确认不能执行")) as submit:
             with patch.object(rss_delivery, "prepare", side_effect=AssertionError("无效范围不能读取业务快照")) as prepare:
                 for arguments in ({}, {"subscription_ids": None, "scope": None},

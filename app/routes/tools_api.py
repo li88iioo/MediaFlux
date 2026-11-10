@@ -17,7 +17,7 @@ from fastapi import APIRouter, Body, Path, Query, Request
 from fastapi.responses import Response
 
 from app import config
-from app import database as db
+from app.repositories import recognition as recognition_repo
 from app.concurrency import run_awaitable_sync
 from app.agent.model_catalog import fetch_ai_models
 from app.agent.rate_limit import agent_rate_limiter
@@ -409,7 +409,7 @@ def scrape_confirm(request: Request, data: dict | None = Body(default=None)):
 @router.get("/locks")
 def list_locks(request: Request, q: str = Query(default="")):
     require_api_login(request)
-    rows = db.list_tmdb_locks(keyword=q or "", limit=300)
+    rows = recognition_repo.list_tmdb_locks(keyword=q or "", limit=300)
     return api_response([{
         "id": row["id"],
         "raw_name": row["raw_name"],
@@ -428,7 +428,7 @@ def list_locks(request: Request, q: str = Query(default="")):
 @router.delete("/locks/{lock_id}")
 def delete_lock(request: Request, lock_id: int = Path(...)):
     require_api_login(request)
-    ok = db.delete_tmdb_lock(lock_id)
+    ok = recognition_repo.delete_tmdb_lock(lock_id)
     return api_response({"success": ok})
 
 

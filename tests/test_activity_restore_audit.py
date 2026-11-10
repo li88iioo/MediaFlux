@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app import sdk
 from app.modules import backup
 from app.repositories.activity import timeline_snapshot
@@ -32,7 +33,7 @@ class ActivityRestoreAuditTests(unittest.TestCase):
         return paths
 
     def _seed(self):
-        request, _ = db.create_download_request(
+        request, _ = download_requests_repo.create_download_request(
             "history-download", "magnet", title="history-download"
         )
         with db.get_conn() as conn:

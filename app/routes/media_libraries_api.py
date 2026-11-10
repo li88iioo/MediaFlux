@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Request
 
 from app import config
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.clients.base import close_media_server_client
 from app.logger import get_logger
 from app.modules.local_directory_browser import VIRTUAL_ROOT, browse_local_directories
@@ -116,7 +116,7 @@ def _local_sources() -> list[dict[str, Any]]:
             "local_root": source.local_root,
             "enabled": source.enabled,
         }
-        for source in db.list_local_media_sources(owner=_OWNER)
+        for source in local_media_repo.list_local_media_sources(owner=_OWNER)
     ]
 
 
@@ -133,7 +133,7 @@ def _local_bindings() -> list[dict[str, Any]]:
             "library_name": str(row["library_name"] or ""),
             "server_path": str(row["server_path"] or ""),
         }
-        for row in db.list_local_library_bindings(owner=_OWNER)
+        for row in local_media_repo.list_local_library_bindings(owner=_OWNER)
     ]
 
 
@@ -352,7 +352,7 @@ def _optional_text(payload: dict[str, Any], key: str, *, maximum: int = 2048) ->
 def _validated_local_bindings(raw: object) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         raise ValueError("local_bindings 必须是数组")
-    sources = {item.id: item for item in db.list_local_media_sources(owner=_OWNER)}
+    sources = {item.id: item for item in local_media_repo.list_local_media_sources(owner=_OWNER)}
     if len(raw) > max(64, len(sources) * len(LOCAL_MEDIA_CATEGORIES)):
         raise ValueError("本地归档映射数量过多")
     normalized: list[dict[str, Any]] = []
@@ -423,12 +423,12 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
                 }
                 for item in _local_bindings()
             ]
-            db.replace_local_library_targets(local_bindings, owner=_OWNER)
+            local_media_repo.replace_local_library_targets(local_bindings, owner=_OWNER)
             try:
                 if strm_updates:
                     config.set_and_save(strm_updates)
             except Exception as exc:
-                db.replace_local_library_targets(previous_bindings, owner=_OWNER)
+                local_media_repo.replace_local_library_targets(previous_bindings, owner=_OWNER)
                 return config_write_api_error(
                     exc,
                     logger=logger,

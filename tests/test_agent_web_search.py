@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.modules.web_evidence import (
     WebEvidenceError,
     _map_search_response, _provider_error, _search_tavily,
@@ -128,16 +129,16 @@ class WebSearchDatabaseFacadeCompatibilityTests(unittest.TestCase):
         with patch("app.repositories.agent_web_search.date") as local_date:
             local_date.today.return_value = date(2026, 9, 5)
             self.assertEqual(
-                db.current_agent_web_search_usage_date(),
+                agent_web_search_repo.current_agent_web_search_usage_date(),
                 "2026-09-05",
             )
 
     def test_private_usage_date_validator_remains_available(self):
         self.assertEqual(
-            db._validate_agent_web_search_usage_date("2026-08-08"), "2026-08-08"
+            agent_web_search_repo._validate_agent_web_search_usage_date("2026-08-08"), "2026-08-08"
         )
         with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
-            db._validate_agent_web_search_usage_date("2026-8-8")
+            agent_web_search_repo._validate_agent_web_search_usage_date("2026-8-8")
 
 
 class WebSearchExecutionTests(IsolatedDatabaseTestCase):
@@ -194,8 +195,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
                     search_web(**{"query": message})
         provider.assert_not_called()
         self.assertEqual(
-            db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            agent_web_search_repo.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=agent_web_search_repo.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -221,8 +222,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(second['data']["cached"])
         self.assertEqual(call.call_count, 1)
         self.assertEqual(
-            db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            agent_web_search_repo.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=agent_web_search_repo.current_agent_web_search_usage_date()
             ),
             1,
         )
@@ -298,7 +299,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         for legacy in (old, {"kind": web_evidence._CACHE_KIND, "result": old}):
             with self.subTest(layout=legacy.get("kind", "direct_toolresult")):
                 clear_web_cache()
-                db.set_agent_web_search_cache(key, legacy, ttl_seconds=900)
+                agent_web_search_repo.set_agent_web_search_cache(key, legacy, ttl_seconds=900)
                 with patch("app.modules.web_evidence.get", side_effect=_config(self.values)), patch(
                     "app.modules.web_evidence._search_tavily", return_value=fresh,
                 ) as provider:
@@ -372,8 +373,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(all(result is not None and result['ok'] for result in results))
         self.assertEqual(sorted(result['data']["cached"] for result in results), [False, True])
         self.assertEqual(
-            db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            agent_web_search_repo.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=agent_web_search_repo.current_agent_web_search_usage_date()
             ),
             1,
         )
@@ -411,8 +412,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(provider_calls, 1)
         self.assertEqual(sorted(result['status'] for result in results), ["timeout", "unavailable"])
         self.assertEqual(
-            db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            agent_web_search_repo.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=agent_web_search_repo.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -429,8 +430,8 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
             result = search_web(**{"query": "temporary failure"})
         self.assertEqual(result['status'], "timeout")
         self.assertEqual(
-            db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            agent_web_search_repo.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=agent_web_search_repo.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -515,9 +516,9 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
     def test_daily_budget_fails_closed_before_provider(self):
         self.values["TAVILY_DAILY_CREDIT_LIMIT"] = "1"
         self.assertTrue(
-            db.reserve_agent_web_search_credits(
+            agent_web_search_repo.reserve_agent_web_search_credits(
                 provider="tavily",
-                usage_date=db.current_agent_web_search_usage_date(),
+                usage_date=agent_web_search_repo.current_agent_web_search_usage_date(),
                 cost=1,
                 daily_limit=1,
             )

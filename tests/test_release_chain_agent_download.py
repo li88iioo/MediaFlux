@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import tests  # noqa: F401 - 先隔离运行目录，禁止读取真实配置/数据库。
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.confirmation import ConfirmationStore
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
@@ -51,7 +51,7 @@ class TelegramDownloadResultBoundaryTests(unittest.TestCase):
         }) as backend:
             handlers._dispatch_download_callback(bot, "100", "1", request_id, "qb")
         backend.assert_called_once()
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["qb_status"], "submitted")
         self.tracker.reload.assert_called_once()
@@ -97,7 +97,7 @@ class TelegramDownloadResultBoundaryTests(unittest.TestCase):
             handlers._dispatch_download_callback(bot, "100", "1", request_id, "guangya")
 
         backend.assert_called_once()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["gy_status"], "failed")
         self.assertEqual(row["error"], "guangya: 文件违规")
@@ -124,7 +124,7 @@ class TelegramDownloadResultBoundaryTests(unittest.TestCase):
 
         qb_backend.assert_called_once()
         guangya_backend.assert_called_once()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["qb_status"], "submitted")
         self.assertEqual(row["gy_status"], "failed")
@@ -200,7 +200,7 @@ class TelegramDownloadResultBoundaryTests(unittest.TestCase):
         backend.assert_called_once()
         self.tracker.reload.assert_called_once()
         self.assertEqual(bot.edit_message_text.call_count, 2)
-        get_download_request_result_2 = db.get_download_request(request_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2["status"], "submitted")
 
@@ -217,7 +217,7 @@ class TelegramDownloadResultBoundaryTests(unittest.TestCase):
         backend.assert_called_once()
         dispatch.assert_called_once()
         self.tracker.reload.assert_called_once()
-        get_download_request_result_3 = db.get_download_request(request_id)
+        get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["status"], "submitted")
         text = bot.edit_message_text.call_args.args[0]

@@ -1,4 +1,4 @@
-"""TMDB 人工映射锁 Repository 与兼容门面测试。"""
+"""TMDB 人工映射锁 Repository 测试。"""
 from __future__ import annotations
 
 import unittest
@@ -7,17 +7,13 @@ import sqlite3
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_history as organize_history_repo
 from app import database_migrations
 from app.repositories import recognition
 from tests.support import isolated_test_database
 
 
 class RecognitionRepositoryTests(unittest.TestCase):
-    def test_database_facade_keeps_management_entrypoints(self):
-        self.assertIs(db.list_tmdb_locks, recognition.list_tmdb_locks)
-        self.assertIs(db.delete_tmdb_lock, recognition.delete_tmdb_lock)
-        self.assertIs(db.get_tmdb_lock, recognition.get_tmdb_lock)
-        self.assertIs(db.upsert_tmdb_lock, recognition.upsert_tmdb_lock)
 
     def test_lock_round_trip_uses_full_context_and_manual_source(self):
         with isolated_test_database("recognition-repository.db"):
@@ -46,9 +42,9 @@ class RecognitionRepositoryTests(unittest.TestCase):
                 media_type="tv",
                 season=1,
             ))
-            locks = db.list_tmdb_locks("Demo")
+            locks = recognition.list_tmdb_locks("Demo")
             self.assertEqual(len(locks), 1)
-            self.assertTrue(db.delete_tmdb_lock(int(locks[0]["id"])))
+            self.assertTrue(recognition.delete_tmdb_lock(int(locks[0]["id"])))
 
 
 class ManualEpisodeConfirmationTests(unittest.TestCase):
@@ -154,12 +150,12 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
 
     def test_snapshot_undo_restores_previous_knowledge_and_actor(self):
         lid = self.learn()
-        before = db.capture_organize_business_snapshot(lid)
+        before = organize_history_repo.capture_organize_business_snapshot(lid)
         db.update_organize_log(lid, tmdb_id="123", episode=6, release_parse_json=json.dumps(self.position(6)),
                                confirmation_actor="human", operation_type="reorganize")
         self.assertEqual(self.records(), [])
         self.assertEqual(self.records("123")[0]["episode"], 6)
-        db.restore_organize_business_snapshot(lid, before, status="reverted", operation_type="revert")
+        organize_history_repo.restore_organize_business_snapshot(lid, before, status="reverted", operation_type="revert")
         self.assertEqual(self.records("123"), [])
         self.assertEqual(self.records(), [before["manual_episode_confirmation"]])
         db.update_organize_log(lid, error="后处理提示不应改变识别事实")
@@ -171,12 +167,12 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
 
     def test_legacy_snapshot_without_learning_still_restores_business(self):
         lid = self.learn(status="skipped", release_parse={})
-        before = db.capture_organize_business_snapshot(lid)
+        before = organize_history_repo.capture_organize_business_snapshot(lid)
         before.pop("manual_episode_confirmation")
         before["log"].pop("confirmation_actor")
         db.update_organize_log(lid, status="success", release_parse_json=json.dumps(self.position()))
         self.assertEqual(len(self.records()), 1)
-        db.restore_organize_business_snapshot(lid, before, status="reverted", operation_type="revert")
+        organize_history_repo.restore_organize_business_snapshot(lid, before, status="reverted", operation_type="revert")
         self.assertEqual(self.records(), [])
         self.assertEqual(self.stored_log(lid)["release_parse_json"], "")
 
@@ -192,7 +188,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
                     "current_name": "original.mp4" if completed else "S02E05.mp4",
                     "status": "success" if completed else "running",
                 }])
-                db.add_organize_operation_step(lid, "return", 1, "return_to_source", file_id="video",
+                organize_history_repo.add_organize_operation_step(lid, "return", 1, "return_to_source", file_id="video",
                                                to_parent_id="source", to_name="original.mp4",
                                                status="success" if completed else "running")
                 db.init_db()
@@ -256,7 +252,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
         old = self.learn()
         latest = self.learn(tmdb_id="123", episode=6, release_parse=self.position(6))
         for lid, hour in ((old, "10"), (latest, "11")):
-            db.add_organize_operation_step(lid, f"manual-{lid}", 1, "move_rename", status="success",
+            organize_history_repo.add_organize_operation_step(lid, f"manual-{lid}", 1, "move_rename", status="success",
                                           finished_at=f"2026-11-02 {hour}:00:00")
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_log SET updated_at='2026-11-02 12:00:00' WHERE id=?", (old,))

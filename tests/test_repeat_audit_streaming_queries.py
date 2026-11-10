@@ -43,7 +43,7 @@ class ObservedConnection:
 class StreamingHistoryQueryTests(IsolatedDatabaseTestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media.create_local_media_source(
             name='streaming', qb_profile='', qb_path_prefix='', local_root='/synthetic/stream', owner='admin',
         )
         with db.get_conn() as conn:

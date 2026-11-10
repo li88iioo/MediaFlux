@@ -5,7 +5,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from app import database
+from app.repositories import media_proxy as media_proxy_repo
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -15,7 +15,7 @@ _DEFAULT_DRAIN_TIMEOUT_SECONDS = 3.0
 
 
 def _write_record(payload: Mapping[str, Any]) -> None:
-    database.record_media_proxy_playback_attempt(**dict(payload))
+    media_proxy_repo.record_media_proxy_playback_attempt(**dict(payload))
 
 
 class PlaybackRecordWriter:

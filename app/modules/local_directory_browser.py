@@ -152,9 +152,9 @@ def browse_local_directories(
 ) -> dict:
     """列出一级子目录；指定 allowed_root 时禁止离开该来源根目录。"""
     if source_id:
-        from app import database as db
+        from app.repositories import local_media as local_media_repo
 
-        source = db.get_local_media_source(source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(source_id, owner=owner)
         if source and allowed_root is None:
             allowed_root = Path(source.local_root)
 

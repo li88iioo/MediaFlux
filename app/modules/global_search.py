@@ -7,6 +7,8 @@ from urllib.parse import quote_plus, urlencode
 
 from app import config as app_config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.clients.base import MediaItem
 from app.discovery.search import get_discovery_search_service
 from app.logger import get_logger
@@ -224,7 +226,7 @@ def _discovery_section(query: str) -> dict:
 def _rss_section(query: str) -> dict:
     folded = query.casefold()
     items = []
-    for row in db.list_rss_subscriptions():
+    for row in rss_repo.list_rss_subscriptions():
         haystack = " ".join(str(_row_value(row, key)) for key in (
             "name", "urls", "parser", "exclude_keywords"
         )).casefold()
@@ -270,7 +272,7 @@ def _progress_percent(value) -> int:
 
 
 def _downloads_section(query: str) -> dict:
-    rows = db.list_download_logs(keyword=query, limit=8, offset=0)
+    rows = download_requests_repo.list_download_logs(keyword=query, limit=8, offset=0)
     items = []
     status_labels = {
         "submitting": "提交中", "submitted": "已提交", "downloading": "下载中",

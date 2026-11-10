@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher, offline
 from tests.support import assert_present, isolated_test_database
@@ -66,7 +67,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
 
         item = replace(self.raw, torrent_data=TORRENT_A)
         original = int(dispatcher.create_request(item, "", "")["id"])
-        db.update_download_request(original, status="failed", gy_status="failed")
+        download_requests_repo.update_download_request(original, status="failed", gy_status="failed")
         successor = int(dispatcher.create_request(item, "", "")["id"])
         self.assertNotEqual(successor, original)
         alias = dispatcher.request_source_alias_key(item)
@@ -77,11 +78,11 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
             )
         for retained in (None, b"not-a-torrent"):
             with self.subTest(retained=retained):
-                db.update_download_request(original, torrent_data=retained)
+                download_requests_repo.update_download_request(original, torrent_data=retained)
                 with self.assertRaises(ValueError):
                     check_download_request_torrent_identity(original, dispatcher.request_keys(item), source_alias_key=alias)
         self.assertEqual(self.sent, [])
-        self.assertEqual(assert_present(db.get_download_request_by_request_key(self.key(TORRENT_A)))["id"], successor)
+        self.assertEqual(assert_present(download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_A)))["id"], successor)
 
     def submit(self, target="guangya"):
         return submit_download_input(self.raw, target, origin="rss:identity-fixture")
@@ -90,7 +91,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         self.cloud_accepts = False
         first = self.submit()
         request_id = first["request_id"]
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["status"], "failed")
         with db.get_conn() as conn:
@@ -98,8 +99,8 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
                 "UPDATE download_requests SET updated_at=datetime('now','localtime','-31 days'),"
                 "completed_at=datetime('now','localtime','-31 days') WHERE id=?", (request_id,),
             )
-        self.assertEqual(db.purge_expired_download_request_torrent_data(30), 1)
-        get_download_request_result_2 = db.get_download_request(request_id)
+        self.assertEqual(download_requests_repo.purge_expired_download_request_torrent_data(30), 1)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertIsNone(get_download_request_result_2["torrent_data"])
         self.cloud_accepts = True
@@ -117,7 +118,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         expected.append(("guangya", TORRENT_B))
         self.assertCountEqual(self.sent, expected)
         for payload, result in ((TORRENT_A, first), (TORRENT_B, second)):
-            owner = db.get_download_request_by_request_key(self.key(payload))
+            owner = download_requests_repo.get_download_request_by_request_key(self.key(payload))
             assert owner is not None
             self.assertEqual(owner["id"], result["request_id"])
             self.assertEqual(owner["torrent_data"], payload)
@@ -134,13 +135,13 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
             results = list(pool.map(lambda item: dispatcher.create_request(item, "", "fixture"), items))
         self.assertEqual(len({result["id"] for result in results}), 2)
         for payload, result in zip((TORRENT_A, TORRENT_B), results):
-            get_download_request_by_request_key_result = db.get_download_request_by_request_key(self.key(payload))
+            get_download_request_by_request_key_result = download_requests_repo.get_download_request_by_request_key(self.key(payload))
             assert get_download_request_by_request_key_result is not None
             self.assertEqual(get_download_request_by_request_key_result["id"], result["id"])
 
     def test_purged_retry_rejects_changed_content_before_archiving_original(self):
         request_id = self.fail_and_purge()
-        get_download_request_result_7 = db.get_download_request(request_id)
+        get_download_request_result_7 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_7 is not None
         before = dict(get_download_request_result_7)
         self.payload = TORRENT_B
@@ -148,29 +149,29 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         retried = dispatcher.resubmit_download_request(request_id, "guangya")
         self.assertFalse(retried["ok"], retried)
         self.assertEqual(self.sent, [])
-        get_download_request_result_8 = db.get_download_request(request_id)
+        get_download_request_result_8 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_8 is not None
         self.assertEqual(dict(get_download_request_result_8), before)
-        get_download_request_by_request_key_result_2 = db.get_download_request_by_request_key(self.key(TORRENT_A))
+        get_download_request_by_request_key_result_2 = download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_A))
         assert get_download_request_by_request_key_result_2 is not None
         self.assertEqual(get_download_request_by_request_key_result_2["id"], request_id)
-        self.assertIsNone(db.get_download_request_by_request_key(self.key(TORRENT_B)))
+        self.assertIsNone(download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_B)))
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 1)
 
     def test_new_content_after_retention_does_not_archive_the_previous_failure(self):
         request_id = self.fail_and_purge()
-        get_download_request_result_9 = db.get_download_request(request_id)
+        get_download_request_result_9 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_9 is not None
         before = dict(get_download_request_result_9)
         self.payload = TORRENT_B
         result = self.submit()
         self.assertTrue(result["dispatch"]["ok"], result)
         self.assertNotEqual(request_id, result["request_id"])
-        get_download_request_result_10 = db.get_download_request(request_id)
+        get_download_request_result_10 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_10 is not None
         self.assertEqual(dict(get_download_request_result_10), before)
-        get_download_request_by_request_key_result_3 = db.get_download_request_by_request_key(self.key(TORRENT_A))
+        get_download_request_by_request_key_result_3 = download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_A))
         assert get_download_request_by_request_key_result_3 is not None
         self.assertEqual(get_download_request_by_request_key_result_3["id"], request_id)
 
@@ -188,10 +189,10 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertTrue(successor["created"])
         self.assertEqual(self.sent, [])
-        get_download_request_by_request_key_result_4 = db.get_download_request_by_request_key(self.key(TORRENT_A))
+        get_download_request_by_request_key_result_4 = download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_A))
         assert get_download_request_by_request_key_result_4 is not None
         self.assertEqual(get_download_request_by_request_key_result_4["id"], successor["id"])
-        self.assertIsNone(db.get_download_request_by_request_key(self.key(TORRENT_B)))
+        self.assertIsNone(download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_B)))
 
     def test_purged_qb_retry_also_preserves_previously_verified_identity(self):
         request_id = self.fail_and_purge()
@@ -200,7 +201,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         retried = dispatcher.resubmit_download_request(request_id, "qb")
         self.assertFalse(retried["ok"], retried)
         self.assertEqual(self.sent, [])
-        get_download_request_by_request_key_result_5 = db.get_download_request_by_request_key(self.key(TORRENT_A))
+        get_download_request_by_request_key_result_5 = download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_A))
         assert get_download_request_by_request_key_result_5 is not None
         self.assertEqual(get_download_request_by_request_key_result_5["id"], request_id)
 
@@ -210,7 +211,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         result = dispatcher.resubmit_download_request(request_id, "guangya")
         self.assertTrue(result["ok"], result)
         self.assertEqual(self.sent, [("guangya", TORRENT_A)])
-        owner = db.get_download_request_by_request_key(self.key(TORRENT_A))
+        owner = download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_A))
         assert owner is not None
         self.assertEqual(owner["id"], result["request_id"])
         self.assertEqual(owner["request_key"], self.key(TORRENT_A))
@@ -237,7 +238,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
             replace(self.raw, content_type=""), "qb", origin="telegram:legacy-http",
         )
         self.assertTrue(first["dispatch"]["ok"], first)
-        row = db.get_download_request(first["request_id"])
+        row = download_requests_repo.get_download_request(first["request_id"])
         assert row is not None
         self.assertIsNone(row["torrent_data"])
         self.assertEqual(row["content_type"], "")
@@ -245,7 +246,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
 
     def test_active_qb_append_preserves_prepared_dynamic_torrent(self):
         request_id = self.start_untyped_qb_request()
-        get_download_request_result_3 = db.get_download_request(request_id)
+        get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_3 is not None
         original_task = get_download_request_result_3["qb_task_id"]
         result = self.submit("guangya")
@@ -253,7 +254,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         self.assertEqual(result["request_id"], request_id)
         self.assertEqual(self.sent, [("qb", None), ("guangya", TORRENT_A)])
         self.assertEqual(self.fetch.call_count, 1)
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["qb_task_id"], original_task)
         self.assertEqual(row["qb_status"], "submitted")
@@ -272,29 +273,29 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
 
     def test_active_qb_append_rejects_changed_content_before_claiming_cloud(self):
         request_id = self.start_untyped_qb_request()
-        get_download_request_result_11 = db.get_download_request(request_id)
+        get_download_request_result_11 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_11 is not None
         before = dict(get_download_request_result_11)
         self.payload = TORRENT_B
         result = self.submit("guangya")
         self.assertFalse(result["dispatch"]["ok"], result)
         self.assertEqual(self.sent, [("qb", None)])
-        get_download_request_result_12 = db.get_download_request(request_id)
+        get_download_request_result_12 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_12 is not None
         self.assertEqual(dict(get_download_request_result_12), before)
-        self.assertIsNone(db.get_download_request_by_request_key(self.key(TORRENT_B)))
+        self.assertIsNone(download_requests_repo.get_download_request_by_request_key(self.key(TORRENT_B)))
 
     def test_active_qb_append_does_not_store_payload_after_cancelled_claim(self):
         request_id = self.start_untyped_qb_request()
-        claim = db.claim_download_request_targets
+        claim = download_requests_repo.claim_download_request_targets
 
         def cancel_before_claim(current_id, targets):
-            db.update_download_request(current_id, status="cancelled")
+            download_requests_repo.update_download_request(current_id, status="cancelled")
             return claim(current_id, targets)
 
-        with patch.object(db, "claim_download_request_targets", side_effect=cancel_before_claim):
+        with patch.object(download_requests_repo, "claim_download_request_targets", side_effect=cancel_before_claim):
             self.submit("guangya")
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "cancelled")
         self.assertIsNone(row["torrent_data"])
@@ -308,13 +309,13 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         self.assertTrue(any(result["dispatch"]["ok"] for result in results), results)
         self.assertTrue(all(result["request_id"] == request_id for result in results))
         self.assertEqual(self.sent, [("qb", None), ("guangya", TORRENT_A)])
-        get_download_request_result_4 = db.get_download_request(request_id)
+        get_download_request_result_4 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["torrent_data"], TORRENT_A)
 
     def test_active_qb_append_rejects_prepared_source_mismatch_before_claim(self):
         request_id = self.start_untyped_qb_request()
-        get_download_request_result_13 = db.get_download_request(request_id)
+        get_download_request_result_13 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_13 is not None
         before = dict(get_download_request_result_13)
         result = dispatcher.dispatch_missing_targets(
@@ -323,7 +324,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
             ),
         )
         self.assertFalse(result["ok"], result)
-        get_download_request_result_14 = db.get_download_request(request_id)
+        get_download_request_result_14 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_14 is not None
         self.assertEqual(dict(get_download_request_result_14), before)
         self.assertEqual(self.sent, [("qb", None)])
@@ -337,7 +338,7 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         self.assertTrue(result["dispatch"]["ok"], result)
         self.assertEqual(result["request_id"], first["request_id"])
         self.assertEqual(self.sent, [("qb", TORRENT_A), ("guangya", TORRENT_A)])
-        get_download_request_result_5 = db.get_download_request(first["request_id"])
+        get_download_request_result_5 = download_requests_repo.get_download_request(first["request_id"])
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5["kind"], "torrent")
 
@@ -351,6 +352,6 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
         self.assertTrue(result["dispatch"]["ok"], result)
         self.assertEqual(result["request_id"], first["request_id"])
         self.assertEqual(self.sent, [("qb", TORRENT_A), ("guangya", TORRENT_A)])
-        get_download_request_result_6 = db.get_download_request(first["request_id"])
+        get_download_request_result_6 = download_requests_repo.get_download_request(first["request_id"])
         assert get_download_request_result_6 is not None
         self.assertEqual(get_download_request_result_6["torrent_data"], TORRENT_A)

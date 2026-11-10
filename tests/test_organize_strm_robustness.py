@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.directory_scrape_errors import DirectoryScrapeStateError
 from app.modules.organize import (
@@ -220,7 +221,7 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
         with patch.object(organizer, "_ensure_dir_chain", return_value="target-id"), patch.object(
             organizer, "_resolve_variant_conflict", return_value=(None, "none", "")
         ), patch.object(organizer, "_write_organize_audit", return_value=1), patch(
-            "app.modules.organize.db.enqueue_organize_probe_completion",
+            "app.repositories.organize_probe.enqueue_organize_probe_completion",
             return_value=9,
         ) as enqueue_probe, patch(
             "app.modules.organize_probe_worker.get_organize_probe_worker",
@@ -438,8 +439,8 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
 class StrmRobustnessTests(IsolatedDatabaseTestCase):
     def _cleanup(self, source_id: str) -> None:
         for key in (f"guangya:{source_id}", f"guangya-meta:{source_id}"):
-            rows = db.list_strm_index(key)
-            db.delete_strm_index_ids(key, [row["file_id"] for row in rows])
+            rows = strm_repo.list_strm_index(key)
+            strm_repo.delete_strm_index_ids(key, [row["file_id"] for row in rows])
 
     def test_full_sync_rejects_preexisting_symlink_escape(self) -> None:
         source_id = f"symlink-{uuid.uuid4().hex}"
@@ -473,7 +474,7 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
             with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
                 outside_path = Path(outside) / "Movie.mkv.strm"
                 outside_path.write_text("keep", encoding="utf-8")
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key,
                     file.file_id,
                     "old-etag",
@@ -492,7 +493,7 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
 
                 self.assertEqual(result["generated"], 1)
                 self.assertTrue(outside_path.is_file())
-                row = db.list_strm_index(source_key)[0]
+                row = strm_repo.list_strm_index(source_key)[0]
                 self.assertEqual(
                     Path(row["strm_path"]),
                     Path(root) / STRM_SUBDIR / "Renamed.strm",
@@ -509,7 +510,7 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
                 old_path = Path(root) / STRM_SUBDIR / "Old.nfo"
                 old_path.parent.mkdir(parents=True)
                 old_path.write_bytes(b"old")
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key,
                     file.file_id,
                     "old-etag",
@@ -549,11 +550,11 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["metadata_generated"], 0)
                 self.assertEqual(result["metadata_queued"], 1)
                 self.assertEqual(
-                    db.list_strm_metadata_queue()[0]["status"], "completed"
+                    strm_repo.list_strm_metadata_queue()[0]["status"], "completed"
                 )
                 self.assertFalse(old_path.exists())
                 self.assertEqual(new_path.read_bytes(), b"newdata")
-                self.assertEqual(Path(db.list_strm_index(source_key)[0]["strm_path"]), new_path)
+                self.assertEqual(Path(strm_repo.list_strm_index(source_key)[0]["strm_path"]), new_path)
         finally:
             self._cleanup(source_id)
 
@@ -588,8 +589,8 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
                 path_b = output / "B.nfo"
                 path_a.write_bytes(b"old-a")
                 path_b.write_bytes(b"old-b")
-                db.upsert_strm_index(source_key, first.file_id, "old-a", 5, "A.nfo", str(path_a))
-                db.upsert_strm_index(source_key, second.file_id, "old-b", 5, "B.nfo", str(path_b))
+                strm_repo.upsert_strm_index(source_key, first.file_id, "old-a", 5, "A.nfo", str(path_a))
+                strm_repo.upsert_strm_index(source_key, second.file_id, "old-b", 5, "B.nfo", str(path_b))
 
                 with patch("app.modules.strm.requests.get") as request_get:
                     result = sync_strm(
@@ -955,8 +956,8 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         with patch.object(
             scheduler, "_persist_change_targets", return_value=True,
         ), patch.object(
-            db, "reschedule_strm_change_targets",
-            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+            strm_repo, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(strm_repo.group_changes_by_target(changes)),
         ), patch.object(
             scheduler, "_start_locked_worker", side_effect=fake_start,
         ):
@@ -1014,8 +1015,8 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         with patch.object(
             scheduler, "_persist_change_targets", return_value=True,
         ), patch.object(
-            db, "reschedule_strm_change_targets",
-            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+            strm_repo, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(strm_repo.group_changes_by_target(changes)),
         ), patch.object(
             scheduler, "_start_locked_worker", side_effect=fake_start,
         ):
@@ -1068,8 +1069,8 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         with patch.object(
             scheduler, "_persist_change_targets", return_value=True,
         ), patch.object(
-            db, "reschedule_strm_change_targets",
-            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+            strm_repo, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(strm_repo.group_changes_by_target(changes)),
         ), patch.object(
             scheduler, "_start_locked_worker", side_effect=fake_start,
         ):
@@ -1130,11 +1131,11 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
 
         scheduler = STRMScheduler()
         with patch.object(
-            db, "recover_stale_strm_change_targets", return_value=0,
+            strm_repo, "recover_stale_strm_change_targets", return_value=0,
         ), patch.object(
-            db, "count_pending_strm_change_targets", return_value=1,
+            strm_repo, "count_pending_strm_change_targets", return_value=1,
         ), patch.object(
-            db, "seconds_until_next_strm_change_target", return_value=12.5,
+            strm_repo, "seconds_until_next_strm_change_target", return_value=12.5,
         ), patch.object(
             scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
         ) as schedule:
@@ -1163,7 +1164,7 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
 
         scheduler = STRMScheduler()
         with patch.object(
-            db, "seconds_until_next_strm_change_target", return_value=42.0,
+            strm_repo, "seconds_until_next_strm_change_target", return_value=42.0,
         ), patch.object(
             scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
         ) as schedule:
@@ -1185,7 +1186,7 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             )
 
         self.assertFalse(result["ok"])
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
         with patch.object(
             scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
         ) as schedule:
@@ -1205,7 +1206,7 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             result = scheduler.trigger("organize", organize_changes=[change])
 
         self.assertFalse(result["ok"])
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
         with patch.object(
             scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
         ) as schedule:
@@ -1242,8 +1243,8 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         with patch.object(
             scheduler, "_persist_change_targets", return_value=True,
         ) as persist, patch.object(
-            db, "reschedule_strm_change_targets",
-            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+            strm_repo, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(strm_repo.group_changes_by_target(changes)),
         ), patch.object(
             scheduler, "_start_locked_worker", side_effect=fake_start,
         ):
@@ -1285,8 +1286,8 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         with patch.object(
             scheduler, "_persist_change_targets", return_value=True,
         ), patch.object(
-            db, "reschedule_strm_change_targets",
-            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+            strm_repo, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(strm_repo.group_changes_by_target(changes)),
         ), patch.object(
             scheduler, "_start_locked_worker", side_effect=fake_start,
         ):

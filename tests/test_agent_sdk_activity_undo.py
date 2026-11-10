@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 from app import database as db, sdk
+from app.repositories import organize_history as organize_history_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -118,11 +119,11 @@ def test_inspect_undo_uses_complete_reversible_batch_outside_history_window(runt
         "original_parent_id": "source", "original_name": f"old-member-{i}.mkv",
         "current_parent_id": "target", "current_name": f"new-member-{i}.mkv", "size": 10} for i in range(members)])
     for i in range(members):
-        db.add_organize_operation_step(log_id, "batch", i, "move_rename", file_id=f"member-{i}",
+        organize_history_repo.add_organize_operation_step(log_id, "batch", i, "move_rename", file_id=f"member-{i}",
             from_parent_id="source", from_name=f"old-member-{i}.mkv", to_parent_id="target",
             to_name=f"new-member-{i}.mkv", status="success")
     for i in range(later_steps):
-        db.add_organize_operation_step(log_id, "history", i, "probe_rename", status="failed")
+        organize_history_repo.add_organize_operation_step(log_id, "history", i, "probe_rename", status="failed")
     service_class = organize_correction.OrganizeCorrectionService
     monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", lambda: service_class(client=cast(GuangYaClient, ReadClient()), scraper=Mock()))
     with sdk.call_owner(OWNER):

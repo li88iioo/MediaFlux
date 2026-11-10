@@ -45,9 +45,9 @@ class MediaSubscriptionSchedulerTests(TestCase):
         scheduler = MediaSubscriptionScheduler()
         scheduler._stop_event.set()
         with patch(
-            "app.modules.media_subscription_scheduler.db.recover_stale_media_subscription_checks"
+            "app.repositories.media_subscriptions.recover_stale_media_subscription_checks"
         ) as recover, patch(
-            "app.modules.media_subscription_scheduler.db.list_due_media_subscriptions"
+            "app.repositories.media_subscriptions.list_due_media_subscriptions"
         ) as due, patch(
             "app.modules.media_subscription_scheduler.threading.Thread", _FakeThread
         ):
@@ -68,10 +68,10 @@ class MediaSubscriptionSchedulerTests(TestCase):
 
         runner = threading.Thread(target=scheduler.run_due)
         with patch(
-            "app.modules.media_subscription_scheduler.db.recover_stale_media_subscription_checks",
+            "app.repositories.media_subscriptions.recover_stale_media_subscription_checks",
             return_value=0,
         ), patch(
-            "app.modules.media_subscription_scheduler.db.list_due_media_subscriptions",
+            "app.repositories.media_subscriptions.list_due_media_subscriptions",
             side_effect=due_rows,
         ), patch(
             "app.modules.media_subscription_scheduler.threading.Thread", _FakeThread,
@@ -90,10 +90,10 @@ class MediaSubscriptionSchedulerTests(TestCase):
         scheduler = MediaSubscriptionScheduler()
         rows = [{"id": 1}, {"id": 1}, {"id": 2}, {"id": 3}]
         with patch(
-            "app.modules.media_subscription_scheduler.db.recover_stale_media_subscription_checks",
+            "app.repositories.media_subscriptions.recover_stale_media_subscription_checks",
             return_value=0,
         ), patch(
-            "app.modules.media_subscription_scheduler.db.list_due_media_subscriptions",
+            "app.repositories.media_subscriptions.list_due_media_subscriptions",
             return_value=rows,
         ), patch(
             "app.modules.media_subscription_scheduler.threading.Thread", _FakeThread

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.clients.base import SeriesCandidate, SeriesEpisodeInventory, SeriesSearchResult
 from app.modules.media_identity import build_media_key, parse_episode_label
 from app.modules.rss import RSSEngine, RSSEntry, rss_subscription_refresh_revision
@@ -33,49 +34,49 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         )
 
     def test_subscription_binding_round_trips_without_changing_legacy_rss_row(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Anime", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=2,
             skip_existing_episodes=1,
         )
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         assert row is not None
         self.assertEqual(str(row["media_tmdb_id"]), "105556")
         self.assertEqual(int(row["media_default_season"]), 2)
         self.assertTrue(bool(row["skip_existing_episodes"]))
 
-        db.update_rss_subscription(sid, {
+        rss_repo.update_rss_subscription(sid, {
             "media_tmdb_id": "", "skip_existing_episodes": 0,
         })
-        cleared = db.get_rss_subscription(sid)
+        cleared = rss_repo.get_rss_subscription(sid)
         assert cleared is not None
         self.assertEqual(str(cleared["media_tmdb_id"]), "")
         self.assertFalse(bool(cleared["skip_existing_episodes"]))
 
     def test_enabled_subscription_snapshot_includes_binding_revision_fields(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Enabled", "https://example.invalid/rss", media_tmdb_id="105556",
             media_default_season=0, skip_existing_episodes=1,
         )
-        row = next(item for item in db.list_enabled_rss_subscriptions() if int(item["id"]) == sid)
+        row = next(item for item in rss_repo.list_enabled_rss_subscriptions() if int(item["id"]) == sid)
         self.assertEqual(str(row["media_tmdb_id"]), "105556")
         self.assertEqual(int(row["media_default_season"]), 0)
         self.assertTrue(bool(row["skip_existing_episodes"]))
 
     def test_specials_season_zero_is_preserved_in_refresh_revision(self) -> None:
-        zero_id = db.add_rss_subscription(
+        zero_id = rss_repo.add_rss_subscription(
             "Specials", "https://example.invalid/specials",
             media_tmdb_id="105556", media_default_season=0,
             skip_existing_episodes=1,
         )
-        one_id = db.add_rss_subscription(
+        one_id = rss_repo.add_rss_subscription(
             "Season One", "https://example.invalid/season-one",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=1,
         )
 
-        zero = db.get_rss_subscription(zero_id)
-        one = db.get_rss_subscription(one_id)
+        zero = rss_repo.get_rss_subscription(zero_id)
+        one = rss_repo.get_rss_subscription(one_id)
         assert zero is not None
         self.assertEqual(int(zero["media_default_season"]), 0)
         self.assertNotEqual(
@@ -84,27 +85,27 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         )
 
     def test_media_key_dedupes_across_rss_subscriptions(self) -> None:
-        first_sub = db.add_rss_subscription("A", "https://a.invalid/rss")
-        second_sub = db.add_rss_subscription("B", "https://b.invalid/rss")
+        first_sub = rss_repo.add_rss_subscription("A", "https://a.invalid/rss")
+        second_sub = rss_repo.add_rss_subscription("B", "https://b.invalid/rss")
         media_key = build_media_key("105556", "tv", 1, 7)
-        first = db.add_rss_entry_with_media(
+        first = rss_repo.add_rss_entry_with_media(
             first_sub, "first", "guid-a", media_key=media_key,
             tmdb_id="105556", season=1, episode=7,
         )
         # 发现 pending 本身不是消费凭据；已经 claim 的条目才阻止另一源。
-        self.assertTrue(db.claim_rss_entry(int(first["id"])))
-        second = db.add_rss_entry_with_media(
+        self.assertTrue(rss_repo.claim_rss_entry(int(first["id"])))
+        second = rss_repo.add_rss_entry_with_media(
             second_sub, "second", "guid-b", media_key=media_key,
             tmdb_id="105556", season=1, episode=7,
         )
 
         self.assertEqual(first["status"], "pending")
         self.assertEqual(second["status"], "skipped")
-        rows = db.list_rss_entries(sub_id=second_sub).items
+        rows = rss_repo.list_rss_entries(sub_id=second_sub).items
         self.assertEqual(str(rows[0]["skip_reason"]), "相同 TMDB 剧集已在 RSS 队列或下载记录中")
         self.assertTrue(bool(rows[0]["processed"]))
-        self.assertEqual(db.update_rss_entries_processed([int(rows[0]["id"])], False), 1)
-        restored = db.list_rss_entries(sub_id=second_sub).items[0]
+        self.assertEqual(rss_repo.update_rss_entries_processed([int(rows[0]["id"])], False), 1)
+        restored = rss_repo.list_rss_entries(sub_id=second_sub).items[0]
         self.assertEqual(str(restored["status"]), "pending")
         self.assertEqual(str(restored["skip_reason"]), "")
 
@@ -120,20 +121,20 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
                     conn.execute("DELETE FROM rss_entry_media")
                     conn.execute("DELETE FROM rss_entries")
                     conn.execute("DELETE FROM rss_items")
-                first_sub = db.add_rss_subscription(
+                first_sub = rss_repo.add_rss_subscription(
                     f"first-{failure_code}", f"https://first.invalid/{failure_code}"
                 )
-                second_sub = db.add_rss_subscription(
+                second_sub = rss_repo.add_rss_subscription(
                     f"second-{failure_code}", f"https://second.invalid/{failure_code}"
                 )
-                first = db.add_rss_entry_with_media(
+                first = rss_repo.add_rss_entry_with_media(
                     first_sub, "first", f"guid-first-{failure_code}",
                     media_key=media_key, tmdb_id="105556", season=1, episode=8,
                 )
                 first_id = int(first["id"])
-                db.record_rss_entry_failure(first_id, failure_code, False)
+                rss_repo.record_rss_entry_failure(first_id, failure_code, False)
 
-                second = db.add_rss_entry_with_media(
+                second = rss_repo.add_rss_entry_with_media(
                     second_sub, "second", f"guid-second-{failure_code}",
                     media_key=media_key, tmdb_id="105556", season=1, episode=8,
                 )
@@ -145,7 +146,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
                 )
 
     def test_refresh_skips_exact_episode_already_in_media_library(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Bound", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=1,
@@ -166,7 +167,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(result["library_skipped"], 1)
         self.assertEqual(result["new"], 1)
-        rows = db.list_rss_entries(sub_id=sid).items
+        rows = rss_repo.list_rss_entries(sub_id=sid).items
         self.assertEqual(str(rows[0]["status"]), "skipped")
         self.assertEqual(str(rows[0]["skip_reason"]), "媒体库已存在该剧集")
 
@@ -188,7 +189,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         client.detail_with_alternative_titles.assert_called_once_with("105556", "tv")
 
     def test_single_series_title_mismatch_bypasses_tmdb_binding(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Wrong binding", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=1,
@@ -207,7 +208,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         library_lookup.assert_not_called()
         self.assertTrue(result["media_binding_bypassed"])
         self.assertEqual(result["binding_bypass_reason"], "tmdb_title_mismatch")
-        rows = db.list_rss_entries(sub_id=sid).items
+        rows = rss_repo.list_rss_entries(sub_id=sid).items
         self.assertEqual(str(rows[0]["status"]), "pending")
         self.assertEqual(str(rows[0]["skip_reason"]), "")
         with db.get_conn() as conn:
@@ -219,7 +220,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(bound_rows, 0)
 
     def test_tmdb_title_lookup_failure_keeps_feed_entries_pending(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Unverified", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=1,
@@ -238,12 +239,12 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         library_lookup.assert_not_called()
         self.assertTrue(result["media_binding_bypassed"])
         self.assertEqual(result["binding_bypass_reason"], "tmdb_title_unverified")
-        rows = db.list_rss_entries(sub_id=sid).items
+        rows = rss_repo.list_rss_entries(sub_id=sid).items
         self.assertEqual(str(rows[0]["status"]), "pending")
         self.assertEqual(str(rows[0]["skip_reason"]), "")
 
     def test_normalized_official_title_enables_media_identity(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Normalized", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=0,
@@ -268,7 +269,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(media["tmdb_id"], "105556")
 
     def test_mixed_feed_bypasses_subscription_level_tmdb_binding(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Mixed", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=1,
@@ -293,7 +294,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["detected_series_count"], 2)
         self.assertEqual(result["library_skipped"], 0)
         self.assertEqual(result["semantic_duplicates"], 0)
-        rows = db.list_rss_entries(sub_id=sid).items
+        rows = rss_repo.list_rss_entries(sub_id=sid).items
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(str(row["status"]) == "pending" for row in rows))
         with db.get_conn() as conn:
@@ -306,7 +307,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertTrue(all(str(row["skip_reason"] or "") == "" for row in rows))
 
     def test_unresolved_series_in_feed_bypasses_subscription_level_tmdb_binding(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Partially unresolved", "https://example.invalid/rss",
             media_tmdb_id="105556", media_default_season=1,
             skip_existing_episodes=1,
@@ -332,7 +333,7 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["binding_bypass_reason"], "series_unresolved")
         self.assertEqual(result["detected_series_count"], 1)
         self.assertEqual(result["unresolved_series_count"], 1)
-        rows = db.list_rss_entries(sub_id=sid).items
+        rows = rss_repo.list_rss_entries(sub_id=sid).items
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(str(row["status"]) == "pending" for row in rows))
         with db.get_conn() as conn:
@@ -407,7 +408,7 @@ class RSSTMDBClientLifecycleTests(IsolatedDatabaseTestCase):
         }
 
     def test_refresh_closes_lazily_created_tmdb_client(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Bound",
             "https://example.invalid/rss",
             media_tmdb_id="105556",

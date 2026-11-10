@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Annotated
 from fastapi import APIRouter, Body, Query, Request
 
-from app import database as db
+from app.repositories import rss as rss_repo
 from app.logger import get_logger
 from app.modules.rss import RSSEngine, rss_entry_delivery
 from app.modules.rss_subscriptions import RSSSubscriptionError, apply_change
@@ -18,14 +18,14 @@ router = APIRouter(prefix="/api/rss")
 @router.get("/stats")
 def rss_stats(request: Request):
     require_api_login(request)
-    return api_response(db.get_rss_stats())
+    return api_response(rss_repo.get_rss_stats())
 
 
 # ===== 订阅项 =====
 @router.get("/subscriptions")
 def list_subs(request: Request):
     require_api_login(request)
-    rows = db.list_rss_subscriptions()
+    rows = rss_repo.list_rss_subscriptions()
     return api_response([{
         "id": r["id"],
         "name": r["name"],
@@ -70,7 +70,7 @@ def create_sub(request: Request, data: dict = Body(...)):
 @router.put("/subscriptions/{sid}")
 def update_sub(sid: int, request: Request, data: dict = Body(...)):
     require_api_login(request)
-    current = db.get_rss_subscription(sid)
+    current = rss_repo.get_rss_subscription(sid)
     if current is None:
         return api_error("订阅项不存在", 404)
     try:
@@ -85,7 +85,7 @@ def update_sub(sid: int, request: Request, data: dict = Body(...)):
 @router.delete("/subscriptions/{sid}")
 def delete_sub(sid: int, request: Request):
     require_api_login(request)
-    if db.get_rss_subscription(sid) is not None:
+    if rss_repo.get_rss_subscription(sid) is not None:
         try:
             return _subscription_response(apply_change("delete", {"subscription_id": sid}))
         except RSSSubscriptionError as exc:
@@ -142,7 +142,7 @@ def list_entries(
     except (TypeError, ValueError):
         return api_error("订阅 ID 无效", 400)
     status = status or None
-    page = db.list_rss_entries(
+    page = rss_repo.list_rss_entries(
         sub_id=sid,
         status=status,
         keyword=q.strip(),
@@ -198,7 +198,7 @@ def mark_entries(request: Request, data: dict = Body(...)):
     if not ids or len(ids) > 300:
         return api_error("每次请选择 1 至 300 个条目", 400)
     processed = bool(data.get("processed"))
-    updated = db.update_rss_entries_processed(ids, processed)
+    updated = rss_repo.update_rss_entries_processed(ids, processed)
     return api_response({"success": True, "updated": updated, "processed": processed})
 
 

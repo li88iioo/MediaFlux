@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from tests.support import assert_present, isolated_test_database
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app import database_migrations
 from app.modules import download_dispatcher as dispatcher
 from app.modules.download_tracker import DownloadTracker
@@ -63,7 +64,7 @@ class DownloadSubmissionClockTests(unittest.TestCase):
         return int(result["id"])
 
     def row(self, request_id):
-        return assert_present(db.get_download_request(request_id))
+        return assert_present(download_requests_repo.get_download_request(request_id))
 
     def test_peer_tracker_cannot_extend_failed_receipt_persistence_timeout(self):
         request_id = self.request()
@@ -99,13 +100,13 @@ class DownloadSubmissionClockTests(unittest.TestCase):
         self.assertIsNone(self.row(request_id)["gy_submitting_at"])
         self.advance(20)  # 等待用户确认不计入后端提交租约。
         claimed_at = self.stamp()
-        self.assertTrue(db.claim_download_request(request_id, "qb"))
+        self.assertTrue(download_requests_repo.claim_download_request(request_id, "qb"))
         self.advance(5)
-        self.assertFalse(db.claim_download_request(request_id, "both"))
-        self.assertEqual(db.claim_download_request_targets(request_id, "qb"), ())
+        self.assertFalse(download_requests_repo.claim_download_request(request_id, "both"))
+        self.assertEqual(download_requests_repo.claim_download_request_targets(request_id, "qb"), ())
         self.assertEqual(self.row(request_id)["qb_submitting_at"], claimed_at)
         self.assertIsNone(self.row(request_id)["gy_submitting_at"])
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
         atomic = self.request(initial_targets="both")
         self.assertEqual((self.row(atomic)["qb_submitting_at"], self.row(atomic)["gy_submitting_at"]),
                          (self.stamp(), self.stamp()))
@@ -119,20 +120,20 @@ class DownloadSubmissionClockTests(unittest.TestCase):
                 first_at = self.stamp()
                 self.advance(10)
                 peer_at = self.stamp()
-                self.assertEqual(db.claim_download_request_targets(request_id, peer), (peer,))
+                self.assertEqual(download_requests_repo.claim_download_request_targets(request_id, peer), (peer,))
                 self.assertEqual(self.row(request_id)[f"{prefix}_submitting_at"], first_at)
                 self.assertEqual(self.row(request_id)[f"{peer_prefix}_submitting_at"], peer_at)
                 self.advance(5)
-                self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+                self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
                 self.advance(1)
-                self.assertEqual(db.recover_stale_submitting_download_requests(), 1)
+                self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 1)
                 self.assertEqual(self.row(request_id)[f"{prefix}_status"], "manual_review")
                 self.assertEqual(self.row(request_id)[f"{peer_prefix}_status"], "submitting")
-                self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
-                self.assertEqual(db.finalize_download_request_submission(
+                self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
+                self.assertEqual(download_requests_repo.finalize_download_request_submission(
                     request_id, (peer,), **{f"{peer_prefix}_status": "submitted"},
                 ), "manual_review")
-                self.assertIsNone(db.finalize_download_request_submission(
+                self.assertIsNone(download_requests_repo.finalize_download_request_submission(
                     request_id, (first,), **{f"{prefix}_status": "submitted"},
                 ))
                 self.assertEqual(self.row(request_id)[f"{peer_prefix}_submitting_at"], peer_at)
@@ -141,15 +142,15 @@ class DownloadSubmissionClockTests(unittest.TestCase):
         request_id = self.request(initial_targets="both")
         started_at = self.stamp()
         self.advance(10)
-        self.assertTrue(db.bind_download_request_guangya_staging(
+        self.assertTrue(download_requests_repo.bind_download_request_guangya_staging(
             request_id, staging_id="stage", parent_id="parent", staging_name="MF-Audit", target_name="Audit",
         ))
-        db.update_download_request(request_id, qb_status="downloading")
+        download_requests_repo.update_download_request(request_id, qb_status="downloading")
         request_download_notification_refresh(request_id)
         self.assertEqual(self.row(request_id)["updated_at"], self.stamp())
         self.assertEqual(self.row(request_id)["gy_submitting_at"], started_at)
         self.advance(6)
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 1)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 1)
         row = self.row(request_id)
         self.assertEqual((row["qb_status"], row["gy_status"]), ("downloading", "manual_review"))
         self.assertEqual((row["gy_target_dir"], row["gy_isolated"]), ("stage", 1))
@@ -157,7 +158,7 @@ class DownloadSubmissionClockTests(unittest.TestCase):
     def test_in_place_retry_renews_only_selected_clock(self):
         request_id = self.request(initial_targets="both")
         first_at = self.stamp()
-        db.finalize_download_request_submission(
+        download_requests_repo.finalize_download_request_submission(
             request_id, ("qb", "guangya"), qb_status="submitted", gy_status="failed",
         )
         self.advance(10)
@@ -184,7 +185,7 @@ class DownloadSubmissionClockTests(unittest.TestCase):
     def test_successor_has_new_clock_without_rewriting_original_attempt(self):
         request_id = self.request(initial_targets="qb")
         first_at = self.stamp()
-        db.finalize_download_request_submission(request_id, ("qb",), qb_status="failed")
+        download_requests_repo.finalize_download_request_submission(request_id, ("qb",), qb_status="failed")
         self.advance(10)
         with (
             patch.object(dispatcher, "get", return_value="http://qb.invalid"),
@@ -199,48 +200,48 @@ class DownloadSubmissionClockTests(unittest.TestCase):
         self.assertEqual(self.row(request_id)["qb_submitting_at"], first_at)
 
     def test_share_creation_retry_recovery_and_late_receipt_use_cloud_clock(self):
-        request_id, created = db.create_share_transfer_request("clock-share", title="Audit")
+        request_id, created = download_requests_repo.create_share_transfer_request("clock-share", title="Audit")
         self.assertTrue(created)
         self.assertEqual(self.row(request_id)["gy_submitting_at"], self.stamp())
         self.assertIsNone(self.row(request_id)["qb_submitting_at"])
-        self.assertTrue(db.finish_share_transfer_request(
+        self.assertTrue(download_requests_repo.finish_share_transfer_request(
             request_id, success=False, target_dir_id="parent", target_dir_name="Parent", title="Audit",
         ))
         self.advance(10)
-        self.assertTrue(db.claim_failed_share_transfer_request(request_id))
+        self.assertTrue(download_requests_repo.claim_failed_share_transfer_request(request_id))
         claimed_at = self.stamp()
         self.advance(1)
-        self.assertFalse(db.claim_failed_share_transfer_request(request_id))
+        self.assertFalse(download_requests_repo.claim_failed_share_transfer_request(request_id))
         self.assertEqual(self.row(request_id)["gy_submitting_at"], claimed_at)
         self.advance(15)
-        db.update_download_request(request_id, gy_target_dir="stage")
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 1)
+        download_requests_repo.update_download_request(request_id, gy_target_dir="stage")
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 1)
         before = dict(self.row(request_id))
-        self.assertFalse(db.finish_share_transfer_request(
+        self.assertFalse(download_requests_repo.finish_share_transfer_request(
             request_id, success=True, target_dir_id="late", target_dir_name="Late", title="Audit",
         ))
         self.assertEqual(dict(self.row(request_id)), before)
-        self.assertEqual(len(db.list_download_logs(source="guangya_share")), 1)
+        self.assertEqual(len(download_requests_repo.list_download_logs(source="guangya_share")), 1)
 
     def test_late_dispatch_receipts_cannot_revive_expired_claims(self):
         for path in ("first", "supplement", "retry", "successor"):
             with self.subTest(path=path):
                 request_id = self.request()
                 if path in {"supplement", "retry"}:
-                    self.assertTrue(db.claim_download_request(request_id, "guangya"))
-                    db.finalize_download_request_submission(request_id, ("guangya",), gy_status="submitted")
+                    self.assertTrue(download_requests_repo.claim_download_request(request_id, "guangya"))
+                    download_requests_repo.finalize_download_request_submission(request_id, ("guangya",), gy_status="submitted")
                     if path == "retry":
-                        self.assertEqual(db.claim_download_request_targets(request_id, "qb"), ("qb",))
-                        db.finalize_download_request_submission(request_id, ("qb",), qb_status="failed")
+                        self.assertEqual(download_requests_repo.claim_download_request_targets(request_id, "qb"), ("qb",))
+                        download_requests_repo.finalize_download_request_submission(request_id, ("qb",), qb_status="failed")
                 elif path == "successor":
-                    self.assertTrue(db.claim_download_request(request_id, "qb"))
-                    db.finalize_download_request_submission(request_id, ("qb",), qb_status="failed")
+                    self.assertTrue(download_requests_repo.claim_download_request(request_id, "qb"))
+                    download_requests_repo.finalize_download_request_submission(request_id, ("qb",), qb_status="failed")
 
                 recovered = {}
 
                 def submit(row, **_kwargs):
                     self.advance(16)
-                    self.assertEqual(db.recover_stale_submitting_download_requests(), 1)
+                    self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 1)
                     recovered.update(dict(self.row(row["id"])))
                     return {"ok": True, "task_id": "a" * 40}
 
@@ -257,12 +258,12 @@ class DownloadSubmissionClockTests(unittest.TestCase):
                     result = operation(request_id, "qb")
                 self.assertTrue(result["stale_result"], result)
                 self.assertEqual(dict(self.row(result["request_id"])), recovered)
-                self.assertIn("迟到", db.list_download_logs()[0]["error"])
+                self.assertIn("迟到", download_requests_repo.list_download_logs()[0]["error"])
 
     def test_boot_recovers_recent_claims_and_missing_legacy_clock_ignores_updates(self):
         recent = self.request(initial_targets="both")
         claimed_at = self.stamp()
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
         db.init_db()
         self.assertEqual((self.row(recent)["qb_status"], self.row(recent)["gy_status"]),
                          ("manual_review", "manual_review"))
@@ -273,14 +274,14 @@ class DownloadSubmissionClockTests(unittest.TestCase):
         with db.get_conn() as conn:
             conn.execute("UPDATE download_requests SET gy_submitting_at=NULL,updated_at=? WHERE id=?",
                          (self.stamp(), legacy))
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 1)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 1)
         self.assertEqual(self.row(legacy)["gy_status"], "manual_review")
 
     def test_migration_backfills_only_missing_active_clocks_once(self):
         active = self.request(initial_targets="both")
         pending = self.request()
         completed = self.request(initial_targets="qb")
-        db.finalize_download_request_submission(completed, ("qb",), qb_status="completed")
+        download_requests_repo.finalize_download_request_submission(completed, ("qb",), qb_status="completed")
         fallback = self.request(initial_targets="guangya")
         undated = self.request(initial_targets="qb")
         created_at = self.stamp()
@@ -311,10 +312,10 @@ class DownloadSubmissionClockTests(unittest.TestCase):
         for version in (34, 0, db.SCHEMA_VERSION):
             with self.subTest(version=version), isolated_test_database():
                 active = self.request(initial_targets="both")
-                db.update_download_request(active, qb_status="completed", qb_task_id="known")
+                download_requests_repo.update_download_request(active, qb_status="completed", qb_task_id="known")
                 pending = self.request()
-                share, _ = db.create_share_transfer_request("legacy-share", title="Legacy")
-                db.update_download_request(share, status="pending", gy_status="completed", gy_task_id="known-share")
+                share, _ = download_requests_repo.create_share_transfer_request("legacy-share", title="Legacy")
+                download_requests_repo.update_download_request(share, status="pending", gy_status="completed", gy_task_id="known-share")
                 old_time = "2000-01-01 00:00:00"
                 with db.get_conn() as conn:
                     conn.execute("UPDATE download_requests SET updated_at=?", (old_time,))

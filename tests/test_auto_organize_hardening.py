@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import media_probe as media_probe_repo
 from app.clients.ai_recognition import AIRecognitionInput, AIRecognitionResult
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.discovery.models import ProviderTimeout
@@ -60,18 +62,18 @@ def _immediate_operation_manager() -> SimpleNamespace:
 
 class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
     def test_requires_manual_request_cannot_reenter_download_admission(self):
-        request_id, _ = db.create_download_request("manual-staging-reentry-fixture", "magnet")
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request("manual-staging-reentry-fixture", "magnet")
+        download_requests_repo.update_download_request(
             request_id, targets="guangya", status="completed", gy_status="completed",
             gy_isolated=1, gy_target_dir="stage", gy_staging_cleanup_status="retained",
             organize_started=1, organize_status="requires_manual", organize_task_id="old-task",
         )
 
-        self.assertFalse(db.claim_download_request_organize(request_id))
-        get_download_request_result = db.get_download_request(request_id)
+        self.assertFalse(download_requests_repo.claim_download_request_organize(request_id))
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["organize_status"], "requires_manual")
-        self.assertIn("stage", db.list_protected_guangya_staging_ids())
+        self.assertIn("stage", download_requests_repo.list_protected_guangya_staging_ids())
 
     def test_moved_staging_cannot_reuse_a_previous_stable_snapshot(self):
         tracker = DownloadTracker()
@@ -95,35 +97,35 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertIn("身份已变化", fail.call_args.args[1])
 
     def test_download_staging_identity_is_bound_before_provider_write(self):
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "staging-bind-before-provider",
             "magnet",
             title="Bound staging",
             source_value="magnet:?xt=urn:btih:" + "a" * 40,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="guangya",
             status="submitting",
             gy_status="submitting",
         )
 
-        self.assertTrue(db.bind_download_request_guangya_staging(
+        self.assertTrue(download_requests_repo.bind_download_request_guangya_staging(
             request_id,
             staging_id="stage-bound",
             parent_id="parent",
             staging_name="MF-stage-bound",
             target_name="下载 / MF-stage-bound",
         ))
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["gy_target_dir"], "stage-bound")
         self.assertEqual(row["gy_staging_parent_dir"], "parent")
         self.assertEqual(row["gy_staging_cleanup_status"], "pending")
 
-        db.update_download_request(request_id, status="cancelled", gy_status="cancelled")
-        self.assertFalse(db.bind_download_request_guangya_staging(
+        download_requests_repo.update_download_request(request_id, status="cancelled", gy_status="cancelled")
+        self.assertFalse(download_requests_repo.bind_download_request_guangya_staging(
             request_id,
             staging_id="stage-late",
             parent_id="parent",
@@ -132,13 +134,13 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         ))
 
     def test_staging_finalize_claim_is_identity_bound_and_leased(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "staging-finalize-lease",
             "magnet",
             title="Finalize staging",
             source_value="magnet:?xt=urn:btih:" + "b" * 40,
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="guangya",
             status="completed",
@@ -150,19 +152,19 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             gy_staging_cleanup_status="pending",
         )
 
-        self.assertTrue(db.claim_download_request_staging_finalize(
+        self.assertTrue(download_requests_repo.claim_download_request_staging_finalize(
             request_id,
             staging_id="stage-finalize",
             parent_id="parent",
             staging_name="MF-stage-finalize",
         ))
-        self.assertFalse(db.claim_download_request_staging_finalize(
+        self.assertFalse(download_requests_repo.claim_download_request_staging_finalize(
             request_id,
             staging_id="stage-finalize",
             parent_id="parent",
             staging_name="MF-stage-finalize",
         ))
-        self.assertFalse(db.claim_download_request_staging_finalize(
+        self.assertFalse(download_requests_repo.claim_download_request_staging_finalize(
             request_id,
             staging_id="wrong-stage",
             parent_id="parent",
@@ -170,23 +172,23 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         ))
 
     def test_active_isolated_download_staging_is_globally_protected(self):
-        protected_id, _ = db.create_download_request(
+        protected_id, _ = download_requests_repo.create_download_request(
             "protected-download-staging",
             "magnet",
             source_value="magnet:?xt=urn:btih:" + "c" * 40,
         )
-        completed_id, _ = db.create_download_request(
+        completed_id, _ = download_requests_repo.create_download_request(
             "completed-download-staging",
             "magnet",
             source_value="magnet:?xt=urn:btih:" + "d" * 40,
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             protected_id,
             gy_isolated=1,
             gy_target_dir="stage-protected",
             gy_staging_cleanup_status="retained",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             completed_id,
             gy_isolated=1,
             gy_target_dir="stage-cleaned",
@@ -194,7 +196,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         )
 
         self.assertEqual(
-            db.list_protected_guangya_staging_ids(),
+            download_requests_repo.list_protected_guangya_staging_ids(),
             {"stage-protected"},
         )
 
@@ -305,7 +307,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch.object(
             tracker, "_start_organize"
         ) as start, patch.object(tracker, "_update_backend_log"), patch.object(
-            db, "update_download_request"
+            download_requests_repo, "update_download_request"
         ) as update, patch("app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}), patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"):
             tracker._update_request(row, [], done)
 
@@ -346,7 +348,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch.object(
             tracker, "_start_organize"
         ) as start, patch.object(tracker, "_update_backend_log"), patch.object(
-            db, "update_download_request"
+            download_requests_repo, "update_download_request"
         ), patch("app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}) as persist, patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"):
             tracker._update_request(row, [], done)
 
@@ -380,7 +382,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch.object(
             tracker, "_start_organize"
         ) as start, patch.object(tracker, "_update_backend_log"), patch.object(
-            db, "update_download_request"
+            download_requests_repo, "update_download_request"
         ) as update, patch("app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}), patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"):
             tracker._update_request(row, [], done)
 
@@ -437,9 +439,9 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
         ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
-            db, "claim_download_request_staging_finalize", return_value=True,
-        ), patch.object(db, "get_download_request", return_value=row), patch.object(
-            db, "update_download_request"
+            download_requests_repo, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(download_requests_repo, "get_download_request", return_value=row), patch.object(
+            download_requests_repo, "update_download_request"
         ) as update:
             tracker._start_organize(row)
 
@@ -484,9 +486,9 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
         ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
-            db, "claim_download_request_staging_finalize", return_value=True,
-        ), patch.object(db, "get_download_request", return_value=row), patch.object(
-            db, "update_download_request"
+            download_requests_repo, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(download_requests_repo, "get_download_request", return_value=row), patch.object(
+            download_requests_repo, "update_download_request"
         ) as update:
             tracker._start_organize(row)
 
@@ -525,9 +527,9 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
         ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
-            db, "claim_download_request_staging_finalize", return_value=True,
-        ), patch.object(db, "get_download_request", return_value=row), patch.object(
-            db, "update_download_request"
+            download_requests_repo, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(download_requests_repo, "get_download_request", return_value=row), patch.object(
+            download_requests_repo, "update_download_request"
         ) as update:
             tracker._start_organize(row)
 
@@ -551,9 +553,9 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
         ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
-            db, "claim_download_request_staging_finalize", return_value=True,
+            download_requests_repo, "claim_download_request_staging_finalize", return_value=True,
         ), patch("app.modules.download_tracker.GuangYaClient") as client_cls, patch.object(
-            db, "update_download_request"
+            download_requests_repo, "update_download_request"
         ) as update:
             tracker._start_organize(row)
 
@@ -576,10 +578,10 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
         ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
-            db, "claim_download_request_staging_finalize", return_value=True,
-        ), patch.object(db, "get_download_request", return_value=current), patch(
+            download_requests_repo, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(download_requests_repo, "get_download_request", return_value=current), patch(
             "app.modules.download_tracker.GuangYaClient"
-        ) as client_cls, patch.object(db, "update_download_request") as update:
+        ) as client_cls, patch.object(download_requests_repo, "update_download_request") as update:
             tracker._start_organize(row)
 
         client_cls.assert_not_called()
@@ -1355,8 +1357,8 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         budget = ProbeBudget(2)
         with patch.dict("os.environ", {"MEDIAFLUX_FFPROBE": "/opt/mediaflux/ffprobe"}), patch(
             "app.modules.media_probe.subprocess.run", side_effect=[first, success]
-        ) as run, patch.object(db, "get_media_probe_cache", return_value=""), patch.object(
-            db, "upsert_media_probe_cache"
+        ) as run, patch.object(media_probe_repo, "get_media_probe_cache", return_value=""), patch.object(
+            media_probe_repo, "upsert_media_probe_cache"
         ):
             profile = probe_media_profile(file, client, enabled=True, timeout=5, budget=budget)
 
@@ -1378,8 +1380,8 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             1, ["ffprobe"], stderr="Invalid data found when processing input"
         )
         with patch("app.modules.media_probe.subprocess.run", side_effect=failure) as run, patch.object(
-            db, "get_media_probe_cache", return_value=""
-        ), patch.object(db, "upsert_media_probe_cache"):
+            media_probe_repo, "get_media_probe_cache", return_value=""
+        ), patch.object(media_probe_repo, "upsert_media_probe_cache"):
             self.assertIsNone(probe_media_profile(file, client, enabled=True))
 
         self.assertEqual(run.call_count, 1)
@@ -1394,8 +1396,8 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             file_info=Mock(return_value=info), supports_guarded_empty_directory_delete=True,
             delete_empty_directory=Mock(return_value=True),
         )
-        request_id, _ = db.create_download_request(root, "magnet")
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request(root, "magnet")
+        download_requests_repo.update_download_request(
             request_id, targets="guangya", status="completed", gy_status="completed",
             gy_isolated=1, gy_target_dir=root, gy_staging_parent_dir="parent", gy_staging_name="MF-7",
             gy_staging_cleanup_status="retained", organize_status="completed", organize_started=1,
@@ -1412,7 +1414,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         organizer.client.delete_empty_directory.assert_called_once_with(
             root, expected_etag="dir-etag", expected_updated_at=123,
         )
-        get_download_request_result_2 = db.get_download_request(request_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2["gy_staging_cleanup_status"], "completed")
 
@@ -1425,7 +1427,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(report["unsupported"], 1)
         organizer.client.delete_empty_directory.assert_not_called()
-        get_download_request_result_3 = db.get_download_request(request_id)
+        get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["gy_staging_cleanup_status"], "retained")
 
@@ -1437,7 +1439,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             rules=OrganizeRules(clean_empty=True),
         )
         self.assertEqual(report["delete_failures"], 1)
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["gy_staging_cleanup_status"], "failed")
         self.assertIn("结果未确认", row["gy_staging_cleanup_error"])
@@ -1451,7 +1453,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         )
         self.assertGreater(report["unavailable"], 0)
         organizer.client.delete_empty_directory.assert_not_called()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["gy_staging_cleanup_status"], "retained")
         self.assertIn("身份", row["gy_staging_cleanup_error"])
@@ -1497,18 +1499,18 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertTrue(organizer.organize.call_args.kwargs["automatic"])
 
     def test_stopped_download_organize_is_marked_for_attention(self):
-        request_id, _created = db.create_download_request(
+        request_id, _created = download_requests_repo.create_download_request(
             "stopped-organize", "magnet", title="Stopped", initial_targets="guangya",
             source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="completed", gy_status="completed",
             organize_started=1, organize_status="running",
         )
         manager = OrganizeTaskManager()
         manager._lock.acquire()
         run_id = db.add_task_run("guangya_organize", "download", result=json.dumps({"task_id": "stop-task"}))
-        db.update_download_request(request_id, organize_task_id="stop-task", organize_run_id=run_id, strm_status="pending")
+        download_requests_repo.update_download_request(request_id, organize_task_id="stop-task", organize_run_id=run_id, strm_status="pending")
         manager._task = {"id": "stop-task", "run_id": run_id, "status": "running", "stats": {}}
         organizer = Mock()
         organizer._validate_target_outside_source = Mock()
@@ -1534,14 +1536,14 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
                 download_request_ids=[request_id], trigger_type="download",
             )
 
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["organize_status"], "stopped")
         self.assertEqual(row["organize_started"], -1)
         self.assertEqual(row["strm_status"], "skipped")
         self.assertIn("勿直接重复执行", row["organize_error"])
         attention_ids = {
-            int(item["id"]) for item in db.list_download_requests_requiring_attention()
+            int(item["id"]) for item in download_requests_repo.list_download_requests_requiring_attention()
         }
         self.assertIn(request_id, attention_ids)
 

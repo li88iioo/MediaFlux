@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app import sdk
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.domains.library.missing_workflow_runtime import (
@@ -114,7 +116,7 @@ def test_native_search_file_cli_cold_batch_confirmation_and_original_verificatio
 
     def dispatch(request_id, target, **kwargs):
         writes.append((request_id, target))
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="downloading", targets=target, qb_status="downloading"
         )
         return {"ok": True, "status": "submitted", "succeeded": [target], "failed": []}
@@ -215,17 +217,17 @@ raise AssertionError("确认后不能重跑脚本")
             "verification_pending"
         }
         for request_id, _ in writes:
-            job = db.get_agent_download_verification(request_id)
+            job = agent_download_verification_repo.get_agent_download_verification(request_id)
             assert (
                 job is not None
                 and job["owner"] == context.owner
                 and len(job["targets"]) == 2
             )
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id, status="completed", qb_status="completed"
             )
         for _ in writes:
-            job = db.claim_due_agent_download_verification(
+            job = agent_download_verification_repo.claim_due_agent_download_verification(
                 current_time="2099-01-01 00:00:00"
             )
             assert job is not None

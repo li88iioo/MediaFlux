@@ -13,6 +13,7 @@ from time import monotonic, sleep, time
 from unittest.mock import MagicMock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient
 from app.notifier import TelegramSendResult
 from app.modules.organize import (
@@ -67,13 +68,13 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
         return [], {"total": 1, "moved": 1, "failed": 0}
 
     def _request(self, name):
-        request_id, _ = db.create_download_request(name, "magnet")
-        db.update_download_request(request_id, status="completed", gy_status="completed",
+        request_id, _ = download_requests_repo.create_download_request(name, "magnet")
+        download_requests_repo.update_download_request(request_id, status="completed", gy_status="completed",
                                    gy_target_dir="source", targets="guangya")
         return request_id
 
     def _request_row(self, request_id: int) -> sqlite3.Row:
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         return row
 
@@ -403,11 +404,11 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
                         {"organize_run_id": 9999}):
             with self.subTest(changed=changed):
                 request = self._request("confirmation-cas-" + str(changed))
-                db.update_download_request(request, gy_staging_cleanup_status="retained")
+                download_requests_repo.update_download_request(request, gy_staging_cleanup_status="retained")
 
                 def need_confirmation(*args, **kwargs):
                     self._organize(*args, **kwargs)
-                    db.update_download_request(request, **changed)
+                    download_requests_repo.update_download_request(request, **changed)
                     return [], {"total": 1, "need_confirm": 1, "moved": 0, "failed": 0}
 
                 self.organizer.organize.side_effect = need_confirmation
@@ -422,16 +423,16 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
 
     def _request_with_qb_successor(self, name):
         request = self._request(name)
-        db.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
-        successor, _ = db.create_download_request(name + "-successor", "magnet")
-        self.assertTrue(db.mark_download_request_resubmitted(
+        download_requests_repo.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
+        successor, _ = download_requests_repo.create_download_request(name + "-successor", "magnet")
+        self.assertTrue(download_requests_repo.mark_download_request_resubmitted(
             request, successor_request_id=successor, targets="qb",
         ))
         return request
 
     def test_qb_only_resubmit_settles_completed_cloud_task(self):
         request = self._request_with_qb_successor("qb-only-settlement")
-        self.assertTrue(db.claim_download_request_organize(request))
+        self.assertTrue(download_requests_repo.claim_download_request_organize(request))
         accepted = self._start([request])
         self._join()
         self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
@@ -487,7 +488,7 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
             with self.subTest(case=case):
                 if case in {"guangya", "both"}:
                     request = self._request("handoff-" + case)
-                    db.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
+                    download_requests_repo.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
                 else:
                     request = self._request_with_qb_successor("fence-" + case)
                 snapshot = {}
@@ -496,9 +497,9 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
                              snapshot=snapshot, **kwargs):
                     result = self._organize(*args, **kwargs)
                     if case in {"guangya", "both"}:
-                        db.update_download_request(request, organize_status="failed")
-                        successor, _ = db.create_download_request("handoff-successor-" + case, "magnet")
-                        db.mark_download_request_resubmitted(request, successor_request_id=successor, targets=case)
+                        download_requests_repo.update_download_request(request, organize_status="failed")
+                        successor, _ = download_requests_repo.create_download_request("handoff-successor-" + case, "magnet")
+                        download_requests_repo.mark_download_request_resubmitted(request, successor_request_id=successor, targets=case)
                         self.assertEqual(self._request_row(request)["organize_status"], "resubmitted")
                     else:
                         with db.get_conn() as conn:
@@ -655,8 +656,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.enterContext(isolated_test_database("organize-task-failures.db"))
 
     def test_strm_rejection_keeps_completed_cloud_work_without_requeuing_it(self):
-        request_id, _ = db.create_download_request("test_strm_rejection_keeps_completed_cloud_work_without_requeuing_it", "magnet")
-        db.update_download_request(request_id, status="completed", gy_status="completed", gy_target_dir="source")
+        request_id, _ = download_requests_repo.create_download_request("test_strm_rejection_keeps_completed_cloud_work_without_requeuing_it", "magnet")
+        download_requests_repo.update_download_request(request_id, status="completed", gy_status="completed", gy_target_dir="source")
         manager = OrganizeTaskManager()
         organizer = MagicMock()
         organizer.organize.return_value = ([], {"total": 1, "moved": 1, "failed": 0})
@@ -670,7 +671,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.settle_organize_task_run",
             wraps=settle_organize_task_run,
         ) as finish, patch(
-            "app.modules.organize_tasks.db.get_download_request", return_value=None
+            "app.repositories.download_requests.get_download_request", return_value=None
         ), patch(
             "app.modules.organize_tasks.Organizer.trigger_post_actions", side_effect=reject_handoff
         ), patch("app.modules.organize_tasks._publish_download_lifecycles", return_value=False), patch.object(
@@ -964,7 +965,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
             "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ), patch(
-            "app.modules.organize_tasks.db.list_protected_guangya_staging_ids",
+            "app.repositories.download_requests.list_protected_guangya_staging_ids",
             return_value={"active-download-staging"},
         ):
             result = manager.start(
@@ -1044,11 +1045,11 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         ), patch(
             "app.modules.organize_tasks.Organizer", return_value=organizer,
         ), patch(
-            "app.modules.organize_tasks.db.get_download_request", return_value=None,
+            "app.repositories.download_requests.get_download_request", return_value=None,
         ), patch(
             "app.modules.organize_tasks.db.add_task_run", return_value=101,
         ), patch(
-            "app.modules.organize_tasks.db.update_download_request",
+            "app.repositories.download_requests.update_download_request",
             side_effect=[RuntimeError("database unavailable"), None],
         ) as update_request, patch(
             "app.modules.organize_tasks.db.finish_task_run",
@@ -1120,8 +1121,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         manager._admission_lock.release()
 
     def test_per_file_failure_persists_partial_state(self):
-        request_id, _ = db.create_download_request("test_per_file_failure_persists_partial_state", "magnet")
-        db.update_download_request(request_id, status="completed", gy_status="completed", gy_target_dir="source")
+        request_id, _ = download_requests_repo.create_download_request("test_per_file_failure_persists_partial_state", "magnet")
+        download_requests_repo.update_download_request(request_id, status="completed", gy_status="completed", gy_target_dir="source")
         manager = OrganizeTaskManager()
         organizer = MagicMock()
         organizer.organize.return_value = ([], {
@@ -1135,7 +1136,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.settle_organize_task_run",
             wraps=settle_organize_task_run,
         ) as finish, patch(
-            "app.modules.organize_tasks.db.get_download_request", return_value=None
+            "app.repositories.download_requests.get_download_request", return_value=None
         ), patch(
             "app.modules.organize_tasks.Organizer.trigger_post_actions"
         ), patch(

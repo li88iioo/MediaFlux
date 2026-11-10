@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator, BinaryIO, Protocol, Sequence
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_path_mapping import assert_within
 from app.modules.local_storage import (
     LocalContentChanged,
@@ -305,7 +305,7 @@ class LocalMoveTransaction:
     def _record_step(self, index: int, action: str, source: Path, target: Path) -> None:
         if self.task_id is None:
             return
-        step_id = db.add_local_media_operation_step(
+        step_id = local_media_repo.add_local_media_operation_step(
             self.task_id,
             self.operation_token,
             index,
@@ -314,13 +314,13 @@ class LocalMoveTransaction:
             str(target),
             owner=self.owner,
         )
-        db.update_local_media_operation_step(step_id, "running")
+        local_media_repo.update_local_media_operation_step(step_id, "running")
         self._step_ids[index] = step_id
 
     def _finish_step(self, index: int, status: str, error: str = "") -> None:
         step_id = self._step_ids.get(index)
         if step_id is not None:
-            db.update_local_media_operation_step(step_id, status, error=error)
+            local_media_repo.update_local_media_operation_step(step_id, status, error=error)
 
     def _verify_target(
         self,

@@ -44,13 +44,13 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
     def test_dispatch_request_preserves_partial_submission_as_outcome_unknown(self):
         row = self._request_row()
         partial = self._partial_result()
-        with patch("app.database.get_download_request", return_value=row), patch(
-            "app.database.claim_download_request", return_value=True
+        with patch("app.repositories.download_requests.get_download_request", return_value=row), patch(
+            "app.repositories.download_requests.claim_download_request", return_value=True
         ), patch(
             "app.modules.download_dispatcher._submit_guangya", return_value=partial
         ), patch(
-            "app.database.finalize_download_request_submission", return_value="submitted"
-        ) as finalize, patch("app.database.add_download_log") as add_log:
+            "app.repositories.download_requests.finalize_download_request_submission", return_value="submitted"
+        ) as finalize, patch("app.repositories.download_requests.add_download_log") as add_log:
             result = dispatch_request(91, "guangya")
 
         self.assertFalse(result["ok"])
@@ -67,13 +67,13 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
     def test_dispatch_missing_target_preserves_partial_submission_as_outcome_unknown(self):
         row = self._request_row(92)
         partial = self._partial_result()
-        with patch("app.database.get_download_request", return_value=row), patch(
-            "app.database.claim_download_request_targets", return_value=["guangya"]
+        with patch("app.repositories.download_requests.get_download_request", return_value=row), patch(
+            "app.repositories.download_requests.claim_download_request_targets", return_value=["guangya"]
         ), patch(
             "app.modules.download_dispatcher._submit_guangya", return_value=partial
         ), patch(
-            "app.database.finalize_download_request_submission", return_value="submitted"
-        ) as finalize, patch("app.database.add_download_log") as add_log:
+            "app.repositories.download_requests.finalize_download_request_submission", return_value="submitted"
+        ) as finalize, patch("app.repositories.download_requests.add_download_log") as add_log:
             result = dispatch_missing_targets(92, "guangya")
 
         self.assertTrue(result["handled"])
@@ -118,7 +118,7 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
             "app.modules.download_dispatcher.submit_offline",
             side_effect=submit_side_effect,
         ), patch(
-            "app.database.bind_download_request_guangya_staging",
+            "app.repositories.download_requests.bind_download_request_guangya_staging",
             return_value=True,
         ) as bind:
             result = _submit_guangya(row)
@@ -147,7 +147,7 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
             "app.modules.download_dispatcher.submit_offline",
             side_effect=submit_side_effect,
         ), patch(
-            "app.database.bind_download_request_guangya_staging",
+            "app.repositories.download_requests.bind_download_request_guangya_staging",
             return_value=False,
         ):
             with self.assertRaisesRegex(RuntimeError, "请求已失效"):

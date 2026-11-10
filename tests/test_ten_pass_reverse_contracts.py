@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.indexers.models import IndexerMediaSearchRequest, IndexerSearchRequest
 from app.indexers.query_plan import build_site_queries
 from app.modules import download_dispatcher as dispatcher
@@ -45,7 +45,7 @@ class TenPassReverseContractTests(unittest.TestCase):
             )
             item = dispatcher.torrent_download_input("audit.torrent", payload)
             request_id = dispatcher.create_request(item, "", "audit")["id"]
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id,
                 status="downloading",
                 targets="both",
@@ -54,7 +54,7 @@ class TenPassReverseContractTests(unittest.TestCase):
                 gy_task_id="unknown-peer",
                 gy_staging_name="keep-stage",
             )
-            get_download_request_result = db.get_download_request(request_id)
+            get_download_request_result = download_requests_repo.get_download_request(request_id)
             assert get_download_request_result is not None
             before = dict(get_download_request_result)
             client = Mock()
@@ -88,7 +88,7 @@ class TenPassReverseContractTests(unittest.TestCase):
             )
             self.assertEqual(client.add_torrent_detailed.call_args.kwargs["urls"], "")
             client.close.assert_called_once()
-            get_download_request_result_2 = db.get_download_request(request_id)
+            get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
             assert get_download_request_result_2 is not None
             after = dict(get_download_request_result_2)
             for key in (

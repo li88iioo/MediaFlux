@@ -134,7 +134,7 @@ def _store(
 
 
 def _reserve_daily(limit: int) -> bool:
-    from app.database import (
+    from app.repositories.agent_web_search import (
         current_agent_web_search_usage_date,
         reserve_agent_web_search_credits,
     )

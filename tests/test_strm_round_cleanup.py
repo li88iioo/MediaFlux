@@ -49,7 +49,7 @@ class TestStrmRoundCleanup:
                 "stopped": False,
             },
         ) as empty_cleanup, patch(
-            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs", return_value=0,
+            "app.repositories.strm.cancel_retired_strm_metadata_jobs", return_value=0,
         ):
             aggregate, source_results, stopped = scheduler._run_full_sources(
                 sources,
@@ -114,7 +114,7 @@ class TestStrmRoundCleanup:
             "app.modules.scheduler.clean_empty_strm_dirs",
             return_value={"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False},
         ), patch(
-            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs", return_value=0,
+            "app.repositories.strm.cancel_retired_strm_metadata_jobs", return_value=0,
         ):
             scheduler._run_full_sources(
                 sources, base_url="http://media.invalid", strm_root="/tmp/strm",
@@ -158,7 +158,7 @@ class TestStrmRoundCleanup:
         ) as retire, patch(
             "app.modules.scheduler.clean_empty_strm_dirs",
         ) as empty_cleanup, patch(
-            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs",
+            "app.repositories.strm.cancel_retired_strm_metadata_jobs",
         ) as cancel_retired:
             aggregate, source_results, stopped = scheduler._run_full_sources(
                 sources, base_url="http://media.invalid", strm_root="/tmp/strm",
@@ -189,7 +189,7 @@ class TestStrmRoundCleanup:
         ), patch(
             "app.modules.scheduler.clean_retired_strm_sources",
         ) as retire, patch(
-            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs",
+            "app.repositories.strm.cancel_retired_strm_metadata_jobs",
         ) as cancel_retired, patch(
             "app.modules.scheduler.clean_empty_strm_dirs",
             return_value={

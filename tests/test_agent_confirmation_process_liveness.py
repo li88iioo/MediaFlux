@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import discovery as discovery_repo
 
 from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.model import ModelEvent, ModelEventType as M, ModelToolCall
@@ -147,7 +148,7 @@ def test_dead_foreground_allows_cold_management_and_original_write_exactly_once(
                 assert isinstance(cold_rig, trust_cases.TrustRig)
                 assert isinstance(original, trust_cases.TrustRig)
                 assert len(cold_rig.attempts) == 1 and original.attempts == []
-                assert db.get_media_watchlist("tmdb", "100", "tv") is not None
+                assert discovery_repo.get_media_watchlist("tmdb", "100", "tv") is not None
             replay_rig = type(original)(SQLiteKernelStore(secret_provider=lambda: _STORE_SECRET))
             replay = _session(replay_rig, ScriptedModel([]))
             duplicate = await collect(replay.confirm(owner=OWNER, session_id=SESSION, plan_id=managed_plan))

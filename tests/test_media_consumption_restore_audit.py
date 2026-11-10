@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules import backup
 from app.repositories import media_experience as repository
 from app.runtime_paths import RuntimePaths
@@ -34,7 +36,7 @@ class MediaConsumptionRestoreAuditTests(unittest.TestCase):
     @staticmethod
     def _seed():
         stamp = datetime.now().astimezone().strftime("%Y-%m-%d 12:00:00")
-        sid = db.add_media_subscription(
+        sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="444",
             tmdb_id="444",
@@ -44,7 +46,7 @@ class MediaConsumptionRestoreAuditTests(unittest.TestCase):
             download_target="guangya",
             sites=("mikan",),
         )
-        rss_id = db.add_rss_subscription("restored", "https://fixture.invalid/rss")
+        rss_id = rss_repo.add_rss_subscription("restored", "https://fixture.invalid/rss")
         current = repository.get_notification_rule(sid)
         assert current is not None
         repository.set_notification_rule(

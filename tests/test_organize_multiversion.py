@@ -874,7 +874,7 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
             }
 
         with patch(
-            "app.modules.organize.db.get_media_probe_cache_many",
+            "app.repositories.media_probe.get_media_probe_cache_many",
             side_effect=cached_profiles,
         ) as batch_cache, patch(
             "app.modules.organize.get_media_probe_cache",

@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.owner_routes import normalize_delivery_route
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
@@ -256,7 +257,7 @@ def _protected_organize_root_ids(rules: OrganizeRules) -> tuple[set[str], str]:
     protected = {"0", (rules.target_dir_id or "").strip()}
     protected.update((item.get("id") or "").strip() for item in sources)
     try:
-        protected.update(db.list_protected_guangya_staging_ids())
+        protected.update(download_requests_repo.list_protected_guangya_staging_ids())
     except Exception as exc:
         logger.warning(
             "读取活动下载隔离目录保护集失败 type=%s", type(exc).__name__
@@ -275,7 +276,7 @@ def _protected_source_ids(
         for source in sources
         if (source.get("id") or "").strip()
     }
-    protected.update(db.list_protected_guangya_staging_ids() if staging_ids is None else staging_ids)
+    protected.update(download_requests_repo.list_protected_guangya_staging_ids() if staging_ids is None else staging_ids)
     return protected
 
 
@@ -521,7 +522,7 @@ class OrganizeTaskManager:
             resolved_chat_id = (chat_id or "").strip()
             if not resolved_chat_id and request_ids:
                 try:
-                    request_row = db.get_download_request(request_ids[0])
+                    request_row = download_requests_repo.get_download_request(request_ids[0])
                 except Exception as exc:
                     # 通知上下文是可选信息；数据库短暂不可读不应在已取得跨进程
                     # 锁后中断任务并泄漏锁。后续状态写入仍按各自错误边界处理。
@@ -568,7 +569,7 @@ class OrganizeTaskManager:
                 }
             task_initialized = True
             for request_id in request_ids:
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     request_id, organize_started=1, organize_task_id=task_id,
                     organize_run_id=run_id or None, organize_status="running",
                     organize_attempts=0, organize_next_retry_at=None,
@@ -615,7 +616,7 @@ class OrganizeTaskManager:
             try:
                 for request_id in request_ids:
                     try:
-                        db.update_download_request(
+                        download_requests_repo.update_download_request(
                             request_id, organize_started=0, organize_status="queued",
                             organize_attempts=1, organize_next_retry_at=None,
                             organize_error="整理任务启动失败，可稍后重试",
@@ -866,7 +867,7 @@ class OrganizeTaskManager:
                     permanent_ids, config_error = _protected_organize_root_ids(rules)
                     if config_error:
                         return {"ok": False, "error": config_error}
-                    staging_ids = set(db.list_protected_guangya_staging_ids())
+                    staging_ids = set(download_requests_repo.list_protected_guangya_staging_ids())
                     # permanent辅助方法也含活动隔离根；专用收尾单独按请求解保护。
                     permanent_ids -= staging_ids
                     configured_sources, _ = normalize_organize_sources(config.get("GY_ORGANIZE_SOURCE_DIRS", ""))
@@ -1764,7 +1765,7 @@ class OrganizeTaskManager:
             if not _credential_snapshot_is_current(client, expected_credential_generation):
                 raise RuntimeError("光鸭登录凭据已变化，已拒绝执行整理")
             organizer = Organizer(client=client) if client is not None else Organizer()
-            protected_staging_ids = db.list_protected_guangya_staging_ids()
+            protected_staging_ids = download_requests_repo.list_protected_guangya_staging_ids()
             protected_source_ids = _protected_source_ids(sources, staging_ids=protected_staging_ids)
             worker_budget = resolve_organize_workers()
             source_worker_count = min(worker_budget, max(1, len(sources)))
@@ -1780,7 +1781,7 @@ class OrganizeTaskManager:
             request_sources: dict[int, str] = {}
             for request_id in download_request_ids or []:
                 try:
-                    row = db.get_download_request(request_id)
+                    row = download_requests_repo.get_download_request(request_id)
                     if row is not None:
                         request_sources[request_id] = str(row["gy_target_dir"] or "")
                         request_generations[request_id] = int(row["strm_generation"] or 0)
@@ -2387,7 +2388,7 @@ class OrganizeTaskManager:
             result["reasons"] = [error]
             return result
         # 永久来源/目标不可解保护；只有明确传入请求的隔离根交给共享服务核验。
-        staging_ids = set(db.list_protected_guangya_staging_ids())
+        staging_ids = set(download_requests_repo.list_protected_guangya_staging_ids())
         protected -= staging_ids
         configured, config_error = normalize_organize_sources(config.get("GY_ORGANIZE_SOURCE_DIRS", ""))
         if config_error:

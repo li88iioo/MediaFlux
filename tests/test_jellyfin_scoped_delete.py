@@ -12,6 +12,8 @@ from unittest.mock import Mock, patch
 
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import jellyfin_delete as deletion
 from app.modules import organize_rules, strm
@@ -350,27 +352,27 @@ class JellyfinScopedDeleteTests(IsolatedDatabaseTestCase):
         self.file("nfo", "Movie.nfo", "movie")
         local_nfo = root / "Movie.nfo"
         local_nfo.write_bytes(b"metadata")
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             "guangya-meta:source-a", "nfo", "etag-nfo", 100, "Movie.nfo",
             str(local_nfo), legacy.fingerprint(local_nfo.read_bytes()),
         )
-        db.enqueue_strm_metadata_jobs([
+        strm_repo.enqueue_strm_metadata_jobs([
             {"source_id": "source-a", "file_id": file_id, "filename": filename,
              "etag": "etag-" + file_id, "size": 100, "parent_id": "movie"}
             for file_id, filename in (("nfo", "Movie.nfo"), ("unrelated", "Other.nfo"))
         ])
-        job = db.claim_due_strm_metadata_jobs(owner="test-worker", limit=1)[0]
+        job = strm_repo.claim_due_strm_metadata_jobs(owner="test-worker", limit=1)[0]
         lease = {"expected_lease_generation": job["lease_generation"],
                  "expected_revision": job["revision"], "expected_owner": "test-worker"}
-        self.assertTrue(db.strm_metadata_job_is_current(job["id"], **lease))
+        self.assertTrue(strm_repo.strm_metadata_job_is_current(job["id"], **lease))
         result = self.execute(self.payload("movie", root, path))
         self.assert_success(result, {"movie-video", "nfo"})
         self.assertEqual(result["stats"]["strm_indexes_retired"], 2)
         self.assertEqual(result["stats"]["metadata_jobs_cancelled"], 1)
         self.assertEqual(list_strm_path_owners(str(local_nfo)), [])
         self.assertEqual(local_nfo.read_bytes(), b"metadata")
-        self.assertFalse(db.strm_metadata_job_is_current(job["id"], **lease))
-        self.assertEqual(db.settle_strm_metadata_job(job["id"], **lease), "stale")
+        self.assertFalse(strm_repo.strm_metadata_job_is_current(job["id"], **lease))
+        self.assertEqual(strm_repo.settle_strm_metadata_job(job["id"], **lease), "stale")
         with db.get_conn() as conn:
             states = {row["file_id"]: row["status"] for row in conn.execute("SELECT * FROM strm_metadata_queue")}
         self.assertEqual(states, {"nfo": "cancelled", "unrelated": "queued"})
@@ -1015,7 +1017,7 @@ class JellyfinScopedDeleteTests(IsolatedDatabaseTestCase):
                     source_id=source, status=status, organize_status="completed"
                 )
                 if status == "completed":
-                    db.update_download_request(
+                    download_requests_repo.update_download_request(
                         request_id, gy_staging_cleanup_status="completed"
                     )
                 result = self.execute(self.payload("movie", root, path))

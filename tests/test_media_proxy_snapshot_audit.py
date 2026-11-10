@@ -84,7 +84,7 @@ class MediaProxySnapshotAuditTests(IsolatedDatabaseTestCase):
             "SELECT COUNT(*) AS count FROM media_proxy_playback_records",
             self._record,
         ):
-            page = db.list_media_proxy_playback_records(instance_id=1)
+            page = repository.list_media_proxy_playback_records(instance_id=1)
         self.assertEqual(page["total"], 1)
         self.assertEqual([row["id"] for row in page["items"]], [first])
         self.assertEqual(page["items"][0]["internal_latency_ms"], 15)
@@ -96,7 +96,7 @@ class MediaProxySnapshotAuditTests(IsolatedDatabaseTestCase):
             "SELECT id,instance_id,media_item_id,media_source_id,media_name,guangya_file_id,",
             lambda: self._record(session="fixture-session"),
         ):
-            page = db.list_media_proxy_playback_sessions(instance_id=1)
+            page = repository.list_media_proxy_playback_sessions(instance_id=1)
         item = page["items"][0]
         self.assertEqual(item["request_count"], 1)
         self.assertEqual(item["redirect_request_count"], 1)
@@ -111,7 +111,7 @@ class MediaProxySnapshotAuditTests(IsolatedDatabaseTestCase):
             "SELECT COUNT(*) AS total,",
             lambda: self._record(status=504, stage="upstream_timeout"),
         ):
-            summary = db.get_media_proxy_playback_failure_summary(instance_id=1)
+            summary = repository.get_media_proxy_playback_failure_summary(instance_id=1)
         self.assertEqual(summary["total_recorded"], 1)
         self.assertEqual(summary["failed"], 1)
         self.assertEqual(

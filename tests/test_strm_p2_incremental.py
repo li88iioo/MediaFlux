@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.scheduler import STRMScheduler, _merge_organize_changes
 from app.modules.strm import (
@@ -108,7 +109,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             "app.modules.scheduler.clean_empty_strm_dirs",
             return_value={"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False},
         ), patch(
-            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs", return_value=0,
+            "app.repositories.strm.cancel_retired_strm_metadata_jobs", return_value=0,
         ), patch(
             "app.modules.scheduler.reconcile_historical_strm",
         ), patch(
@@ -231,7 +232,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             self.assertTrue(old_path.exists())
             metadata_path = old_path.with_suffix(".nfo")
             metadata_path.write_text("metadata", encoding="utf-8")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 metadata_key, large.file_id, "metadata-etag",
                 metadata_path.stat().st_size, "Movie.nfo", str(metadata_path),
                 self._fingerprint(metadata_path),
@@ -249,8 +250,8 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             )
 
             self.assertFalse(old_path.exists())
-            self.assertEqual(db.list_strm_index(source_key), [])
-            metadata_rows = db.list_strm_index(metadata_key)
+            self.assertEqual(strm_repo.list_strm_index(source_key), [])
+            metadata_rows = strm_repo.list_strm_index(metadata_key)
             self.assertEqual([row["file_id"] for row in metadata_rows], [large.file_id])
             self.assertTrue(metadata_path.exists())
 
@@ -291,7 +292,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(second["cleaned"], 0)
         self.assertFalse(first["fallback_required"])
         self.assertFalse(second["fallback_required"])
-        self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+        self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
         self.assertEqual(generated, [])
         self.assertEqual(client.list_calls, 0)
 
@@ -336,7 +337,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                     client=cast(GuangYaClient, client), skip_threshold_mb=10,
                 )
 
-            rows = db.list_strm_index(source_key)
+            rows = strm_repo.list_strm_index(source_key)
             self.assertTrue(old_path.exists())
             self.assertEqual(old_path.read_text(encoding="utf-8"), old_content)
 
@@ -544,7 +545,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             new_path = Path(root) / STRM_SUBDIR / "电影" / "Movie.strm"
             new_path.unlink()
             old_path.write_text(payload, encoding="utf-8")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, video.file_id, video.etag, video.size, video.name,
                 str(old_path), self._fingerprint(old_path),
             )
@@ -559,7 +560,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 }],
                 "http://media.invalid", root, client=cast(GuangYaClient, client),
             )
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             old_exists = old_path.exists()
             new_exists = new_path.exists()
             expected_new_path = str(new_path)
@@ -581,7 +582,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         client = _IncrementalClient({new.file_id: new})
         with tempfile.TemporaryDirectory() as root:
             old_path = generate_strm(old, "电影/示例", "http://media.invalid", root)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, old.file_id, old.etag, old.size, old.name,
                 str(old_path), self._fingerprint(old_path),
             )
@@ -601,7 +602,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 ],
                 "http://media.invalid", root, client=cast(GuangYaClient, client),
             )
-            rows = db.list_strm_index(source_key)
+            rows = strm_repo.list_strm_index(source_key)
             new_files = list((Path(root) / STRM_SUBDIR).rglob("New.strm"))
             old_exists = old_path.exists()
 
@@ -620,7 +621,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         client = _TreeClient({source_id: [renamed]})
         with tempfile.TemporaryDirectory() as root:
             old_path = generate_strm(old, "", "http://media.invalid", root)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, old.file_id, old.etag, old.size, old.name,
                 str(old_path), self._fingerprint(old_path),
             )
@@ -668,7 +669,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             target.write_text("old", encoding="utf-8")
             for file_id in ("old-a", "old-b"):
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key, file_id, "old", 1, "Movie.mkv", str(target),
                     f"sha256:{hashlib.sha256(b'old').hexdigest()}",
                 )
@@ -676,7 +677,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 source_id, "http://media.invalid", root,
                 client=cast(GuangYaClient, _TreeClient({source_id: [winner]})),
             )
-            rows = db.list_strm_index(source_key)
+            rows = strm_repo.list_strm_index(source_key)
 
         self.assertEqual(stats["generated"], 1)
         self.assertEqual([row["file_id"] for row in rows], ["winner"])
@@ -821,7 +822,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / STRM_SUBDIR / "Series" / "Missing.strm"
             target.parent.mkdir(parents=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{source_id}", "missing-video", "etag", 1,
                 "Missing.mkv", str(target),
                 f"sha256:{hashlib.sha256(b'formerly-owned').hexdigest()}",
@@ -833,13 +834,13 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 )
 
             result = self._run_full_schedule(root, source, scan)
-            entries = db.list_strm_refresh_entries()
+            entries = strm_repo.list_strm_refresh_entries()
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stats"]["cleaned"], 0)
         self.assertIn(str(target), result["stats"]["changed_strm_paths"])
         self.assertIn(str(target.parent), {entry["path"] for entry in entries})
-        self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+        self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
 
     def test_full_schedule_persists_retired_missing_path_to_refresh_outbox(self):
         active_id = f"active-{uuid.uuid4().hex}"
@@ -848,7 +849,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / STRM_SUBDIR / "Series" / "Retired.strm"
             target.parent.mkdir(parents=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{retired_id}", "retired-video", "etag", 1,
                 "Retired.mkv", str(target),
                 f"sha256:{hashlib.sha256(b'formerly-owned').hexdigest()}",
@@ -861,13 +862,13 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             result = self._run_full_schedule(
                 root, source, scan, process_retirements=True,
             )
-            entries = db.list_strm_refresh_entries()
+            entries = strm_repo.list_strm_refresh_entries()
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stats"]["cleaned"], 0)
         self.assertIn(str(target.resolve()), result["stats"]["changed_strm_paths"])
         self.assertIn(str(target.parent), {entry["path"] for entry in entries})
-        self.assertEqual(db.list_strm_index(f"guangya:{retired_id}"), [])
+        self.assertEqual(strm_repo.list_strm_index(f"guangya:{retired_id}"), [])
         self.assertFalse(any(
             row["source_id"] == retired_id for row in db.list_strm_retired_sources()
         ))
@@ -892,7 +893,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 root_prefix = str(Path(root) / STRM_SUBDIR)
                 self.assertFalse(any(
                     entry["path"].startswith(root_prefix)
-                    for entry in db.list_strm_refresh_entries()
+                    for entry in strm_repo.list_strm_refresh_entries()
                 ))
                 self.assertEqual(result["stats"]["changed_strm_paths"], [])
 
@@ -947,8 +948,8 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 source_id, "http://media.invalid", root,
                 client=cast(GuangYaClient, client), clean_invalid=False, scan_workers=1,
             )
-            row = db.list_strm_index(source_key)[0]
-            db.upsert_strm_index(
+            row = strm_repo.list_strm_index(source_key)[0]
+            strm_repo.upsert_strm_index(
                 source_key,
                 row["file_id"],
                 row["etag"],
@@ -958,8 +959,8 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 "",
             )
             with patch(
-                "app.modules.strm.db.upsert_strm_index_batch",
-                wraps=db.upsert_strm_index_batch,
+                "app.repositories.strm.upsert_strm_index_batch",
+                wraps=strm_repo.upsert_strm_index_batch,
             ) as batch, patch(
                 "app.modules.strm._content_fingerprint",
                 side_effect=AssertionError("稳定 STRM 不应再次读取计算指纹"),
@@ -969,7 +970,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                     client=cast(GuangYaClient, client), clean_invalid=False, scan_workers=1,
                 )
 
-            persisted = db.list_strm_index(source_key)[0]
+            persisted = strm_repo.list_strm_index(source_key)[0]
 
         self.assertEqual(first["generated"], 1)
         self.assertEqual(first["created"], 1)
@@ -993,14 +994,14 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         } for file in (first, second)]
         with tempfile.TemporaryDirectory() as root:
             target = generate_strm(first, "Film", "http://media.invalid", root)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, first.file_id, first.etag, first.size,
                 first.name, str(target), "",
             )
             stats = sync_strm_incremental(
                 source_id, changes, "http://media.invalid", root, client=cast(GuangYaClient, client),
             )
-            rows = db.list_strm_index(source_key)
+            rows = strm_repo.list_strm_index(source_key)
             fingerprint = self._fingerprint(target)
 
         self.assertEqual(stats["failed"], 0)
@@ -1030,14 +1031,14 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             for file in files:
                 target = generate_strm(file, "", "http://media.invalid", root)
                 expected[file.file_id] = self._fingerprint(target)
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key, file.file_id, file.etag, file.size,
                     file.name, str(target), "",
                 )
             with patch.object(
-                db, "upsert_strm_index_batch", wraps=db.upsert_strm_index_batch,
+                strm_repo, "upsert_strm_index_batch", wraps=strm_repo.upsert_strm_index_batch,
             ) as batch, patch.object(
-                db, "upsert_strm_index", side_effect=AssertionError("稳定文件不应逐条补写"),
+                strm_repo, "upsert_strm_index", side_effect=AssertionError("稳定文件不应逐条补写"),
             ), patch(
                 "app.modules.strm._content_fingerprint",
                 side_effect=AssertionError("稳定文件不应重复计算指纹"),
@@ -1051,7 +1052,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["generated"], 0)
         self.assertEqual(stats["skipped"], len(files))
         self.assertEqual(
-            {row["file_id"]: row["content_fingerprint"] for row in db.list_strm_index(source_key)},
+            {row["file_id"]: row["content_fingerprint"] for row in strm_repo.list_strm_index(source_key)},
             expected,
         )
         batch.assert_called_once()

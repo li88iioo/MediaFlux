@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import media_probe as media_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.media_probe import (
     ProbeBudget,
@@ -638,7 +639,7 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
                 ],
             )
 
-        deleted = db.prune_media_probe_cache(
+        deleted = media_probe_repo.prune_media_probe_cache(
             expired_before="2026-05-01 00:00:00",
             max_rows=1,
             batch_size=10,
@@ -655,12 +656,12 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
         self.assertEqual(remaining, ["new-live"])
 
     def test_batch_probe_cache_uses_one_connection_and_strict_versions(self):
-        db.upsert_media_probe_cache("one", "etag-1", 100, '{"resolution":"1080p"}')
-        db.upsert_media_probe_cache("two", "etag-2", 200, '{"resolution":"2160p"}')
+        media_probe_repo.upsert_media_probe_cache("one", "etag-1", 100, '{"resolution":"1080p"}')
+        media_probe_repo.upsert_media_probe_cache("two", "etag-2", 200, '{"resolution":"2160p"}')
         original_get_conn = db.get_conn
 
         with patch.object(db, "get_conn", wraps=original_get_conn) as get_conn:
-            cached = db.get_media_probe_cache_many([
+            cached = media_probe_repo.get_media_probe_cache_many([
                 ("one", "etag-1", 100),
                 ("two", "wrong-etag", 200),
                 ("missing", "etag", 1),
@@ -672,16 +673,16 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
 
     def test_cloud_probe_cache_reuses_success_by_content_fingerprint(self):
         payload = json.dumps({"resolution": "2160p", "video_codec": "H.265"})
-        db.upsert_media_probe_cache("old-id", "etag-shared", 4096, payload)
+        media_probe_repo.upsert_media_probe_cache("old-id", "etag-shared", 4096, payload)
 
         self.assertEqual(
-            db.get_media_probe_cache(
+            media_probe_repo.get_media_probe_cache(
                 "new-id", "etag-shared", 4096, allow_fingerprint_fallback=True,
             ),
             payload,
         )
         self.assertEqual(
-            db.get_media_probe_cache_many(
+            media_probe_repo.get_media_probe_cache_many(
                 [("new-id", "etag-shared", 4096)],
                 allow_fingerprint_fallback=True,
             ),
@@ -694,8 +695,8 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             ("etag-two", 8192): json.dumps({"resolution": "1080p"}),
         }
         for index, ((etag, size), payload) in enumerate(payloads.items(), start=1):
-            db.upsert_media_probe_cache(f"success-{index}", etag, size, payload)
-            db.upsert_media_probe_cache(
+            media_probe_repo.upsert_media_probe_cache(f"success-{index}", etag, size, payload)
+            media_probe_repo.upsert_media_probe_cache(
                 f"zz-failure-{index}", etag, size,
                 json.dumps({"_media_probe_cache": "failure"}),
             )
@@ -704,7 +705,7 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             (f"new-{index}", etag, size)
             for index, (etag, size) in enumerate(payloads, start=1)
         ]
-        cached = db.get_media_probe_cache_many(
+        cached = media_probe_repo.get_media_probe_cache_many(
             versions, allow_fingerprint_fallback=True,
         )
         self.assertEqual(
@@ -731,21 +732,21 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             "reason": "timeout",
         })
         success = json.dumps({"resolution": "2160p", "video_codec": "H.265"})
-        db.upsert_media_probe_cache("failed-id", "etag-shared", 4096, failure)
-        db.upsert_media_probe_cache("healthy-id", "etag-shared", 4096, success)
+        media_probe_repo.upsert_media_probe_cache("failed-id", "etag-shared", 4096, failure)
+        media_probe_repo.upsert_media_probe_cache("healthy-id", "etag-shared", 4096, success)
 
         self.assertEqual(
-            db.get_media_probe_cache(
+            media_probe_repo.get_media_probe_cache(
                 "failed-id", "etag-shared", 4096, allow_fingerprint_fallback=True,
             ),
             success,
         )
         self.assertEqual(
-            db.get_media_probe_cache("failed-id", "etag-shared", 4096),
+            media_probe_repo.get_media_probe_cache("failed-id", "etag-shared", 4096),
             failure,
         )
         self.assertEqual(
-            db.get_media_probe_cache_many(
+            media_probe_repo.get_media_probe_cache_many(
                 [("failed-id", "etag-shared", 4096)],
                 allow_fingerprint_fallback=True,
             ),
@@ -758,16 +759,16 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             "retry_after_epoch": 9999999999,
             "reason": "timeout",
         })
-        db.upsert_media_probe_cache("failed-id", "etag-failure-only", 8192, failure)
+        media_probe_repo.upsert_media_probe_cache("failed-id", "etag-failure-only", 8192, failure)
 
         self.assertEqual(
-            db.get_media_probe_cache(
+            media_probe_repo.get_media_probe_cache(
                 "new-id", "etag-failure-only", 8192, allow_fingerprint_fallback=True,
             ),
             "",
         )
         self.assertEqual(
-            db.get_media_probe_cache_many(
+            media_probe_repo.get_media_probe_cache_many(
                 [("new-id", "etag-failure-only", 8192)],
                 allow_fingerprint_fallback=True,
             ),
@@ -781,15 +782,15 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             "retry_after_epoch": 9999999999,
             "reason": "timeout",
         })
-        db.upsert_media_probe_cache("same-id", "same-etag", 4096, success)
+        media_probe_repo.upsert_media_probe_cache("same-id", "same-etag", 4096, success)
 
-        written = db.upsert_media_probe_failure_cache(
+        written = media_probe_repo.upsert_media_probe_failure_cache(
             "same-id", "same-etag", 4096, failure,
         )
 
         self.assertFalse(written)
         self.assertEqual(
-            db.get_media_probe_cache("same-id", "same-etag", 4096),
+            media_probe_repo.get_media_probe_cache("same-id", "same-etag", 4096),
             success,
         )
 
@@ -800,7 +801,7 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             media.write_bytes(b"media")
             with (
                 patch("app.modules.media_probe._run_ffprobe") as run,
-                patch.object(db, "upsert_media_probe_failure_cache") as write_failure,
+                patch.object(media_probe_repo, "upsert_media_probe_failure_cache") as write_failure,
             ):
                 profile = probe_local_media_profile(
                     media,
@@ -872,8 +873,8 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             "video_codec": "H.265",
             "audio_codec": "AAC",
         })
-        db.upsert_media_probe_cache("alpha", "etag-a", 100, payload)
-        db.upsert_media_probe_cache("beta", "etag-b", 200, payload)
+        media_probe_repo.upsert_media_probe_cache("alpha", "etag-a", 100, payload)
+        media_probe_repo.upsert_media_probe_cache("beta", "etag-b", 200, payload)
         client = _ProbeTreeClient(files)
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _ProbeScraper()))
         rules = OrganizeRules(
@@ -890,7 +891,7 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
         )
 
         with patch(
-            "app.modules.media_probe.db.get_media_probe_cache",
+            "app.repositories.media_probe.get_media_probe_cache",
             side_effect=AssertionError("unexpected per-file cache lookup"),
         ) as single_lookup:
             plans, stats = organizer.organize(
@@ -913,8 +914,8 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
             "video_codec": "H.265",
             "audio_codec": "AAC",
         })
-        db.upsert_media_probe_cache("one", "etag-1", 100, payload)
-        db.upsert_media_probe_cache("two", "etag-2", 200, payload)
+        media_probe_repo.upsert_media_probe_cache("one", "etag-1", 100, payload)
+        media_probe_repo.upsert_media_probe_cache("two", "etag-2", 200, payload)
         files = [
             GuangYaFile("one", "One.mkv", False, 100, "etag-1", "target"),
             GuangYaFile("two", "Two.mkv", False, 200, "etag-2", "target"),

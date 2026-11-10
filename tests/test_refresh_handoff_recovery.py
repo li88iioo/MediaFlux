@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app import database as db
+from app.repositories import strm as strm_repo
 from app.modules.local_media_service import LocalMediaService
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.modules.scheduler import STRMScheduler
@@ -66,31 +66,31 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
 
     def test_old_outbox_ack_cannot_delete_new_same_path_event(self):
         path = "/fixture/Film"
-        db.enqueue_strm_refresh_paths([path])
-        old = db.list_strm_refresh_entries()
-        db.enqueue_strm_refresh_paths([path])
-        self.assertEqual(db.acknowledge_strm_refresh_paths(old), 0)
-        self.assertEqual(db.count_strm_refresh_paths(), 1)
-        current = db.list_strm_refresh_entries()
+        strm_repo.enqueue_strm_refresh_paths([path])
+        old = strm_repo.list_strm_refresh_entries()
+        strm_repo.enqueue_strm_refresh_paths([path])
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(old), 0)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 1)
+        current = strm_repo.list_strm_refresh_entries()
         self.assertNotEqual(old[0]["event_token"], current[0]["event_token"])
-        self.assertEqual(db.acknowledge_strm_refresh_paths(current), 1)
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(current), 1)
 
     def test_old_outbox_ack_cannot_delete_reinserted_key_or_other_provider(self):
         path = "/fixture/Film"
-        db.enqueue_strm_refresh_paths([path], allow_emby=False)
-        old = db.list_strm_refresh_entries()
-        self.assertEqual(db.acknowledge_strm_refresh_paths(old), 1)
-        db.enqueue_strm_refresh_paths([path], allow_emby=False)
-        db.enqueue_strm_refresh_paths([path], allow_emby=True)
-        self.assertEqual(db.acknowledge_strm_refresh_paths(old), 0)
-        self.assertEqual(db.count_strm_refresh_paths(), 2)
-        current = db.list_strm_refresh_entries()
-        self.assertEqual(db.acknowledge_strm_refresh_paths([current[0]]), 1)
-        self.assertEqual(db.count_strm_refresh_paths(), 1)
+        strm_repo.enqueue_strm_refresh_paths([path], allow_emby=False)
+        old = strm_repo.list_strm_refresh_entries()
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(old), 1)
+        strm_repo.enqueue_strm_refresh_paths([path], allow_emby=False)
+        strm_repo.enqueue_strm_refresh_paths([path], allow_emby=True)
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(old), 0)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 2)
+        current = strm_repo.list_strm_refresh_entries()
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths([current[0]]), 1)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 1)
 
     def test_old_worker_handoff_cannot_ack_a_new_failed_scheduler_handoff(self):
         path = f"/fixture/{STRM_SUBDIR}/Film/Film.strm"
-        db.enqueue_strm_refresh_paths([str(Path(path).parent)])
+        strm_repo.enqueue_strm_refresh_paths([str(Path(path).parent)])
         calls = []
 
         def handoff(paths, **kwargs):
@@ -108,10 +108,10 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
             stack.enter_context(patch("app.modules.media_refresh_coordinator.enqueue_media_refresh_paths", side_effect=handoff))
             STRMMetadataWorker()._flush_media_refresh(force=False)
         self.assertEqual(len(calls), 2)
-        self.assertEqual(db.count_strm_refresh_paths(), 1)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 1)
         with patch("app.modules.media_refresh_coordinator.enqueue_media_refresh_paths", return_value={"Jellyfin": "queued"}):
             STRMMetadataWorker()._flush_media_refresh(force=True)
-        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
 
     def test_binding_constraints_survive_queue_and_fail_closed(self):
         cases = (
@@ -154,10 +154,10 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(media_refresh_queue_status()["paths"], 3)
 
     def test_ack_requires_token_and_supports_large_batches(self):
-        entries = db.enqueue_strm_refresh_paths([f"/fixture/{i}" for i in range(1201)])
+        entries = strm_repo.enqueue_strm_refresh_paths([f"/fixture/{i}" for i in range(1201)])
         for invalid in (["/fixture/0"], [{"path": "/fixture/0", "allow_emby": True}],
                         [entries[0], {"path": "bad", "event_token": ""}]):
             with self.assertRaises(ValueError):
-                db.acknowledge_strm_refresh_paths(cast(list[dict[str, Any]], invalid))
-        self.assertEqual(db.count_strm_refresh_paths(), 1201)
-        self.assertEqual(db.acknowledge_strm_refresh_paths(entries), 1201)
+                strm_repo.acknowledge_strm_refresh_paths(cast(list[dict[str, Any]], invalid))
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 1201)
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(entries), 1201)

@@ -113,7 +113,7 @@ def _state_for(fingerprint: str, config: AIRecognitionGovernanceConfig) -> _Prov
 
 
 def _reserve_daily_request(limit: int) -> bool:
-    from app.database import (
+    from app.repositories.agent_web_search import (
         current_agent_web_search_usage_date,
         reserve_agent_web_search_credits,
     )

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaServiceError
 from app.clients.base import close_media_server_client
 from app.clients.emby import EmbyClient
@@ -84,10 +85,10 @@ def bound_local_task_library(task: Any) -> dict[str, Any]:
         )
     items = [
         item
-        for item in db.list_local_media_task_items(task.id, owner="admin")
+        for item in local_media_repo.list_local_media_task_items(task.id, owner="admin")
         if str(item["role"] or "") == "video" and str(item["target_path"] or "").strip()
     ]
-    targets = db.list_local_library_targets(task.source_id, owner="admin")
+    targets = local_media_repo.list_local_library_targets(task.source_id, owner="admin")
     if not items or not targets:
         raise LocalMediaServiceError(
             "任务没有可验证的已绑定媒体库目标"

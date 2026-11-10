@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
 
@@ -44,20 +45,20 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
             current_parent_id="1", current_name="Anime.E01.mkv",
             media_type="tv", title="Anime", error="目标已存在",
         )
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name="qB 动漫", qb_profile="", qb_path_prefix="",
             local_root="/downloads/anime", owner="admin",
         )
-        local_id = db.create_local_media_task(
+        local_id = local_media_repo.create_local_media_task(
             source_id, "", "/downloads/anime/Local.Show.S01E01.mkv",
             owner="admin", trigger="manual",
         )
-        db.add_local_media_task_item(
+        local_media_repo.add_local_media_task_item(
             local_id, "/downloads/anime/Local.Show.S01E01.mkv",
             "/media/anime/Local Show/Season 01/Local.Show.S01E01.mkv",
             role="video", owner="admin",
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             local_id, owner="admin", status="failed", title="Local Show",
             media_type="tv", tmdb_id="200", error="目标目录不可写",
         )

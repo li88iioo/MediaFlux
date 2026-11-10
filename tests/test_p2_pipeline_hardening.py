@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import OrganizeTaskManager
@@ -74,7 +76,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             payload = b"http://localhost/playgy/file-1/etag/1/Movie.mkv"
             target.write_bytes(payload)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{source_id}", "file-1", "etag", 1, "Movie.mkv",
                 str(target), self._fingerprint(payload),
             )
@@ -84,7 +86,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
 
             self.assertEqual(result["cleaned"], 1)
             self.assertFalse(target.exists())
-            self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+            self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
             self.assertFalse(any(row["source_id"] == source_id for row in db.list_strm_retired_sources()))
 
     def test_invalid_cleanup_reports_missing_managed_path_idempotently(self) -> None:
@@ -93,7 +95,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / STRM_SUBDIR / "Series" / "Missing.strm"
             target.parent.mkdir(parents=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "missing-video", "etag", 1, "Missing.mkv",
                 str(target), self._fingerprint(b"formerly-owned"),
             )
@@ -109,7 +111,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         self.assertEqual(first["removed_paths"], [str(target)])
         self.assertEqual(second["cleaned"], 0)
         self.assertEqual(second["removed_paths"], [])
-        self.assertEqual(db.list_strm_index(source_key), [])
+        self.assertEqual(strm_repo.list_strm_index(source_key), [])
 
     def test_invalid_cleanup_does_not_report_shared_active_or_external_path(self) -> None:
         source_id = f"shared-stale-{uuid.uuid4().hex}"
@@ -117,10 +119,10 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
             shared = Path(root) / STRM_SUBDIR / "Series" / "Shared.strm"
             shared.parent.mkdir(parents=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "stale", "etag", 1, "Shared.mkv", str(shared), "",
             )
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "active", "etag", 1, "Shared.mkv", str(shared), "",
             )
             active = clean_invalid_strm(
@@ -128,13 +130,13 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(active["removed_paths"], [])
             self.assertEqual(
-                [row["file_id"] for row in db.list_strm_index(source_key)], ["active"],
+                [row["file_id"] for row in strm_repo.list_strm_index(source_key)], ["active"],
             )
 
             external_key = f"guangya:{source_id}-external"
             external = Path(outside) / "Outside.strm"
             external.parent.mkdir(parents=True, exist_ok=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 external_key, "outside", "etag", 1, "Outside.mkv", str(external), "",
             )
             blocked = clean_invalid_strm(
@@ -143,7 +145,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(blocked["skipped"])
         self.assertEqual(blocked["removed_paths"], [])
-        self.assertEqual(len(db.list_strm_index(external_key)), 1)
+        self.assertEqual(len(strm_repo.list_strm_index(external_key)), 1)
 
     def test_retired_source_reports_missing_managed_path_idempotently(self) -> None:
         source_id = f"retired-missing-{uuid.uuid4().hex}"
@@ -151,7 +153,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / STRM_SUBDIR / "Series" / "Missing.strm"
             target.parent.mkdir(parents=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "missing-video", "etag", 1, "Missing.mkv",
                 str(target), self._fingerprint(b"formerly-owned"),
             )
@@ -164,7 +166,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         self.assertGreaterEqual(first["index_cleaned"], 1)
         self.assertEqual(first["removed_paths"], [str(target.resolve())])
         self.assertEqual(second["removed_paths"], [])
-        self.assertEqual(db.list_strm_index(source_key), [])
+        self.assertEqual(strm_repo.list_strm_index(source_key), [])
         self.assertFalse(any(
             row["source_id"] == source_id for row in db.list_strm_retired_sources()
         ))
@@ -175,11 +177,11 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
             shared = Path(root) / STRM_SUBDIR / "Shared.strm"
             shared.parent.mkdir(parents=True)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{retired_id}", "retired-file", "etag", 1,
                 "Shared.mkv", str(shared), "",
             )
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{active_id}", "active-file", "etag", 1,
                 "Shared.mkv", str(shared), "",
             )
@@ -190,7 +192,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
 
             external_id = f"retired-external-{uuid.uuid4().hex}"
             external = Path(outside) / "Outside.strm"
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{external_id}", "external-file", "etag", 1,
                 "Outside.mkv", str(external), "",
             )
@@ -198,11 +200,11 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             external_result = clean_retired_strm_sources(set(), clean_empty_dirs=False)
 
         self.assertEqual(shared_result["removed_paths"], [])
-        self.assertEqual(db.list_strm_index(f"guangya:{active_id}")[0]["file_id"], "active-file")
+        self.assertEqual(strm_repo.list_strm_index(f"guangya:{active_id}")[0]["file_id"], "active-file")
         self.assertEqual(external_result["removed_paths"], [])
         self.assertEqual(external_result["blocked"], 1)
-        self.assertEqual(len(db.list_strm_index(f"guangya:{external_id}")), 1)
-        db.delete_strm_index_ids(f"guangya:{external_id}", ["external-file"])
+        self.assertEqual(len(strm_repo.list_strm_index(f"guangya:{external_id}")), 1)
+        strm_repo.delete_strm_index_ids(f"guangya:{external_id}", ["external-file"])
         db.delete_strm_retired_source(external_id)
 
     def test_retired_source_preserves_locally_modified_metadata(self) -> None:
@@ -212,7 +214,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             original = b"mediaflux-owned"
             target.write_bytes(b"user-modified!")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya-meta:{source_id}", "poster-1", "etag", len(original),
                 "poster.jpg", str(target), self._fingerprint(original),
             )
@@ -223,9 +225,9 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertEqual(result["cleaned"], 0)
             self.assertEqual(result["blocked"], 1)
             self.assertTrue(target.exists())
-            self.assertEqual(len(db.list_strm_index(f"guangya-meta:{source_id}")), 1)
+            self.assertEqual(len(strm_repo.list_strm_index(f"guangya-meta:{source_id}")), 1)
             self.assertTrue(any(row["source_id"] == source_id for row in db.list_strm_retired_sources()))
-            db.delete_strm_index_ids(f"guangya-meta:{source_id}", ["poster-1"])
+            strm_repo.delete_strm_index_ids(f"guangya-meta:{source_id}", ["poster-1"])
             db.delete_strm_retired_source(source_id)
 
     def test_sync_repairs_locally_modified_indexed_strm(self) -> None:
@@ -244,7 +246,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
                 source_id, "http://localhost:1258", root,
                 client=cast(GuangYaClient, _TreeClient({source_id: [video]})),
             )
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             expected = build_play_url(
                 "http://localhost:1258", video.file_id, video.etag,
                 video.size, video.name,
@@ -274,7 +276,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertEqual(stats["generated"], 0)
             self.assertEqual(stats["failed"], 1)
             self.assertEqual(target.read_text(encoding="utf-8"), "user-owned")
-            self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+            self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
 
     def test_full_sync_preserves_unindexed_tgto_strm_and_local_sidecars(self) -> None:
         source_id = f"tgto-{uuid.uuid4().hex}"
@@ -306,8 +308,8 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
                 "<movie><title>Movie</title></movie>",
             )
             self.assertEqual(poster_target.read_bytes(), b"tgto-poster")
-            self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
-            self.assertEqual(db.list_strm_index(f"guangya-meta:{source_id}"), [])
+            self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
+            self.assertEqual(strm_repo.list_strm_index(f"guangya-meta:{source_id}"), [])
 
     def test_incremental_rename_preserves_modified_old_path_and_index(self) -> None:
         from app.modules.strm import sync_strm_incremental
@@ -323,7 +325,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
 
         with tempfile.TemporaryDirectory() as root:
             old_path = generate_strm(original, "电影/Test", "http://localhost:1258", root)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, original.file_id, original.etag, original.size, original.name,
                 str(old_path), self._fingerprint(old_path.read_bytes()),
             )
@@ -336,7 +338,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
                     "parent_id": renamed.parent_id,
                 }], "http://localhost:1258", root, client=cast(GuangYaClient, _IncrementalClient()),
             )
-            rows = db.list_strm_index(source_key)
+            rows = strm_repo.list_strm_index(source_key)
             new_paths = list((Path(root) / STRM_SUBDIR).rglob("New.strm"))
 
             self.assertTrue(stats["fallback_required"])
@@ -352,7 +354,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             original = b"mediaflux-owned"
             target.write_bytes(original)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "stale", "etag", len(original), "stale.mkv",
                 str(target), self._fingerprint(original),
             )
@@ -363,7 +365,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertTrue(result["skipped"])
             self.assertEqual(result["ownership_blocked"], 1)
             self.assertTrue(target.exists())
-            self.assertEqual(len(db.list_strm_index(source_key)), 1)
+            self.assertEqual(len(strm_repo.list_strm_index(source_key)), 1)
 
     def test_full_metadata_sync_preserves_locally_modified_target(self) -> None:
         source_id = f"metadata-modified-{uuid.uuid4().hex}"
@@ -374,7 +376,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             original = b"original"
             target.write_bytes(original)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, metadata.file_id, "etag-1", len(original), metadata.name,
                 str(target), self._fingerprint(original),
             )
@@ -384,7 +386,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
                 source_id, "http://localhost:1258", root,
                 client=cast(GuangYaClient, _TreeClient({source_id: [metadata]})), metadata_exts={"jpg"},
             )
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
 
             self.assertEqual(stats["metadata_generated"], 0)
             self.assertEqual(stats["metadata_failed"], 1)
@@ -407,7 +409,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["stop_stage"], "scan")
         self.assertEqual(stats["generated"], 0)
         cleanup.assert_not_called()
-        self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+        self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
 
 
 class P2SchedulerCancellationTests(IsolatedDatabaseTestCase):
@@ -467,7 +469,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
         ), patch("app.modules.organize_tasks.Organizer"), patch(
             "app.modules.organize_tasks.db.add_task_run", return_value=77
         ), patch(
-            "app.modules.organize_tasks.db.update_download_request"
+            "app.repositories.download_requests.update_download_request"
         ) as update, patch(
             "app.modules.organize_tasks.threading.Thread", Thread
         ):
@@ -485,7 +487,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
     def test_queued_strm_request_is_persisted_before_waiter_start(self) -> None:
         scheduler = STRMScheduler()
         observed = {"started": False}
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"strm-before-waiter-{uuid.uuid4().hex}", "http", title="排队测试",
         )
 
@@ -499,7 +501,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
             def start(self):
                 observed["started"] = True
                 # 检查真实SQLite提交，而不是绑定旧的无围栏更新函数。
-                get_download_request_result = db.get_download_request(request_id)
+                get_download_request_result = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result is not None
                 assert get_download_request_result["strm_status"] == "queued"
 
@@ -511,10 +513,10 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
         self.assertTrue(observed["started"])
 
     def test_init_db_marks_interrupted_pipeline_states_for_review(self) -> None:
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"recovery-{uuid.uuid4().hex}", "http", title="恢复测试"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, organize_started=1, organize_status="running",
             strm_status="queued",
         )
@@ -536,7 +538,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
 
         db.init_db()
 
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["organize_started"], -1)
         self.assertEqual(row["organize_status"], "failed")
@@ -561,7 +563,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
 
     def test_pending_strm_requests_are_closed_when_scheduler_stops(self) -> None:
         scheduler = STRMScheduler()
-        request_ids = [db.create_download_request(
+        request_ids = [download_requests_repo.create_download_request(
             f"strm-stop-{uuid.uuid4().hex}", "http", title="关停测试",
         )[0] for _ in range(2)]
         scheduler._pending_organize_options = {"download_request_ids": request_ids}
@@ -569,7 +571,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
         scheduler._wait_and_run_pending_organize()
 
         self.assertEqual(
-            [assert_present(db.get_download_request(request_id))["strm_status"] for request_id in request_ids],
+            [assert_present(download_requests_repo.get_download_request(request_id))["strm_status"] for request_id in request_ids],
             ["stopped", "stopped"],
         )
 
@@ -582,7 +584,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
                 "http://localhost/playgy/file-legacy/etag/1/Legacy.mkv",
                 encoding="utf-8",
             )
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya:{source_id}", "file-legacy", "etag", 1,
                 "Legacy.mkv", str(target), "",
             )
@@ -603,7 +605,7 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
                 payload = f"owned-{index}".encode()
                 target = base / f"{index}.jpg"
                 target.write_bytes(payload)
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     f"guangya-meta:{source_id}", f"file-{index}", "etag",
                     len(payload), target.name, str(target),
                     f"sha256:{hashlib.sha256(payload).hexdigest()}",
@@ -652,7 +654,7 @@ class P2MetadataCancellationTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             old_payload = b"old-poster"
             target.write_bytes(old_payload)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 f"guangya-meta:{source_id}", remote.file_id, "old-etag",
                 len(old_payload), remote.name, str(target),
                 f"sha256:{hashlib.sha256(old_payload).hexdigest()}",
@@ -671,11 +673,11 @@ class P2MetadataCancellationTests(IsolatedDatabaseTestCase):
             self.assertEqual(stats["metadata_queued"], 1)
             self.assertEqual(stats["metadata_failed"], 0)
             self.assertEqual(target.read_bytes(), old_payload)
-            row = db.list_strm_index(f"guangya-meta:{source_id}")[0]
+            row = strm_repo.list_strm_index(f"guangya-meta:{source_id}")[0]
             self.assertEqual(row["etag"], "old-etag")
             self.assertEqual(db.list_strm_failures(status="open"), [])
             self.assertEqual(
-                db.list_strm_metadata_queue()[0]["status"], "retry_wait"
+                strm_repo.list_strm_metadata_queue()[0]["status"], "retry_wait"
             )
 
 
@@ -716,7 +718,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
             self.assertEqual(stats["generated"], 0)
             self.assertEqual(stats["failed"], 1)
             self.assertEqual(target.read_text(encoding="utf-8"), "user-during-sync")
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             self.assertEqual(row["etag"], "etag-1")
 
     def test_external_write_after_install_is_not_overwritten_by_rollback(self) -> None:
@@ -736,7 +738,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
                 raise RuntimeError("index unavailable")
 
             with patch(
-                "app.modules.strm.db.upsert_strm_index",
+                "app.repositories.strm.upsert_strm_index",
                 side_effect=fail_after_external_write,
             ):
                 stats = sync_strm(
@@ -747,7 +749,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
             self.assertEqual(stats["generated"], 0)
             self.assertEqual(stats["failed"], 1)
             self.assertEqual(target.read_text(encoding="utf-8"), "user-after-install")
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             self.assertEqual(row["etag"], "etag-1")
 
     def test_full_metadata_changed_after_backup_is_not_overwritten_by_rollback(self) -> None:
@@ -780,7 +782,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             original = b"old-poster"
             target.write_bytes(original)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, remote.file_id, "etag-1", len(original), remote.name,
                 str(target), self._fingerprint(original),
             )
@@ -812,10 +814,10 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
             self.assertEqual(stats["metadata_queued"], 1)
             self.assertEqual(stats["metadata_failed"], 0)
             self.assertEqual(target.read_bytes(), b"user-during-download")
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             self.assertEqual(row["etag"], "etag-1")
             self.assertEqual(
-                db.list_strm_metadata_queue()[0]["status"], "retry_wait"
+                strm_repo.list_strm_metadata_queue()[0]["status"], "retry_wait"
             )
             failures = db.list_strm_failures(
                 status="open", source_id=source_id, action="metadata"
@@ -832,7 +834,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
             target.parent.mkdir(parents=True)
             owned = b"mediaflux-owned"
             target.write_bytes(owned)
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "stale", "etag", len(owned), "stale.mkv",
                 str(target), self._fingerprint(owned),
             )
@@ -854,4 +856,4 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
 
             self.assertTrue(result["skipped"])
             self.assertEqual(target.read_bytes(), b"user-before-delete")
-            self.assertEqual(len(db.list_strm_index(source_key)), 1)
+            self.assertEqual(len(strm_repo.list_strm_index(source_key)), 1)

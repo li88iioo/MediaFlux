@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizeRules, Organizer, _OrganizeAuditWriteError
 from app.modules.scraper import TMDBScraper
@@ -313,7 +314,7 @@ class OrganizeP0PerformanceTests(IsolatedDatabaseTestCase):
             GuangYaFile("video-2", "Example.S01E02.mkv", False, 200, "etag-2", source_id),
         ]
         client = _TreeClient(source_id, files)
-        original = db.list_strm_index
+        original = strm_repo.list_strm_index
         source_key = f"guangya:{source_id}"
         calls: list[str] = []
 
@@ -322,7 +323,7 @@ class OrganizeP0PerformanceTests(IsolatedDatabaseTestCase):
             return original(source)
 
         with tempfile.TemporaryDirectory() as root, patch.object(
-            db, "list_strm_index", side_effect=counted
+            strm_repo, "list_strm_index", side_effect=counted
         ):
             stats = sync_strm(
                 source_id, "http://example", root,
@@ -371,19 +372,19 @@ if __name__ == "__main__":
 class StrmBatchPerformanceTests(IsolatedDatabaseTestCase):
     def test_conflicting_index_replacement_uses_one_database_transaction(self):
         source_key = "guangya:transaction-source"
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             source_key, "old", "old-etag", 1, "Movie.mkv", "/tmp/old.strm"
         )
         original_get_conn = db.get_conn
 
         with patch.object(db, "get_conn", wraps=original_get_conn) as get_conn:
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "new", "new-etag", 2, "Movie.mkv", "/tmp/new.strm",
                 conflicting_file_ids=("old",),
             )
 
         self.assertEqual(get_conn.call_count, 1)
-        rows = db.list_strm_index(source_key)
+        rows = strm_repo.list_strm_index(source_key)
         self.assertEqual([row["file_id"] for row in rows], ["new"])
 
     def test_full_sync_resolves_failure_ledger_in_one_batch(self):
@@ -520,7 +521,7 @@ class StrmBatchPerformanceTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root:
             first_path = Path(root) / "first.strm"
             first_path.write_text("managed", encoding="utf-8")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, first.file_id, first.etag, first.size,
                 first.name, str(first_path), "",
             )
@@ -534,17 +535,17 @@ class StrmBatchPerformanceTests(IsolatedDatabaseTestCase):
             }
             second_path = Path(root) / "second.strm"
             second_path.write_text("moved", encoding="utf-8")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, second.file_id, second.etag, second.size, second.name,
                 str(second_path), f"sha256:{hashlib.sha256(second_path.read_bytes()).hexdigest()}",
             )
-            before = dict(db.list_strm_index(source_key)[0])
+            before = dict(strm_repo.list_strm_index(source_key)[0])
             with patch.object(
-                db, "upsert_strm_index_batch", wraps=db.upsert_strm_index_batch,
+                strm_repo, "upsert_strm_index_batch", wraps=strm_repo.upsert_strm_index_batch,
             ) as batch:
                 _flush_fingerprint_backfills(source_key, [stale_backfill], {second.file_id: before})
 
-        self.assertEqual(dict(db.list_strm_index(source_key)[0]), before)
+        self.assertEqual(dict(strm_repo.list_strm_index(source_key)[0]), before)
         batch.assert_not_called()
 
     def test_strm_stage_timings_are_exposed(self):

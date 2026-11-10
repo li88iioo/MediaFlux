@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.qbittorrent import TorrentAddResult
 from app.indexers import downloads
 from app.modules import download_dispatcher as dispatcher
@@ -24,7 +25,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
 
     def request(self):
         self.serial += 1
-        request_id, _ = db.create_download_request('single-track-'+str(self.serial), 'magnet', title='统一分发', source_value='magnet:?xt=urn:btih:'+'a'*40)
+        request_id, _ = download_requests_repo.create_download_request('single-track-'+str(self.serial), 'magnet', title='统一分发', source_value='magnet:?xt=urn:btih:'+'a'*40)
         return request_id
 
     def test_url_preview_is_read_only_and_changed_identity_never_dispatches(self):
@@ -66,7 +67,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         self.assertTrue(duplicate['duplicate'])
         self.assertEqual(duplicate['request_id'], first['request_id'])
         self.assertNotIn('token=secret', json.dumps(first))
-        row = db.get_download_request(first['request_id'])
+        row = download_requests_repo.get_download_request(first['request_id'])
         assert row is not None
         self.assertEqual((row['qb_status'], row['gy_status']), ('submitted', 'failed'))
 
@@ -83,13 +84,13 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                  patch.object(dispatcher, '_submit_qb', return_value={'ok': True}) as qb:
                 url = f'magnet:?xt=urn:btih:{serial:040x}'
                 old = dispatcher.create_request(dispatcher.normalize_download_url(url), '', '', origin='agent')
-                db.update_download_request(old['id'], targets='qb', status=status, qb_status=status)
+                download_requests_repo.update_download_request(old['id'], targets='qb', status=status, qb_status=status)
                 db.init_db()
                 fresh = downloads.submit_download_url(url, 'qb', origin='agent')
                 duplicate = downloads.submit_download_url(url, 'qb', origin='agent')
                 self.assertTrue(fresh['created'])
                 self.assertNotEqual(fresh['request_id'], old['id'])
-                prior = db.get_download_request(old['id'])
+                prior = download_requests_repo.get_download_request(old['id'])
                 assert prior is not None
                 self.assertEqual(prior['status'], status)
                 self.assertTrue(duplicate['duplicate'])
@@ -106,7 +107,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
             client.return_value.logged_in = True
             result = downloads.submit_download_url(url, 'both', origin='agent')
         self.assertEqual(result['status'], 'submitted')
-        row = db.get_download_request(result['request_id'])
+        row = download_requests_repo.get_download_request(result['request_id'])
         assert row is not None
         self.assertEqual((row['kind'], row['source_value'], row['torrent_data']), ('http', url, None))
         qb.assert_called_once()
@@ -136,13 +137,13 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                 for additional in (False, True):
                     request_id = self.request()
                     if additional:
-                        db.update_download_request(request_id, targets='qb', status='downloading', qb_status='completed', qb_task_id='kept-qb')
+                        download_requests_repo.update_download_request(request_id, targets='qb', status='downloading', qb_status='completed', qb_task_id='kept-qb')
                     operation = dispatcher.dispatch_missing_targets if additional else dispatcher.dispatch_request
                     with patch.object(dispatcher, '_submit_guangya', return_value=result) as gy, patch.object(dispatcher, '_submit_qb') as qb:
                         outcome = operation(request_id, 'guangya', gy_target_dir='selected', gy_target_name='selected-name', log_path='[magnet]')
                     gy.assert_called_once()
                     qb.assert_not_called()
-                    row = db.get_download_request(request_id)
+                    row = download_requests_repo.get_download_request(request_id)
                     # 用真实仓储业务结果补足旧 Mock-only 的 status 参数断言。
                     expected_status = (
                         'submitted' if result.get('ok') or result.get('partial_success')
@@ -160,7 +161,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                         self.assertEqual((row['qb_status'], row['qb_task_id']), ('completed', 'kept-qb'))
                     else:
                         self.assertNotIn('handled', outcome)
-                    logs = db.list_download_logs()
+                    logs = download_requests_repo.list_download_logs()
                     own = [log for log in logs if log['request_id'] == request_id]
                     self.assertEqual(len(own), 1)
                     self.assertEqual(own[0]['path'], '[magnet]')
@@ -187,16 +188,16 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
             with self.subTest(additional=additional):
                 request_id = self.request()
                 if additional:
-                    db.update_download_request(request_id, targets='qb', status='downloading', qb_status='completed')
+                    download_requests_repo.update_download_request(request_id, targets='qb', status='downloading', qb_status='completed')
                 def submit(_row, **_kwargs):
-                    db.update_download_request(request_id, status='manual_review', gy_status='manual_review')
+                    download_requests_repo.update_download_request(request_id, status='manual_review', gy_status='manual_review')
                     return {'ok': True, 'task_id': 'external-task'}
                 operation = dispatcher.dispatch_missing_targets if additional else dispatcher.dispatch_request
                 with patch.object(dispatcher, '_submit_guangya', side_effect=submit):
                     result = operation(request_id, 'guangya')
                 self.assertTrue(result['stale_result'])
                 self.assertTrue(result['outcome_unknown'])
-                get_download_request_result = db.get_download_request(request_id)
+                get_download_request_result = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result is not None
                 self.assertEqual(get_download_request_result['gy_status'], 'manual_review')
 
@@ -209,7 +210,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         gy.assert_called_once()
         self.assertEqual(result['succeeded'], ['guangya'])
         self.assertEqual(set(result['results']), {'guangya'})
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row['targets'], row['qb_status'], row['gy_status']), ('both','submitted','submitted'))
 
@@ -232,13 +233,13 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                     item = dispatcher.normalize_download_url(f'magnet:?xt=urn:btih:{self.serial:040x}')
                     request_id = dispatcher.create_request(item, '', 'route-test')['id']
                     if path in {'missing', 'retry_in_place'}:
-                        db.update_download_request(
+                        download_requests_repo.update_download_request(
                             request_id, status='downloading', targets='both',
                             qb_status='failed' if path == 'retry_in_place' else '',
                             gy_status='downloading', gy_task_id='kept-cloud',
                         )
                     elif path == 'successor':
-                        db.update_download_request(request_id, status='failed', targets='qb', qb_status='failed')
+                        download_requests_repo.update_download_request(request_id, status='failed', targets='qb', qb_status='failed')
                     with (
                         patch.object(dispatcher, 'get', return_value=''),
                         patch.object(dispatcher, 'analyze_offline_url', return_value=SimpleNamespace(allowed=True)),
@@ -259,7 +260,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                     })
                     cloud.assert_not_called()
                     if path in {'missing', 'retry_in_place'}:
-                        row = db.get_download_request(request_id)
+                        row = download_requests_repo.get_download_request(request_id)
                         assert row is not None
                         self.assertEqual((row['gy_status'], row['gy_task_id']), ('downloading', 'kept-cloud'))
                         self.assertEqual(result['request_id'], request_id)
@@ -283,7 +284,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                     request_id = dispatcher.create_request(
                         dispatcher.normalize_download_url(torrent.source_value), '', 'cloud-recovery-test')['id']
                     torrent_id = dispatcher.parse_torrent_metadata(payload)[1]
-                    db.update_download_request(
+                    download_requests_repo.update_download_request(
                         request_id, targets='both', status='submitted' if active_peer else 'completed',
                         qb_status='downloading' if active_peer else 'completed',
                         qb_task_id=torrent_id, gy_status='failed',
@@ -319,13 +320,13 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
 
     def test_completed_request_requires_successor_instead_of_reopening_in_place(self):
         request_id = self.request()
-        db.update_download_request(request_id, status='completed', targets='qb', qb_status='completed')
+        download_requests_repo.update_download_request(request_id, status='completed', targets='qb', qb_status='completed')
         with patch.object(dispatcher, '_submit_guangya') as backend:
             result = dispatcher.dispatch_missing_targets(request_id, 'guangya')
         backend.assert_not_called()
         self.assertFalse(result['handled'])
         self.assertTrue(result['duplicate'])
-        get_download_request_result_2 = db.get_download_request(request_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2['status'], 'completed')
 
@@ -350,7 +351,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                         second = submit_download_input(item, target, origin='audit')
                     self.assertEqual(len(calls), 1)
                     self.assertEqual(first['request_id'], second['request_id'])
-                    row = db.get_download_request(first['request_id'])
+                    row = download_requests_repo.get_download_request(first['request_id'])
                     field = 'qb_status' if target == 'qb' else 'gy_status'
                     assert row is not None
                     self.assertEqual(row[field], 'outcome_unknown')
@@ -367,11 +368,11 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
             with self.subTest(additional=additional):
                 request_id = self.request()
                 if additional:
-                    db.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted', qb_task_id='kept')
+                    download_requests_repo.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted', qb_task_id='kept')
                 operation = dispatcher.dispatch_missing_targets if additional else dispatcher.dispatch_request
 
                 def accepted_then_error(row, **kwargs):
-                    self.assertTrue(db.bind_download_request_guangya_staging(
+                    self.assertTrue(download_requests_repo.bind_download_request_guangya_staging(
                         request_id, staging_id='owned-stage', parent_id='chosen-parent',
                         staging_name='MF-audit', target_name='Chosen / MF-audit',
                     ))
@@ -380,7 +381,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
                 with patch.object(dispatcher, '_submit_guangya', side_effect=accepted_then_error):
                     result = operation(request_id, 'guangya')
                 self.assertTrue(result['outcome_unknown'])
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual((row['gy_isolated'], row['gy_target_dir'], row['gy_staging_parent_dir'], row['gy_staging_name']), (1, 'owned-stage', 'chosen-parent', 'MF-audit'))
                 matching = {'id': 'actual', 'target_dir': 'owned-stage', 'name': 'Different title'}
@@ -395,7 +396,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         from app.modules.download_tracker import DownloadTracker
 
         request_id = self.request()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         other = SimpleNamespace(hash='b' * 40, name=row['title'])
         correct = SimpleNamespace(hash='a' * 40, name='Renamed by downloader')
@@ -414,22 +415,22 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 request_id = self.request()
-                db.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted', source_value=source)
+                download_requests_repo.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted', source_value=source)
                 with patch.object(tracker, '_notify_completion'):
-                    tracker._update_request(db.get_download_request(request_id), [], [], qb_available=False, gy_available=False)
-                    unchanged = db.get_download_request(request_id)
+                    tracker._update_request(download_requests_repo.get_download_request(request_id), [], [], qb_available=False, gy_available=False)
+                    unchanged = download_requests_repo.get_download_request(request_id)
                     assert unchanged is not None
                     self.assertFalse(unchanged['qb_task_missing_since'])
                     self.assertEqual(unchanged['qb_status'], 'submitted')
                     tracker._update_request(unchanged, [], [], gy_available=False)
-                    missing = db.get_download_request(request_id)
+                    missing = download_requests_repo.get_download_request(request_id)
                     assert missing is not None
                     self.assertEqual(missing['qb_task_id'], expected)
                     self.assertTrue(missing['qb_task_missing_since'])
                     self.assertEqual(missing['qb_status'], 'submitted')
-                    db.update_download_request(request_id, qb_task_missing_since='2000-01-01 00:00:00')
-                    tracker._update_request(db.get_download_request(request_id), [], [], gy_available=False)
-                get_download_request_result_3 = db.get_download_request(request_id)
+                    download_requests_repo.update_download_request(request_id, qb_task_missing_since='2000-01-01 00:00:00')
+                    tracker._update_request(download_requests_repo.get_download_request(request_id), [], [], gy_available=False)
+                get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result_3 is not None
                 self.assertEqual(get_download_request_result_3['qb_status'], 'manual_review')
 
@@ -438,10 +439,10 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
 
         tracker = DownloadTracker()
         request_id = self.request()
-        db.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted', source_value='')
+        download_requests_repo.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted', source_value='')
         with patch.object(tracker, '_notify_completion'):
-            tracker._update_request(db.get_download_request(request_id), [], [], gy_available=False)
-        row = db.get_download_request(request_id)
+            tracker._update_request(download_requests_repo.get_download_request(request_id), [], [], gy_available=False)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row['qb_status'], 'manual_review')
         self.assertIn('未返回可跟踪任务标识', row['error'])
@@ -454,11 +455,11 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         request_id = self.request()
         with patch.object(dispatcher, '_submit_qb', side_effect=RuntimeError('lost receipt')):
             dispatcher.dispatch_request(request_id, 'qb')
-        db.update_download_request(request_id, targets='both', gy_status='downloading', gy_task_id='peer')
+        download_requests_repo.update_download_request(request_id, targets='both', gy_status='downloading', gy_task_id='peer')
         task = SimpleNamespace(hash='a' * 40, name='Downloader renamed title', progress=1, state='pausedUP')
         with patch.object(tracker, '_notify_completion'), patch.object(tracker, '_start_local_import') as organize:
-            tracker._update_request(db.get_download_request(request_id), [task], [], gy_available=False)
-        row = db.get_download_request(request_id)
+            tracker._update_request(download_requests_repo.get_download_request(request_id), [task], [], gy_available=False)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row['qb_status'], row['gy_status'], row['gy_task_id']), ('completed', 'downloading', 'peer'))
         organize.assert_called_once()
@@ -470,13 +471,13 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         tracker = DownloadTracker()
         payload = b'd4:infod6:lengthi10485760e4:name9:Movie.mkvee'
         identity = dispatcher.parse_torrent_metadata(payload)[1]
-        request_id, _ = db.create_download_request('legacy-http', 'http',
+        request_id, _ = download_requests_repo.create_download_request('legacy-http', 'http',
             source_value='https://fixture.invalid/rotating.torrent', torrent_data=payload)
-        db.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted')
+        download_requests_repo.update_download_request(request_id, targets='qb', status='submitted', qb_status='submitted')
         task = SimpleNamespace(hash=identity, name='Changed title', progress=0.5, state='downloading')
         with patch.object(tracker, '_update_backend_log'), patch.object(tracker, '_notify_completion'):
-            tracker._update_request(db.get_download_request(request_id), [task], [], gy_available=False)
-        row = db.get_download_request(request_id)
+            tracker._update_request(download_requests_repo.get_download_request(request_id), [task], [], gy_available=False)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row['qb_task_id'], row['qb_status']), (identity, 'downloading'))
 
@@ -484,7 +485,7 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         request_id = self.request()
         with patch.object(dispatcher, '_submit_qb', return_value={'ok': False, 'error': 'rejected before submission'}):
             result = dispatcher.dispatch_request(request_id, 'qb')
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         self.assertFalse(result['ok'])
         assert row is not None
         self.assertFalse(row['qb_task_id'])
@@ -496,14 +497,14 @@ class DownloadDispatchSingleTrackTests(unittest.TestCase):
         request_id = self.request()
         with patch.object(dispatcher, '_submit_guangya', side_effect=RuntimeError('lost response')):
             dispatcher.dispatch_request(request_id, 'guangya')
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         other = {'id': 'unrelated', 'name': row['title'], 'target_dir': 'unrelated-dir',
                  'raw': {'url': 'magnet:?xt=urn:btih:' + 'b' * 40}, 'status': 2, 'progress': 1}
         tracker = DownloadTracker()
         with patch.object(tracker, '_notify_completion'), patch.object(tracker, '_update_backend_log'), patch.object(tracker, '_start_organize') as organize:
             tracker._update_request(row, [], [other], qb_available=False)
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row['gy_status'], 'manual_review')
         self.assertFalse(row['gy_task_id'])

@@ -37,9 +37,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, overload
 
 from app import database as db
+from app.repositories import media_probe as media_probe_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get, get_bool, get_int
-from app.database import add_organize_log, add_organize_log_items, get_media_probe_cache
+from app.database import add_organize_log, add_organize_log_items
+from app.repositories.media_probe import get_media_probe_cache
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.repositories.organize_probe import normalize_notification_context
 from app.repositories.organize_operation_jobs import OrganizeOperationCancelled
@@ -1536,7 +1538,7 @@ class Organizer:
                 for item in scanned_videos
             ]
             try:
-                source_probe_cache = db.get_media_probe_cache_many(
+                source_probe_cache = media_probe_repo.get_media_probe_cache_many(
                     probe_versions, allow_fingerprint_fallback=True
                 )
                 source_probe_cache_loaded = True
@@ -6871,7 +6873,7 @@ class Organizer:
         hits = 0
         if pending_versions:
             try:
-                cached_payloads = db.get_media_probe_cache_many(
+                cached_payloads = media_probe_repo.get_media_probe_cache_many(
                     pending_versions, allow_fingerprint_fallback=True
                 )
                 batches = 1

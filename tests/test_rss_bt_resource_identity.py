@@ -5,6 +5,8 @@ import json
 from dataclasses import replace
 from unittest.mock import patch
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.modules import offline
 from app.modules.rss import RSSEngine
 from tests import test_rss_guangya_torrent_input as _fixtures
@@ -22,7 +24,7 @@ class FeedInputAudit(_fixtures.RssTorrentFixture):
             return TORRENT, {"content-type": "application/x-bittorrent"}
 
         self.fetch.side_effect = fetch
-        sub = db.add_rss_subscription(
+        sub = rss_repo.add_rss_subscription(
             name="Audit feed",
             urls="https://feed.invalid/rss.xml",
             download_method="guangya",
@@ -101,14 +103,14 @@ class ContentIdentityAudit(_fixtures.RssTorrentFixture):
         with patch.object(offline, "GuangYaClient", return_value=client) as factory:
             factory.normalize_offline_files = normalize
             for i, url in enumerate(urls):
-                sub = db.add_rss_subscription(
+                sub = rss_repo.add_rss_subscription(
                     name=f"Feed {i}",
                     urls=f"https://feed.invalid/rss/{i}",
                     download_method="guangya",
                     gy_target_dir="target",
                     gy_target_dir_name="Same target",
                 )
-                entry = db.add_rss_entry_with_media(
+                entry = rss_repo.add_rss_entry_with_media(
                     sub,
                     "Example S01E01",
                     f"guid-{i}",
@@ -272,8 +274,8 @@ class ContentIdentityConcurrencyTests(_fixtures.RssTorrentFixture):
                     "completed_at=datetime('now','localtime','-31 days') WHERE id=?",
                     (first["request_id"],),
                 )
-            self.assertEqual(db.purge_expired_download_request_torrent_data(30), 1)
-            stored = db.get_download_request(first["request_id"])
+            self.assertEqual(download_requests_repo.purge_expired_download_request_torrent_data(30), 1)
+            stored = download_requests_repo.get_download_request(first["request_id"])
             assert stored is not None
             self.assertIsNone(stored["torrent_data"])
             self.assertEqual(stored["source_value"], raw.source_value)

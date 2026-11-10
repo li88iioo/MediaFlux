@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.modules import download_dispatcher as dispatcher
 from app.modules.rss import RSSEngine
 from app.repositories.rss import bind_rss_entry_download
@@ -49,12 +51,12 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             "gy_requested_target_dir": "target-parent", "gy_staging_parent_dir": "target-parent",
         }
         fields.update(updates)
-        db.update_download_request(request_id, **fields)
-        sub_id = db.add_rss_subscription(
+        download_requests_repo.update_download_request(request_id, **fields)
+        sub_id = rss_repo.add_rss_subscription(
             f"failed-{self.sequence}", f"https://example.invalid/{self.sequence}.xml",
             download_method="guangya", gy_target_dir="target-parent",
         )
-        entry_id = int(db.add_rss_entry_with_media(
+        entry_id = int(rss_repo.add_rss_entry_with_media(
             sub_id, "Episode", f"entry-{self.sequence}",
             payload=json.dumps({"torrent_url": source}),
         )["id"])
@@ -65,7 +67,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     @staticmethod
     def snapshot(entry_id: int) -> dict:
-        row = db.get_rss_entry(entry_id)
+        row = rss_repo.get_rss_entry(entry_id)
         return {field: assert_present(row)[field] for field in (
             "id", "status", "processed", "created_at", "failure_code", "failure_retryable"
         )}
@@ -76,7 +78,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     def test_completed_download_with_failed_settle_is_retryable(self):
         request_id, _entry_id = self.resource()
-        capabilities = dispatcher.download_resubmit_capabilities(db.get_download_request(request_id))
+        capabilities = dispatcher.download_resubmit_capabilities(download_requests_repo.get_download_request(request_id))
         self.assertTrue(capabilities["guangya"]["enabled"], capabilities)
 
     def test_resubmit_creates_successor_and_releases_old_attention(self):
@@ -91,16 +93,16 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertNotEqual(result["request_id"], request_id)
         gy.assert_called_once()
         qb.assert_not_called()
-        successor = db.get_download_request(result["request_id"])
+        successor = download_requests_repo.get_download_request(result["request_id"])
         assert successor is not None
         self.assertEqual(successor["gy_status"], "submitted")
         self.assertEqual(successor["gy_requested_target_dir"], "target-parent")
         self.assertNotEqual(successor["gy_target_dir"], "old-isolated-stage")
-        old = db.get_download_request(request_id)
+        old = download_requests_repo.get_download_request(request_id)
         assert old is not None
         self.assertEqual(old["organize_status"], "resubmitted")
         self.assertEqual(old["organize_error"], _SETTLE_ERROR)
-        self.assertEqual(db.count_download_requests_requiring_attention(request_id), 0)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request_id), 0)
 
     def test_download_page_batch_does_not_skip_failed_settle(self):
         request_id, _entry_id = self.resource()
@@ -116,7 +118,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     def test_normal_completed_backend_stays_nonretryable(self):
         request_id, _entry_id = self.resource(organize_status="completed", organize_started=1)
-        capabilities = dispatcher.download_resubmit_capabilities(db.get_download_request(request_id))
+        capabilities = dispatcher.download_resubmit_capabilities(download_requests_repo.get_download_request(request_id))
         self.assertFalse(capabilities["guangya"]["enabled"])
         with patch.object(dispatcher, "_submit_guangya") as backend:
             result = dispatcher.resubmit_download_request(request_id, "guangya")
@@ -138,11 +140,11 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         for status in _ACTIVE:
             with self.subTest(status=status):
                 request_id, entry_id = self.resource(qb_status=status, targets="both")
-                get_download_request_result = db.get_download_request(request_id)
+                get_download_request_result = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result is not None
                 key = get_download_request_result["request_key"]
                 capabilities = dispatcher.download_resubmit_capabilities(
-                    db.get_download_request(request_id), allow_completed=True
+                    download_requests_repo.get_download_request(request_id), allow_completed=True
                 )
                 self.assertFalse(capabilities["guangya"]["enabled"], capabilities)
                 with patch.object(dispatcher, "_submit_guangya") as backend:
@@ -151,33 +153,33 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                 self.assertFalse(result["ok"], result)
                 self.assertTrue(rss_result["existing"], rss_result)
                 backend.assert_not_called()
-                get_download_request_result_2 = db.get_download_request(request_id)
+                get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result_2 is not None
                 self.assertEqual(get_download_request_result_2["request_key"], key)
-                self.assertEqual(db.update_rss_entries_processed([entry_id], False), 0)
+                self.assertEqual(rss_repo.update_rss_entries_processed([entry_id], False), 0)
 
     def test_rss_reset_api_reopens_only_linked_failed_download(self):
         request_id, entry_id = self.resource()
         healthy_id, healthy_entry = self.resource(organize_status="completed", organize_started=1)
-        before = db.get_rss_entry(entry_id)
+        before = rss_repo.get_rss_entry(entry_id)
         response = rss_api.mark_entries(cast(Request, None), {
             "entry_ids": [entry_id, healthy_entry], "processed": False,
         })
         body = json.loads(bytes(response.body))
         self.assertEqual(body["updated"], 1, body)
-        reset = db.get_rss_entry(entry_id)
+        reset = rss_repo.get_rss_entry(entry_id)
         assert reset is not None
         self.assertEqual((reset["status"], reset["processed"], reset["processed_at"]), ("pending", 0, None))
         assert before is not None
         self.assertEqual(reset["download_request_key"], before["download_request_key"])
         self.assertEqual(reset["download_backend"], "guangya")
-        get_rss_entry_result = db.get_rss_entry(healthy_entry)
+        get_rss_entry_result = rss_repo.get_rss_entry(healthy_entry)
         assert get_rss_entry_result is not None
         self.assertEqual(get_rss_entry_result["status"], "downloaded")
-        get_download_request_result_3 = db.get_download_request(request_id)
+        get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["organize_status"], "failed")
-        get_download_request_result_4 = db.get_download_request(healthy_id)
+        get_download_request_result_4 = download_requests_repo.get_download_request(healthy_id)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["organize_status"], "completed")
 
@@ -188,7 +190,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             conn.execute("UPDATE rss_entries SET download_request_id=NULL WHERE id=?", (entry_id,))
             conn.execute("PRAGMA user_version=35")
         db.init_db()
-        entry = assert_present(db.get_rss_entry(entry_id))
+        entry = assert_present(rss_repo.get_rss_entry(entry_id))
         self.assertEqual(entry["delivery_request_id"], request_id)
         engine = RSSEngine()
         self.addCleanup(engine.close)
@@ -206,10 +208,10 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertFalse(result["existing"], result)
         self.assertNotEqual(result["request_id"], request_id)
         backend.assert_called_once()
-        get_rss_entry_result_2 = db.get_rss_entry(entry_id)
+        get_rss_entry_result_2 = rss_repo.get_rss_entry(entry_id)
         assert get_rss_entry_result_2 is not None
         self.assertEqual(get_rss_entry_result_2["status"], "downloaded")
-        get_download_request_result_5 = db.get_download_request(request_id)
+        get_download_request_result_5 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5["organize_status"], "resubmitted")
         with db.get_conn() as conn:
@@ -217,14 +219,14 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                 "SELECT rss_item_id,path FROM download_log WHERE request_id=? AND source='guangya'",
                 (result["request_id"],),
             ).fetchone()
-        get_rss_entry_result_3 = db.get_rss_entry(entry_id)
+        get_rss_entry_result_3 = rss_repo.get_rss_entry(entry_id)
         assert get_rss_entry_result_3 is not None
         self.assertEqual(log["rss_item_id"], get_rss_entry_result_3["rss_item_id"])
         self.assertEqual(log["path"], "[magnet]")
 
     def test_rss_download_after_reset_uses_the_same_successor_retry(self):
         request_id, entry_id = self.resource()
-        self.assertEqual(db.update_rss_entries_processed([entry_id], False), 1)
+        self.assertEqual(rss_repo.update_rss_entries_processed([entry_id], False), 1)
         with patch.object(dispatcher, "_submit_guangya", side_effect=self.submitted) as backend:
             result = RSSEngine().download(entry_id)
         self.assertTrue(result["ok"], result)
@@ -235,22 +237,22 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
     def test_binding_failed_settle_does_not_reproject_it_as_downloaded(self):
         request_id, entry_id = self.resource()
         seed_rss_entry_state(entry_id, "pending")
-        self.assertTrue(db.claim_rss_entry(entry_id))
-        get_download_request_result_6 = db.get_download_request(request_id)
+        self.assertTrue(rss_repo.claim_rss_entry(entry_id))
+        get_download_request_result_6 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_6 is not None
         bind_rss_entry_download(entry_id, get_download_request_result_6["request_key"], "guangya")
-        row = db.get_rss_entry(entry_id)
+        row = rss_repo.get_rss_entry(entry_id)
         assert row is not None
         self.assertEqual((row["status"], row["processed"]), ("submitting", 0))
 
     def test_binding_active_download_still_projects_backend_acceptance(self):
         request_id, entry_id = self.resource(status="submitted", gy_status="submitted")
         seed_rss_entry_state(entry_id, "pending")
-        self.assertTrue(db.claim_rss_entry(entry_id))
-        get_download_request_result_7 = db.get_download_request(request_id)
+        self.assertTrue(rss_repo.claim_rss_entry(entry_id))
+        get_download_request_result_7 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_7 is not None
         bind_rss_entry_download(entry_id, get_download_request_result_7["request_key"], "guangya")
-        row = db.get_rss_entry(entry_id)
+        row = rss_repo.get_rss_entry(entry_id)
         assert row is not None
         self.assertEqual((row["status"], row["processed"]), ("downloaded", 1))
 
@@ -260,7 +262,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                 _request_id, entry_id = self.resource(
                     gy_status=status, organize_status="completed" if status == "completed" else "failed"
                 )
-                self.assertEqual(db.update_rss_entries_processed([entry_id], False), 0)
+                self.assertEqual(rss_repo.update_rss_entries_processed([entry_id], False), 0)
                 with patch.object(dispatcher, "_submit_guangya") as backend:
                     result = RSSEngine().download(entry_id)
                 self.assertTrue(result["existing"], result)
@@ -268,9 +270,9 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     def test_duplicate_rss_entries_submit_failed_source_only_once(self):
         request_id, entry_id = self.resource()
-        entry = db.get_rss_entry(entry_id)
+        entry = rss_repo.get_rss_entry(entry_id)
         assert entry is not None
-        second_id = int(db.add_rss_entry_with_media(
+        second_id = int(rss_repo.add_rss_entry_with_media(
             entry["rss_item_id"], "Duplicate", "duplicate-guid", payload=entry["payload"]
         )["id"])
         seed_rss_entry_state(second_id, "submitting")
@@ -282,7 +284,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertEqual(result["existing_count"], 1, result)
         self.assertEqual(result["failure_count"], 0, result)
         backend.assert_called_once()
-        get_download_request_result_8 = db.get_download_request(request_id)
+        get_download_request_result_8 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_8 is not None
         self.assertEqual(get_download_request_result_8["organize_status"], "resubmitted")
 
@@ -292,13 +294,13 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             result = RSSEngine().download(entry_id)
         self.assertFalse(result["ok"], result)
         self.assertFalse(result["existing"], result)
-        row = db.get_rss_entry(entry_id)
+        row = rss_repo.get_rss_entry(entry_id)
         assert row is not None
         self.assertEqual((row["status"], row["processed"]), ("failed", 0))
-        get_download_request_result_9 = db.get_download_request(request_id)
+        get_download_request_result_9 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_9 is not None
         self.assertEqual(get_download_request_result_9["organize_status"], "failed")
-        self.assertEqual(db.count_download_requests_requiring_attention(request_id), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request_id), 1)
 
     def test_unknown_rss_resubmit_keeps_manual_review_and_dedupe(self):
         request_id, entry_id = self.resource()
@@ -308,10 +310,10 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             result = RSSEngine().download(entry_id)
         self.assertFalse(result["ok"], result)
         self.assertTrue(result["review_required"], result)
-        get_rss_entry_result_4 = db.get_rss_entry(entry_id)
+        get_rss_entry_result_4 = rss_repo.get_rss_entry(entry_id)
         assert get_rss_entry_result_4 is not None
         self.assertEqual(get_rss_entry_result_4["processed"], 0)
-        get_download_request_result_10 = db.get_download_request(request_id)
+        get_download_request_result_10 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_10 is not None
         self.assertEqual(get_download_request_result_10["organize_status"], "failed")
         backend.assert_called_once()
@@ -322,8 +324,8 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     def test_snapshot_reset_can_reopen_linked_downloaded_failure(self):
         _request_id, entry_id = self.resource()
-        self.assertEqual(db.update_rss_entries_processed_snapshot([self.snapshot(entry_id)], False), 1)
-        row = db.get_rss_entry(entry_id)
+        self.assertEqual(rss_repo.update_rss_entries_processed_snapshot([self.snapshot(entry_id)], False), 1)
+        row = rss_repo.get_rss_entry(entry_id)
         assert row is not None
         self.assertEqual((row["status"], row["processed"]), ("pending", 0))
 
@@ -337,11 +339,11 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                 "VALUES(?,'keep','old','old')",
                 [(entry_id,), (healthy_entry,)],
             )
-        self.assertEqual(db.update_rss_entries_processed_snapshot(rows, False), 0)
-        get_rss_entry_result_5 = db.get_rss_entry(entry_id)
+        self.assertEqual(rss_repo.update_rss_entries_processed_snapshot(rows, False), 0)
+        get_rss_entry_result_5 = rss_repo.get_rss_entry(entry_id)
         assert get_rss_entry_result_5 is not None
         self.assertEqual(get_rss_entry_result_5["status"], "downloaded")
-        get_rss_entry_result_6 = db.get_rss_entry(healthy_entry)
+        get_rss_entry_result_6 = rss_repo.get_rss_entry(healthy_entry)
         assert get_rss_entry_result_6 is not None
         self.assertEqual(get_rss_entry_result_6["status"], "downloaded")
         with db.get_conn() as conn:
@@ -349,7 +351,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                                  (entry_id, healthy_entry)).fetchall()
         self.assertEqual([tuple(row) for row in media], [("keep", "old"), ("keep", "old")])
         # 普通显式入口只更新合格条目；Agent 快照入口则必须全批次原子拒绝。
-        self.assertEqual(db.update_rss_entries_processed([entry_id, healthy_entry], False), 1)
+        self.assertEqual(rss_repo.update_rss_entries_processed([entry_id, healthy_entry], False), 1)
         with db.get_conn() as conn:
             media = {row["rss_entry_id"]: row["skip_reason"] for row in conn.execute(
                 "SELECT rss_entry_id,skip_reason FROM rss_entry_media WHERE rss_entry_id IN (?,?)",
@@ -362,7 +364,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             for status in _ACTIVE:
                 with self.subTest(field=field, status=status):
                     request_id, _entry_id = self.resource()
-                    get_download_request_result_11 = db.get_download_request(request_id)
+                    get_download_request_result_11 = download_requests_repo.get_download_request(request_id)
                     assert get_download_request_result_11 is not None
                     original_key = get_download_request_result_11["request_key"]
                     original = dispatcher.download_resubmit_capabilities
@@ -372,7 +374,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                         changed_status=status, capability_fn=original, **kwargs,
                     ):
                         capability = capability_fn(row, **kwargs)
-                        db.update_download_request(source_id, **{changed_field: changed_status})
+                        download_requests_repo.update_download_request(source_id, **{changed_field: changed_status})
                         return capability
 
                     with (
@@ -382,7 +384,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
                         result = dispatcher.resubmit_download_request(request_id, "guangya")
                     self.assertFalse(result["ok"], result)
                     self.assertTrue(result.get("retry_blocked"), result)
-                    get_download_request_result_12 = db.get_download_request(request_id)
+                    get_download_request_result_12 = download_requests_repo.get_download_request(request_id)
                     assert get_download_request_result_12 is not None
                     self.assertEqual(get_download_request_result_12["request_key"], original_key)
                     backend.assert_not_called()

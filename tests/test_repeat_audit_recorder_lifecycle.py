@@ -4,6 +4,7 @@ import threading
 import unittest
 
 from app import database as db
+from app.repositories import media_proxy as media_proxy_repo
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
 from tests.support import isolated_test_database
 
@@ -75,7 +76,7 @@ class RecorderLifecycleAuditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_shutdown_restart_persists_records_and_session_history(self):
         with isolated_test_database():
-            instance_id = db.add_media_proxy_instance(
+            instance_id = media_proxy_repo.add_media_proxy_instance(
                 name='synthetic-recorder', server_type='jellyfin', upstream_url='http://synthetic.invalid',
                 api_key='synthetic', listen_host='127.0.0.1', listen_port=18888, enabled=0,
             )
@@ -94,8 +95,8 @@ class RecorderLifecycleAuditTests(unittest.IsolatedAsyncioTestCase):
                 await writer.stop()
                 writer._drop_queued_for_shutdown()
             db.init_db()
-            records = db.list_media_proxy_playback_records(instance_id=instance_id)
-            sessions = db.list_media_proxy_playback_sessions(instance_id=instance_id)
+            records = media_proxy_repo.list_media_proxy_playback_records(instance_id=instance_id)
+            sessions = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=instance_id)
             self.assertEqual(records['total'], 2)
             self.assertEqual(sessions['total'], 1)
             self.assertEqual(sessions['items'][0]['request_count'], 2)

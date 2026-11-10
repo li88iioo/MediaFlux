@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from app import database as db
+from app.repositories import strm as strm_repo
 from app.modules.media_refresh import plan_refresh_targets
 
 # 只读小型指针文件，不把伪装成 .strm 的媒体文件加载进内存。
@@ -77,7 +77,7 @@ def recover_pending_paths(
     reported_paths = set(stats.get("changed_strm_paths") or [])
     after_id = 0
     while not _stopped(stats, should_stop):
-        batch = db.list_strm_path_cleanup(
+        batch = strm_repo.list_strm_path_cleanup(
             source_key, after_id=after_id, only_file_ids=only_file_ids,
         )
         if not batch:
@@ -96,7 +96,7 @@ def recover_pending_paths(
                 )
                 continue
             try:
-                if db.list_strm_path_owners(str(path)):
+                if strm_repo.list_strm_path_owners(str(path)):
                     # 普通异常已回滚，或路径已被其他活跃对象复用；凭据不再适用。
                     completed.append(int(row["id"]))
                     continue
@@ -104,7 +104,7 @@ def recover_pending_paths(
                     if current is None:
                         current = {
                             str(item["file_id"]): item
-                            for item in db.list_strm_index(
+                            for item in strm_repo.list_strm_index(
                                 source_key, only_file_ids=only_file_ids,
                             )
                         }
@@ -162,7 +162,7 @@ def recover_pending_paths(
                     )
                     stats.update(stopped=True, stop_stage="refresh-persist")
                     return
-            db.delete_strm_path_cleanup(completed)
+            strm_repo.delete_strm_path_cleanup(completed)
 
 
 def _pointer(path: Path) -> bytes:
@@ -250,7 +250,7 @@ def reconcile_historical_strm(
     if not sources or not root.is_dir() or root.is_symlink():
         return
     source_keys = {f"guangya:{source['id']}" for source in sources}
-    rows = db.list_strm_index_by_prefix("")
+    rows = strm_repo.list_strm_index_by_prefix("")
     indexed_paths: set[Path] = set()
     replacements: dict[bytes, list[tuple[str, str, Path, str]]] = {}
     valid_ids_by_source: dict[str, set[str]] = {}
@@ -299,7 +299,7 @@ def reconcile_historical_strm(
         if not pending:
             return True
         try:
-            db.enqueue_strm_path_cleanup(pending)
+            strm_repo.enqueue_strm_path_cleanup(pending)
         except (sqlite3.Error, RuntimeError, ValueError) as exc:
             _blocked(stats, root, f"历史 STRM 清理凭据持久化失败（{type(exc).__name__}）")
             stats.update(stopped=True, stop_stage="recovery-persist")

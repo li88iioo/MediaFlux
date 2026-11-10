@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
 
-from app import database as db
+from app.repositories import agent_jobs as agent_jobs_repo
 from app.modules.library_patrol import (
     finalize_patrol_progress,
     load_patrol_progress,
@@ -100,7 +100,7 @@ class AgentJobsScheduler:
         stale_before = self._format(
             self._clock() - timedelta(seconds=_RUNNING_LEASE_SECONDS)
         )
-        job = db.claim_due_agent_job(
+        job = agent_jobs_repo.claim_due_agent_job(
             job_type=_JOB_TYPE,
             current_time=current,
             stale_before=stale_before,
@@ -109,7 +109,7 @@ class AgentJobsScheduler:
             return 0
         # 关闭可能与 SQLite claim 交错；未开始的批次无损还回持久队列。
         if self._stop_event.is_set() or not agent_runtime_generation_is_current(runtime_generation):
-            db.release_agent_job_lease(
+            agent_jobs_repo.release_agent_job_lease(
                 str(job["job_id"]),
                 expected_lease_generation=int(job["lease_generation"]),
                 next_run_at=current,
@@ -126,7 +126,7 @@ class AgentJobsScheduler:
             if agent_runtime_generation_is_current(runtime_generation):
                 self._retry(job, error_code=type(exc).__name__)
             else:
-                db.release_agent_job_lease(
+                agent_jobs_repo.release_agent_job_lease(
                     str(job["job_id"]),
                     expected_lease_generation=int(job["lease_generation"]),
                     next_run_at=current,
@@ -136,10 +136,10 @@ class AgentJobsScheduler:
     def _process(self, job, *, current: str, runtime_generation: int) -> None:
         job_id = str(job["job_id"])
         generation = int(job["lease_generation"])
-        if bool(job["cancel_requested"]) or db.is_agent_job_cancel_requested(
+        if bool(job["cancel_requested"]) or agent_jobs_repo.is_agent_job_cancel_requested(
             job_id, expected_lease_generation=generation
         ):
-            db.finalize_cancelled_agent_job(
+            agent_jobs_repo.finalize_cancelled_agent_job(
                 job_id, expected_lease_generation=generation
             )
             return
@@ -159,7 +159,7 @@ class AgentJobsScheduler:
                 "after_tmdb_id": checkpoint["cursor"],
             })
         if not agent_runtime_generation_is_current(runtime_generation):
-            db.release_agent_job_lease(
+            agent_jobs_repo.release_agent_job_lease(
                 job_id,
                 expected_lease_generation=generation,
                 next_run_at=current,
@@ -184,10 +184,10 @@ class AgentJobsScheduler:
         merged = merge_patrol_progress(previous, current_projection)
 
         # 取消采用协作式语义：当前有界批次完成后，不再继续下一批。
-        if db.is_agent_job_cancel_requested(
+        if agent_jobs_repo.is_agent_job_cancel_requested(
             job_id, expected_lease_generation=generation
         ):
-            db.finalize_cancelled_agent_job(
+            agent_jobs_repo.finalize_cancelled_agent_job(
                 job_id, expected_lease_generation=generation
             )
             return
@@ -220,7 +220,7 @@ class AgentJobsScheduler:
                 sort_keys=True,
             )
             checked = int(merged["checked_series_count"])
-            updated = db.continue_agent_job(
+            updated = agent_jobs_repo.continue_agent_job(
                 job_id,
                 expected_lease_generation=generation,
                 checkpoint_json=checkpoint_json,
@@ -231,10 +231,10 @@ class AgentJobsScheduler:
                 summary=f"已检查 {checked} 部剧集，后台将继续下一批",
             )
             if not updated:
-                if db.is_agent_job_cancel_requested(
+                if agent_jobs_repo.is_agent_job_cancel_requested(
                     job_id, expected_lease_generation=generation
                 ):
-                    db.finalize_cancelled_agent_job(
+                    agent_jobs_repo.finalize_cancelled_agent_job(
                         job_id, expected_lease_generation=generation
                     )
                     logger.info("Agent 长任务在批次提交竞态中完成取消")
@@ -256,7 +256,7 @@ class AgentJobsScheduler:
         )
         checked = int(finalized["checked_series_count"])
         summary = self._completion_summary(finalized)
-        updated = db.complete_agent_job(
+        updated = agent_jobs_repo.complete_agent_job(
             job_id,
             expected_lease_generation=generation,
             projection_json=projection_json,
@@ -266,10 +266,10 @@ class AgentJobsScheduler:
             finished_at=current,
         )
         if not updated:
-            if db.is_agent_job_cancel_requested(
+            if agent_jobs_repo.is_agent_job_cancel_requested(
                 job_id, expected_lease_generation=generation
             ):
-                db.finalize_cancelled_agent_job(
+                agent_jobs_repo.finalize_cancelled_agent_job(
                     job_id, expected_lease_generation=generation
                 )
                 logger.info("Agent 长任务在结果提交竞态中完成取消")
@@ -314,7 +314,7 @@ class AgentJobsScheduler:
         def renew_loop() -> None:
             while not stopped.wait(_LEASE_HEARTBEAT_SECONDS):
                 try:
-                    if not db.renew_agent_job_lease(
+                    if not agent_jobs_repo.renew_agent_job_lease(
                         job_id,
                         expected_lease_generation=generation,
                     ):
@@ -338,7 +338,7 @@ class AgentJobsScheduler:
             thread.join(timeout=1.0)
 
     def _fail_terminal(self, job, *, error_code: str, summary: str) -> None:
-        status = db.fail_or_retry_agent_job(
+        status = agent_jobs_repo.fail_or_retry_agent_job(
             str(job["job_id"]),
             expected_lease_generation=int(job["lease_generation"]),
             attempts=max(1, int(job["max_attempts"] or 1)),
@@ -352,7 +352,7 @@ class AgentJobsScheduler:
     def _retry(self, job, *, error_code: str) -> None:
         attempts = max(0, int(job["attempts"] or 0)) + 1
         delay = _RETRY_DELAYS[min(attempts - 1, len(_RETRY_DELAYS) - 1)]
-        status = db.fail_or_retry_agent_job(
+        status = agent_jobs_repo.fail_or_retry_agent_job(
             str(job["job_id"]),
             expected_lease_generation=int(job["lease_generation"]),
             attempts=attempts,

@@ -13,6 +13,7 @@ import pytest
 
 from app import config, sdk
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -249,8 +250,8 @@ def test_committed_unknown_is_consumed_and_never_replayed(backend, monkeypatch, 
 def test_media_creation_and_restore_use_real_subscription_transaction(backend, restored):
     old_id = None
     if restored:
-        old_id = db.add_media_subscription(provider="tmdb", external_id="123", tmdb_id="123", media_type="tv", title="旧作品", enabled=False)
-        assert db.delete_media_subscription(old_id)
+        old_id = media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id="123", tmdb_id="123", media_type="tv", title="旧作品", enabled=False)
+        assert media_subscriptions_repo.delete_media_subscription(old_id)
 
     async def run():
         effects = executor()
@@ -265,7 +266,7 @@ def test_media_creation_and_restore_use_real_subscription_transaction(backend, r
         assert all(saved[key] == row[key] for key in row)
         assert row["seasons"] == [2] and row["monitor_mode"] == "selected" and row["action"] == "auto"
         assert row["download_target"] == "qb" and row["sites"] == ["nyaa"] and row["check_interval_minutes"] == 10080
-        assert db.list_media_subscription_runs() == []
+        assert media_subscriptions_repo.list_media_subscription_runs() == []
         backend.scheduler.reload.assert_called_once()
         with pytest.raises(ToolPipelineError):
             await effects.execute_confirmed(plan.plan_id, context=context)

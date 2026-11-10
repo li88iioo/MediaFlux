@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules import local_storage
 from app.modules.local_media_candidates import discover_local_media_candidates
 from app.modules.local_media_service import LocalMediaService, LocalMediaServiceError
@@ -27,7 +27,7 @@ class SiblingBatchTests(IsolatedDatabaseTestCase):
         temporary = tempfile.TemporaryDirectory(prefix="node-fixes-bo1-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media_repo.create_local_media_source(
             name=self.root.name,
             qb_profile="",
             qb_path_prefix="",
@@ -66,7 +66,7 @@ class SiblingBatchTests(IsolatedDatabaseTestCase):
                         b"subtitle"
                     )
                 # 使用正式发现入口，统计仅涵盖随后的逐候选检查。
-                source = db.get_local_media_source(self.source_id, owner="admin")
+                source = local_media_repo.get_local_media_source(self.source_id, owner="admin")
                 candidates, error = discover_local_media_candidates(source)
                 self.assertEqual(error, "")
                 self.assertEqual(len(candidates), count)

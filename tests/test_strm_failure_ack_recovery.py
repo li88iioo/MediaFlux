@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.modules import strm
 from app.modules.scheduler import STRMScheduler
@@ -71,7 +72,7 @@ def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arri
     seed_failed_video(tmp_path)
     tree = _tree()
     if mode == "fast":
-        db.enqueue_strm_change_targets([{
+        strm_repo.enqueue_strm_change_targets([{
             "source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
             "parent_id": "d", "name": "Movie.mkv", "rel_dir": "Film", "etag": "e", "size": 100,
         }])
@@ -122,9 +123,9 @@ def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arri
     restore_ack_and_restart()
     retry = _run(tmp_path, mode="fast", enabled=False, tree=tree, queue_only=True)
     assert not retry["partial"], retry
-    assert db.count_pending_strm_change_targets() == 0
+    assert strm_repo.count_pending_strm_change_targets() == 0
     assert not old_path.exists()
-    rows = db.list_strm_index("guangya:s")
+    rows = strm_repo.list_strm_index("guangya:s")
     if action == "remove":
         assert rows == []
     else:
@@ -145,7 +146,7 @@ def test_ack_sql_failure_is_partial_and_restarts_from_durable_target_without_rew
     assert result["stats"]["failure_ledger_failed"] == 1
     assert not result["fallback_used"], result
     assert len(db.list_strm_failures(status="open")) == 1
-    assert db.count_pending_strm_change_targets() == 1
+    assert strm_repo.count_pending_strm_change_targets() == 1
     target = next(tmp_path.rglob("*.strm"))
     before = (target.read_bytes(), target.stat().st_mtime_ns, target.stat().st_ino)
     event = STRMScheduler._build_success_event(
@@ -168,7 +169,7 @@ def test_ack_sql_failure_is_partial_and_restarts_from_durable_target_without_rew
     assert retry["stats"]["generated"] == retry["stats"]["failed"] == 0
     assert retry["stats"]["skipped"] == 1
     assert db.list_strm_failures(status="open") == []
-    assert db.count_pending_strm_change_targets() == 0
+    assert strm_repo.count_pending_strm_change_targets() == 0
     assert (target.read_bytes(), target.stat().st_mtime_ns, target.stat().st_ino) == before
 
 
@@ -204,24 +205,24 @@ def test_late_ack_cannot_resolve_new_failure_in_same_timestamp(tmp_path, mode, l
         assert rows[0]["updated_at"] == previous["updated_at"]
         assert rows[0]["error"] == f"later {'retry' if later == 'retry' else 'failure'} must survive old ACK"
         assert result["strm_partial"] and result["stats"]["failed"] == 0
-        assert db.count_pending_strm_change_targets() == 1
+        assert strm_repo.count_pending_strm_change_targets() == 1
     make_targets_due()
     with patch.object(strm, "_install_video_candidate", side_effect=AssertionError("must recheck without rewriting")) as install:
         retry = _run(tmp_path, mode="fast", enabled=False, queue_only=True)
     install.assert_not_called()
     assert retry["ok"] and not retry["partial"]
     assert db.list_strm_failures(status="open") == []
-    assert db.count_pending_strm_change_targets() == 0
+    assert strm_repo.count_pending_strm_change_targets() == 0
 
 
 def test_ack_failure_requeues_claimed_target_and_old_finish_cannot_clear_new_work(tmp_path):
     seed_failed_video(tmp_path)
-    db.enqueue_strm_change_targets([{
+    strm_repo.enqueue_strm_change_targets([{
         "source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
         "parent_id": "d", "name": "Movie.mkv", "rel_dir": "Film",
     }])
     reject_ack()
-    enqueue = db.enqueue_strm_change_targets
+    enqueue = strm_repo.enqueue_strm_change_targets
     old_claim = {}
 
     def enqueue_while_claimed(*args, **kwargs):
@@ -239,7 +240,7 @@ def test_ack_failure_requeues_claimed_target_and_old_finish_cannot_clear_new_wor
         assert json.loads(dirty["pending_changes_json"])[0]["etag"] == "e"
         return count
 
-    with patch.object(db, "enqueue_strm_change_targets", side_effect=enqueue_while_claimed) as requeue:
+    with patch.object(strm_repo, "enqueue_strm_change_targets", side_effect=enqueue_while_claimed) as requeue:
         result = _run(tmp_path, mode="fast", enabled=False, queue_only=True)
     requeue.assert_called_once()
     assert result["strm_partial"] and not result["fallback_used"], result
@@ -249,9 +250,9 @@ def test_ack_failure_requeues_claimed_target_and_old_finish_cannot_clear_new_wor
     assert pending is not None and pending["state"] == "queued"
     assert json.loads(pending["pending_changes_json"])[0]["etag"] == "e"
     restore_ack_and_restart()
-    newer = db.claim_strm_change_targets(owner="newer-ack-replay")
+    newer = strm_repo.claim_strm_change_targets(owner="newer-ack-replay")
     assert len(newer) == 1 and newer[0]["lease_generation"] > old_claim["lease_generation"]
-    assert db.complete_strm_change_target(
+    assert strm_repo.complete_strm_change_target(
         old_claim["id"], expected_owner=old_claim["lease_owner"],
         expected_lease_generation=old_claim["lease_generation"],
     ) == "stale"
@@ -259,12 +260,12 @@ def test_ack_failure_requeues_claimed_target_and_old_finish_cannot_clear_new_wor
         running = conn.execute("SELECT * FROM strm_change_queue").fetchone()
     assert running is not None and running["state"] == "running"
     assert json.loads(running["inflight_changes_json"])[0]["etag"] == "e"
-    assert db.release_strm_change_targets(newer, reason="test returns lease for real scheduler") == 1
+    assert strm_repo.release_strm_change_targets(newer, reason="test returns lease for real scheduler") == 1
     with patch.object(strm, "_install_video_candidate", side_effect=AssertionError("correct file must not be rewritten")) as install:
         retry = _run(tmp_path, mode="fast", enabled=False, queue_only=True)
     install.assert_not_called()
     assert retry["ok"] and not retry["partial"], retry
-    assert db.count_pending_strm_change_targets() == 0
+    assert strm_repo.count_pending_strm_change_targets() == 0
     assert db.list_strm_failures(status="open") == []
 
 
@@ -293,7 +294,7 @@ def test_ack_replay_uses_current_file_and_does_not_duplicate_source_prefix(tmp_p
     result = sync()
     assert result["generated"] == 1 and result["failed"] == 0
     restore_ack_and_restart()
-    claimed = db.claim_strm_change_targets(owner="ack-prefix-test")
+    claimed = strm_repo.claim_strm_change_targets(owner="ack-prefix-test")
     assert len(claimed) == 1
     changes = claimed[0]["changes"]
     assert changes[0]["rel_dir"] == "Film"
@@ -305,7 +306,7 @@ def test_ack_replay_uses_current_file_and_does_not_duplicate_source_prefix(tmp_p
     install.assert_not_called()
     assert retry["skipped"] == 1 and not retry["fallback_required"]
     assert db.list_strm_failures(status="open") == []
-    assert db.complete_strm_change_target(
+    assert strm_repo.complete_strm_change_target(
         claimed[0]["id"], expected_owner=claimed[0]["lease_owner"],
         expected_lease_generation=claimed[0]["lease_generation"],
     ) == "completed"
@@ -319,7 +320,7 @@ def test_current_metadata_ack_failure_replays_without_download(tmp_path, increme
     target = strm._metadata_target(file, "", str(tmp_path))
     target.parent.mkdir(parents=True)
     target.write_bytes(b"metadata")
-    db.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size,
+    strm_repo.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size,
                          file.name, str(target), strm._content_fingerprint(target))
     db.record_strm_failure(source_id="s", source_name="S", file_id=file.file_id,
         parent_id="s", filename=file.name, action="metadata", rel_dir="",
@@ -337,7 +338,7 @@ def test_current_metadata_ack_failure_replays_without_download(tmp_path, increme
     assert result["metadata_failed"] == result["metadata_generated"] == 0
     assert result["metadata_skipped"] == result["failure_ledger_failed"] == 1
     restore_ack_and_restart()
-    claimed = db.claim_strm_change_targets(owner="ack-metadata-test")
+    claimed = strm_repo.claim_strm_change_targets(owner="ack-metadata-test")
     assert len(claimed) == 1
     assert claimed[0]["changes"][0]["kind"] == "metadata"
     with patch.object(strm, "_install_metadata_candidate", side_effect=AssertionError("must reuse metadata")) as install:
@@ -353,13 +354,13 @@ def test_current_metadata_ack_failure_replays_without_download(tmp_path, increme
 def test_ack_and_replay_enqueue_failure_keeps_manual_pending_and_truthful_feedback(tmp_path):
     seed_failed_video(tmp_path)
     reject_ack()
-    with patch.object(db, "enqueue_strm_change_targets", side_effect=OSError("isolated queue store failure")):
+    with patch.object(strm_repo, "enqueue_strm_change_targets", side_effect=OSError("isolated queue store failure")):
         result = _run(tmp_path, enabled=False)
     assert result["ok"] and result["strm_partial"], result
     assert result["stats"]["generated"] == 1 and result["stats"]["failed"] == 0
     assert last_status() == "partial"
     assert len(db.list_strm_failures(status="open")) == 1
-    assert db.count_pending_strm_change_targets() == 0
+    assert strm_repo.count_pending_strm_change_targets() == 0
     assert "手动重试" in str(result["stats"]["error_samples"])
     restore_ack_and_restart()
     with patch.object(strm, "_install_video_candidate", side_effect=AssertionError("must keep successful file")) as install:

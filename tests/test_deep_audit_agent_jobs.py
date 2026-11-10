@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import database as db
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
+from app.repositories import agent_jobs as agent_jobs_repo
 from app.modules.library_patrol import empty_patrol_projection
 from app.modules.library_audit_jobs import (
     audit_job,
@@ -34,7 +36,7 @@ def isolated_jobs():
 
 
 def create_job(*, checkpoint=None, projection=None):
-    row, created = db.create_agent_job(
+    row, created = agent_jobs_repo.create_agent_job(
         owner=OWNER,
         job_type="library_episode_audit",
         dedupe_key=f"{AS_OF}:2",
@@ -83,7 +85,7 @@ def run_worker(executor):
 
 
 def load(job_id):
-    row = db.get_agent_job(owner=OWNER, job_id=job_id)
+    row = agent_jobs_repo.get_agent_job(owner=OWNER, job_id=job_id)
     assert row is not None
     return dict(row)
 
@@ -132,7 +134,7 @@ def test_restart_repeat_cancelled_batch_never_publishes_or_reexecutes():
     job_id = create_job()
 
     def cancel_during_batch(_arguments):
-        row, outcome = db.cancel_agent_job(owner=OWNER, job_id=job_id)
+        row, outcome = agent_jobs_repo.cancel_agent_job(owner=OWNER, job_id=job_id)
         assert row is not None
         assert outcome == "requested" and row["cancel_requested"] == 1
         return batch(checked=2, missing=3, cursor="100")
@@ -191,7 +193,7 @@ def test_history_scheduled_patrol_missing_progress_never_publishes_completion():
     """定时与手动巡检共用恢复验证，不得读尾批后把缺失历史当空白历史。"""
     from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
 
-    db.ensure_agent_library_patrol(next_run_at="2000-01-01 00:00:00")
+    agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2000-01-01 00:00:00")
     with db.get_conn() as conn:
         conn.execute(
             "UPDATE agent_library_patrol SET cycle_as_of=?,"
@@ -205,7 +207,7 @@ def test_history_scheduled_patrol_missing_progress_never_publishes_completion():
         patch.object(worker, "_notifications_enabled", return_value=False),
     ):
         assert worker.run_once() == 1
-    get_agent_library_patrol_result = db.get_agent_library_patrol()
+    get_agent_library_patrol_result = agent_library_patrol_repo.get_agent_library_patrol()
     assert get_agent_library_patrol_result is not None
     row = dict(get_agent_library_patrol_result)
     assert row["outcome"] != "up_to_date"
@@ -222,7 +224,7 @@ def test_history_scheduled_patrol_valid_progress_preserves_prior_findings():
     previous.update(
         checked_series_count=2, updates_available_count=1, missing_episode_count=3
     )
-    db.ensure_agent_library_patrol(next_run_at="2000-01-01 00:00:00")
+    agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2000-01-01 00:00:00")
     with db.get_conn() as conn:
         conn.execute(
             "UPDATE agent_library_patrol SET cycle_as_of=?,"
@@ -240,7 +242,7 @@ def test_history_scheduled_patrol_valid_progress_preserves_prior_findings():
     executor.assert_called_once_with(
         {"as_of": AS_OF, "max_series": 2, "after_tmdb_id": "100"}
     )
-    get_agent_library_patrol_result_2 = db.get_agent_library_patrol()
+    get_agent_library_patrol_result_2 = agent_library_patrol_repo.get_agent_library_patrol()
     assert get_agent_library_patrol_result_2 is not None
     row = dict(get_agent_library_patrol_result_2)
     assert row["outcome"] == "updates_available"

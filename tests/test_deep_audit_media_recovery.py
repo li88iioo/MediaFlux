@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.modules import strm_metadata_worker as metadata
 from tests.support import isolated_test_database
 
@@ -53,20 +54,20 @@ def test_superseded_metadata_failure_does_not_poison_current_work(
 ):
     """准备阶段的旧请求失败，只能影响它拥有的 revision/lease，不能污染新任务。"""
     with isolated_test_database():
-        db.enqueue_strm_metadata_jobs([metadata_job()])
+        strm_repo.enqueue_strm_metadata_jobs([metadata_job()])
         worker = metadata.STRMMetadataWorker()
         worker._client = cast(GuangYaClient, SimpleNamespace(credentials_current=True, logged_in=True))
 
         def interrupted_download(*args, **kwargs):
             if interruption == "revision":
-                db.enqueue_strm_metadata_jobs(
+                strm_repo.enqueue_strm_metadata_jobs(
                     [metadata_job(etag="v2", filename="Renamed.nfo")]
                 )
             elif interruption == "cancel":
-                db.cancel_strm_metadata_job("audit", "meta", reason="source removed")
+                strm_repo.cancel_strm_metadata_job("audit", "meta", reason="source removed")
             else:
-                db.recover_stale_strm_metadata_jobs(force=True, owner=worker._owner)
-                db.claim_due_strm_metadata_jobs(owner="successor")
+                strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=worker._owner)
+                strm_repo.claim_due_strm_metadata_jobs(owner="successor")
             raise OSError("old download disconnected")
 
         with (
@@ -82,7 +83,7 @@ def test_superseded_metadata_failure_does_not_poison_current_work(
         ):
             assert worker._process_one() is True
 
-        row = dict(db.list_strm_metadata_queue(status="all")[0])
+        row = dict(strm_repo.list_strm_metadata_queue(status="all")[0])
         expected = {"revision": "queued", "cancel": "cancelled", "lease": "running"}
         assert row["status"] == expected[interruption]
         assert row["attempts"] == 0
@@ -95,7 +96,7 @@ def test_superseded_metadata_failure_does_not_poison_current_work(
 
 def test_current_metadata_failure_remains_retryable(tmp_path):
     with isolated_test_database():
-        db.enqueue_strm_metadata_jobs([metadata_job()])
+        strm_repo.enqueue_strm_metadata_jobs([metadata_job()])
         worker = metadata.STRMMetadataWorker()
         worker._client = cast(GuangYaClient, SimpleNamespace(credentials_current=True, logged_in=True))
         with (
@@ -110,7 +111,7 @@ def test_current_metadata_failure_remains_retryable(tmp_path):
             ),
         ):
             assert worker._process_one() is True
-        row = dict(db.list_strm_metadata_queue(status="all")[0])
+        row = dict(strm_repo.list_strm_metadata_queue(status="all")[0])
         assert row["status"] == "retry_wait"
         assert row["attempts"] == 1
         assert len(db.list_strm_failures(status="all")) == 1

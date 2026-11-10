@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaFile
 from app.main import create_app
 from app.modules import jellyfin_delete as deletion
@@ -378,9 +379,9 @@ class JellyfinDeleteTests(IsolatedDatabaseTestCase):
 
 
     def request_download(self, *, source_id="source-b", status="downloading", organize_status=""):
-        request_id, created = db.create_download_request("jellyfin-" + self.root.name, "magnet")
+        request_id, created = download_requests_repo.create_download_request("jellyfin-" + self.root.name, "magnet")
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="guangya", status="submitted", gy_status=status,
             gy_isolated=1, gy_target_dir=source_id, gy_staging_parent_dir="library",
             gy_staging_name=source_id, gy_staging_cleanup_status="retained",

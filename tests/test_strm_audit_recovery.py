@@ -9,6 +9,7 @@ import threading
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from tests.support import isolated_test_database
@@ -91,14 +92,14 @@ def test_retry_committed_video_persists_refresh_before_ack_and_replays(tmp_path)
         runtime.update(media_server_refresh=True, allow_emby=False)
         result = retry("selected", client, runtime)
         assert result["resolved"] == 1
-        entries = db.list_strm_refresh_entries()
+        entries = strm_repo.list_strm_refresh_entries()
         assert len(entries) == 1, "失败重试已写盘/确认成功，但丢失媒体库刷新意图"
         assert entries[0]["allow_emby"] is False
         assert Path(entries[0]["path"]).exists()
         with patch("app.modules.media_refresh_coordinator.enqueue_media_refresh_paths", return_value={"Jellyfin": "queued"}) as handoff:
             STRMMetadataWorker()._flush_media_refresh(force=True)
             assert handoff.call_count == 1
-        assert db.count_strm_refresh_paths() == 0
+        assert strm_repo.count_strm_refresh_paths() == 0
 
 
 @pytest.mark.parametrize("count", [40, 80, 1001])
@@ -112,7 +113,7 @@ def test_metadata_retry_only_visits_related_index_rows(tmp_path, count):
                 action="metadata", error="download failed")
             # 历史索引保留，但文件缺失，重试必须补写。
             target = strm._metadata_target(file, "", str(tmp_path))
-            db.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size, file.name, str(target))
+            strm_repo.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size, file.name, str(target))
         client = _TreeClient({"s": files})
         runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}]),
                    "strm_root": str(tmp_path), "base_url": "http://play.invalid"}
@@ -130,7 +131,7 @@ def test_metadata_retry_only_visits_related_index_rows(tmp_path, count):
             visits.append(len(args[5]))
             return original(*args, **kwargs)
 
-        with patch.object(strm, "prepare_metadata_download", side_effect=download), patch.object(strm, "_install_metadata_candidate", side_effect=install), patch.object(db, "list_strm_index", wraps=db.list_strm_index) as reads, patch.object(db, "list_strm_installation_rows", wraps=db.list_strm_installation_rows) as point_reads:
+        with patch.object(strm, "prepare_metadata_download", side_effect=download), patch.object(strm, "_install_metadata_candidate", side_effect=install), patch.object(strm_repo, "list_strm_index", wraps=strm_repo.list_strm_index) as reads, patch.object(strm_repo, "list_strm_installation_rows", wraps=strm_repo.list_strm_installation_rows) as point_reads:
             result = strm.retry_all_strm_failures("s", "metadata", "test", client=cast(GuangYaClient, client), runtime_config=runtime)
         assert result["resolved"] == count, result
         # 共享准备/安装链只作 file_id/目标路径定点读取，不再整源装载索引。
@@ -152,7 +153,7 @@ def test_retry_refresh_ack_is_atomic_and_failure_remains_replayable(tmp_path):
         assert len(list(tmp_path.rglob("*.strm"))) == 1
         again = retry("selected", client, runtime)
         assert again["resolved"] == 1
-        assert db.count_strm_refresh_paths() == 1
+        assert strm_repo.count_strm_refresh_paths() == 1
         assert len(list(tmp_path.rglob("*.strm"))) == 1
 
 
@@ -161,7 +162,7 @@ def test_retry_refresh_disabled_does_not_publish_work(tmp_path):
         client, runtime = seed(tmp_path, 1)
         runtime["media_server_refresh"] = False
         assert retry("selected", client, runtime)["resolved"] == 1
-        assert db.count_strm_refresh_paths() == 0
+        assert strm_repo.count_strm_refresh_paths() == 0
 
 
 def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
@@ -184,7 +185,7 @@ def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
             assert result["resolved"] == 1
         paths = sorted(tmp_path.rglob("*.strm"))
         assert len(paths) == 2 and paths[0].read_bytes() != paths[1].read_bytes()
-        assert db.count_strm_refresh_paths() == 2
+        assert strm_repo.count_strm_refresh_paths() == 2
         coordinator = refresh.MediaRefreshCoordinator()
         provider = Mock(display_name="Jellyfin")
         provider.refresh_for_paths.return_value = {"ok": True, "succeeded_target_ids": ["library"], "deduplicated": 0}
@@ -198,7 +199,7 @@ def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
         provider.refresh_for_paths.assert_called_once()
         assert provider.refresh_for_paths.call_args.kwargs["allow_global_fallback"] is False
         assert not queue.claim_due_media_refreshes(owner=coordinator._owner, limit=8)
-        assert db.count_strm_refresh_paths() == 0
+        assert strm_repo.count_strm_refresh_paths() == 0
 
 
 def test_metadata_retry_download_stop_releases_instead_of_failing(tmp_path):
@@ -233,7 +234,7 @@ def test_metadata_manual_move_honors_refresh_policy_for_old_and_new_paths(tmp_pa
         old = tmp_path / strm.STRM_SUBDIR / "Old" / file.name
         old.parent.mkdir(parents=True)
         old.write_bytes(b"metadata")
-        db.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size,
+        strm_repo.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size,
                             file.name, str(old), strm._content_fingerprint(old))
         db.record_strm_failure(source_id="s", source_name="S", file_id="m", parent_id="s",
                                filename=file.name, action="metadata", rel_dir="",
@@ -248,7 +249,7 @@ def test_metadata_manual_move_honors_refresh_policy_for_old_and_new_paths(tmp_pa
         assert result["resolved"] == 1, result
         assert target.read_bytes() == b"metadata"
         assert not old.exists()
-        assert db.list_strm_path_cleanup("guangya-meta:s") == []
-        events = db.list_strm_refresh_entries()
+        assert strm_repo.list_strm_path_cleanup("guangya-meta:s") == []
+        events = strm_repo.list_strm_refresh_entries()
         assert {event["path"] for event in events} == ({str(old.parent), str(target)} if enabled else set())
         assert all(event["allow_emby"] is False for event in events)

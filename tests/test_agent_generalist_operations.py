@@ -22,10 +22,9 @@ class MediaProxyRuntimeRestartTests(unittest.IsolatedAsyncioTestCase):
         manager = media_proxy.MediaProxyManager()
         manager._runtimes[7] = previous
         with (
-            patch.object(
-                media_proxy.database, "get_media_proxy_instance", return_value=row
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row
             ),
-            patch.object(media_proxy.database, "update_media_proxy_instance"),
+            patch("app.repositories.media_proxy.update_media_proxy_instance"),
             patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
             patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop,
             patch.object(

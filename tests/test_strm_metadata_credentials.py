@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaClient
 from app.modules import strm_metadata_worker as metadata
 from app.modules.strm import STRM_SUBDIR
@@ -73,7 +74,7 @@ class MetadataCredentialTests(unittest.TestCase):
         self.job = {"source_id": "source", "source_name": "整理", "file_id": "meta",
                     "parent_id": "source", "filename": "Movie.nfo", "etag": "v1", "size": 8,
                     "rel_dir": "Movie", "target_rel_path": f"{STRM_SUBDIR}/Movie/Movie.nfo"}
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         self.target = self.root / "strm" / STRM_SUBDIR / "Movie" / "Movie.nfo"
 
     def login(self):
@@ -86,7 +87,7 @@ class MetadataCredentialTests(unittest.TestCase):
         return client
 
     def row(self):
-        return dict(db.list_strm_metadata_queue(status="all")[0])
+        return dict(strm_repo.list_strm_metadata_queue(status="all")[0])
 
     def make_due(self):
         with db.get_conn() as conn:
@@ -192,7 +193,7 @@ class MetadataCredentialTests(unittest.TestCase):
             return result
         with (
             patch.object(metadata, "commit_strm_metadata_job", side_effect=commit),
-            patch.object(db, "settle_strm_metadata_job", side_effect=OSError("fixture ack failure")),
+            patch.object(strm_repo, "settle_strm_metadata_job", side_effect=OSError("fixture ack failure")),
         ):
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.row()["status"], "retry_wait")

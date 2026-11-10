@@ -5,6 +5,7 @@ import sqlite3
 from unittest.mock import patch
 
 from app import database as db, sdk
+from app.repositories import local_media as local_media_repo
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -52,21 +53,21 @@ class OrganizeAuditUnitTests(IsolatedDatabaseTestCase):
         trigger: str = "manual",
         stamp: str = "2026-08-10 11:00:00",
     ) -> int:
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"PRIVATE-SOURCE-{title}",
             qb_profile="qb",
             qb_path_prefix="/private/qb",
             local_root="/private/local",
             owner=owner,
         )
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id,
             f"PRIVATE-HASH-{title}",
             f"/private/{title}.mkv",
             owner=owner,
             trigger=trigger,
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task_id,
             owner=owner,
             status=status,

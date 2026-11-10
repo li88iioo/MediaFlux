@@ -13,6 +13,7 @@ from typing import cast
 from unittest.mock import Mock, patch
 
 from app import database, sdk
+from app.repositories import discovery as discovery_repo
 from app.discovery.cache import DiscoveryCache
 from app.discovery.models import (
     DiscoveryPage,
@@ -304,8 +305,8 @@ class DiscoveryServiceTests(unittest.TestCase):
             refresh_submit=lambda fn: fn(),
         )
         with patch(
-            "app.database.get_discovery_cache_many",
-            wraps=database.get_discovery_cache_many,
+            "app.repositories.discovery.get_discovery_cache_many",
+            wraps=discovery_repo.get_discovery_cache_many,
         ) as batch_read:
             page = self.service.list_items("tmdb", "popular", "movie", 1, {})
 
@@ -347,11 +348,11 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.addCleanup(service.shutdown)
         page = service.list_items("douban", "movie_hot", "movie")
         self.assertEqual(page.items[0].tmdb_id, "")
-        database.upsert_media_external_id("douban", "1", "movie", "550", confirmed=False)
-        database.upsert_media_external_id("douban", "1", "tv", "999", confirmed=True)
+        discovery_repo.upsert_media_external_id("douban", "1", "movie", "550", confirmed=False)
+        discovery_repo.upsert_media_external_id("douban", "1", "tv", "999", confirmed=True)
         self.assertEqual(service.list_items("douban", "movie_hot", "movie").items[0].tmdb_id, "")
         for identity in ("550", "551"):
-            database.upsert_media_external_id("douban", "1", "movie", identity, confirmed=True)
+            discovery_repo.upsert_media_external_id("douban", "1", "movie", identity, confirmed=True)
             page = service.list_items("douban", "movie_hot", "movie")
             self.assertTrue(page.cached)
             self.assertEqual((page.items[0].external_id, page.items[0].tmdb_id), ("1", identity))
@@ -751,7 +752,7 @@ class DiscoveryServiceTests(unittest.TestCase):
     def test_background_refresh_does_not_query_watchlist_for_discarded_result(self):
         self.service.list_items("tmdb", "popular", "movie", 1, {})
         self.now += timedelta(seconds=61)
-        with patch("app.discovery.service.database.list_media_watchlist_keys", wraps=database.list_media_watchlist_keys) as lookup:
+        with patch("app.repositories.discovery.list_media_watchlist_keys", wraps=discovery_repo.list_media_watchlist_keys) as lookup:
             self.service.list_items("tmdb", "popular", "movie", 1, {})
         lookup.assert_called_once()
 
@@ -773,8 +774,8 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertEqual(self.provider.calls, 0)
 
     def test_watchlist_state_is_attached_with_one_batch_lookup(self):
-        database.add_media_watchlist("tmdb", "1", "movie", "Page 1")
-        with patch("app.discovery.service.database.list_media_watchlist_keys", wraps=database.list_media_watchlist_keys) as lookup:
+        discovery_repo.add_media_watchlist("tmdb", "1", "movie", "Page 1")
+        with patch("app.repositories.discovery.list_media_watchlist_keys", wraps=discovery_repo.list_media_watchlist_keys) as lookup:
             page = self.service.list_items("tmdb", "popular", "movie", 1, {})
         self.assertEqual(page.items[0].state, "watchlisted")
         lookup.assert_called_once()
@@ -830,7 +831,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         card = MediaCard(**preview["canonical"])
         number = self.service.add_watchlist(card, expected_absent=True)
         self.assertIsInstance(number, int)
-        row = database.get_media_watchlist_by_id(number)
+        row = discovery_repo.get_media_watchlist_by_id(number)
         assert row is not None
         self.assertEqual((row["title"], row["poster_key"]), ("Verified Title", "private-poster"))
         self.assertEqual(self.provider.detail_calls, 1)
@@ -853,7 +854,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         current = MediaCard(provider="tmdb", media_type="movie", external_id="10", title="Concurrent")
         self.service.add_watchlist(current)
         self.assertIsNone(self.service.add_watchlist(MediaCard(**preview["canonical"]), expected_absent=True))
-        row = database.get_media_watchlist("tmdb", "10", "movie")
+        row = discovery_repo.get_media_watchlist("tmdb", "10", "movie")
         assert row is not None
         snapshot = self.service.get_watchlist_snapshot(row["id"])
         self.assertEqual(snapshot["title"], "Concurrent")
@@ -959,14 +960,14 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertTrue(thread_names[0].startswith("discovery-refresh"))
 
     def test_confirmed_mapping_is_reused_without_search(self):
-        database.upsert_media_external_id("douban", "7", "movie", "550", "Movie", "1999", 1.0, True)
+        discovery_repo.upsert_media_external_id("douban", "7", "movie", "550", "Movie", "1999", 1.0, True)
         scraper = SimpleNamespace(search_candidates=lambda *args, **kwargs: self.fail("search should not run"))
         service = DiscoveryService(registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper)
         result = service.map_to_tmdb("douban", "7", "movie", "Movie", "1999")
         self.assertEqual((result["tmdb_id"], result["confirmed"]), ("550", True))
 
     def test_legacy_unconfirmed_mapping_does_not_hide_new_candidates(self):
-        database.upsert_media_external_id(
+        discovery_repo.upsert_media_external_id(
             "douban", "legacy-tentative", "movie", "550", "旧自动候选",
             "1999", 0.96, False,
         )
@@ -989,7 +990,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["tmdb_id"], "551")
 
     def test_explicit_confirmation_does_not_overwrite_existing_confirmed_mapping(self):
-        database.upsert_media_external_id(
+        discovery_repo.upsert_media_external_id(
             "douban", "confirmed-7", "movie", "550", "Existing Movie",
             "1999", 1.0, True,
         )
@@ -1006,7 +1007,7 @@ class DiscoveryServiceTests(unittest.TestCase):
             confirmed_tmdb_id="551", confirmed_title="Other", confirmed_year="2000",
         )
 
-        stored = database.get_media_external_id("douban", "confirmed-7", "movie")
+        stored = discovery_repo.get_media_external_id("douban", "confirmed-7", "movie")
         self.assertEqual((result["tmdb_id"], result["confirmed"]), ("550", True))
         assert stored is not None
         self.assertEqual(
@@ -1015,7 +1016,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         )
 
     def test_explicit_confirmation_corrects_existing_unconfirmed_mapping(self):
-        database.upsert_media_external_id(
+        discovery_repo.upsert_media_external_id(
             "douban", "7", "movie", "550", "Wrong Movie", "1998", 0.96, False,
         )
         scraper = SimpleNamespace(
@@ -1032,7 +1033,7 @@ class DiscoveryServiceTests(unittest.TestCase):
             confirmed_tmdb_id="551", confirmed_title="Correct Movie", confirmed_year="2000",
         )
 
-        stored = database.get_media_external_id("douban", "7", "movie")
+        stored = discovery_repo.get_media_external_id("douban", "7", "movie")
         self.assertEqual((result["tmdb_id"], result["confirmed"]), ("551", True))
         assert stored is not None
         self.assertEqual(
@@ -1049,13 +1050,13 @@ class DiscoveryServiceTests(unittest.TestCase):
         result = service.map_to_tmdb("douban", "8", "movie", "Fight Club", "1999")
         self.assertEqual((result["tmdb_id"], result["confirmed"]), ("", False))
         self.assertEqual(result["candidates"][0]["tmdb_id"], "550")
-        self.assertIsNone(database.get_media_external_id("douban", "8", "movie"))
+        self.assertIsNone(discovery_repo.get_media_external_id("douban", "8", "movie"))
 
         candidates[:] = [low]
         result = service.map_to_tmdb("douban", "9", "movie", "Maybe", "2000")
         self.assertEqual(result["tmdb_id"], "")
         self.assertEqual(result["candidates"][0]["tmdb_id"], "551")
-        self.assertIsNone(database.get_media_external_id("douban", "9", "movie"))
+        self.assertIsNone(discovery_repo.get_media_external_id("douban", "9", "movie"))
 
 
 if __name__ == "__main__":

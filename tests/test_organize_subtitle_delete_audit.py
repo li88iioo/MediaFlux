@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.modules import strm
 from app.clients.guangya import GuangYaFile
 from app.modules.subtitle_identity import SubtitleIdentity, plan_subtitle_companions
@@ -634,7 +635,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("managed-" + file.file_id)
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             ("guangya-meta:" if metadata else "guangya:") + source,
             file.file_id, file.etag, file.size, file.name, str(path),
             strm._content_fingerprint(path) if fingerprint else "",
@@ -655,7 +656,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["warnings"], [])
         self.assertEqual(self.pending(), [])
         self.wake.assert_not_called()
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_indexed_skipped_group_removes_only_owned_paths_and_hands_off_refresh(self):
         log_id, files = self.seed(subtitle=True)
@@ -668,10 +669,10 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["warnings"], [])
         self.assertTrue(all(not path.exists() for path in paths))
         self.assertTrue(neighbor.exists())
-        self.assertEqual(len(db.list_strm_index("guangya:library")), 1)
-        self.assertEqual(db.list_strm_index("guangya-meta:library"), [])
+        self.assertEqual(len(strm_repo.list_strm_index("guangya:library")), 1)
+        self.assertEqual(strm_repo.list_strm_index("guangya-meta:library"), [])
         self.assertEqual(self.pending(), [])
-        refresh = db.list_strm_refresh_entries()
+        refresh = strm_repo.list_strm_refresh_entries()
         self.assertTrue(refresh)
         self.assertTrue(all(not row["allow_emby"] for row in refresh))
         self.wake.return_value.wake.assert_called_once()
@@ -701,8 +702,8 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         log = db.get_organize_log(log_id)
         assert log is not None
         self.assertEqual(log["status"], "partial_failed")
-        self.assertEqual(len(db.list_strm_index("guangya:library")), 1)
-        self.assertEqual(db.list_strm_index("guangya-meta:library"), [])
+        self.assertEqual(len(strm_repo.list_strm_index("guangya:library")), 1)
+        self.assertEqual(strm_repo.list_strm_index("guangya-meta:library"), [])
 
     def test_changed_local_file_is_preserved_with_persistent_cleanup_warning(self):
         log_id, files = self.seed()
@@ -743,9 +744,9 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         result = self.delete(log_id)
         self.assertEqual(result["warnings"], [])
         self.assertTrue(path.exists())
-        self.assertEqual(len(db.list_strm_index("guangya:other-library")), 1)
+        self.assertEqual(len(strm_repo.list_strm_index("guangya:other-library")), 1)
         self.assertEqual(self.pending(), [])
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_outside_root_and_symlink_paths_are_preserved(self):
         outside = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -800,7 +801,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
 
     def test_metadata_only_queue_is_cancelled_without_triggering_sync(self):
         log_id, files = self.seed(subtitle=True)
-        db.enqueue_strm_metadata_jobs([{
+        strm_repo.enqueue_strm_metadata_jobs([{
             "source_id": "library", "file_id": files[1].file_id,
             "filename": files[1].name, "size": files[1].size, "etag": files[1].etag,
         }])
@@ -825,7 +826,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         self.rules.link_strm = False
         self.delete(log_id)
         self.assertTrue(path.exists())
-        self.assertEqual(len(db.list_strm_index("guangya:library")), 1)
+        self.assertEqual(len(strm_repo.list_strm_index("guangya:library")), 1)
         self.wake.assert_not_called()
 
     def test_cleanup_failure_does_not_replay_successful_cloud_delete(self):
@@ -848,12 +849,12 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
     def test_cleanup_ack_failure_keeps_receipt_for_idempotent_local_recovery(self):
         log_id, files = self.seed()
         path = self.index(files[0])
-        with patch.object(db, "delete_strm_path_cleanup", side_effect=RuntimeError("ACK interrupted")):
+        with patch.object(strm_repo, "delete_strm_path_cleanup", side_effect=RuntimeError("ACK interrupted")):
             result = self.delete(log_id)
         self.assertTrue(result["warnings"])
         self.assertFalse(path.exists())
         self.assertEqual(len(self.pending()), 1)
-        self.assertTrue(db.list_strm_refresh_entries())
+        self.assertTrue(strm_repo.list_strm_refresh_entries())
         restored = strm.cleanup_deleted_cloud_files({"video"}, allow_emby=False)
         self.assertEqual(restored["cleaned"], 0)
         self.assertEqual(self.pending(), [])

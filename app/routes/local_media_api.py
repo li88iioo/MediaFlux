@@ -8,6 +8,8 @@ from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import JSONResponse
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
+from app.repositories import organize_history as organize_history_repo
 from app.clients.base import close_media_server_client
 from app.clients.qbittorrent import close_qbittorrent_client
 from app.logger import get_logger
@@ -141,8 +143,8 @@ def _task_payload(task, source_name: str, active_confirmations: set[str]) -> dic
 
 def _task_detail_payload(task) -> dict:
     with db.get_conn() as conn:
-        _, active_confirmations, _ = db.active_organize_confirmation_refs(conn)
-    source = db.get_local_media_source(task.source_id, owner=_OWNER)
+        _, active_confirmations, _ = organize_history_repo.active_organize_confirmation_refs(conn)
+    source = local_media_repo.get_local_media_source(task.source_id, owner=_OWNER)
     payload = _task_payload(task, source.name if source else "已删除来源", active_confirmations)
     payload.update({
         "content_path": task.content_path,
@@ -223,7 +225,7 @@ def list_directories(
             return api_error(LEGACY_SOURCE_PATH_ERROR, 400)
         allowed_root = None
         if source_id:
-            source = db.get_local_media_source(source_id, owner=_OWNER)
+            source = local_media_repo.get_local_media_source(source_id, owner=_OWNER)
             if source is None:
                 return api_error("本地媒体来源不存在", 404)
             allowed_root = Path(source.local_root)
@@ -292,7 +294,7 @@ def create_source(request: Request, data: dict | None = Body(default=None)):
 def update_source(source_id: int, request: Request, data: dict | None = Body(default=None)):
     require_api_login(request)
     from app.modules.local_media_service import save_local_source_config
-    if db.get_local_media_source(source_id, owner=_OWNER) is None:
+    if local_media_repo.get_local_media_source(source_id, owner=_OWNER) is None:
         return api_error("本地媒体来源不存在", 404)
     try:
         return save_local_source_config(data or {}, source_id)["source"]
@@ -305,7 +307,7 @@ def delete_source(source_id: int, request: Request):
     require_api_login(request)
     from app.modules.local_media_service import delete_local_source_config
     try:
-        if db.get_local_media_source(source_id, owner=_OWNER) is None:
+        if local_media_repo.get_local_media_source(source_id, owner=_OWNER) is None:
             return api_error("本地媒体来源不存在", 404)
         return {"deleted": delete_local_source_config(source_id)["deleted"]}
     except Exception as exc:
@@ -320,7 +322,7 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
         if path and source_id <= 0:
             raise ValueError("浏览目录时必须指定媒体来源")
         if source_id > 0:
-            source = db.get_local_media_source(source_id, owner=_OWNER)
+            source = local_media_repo.get_local_media_source(source_id, owner=_OWNER)
             if source is None:
                 return api_error("本地媒体来源不存在", 404)
             selected_path = _text({"path": path}, "path", max_length=4096) or source.local_root
@@ -329,7 +331,7 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
             )
             if current is None:
                 return api_error(error or "目录读取失败", 400)
-            targets = db.list_local_library_targets(source.id, owner=_OWNER)
+            targets = local_media_repo.list_local_library_targets(source.id, owner=_OWNER)
             organize_ready = bool(targets) and source.mode != "preview_only"
             serialized, error = _candidate_payloads(
                 source, candidates, organize_ready=organize_ready, error=error, allow_nested=True,
@@ -362,8 +364,8 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
 
         items: list[dict] = []
         source_results: list[dict] = []
-        bound_sources = {target.source_id for target in db.list_local_library_targets(owner=_OWNER)}
-        for source in db.list_local_media_sources(owner=_OWNER):
+        bound_sources = {target.source_id for target in local_media_repo.list_local_library_targets(owner=_OWNER)}
+        for source in local_media_repo.list_local_media_sources(owner=_OWNER):
             candidates, error, _ = discover_local_media_directory_candidates(source)
             serialized, error = _candidate_payloads(
                 source, candidates,
@@ -386,7 +388,7 @@ def delete_media_item(request: Request, data: dict | None = Body(default=None)):
     payload = data or {}
     try:
         source_id = _integer(payload, "source_id", 0, 1, 2_147_483_647)
-        source = db.get_local_media_source(source_id, owner=_OWNER)
+        source = local_media_repo.get_local_media_source(source_id, owner=_OWNER)
         if source is None:
             return api_error("本地媒体来源不存在", 404)
         identity = payload.get("identity")
@@ -423,11 +425,11 @@ def scan_existing_media(request: Request):
 def list_tasks(request: Request, status: str = "", before_id: int = Query(default=0, ge=0, le=2**63 - 1)):
     require_api_login(request)
     try:
-        page = db.list_local_media_tasks(owner=_OWNER, status=status, limit=501, before_id=before_id)
+        page = local_media_repo.list_local_media_tasks(owner=_OWNER, status=status, limit=501, before_id=before_id)
         tasks, has_more = page[:500], len(page) > 500
-        sources = {source.id: source.name for source in db.list_local_media_sources(owner=_OWNER)}
+        sources = {source.id: source.name for source in local_media_repo.list_local_media_sources(owner=_OWNER)}
         with db.get_conn() as conn:
-            _, active_confirmations, _ = db.active_organize_confirmation_refs(conn)
+            _, active_confirmations, _ = organize_history_repo.active_organize_confirmation_refs(conn)
         return {
             "tasks": [_task_payload(item, sources.get(item.source_id, "已删除来源"), active_confirmations) for item in tasks],
             "has_more": has_more, "next": tasks[-1].id if has_more else None,
@@ -449,7 +451,7 @@ def clear_tasks(request: Request, data: dict | None = Body(default=None)):
         if len(raw_ids) > 500:
             raise ValueError("单次最多清除 500 条本地整理日志")
         task_ids = [_integer({"日志 ID": value}, "日志 ID", 0, 1, 2**63 - 1) for value in raw_ids]
-        return db.delete_local_media_tasks(task_ids, owner=_OWNER)
+        return local_media_repo.delete_local_media_tasks(task_ids, owner=_OWNER)
     except Exception as exc:
         return _safe_error(exc)
 
@@ -458,17 +460,17 @@ def clear_tasks(request: Request, data: dict | None = Body(default=None)):
 def task_detail(task_id: int, request: Request):
     require_api_login(request)
     try:
-        task = db.get_local_media_task(task_id, owner=_OWNER)
+        task = local_media_repo.get_local_media_task(task_id, owner=_OWNER)
         if task is None:
             return api_error("本地整理日志不存在", 404)
-        item_rows = db.list_local_media_task_items(task_id, owner=_OWNER)
+        item_rows = local_media_repo.list_local_media_task_items(task_id, owner=_OWNER)
         return {
             "task": _task_detail_payload(task),
             "recognition": _task_recognition_payload(task, item_rows),
             "items": [_task_item_payload(row) for row in item_rows],
             "steps": [
                 _task_step_payload(row)
-                for row in db.list_local_media_operation_steps(task_id, owner=_OWNER)
+                for row in local_media_repo.list_local_media_operation_steps(task_id, owner=_OWNER)
             ],
         }
     except Exception as exc:
@@ -481,7 +483,7 @@ def inspect_path(request: Request, data: dict | None = Body(default=None)):
     payload = data or {}
     try:
         source_id = _integer(payload, "source_id", 0, 1, 2_147_483_647)
-        source = db.get_local_media_source(source_id, owner=_OWNER)
+        source = local_media_repo.get_local_media_source(source_id, owner=_OWNER)
         if source is None:
             return api_error("本地媒体来源不存在", 404)
         path = _text(payload, "path") or source.local_root
@@ -563,9 +565,9 @@ def execute_media(request: Request, data: dict | None = Body(default=None)):
             preview_digest=_text(payload, "preview_digest", max_length=144),
         )
         notification_task_id = task_id
-        if not db.claim_local_media_task(task_id, expected="waiting_stable", owner=_OWNER):
+        if not local_media_repo.claim_local_media_task(task_id, expected="waiting_stable", owner=_OWNER):
             raise LocalMediaServiceError("任务已被其他操作认领")
-        task = db.get_local_media_task(task_id, owner=_OWNER)
+        task = local_media_repo.get_local_media_task(task_id, owner=_OWNER)
         if task is None:
             raise LocalMediaServiceError("本地媒体任务不存在")
         if task.qb_hash:
@@ -576,7 +578,7 @@ def execute_media(request: Request, data: dict | None = Body(default=None)):
                     raise LocalMediaServiceError("qB 客户端不可用")
             except Exception as exc:
                 message = "qB 客户端初始化失败，请检查下载器配置后重试；尚未移动源文件"
-                db.update_local_media_task(task_id, owner=_OWNER, status="failed", error=message)
+                local_media_repo.update_local_media_task(task_id, owner=_OWNER, status="failed", error=message)
                 logger.warning("手动整理qB客户端初始化失败 task=%s type=%s", task_id, type(exc).__name__)
                 raise LocalMediaServiceError(message) from exc
         result = service.execute_task(_OWNER, task_id, qb_client=qb_client)
@@ -624,7 +626,7 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
         confirm_interrupted_write = _boolean(
             payload, "confirm_interrupted_write", False,
         )
-        task = db.get_local_media_task(task_id, owner=_OWNER)
+        task = local_media_repo.get_local_media_task(task_id, owner=_OWNER)
         if (
             task is not None
             and db.is_interrupted_local_media_write_error(task.error)
@@ -636,7 +638,7 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
                 409,
             )
         retry_fields["confirm_interrupted_write"] = confirm_interrupted_write
-        if not db.reset_local_media_task(task_id, owner=_OWNER, **retry_fields):
+        if not local_media_repo.reset_local_media_task(task_id, owner=_OWNER, **retry_fields):
             return api_error("任务不存在或当前状态不可重试", 409)
         get_local_media_scheduler().reload()
         return {"queued": True, "task_id": task_id}

@@ -115,8 +115,8 @@ class TrackerScaleTests(unittest.TestCase):
     def setUp(self):
         self.tracker = DownloadTracker()
         self.enterContext(patch.object(self.tracker, "_run_torrent_data_cleanup_if_due"))
-        self.enterContext(patch("app.modules.download_tracker.db.recover_stale_submitting_download_requests", return_value=0))
-        self.enterContext(patch("app.modules.download_tracker.db.list_local_media_sources", return_value=[]))
+        self.enterContext(patch("app.repositories.download_requests.recover_stale_submitting_download_requests", return_value=0))
+        self.enterContext(patch("app.repositories.local_media.list_local_media_sources", return_value=[]))
         self.enterContext(patch("app.modules.download_tracker.db.kv_get", return_value="0"))
         self.enterContext(patch("app.modules.download_tracker.db.kv_set"))
         self.apply = self.enterContext(patch("app.modules.download_tracker.apply_download_tracker_update", return_value=None))
@@ -126,7 +126,7 @@ class TrackerScaleTests(unittest.TestCase):
                  "gy_status": "submitted", "gy_task_ids": json.dumps([str(i)]), "gy_batch_count": 1} for i in range(100)]
         qb_tasks = CountedTasks(SimpleNamespace(hash=str(i), name=str(i), progress=0.1, state="downloading") for i in range(1000))
         gy_tasks = CountedTasks({"id": str(i), "status": "running", "progress": 0.1} for i in range(1000))
-        self.enterContext(patch("app.modules.download_tracker.db.list_active_download_requests", return_value=rows))
+        self.enterContext(patch("app.repositories.download_requests.list_active_download_requests", return_value=rows))
         qb_fetch = self.enterContext(patch.object(self.tracker, "_qb_tasks", return_value=(True, qb_tasks)))
         gy_fetch = self.enterContext(patch.object(self.tracker, "_gy_tasks", return_value=(True, gy_tasks)))
         self.assertEqual(self.tracker.run_once(), 100)

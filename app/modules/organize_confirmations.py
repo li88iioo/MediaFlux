@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get
 from app.logger import get_logger
@@ -2289,12 +2291,12 @@ def _execute_local_media_confirmation(
         if expected_version <= 0 or expected_source_id <= 0 or not expected_digest or not rules_snapshot:
             raise ValueError("本地媒体确认快照无效，请前往 Web 重新处理")
 
-        task = db.get_local_media_task(task_id, owner=owner)
+        task = local_media_repo.get_local_media_task(task_id, owner=owner)
         if task is None or task.status != "requires_manual":
             raise ValueError("本地媒体任务已变化，请前往 Web 查看最新状态")
         if task.version != expected_version or task.source_id != expected_source_id:
             raise ValueError("本地媒体任务已更新，请前往 Web 重新确认")
-        source = db.get_local_media_source(task.source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
         if source is None:
             raise ValueError("本地媒体来源已删除，请前往 Web 重新配置")
 
@@ -2304,7 +2306,7 @@ def _execute_local_media_confirmation(
         inspection = scheduler.service.inspect_source(owner, task.source_id, task.content_path)
         if str(inspection.get("digest") or "") != expected_digest:
             raise ValueError("源文件在通知后发生变化，请前往 Web 重新检查")
-        if not db.claim_local_media_confirmation_task(
+        if not local_media_repo.claim_local_media_confirmation_task(
             task_id,
             owner=owner,
             expected_version=expected_version,
@@ -2322,7 +2324,7 @@ def _execute_local_media_confirmation(
         ):
             raise ValueError("本地媒体任务已被其他操作认领，请前往 Web 查看最新状态")
         claimed_task = True
-        current = db.get_local_media_task(task_id, owner=owner)
+        current = local_media_repo.get_local_media_task(task_id, owner=owner)
         if current is None:
             raise ValueError("本地媒体任务不存在")
         qb_client = scheduler.qb_factory() if current.qb_hash else None
@@ -2351,7 +2353,7 @@ def _execute_local_media_confirmation(
         message = str(exc or "本地媒体确认整理失败").strip() or "本地媒体确认整理失败"
         if claimed_task and task_id > 0:
             try:
-                current = db.get_local_media_task(
+                current = local_media_repo.get_local_media_task(
                     task_id, owner=str(payload.get("owner") or "admin")
                 )
                 if current is not None and current.status == "recognizing":
@@ -2360,13 +2362,13 @@ def _execute_local_media_confirmation(
                         if bool(getattr(exc, "requires_manual", False))
                         else "failed"
                     )
-                    db.update_local_media_task(
+                    local_media_repo.update_local_media_task(
                         task_id,
                         owner=current.owner,
                         status=failure_status,
                         error=message,
                     )
-                    current = db.get_local_media_task(task_id, owner=current.owner)
+                    current = local_media_repo.get_local_media_task(task_id, owner=current.owner)
             except Exception:
                 logger.warning(
                     "本地媒体确认失败状态保存异常 task=%s", task_id, exc_info=True
@@ -2580,7 +2582,7 @@ def _cleanup_confirmed_source(payload: dict, organizer: Organizer, rules: Organi
         parent_id = str(payload.get("source_parent_id") or "").strip()
         if not source_id or not parent_id:
             raise RuntimeError("来源目录身份缺失，已保留空目录")
-        staging_ids = set(db.list_protected_guangya_staging_ids())
+        staging_ids = set(download_requests_repo.list_protected_guangya_staging_ids())
         if source_inside_protected_staging(organizer.client, parent_id, staging_ids):
             Organizer._append_reason(
                 stats, "empty_dir_cleanup_reasons", "下载隔离目录由下载收尾处理，未执行通用清理", limit=8,

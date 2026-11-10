@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import organize_confirmations as confirmations
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
@@ -246,7 +247,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
             patch("app.modules.organize_tasks.config.get", side_effect=lambda key, default="": (
                 '[{"id":"source","name":"Source"}]' if key == "GY_ORGANIZE_SOURCE_DIRS" else default
             )),
-            patch.object(db, "list_protected_guangya_staging_ids", return_value=[]),
+            patch.object(download_requests_repo, "list_protected_guangya_staging_ids", return_value=[]),
             patch.object(confirmations, "_record_confirmation_learning", return_value=[]),
             patch.object(
                 confirmations,
@@ -306,8 +307,8 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
     def test_agent_clean_download_uses_staging_finalizer_not_generic_cleanup(self):
         from app.modules.process_lock import CrossProcessLock
 
-        request_id, _ = db.create_download_request("agent-clean-download", "magnet")
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request("agent-clean-download", "magnet")
+        download_requests_repo.update_download_request(
             request_id, targets="guangya", status="completed", gy_status="completed",
             gy_isolated=1, gy_target_dir="parent", gy_staging_parent_dir="source", gy_staging_name="parent",
             gy_staging_cleanup_status="retained", organize_started=1,
@@ -333,7 +334,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
         self.assertNotIn("已清理 0 个", str(event.fields))
         self.assertIn(("目录清理", "由下载流程核验收尾，结果见下载记录"), event.fields)
         self.assertEqual(result["stats"]["download_staging_policy"], "cleanup_empty")
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["organize_status"], "completed")
         self.assertEqual(row["gy_staging_cleanup_status"], "completed")

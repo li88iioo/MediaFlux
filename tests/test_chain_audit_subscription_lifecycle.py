@@ -116,11 +116,11 @@ class SubscriptionSchedulerLifecycleTests(unittest.TestCase):
         with (
             patch.object(scheduler, "_loop", side_effect=scheduler._stop_event.wait),
             patch(
-                "app.modules.media_subscription_scheduler.db.recover_stale_media_subscription_checks",
+                "app.repositories.media_subscriptions.recover_stale_media_subscription_checks",
                 return_value=0,
             ),
             patch(
-                "app.modules.media_subscription_scheduler.db.list_due_media_subscriptions",
+                "app.repositories.media_subscriptions.list_due_media_subscriptions",
                 return_value=[{"id": 1}],
             ),
         ):

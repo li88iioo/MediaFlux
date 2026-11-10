@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app import sdk
 from app.modules.media_automation_rules import drain_automation_rules
 from app.modules.telegram_notification_policy import NotificationImportance
@@ -107,10 +108,10 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
         self.assertEqual(sum("GROUP BY status" in sql for sql in statements), 1)
 
     def _linked_download(self, oldest_status):
-        request, _ = db.create_download_request(
+        request, _ = download_requests_repo.create_download_request(
             "fixture-linked", "magnet", title="Linked"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request,
             targets="qb",
             status="completed",
@@ -247,8 +248,8 @@ class ActivityMemberRollupAuditTests(IsolatedDatabaseTestCase):
         self.assertNotIn("/fixture", str(publish.call_args.args[1]))
 
     def test_small_linked_list_does_not_pay_for_overflow_aggregation(self):
-        request, _ = db.create_download_request("small-linked", "magnet", title="Small")
-        db.update_download_request(
+        request, _ = download_requests_repo.create_download_request("small-linked", "magnet", title="Small")
+        download_requests_repo.update_download_request(
             request,
             targets="qb",
             status="completed",

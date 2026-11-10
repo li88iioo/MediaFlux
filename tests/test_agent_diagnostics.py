@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db, sdk
+from app.repositories import rss as rss_repo
 from app.agent.kernel.bootstrap import build_tool_catalog
 from app.modules import diagnostics as diag
 from app.agent.kernel.pipeline import ToolPipeline
@@ -51,7 +52,7 @@ class DiagnosticQueryTests(IsolatedDatabaseTestCase):
                 "VALUES(?,?,?,?,?,?,?,'2026-11-03','2026-11-03','2026-11-03')",
                 [("private-continuation", "agent", "-1001234567890", event_json, "pending", 0, ""),
                  ("download-result", "download", "", "{}", "retry_wait", 2, "投递超时")])
-        db.add_rss_subscription("Mikan", f"https://mikan.example/rss?{SECRET}")
+        rss_repo.add_rss_subscription("Mikan", f"https://mikan.example/rss?{SECRET}")
 
     def test_schema_lists_operational_tables_without_credential_columns(self):
         tables = {row["table"]: row["columns"] for row in query()["data"]["tables"]}

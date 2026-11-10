@@ -31,7 +31,7 @@ from tests.test_agent_sdk_effects import context_for
 
 
 def add(*, enabled=1, config_source="custom", port=19096):
-    return db.add_media_proxy_instance(name="真实实例名称", server_type="jellyfin", config_source=config_source,
+    return repository.add_media_proxy_instance(name="真实实例名称", server_type="jellyfin", config_source=config_source,
         upstream_url="http://upstream.invalid:8096/emby", api_key="NATIVE_PROXY_PRIVATE_KEY",
         listen_host="127.0.0.1", listen_port=port, local_root="/fixture/media", enabled=enabled)
 
@@ -67,7 +67,7 @@ def runtime(instance_id: int) -> service.ProxyRuntime:
 
 
 def record(instance_id, index, status=502):
-    return db.record_media_proxy_playback_attempt(instance_id=instance_id, playback_session_key="fixture-session",
+    return repository.record_media_proxy_playback_attempt(instance_id=instance_id, playback_session_key="fixture-session",
         media_item_id="fixture-media", media_name="保留的媒体名", route_class=f"route_{index % 12}", method="GET",
         status_code=status, source="guangya", failure_stage=f"stage_{index % 12}", total_latency_ms=55,
         upstream_latency_ms=12, error="无法生成直链 " + "完整诊断细节。" * 80
@@ -89,8 +89,8 @@ def test_only_native_entries_and_real_instance_id_contract():
 def test_instances_keep_full_configuration_runtime_errors_and_real_ids(backend):
     removed = add(port=19090)
     target = add(port=19091, config_source="configured:jellyfin")
-    db.delete_media_proxy_instance(removed)
-    db.update_media_proxy_instance(target, {"status": "error", "last_error": "根因：" + "详细异常。" * 160 + " tail-fact NATIVE_CONFIGURED_PRIVATE_KEY"})
+    repository.delete_media_proxy_instance(removed)
+    repository.update_media_proxy_instance(target, {"status": "error", "last_error": "根因：" + "详细异常。" * 160 + " tail-fact NATIVE_CONFIGURED_PRIVATE_KEY"})
     backend.manager.status.return_value = {target: {"running": True, "listen_host": "127.0.0.1", "listen_port": 19091}}
     result = sdk.playback.instances()
     item, = result["data"]["instances"]
@@ -188,7 +188,7 @@ def test_cold_sqlite_confirmation_only_operates_real_target_once(backend, operat
         backend.clear.assert_not_called()
         backend.manager.request_restart.assert_not_called()
         backend.manager.request_reconcile.assert_not_called()
-        db.delete_media_proxy_instance(first)  # 原序号移动不改变真实目标。
+        repository.delete_media_proxy_instance(first)  # 原序号移动不改变真实目标。
         cold = executor()
         pending = await cold.get_pending_plan(owner=context.owner, session_id=context.session_id)
         assert pending is not None and pending.plan_id == plan.plan_id
@@ -198,7 +198,7 @@ def test_cold_sqlite_confirmation_only_operates_real_target_once(backend, operat
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)
         backend.clear.assert_called_once_with(target)
-        row = db.get_media_proxy_instance(target)
+        row = repository.get_media_proxy_instance(target)
         assert row is not None
         if operation == "set_enabled":
             assert row["enabled"] == 0
@@ -229,13 +229,13 @@ def test_frozen_target_config_cancellation_and_scope_block_all_effects(backend, 
         elif change in {"owner", "session"}:
             context = await context_for(SQLiteKernelStore(), **{change: "other"})
         elif change == "delete":
-            db.delete_media_proxy_instance(target)
+            repository.delete_media_proxy_instance(target)
         elif change == "target_config":
-            db.update_media_proxy_instance(target, {"listen_port": 29096, "local_root": "/new/media"})
+            repository.update_media_proxy_instance(target, {"listen_port": 29096, "local_root": "/new/media"})
         elif change == "credential":
-            db.update_media_proxy_instance(target, {"api_key": "changed-private-key"})
+            repository.update_media_proxy_instance(target, {"api_key": "changed-private-key"})
         elif change == "forwarding":
-            db.update_media_proxy_instance(target, {"trust_forwarded_headers": 1, "trusted_proxy_cidrs_json": '["10.0.0.0/8"]'})
+            repository.update_media_proxy_instance(target, {"trust_forwarded_headers": 1, "trusted_proxy_cidrs_json": '["10.0.0.0/8"]'})
         elif change == "profile":
             monkeypatch.setenv("JELLYFIN_API_KEY", "changed-configured-key")
         capture = service._proxy_change_state
@@ -260,7 +260,7 @@ def test_frozen_target_config_cancellation_and_scope_block_all_effects(backend, 
         backend.manager.request_restart.assert_not_called()
         backend.manager.request_reconcile.assert_not_called()
         if change != "delete":
-            row = db.get_media_proxy_instance(target)
+            row = repository.get_media_proxy_instance(target)
             assert row is not None and row["enabled"] == 1
     asyncio.run(check())
 
@@ -301,7 +301,7 @@ def test_enable_saved_when_runtime_reconcile_not_queued(backend):
     backend.manager.request_reconcile.side_effect = RuntimeError("PRIVATE queue error")
     result = sdk.playback.set_enabled(target, True)
     assert result["ok"] and result["status"] == "completed" and not result["data"]["runtime_refreshed"]
-    row = db.get_media_proxy_instance(target)
+    row = repository.get_media_proxy_instance(target)
     assert row is not None and row["enabled"] == 1 and "PRIVATE" not in json.dumps(result)
 
 
@@ -321,7 +321,7 @@ def test_native_control_rejects_old_ordinals_and_invalid_parameters(backend, arg
 def test_queued_restart_config_drift_does_not_stop_or_start_runtime(backend):
     target = add()
     prepared = service.prepare_playback_proxy_change("restart", target)
-    db.update_media_proxy_instance(target, {"listen_port": 29096})
+    repository.update_media_proxy_instance(target, {"listen_port": 29096})
     manager = service.MediaProxyManager()
     previous = runtime(target)
     manager._runtimes[target] = previous
@@ -386,7 +386,7 @@ def test_enable_exception_after_sqlite_write_is_unknown_and_never_replayed(backe
         with pytest.raises(ToolPipelineError) as caught:
             await executor().execute_confirmed(plan.plan_id, context=context)
         assert caught.value.execution_started is True and "PRIVATE" not in str(caught.value)
-        row = db.get_media_proxy_instance(target)
+        row = repository.get_media_proxy_instance(target)
         assert row is not None and row["enabled"] == 0
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)
@@ -399,7 +399,7 @@ def test_enable_exception_after_sqlite_write_is_unknown_and_never_replayed(backe
 def test_native_python_cli_full_fact_files_to_cold_confirmation(backend, tmp_path, monkeypatch, language):
     obsolete = add(port=19090)
     target = add(port=19091)
-    db.delete_media_proxy_instance(obsolete)
+    repository.delete_media_proxy_instance(obsolete)
     record(target, 0)
     monkeypatch.setattr(sandbox, "get_runtime_paths", lambda: SimpleNamespace(data_dir=tmp_path, runtime_dir=tmp_path / "runtime"))
     async def check():

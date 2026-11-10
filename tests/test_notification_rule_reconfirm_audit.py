@@ -6,6 +6,7 @@ import sqlite3
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules import media_subscription_notifications as actions
 from app.modules.media_subscriptions import MediaSubscriptionError
 from app.agent.models import ToolContext
@@ -19,7 +20,7 @@ class NotificationRuleReconfirmAuditTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM media_subscription_notification_rules")
             conn.execute("DELETE FROM media_subscriptions")
         self.context = ToolContext(owner="audit", session_id="isolated")
-        self.sid = db.add_media_subscription(
+        self.sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="606",
             tmdb_id="606",

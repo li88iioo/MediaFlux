@@ -366,7 +366,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "api_key": "server-token", "enabled": 1,
         }
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=row),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row),
             patch("app.modules.media_proxy._resolve_upstream_addresses", return_value=("203.0.113.7",)),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
         ):
@@ -401,7 +401,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=row,
             ),
             patch(
@@ -432,7 +432,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "enabled": 1,
         }
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=row),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._playback_info_response_limit", return_value=4),
         ):
@@ -444,7 +444,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         stack = ExitStack()
         stack.enter_context(
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance())
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance())
         )
         stack.enter_context(patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient))
         stack.enter_context(
@@ -500,10 +500,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=binding),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=binding),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
             patch("app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)),
@@ -535,8 +535,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
             patch("app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)),
@@ -595,11 +595,11 @@ class HybridMediaProxyTests(unittest.TestCase):
                 app = media_proxy.create_proxy_app(7)
                 with (
                     patch(
-                        "app.modules.media_proxy.database.get_media_proxy_instance",
+                        "app.repositories.media_proxy.get_media_proxy_instance",
                         return_value=self._instance(),
                     ),
                     patch(
-                        "app.modules.media_proxy.database.get_media_proxy_binding",
+                        "app.repositories.media_proxy.get_media_proxy_binding",
                         return_value=binding,
                     ),
                     patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -621,7 +621,7 @@ class HybridMediaProxyTests(unittest.TestCase):
     def test_direct_playgy_rejects_valid_token_without_file_playback_scope(self):
         stack, client = self._client()
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding", return_value=None
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
         ), client:
             response = client.get(
                 "/playgy/known-but-ungranted/e/1/Movie.mkv?api_key=valid-token",
@@ -636,8 +636,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"ok")]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -658,7 +658,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -678,8 +678,8 @@ class HybridMediaProxyTests(unittest.TestCase):
     def test_oversized_request_body_is_rejected_before_contacting_upstream(self):
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._proxy_request_body_limit", return_value=8),
             TestClient(app, raise_server_exceptions=False) as client,
@@ -693,8 +693,8 @@ class HybridMediaProxyTests(unittest.TestCase):
     def test_client_disconnect_while_reading_body_is_not_raised_as_asgi_error(self):
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch(
                 "app.modules.media_proxy._read_proxy_request_body",
@@ -723,8 +723,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -745,11 +745,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -779,11 +779,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch(
@@ -816,11 +816,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch(
@@ -849,7 +849,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         instance = {**self._instance(), "server_type": "jellyfin"}
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -893,7 +893,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -944,7 +944,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -1062,7 +1062,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         instance = {**self._instance(), "server_type": "jellyfin"}
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -1097,7 +1097,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         authorization = 'MediaBrowser Token="same-token", Client="Jellyfin"'
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -1126,11 +1126,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1169,7 +1169,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1209,7 +1209,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1252,7 +1252,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         path = "/Videos/hls-item/hls1/playlist/0.mp4"
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1290,7 +1290,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1324,7 +1324,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1374,7 +1374,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1428,7 +1428,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -1651,7 +1651,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "media_source_id": "version A/1080p?",
         }
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=binding,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "multi-item")
@@ -1681,7 +1681,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             return binding if source_id in {"cloud version/4k", ""} else None
 
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             side_effect=binding_lookup,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(
@@ -1700,9 +1700,9 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 side_effect=binding_lookup,
             ),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -1733,7 +1733,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "media_source_id": "",
         }
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=item_binding,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "mixed-item")
@@ -1753,8 +1753,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=item_binding),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=item_binding),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
             patch("app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)),
@@ -1778,7 +1778,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "media_source_id": "",
         }
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=item_binding,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(
@@ -1799,8 +1799,8 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=item_binding),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=item_binding),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
             patch("app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)),
             TestClient(app, raise_server_exceptions=False) as client,
@@ -1918,7 +1918,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"system-info")]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=instance),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=instance),
             patch("app.modules.media_proxy.socket.getaddrinfo", return_value=resolved) as resolver,
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
@@ -1957,7 +1957,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2000,7 +2000,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 app = media_proxy.create_proxy_app(7)
                 with (
                     patch(
-                        "app.modules.media_proxy.database.get_media_proxy_instance",
+                        "app.repositories.media_proxy.get_media_proxy_instance",
                         return_value=instance,
                     ),
                     patch(
@@ -2047,7 +2047,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2080,7 +2080,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2108,7 +2108,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -2136,7 +2136,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"system-info")]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=instance),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=instance),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -2278,7 +2278,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         websocket = DuplicateAuthorizationWebSocket()
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2342,7 +2342,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         connector = object()
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2448,7 +2448,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2577,7 +2577,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2652,7 +2652,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2737,7 +2737,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=instance,
             ),
             patch(
@@ -2836,7 +2836,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             and getattr(route, "methods", None) is None
         )
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_instance",
+            "app.repositories.media_proxy.get_media_proxy_instance",
             return_value=instance,
         ), patch(
             "app.modules.media_proxy._pin_upstream_target",
@@ -2937,7 +2937,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             and getattr(route, "methods", None) is None
         )
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_instance",
+            "app.repositories.media_proxy.get_media_proxy_instance",
             return_value=instance,
         ), patch(
             "app.modules.media_proxy._pin_upstream_target",
@@ -3007,8 +3007,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         from starlette.requests import Request
         request = Request(scope, receive)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
         ):
             assert isinstance(route, Route)
@@ -3028,11 +3028,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -3061,11 +3061,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -3115,8 +3115,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         from starlette.requests import Request
         request = Request(scope, receive)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._playback_info_response_limit", return_value=4),
         ):
@@ -3140,7 +3140,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self._grant_file("client-token", "header-item", "header-source", "private-file")
         stack, client = self._client()
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding", return_value=None
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
         ), client:
             response = client.get(
                 "/playgy/private-file/e/1/a.mkv?api_key=client-token",
@@ -3253,7 +3253,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             return None
 
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             side_effect=lookup,
         ):
             resolved = media_proxy._media_proxy_binding(7, compact, compact)
@@ -3361,7 +3361,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         local_before = copy.deepcopy(local_source)
         unknown_before = copy.deepcopy(unknown_source)
 
-        with patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None):
+        with patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None):
             rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "item-1")
 
         self.assertTrue(changed)
@@ -3413,8 +3413,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -3478,11 +3478,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -3619,11 +3619,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -3766,11 +3766,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -3840,11 +3840,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -3942,11 +3942,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4132,7 +4132,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 }
                 allowed_signatures: set[str] = set()
                 with patch(
-                    "app.modules.media_proxy.database.get_media_proxy_binding",
+                    "app.repositories.media_proxy.get_media_proxy_binding",
                     return_value=None,
                 ):
                     _rewritten, changed = media_proxy.rewrite_playback_info(
@@ -4186,11 +4186,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4260,11 +4260,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=legacy_binding,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4323,7 +4323,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         stack, client = self._client(base_url="https://testserver")
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=None,
         ), client:
             response = client.get(
@@ -4377,11 +4377,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4457,11 +4457,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4522,11 +4522,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4595,11 +4595,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4669,11 +4669,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4742,11 +4742,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -4811,11 +4811,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", SlowAsyncClient),
@@ -4919,11 +4919,11 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch(
@@ -4992,7 +4992,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
@@ -5048,11 +5048,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5142,11 +5142,11 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5207,7 +5207,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "?MediaSourceId=ua-source&api_key=client-token"
         )
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=None,
         ), client:
             first = client.get(
@@ -5263,11 +5263,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.GuangYaClient", BoundClient),
@@ -5317,11 +5317,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5383,11 +5383,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5466,11 +5466,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5542,11 +5542,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5661,11 +5661,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5762,11 +5762,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5888,11 +5888,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -5953,11 +5953,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6013,11 +6013,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6077,11 +6077,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6151,11 +6151,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6231,11 +6231,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6316,11 +6316,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6421,11 +6421,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6497,11 +6497,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6591,7 +6591,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         payload = {"MediaSources": [source]}
 
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=None,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(
@@ -6637,11 +6637,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6725,11 +6725,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -6824,7 +6824,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             with self.subTest(source=source):
                 payload = {"MediaSources": [copy.deepcopy(source)]}
                 with patch(
-                    "app.modules.media_proxy.database.get_media_proxy_binding",
+                    "app.repositories.media_proxy.get_media_proxy_binding",
                     return_value=None,
                 ):
                     rewritten, changed = media_proxy.rewrite_playback_info(
@@ -6901,11 +6901,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7002,11 +7002,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7067,11 +7067,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7143,11 +7143,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7245,11 +7245,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7322,7 +7322,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         authorize = AsyncMock(return_value=True)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7383,11 +7383,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7454,11 +7454,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7525,11 +7525,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7591,11 +7591,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7650,11 +7650,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7717,11 +7717,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7793,8 +7793,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)),
             patch("app.modules.media_proxy.GuangYaClient", GuangYa),
@@ -7868,11 +7868,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7931,11 +7931,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -7977,7 +7977,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -8020,11 +8020,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -8084,11 +8084,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -8140,10 +8140,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8225,11 +8225,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -8310,11 +8310,11 @@ class HybridMediaProxyTests(unittest.TestCase):
             patch.object(media_proxy, "_item_level_binding_scopes", scopes),
             patch.object(media_proxy, "_playback_grants", grants),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=None,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -8355,10 +8355,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8388,10 +8388,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             TestClient(app, raise_server_exceptions=False) as client,
@@ -8410,10 +8410,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -8451,10 +8451,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8500,10 +8500,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8551,10 +8551,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8619,10 +8619,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._client_is_authorized", new=authorize),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8649,10 +8649,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -8680,10 +8680,10 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -8709,7 +8709,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self._grant_file("client-token", "item-2", "source-2", "manual-file", manual)
         stack, client = self._client()
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding", return_value=manual
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=manual
         ), client:
             response = client.get(
                 "/emby/Videos/item-2/stream?MediaSourceId=source-2&api_key=client-token",
@@ -8725,7 +8725,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self._grant_file("client-token", "item-3", "source-3", "dynamic-file")
         stack, client = self._client()
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding", return_value=None
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
         ), client:
             first = client.get(
                 "/Videos/item-3/stream?MediaSourceId=source-3&api_key=client-token",
@@ -8748,7 +8748,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self._grant_file("client-token", "direct-item", "direct-source", "direct-file")
         stack, client = self._client()
         with stack, patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding", return_value=None
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
         ), client:
             failed = client.get(
                 "/playgy/direct-file/etag/123/Movie.mkv?api_key=client-token",
@@ -8800,7 +8800,7 @@ class HybridMediaProxyTests(unittest.TestCase):
     def test_direct_playgy_uses_existing_client_token_authorization(self):
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
             patch(
                 "app.modules.media_proxy._client_is_authorized",
@@ -8834,8 +8834,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -8881,7 +8881,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
 
         with patch(
-            "app.modules.media_proxy.database.get_media_proxy_binding",
+            "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=fallback_binding,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "mixed-item")
@@ -8900,9 +8900,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         app = media_proxy.create_proxy_app(7)
         with (
-            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
+                "app.repositories.media_proxy.get_media_proxy_binding",
                 return_value=fallback_binding,
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -9088,12 +9088,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
+                "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
-            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
-            patch("app.modules.media_proxy.database.record_media_proxy_playback_attempt"),
+            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
+            patch("app.repositories.media_proxy.record_media_proxy_playback_attempt"),
             patch.object(media_proxy.logger, "debug") as debug,
             TestClient(app, raise_server_exceptions=False) as client,
         ):

@@ -93,19 +93,19 @@ def executor(store, *, authorization=None):
 
 @pytest.fixture
 def activity_request():
-    from app import database as db
+    from app.repositories import download_requests as download_requests_repo
     from app.repositories import activity as repository
 
     with isolated_test_database(), patch.object(repository, "notification_route_settings", side_effect=lambda owner, **_: {
         "notification_owner": owner, "notification_chat_id": "123",
     }), patch("socket.socket.connect", side_effect=AssertionError("no external service")):
-        identifier, _ = db.create_download_request("native-follow", "magnet", title="关注示例")
-        db.update_download_request(identifier, status="downloading", gy_status="downloading")
+        identifier, _ = download_requests_repo.create_download_request("native-follow", "magnet", title="关注示例")
+        download_requests_repo.update_download_request(identifier, status="downloading", gy_status="downloading")
         yield identifier
 
 
 def test_activity_follow_rpc_cold_confirmation_once_and_unfollow_nochange(activity_request, tmp_path):
-    from app import database as db
+    from app.repositories import download_requests as download_requests_repo
     from app.repositories import media_automation_rules as rules
     from app.repositories.agent_jobs import agent_job_owner_digest
 
@@ -138,7 +138,7 @@ def test_activity_follow_rpc_cold_confirmation_once_and_unfollow_nochange(activi
         assert len(rules.list_rules(agent_job_owner_digest(context.owner), kind="activity_follow")) == 1
         with sdk.call_owner("other-owner"):
             assert sdk.activity.follows()["data"]["items"] == []
-        request_row = db.get_download_request(activity_request)
+        request_row = download_requests_repo.get_download_request(activity_request)
         assert request_row is not None and request_row["status"] == "downloading"
         stop = (await restored.prepare("activity.unfollow", {"rule_id": saved["rule_id"]}, context=context)).effect_plan
         assert stop is not None
@@ -223,7 +223,7 @@ def test_native_activity_follow_script_stops_at_card_and_is_not_replayed(activit
 
 @pytest.fixture
 def retry_backend(monkeypatch):
-    from app import database as db
+    from app.repositories import download_requests as download_requests_repo
     from app.modules import download_dispatcher as dispatcher
 
     monkeypatch.setenv("QB_URL", "http://qb.invalid")
@@ -231,9 +231,9 @@ def retry_backend(monkeypatch):
         "ok": True, "task_id": "a" * 40,
     }) as backend, patch.object(dispatcher, "_submit_guangya", side_effect=AssertionError("unselected target")), \
          patch("socket.socket.connect", side_effect=AssertionError("no real download")):
-        request_id, _ = db.create_download_request("retry-native", "magnet", title="Private.Show",
+        request_id, _ = download_requests_repo.create_download_request("retry-native", "magnet", title="Private.Show",
             source_value="magnet:?xt=urn:btih:" + "a" * 40, origin="agent")
-        db.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
+        download_requests_repo.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
         backend.request_id = request_id
         yield backend
 
@@ -285,7 +285,7 @@ def test_native_retry_rpc_freezes_plan_and_confirmation_survives_restart_once(re
 @pytest.mark.parametrize("change", ["cancel", "cancellation", "source", "config", "foreign_owner"])
 def test_native_retry_cancel_or_frozen_drift_never_writes(retry_backend, monkeypatch, change):
     async def check():
-        from app import database as db
+        from app.repositories import download_requests as download_requests_repo
 
         store = SQLiteKernelStore()
         context = await context_for(store)
@@ -299,7 +299,7 @@ def test_native_retry_cancel_or_frozen_drift_never_writes(retry_backend, monkeyp
         elif change == "cancellation":
             context.cancellation.cancel()
         elif change == "source":
-            db.update_download_request(retry_backend.request_id, title="changed")
+            download_requests_repo.update_download_request(retry_backend.request_id, title="changed")
         elif change == "config":
             monkeypatch.setenv("TG_QB_SAVE_PATH", "/changed")
         else:
@@ -310,7 +310,7 @@ def test_native_retry_cancel_or_frozen_drift_never_writes(retry_backend, monkeyp
             assert isinstance(error.value, ToolPipelineError)
             assert error.value.code == "confirmation_stale"
         retry_backend.assert_not_called()
-        row = db.get_download_request(retry_backend.request_id)
+        row = download_requests_repo.get_download_request(retry_backend.request_id)
         assert row is not None and row["qb_status"] == "failed"
 
     asyncio.run(check())
@@ -575,6 +575,7 @@ def test_native_download_cancellation_during_resolution_never_submits(resources_
 @pytest.mark.parametrize("method", ["downloads.submit", "downloads.retry"])
 def test_native_download_cancel_during_shared_preflight_never_writes(retry_backend, method):
     from app import database as db
+    from app.repositories import download_requests as download_requests_repo
     from app.indexers import downloads
     from app.modules import download_dispatcher
 
@@ -606,7 +607,7 @@ def test_native_download_cancel_during_shared_preflight_never_writes(retry_backe
         retry_backend.assert_not_called()
         with db.get_conn() as conn:
             assert conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0] == 1
-        row = db.get_download_request(retry_backend.request_id)
+        row = download_requests_repo.get_download_request(retry_backend.request_id)
         assert row is not None and row["qb_status"] == "failed"
 
     asyncio.run(check())
@@ -788,6 +789,7 @@ def test_session_emits_confirmation_and_resumes_with_authoritative_receipt(resou
 ])
 def test_native_url_rpc_freezes_default_and_cold_confirm_is_once_only(retry_backend, tmp_path, url, kind):
     from app import database as db
+    from app.repositories import download_requests as download_requests_repo
 
     async def check():
         store = SQLiteKernelStore()
@@ -823,7 +825,7 @@ def test_native_url_rpc_freezes_default_and_cold_confirm_is_once_only(retry_back
         assert result.outcome.public_content['status'] == 'accepted'
         data = result.outcome.public_content['data']
         assert data['target'] == 'qb' and data['kind'] == kind and data['created']
-        row = db.get_download_request(data['request_id'])
+        row = download_requests_repo.get_download_request(data['request_id'])
         assert row is not None
         assert row['source_value'] == url and row['kind'] == kind
         # 保留旧 direct 行为：HTTP 原链接交由既有 dispatcher，不提前拉 torrent 或改变去重身份。
@@ -871,7 +873,7 @@ def test_native_url_cancel_and_frozen_target_required(retry_backend, change):
 
 
 def test_native_url_unknown_acceptance_is_recorded_and_not_retried(retry_backend):
-    from app import database as db
+    from app.repositories import download_requests as download_requests_repo
 
     async def check():
         retry_backend.side_effect = TimeoutError('unknown backend acceptance')
@@ -884,7 +886,7 @@ def test_native_url_unknown_acceptance_is_recorded_and_not_retried(retry_backend
         first = await effects.execute_confirmed(plan.plan_id, context=context)
         assert first.outcome.public_content['status'] == 'outcome_unknown'
         request_id = first.outcome.public_content['data']['request_id']
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None and row['qb_status'] == 'outcome_unknown'
         rebuilt = executor(SQLiteKernelStore())
         second = (await rebuilt.prepare('downloads.submit', arguments, context=context)).effect_plan
@@ -892,7 +894,7 @@ def test_native_url_unknown_acceptance_is_recorded_and_not_retried(retry_backend
         duplicate = await rebuilt.execute_confirmed(second.plan_id, context=context)
         assert duplicate.outcome.public_content['data']['duplicate']
         assert duplicate.outcome.public_content['data']['request_id'] == request_id
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None and row['qb_status'] == 'outcome_unknown'
         retry_backend.assert_called_once()
 

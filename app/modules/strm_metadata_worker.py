@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, redact_sensitive_text
@@ -85,7 +86,7 @@ class STRMMetadataWorker:
         self._wake_event.set()
 
     def status(self) -> dict[str, Any]:
-        counts = db.count_strm_metadata_jobs()
+        counts = strm_repo.count_strm_metadata_jobs()
         with self._state_lock:
             breaker_remaining = max(0, int(self._breaker_until - time.monotonic()))
             return {
@@ -129,7 +130,7 @@ class STRMMetadataWorker:
                             continue
                     # 只有持锁者可以恢复前驱租约；恢复成功前不开始消费。
                     if recovery_pending:
-                        recovered = db.recover_stale_strm_metadata_jobs(force=True)
+                        recovered = strm_repo.recover_stale_strm_metadata_jobs(force=True)
                         recovery_pending = False
                         with self._state_lock:
                             self._consumer_active = True
@@ -154,7 +155,7 @@ class STRMMetadataWorker:
                     logger.exception("STRM 元数据退出刷新交接失败，保留 outbox 待恢复")
                 finally:
                     try:
-                        db.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
+                        strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
                     except Exception:
                         logger.exception("恢复当前 STRM 元数据租约失败")
                     finally:
@@ -184,7 +185,7 @@ class STRMMetadataWorker:
         if breaker_until > now_mono:
             return False
         lease_seconds = max(30, get_int("STRM_METADATA_LEASE_SECONDS", 900))
-        jobs = db.claim_due_strm_metadata_jobs(
+        jobs = strm_repo.claim_due_strm_metadata_jobs(
             owner=self._owner, lease_seconds=lease_seconds, limit=1
         )
         if not jobs:
@@ -201,7 +202,7 @@ class STRMMetadataWorker:
             interval = max(5.0, float(lease_seconds) / 3.0)
             while not heartbeat_stop.wait(interval):
                 try:
-                    if not db.renew_strm_metadata_job_lease(
+                    if not strm_repo.renew_strm_metadata_job_lease(
                         job_id,
                         expected_owner=self._owner,
                         expected_lease_generation=lease_generation,
@@ -234,7 +235,7 @@ class STRMMetadataWorker:
                 if item.strip()
             }
             if configured and extension not in configured:
-                db.settle_strm_metadata_job(
+                strm_repo.settle_strm_metadata_job(
                     job_id,
                     expected_lease_generation=lease_generation,
                     expected_revision=revision,
@@ -254,13 +255,13 @@ class STRMMetadataWorker:
             else:
                 raise _STRMStopped("元数据后台任务已停止")
             try:
-                if not db.strm_metadata_job_is_current(
+                if not strm_repo.strm_metadata_job_is_current(
                     job_id,
                     expected_lease_generation=lease_generation,
                     expected_revision=revision,
                     expected_owner=self._owner,
                 ):
-                    db.settle_strm_metadata_job(
+                    strm_repo.settle_strm_metadata_job(
                         job_id,
                         expected_lease_generation=lease_generation,
                         expected_revision=revision,
@@ -272,7 +273,7 @@ class STRMMetadataWorker:
                     should_stop=self._stop_event.is_set,
                 )
                 metadata_committed = True
-                settled = db.settle_strm_metadata_job(
+                settled = strm_repo.settle_strm_metadata_job(
                     job_id,
                     expected_lease_generation=lease_generation,
                     expected_revision=revision,
@@ -289,7 +290,7 @@ class STRMMetadataWorker:
                 self._flush_media_refresh(force=False)
             return True
         except _STRMStopped:
-            db.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
+            strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
             return False
         except Exception as exc:
             credentials_unavailable = False
@@ -301,7 +302,7 @@ class STRMMetadataWorker:
                     credentials_unavailable = True
             error_type = "GuangYaCredentialsUnavailable" if credentials_unavailable else type(exc).__name__
             error = "光鸭登录信息已变化或暂不可用，元数据任务等待恢复后重试" if credentials_unavailable else exc
-            state = db.fail_or_retry_strm_metadata_job(
+            state = strm_repo.fail_or_retry_strm_metadata_job(
                 job_id,
                 expected_lease_generation=lease_generation,
                 expected_revision=revision,
@@ -381,7 +382,7 @@ class STRMMetadataWorker:
 
         # 先收敛上轮 ACK 后中断的通知；即使刷新 outbox 已空也不能漏掉。
         reconcile_organize_refresh_notifications()
-        entries = db.list_strm_refresh_entries(limit=20000)
+        entries = strm_repo.list_strm_refresh_entries(limit=20000)
         if not entries:
             return
         grouped_entries = {
@@ -435,7 +436,7 @@ class STRMMetadataWorker:
             # 统一刷新队列已持久接管这些路径；后续媒体服务器失败只重试刷新，
             # 不再让 STRM 或元数据 worker 重复提交同一文件变化。
             try:
-                db.acknowledge_strm_refresh_paths(batch)
+                strm_repo.acknowledge_strm_refresh_paths(batch)
             except Exception:
                 retry_pending = True
                 logger.exception(

@@ -13,6 +13,7 @@ import tests  # noqa: F401 -- 必须先隔离运行目录
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.modules import media_refresh_coordinator as refresh
 from app.modules import organize_tasks, strm
@@ -170,7 +171,7 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
             ready.set()
             assert finished.wait(10)
             after_failure = snapshot()
-            entries_before = db.list_strm_refresh_entries()
+            entries_before = strm_repo.list_strm_refresh_entries()
             assert len(entries_before) == int(fail_refresh)
             assert len(list(tmp_path.rglob("*.strm"))) == 1
             if fail_refresh:
@@ -180,7 +181,7 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
                 assert reconcile_organize_refresh_notifications() == 0
             # 新 worker 实例从 SQLite 读取失败遗留项；不传入通知 ID 或伪造成功回调。
             STRMMetadataWorker()._flush_media_refresh(force=True)
-            assert db.count_strm_refresh_paths() == 0
+            assert strm_repo.count_strm_refresh_paths() == 0
             coordinator = refresh.MediaRefreshCoordinator()
             api = Mock(display_name="Jellyfin")
             api.refresh_for_paths.return_value = {"ok": True, "scope": "item", "requested": 1}

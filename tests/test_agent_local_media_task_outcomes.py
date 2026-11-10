@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db, sdk
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_tasks import local_tasks, local_task
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.models import ToolContext, ToolResult
@@ -73,7 +74,7 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM local_media_tasks")
             conn.execute("DELETE FROM local_library_targets")
             conn.execute("DELETE FROM local_media_sources")
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media_repo.create_local_media_source(
             name="本地来源",
             qb_profile="qb",
             qb_path_prefix="/downloads",
@@ -90,10 +91,10 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
         action="skip",
         updated_at="2026-09-12 14:22:00",
     ):
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             self.source_id, "", f"/private/downloads/{name}", owner="admin"
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task_id,
             owner="admin",
             status=status,
@@ -107,7 +108,7 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
                 (updated_at, task_id),
             )
         if action:
-            db.add_local_media_task_item(
+            local_media_repo.add_local_media_task_item(
                 task_id,
                 f"/private/downloads/{name}",
                 f"/private/library/{name}",
@@ -145,11 +146,11 @@ class LocalMediaTaskOutcomeTests(IsolatedDatabaseTestCase):
             with self.subTest(outcome=outcome, unknown=unknown):
                 task_id = self._task(action=actions[0] if actions else "")
                 for index, action in enumerate(actions[1:], 1):
-                    db.add_local_media_task_item(task_id,
+                    local_media_repo.add_local_media_task_item(task_id,
                         f"/private/downloads/本集-{index}.mkv", f"/private/library/本集-{index}.mkv",
                         role="video", action=action, owner="admin")
                 if outcome == "preview_only":
-                    db.update_local_media_task(task_id, warning="仅预览模式：未移动文件", owner="admin")
+                    local_media_repo.update_local_media_task(task_id, warning="仅预览模式：未移动文件", owner="admin")
                 accepted = ToolResult(True, "accepted", "任务已重新排队",
                     data={"task_id": task_id}, model_data={"task_id": task_id}, effect_metadata={
                         "completion": {"kind": "local_media_task", "task_id": task_id,

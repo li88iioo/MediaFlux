@@ -13,6 +13,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import organize_history as organize_history_repo
 from app.clients.guangya import (
     GuangYaClient,
     GuangYaFile,
@@ -168,12 +170,12 @@ class OrganizeCorrectionService:
             data.pop("release_parse_json", "")
         )
         items = [self._row_dict(item) for item in db.list_organize_log_items(log_id)]
-        steps = [self._row_dict(step) for step in db.list_organize_operation_steps(log_id)]
+        steps = [self._row_dict(step) for step in organize_history_repo.list_organize_operation_steps(log_id)]
         complete, safety_notice = self._snapshot_complete(data, items)
         status = str(data.get("status") or "")
         busy = status in BUSY_STATUSES
         data["items"] = items
-        data["related_logs"] = [dict(row) for row in db.list_related_organize_logs(log_id)]
+        data["related_logs"] = [dict(row) for row in organize_history_repo.list_related_organize_logs(log_id)]
         data["operations"] = steps
         data["delete_audits"] = [
             self._row_dict(audit)
@@ -182,7 +184,7 @@ class OrganizeCorrectionService:
         has_reversible_step = any(
             step.get("status") == "success" and step.get("action") == "move_rename"
             for step in steps
-        ) or (complete and status in REVERT_STATUSES and bool(db.list_latest_reversible_organize_steps(log_id)))
+        ) or (complete and status in REVERT_STATUSES and bool(organize_history_repo.list_latest_reversible_organize_steps(log_id)))
         data["allowed_actions"] = {
             "search": complete,
             "preview": complete and not busy,
@@ -908,7 +910,7 @@ class OrganizeCorrectionService:
                 raise RuntimeError("回退目录的已知父目录不存在，禁止盲建")
             if any(entry.name == name for entry in self.client.list_dir(parent_id)):
                 raise RuntimeError("回退路径存在无恢复凭据的同名条目，禁止合并或覆盖")
-            step_id = db.add_organize_operation_step(
+            step_id = organize_history_repo.add_organize_operation_step(
                 log_id, operation_token + ':directories', index, 'restore_directory',
                 file_id=directory_id, from_parent_id=directory_id, from_name=name,
                 to_parent_id=parent_id, to_name=name, status='running',
@@ -929,7 +931,7 @@ class OrganizeCorrectionService:
                         raise RuntimeError("目录恢复凭据未能可靠提交，必须人工核验")
                 resolved[directory_id] = result
             except Exception as exc:
-                db.finish_organize_operation_step(step_id, 'failed', str(exc))
+                organize_history_repo.finish_organize_operation_step(step_id, 'failed', str(exc))
                 raise
         return {key: resolved.get(value, value) for key, value in resolved.items()}
 
@@ -1039,12 +1041,12 @@ class OrganizeCorrectionService:
                     current_name=transition.before_name,
                     status="success", error="",
                 )
-                db.finish_organize_operation_step(
+                organize_history_repo.finish_organize_operation_step(
                     transition.step_id, "rolled_back", "批次后续步骤失败，已自动补偿"
                 )
             except Exception as rollback_exc:
                 self._snapshot_after_rollback_failure(transition.item, rollback_exc)
-                db.finish_organize_operation_step(
+                organize_history_repo.finish_organize_operation_step(
                     transition.step_id, "rollback_failed", str(rollback_exc)
                 )
                 logger.error(f"纠偏回滚失败 {transition.item.file_id}: {rollback_exc}")
@@ -1573,7 +1575,7 @@ class OrganizeCorrectionService:
                 return []
             # 必须在持久收尾可能删除 staging 根之前判定来源归属；通用扫描
             # 永不绕过下载确认、请求身份或结果未知的删除保护。
-            staging_ids = set(db.list_protected_guangya_staging_ids())
+            staging_ids = set(download_requests_repo.list_protected_guangya_staging_ids())
             staging_source = source_dir_id in staging_ids or (
                 rules.clean_empty and source_inside_protected_staging(
                     self.client, source_dir_id, staging_ids,
@@ -1698,7 +1700,7 @@ class OrganizeCorrectionService:
             raise ValueError("整理规则已变化，请重新预览并确认")
         rules = restore_organize_rules_snapshot(preview["rules_snapshot"], trusted_rules=current_rules)
         self._verify_nsfw_target_identity(MatchResult(**preview["match"]), preview["target_path"])
-        before = db.capture_organize_business_snapshot(log_id)
+        before = organize_history_repo.capture_organize_business_snapshot(log_id)
         previous_log = db.get_organize_log(log_id)
         assert previous_log is not None
         # 回退可能回到上一部作品的归档，也可能回到最初来源；用恢复后的
@@ -1736,7 +1738,7 @@ class OrganizeCorrectionService:
                     )
                 )
             for step_index, (item, planned) in enumerate(zip(items, preview["items"]), start=1):
-                step_id = db.add_organize_operation_step(
+                step_id = organize_history_repo.add_organize_operation_step(
                     log_id, operation_token, step_index, "move_rename",
                     file_id=item.file_id, from_parent_id=item.current_parent_id,
                     from_name=item.current_name, to_parent_id=target_id,
@@ -1751,9 +1753,9 @@ class OrganizeCorrectionService:
                         item.id, current_parent_id=target_id, current_name=planned["to_name"],
                         target_parent_id=target_id, target_name=planned["to_name"], status="success", error="",
                     )
-                    db.finish_organize_operation_step(step_id, "success")
+                    organize_history_repo.finish_organize_operation_step(step_id, "success")
                 except Exception as exc:
-                    db.finish_organize_operation_step(step_id, "failed", str(exc))
+                    organize_history_repo.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
             if not db.update_organize_log(
                 log_id, status="success", operation_type="reorganize", confirmation_actor=confirmation_actor,
@@ -1770,7 +1772,7 @@ class OrganizeCorrectionService:
             self._rollback_transitions(completed)
             if completed and self._failure_status(log_id, "failed") != "partial_failed":
                 try:
-                    if not db.restore_organize_business_snapshot(log_id, before):
+                    if not organize_history_repo.restore_organize_business_snapshot(log_id, before):
                         raise RuntimeError("重整失败后的业务前像未恢复")
                 except Exception as restore_exc:
                     for transition in completed:
@@ -1831,7 +1833,7 @@ class OrganizeCorrectionService:
             )
             for index, item in enumerate(items, start=1):
                 parent_id = restored[item.original_parent_id]
-                step_id = db.add_organize_operation_step(
+                step_id = organize_history_repo.add_organize_operation_step(
                     log_id, operation_token, index, "return_to_source",
                     file_id=item.file_id, from_parent_id=item.current_parent_id,
                     from_name=item.current_name, to_parent_id=parent_id,
@@ -1847,9 +1849,9 @@ class OrganizeCorrectionService:
                         item.id, current_parent_id=parent_id,
                         current_name=item.original_name, status="success", error="",
                     )
-                    db.finish_organize_operation_step(step_id, "success")
+                    organize_history_repo.finish_organize_operation_step(step_id, "success")
                 except Exception as exc:
-                    db.finish_organize_operation_step(step_id, "failed", str(exc))
+                    organize_history_repo.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
             video = self._video(items)
             if not db.update_organize_log(
@@ -1902,7 +1904,7 @@ class OrganizeCorrectionService:
         detail = self.detail(log_id)
         if not detail["allowed_actions"]["revert"]:
             raise ValueError("没有可安全回退的上一版操作快照")
-        steps = [dict(row) for row in db.list_latest_reversible_organize_steps(log_id)]
+        steps = [dict(row) for row in organize_history_repo.list_latest_reversible_organize_steps(log_id)]
         if not steps:
             raise ValueError("没有可安全回退的操作步骤")
         snapshots = [str(step.get("state_before_json") or "") for step in steps if step.get("state_before_json")]
@@ -1957,7 +1959,7 @@ class OrganizeCorrectionService:
                 item = items_by_file[str(previous.get("file_id") or "")]
                 target_parent = restored[str(previous.get("from_parent_id") or "")]
                 target_name = str(previous.get("from_name") or "")
-                step_id = db.add_organize_operation_step(
+                step_id = organize_history_repo.add_organize_operation_step(
                     log_id, operation_token, index, "revert",
                     file_id=item.file_id, from_parent_id=item.current_parent_id,
                     from_name=item.current_name, to_parent_id=target_parent,
@@ -1972,9 +1974,9 @@ class OrganizeCorrectionService:
                         item.id, current_parent_id=target_parent,
                         current_name=target_name, status="success", error="",
                     )
-                    db.finish_organize_operation_step(step_id, "success")
+                    organize_history_repo.finish_organize_operation_step(step_id, "success")
                 except Exception as exc:
-                    db.finish_organize_operation_step(step_id, "failed", str(exc))
+                    organize_history_repo.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
             refreshed_items = self._load_items(log_id)
             video = self._video(refreshed_items)
@@ -1984,7 +1986,7 @@ class OrganizeCorrectionService:
                 "error": legacy_warning,
             }
             if snapshot is not None:
-                persisted = db.restore_organize_business_snapshot(log_id, snapshot, **finish_fields)
+                persisted = organize_history_repo.restore_organize_business_snapshot(log_id, snapshot, **finish_fields)
             else:
                 # 同一执行器的历史降级：只承诺步骤中可证实的路径逆操作，不猜身份。
                 persisted = db.update_organize_log(log_id, **finish_fields)
@@ -2061,7 +2063,7 @@ class OrganizeCorrectionService:
         error: Exception | None = None
         try:
             for index, item in enumerate(ordered, start=1):
-                step_id = db.add_organize_operation_step(
+                step_id = organize_history_repo.add_organize_operation_step(
                     log_id, operation_token, index, "delete",
                     file_id=item.file_id, from_parent_id=item.current_parent_id,
                     from_name=item.current_name, status="running",
@@ -2080,9 +2082,9 @@ class OrganizeCorrectionService:
                         deleted.add(item.file_id)
                         batch_deleted.add(item.file_id)
                     db.update_organize_log_item(item.id, status="deleted", error="")
-                    db.finish_organize_operation_step(step_id, "success")
+                    organize_history_repo.finish_organize_operation_step(step_id, "success")
                 except Exception as exc:
-                    db.finish_organize_operation_step(step_id, "failed", str(exc))
+                    organize_history_repo.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
         except Exception as exc:
             error = exc

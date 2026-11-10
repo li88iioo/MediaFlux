@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from app.modules.scheduler import STRMScheduler
@@ -64,18 +64,18 @@ def test_committed_strm_stop_retains_refresh_for_skip_only_replay(tmp_path, mode
             first = scheduler.run_blocking("manual", **options)
         assert first["stopped"] and first["stats"]["generated"] == 1
         refresh.assert_not_called()
-        entries = db.list_strm_refresh_entries()
+        entries = strm_repo.list_strm_refresh_entries()
         assert len(entries) == int(refresh_enabled)
         if entries:
             assert entries[0]["allow_emby"] is allow_emby
         if mode == "fast":
-            assert db.count_pending_strm_change_targets() == 1
+            assert strm_repo.count_pending_strm_change_targets() == 1
         scheduler._stop_event.clear()
         second = scheduler.run_blocking("manual", sync_mode=mode)
         assert second["stats"]["generated"] == 0 and second["stats"]["skipped"] == 1
-        assert db.count_pending_strm_change_targets() == 0
+        assert strm_repo.count_pending_strm_change_targets() == 0
         # 全跳过不会新建刷新事件；由独立 worker 接管上次已提交的文件变化。
         refresh.assert_not_called()
         STRMMetadataWorker()._flush_media_refresh(force=True)
         assert refresh.call_count == int(refresh_enabled)
-        assert db.count_strm_refresh_paths() == 0
+        assert strm_repo.count_strm_refresh_paths() == 0

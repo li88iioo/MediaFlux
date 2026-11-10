@@ -43,7 +43,7 @@ class StrmRefreshPolicy:
         from app.modules.media_refresh import plan_refresh_targets
 
         planned = plan_refresh_targets(changed_dirs=targets, media_roots=[self.media_root])
-        db.enqueue_strm_refresh_paths(
+        enqueue_strm_refresh_paths(
             planned.targets, allow_emby=self.allow_emby, request_owners=self.request_owners,
         )
 

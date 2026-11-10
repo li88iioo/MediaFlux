@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from app import config
 from app import database as db
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.modules import episode_research_service as service
 from app.modules.episode_research import EpisodeEvidenceReader, EpisodeResearchError
 from app.repositories.episode_research import invalidate_episode_research_cache
@@ -129,7 +130,7 @@ class EpisodeResearchServiceTests(IsolatedDatabaseTestCase):
         another["files"][0]["size"] += 1
         self.assertEqual(self.research(another)["reason_code"], "research_daily_budget")
         self.assertEqual(self.calls, 1)
-        self.assertEqual(db.get_agent_web_search_daily_usage(provider="episode_research", usage_date=db.current_agent_web_search_usage_date()), 1)
+        self.assertEqual(agent_web_search_repo.get_agent_web_search_daily_usage(provider="episode_research", usage_date=agent_web_search_repo.current_agent_web_search_usage_date()), 1)
 
     def test_abstention_is_cached_without_model_free_text(self):
         async def abstain(payload, *, reader):

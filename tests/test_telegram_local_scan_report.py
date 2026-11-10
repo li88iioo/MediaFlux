@@ -3,6 +3,7 @@
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.bot import handlers
 from app.modules.local_media_scan_runs import (
     record_local_media_scan,
@@ -22,14 +23,14 @@ class TelegramLocalScanReportTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM local_media_sources")
 
     def _task(self, name, status, action=None):
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"下载-{name}", qb_profile="", qb_path_prefix="", local_root="/private/downloads"
         )
         path = f"/private/downloads/{name}"
-        task_id = db.create_local_media_task(source_id, "", path, trigger="scan")
-        db.update_local_media_task(task_id, status=status, title="示例剧集")
+        task_id = local_media_repo.create_local_media_task(source_id, "", path, trigger="scan")
+        local_media_repo.update_local_media_task(task_id, status=status, title="示例剧集")
         if action:
-            db.add_local_media_task_item(task_id, path, f"/private/library/{name}", role="video", action=action)
+            local_media_repo.add_local_media_task_item(task_id, path, f"/private/library/{name}", role="video", action=action)
         return task_id
 
     def test_notice_freezes_exact_batch_and_does_not_call_skipped_file_archived(self):
@@ -78,7 +79,7 @@ class TelegramLocalScanReportTests(IsolatedDatabaseTestCase):
     def test_filenames_in_scan_notice_are_escaped_and_do_not_reveal_directories(self):
         task = self._task("<script>alert(1)</script>.mkv", "requires_manual")
         from app.modules.local_media_outcomes import local_media_task_outcome
-        item = local_media_task_outcome(db.get_local_media_task(task), [])
+        item = local_media_task_outcome(local_media_repo.get_local_media_task(task), [])
         rendered = render_event(handlers._local_organize_event({
             "task_outcomes": [{"status": "requires_manual", **item}],
             "candidate_count": 1, "requires_manual": 1,

@@ -60,10 +60,10 @@ def backend(monkeypatch, tmp_path):
         scheduler.shutdown()
 
 
-def source(backend: Backend, name: str = "来源", *, enabled: bool = True, mode: str = "move") -> int:
+def source(backend: Backend, name: str = "来源", *, enabled: bool = True, mode: str = "move", save=None) -> int:
     root = backend.directory / name
     root.mkdir()
-    return db.save_local_media_source_bundle(name=name, local_root=str(root), qb_profile="configured:qb",
+    return (save or repository.save_local_media_source_bundle)(name=name, local_root=str(root), qb_profile="configured:qb",
         qb_path_prefix="Z:\\Downloads\\" + name, enabled=enabled, media_type="tv", mode=mode,
         targets=[{"category": "tv", "path": str(backend.target), "provider": "jellyfin", "library_id": "real-library-id",
                   "library_name": "剧集", "server_path": "/nas/Shows"}])
@@ -87,7 +87,7 @@ async def context_for(effects: EffectExecutor, *, owner: str = OWNER, session: s
 def test_real_ids_complete_facts_and_physical_retirement(backend):
     removed = source(backend, "先删除")
     selected = source(backend, "保留事实")
-    db.delete_local_media_source(removed)
+    repository.delete_local_media_source(removed)
     with db.get_conn() as conn:
         conn.execute("UPDATE local_media_sources SET smb_user='retired-user',smb_pass='retired-secret' WHERE id=?", (selected,))
     rows = sdk.local.sources()
@@ -132,24 +132,24 @@ def test_crud_preserves_subdirectories_target_identity_and_permissions(backend):
     after = sdk.local.source(identifier)
     assert after["targets"] == before["targets"] and after["qb_path_prefix"] == "/qb/downloads"
     assert sdk.local.delete_source(identifier)["ok"]
-    assert not db.list_local_media_sources()
+    assert not repository.list_local_media_sources()
     assert video.read_bytes() == b"unmoved-media"
     assert {path: stat.S_IMODE(path.stat().st_mode) for path in modes} == modes
 
 
 def test_active_tasks_keep_web_transaction_guard_and_qb_takeover_config(backend):
     identifier = source(backend)
-    task_id = db.create_local_media_task(identifier, "torrent-hash", str(backend.directory / "来源" / "Show.mkv"), trigger="qb_completed")
-    task_before = db.get_local_media_task(task_id)
+    task_id = repository.create_local_media_task(identifier, "torrent-hash", str(backend.directory / "来源" / "Show.mkv"), trigger="qb_completed")
+    task_before = repository.get_local_media_task(task_id)
     assert task_before is not None
     assert sdk.local.update_source(identifier, name="只改名称")["ok"]
     for operation in (lambda: sdk.local.update_source(identifier, enabled=False), lambda: sdk.local.delete_source(identifier)):
         with pytest.raises(ValueError, match="未完成任务"):
             operation()
     assert sdk.local.source(identifier)["enabled"]
-    task_after = db.get_local_media_task(task_id)
+    task_after = repository.get_local_media_task(task_id)
     assert task_after == task_before
-    db.update_local_media_task(task_id, status="completed")
+    repository.update_local_media_task(task_id, status="completed")
     assert sdk.local.update_source(identifier, enabled=False)["ok"]
     assert not sdk.local.source(identifier)["enabled"]
     assert sdk.local.source(identifier)["targets"][0]["server_path"] == "/nas/Shows"
@@ -168,9 +168,9 @@ def test_real_transaction_cas_rejects_race_after_service_recheck(backend, operat
     writer = repository.delete_local_media_source if operation == "delete" else repository.save_local_media_source_bundle
     def race(*args, **kwargs):
         if operation == "create":
-            source(backend, "external")
+            source(backend, "external", save=writer)
         else:
-            db.upsert_local_library_target(identifier, "tv", str(backend.target), provider="jellyfin",
+            repository.upsert_local_library_target(identifier, "tv", str(backend.target), provider="jellyfin",
                 library_name="外部映射", library_id="changed", server_path="/external/TV")
         return writer(*args, **kwargs)
     with patch.object(repository, writer.__name__, side_effect=race):
@@ -196,11 +196,11 @@ def test_cold_confirmation_cancellation_scope_and_drift_never_write(backend, cha
         elif change == "token":
             context.cancellation.cancel()
         elif change == "source":
-            db.update_local_media_source(identifier, name="external")
+            repository.update_local_media_source(identifier, name="external")
         elif change == "targets":
-            db.upsert_local_library_target(identifier, "movie", str(backend.target))
+            repository.upsert_local_library_target(identifier, "movie", str(backend.target))
         elif change == "removed":
-            db.delete_local_media_source(identifier)
+            repository.delete_local_media_source(identifier)
         elif change == "owner":
             context = await context_for(executor(), owner="webk:v1:" + "e" * 64)
         elif change == "session":
@@ -281,11 +281,11 @@ def test_scan_freezes_all_real_ids_has_no_old_batch_limit_and_persists_task_ids(
         assert receipt is not None and receipt["task_ids"] == data["task_ids"]
         assert receipt["summary"]["scan_status"] == "completed"
         for task_id in data["task_ids"]:
-            task = db.get_local_media_task(task_id)
+            task = repository.get_local_media_task(task_id)
             assert task is not None and task.source_id in identifiers and task.trigger == "scan"
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)
-        assert len(db.list_local_media_tasks()) == 21
+        assert len(repository.list_local_media_tasks()) == 21
     asyncio.run(check())
     assert {path: stat.S_IMODE(path.stat().st_mode) for path in modes} == modes
     assert all(path.read_bytes() == b"unchanged" for path in paths)
@@ -297,7 +297,7 @@ def test_scan_cas_at_enqueue_preserves_other_mapping_and_records_failure(backend
     candidate.write_bytes(b"media")
     prepared = service.prepare_local_source_scan([identifier])
     def discover_then_drift(_):
-        db.upsert_local_library_target(identifier, "tv", str(backend.target), provider="jellyfin",
+        repository.upsert_local_library_target(identifier, "tv", str(backend.target), provider="jellyfin",
             library_name="changed", server_path="/changed/TV")
         return [candidate], ""
     with patch.object(backend.scheduler, "_source_candidates", side_effect=discover_then_drift):
@@ -319,7 +319,7 @@ def test_scan_query_filters_titles_and_keeps_empty_failure_and_skip_distinct(bac
     source(backend, "preview", mode="preview_only")
     result = sdk.local.scan_sources(query=" Alpha.Show ")
     assert result["status"] == "accepted" and result["data"]["candidate_count"] == 1
-    task = db.get_local_media_task(result["data"]["task_ids"][0])
+    task = repository.get_local_media_task(result["data"]["task_ids"][0])
     assert task is not None and task.source_id == selected and "Alpha.Show" in task.content_path
     for query in ("/private/media", "access_token=secret", "https://private.invalid", "x" * 121):
         with pytest.raises(ValueError):
@@ -335,7 +335,7 @@ def test_native_python_cli_full_read_then_cold_confirmation_without_script_repla
         pytest.skip(sandbox.workspace_unavailable_reason())
     removed = source(backend, "removed")
     selected = source(backend, "script-source")
-    db.delete_local_media_source(removed)
+    repository.delete_local_media_source(removed)
     async def check():
         effects = executor()
         context = await context_for(effects, session="script-" + language + "-" + outcome)
@@ -371,7 +371,7 @@ def test_native_python_cli_full_read_then_cold_confirmation_without_script_repla
             if outcome == "cancel":
                 assert await cold.cancel_effect(plan.plan_id, lease=context.lease)
             elif outcome == "drift":
-                db.upsert_local_library_target(selected, "tv", str(backend.target), provider="jellyfin",
+                repository.upsert_local_library_target(selected, "tv", str(backend.target), provider="jellyfin",
                     library_name="external", server_path="/external/TV")
                 with pytest.raises(ToolPipelineError):
                     await cold.execute_confirmed(plan.plan_id, context=context)

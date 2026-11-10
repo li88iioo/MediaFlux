@@ -587,9 +587,9 @@ class StrmChangeLedgerIntegrationTests(IsolatedDatabaseTestCase):
                 self.assertNotIn(root, str(stats["changes"]))
                 self.assertTrue((Path(root) / STRM_SUBDIR / "电影.strm").is_file())
         finally:
-            from app import database as db
-            rows = db.list_strm_index(f"guangya:{source_id}")
-            db.delete_strm_index_ids(f"guangya:{source_id}", [row["file_id"] for row in rows])
+            from app.repositories import strm as strm_repo
+            rows = strm_repo.list_strm_index(f"guangya:{source_id}")
+            strm_repo.delete_strm_index_ids(f"guangya:{source_id}", [row["file_id"] for row in rows])
 
     def test_cleanup_rejects_stale_index_path_outside_current_strm_root(self):
         import tempfile
@@ -601,8 +601,8 @@ class StrmChangeLedgerIntegrationTests(IsolatedDatabaseTestCase):
             external = Path(outside) / "unrelated.strm"
             external.write_text("keep", encoding="utf-8")
             rows = [{"file_id": "old", "strm_path": str(external)}]
-            with patch("app.modules.strm.db.list_strm_index", return_value=rows), patch(
-                "app.modules.strm.db.delete_strm_index_ids"
+            with patch("app.repositories.strm.list_strm_index", return_value=rows), patch(
+                "app.repositories.strm.delete_strm_index_ids"
             ) as delete_rows:
                 result = clean_invalid_strm(
                     root, source_key="guangya:source", valid_ids=set(), strm_only=True
@@ -626,8 +626,8 @@ class StrmChangeLedgerIntegrationTests(IsolatedDatabaseTestCase):
                 "file_id": "old", "strm_path": str(target),
                 "content_fingerprint": f"sha256:{hashlib.sha256(b'old').hexdigest()}",
             }]
-            with patch("app.modules.strm.db.list_strm_index", return_value=rows), patch(
-                "app.modules.strm.db.delete_strm_index_ids"
+            with patch("app.repositories.strm.list_strm_index", return_value=rows), patch(
+                "app.repositories.strm.delete_strm_index_ids"
             ):
                 result = clean_invalid_strm(
                     root, source_key="guangya:source", valid_ids=set(), strm_only=True

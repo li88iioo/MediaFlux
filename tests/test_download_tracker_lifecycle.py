@@ -24,7 +24,7 @@ class DownloadTrackerLifecycleTests(unittest.TestCase):
             return 0, 0
 
         with patch(
-            "app.modules.download_tracker.db.reconcile_startup_media_download_admissions",
+            "app.repositories.media_subscriptions.reconcile_startup_media_download_admissions",
             side_effect=reconcile,
         ) as reconcile_call:
             starter = threading.Thread(target=tracker.start)

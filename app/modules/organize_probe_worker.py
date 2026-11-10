@@ -13,6 +13,8 @@ import threading
 import uuid
 
 from app import database as db
+from app.repositories import organize_history as organize_history_repo
+from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.logger import get_logger
 from app.modules.guangya_compensation import (
@@ -94,7 +96,7 @@ class OrganizeProbeWorker:
 
     def status(self) -> dict[str, object]:
         return {
-            **db.count_organize_probe_jobs(),
+            **organize_probe_repo.count_organize_probe_jobs(),
             "worker_running": bool(self._thread and self._thread.is_alive()),
             "current_job_id": self._current_job_id,
         }
@@ -118,7 +120,7 @@ class OrganizeProbeWorker:
             while not self._stop_event.is_set():
                 try:
                     if recovery_pending:
-                        recovered = db.recover_stale_organize_probe_jobs(force=True)
+                        recovered = organize_probe_repo.recover_stale_organize_probe_jobs(force=True)
                         if recovered:
                             logger.warning("已恢复中断的媒体规格补全任务 count=%s", recovered)
                         recovery_pending = False
@@ -283,7 +285,7 @@ class OrganizeProbeWorker:
                 if not target_name or target_name == current_name:
                     continue
                 # 复用已有步骤表记录写意图；进程中断也不能将自己的改名误认成外部变化。
-                step_ids[file_id] = db.add_organize_operation_step(
+                step_ids[file_id] = organize_history_repo.add_organize_operation_step(
                     int(log["id"]), operation_token, len(step_ids) + 1, "probe_rename",
                     file_id=file_id, from_parent_id=str(item.get("current_parent_id") or ""),
                     from_name=current_name, to_parent_id=str(item.get("current_parent_id") or ""),
@@ -316,7 +318,7 @@ class OrganizeProbeWorker:
                     "parent_id": str(item.get("current_parent_id") or ""),
                 })
             new_path = "/".join(part for part in (rel_dir, desired_name) if part)
-            if not db.commit_organize_probe_rename(
+            if not organize_probe_repo.commit_organize_probe_rename(
                 int(log["id"]), current_name=desired_name, new_path=new_path,
                 item_updates=item_updates,
                 job_id=int(job["id"]), owner=self._owner,
@@ -330,7 +332,7 @@ class OrganizeProbeWorker:
                 changes if link_strm else [], ensure_ascii=False,
             )
             for step_id in step_ids.values():
-                if not db.finish_organize_operation_step(step_id, "success"):
+                if not organize_history_repo.finish_organize_operation_step(step_id, "success"):
                     raise _ProbeHandoffUnavailable("改名已提交，操作步骤收尾待重试")
             return changes
         except Exception as failure:
@@ -345,10 +347,10 @@ class OrganizeProbeWorker:
                         file_id, old_name, False, int(item.get("size") or 0),
                         str(item.get("etag") or ""), str(item.get("current_parent_id") or ""),
                     ))
-                    if not db.finish_organize_operation_step(step_ids[file_id], "rolled_back"):
+                    if not organize_history_repo.finish_organize_operation_step(step_ids[file_id], "rolled_back"):
                         raise RuntimeError("补偿步骤状态未持久化")
                 except Exception as exc:
-                    db.finish_organize_operation_step(step_ids[file_id], "rollback_failed", "补偿结果需要人工核验")
+                    organize_history_repo.finish_organize_operation_step(step_ids[file_id], "rollback_failed", "补偿结果需要人工核验")
                     remote = exc.snapshot if isinstance(exc, GuangYaCompensationError) else None
                     db.update_organize_log_item(
                         int(item["id"]), status="rollback_failed",
@@ -403,7 +405,7 @@ class OrganizeProbeWorker:
     def _recover_unfinished_rename(self, job: dict) -> bool:
         """旧进程的写意图只按已提交 DB 事实收尾，否则冻结人工核验，不猜着续写。"""
         try:
-            steps = [dict(row) for row in db.list_pending_organize_probe_steps(
+            steps = [dict(row) for row in organize_history_repo.list_pending_organize_probe_steps(
                 int(job["organize_log_id"]), int(job["id"]), include_succeeded=True,
             )]
         except sqlite3.Error as exc:
@@ -439,7 +441,7 @@ class OrganizeProbeWorker:
                 job["rename_committed"] = True
                 try:
                     for step in steps:
-                        if step["status"] != "success" and not db.finish_organize_operation_step(int(step["id"]), "success"):
+                        if step["status"] != "success" and not organize_history_repo.finish_organize_operation_step(int(step["id"]), "success"):
                             raise _ProbeHandoffUnavailable("已提交改名的步骤收尾尚未完成")
                 except Exception as exc:
                     raise _ProbeHandoffUnavailable("已提交改名的步骤收尾暂不可用") from exc
@@ -461,7 +463,7 @@ class OrganizeProbeWorker:
                 item = items.get(str(step["file_id"]))
                 if item is not None:
                     db.update_organize_log_item(int(item["id"]), status="rollback_failed", current_name="", current_parent_id="", error=reason)
-                db.finish_organize_operation_step(int(step["id"]), "rollback_failed", reason)
+                organize_history_repo.finish_organize_operation_step(int(step["id"]), "rollback_failed", reason)
             db.update_organize_log(int(log["id"]), status="partial_failed", legacy_incomplete=True, error=reason)
             raise _ProbeCompensationFailed(reason)
         finally:
@@ -518,7 +520,7 @@ class OrganizeProbeWorker:
         return handoff_completed
 
     def _process_one(self) -> bool:
-        jobs = db.claim_due_organize_probe_jobs(
+        jobs = organize_probe_repo.claim_due_organize_probe_jobs(
             owner=self._owner, lease_seconds=1800, limit=1,
         )
         if not jobs:
@@ -530,7 +532,7 @@ class OrganizeProbeWorker:
             self._current_job_id = job_id
         try:
             handoff_completed = self._execute_job(job)
-            if not db.complete_organize_probe_job(
+            if not organize_probe_repo.complete_organize_probe_job(
                 job_id, owner=self._owner, handoff_completed=handoff_completed,
             ):
                 raise _ProbeHandoffUnavailable("任务 lease 已变化，未确认规格补全完成")
@@ -544,20 +546,20 @@ class OrganizeProbeWorker:
             except Exception as exc:
                 logger.warning("规格补全完成通知更新失败 type=%s", type(exc).__name__)
         except _ProbeHandoffUnavailable as exc:
-            db.release_organize_probe_job(
+            organize_probe_repo.release_organize_probe_job(
                 job_id, owner=self._owner, delay_seconds=30, reason=exc,
             )
             notification_error = "后台规格补全交接尚未完成，将保留任务重试。"
         except _ProbeCompletionCancelled as exc:
-            if db.cancel_organize_probe_job(job_id, owner=self._owner, reason=exc):
+            if organize_probe_repo.cancel_organize_probe_job(job_id, owner=self._owner, reason=exc):
                 notification_error = "后台规格补全因身份或快照变化取消，请在 Web 运行记录中复核。"
             logger.debug("媒体规格补全任务已取消 job=%s reason=%s", job_id, exc)
         except InterruptedError as exc:
-            db.release_organize_probe_job(
+            organize_probe_repo.release_organize_probe_job(
                 job_id, owner=self._owner, delay_seconds=30, reason=exc,
             )
         except _ProbeCompletionUnavailable as exc:
-            status = db.fail_or_retry_organize_probe_job(
+            status = organize_probe_repo.fail_or_retry_organize_probe_job(
                 job_id, owner=self._owner, error_type="ProbeUnavailable", error=exc,
                 base_backoff_seconds=600,
             )
@@ -573,12 +575,12 @@ class OrganizeProbeWorker:
             if job.get("rename_committed") or job.get("pending_strm_changes_json", "[]") != "[]":
                 # 包含下游已接管但本地完成状态写入失败：允许幂等重投，
                 # 不能让 max_attempts 将已提交的交接永久终结。
-                db.release_organize_probe_job(
+                organize_probe_repo.release_organize_probe_job(
                     job_id, owner=self._owner, delay_seconds=30,
                     reason=f"交接完成状态暂不可用（{type(exc).__name__}）",
                 )
                 return True
-            status = db.fail_or_retry_organize_probe_job(
+            status = organize_probe_repo.fail_or_retry_organize_probe_job(
                 job_id, owner=self._owner, error_type=type(exc).__name__, error=exc,
                 base_backoff_seconds=600,
             )

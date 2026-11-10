@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app import sdk
 from app.modules.media_subscription_notifications import notification_arguments
 from app.modules.media_subscriptions import MediaSubscriptionError
@@ -32,7 +33,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM agent_action_history")
             conn.execute("DELETE FROM download_log")
         reset_agent_service_for_tests()
-        self.sid = db.add_media_subscription(
+        self.sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="12345",
             tmdb_id="12345",
@@ -168,7 +169,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
 
     def test_today_summary_prioritizes_bounded_safe_content_events(self) -> None:
         stamp = db.now()
-        get_media_subscription_result = db.get_media_subscription(self.sid)
+        get_media_subscription_result = media_subscriptions_repo.get_media_subscription(self.sid)
         assert get_media_subscription_result is not None
         revision = int(get_media_subscription_result["revision"])
         with db.get_conn() as conn:

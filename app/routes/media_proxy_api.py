@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Request
 
-from app import database as db
+from app.repositories import media_proxy as media_proxy_repo
 from app.modules.media_proxy import (
     ProxyUpstreamBodyTooLarge,
     clear_signed_url_cache,
@@ -241,7 +241,7 @@ async def list_instances(request: Request):
     runtime = _manager(request).status()
     return api_response([
         _instance_json(row, runtime.get(int(row["id"])))
-        for row in await asyncio.to_thread(db.list_media_proxy_instances)
+        for row in await asyncio.to_thread(media_proxy_repo.list_media_proxy_instances)
     ])
 
 
@@ -263,7 +263,7 @@ async def list_playback_sessions(
     require_api_login(request)
     try:
         sessions = await asyncio.to_thread(
-            db.list_media_proxy_playback_sessions,
+            media_proxy_repo.list_media_proxy_playback_sessions,
             instance_id=instance_id,
             status=status,
             source=source,
@@ -289,7 +289,7 @@ async def list_playback_records(
     require_api_login(request)
     try:
         records = await asyncio.to_thread(
-            db.list_media_proxy_playback_records,
+            media_proxy_repo.list_media_proxy_playback_records,
             instance_id=instance_id,
             session_id=session_id,
             unlinked=unlinked,
@@ -319,7 +319,7 @@ async def clear_playback_records(request: Request, data: dict = Body(...)):
         except (TypeError, ValueError):
             return api_error("instance_id 无效", 400)
     deleted = await asyncio.to_thread(
-        db.clear_media_proxy_playback_records, instance_id=instance_id
+        media_proxy_repo.clear_media_proxy_playback_records, instance_id=instance_id
     )
     return api_response({"deleted": deleted})
 
@@ -338,46 +338,46 @@ async def create_instance(request: Request, data: dict = Body(...)):
         return api_error(error or "实例参数校验失败", 400)
     try:
         instance_id = await asyncio.to_thread(
-            db.add_media_proxy_instance, **payload
+            media_proxy_repo.add_media_proxy_instance, **payload
         )
     except sqlite3.IntegrityError:
         return api_error("监听地址和端口已被其他实例占用", 409)
     result = await _reconcile(request)
-    row = await asyncio.to_thread(db.get_media_proxy_instance, instance_id)
+    row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
     return api_response({"success": True, "instance": _instance_json(row), "runtime": result}, 201)
 
 
 @router.put("/{instance_id}")
 async def update_instance(instance_id: int, request: Request, data: dict = Body(...)):
     require_api_login(request)
-    existing = await asyncio.to_thread(db.get_media_proxy_instance, instance_id)
+    existing = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
     if not existing:
         return api_error("媒体反代实例不存在", 404)
     payload, error = _validated_instance(data, existing)
     if payload is None:
         return api_error(error or "实例参数校验失败", 400)
     try:
-        await asyncio.to_thread(db.update_media_proxy_instance, instance_id, payload)
+        await asyncio.to_thread(media_proxy_repo.update_media_proxy_instance, instance_id, payload)
     except sqlite3.IntegrityError:
         return api_error("监听地址和端口已被其他实例占用", 409)
     clear_signed_url_cache(instance_id)
     result = await _reconcile(request)
-    row = await asyncio.to_thread(db.get_media_proxy_instance, instance_id)
+    row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
     return api_response({"success": True, "instance": _instance_json(row), "runtime": result})
 
 
 @router.delete("/{instance_id}")
 async def delete_instance(instance_id: int, request: Request):
     require_api_login(request)
-    existing = await asyncio.to_thread(db.get_media_proxy_instance, instance_id)
+    existing = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
     if not existing:
         return api_error("媒体反代实例不存在", 404)
     await asyncio.to_thread(
-        db.update_media_proxy_instance, instance_id, {"enabled": 0}
+        media_proxy_repo.update_media_proxy_instance, instance_id, {"enabled": 0}
     )
     clear_signed_url_cache(instance_id)
     await _reconcile(request)
-    if not await asyncio.to_thread(db.delete_media_proxy_instance, instance_id):
+    if not await asyncio.to_thread(media_proxy_repo.delete_media_proxy_instance, instance_id):
         return api_error("媒体反代实例不存在", 404)
     return api_response({"success": True})
 
@@ -385,7 +385,7 @@ async def delete_instance(instance_id: int, request: Request):
 @router.post("/{instance_id}/reload")
 async def reload_instance(instance_id: int, request: Request):
     require_api_login(request)
-    if not await asyncio.to_thread(db.get_media_proxy_instance, instance_id):
+    if not await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id):
         return api_error("媒体反代实例不存在", 404)
     clear_signed_url_cache(instance_id)
     result = await _reconcile(request)
@@ -395,7 +395,7 @@ async def reload_instance(instance_id: int, request: Request):
 @router.post("/{instance_id}/test")
 async def test_instance(instance_id: int, request: Request):
     require_api_login(request)
-    if not await asyncio.to_thread(db.get_media_proxy_instance, instance_id):
+    if not await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id):
         return api_error("媒体反代实例不存在", 404)
     try:
         result = await probe_media_proxy_instance(instance_id, timeout_seconds=10.0)
@@ -418,18 +418,18 @@ async def test_instance(instance_id: int, request: Request):
 @router.get("/{instance_id}/bindings")
 async def list_bindings(instance_id: int, request: Request):
     require_api_login(request)
-    if not await asyncio.to_thread(db.get_media_proxy_instance, instance_id):
+    if not await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id):
         return api_error("媒体反代实例不存在", 404)
     return api_response([
         _binding_json(row)
-        for row in await asyncio.to_thread(db.list_media_proxy_bindings, instance_id)
+        for row in await asyncio.to_thread(media_proxy_repo.list_media_proxy_bindings, instance_id)
     ])
 
 
 @router.post("/{instance_id}/bindings")
 async def create_binding(instance_id: int, request: Request, data: dict = Body(...)):
     require_api_login(request)
-    instance = await asyncio.to_thread(db.get_media_proxy_instance, instance_id)
+    instance = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
     if not instance:
         return api_error("媒体反代实例不存在", 404)
     payload, error = _validated_binding(data, instance)
@@ -437,7 +437,7 @@ async def create_binding(instance_id: int, request: Request, data: dict = Body(.
         return api_error(error or "绑定参数校验失败", 400)
     try:
         row = await asyncio.to_thread(
-            db.create_media_proxy_binding, instance_id=instance_id, **payload
+            media_proxy_repo.create_media_proxy_binding, instance_id=instance_id, **payload
         )
     except sqlite3.IntegrityError:
         return api_error("该媒体项目和媒体源已经存在绑定", 409)
@@ -448,7 +448,7 @@ async def create_binding(instance_id: int, request: Request, data: dict = Body(.
 async def delete_binding(instance_id: int, binding_id: int, request: Request):
     require_api_login(request)
     if not await asyncio.to_thread(
-        db.delete_media_proxy_binding, binding_id, instance_id
+        media_proxy_repo.delete_media_proxy_binding, binding_id, instance_id
     ):
         return api_error("媒体绑定不存在", 404)
     return api_response({"success": True})

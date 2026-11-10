@@ -45,11 +45,11 @@ def build_notification_context(
         refs.append({"topic": "confirmation", "thread_key": f"confirmation:{confirmation_token}",
                      "token": confirmation_token, "chat_id": chat, "topic_enabled": topic_enabled})
     if ids:
-        from app import database as db
+        from app.repositories import download_requests as download_requests_repo
         from app.modules.telegram_download_lifecycle import _chat_id
         for request_id in ids:
             try:
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 if row is None:
                     continue
                 recipient = (_chat_id(row) or get("TG_CHAT_ID", "") or "").strip()

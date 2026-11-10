@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaService, LocalMediaServiceError
 from app.modules.organize import OrganizeRules
 from app.modules.scraper import MatchResult
@@ -42,11 +42,11 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         source.mkdir()
         target = target or self.root / "movies"
         target.mkdir(exist_ok=True)
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"{name}-{self.root.name}", qb_profile="", qb_path_prefix="", local_root=str(source),
             media_type="nsfw", owner=owner,
         )
-        db.upsert_local_library_target(source_id, "movie", str(target), owner=owner)
+        local_media_repo.upsert_local_library_target(source_id, "movie", str(target), owner=owner)
         return source_id, source, target
 
     def _service(self, provider="metatube", external_id="javbus:first", *, number="SODAH-003"):
@@ -60,10 +60,10 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         return service
 
     def _task(self, source_id, path, *, owner="admin"):
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id, "", str(path), owner=owner, trigger="scan",
         )
-        self.assertTrue(db.claim_local_media_task(task_id, owner=owner))
+        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner=owner))
         return task_id
 
     def _preview(self, service, source_id, path):
@@ -74,20 +74,20 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         self, source_id, source, target, *, owner="admin", identity="metatube:javbus:other",
         status="completed", step_status="completed", group=None,
     ):
-        path = source / f"history-{len(db.list_local_media_tasks(owner=owner))}.mp4"
-        task_id = db.create_local_media_task(source_id, "", str(path), owner=owner, trigger="scan")
-        db.add_local_media_task_item(
+        path = source / f"history-{len(local_media_repo.list_local_media_tasks(owner=owner))}.mp4"
+        task_id = local_media_repo.create_local_media_task(source_id, "", str(path), owner=owner, trigger="scan")
+        local_media_repo.add_local_media_task_item(
             task_id, str(path), str(target), role="video", owner=owner,
             media_group=f"movie:{identity}:__root__" if group is None else group,
         )
         if step_status:
-            task = db.get_local_media_task(task_id, owner=owner)
+            task = local_media_repo.get_local_media_task(task_id, owner=owner)
             assert task is not None
-            step = db.add_local_media_operation_step(
+            step = local_media_repo.add_local_media_operation_step(
                 task_id, task.operation_token, 1, "rename", str(path), str(target), owner=owner,
             )
-            db.update_local_media_operation_step(step, step_status)
-        db.update_local_media_task(task_id, owner=owner, status=status)
+            local_media_repo.update_local_media_operation_step(step, step_status)
+        local_media_repo.update_local_media_task(task_id, owner=owner, status=status)
         return task_id
 
     def test_independent_tasks_compare_numbers_and_reject_other_media(self):
@@ -119,7 +119,7 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
                 if blocked:
                     self.assertTrue(second.exists())
                     self.assertIn("历史整理记录", str(result["preview"]["pending_confirmations"]))
-                    self.assertEqual(db.list_local_media_task_items(second_task), [])
+                    self.assertEqual(local_media_repo.list_local_media_task_items(second_task), [])
                 else:
                     self.assertTrue(result["moved"])
                     self.assertFalse(second.exists())
@@ -158,7 +158,7 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
         self.assertIn("历史整理记录", str(result["preview"]["pending_confirmations"]))
         self.assertTrue(incoming.exists())
         self.assertFalse(target.exists())
-        self.assertEqual(db.list_local_media_task_items(task_id), [])
+        self.assertEqual(local_media_repo.list_local_media_task_items(task_id), [])
 
     def test_only_committed_facts_bind_identity_and_missing_identity_is_not_guessed(self):
         for index, (status, step_status, group, blocked) in enumerate((
@@ -191,14 +191,14 @@ class LocalNsfwDirectoryIdentityTests(IsolatedDatabaseTestCase):
                         archived = target.with_name("history.mp4")
                         archived.parent.mkdir(parents=True)
                         archived.write_bytes(b"already-archived")
-                        get_local_media_task_result = db.get_local_media_task(history_task)
+                        get_local_media_task_result = local_media_repo.get_local_media_task(history_task)
                         assert get_local_media_task_result is not None
                         old_token = get_local_media_task_result.operation_token
-                        self.assertTrue(db.reset_local_media_task(history_task))
-                        get_local_media_task_result_2 = db.get_local_media_task(history_task)
+                        self.assertTrue(local_media_repo.reset_local_media_task(history_task))
+                        get_local_media_task_result_2 = local_media_repo.get_local_media_task(history_task)
                         assert get_local_media_task_result_2 is not None
                         self.assertNotEqual(get_local_media_task_result_2.operation_token, old_token)
-                        self.assertEqual(db.list_local_media_task_items(history_task), [])
+                        self.assertEqual(local_media_repo.list_local_media_task_items(history_task), [])
                         with self.assertRaisesRegex(LocalMediaServiceError, "身份快照已缺失"):
                             self._preview(service, source_id, incoming)
                         self.assertTrue(archived.exists())

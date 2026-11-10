@@ -140,7 +140,7 @@ class MediaProxyProbeApiTests(unittest.TestCase):
 
         with (
             patch.object(media_proxy_api, "require_api_login", return_value=None),
-            patch.object(media_proxy_api.db, "get_media_proxy_instance", return_value={"id": 7}),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={"id": 7}),
             patch.object(
                 media_proxy_api, "probe_media_proxy_instance",
                 new=AsyncMock(return_value={"status_code": 204, "latency_ms": 37}),
@@ -162,7 +162,7 @@ class MediaProxyProbeApiTests(unittest.TestCase):
 
         with (
             patch.object(media_proxy_api, "require_api_login", return_value=None),
-            patch.object(media_proxy_api.db, "get_media_proxy_instance", return_value={"id": 7}),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={"id": 7}),
             patch.object(
                 media_proxy_api,
                 "probe_media_proxy_instance",
@@ -197,7 +197,7 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(media_proxy.uvicorn, "Server", return_value=fake_server),
             patch.object(media_proxy.asyncio, "create_task", return_value=fake_task),
             patch.object(media_proxy.asyncio, "sleep", new=AsyncMock()),
-            patch.object(media_proxy.database, "update_media_proxy_instance"),
+            patch("app.repositories.media_proxy.update_media_proxy_instance"),
         ):
             await media_proxy.MediaProxyManager()._start_runtime(row)
 
@@ -237,7 +237,7 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(media_proxy.uvicorn, "Server", return_value=fake_server),
             patch.object(media_proxy.asyncio, "create_task", return_value=fake_task),
             patch.object(media_proxy.asyncio, "sleep", new=AsyncMock()),
-            patch.object(media_proxy.database, "update_media_proxy_instance"),
+            patch("app.repositories.media_proxy.update_media_proxy_instance"),
         ):
             runtime = await media_proxy.MediaProxyManager()._start_runtime(row)
 
@@ -284,9 +284,7 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(media_proxy.uvicorn, "Server", return_value=fake_server),
             patch.object(media_proxy.asyncio, "create_task", side_effect=create_task),
             patch.object(media_proxy.asyncio, "sleep", new=AsyncMock()),
-            patch.object(
-                media_proxy.database,
-                "update_media_proxy_instance",
+            patch("app.repositories.media_proxy.update_media_proxy_instance",
                 side_effect=sqlite3.OperationalError("database is locked"),
             ),
             patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop_runtime,
@@ -340,8 +338,7 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 "sleep",
                 new=AsyncMock(side_effect=asyncio.CancelledError()),
             ),
-            patch.object(
-                media_proxy.database, "update_media_proxy_instance"
+            patch("app.repositories.media_proxy.update_media_proxy_instance"
             ) as update_status,
             patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop_runtime,
         ):
@@ -385,8 +382,8 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         manager = media_proxy.MediaProxyManager()
         manager._runtimes[9] = previous
         with (
-            patch.object(media_proxy.database, "list_media_proxy_instances", return_value=[row]),
-            patch.object(media_proxy.database, "update_media_proxy_instance") as update,
+            patch("app.repositories.media_proxy.list_media_proxy_instances", return_value=[row]),
+            patch("app.repositories.media_proxy.update_media_proxy_instance") as update,
             patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
             patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop,
             patch.object(manager, "_start_runtime", new=AsyncMock(return_value=replacement)) as start,
@@ -439,8 +436,8 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             return replacement
 
         with (
-            patch.object(media_proxy.database, "list_media_proxy_instances", return_value=[row]),
-            patch.object(media_proxy.database, "update_media_proxy_instance"),
+            patch("app.repositories.media_proxy.list_media_proxy_instances", return_value=[row]),
+            patch("app.repositories.media_proxy.update_media_proxy_instance"),
             patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
             patch.object(manager, "_stop_runtime", side_effect=stop_runtime),
             patch.object(manager, "_start_runtime", side_effect=start_runtime),
@@ -475,7 +472,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         manager._runtimes[9] = previous
 
         with (
-            patch.object(media_proxy.database, "list_media_proxy_instances", return_value=[row]),
+            patch("app.repositories.media_proxy.list_media_proxy_instances", return_value=[row]),
             patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
             patch.object(
                 manager,
@@ -515,7 +512,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         manager._runtimes[9] = previous
 
         with (
-            patch.object(media_proxy.database, "get_media_proxy_instance", return_value=row),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row),
             patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
             patch.object(
                 manager,
@@ -548,9 +545,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ticker_ran.set()
 
         manager = media_proxy.MediaProxyManager()
-        with patch.object(
-            media_proxy.database,
-            "list_media_proxy_instances",
+        with patch("app.repositories.media_proxy.list_media_proxy_instances",
             side_effect=slow_list_instances,
         ):
             result, _ = await asyncio.gather(manager.reconcile(), ticker())
@@ -987,8 +982,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             stop_started.set()
             await release.wait()
 
-        with patch.object(manager, "_stop_runtime", side_effect=slow_stop), patch.object(
-            media_proxy.database, "list_media_proxy_instances"
+        with patch.object(manager, "_stop_runtime", side_effect=slow_stop), patch("app.repositories.media_proxy.list_media_proxy_instances"
         ) as list_instances:
             stop_task = asyncio.create_task(manager.stop())
             await stop_started.wait()
@@ -1047,7 +1041,7 @@ class MediaProxyRuntimeProfileTests(unittest.TestCase):
             "JELLYFIN_API_KEY": "current-key",
             "JELLYFIN_ENABLED": "true",
         }
-        with patch.object(media_proxy.database, "get_media_proxy_instance", return_value=row), \
+        with patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row), \
              patch.object(profiles.config, "get", side_effect=lambda key, default="": values.get(key, default)), \
              patch.object(profiles.config, "get_bool", return_value=True):
             resolved = media_proxy._resolved_instance(9)
@@ -1104,7 +1098,7 @@ class LocalPlaybackPassthroughTests(unittest.TestCase):
             "local_relative_path": "Movies/example.mkv",
             "enabled": 1,
         }
-        with patch.object(media_proxy.database, "get_media_proxy_binding", return_value=binding):
+        with patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=binding):
             rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "item-local")
         self.assertFalse(changed)
         self.assertEqual(rewritten["MediaSources"][0], source)

@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules.organize_delete_audit import (
     DeleteCandidate,
     execute_recycle_bin_delete,
@@ -180,7 +181,7 @@ def cleanup_download_staging(
     original_protected = frozenset(value for value in protected_ids)
     selected_scope = frozenset(value for value in scope_ids) if scope_ids is not None else None
     for request_id in dict.fromkeys(value for value in request_ids):
-        stored = db.get_download_request(request_id)
+        stored = download_requests_repo.get_download_request(request_id)
         if stored is None:
             continue
         row = dict(stored)
@@ -232,7 +233,7 @@ def cleanup_download_staging(
                 capability = getattr(client, 'supports_atomic_empty_directory_delete', None)
             if not callable(delete_empty) or capability is not True:
                 raise _RetainDirectory('unsupported', '云盘接口不支持安全空目录清理')
-            other_staging = set(db.list_protected_guangya_staging_ids()) - {root_id}
+            other_staging = set(download_requests_repo.list_protected_guangya_staging_ids()) - {root_id}
             _verify_selected_scope(client, root_id, selected_scope)
             nodes = _empty_tree(client, row, live_protected | other_staging, report)
             # 即使下载行被别处改回 retained，未知审计也不能被后台重放。
@@ -244,7 +245,7 @@ def cleanup_download_staging(
                 ).fetchone()
             if unknown:
                 raise _RetainDirectory('protected', '存在结果未知的目录删除审计，停止自动收尾')
-            latest = db.get_download_request(request_id)
+            latest = download_requests_repo.get_download_request(request_id)
             if (
                 latest is None or not same_staging_identity(dict(latest), row)
                 or not _eligible(dict(latest), allow_running=allow_running)
@@ -272,13 +273,13 @@ def cleanup_download_staging(
                 owners = list_staging_cleanup_requests(source_id=current_root)
                 if len(owners) != 1 or int(owners[0]['id']) != current_request_id:
                     raise _RetainDirectory('protected', '隔离目录归属在清理准备时变为不唯一，已停止')
-                latest = db.get_download_request(current_request_id)
+                latest = download_requests_repo.get_download_request(current_request_id)
                 if (
                     latest is None or not same_staging_identity(dict(latest), expected_row)
                     or not _eligible(dict(latest), allow_running=allow_running,
                                      owned=expected_row.get('gy_staging_cleanup_status') == 'failed')
                     or unresolved_staging_confirmations(current_root)
-                    or current_id in (set(db.list_protected_guangya_staging_ids()) - {current_root})
+                    or current_id in (set(download_requests_repo.list_protected_guangya_staging_ids()) - {current_root})
                 ):
                     raise _RetainDirectory('unavailable', '下载请求或待确认状态已变化，已停止后续清理')
                 parent, name = chain[current_id]

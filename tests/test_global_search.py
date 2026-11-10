@@ -121,8 +121,8 @@ class GlobalSearchTests(unittest.TestCase):
         )
 
     @patch("app.modules.global_search.db.list_organize_logs")
-    @patch("app.modules.global_search.db.list_download_logs")
-    @patch("app.modules.global_search.db.list_rss_subscriptions")
+    @patch("app.repositories.download_requests.list_download_logs")
+    @patch("app.repositories.rss.list_rss_subscriptions")
     @patch("app.modules.global_search.get_discovery_search_service")
     @patch("app.modules.global_search.app_config.get_bool", return_value=True)
     @patch("app.modules.global_search.search_media_servers")
@@ -188,8 +188,8 @@ class GlobalSearchTests(unittest.TestCase):
         self.assertEqual(sections["logs"]["items"][0]["title"], "沙丘2.mkv")
 
     @patch("app.modules.global_search.db.list_organize_logs", side_effect=RuntimeError("db down"))
-    @patch("app.modules.global_search.db.list_download_logs", return_value=[])
-    @patch("app.modules.global_search.db.list_rss_subscriptions", return_value=[])
+    @patch("app.repositories.download_requests.list_download_logs", return_value=[])
+    @patch("app.repositories.rss.list_rss_subscriptions", return_value=[])
     @patch("app.modules.global_search.app_config.get_bool", return_value=False)
     @patch("app.modules.global_search.search_media_servers", return_value=[])
     def test_source_failure_is_isolated_and_discovery_can_be_hidden(

@@ -110,7 +110,7 @@ class RetiredSourceCleanupGateTests(unittest.TestCase):
         with patch(
             "app.modules.strm.db.list_strm_retired_sources", return_value=[]
         ), patch(
-            "app.modules.strm.db.list_strm_index_by_prefix", return_value=[]
+            "app.repositories.strm.list_strm_index_by_prefix", return_value=[]
         ):
             result = clean_retired_strm_sources({"live"}, active_ids_complete=True)
 

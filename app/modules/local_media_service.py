@@ -15,6 +15,7 @@ from typing import Any
 
 from app import config
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.clients.guangya import GuangYaFile
 from app.logger import get_logger
 from app.modules.directory_media import (
@@ -438,7 +439,7 @@ class LocalMediaService:
 
     @_local_media_operation
     def inspect_source(self, owner: str, source_id: int, path: Path | str) -> dict[str, Any]:
-        source = db.get_local_media_source(source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源不存在")
         root = require_container_absolute_path(source.local_root, label="来源目录")
@@ -572,7 +573,7 @@ class LocalMediaService:
 
     @_local_media_operation
     def inspect_task(self, owner: str, task_id: int) -> dict[str, Any]:
-        task = db.get_local_media_task(task_id, owner=owner)
+        task = local_media_repo.get_local_media_task(task_id, owner=owner)
         if task is None:
             raise LocalMediaServiceError("本地媒体任务不存在")
         if task.status != "requires_manual":
@@ -604,7 +605,7 @@ class LocalMediaService:
     ) -> list[dict[str, Any]]:
         if inspection_id:
             inspection = self.inspections.get(owner, inspection_id)
-            source = db.get_local_media_source(inspection.source_id, owner=owner)
+            source = local_media_repo.get_local_media_source(inspection.source_id, owner=owner)
             if source is not None and source.media_type == "nsfw":
                 raise LocalMediaServiceError(
                     "成人番号专用来源不使用 TMDB 搜索，请直接运行 MetaTube 自动识别"
@@ -640,7 +641,7 @@ class LocalMediaService:
         media_type: str = "auto",
     ) -> dict[str, Any]:
         inspection = self.inspections.get(owner, inspection_id)
-        source = db.get_local_media_source(inspection.source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(inspection.source_id, owner=owner)
         if source is not None and source.media_type == "nsfw":
             raise LocalMediaServiceError(
                 "成人番号专用来源不使用豆瓣/BGM 或普通 TMDB 线索"
@@ -1193,7 +1194,7 @@ class LocalMediaService:
         season_override, episode_override = self._normalize_position_overrides(
             inspection, season_override, episode_override,
         )
-        source = db.get_local_media_source(inspection.source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(inspection.source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源已被删除")
         current = LocalFilesystemAdapter(inspection.root).scan(
@@ -1202,7 +1203,7 @@ class LocalMediaService:
         )
         if snapshot_digest(current) != inspection.digest:
             raise LocalMediaServiceError("源文件在检查后发生变化，请重新检查")
-        targets = db.list_local_library_targets(inspection.source_id, owner=owner)
+        targets = local_media_repo.list_local_library_targets(inspection.source_id, owner=owner)
         if not targets:
             raise LocalMediaServiceError("当前来源尚未配置归档目标")
         validate_source_target_roots(
@@ -1801,7 +1802,7 @@ class LocalMediaService:
         owner: str, task_id: int, diagnostic: str,
     ) -> None:
         try:
-            db.update_local_media_task(
+            local_media_repo.update_local_media_task(
                 task_id,
                 owner=owner,
                 status="requires_manual",
@@ -1821,10 +1822,10 @@ class LocalMediaService:
     @_local_media_operation
     def prepare_task(self, owner: str, task_id: int) -> dict[str, Any]:
         """只读预热一个任务的识别与探测缓存，不改变任务状态或文件。"""
-        task = db.get_local_media_task(task_id, owner=owner)
+        task = local_media_repo.get_local_media_task(task_id, owner=owner)
         if task is None:
             raise LocalMediaServiceError("本地媒体任务不存在")
-        source = db.get_local_media_source(task.source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源不存在")
         if source.media_type == "nsfw":
@@ -1882,7 +1883,7 @@ class LocalMediaService:
     ) -> Path:
         """在统一本地媒体 Writer 内把一级媒体条目移入可恢复回收区。"""
         with _local_media_write_lease():
-            source = db.get_local_media_source(source_id, owner=owner)
+            source = local_media_repo.get_local_media_source(source_id, owner=owner)
             if source is None:
                 raise LocalMediaServiceError("本地媒体来源不存在")
             root = require_container_absolute_path(source.local_root, label="来源目录")
@@ -1902,14 +1903,14 @@ class LocalMediaService:
     def _execute_task_under_writer(
         self, owner: str, task_id: int, *, qb_client=None,
     ) -> dict[str, Any]:
-        task = db.get_local_media_task(task_id, owner=owner)
+        task = local_media_repo.get_local_media_task(task_id, owner=owner)
         if task is None:
             raise LocalMediaServiceError("本地媒体任务不存在")
         # 位于 writer 内且在异常持久化范围外：重复投递不得覆盖完成态，
         # 更不能把原路径后来出现的新媒体当作旧任务再次执行。
         if task.status == "completed":
             raise LocalMediaServiceError("本地媒体任务已完成，请创建新任务")
-        source = db.get_local_media_source(task.source_id, owner=owner)
+        source = local_media_repo.get_local_media_source(task.source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源不存在")
         rules = self._restore_rules_snapshot(task.rules_snapshot) if task.rules_snapshot else OrganizeRules.from_config()
@@ -1955,7 +1956,7 @@ class LocalMediaService:
                     f"仍有 {len(pending_confirmations)} 组媒体需要人工确认；"
                     "为保证本地文件事务完整，本次尚未移动任何文件"
                 )
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="requires_manual",
                     snapshot_digest=execution_digest, error=reason,
                     **(preview.get("_task_identity") or {}),
@@ -1967,7 +1968,7 @@ class LocalMediaService:
                        if unplanned else {"reason": reason}),
                 }
             for plan in preview["_move_plans"]:
-                db.add_local_media_task_item(
+                local_media_repo.add_local_media_task_item(
                     task_id, str(plan.source.path), str(plan.target), role=plan.role,
                     media_group=plan.media_group, action=plan.action, size=plan.source.size,
                     mtime_ns=plan.source.mtime_ns, device=plan.source.device, inode=plan.source.inode,
@@ -1990,10 +1991,10 @@ class LocalMediaService:
                         "year": str(primary.get("year") or ""),
                         "media_type": str(primary.get("media_type") or ""),
                     })
-            db.update_local_media_task(task_id, owner=owner, **recognition_fields)
+            local_media_repo.update_local_media_task(task_id, owner=owner, **recognition_fields)
             if source.mode == "preview_only":
                 warning = "仅预览模式：未移动文件"
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="completed", warning=warning,
                     completed_at=db.now(), error="",
                 )
@@ -2008,17 +2009,17 @@ class LocalMediaService:
                 # moving 状态与真实暂停请求同属一个 qB 临界区；Web 恢复/删除
                 # 在获取 lease 后会看到 moving 并拒绝，消除检查/调用间竞态。
                 with qb_control_write_lease():
-                    db.update_local_media_task(task_id, owner=owner, status="moving")
+                    local_media_repo.update_local_media_task(task_id, owner=owner, status="moving")
                     qb_client.pause_torrents(task.qb_hash)
                     paused = True
             else:
-                db.update_local_media_task(task_id, owner=owner, status="moving")
+                local_media_repo.update_local_media_task(task_id, owner=owner, status="moving")
             executable_plans = [item for item in preview["_move_plans"] if item.action != "skip"]
             skipped_plans = [item for item in preview["_move_plans"] if item.action == "skip"]
             if executable_plans:
                 result = LocalMoveTransaction(
                     [Path(source.local_root)],
-                    [Path(item.path) for item in db.list_local_library_targets(task.source_id, owner=owner)],
+                    [Path(item.path) for item in local_media_repo.list_local_library_targets(task.source_id, owner=owner)],
                     task_id=task_id, owner=owner, operation_token=task.operation_token,
                 ).execute(executable_plans)
                 # LocalMoveTransaction 只有在全部移动完成并完成内部校验后才返回。
@@ -2027,7 +2028,7 @@ class LocalMediaService:
                 committed_targets = [str(item.target) for item in result.moved]
             else:
                 result = MoveTransactionResult(status="completed")
-            db.update_local_media_task(task_id, owner=owner, status="verifying")
+            local_media_repo.update_local_media_task(task_id, owner=owner, status="verifying")
             warnings = list(result.warnings)
             if skipped_plans:
                 warnings.append(f"按冲突策略保留现有文件，跳过 {len(skipped_plans)} 项")
@@ -2056,7 +2057,7 @@ class LocalMediaService:
                     remove_empty_dirs=rules.clean_empty,
                 )
                 warnings.extend(cleanup_result.warnings)
-            db.update_local_media_task(task_id, owner=owner, status="refreshing")
+            local_media_repo.update_local_media_task(task_id, owner=owner, status="refreshing")
             media_refresh_status = "skipped"
             if rules.emby_refresh:
                 refresh_warnings = self._refresh_plans(executable_plans)
@@ -2065,7 +2066,7 @@ class LocalMediaService:
             final_status = (
                 "requires_manual" if result.status == "requires_manual" else "completed"
             )
-            db.update_local_media_task(
+            local_media_repo.update_local_media_task(
                 task_id, owner=owner, status=final_status, warning="；".join(warnings),
                 completed_at=db.now(), error="",
             )
@@ -2111,7 +2112,7 @@ class LocalMediaService:
                 except Exception as resume_exc:
                     exc = LocalMediaServiceError(f"{exc}；qB 恢复失败: {resume_exc}")
             try:
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="failed", error=str(exc)
                 )
             except Exception as persist_exc:
@@ -2130,7 +2131,7 @@ class LocalMediaService:
             context = inspection.manual_task
             if not context or preview_digest != context["snapshot_digest"]:
                 raise LocalMediaServiceError("预览已失效，请重新检查并生成预览后确认")
-            task_id = db.prepare_manual_local_media_task(
+            task_id = local_media_repo.prepare_manual_local_media_task(
                 inspection.source_id, str(inspection.selected_path), owner=owner, **context,
             )
             self.inspections.discard(owner, inspection_id)
@@ -2297,18 +2298,18 @@ def _source_paths(
 
 def local_sources() -> list[dict]:
     targets_by_source: dict[int, list] = {}
-    for target in db.list_local_library_targets(owner="admin"):
+    for target in local_media_repo.list_local_library_targets(owner="admin"):
         targets_by_source.setdefault(target.source_id, []).append(target)
     return [local_source_payload(source, targets_by_source.get(source.id, []))
-            for source in db.list_local_media_sources(owner="admin")]
+            for source in local_media_repo.list_local_media_sources(owner="admin")]
 
 
 def local_source(source_id: int) -> dict:
     _local_source_id(source_id)
-    source = db.get_local_media_source(source_id, owner="admin")
+    source = local_media_repo.get_local_media_source(source_id, owner="admin")
     if source is None:
         raise LookupError("本地媒体来源不存在")
-    return local_source_payload(source, db.list_local_library_targets(source_id, owner="admin"))
+    return local_source_payload(source, local_media_repo.list_local_library_targets(source_id, owner="admin"))
 
 
 def _local_source_id(source_id: int) -> int:
@@ -2436,7 +2437,7 @@ def prepare_local_source_scan(source_ids: list[int] | None = None, query: str = 
         raise ValueError("source_ids必须是真实来源ID的正整数数组")
     if not isinstance(query, str) or len(query) > 120 or contains_sensitive_credential(query) or "://" in query or query.strip().startswith(("/", "\\")):
         raise ValueError("query必须是媒体标题过滤词，不是路径、URL或凭据")
-    ids = sorted(set(source_ids)) if source_ids is not None else [source.id for source in db.list_local_media_sources(owner="admin")]
+    ids = sorted(set(source_ids)) if source_ids is not None else [source.id for source in local_media_repo.list_local_media_sources(owner="admin")]
     if not ids:
         raise ValueError("尚未选择本地媒体来源")
     snapshots = {source_id: _local_source_snapshot(source_id) for source_id in ids}

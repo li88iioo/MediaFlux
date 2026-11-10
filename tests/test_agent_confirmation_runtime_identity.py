@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from app import config, database as db
+from app.repositories import media_proxy as media_proxy_repo
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime, invalidate_agent_kernel_runtime
 from app.agent.kernel.model import ModelEvent, ModelEventType
 from app.agent.kernel.effects import InMemoryRateLimiter
@@ -80,7 +81,7 @@ def test_confirmed_restart_does_not_block_concurrent_web_runtime_lookup():
             config.set_and_save({"AGENT_ENABLED": "1", "AGENT_LLM_API_URL": "http://model.invalid/v1", "AGENT_LLM_MODEL": "test-model"})
             invalidate_agent_kernel_runtime()
             current = await asyncio.to_thread(get_agent_kernel_runtime)
-            instance_id = db.add_media_proxy_instance(
+            instance_id = media_proxy_repo.add_media_proxy_instance(
                 name="test", server_type="jellyfin", upstream_url="http://proxy.invalid",
                 api_key="test-key", listen_host="127.0.0.1", listen_port=19001,
                 local_root="/media", enabled=1,
@@ -97,7 +98,7 @@ def test_confirmed_restart_does_not_block_concurrent_web_runtime_lookup():
             async def restart(selected, **_):
                 restart_started.set()
                 await lookup_started.wait()
-                assert await asyncio.to_thread(db.get_media_proxy_instance, selected) is not None
+                assert await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, selected) is not None
                 restarted.append(selected)
                 return {"restarted": True}
 

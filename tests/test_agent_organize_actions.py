@@ -88,7 +88,7 @@ def _atomic_clean_client(*, credential_generation: int = 0):
 class GuangYaOrganizeActionTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch(
-            "app.modules.organize_tasks.db.list_protected_guangya_staging_ids", return_value=set(),
+            "app.repositories.download_requests.list_protected_guangya_staging_ids", return_value=set(),
         ))
 
     def test_configured_sources_normalize_and_deduplicate(self):

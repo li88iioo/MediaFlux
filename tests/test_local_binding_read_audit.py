@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.routes import media_libraries_api as api
 from tests.support import IsolatedDatabaseTestCase
 
@@ -16,7 +17,7 @@ class LocalBindingReadAuditTests(IsolatedDatabaseTestCase):
         self.owner = self._testMethodName
 
     def _source(self, index, *, enabled=True, owner=None):
-        return db.create_local_media_source(
+        return local_media_repo.create_local_media_source(
             name=f"before-{index}",
             qb_profile="",
             qb_path_prefix="",
@@ -26,7 +27,7 @@ class LocalBindingReadAuditTests(IsolatedDatabaseTestCase):
         )
 
     def _binding(self, source_id, category="movie", *, owner=None):
-        return db.upsert_local_library_target(
+        return local_media_repo.upsert_local_library_target(
             source_id,
             category,
             f"/before/{source_id}/{category}",

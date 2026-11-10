@@ -102,7 +102,7 @@ def _consume(*, providers, expected_paths):
         with patch.object(coordinator, "_client_for", return_value=client), patch("app.services.clear_dashboard_cache"):
             coordinator._process_group(group)
         assert client.refresh_for_paths.call_args.kwargs["allow_global_fallback"] is False
-    assert db.count_strm_refresh_paths() == 0
+    assert repository.count_strm_refresh_paths() == 0
     assert media_refresh_queue_status()["paths"] == 0
 
 
@@ -120,16 +120,17 @@ def deny_network(event, args):
 sys.addaudithook(deny_network)
 import tests
 from app import database as db
+from app.repositories import strm as repository
 from tests.test_strm_refresh_closure import _run, _providers
 
 db.configure_database(Path(sys.argv[1]), test_mode=True)
-original = db.upsert_strm_index
+original = repository.upsert_strm_index
 
 def crash_after_commit(*args, **kwargs):
     original(*args, **kwargs)
     os._exit(73)
 
-with _providers(), patch.object(db, 'upsert_strm_index', side_effect=crash_after_commit):
+with _providers(), patch.object(repository, 'upsert_strm_index', side_effect=crash_after_commit):
     _run(Path(sys.argv[2]), mode=sys.argv[3], enabled=sys.argv[4]=='1', allow_emby=sys.argv[5]=='1')
 os._exit(74)
 '''
@@ -145,8 +146,8 @@ def test_commit_crash_replays_refresh_without_rewriting_current_strm(tmp_path, m
         )
         assert child.returncode == 73, (child.returncode, child.stdout, child.stderr)
         paths = list(tmp_path.rglob("*.strm"))
-        assert len(paths) == len(db.list_strm_index("guangya:s")) == 1
-        entries = db.list_strm_refresh_entries()
+        assert len(paths) == len(repository.list_strm_index("guangya:s")) == 1
+        entries = repository.list_strm_refresh_entries()
         assert len(entries) == int(enabled)
         if entries:
             assert entries[0]["allow_emby"] is allow_emby
@@ -154,7 +155,7 @@ def test_commit_crash_replays_refresh_without_rewriting_current_strm(tmp_path, m
         replay = _run(tmp_path, enabled=enabled, allow_emby=allow_emby)
         assert replay["stats"]["generated"] == 0 and replay["stats"]["skipped"] == 1
         assert paths[0].read_bytes() == before
-        assert db.list_strm_refresh_entries() == entries
+        assert repository.list_strm_refresh_entries() == entries
         if enabled:
             _consume(providers=("jellyfin", "emby") if allow_emby else ("jellyfin",), expected_paths=[str(paths[0].parent)])
         else:
@@ -168,7 +169,7 @@ def test_empty_provider_keeps_intent_until_configuration_recovers(tmp_path, orig
     target = str(tmp_path / strm.STRM_SUBDIR / "Film")
     with isolated_test_database(), _providers():
         if origin == "outbox":
-            db.enqueue_strm_refresh_paths([target], allow_emby=False)
+            repository.enqueue_strm_refresh_paths([target], allow_emby=False)
             worker = STRMMetadataWorker()
             worker._flush_media_refresh(force=True)
             assert worker._refresh_retry_pending
@@ -176,7 +177,7 @@ def test_empty_provider_keeps_intent_until_configuration_recovers(tmp_path, orig
             with patch.object(scheduler_module, "get", side_effect=lambda k, d="": str(tmp_path) if k == "STRM_ROOT" else d):
                 result = STRMScheduler._refresh_media_servers(changed_dirs=[target], emby_enabled=False)
             assert result == {"媒体库": "pending"}
-        assert db.count_strm_refresh_paths() == 1
+        assert repository.count_strm_refresh_paths() == 1
         assert media_refresh_queue_status()["paths"] == 0
         _consume(providers=("jellyfin",), expected_paths=[target])
 
@@ -192,7 +193,7 @@ def test_single_source_root_file_create_delete_and_refresh(tmp_path, removal):
             db.enqueue_strm_retired_source("s", "S", str(tmp_path))
         deleted = _run(tmp_path, flat=True, allow_emby=False, tree={"s": []}, retire=removal == "retirement")
         assert deleted["stats"]["cleaned"] == 1
-        assert not path.exists() and not db.list_strm_index("guangya:s")
+        assert not path.exists() and not repository.list_strm_index("guangya:s")
         assert not db.list_strm_retired_sources()
         _consume(providers=("jellyfin",), expected_paths=[str(path)])
 
@@ -215,12 +216,12 @@ def test_failed_file_index_outbox_commit_retries_instead_of_becoming_current(tmp
         with patch.object(repository, "_enqueue_strm_refresh_paths", side_effect=fail_after_outbox_write):
             result = _run(tmp_path)
         assert result["stats"]["failed"] == 1
-        assert len(db.list_strm_index("guangya:s")) == int(existing)
+        assert len(repository.list_strm_index("guangya:s")) == int(existing)
         assert (path.read_bytes() if path.exists() else None) == before
-        assert db.count_strm_refresh_paths() == 0
+        assert repository.count_strm_refresh_paths() == 0
         replay = _run(tmp_path, allow_emby=False)
         assert replay["stats"]["generated"] == 1 and replay["stats"]["skipped"] == 0
-        assert db.list_strm_index("guangya:s")[0]["etag"] == "e"
+        assert repository.list_strm_index("guangya:s")[0]["etag"] == "e"
         _consume(providers=("jellyfin",), expected_paths=[str(path.parent)])
 
 
@@ -230,11 +231,11 @@ def test_deleted_file_keeps_index_until_refresh_is_durable(tmp_path):
         with patch.object(repository, "_enqueue_strm_refresh_paths", side_effect=sqlite3.OperationalError("outbox unavailable")):
             _run(tmp_path, tree={"s": []})
         assert not list(tmp_path.rglob("*.strm"))
-        assert len(db.list_strm_index("guangya:s")) == 1
-        assert db.count_strm_refresh_paths() == 0
+        assert len(repository.list_strm_index("guangya:s")) == 1
+        assert repository.count_strm_refresh_paths() == 0
         replay = _run(tmp_path, tree={"s": []}, allow_emby=False)
         assert replay["stats"]["cleaned"] == 0
-        assert not db.list_strm_index("guangya:s")
+        assert not repository.list_strm_index("guangya:s")
         _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Film")])
 
 
@@ -251,16 +252,16 @@ def test_invalid_empty_source_config_does_not_unlock_retirement(tmp_path):
         db.enqueue_strm_retired_source("s", "S", str(tmp_path))
         _run(tmp_path, retire=True, configured_text="[broken")
         assert len(list(tmp_path.rglob("*.strm"))) == 1
-        assert len(db.list_strm_index("guangya:s")) == 1
+        assert len(repository.list_strm_index("guangya:s")) == 1
         assert len(db.list_strm_retired_sources()) == 1
 
 
 @pytest.mark.parametrize("retire", [False, True])
 def test_delete_commit_crash_retains_refresh_after_index_disappears(tmp_path, retire):
     child_code = _CHILD.replace(
-        "original = db.upsert_strm_index", "original = db.delete_strm_index_ids"
+        "original = repository.upsert_strm_index", "original = repository.delete_strm_index_ids"
     ).replace(
-        "patch.object(db, 'upsert_strm_index'", "patch.object(db, 'delete_strm_index_ids'"
+        "patch.object(repository, 'upsert_strm_index'", "patch.object(repository, 'delete_strm_index_ids'"
     ).replace(
         "_run(Path(sys.argv[2]), mode=sys.argv[3], enabled=sys.argv[4]=='1', allow_emby=sys.argv[5]=='1')",
         "_run(Path(sys.argv[2]), tree={'s': []}, retire=sys.argv[3]=='retire', allow_emby=False)",
@@ -275,8 +276,8 @@ def test_delete_commit_crash_retains_refresh_after_index_disappears(tmp_path, re
         )
         assert child.returncode == 73, (child.returncode, child.stdout, child.stderr)
         assert not list(tmp_path.rglob("*.strm"))
-        assert not db.list_strm_index("guangya:s")
-        assert db.count_strm_refresh_paths() == 1
+        assert not repository.list_strm_index("guangya:s")
+        assert repository.count_strm_refresh_paths() == 1
         replay = _run(tmp_path, tree={"s": []}, retire=retire, allow_emby=False)
         assert replay["stats"]["generated"] == replay["stats"]["cleaned"] == 0
         assert not db.list_strm_retired_sources()
@@ -290,16 +291,16 @@ def test_move_from_root_keeps_old_file_refresh_until_recovery_handoff(tmp_path):
         result = _run(tmp_path, allow_emby=False)
         assert result["stats"]["generated"] == result["stats"]["cleaned"] == 1
         assert not previous.exists()
-        assert not db.list_strm_path_cleanup("guangya:s")
+        assert not repository.list_strm_path_cleanup("guangya:s")
         _consume(providers=("jellyfin",), expected_paths=[str(previous), str(previous.parent / "Film")])
 
 
 def test_skipped_provider_is_not_a_durable_handoff(tmp_path):
     with isolated_test_database():
-        db.enqueue_strm_refresh_paths([str(tmp_path / "Film")], allow_emby=False)
+        repository.enqueue_strm_refresh_paths([str(tmp_path / "Film")], allow_emby=False)
         with patch.object(refresh, "enqueue_media_refresh_paths", return_value={"Jellyfin": "skipped"}):
             STRMMetadataWorker()._flush_media_refresh(force=True)
-        assert db.count_strm_refresh_paths() == 1
+        assert repository.count_strm_refresh_paths() == 1
         assert media_refresh_queue_status()["paths"] == 0
 
 
@@ -339,9 +340,9 @@ def test_real_scheduler_entry_retires_last_source_without_config_short_circuit(t
             assert run["trigger_type"] == ("cron" if entry == "start-cron" else "config-retirement")
             result = json.loads(run["result"])
             assert result["stats"]["cleaned"] == result["stats"]["retired_sources"] == 1
-            assert not db.list_strm_index("guangya:s") and not db.list_strm_retired_sources()
+            assert not repository.list_strm_index("guangya:s") and not db.list_strm_retired_sources()
             assert not list(tmp_path.rglob("*.strm"))
-            assert db.count_strm_refresh_paths() == 1
+            assert repository.count_strm_refresh_paths() == 1
         finally:
             assert scheduler.stop(timeout=5)
         _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Movie.strm")])
@@ -353,21 +354,21 @@ def test_commit_and_overflow_share_frozen_policy_and_do_not_duplicate_paths(tmp_
         scheduler._run_options = {"media_server_refresh_override": True, "emby_refresh_override": False}
         first = scheduler._refresh_overflow_sink(str(tmp_path / "first"))
         path = Path(first.media_root) / "Film" / "Movie.strm"
-        db.upsert_strm_index("guangya:s", "v", "e", 1, "Movie.mkv", str(path), refresh_policy=first)
+        repository.upsert_strm_index("guangya:s", "v", "e", 1, "Movie.mkv", str(path), refresh_policy=first)
         first([str(path.parent)])
-        assert db.count_strm_refresh_paths() == 1
+        assert repository.count_strm_refresh_paths() == 1
         scheduler._run_options = {"media_server_refresh_override": False, "emby_refresh_override": True}
         disabled = scheduler._refresh_overflow_sink(str(tmp_path / "second"))
         disabled([str(Path(disabled.media_root) / "Film")])
         # 后一轮开关/根改变，不能污染上一轮已捕获策略。
         first([str(path.parent)])
-        entries = db.list_strm_refresh_entries()
+        entries = repository.list_strm_refresh_entries()
         assert len(entries) == 1 and entries[0]["allow_emby"] is False
         assert entries[0]["path"] == str(path.parent)
         scheduler._run_options = {"media_server_refresh_override": True, "emby_refresh_override": True}
         second = scheduler._refresh_overflow_sink(str(tmp_path / "second"))
         second([str(Path(second.media_root) / "Film")])
-        assert {(entry["path"], entry["allow_emby"]) for entry in db.list_strm_refresh_entries()} == {
+        assert {(entry["path"], entry["allow_emby"]) for entry in repository.list_strm_refresh_entries()} == {
             (str(path.parent), False), (str(Path(second.media_root) / "Film"), True),
         }
 

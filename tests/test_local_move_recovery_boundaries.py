@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaService
 from app.modules.local_move_transaction import LocalMoveError, LocalMoveTransaction
 from app.modules.local_storage import LocalFilesystemAdapter
@@ -68,9 +68,9 @@ class LocalMoveRecoveryBoundariesTests(IsolatedDatabaseTestCase):
             source = src / 'Movie.2026.mkv'
             source.write_bytes(b'only-new-copy')
             identity = source.stat()
-            source_id = db.create_local_media_source(name='recovery-boundary', qb_profile='',
+            source_id = local_media_repo.create_local_media_source(name='recovery-boundary', qb_profile='',
                 qb_path_prefix='', local_root=str(src), owner='admin')
-            db.upsert_local_library_target(source_id, 'movie', str(dst), owner='admin')
+            local_media_repo.upsert_local_library_target(source_id, 'movie', str(dst), owner='admin')
             service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(
                 tmdb_id='1', title='Movie', year='2026', media_type='movie', confidence=1.0))))
             real_lstat = Path.lstat
@@ -92,7 +92,7 @@ class LocalMoveRecoveryBoundariesTests(IsolatedDatabaseTestCase):
                     task_id = service.create_manual_task(
                         'admin', inspection['inspection_id'], preview_digest=preview['preview_digest'],
                     )
-                    self.assertTrue(db.claim_local_media_task(task_id, owner='admin'))
+                    self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner='admin'))
                     with self.assertRaises(LocalMoveError) as caught:
                         service.execute_task('admin', task_id)
             finally:
@@ -100,10 +100,10 @@ class LocalMoveRecoveryBoundariesTests(IsolatedDatabaseTestCase):
             self.assertEqual(faults, [True])
             self.assertEqual(caught.exception.rollback_errors, [])
             self.assertEqual(source.read_bytes(), b'only-new-copy')
-            get_local_media_task_result = db.get_local_media_task(task_id, owner='admin')
+            get_local_media_task_result = local_media_repo.get_local_media_task(task_id, owner='admin')
             assert get_local_media_task_result is not None
             self.assertEqual(get_local_media_task_result.status, 'failed')
-            self.assertEqual([r['status'] for r in db.list_local_media_operation_steps(
+            self.assertEqual([r['status'] for r in local_media_repo.list_local_media_operation_steps(
                 task_id, owner='admin')], ['rolled_back'])
 
     def test_rollback_never_overwrites_source_created_after_precheck(self):

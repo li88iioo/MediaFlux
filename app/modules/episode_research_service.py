@@ -179,7 +179,7 @@ def _cache_failed_attempt(case_key: str, reason: str) -> None:
 def research_confirmation_episodes(payload: dict, *, runner=None, reader_factory=None) -> dict:
     """后台同步入口；同包合并、每日案例预算和并发上限都不能被模型绕过。"""
     deadline_at = time.monotonic() + _TOTAL_TIMEOUT_SECONDS
-    from app import database as db
+    from app.repositories import agent_web_search as agent_web_search_repo
     from app.repositories.episode_research import put_episode_research_cache
     try:
         _check_scope(payload)
@@ -209,7 +209,7 @@ def research_confirmation_episodes(payload: dict, *, runner=None, reader_factory
             except (TypeError, ValueError):
                 limit = 10
             limit = min(100, max(1, limit))
-            if not db.reserve_agent_web_search_credits(provider="episode_research", usage_date=db.current_agent_web_search_usage_date(), cost=1, daily_limit=limit):
+            if not agent_web_search_repo.reserve_agent_web_search_credits(provider="episode_research", usage_date=agent_web_search_repo.current_agent_web_search_usage_date(), cost=1, daily_limit=limit):
                 return _outcome("research_daily_budget")
             if runner is None:
                 from app.modules.agent_episode_research import (

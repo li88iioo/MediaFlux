@@ -10,6 +10,7 @@ from typing import cast
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.backup import create_backup, recover_pending_restore, restore_backup
 from app.modules.local_media_service import LocalMediaService, LocalMovePlan
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
@@ -35,14 +36,14 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             )
             paths.ensure_writable_dirs()
             paths.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="历史来源",
                 qb_profile="",
                 qb_path_prefix="",
                 local_root="/synthetic/downloads",
                 owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id,
                 "movie",
                 "/media/Movies",

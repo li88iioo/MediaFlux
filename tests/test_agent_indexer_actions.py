@@ -372,11 +372,11 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             ) as normalize,
             patch("app.indexers.downloads.request_keys", return_value=("req:key",)),
             patch(
-                "app.indexers.downloads.db.get_download_request_by_request_key",
+                "app.repositories.download_requests.get_download_request_by_request_key",
                 return_value=None,
             ),
             patch(
-                "app.indexers.downloads.db.get_download_request_by_request_keys",
+                "app.repositories.download_requests.get_download_request_by_request_keys",
                 return_value=None,
             ),
             patch(
@@ -407,11 +407,11 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             ),
             patch("app.indexers.downloads.request_keys", return_value=("req:key",)),
             patch(
-                "app.indexers.downloads.db.get_download_request_by_request_key",
+                "app.repositories.download_requests.get_download_request_by_request_key",
                 return_value=None,
             ),
             patch(
-                "app.indexers.downloads.db.get_download_request_by_request_keys",
+                "app.repositories.download_requests.get_download_request_by_request_keys",
                 return_value=None,
             ),
             patch(
@@ -552,7 +552,7 @@ class IndexerReceivingSourceTests(unittest.TestCase):
     def test_classification_survives_persisted_staging_and_retry_without_remote_writes(self):
         from types import SimpleNamespace
 
-        from app import database as db
+        from app.repositories import download_requests as download_requests_repo
         from app.modules import download_dispatcher as dispatcher
         from app.modules.organize_rules import OrganizeRules
         from tests.support import isolated_test_database
@@ -573,7 +573,7 @@ class IndexerReceivingSourceTests(unittest.TestCase):
             service = FakeDownloadService(_resource_item(site_id="sukebei"))
             submitted = asyncio.run(download_indexer_result(service, _RESULT_ID, "guangya", origin_namespace="agent", scope="agent"))
             self.assertTrue(submitted["ok"], submitted)
-            row = db.get_download_request(submitted["request_id"])
+            row = download_requests_repo.get_download_request(submitted["request_id"])
             assert row is not None
             self.assertEqual((row["gy_requested_target_dir"], row["gy_requested_nsfw"]), ("special-source", 1))
             self.assertEqual((row["gy_staging_parent_dir"], row["gy_target_dir"]), ("special-source", "stage-7"))

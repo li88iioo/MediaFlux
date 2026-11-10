@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm as strm_module
 from tests.support import IsolatedDatabaseTestCase
@@ -920,7 +921,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
                         result = strm_module.retry_strm_failures(ids, "manual", client=cast(GuangYaClient, client), runtime_config=runtime)
                     self.assertEqual(result["resolved"], 2)
                     for source in sources:
-                        rows = db.list_strm_index(source["source_key"])
+                        rows = strm_repo.list_strm_index(source["source_key"])
                         self.assertEqual(len(rows), 1)
                         target = Path(rows[0]["strm_path"])
                         self.assertTrue(target.is_file())
@@ -971,7 +972,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root, self._config(root, sources):
             result = strm_module.retry_strm_failures([failure_id], "manual", client=cast(GuangYaClient, client))
             target = Path(root) / strm_module.STRM_SUBDIR / "新来源" / "Moved.strm"
-            rows = db.list_strm_index(f"guangya:{new_source}")
+            rows = strm_repo.list_strm_index(f"guangya:{new_source}")
             target_exists = target.is_file()
 
         self.assertEqual(result["resolved"], 1)
@@ -1182,8 +1183,8 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
             target = Path(root) / strm_module.STRM_SUBDIR / "poster.jpg"
             target.parent.mkdir(parents=True)
             target.write_bytes(b"old-data")
-            db.upsert_strm_index(source_key, file.file_id, "old", 8, file.name, str(target))
-            original_upsert = db.upsert_strm_index
+            strm_repo.upsert_strm_index(source_key, file.file_id, "old", 8, file.name, str(target))
+            original_upsert = strm_repo.upsert_strm_index
 
             def fail_fresh(source_name, file_id, *args, **kwargs):
                 if source_name == source_key and file_id == file.file_id:
@@ -1193,13 +1194,13 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
             with self._config(root, source), patch(
                 "app.modules.strm.requests.get", return_value=_Response(b"new-data")
             ), patch(
-                "app.modules.strm.db.upsert_strm_index", side_effect=fail_fresh
+                "app.repositories.strm.upsert_strm_index", side_effect=fail_fresh
             ):
                 result = strm_module.retry_strm_failures(
                     [failure_id], "manual", client=cast(GuangYaClient, client)
                 )
 
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             self.assertEqual(target.read_bytes(), b"old-data")
             self.assertEqual(row["etag"], "old")
             self.assertEqual(row["strm_path"], str(target))
@@ -1218,7 +1219,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
             old_path = Path(root) / strm_module.STRM_SUBDIR / "old.jpg"
             old_path.parent.mkdir(parents=True)
             old_path.write_bytes(b"old")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, file.file_id, "old", 3, "old.jpg", str(old_path),
                 f"sha256:{hashlib.sha256(b'old').hexdigest()}",
             )
@@ -1229,7 +1230,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
                     [failure_id], "manual", client=cast(GuangYaClient, client)
                 )
             new_path = Path(root) / strm_module.STRM_SUBDIR / "new.jpg"
-            row = db.list_strm_index(source_key)[0]
+            row = strm_repo.list_strm_index(source_key)[0]
             self.assertFalse(old_path.exists())
             self.assertEqual(new_path.read_bytes(), b"new-data")
             self.assertEqual(row["strm_path"], str(new_path))
@@ -1248,7 +1249,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
             target = Path(root) / strm_module.STRM_SUBDIR / "poster.jpg"
             target.parent.mkdir(parents=True)
             target.write_bytes(b"conflict")
-            db.upsert_strm_index(
+            strm_repo.upsert_strm_index(
                 source_key, "stale", "old", 8, "poster.jpg", str(target),
                 f"sha256:{hashlib.sha256(b'conflict').hexdigest()}",
             )
@@ -1258,7 +1259,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
                 result = strm_module.retry_strm_failures(
                     [failure_id], "manual", client=cast(GuangYaClient, client)
                 )
-            rows = db.list_strm_index(source_key)
+            rows = strm_repo.list_strm_index(source_key)
             self.assertEqual([row["file_id"] for row in rows], ["fresh"])
             self.assertEqual(target.read_bytes(), b"fresh-data")
 

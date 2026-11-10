@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import config
-from app import database as db
+from app.repositories import discovery as discovery_repo
 
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -94,7 +94,7 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
             return_value=({"sources": [{"id": "source"}], "strm_root": "/strm"}, ""),
         ))
         self.strm_retry = self.enterContext(patch("app.modules.strm.retry_strm_failures"))
-        db.add_media_watchlist("tmdb", "8801", "movie", "已收藏影片", "2026", "")
+        discovery_repo.add_media_watchlist("tmdb", "8801", "movie", "已收藏影片", "2026", "")
         names = {name for name, _arguments in _NO_CHANGES_CASES}
         self.catalog = ToolCatalog()
         for tool in (policy_config_tool(), *cloud_organize_tools(), feature_config_tool(), indexer_configuration_tool(), *watchlist_tools(), *rss_delivery_tools(), *schedule_policy_tools(), *strm_failure_tools()):
@@ -166,4 +166,4 @@ class NoChangesContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((facts["ok"], facts["status"]), (True, "no_changes"))
         state = await self.state.load(owner="owner", session_id="watchlist")
         self.assertFalse(state.pending_effect_plan_id)
-        self.assertEqual(len(db.list_media_watchlist()), 1)
+        self.assertEqual(len(discovery_repo.list_media_watchlist()), 1)

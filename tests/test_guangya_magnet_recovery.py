@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.qbittorrent import QBTorrentExportError
 from app.modules import download_dispatcher as dispatcher
 from app.modules import offline
@@ -77,7 +78,7 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
         self.assertTrue(created["created"])
         request_id = created["id"]
         task_id = dispatcher.parse_torrent_metadata(payload)[1] if bound_hash is None else bound_hash
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="both", status=status, qb_status=qb_status,
             gy_status=gy_status, qb_task_id=task_id,
             qb_content_path="/fixture/content", local_import_status="pending",
@@ -93,14 +94,14 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.gy.selection_calls[0]["file_indexes"], [0])
         self.assertEqual(self.gy.selection_calls[0]["target_dir_id"], "fixture-staging")
         self.assertEqual(self.gy.legacy_calls, [])
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["gy_status"], "submitted")
         self.assertEqual(row["gy_expected_file_count"], 1)
 
     def test_partial_failure_retry_uses_same_request_and_never_resubmits_qb(self):
         request_id = self.request()
-        get_download_request_result_6 = db.get_download_request(request_id)
+        get_download_request_result_6 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_6 is not None
         before = dict(get_download_request_result_6)
         result = dispatcher.resubmit_download_request(request_id, "guangya")
@@ -109,7 +110,7 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
         self.assertFalse(result["created"])
         self.assertFalse(result["source_attention_preserved"])
         self.assert_recovered(request_id)
-        after = db.get_download_request(request_id)
+        after = download_requests_repo.get_download_request(request_id)
         for key in ("qb_status", "qb_task_id", "qb_content_path", "local_import_status", "request_key"):
             assert after is not None
             self.assertEqual(after[key], before[key], key)
@@ -131,12 +132,12 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
         result = dispatcher.resubmit_download_request(request_id, "guangya")
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["created"])
-        successor = db.get_download_request(result["request_id"])
+        successor = download_requests_repo.get_download_request(result["request_id"])
         assert successor is not None
         self.assertEqual(successor["kind"], "torrent")
         self.assertEqual(successor["torrent_data"], TORRENT)
         self.assertEqual(successor["qb_status"], "")
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["qb_status"], "completed")
         self.assert_recovered(result["request_id"])
@@ -178,7 +179,7 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
                 result = dispatcher.resubmit_download_request(request_id, "guangya")
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(self.gy.torrent_resolve_calls, [])
-                get_download_request_result_2 = db.get_download_request(result["request_id"])
+                get_download_request_result_2 = download_requests_repo.get_download_request(result["request_id"])
                 assert get_download_request_result_2 is not None
                 self.assertEqual(get_download_request_result_2["kind"], "magnet")
                 # 清理的是当前隔离测试类的临时数据库，不碰开发/生产记录。
@@ -199,7 +200,7 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
                 self.assertEqual(self.gy.torrent_resolve_calls, [])
                 self.assertEqual(self.gy.selection_calls, [])
                 self.gy.create_dir.assert_not_called()
-                get_download_request_result_3 = db.get_download_request(request_id)
+                get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result_3 is not None
                 self.assertEqual(get_download_request_result_3["qb_status"], "downloading")
                 with db.get_conn() as conn:
@@ -244,13 +245,13 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
                 self.assertTrue(started.wait(5))
                 second = dispatcher.resubmit_download_request(request_id, "guangya")
                 self.assertFalse(second["ok"])
-                db.update_download_request(request_id, qb_status="completed")
+                download_requests_repo.update_download_request(request_id, qb_status="completed")
             finally:
                 release.set()
             first = future.result(timeout=5)
         self.assertTrue(first["ok"], first)
         self.assert_recovered(request_id)
-        get_download_request_result_4 = db.get_download_request(request_id)
+        get_download_request_result_4 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["qb_status"], "completed")
 
@@ -265,13 +266,13 @@ class GuangYaMagnetRecoveryTests(IsolatedDatabaseTestCase):
                 def stop_then_dispatch(
                     *args, request_id=request_id, status=status, original=original, **kwargs,
                 ):
-                    db.update_download_request(request_id, status=status)
+                    download_requests_repo.update_download_request(request_id, status=status)
                     return original(*args, **kwargs)
 
                 with patch.object(dispatcher, "dispatch_missing_targets", side_effect=stop_then_dispatch):
                     result = dispatcher.resubmit_download_request(request_id, "guangya")
                 self.assertFalse(result["ok"])
-                get_download_request_result_5 = db.get_download_request(request_id)
+                get_download_request_result_5 = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result_5 is not None
                 self.assertEqual(get_download_request_result_5["status"], status)
                 self.qb_factory.assert_not_called()

@@ -1053,10 +1053,10 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
 
     def setUp(self):
         self.enqueue_outbox = patch(
-            "app.modules.scheduler.db.enqueue_strm_refresh_paths"
+            "app.repositories.strm.enqueue_strm_refresh_paths"
         ).start()
         self.ack_outbox = patch(
-            "app.modules.scheduler.db.acknowledge_strm_refresh_paths"
+            "app.repositories.strm.acknowledge_strm_refresh_paths"
         ).start()
         self.addCleanup(patch.stopall)
 

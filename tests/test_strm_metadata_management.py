@@ -30,7 +30,7 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
         self.addCleanup(self.disabled.stop)
 
     def _enqueue(self, name="a"):
-        db.enqueue_strm_metadata_jobs([_job(file_id=name)])
+        repository.enqueue_strm_metadata_jobs([_job(file_id=name)])
 
     def _status(self):
         with db.get_conn() as conn:
@@ -106,7 +106,7 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
         self._enqueue("a")
         self._enqueue("b")
         _, token = service.prepare_backlog_cancel("owner")
-        db.enqueue_strm_metadata_jobs([_job(file_id="b", etag="new-etag")])
+        repository.enqueue_strm_metadata_jobs([_job(file_id="b", etag="new-etag")])
         with self.assertRaisesRegex(ValueError, "队列已变化"):
             service.cancel_backlog_confirmed(token, "owner")
         self.assertEqual(set(self._status().values()), {"queued"})
@@ -114,7 +114,7 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
     def test_claim_after_preview_rejects_without_touching_running(self):
         self._enqueue()
         _, token = service.prepare_backlog_cancel("owner")
-        db.claim_due_strm_metadata_jobs(owner="worker")
+        repository.claim_due_strm_metadata_jobs(owner="worker")
         with self.assertRaises(ValueError):
             service.cancel_backlog_confirmed(token, "owner")
         self.assertEqual(self._status()["a"], "running")
@@ -122,7 +122,7 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
     def test_queued_running_queued_aba_changes_lease_generation(self):
         self._enqueue()
         _, token = service.prepare_backlog_cancel("owner")
-        db.claim_due_strm_metadata_jobs(owner="worker")
+        repository.claim_due_strm_metadata_jobs(owner="worker")
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_metadata_queue SET status='queued'")
         with self.assertRaises(ValueError):
@@ -134,7 +134,7 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
             conn.execute("UPDATE strm_metadata_queue SET status='completed'")
         self._enqueue("pending")
         _, token = service.prepare_backlog_cancel("owner")
-        db.enqueue_strm_metadata_jobs([_job(file_id="old-complete", etag="new")])
+        repository.enqueue_strm_metadata_jobs([_job(file_id="old-complete", etag="new")])
         with self.assertRaises(ValueError):
             service.cancel_backlog_confirmed(token, "owner")
         self.assertEqual(set(self._status().values()), {"queued"})
@@ -162,7 +162,7 @@ class MetadataManagementTests(IsolatedDatabaseTestCase):
         self.assertEqual(self._status()["a"], "queued")
 
     def test_large_backlog_has_bounded_confirmation_payload(self):
-        db.enqueue_strm_metadata_jobs([_job(file_id=str(i)) for i in range(13581)])
+        repository.enqueue_strm_metadata_jobs([_job(file_id=str(i)) for i in range(13581)])
         view, token = service.prepare_backlog_cancel("owner")
         self.assertEqual(view["count"], 13581)
         self.assertLess(len(token), 1024)

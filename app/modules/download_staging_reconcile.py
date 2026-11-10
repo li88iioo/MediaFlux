@@ -5,7 +5,7 @@ import logging
 from contextlib import ExitStack
 from dataclasses import replace
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger, log_throttled
 from app.modules.download_staging_cleanup import cleanup_report, merge_cleanup_report
@@ -78,7 +78,7 @@ def reconcile_with_client(client=None, *, rules: OrganizeRules | None = None, li
                     expected_identities={int(row['id']): {**row, '_confirmation_id': int(job['confirmation_id'])}},
                 )
                 merge_cleanup_report(aggregate, report)
-                latest = db.get_download_request(int(row['id']))
+                latest = download_requests_repo.get_download_request(int(row['id']))
                 if latest is None or not same_staging_identity(dict(latest), row):
                     state = 'blocked'
                 elif latest['gy_staging_cleanup_status'] == 'completed':

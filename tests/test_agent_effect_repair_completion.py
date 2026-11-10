@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from app import database as db
+from app.repositories import discovery as discovery_repo
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from app.agent.kernel.tool_calls import PreparedEffect
@@ -58,7 +58,7 @@ def test_real_watchlist_direct_retry_writes_once_and_preserves_receipt(rig, mode
             rounds = [call(arguments(501)), call({**arguments(501), "unsupported": True}), call(arguments(501)), FINAL]
         session = await trusted_session(rig, rounds)
         events = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message="把另一部电视剧也加入探索收藏")))
-        assert db.get_media_watchlist("tmdb", "501", "tv") is not None
+        assert discovery_repo.get_media_watchlist("tmdb", "501", "tv") is not None
         assert rig.attempts == [arguments(501)] and await rig.remaining() == 4
         assert events[-1].type is AgentEventType.TURN_COMPLETED
         assert events[-1].payload["status"] == "success", events[-1].payload
@@ -81,8 +81,8 @@ def test_other_targets_business_failure_survives_successful_automatic_write(rig)
         session = await trusted_session(rig, [call({**arguments(501), 'unsupported': True}),
             call(arguments(501)), call(arguments(502)), FINAL])
         events = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message='收藏这些电视剧')))
-        assert db.get_media_watchlist('tmdb', '501', 'tv') is None
-        assert db.get_media_watchlist('tmdb', '502', 'tv') is not None
+        assert discovery_repo.get_media_watchlist('tmdb', '501', 'tv') is None
+        assert discovery_repo.get_media_watchlist('tmdb', '502', 'tv') is not None
         assert rig.attempts == [arguments(502)] and await rig.remaining() == 4
         assert events[-1].payload['status'] == 'partial'
         assert events[-1].payload['finish_reason'] == 'provider_timeout'
@@ -123,7 +123,7 @@ def test_execution_started_argument_error_survives_readback_and_another_targets_
             return result
 
         def readback(args, _):
-            assert db.get_media_watchlist('tmdb', args['external_id'], 'tv') is not None
+            assert discovery_repo.get_media_watchlist('tmdb', args['external_id'], 'tv') is not None
             return {'ok': True, 'status': 'found', 'summary': '只读核验已收藏，原失败回执仍须保留'}
 
         reader = KernelToolSpec(name='library.lookup', domain='library', description='核验真实收藏状态',
@@ -137,8 +137,8 @@ def test_execution_started_argument_error_survives_readback_and_another_targets_
         session = await trusted_session(rig, [call({**arguments(501), 'unsupported': True}),
             call(arguments(501)), query, call(arguments(502)), FINAL])
         events = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message='收藏并核验这些电视剧')))
-        assert db.get_media_watchlist('tmdb', '501', 'tv') is not None
-        assert db.get_media_watchlist('tmdb', '502', 'tv') is not None
+        assert discovery_repo.get_media_watchlist('tmdb', '501', 'tv') is not None
+        assert discovery_repo.get_media_watchlist('tmdb', '502', 'tv') is not None
         assert rig.attempts == [arguments(501), arguments(502)] and await rig.remaining() == 3
         failed = next(event for event in events if event.type is AgentEventType.EFFECT_FAILED)
         assert failed.payload['result']['data']['execution_started'] is True
@@ -158,7 +158,7 @@ def test_receipt_save_failure_preserves_real_write_without_claiming_completion(r
 
         monkeypatch.setattr('app.agent.kernel.turn.remember_result', reject_receipt)
         events = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message='收藏这部电视剧')))
-        assert db.get_media_watchlist('tmdb', '501', 'tv') is not None
+        assert discovery_repo.get_media_watchlist('tmdb', '501', 'tv') is not None
         assert rig.attempts == [arguments(501)] and await rig.remaining() == 4
         assert events[-1].payload['status'] == 'partial'
         assert events[-1].payload['finish_reason'] == 'receipt_unavailable'

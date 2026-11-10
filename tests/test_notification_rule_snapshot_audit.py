@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.repositories import media_experience as repository
 from tests.support import IsolatedDatabaseTestCase
 
@@ -15,7 +16,7 @@ class NotificationRuleSnapshotAuditTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM media_subscription_notification_rules")
             conn.execute("DELETE FROM media_subscriptions")
-        self.sid = db.add_media_subscription(
+        self.sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id=self.id(),
             tmdb_id="321",

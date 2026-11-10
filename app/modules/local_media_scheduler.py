@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.clients.qbittorrent import QBittorrentClient, TorrentTask
 from app.config import get
 from app.logger import get_logger, log_throttled
@@ -221,7 +222,7 @@ class LocalMediaScheduler:
         task_save_path = (task.save_path or "").strip()
         matches = []
         eligible_sources = []
-        for source in db.list_local_media_sources(owner=self.owner, enabled_only=True):
+        for source in local_media_repo.list_local_media_sources(owner=self.owner, enabled_only=True):
             if source.qb_profile and source.qb_profile not in {"qb", "configured:qb", "default"}:
                 continue
             eligible_sources.append(source)
@@ -305,12 +306,12 @@ class LocalMediaScheduler:
             return None
         source, mapping, local_path = actual_matches[0]
         if request_id is None:
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source.id, task.hash, str(local_path), owner=self.owner,
                 trigger="qb_completed",
             )
         else:
-            task_id, _restarted = db.create_and_link_qb_local_media_task(
+            task_id, _restarted = local_media_repo.create_and_link_qb_local_media_task(
                 request_id, source.id, task.hash, str(local_path), owner=self.owner,
             )
         if wake:
@@ -342,7 +343,7 @@ class LocalMediaScheduler:
             {item for item in source_ids} if source_ids is not None else None
         )
         seen_source_ids: set[int] = set()
-        for source in db.list_local_media_sources(owner=self.owner):
+        for source in local_media_repo.list_local_media_sources(owner=self.owner):
             if selected_source_ids is not None and source.id not in selected_source_ids:
                 continue
             seen_source_ids.add(source.id)
@@ -371,7 +372,7 @@ class LocalMediaScheduler:
                     "error": "",
                 })
                 continue
-            if not db.list_local_library_targets(source.id, owner=self.owner):
+            if not local_media_repo.list_local_library_targets(source.id, owner=self.owner):
                 source_results.append({
                     "id": source.id, "name": source.name, "candidates": 0,
                     "queued": 0, "skipped": True, "reason": "尚未配置归档目标",
@@ -401,7 +402,7 @@ class LocalMediaScheduler:
                         SILENT_MANUAL_SCAN_TOKEN_PREFIX
                         if silent else MANUAL_SCAN_TOKEN_PREFIX
                     )
-                    task_id = db.create_local_media_task(
+                    task_id = local_media_repo.create_local_media_task(
                         source.id,
                         "",
                         str(candidate),
@@ -562,7 +563,7 @@ class LocalMediaScheduler:
             captured = self._captured_task_results.pop(normalized_id, None)
         if captured is not None or not was_captured:
             return captured
-        task = db.get_local_media_task(normalized_id, owner=self.owner)
+        task = local_media_repo.get_local_media_task(normalized_id, owner=self.owner)
         if task is None or str(task.status) != "requires_manual":
             return None
         return self._rebuild_manual_review_result(task)
@@ -596,12 +597,12 @@ class LocalMediaScheduler:
             self._path_locks.discard(key)
 
     def _mark_preclaim_failure(self, task, error: str) -> None:
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task.id, owner=self.owner, status="failed", error=error,
         )
 
     def _claim_waiting_task(self, task) -> str | None:
-        source = db.get_local_media_source(task.source_id, owner=self.owner)
+        source = local_media_repo.get_local_media_source(task.source_id, owner=self.owner)
         manual_scan = self._is_manual_scan_task(task)
         error = ""
         if source is None:
@@ -622,7 +623,7 @@ class LocalMediaScheduler:
         if key is None:
             return None
         try:
-            claimed = db.claim_local_media_task(
+            claimed = local_media_repo.claim_local_media_task(
                 task.id, expected="waiting_stable", owner=self.owner,
             )
         except Exception:
@@ -647,7 +648,7 @@ class LocalMediaScheduler:
             )
         except Exception as exc:
             self._complete_captured_task_result(task.id, None)
-            current = db.get_local_media_task(task.id, owner=self.owner)
+            current = local_media_repo.get_local_media_task(task.id, owner=self.owner)
             terminal_statuses = {"completed", "requires_manual", "failed"}
             if current and current.status not in terminal_statuses:
                 failure_status = (
@@ -655,10 +656,10 @@ class LocalMediaScheduler:
                     if isinstance(exc, LocalMediaPostMoveError)
                     else "failed"
                 )
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task.id, owner=self.owner, status=failure_status, error=str(exc),
                 )
-                current = db.get_local_media_task(task.id, owner=self.owner)
+                current = local_media_repo.get_local_media_task(task.id, owner=self.owner)
             logger.error(
                 "本地媒体任务执行失败 task=%s type=%s",
                 task.id, type(exc).__name__,
@@ -757,7 +758,7 @@ class LocalMediaScheduler:
         return resolve_local_media_organize_workers()
 
     def _task_supports_parallel_planning(self, task) -> bool:
-        source = db.get_local_media_source(task.source_id, owner=self.owner)
+        source = local_media_repo.get_local_media_source(task.source_id, owner=self.owner)
         return source is not None and (source.media_type or "") != "nsfw"
 
     def _run_parallel_planning_batch(self, tasks: list, workers: int) -> int:
@@ -848,7 +849,7 @@ class LocalMediaScheduler:
             return processed
 
     def run_once(self) -> int:
-        tasks = db.list_waiting_local_media_tasks(owner=self.owner, limit=500)
+        tasks = local_media_repo.list_waiting_local_media_tasks(owner=self.owner, limit=500)
         workers = self._parallel_planning_worker_count()
         if workers <= 1:
             processed = 0

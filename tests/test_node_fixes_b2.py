@@ -9,6 +9,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.media_probe import MediaProfile
 from app.modules.nsfw import extract_nsfw_part_index
@@ -140,7 +141,7 @@ class ProbePreservesMultipart(IsolatedDatabaseTestCase):
                         },
                     ],
                 )
-                db.enqueue_organize_probe_completion(
+                organize_probe_repo.enqueue_organize_probe_completion(
                     log_id,
                     source_id="target",
                     rel_dir="library",

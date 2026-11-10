@@ -5,7 +5,7 @@ import asyncio
 import threading
 import time
 
-from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.logger import get_logger
 from app.modules.media_subscriptions import MediaSubscriptionError, get_media_subscription_service
 from app.services import MediaIdentityBatch
@@ -111,14 +111,14 @@ class MediaSubscriptionScheduler:
             return 0
         current = time.monotonic()
         if current - self._last_recovery_at >= _RECOVERY_INTERVAL_SECONDS:
-            recovered = db.recover_stale_media_subscription_checks()
+            recovered = media_subscriptions_repo.recover_stale_media_subscription_checks()
             if recovered:
                 logger.warning("已恢复 %s 个中断的媒体订阅检查", recovered)
             self._last_recovery_at = current
 
         count = 0
         identity_batch = MediaIdentityBatch(deadline_at=current + 120, cancelled=self._stop_event.is_set)
-        for row in db.list_due_media_subscriptions(limit=20):
+        for row in media_subscriptions_repo.list_due_media_subscriptions(limit=20):
             if self._stop_event.is_set():
                 break
             subscription_id = int(row["id"])

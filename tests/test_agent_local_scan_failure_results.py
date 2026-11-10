@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import config, database as db
+from app.repositories import local_media as local_media_repo
 from app.agent.action_history import read_actions, record_confirmed_result
 from app.modules.local_media_service import prepare_local_source_scan, scan_local_sources
 from app.modules.local_media_tasks import local_tasks
@@ -30,11 +31,11 @@ OWNER = "webk:v1:" + "b" * 64
 
 
 def source(root: Path, target: Path, *, name: str = "本地来源") -> int:
-    source_id = db.create_local_media_source(
+    source_id = local_media_repo.create_local_media_source(
         name=name, qb_profile="", qb_path_prefix="", local_root=str(root),
         stable_seconds=0, owner="admin",
     )
-    db.upsert_local_library_target(source_id, "default", str(target), owner="admin")
+    local_media_repo.upsert_local_library_target(source_id, "default", str(target), owner="admin")
     return source_id
 
 
@@ -117,8 +118,8 @@ def test_partial_scan_keeps_failure_through_report_query_and_finished_tasks(tmp_
         scan = resolve_local_media_scan(scan_ref)
         original_scan_summary = dict(scan["summary"])
         task_id = scan["task_ids"][0]
-        db.update_local_media_task(task_id, status="completed")
-        db.add_local_media_task_item(
+        local_media_repo.update_local_media_task(task_id, status="completed")
+        local_media_repo.add_local_media_task_item(
             task_id, str(root / "Show.S01E01.mkv"), str(target / "Show.S01E01.mkv"),
             role="video", action="move",
         )
@@ -149,14 +150,14 @@ def test_candidate_enqueue_errors_are_not_lost_or_confused_with_empty_scan(tmp_p
         for name in ("A.mkv", "B.mkv"):
             (root / name).write_bytes(b"video")
         source(root, target)
-        create = db.create_local_media_task
+        create = local_media_repo.create_local_media_task
 
         def enqueue(*args, **kwargs):
             if all_fail or str(args[2]).endswith("A.mkv"):
                 raise OSError("private /secret/directory access_token=token")
             return create(*args, **kwargs)
 
-        with patch("app.database.create_local_media_task", side_effect=enqueue):
+        with patch("app.repositories.local_media.create_local_media_task", side_effect=enqueue):
             result = LocalMediaScheduler(service=Mock()).enqueue_manual_scan_candidates()
         assert result["scan_status"] == ("failed" if all_fail else "partial")
         assert result["queued_count"] == (0 if all_fail else 1)

@@ -1009,7 +1009,7 @@ def delete_local_media_tasks(
             f"SELECT id,status FROM local_media_tasks WHERE owner=? AND id IN ({placeholders})",
             [safe_owner, *normalized_ids],
         ).fetchall()
-        _, active_tasks, _ = db.active_organize_confirmation_refs(conn)
+        _, active_tasks, _ = organize_history_repo.active_organize_confirmation_refs(conn)
         selected = [row["id"] for row in rows if can_clear_local_media_task(row["id"], row["status"], active_tasks)]
         deleted = 0
         if selected:
@@ -1852,3 +1852,4 @@ def _recover_after_restart(conn, timestamp: str, *, writer_available: bool) -> N
 
 # 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
 from app import database as db  # noqa: E402
+from app.repositories import organize_history as organize_history_repo  # noqa: E402

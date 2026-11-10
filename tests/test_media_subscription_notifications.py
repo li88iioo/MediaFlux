@@ -5,6 +5,7 @@ from datetime import datetime
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules.media_subscription_notifications import (
     drain_media_subscription_notifications,
 )
@@ -29,7 +30,7 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM media_subscription_notification_rules")
             conn.execute("DELETE FROM media_subscription_runs")
             conn.execute("DELETE FROM media_subscriptions")
-        self.sid = db.add_media_subscription(
+        self.sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="54321",
             tmdb_id="54321",
@@ -59,12 +60,12 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self, *, status: str = "missing", missing_count: int = 1,
         payload: dict | None = None, summary: str = "检查完成",
     ) -> int:
-        run_id = db.claim_media_subscription_check_run(self.sid, "manual")
+        run_id = media_subscriptions_repo.claim_media_subscription_check_run(self.sid, "manual")
         assert (run_id) is not None
-        get_media_subscription_result = db.get_media_subscription(self.sid)
+        get_media_subscription_result = media_subscriptions_repo.get_media_subscription(self.sid)
         assert get_media_subscription_result is not None
         revision = int(get_media_subscription_result["revision"])
-        committed = db.finalize_media_subscription_check(
+        committed = media_subscriptions_repo.finalize_media_subscription_check(
             self.sid,
             run_id,
             status=status,
@@ -94,10 +95,10 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self.assertEqual(rows[0]["event_key"], f"media-subscription-run:{run_id}:missing")
         self.assertEqual(rows[0]["status"], "pending")
 
-        get_media_subscription_result_2 = db.get_media_subscription(self.sid)
+        get_media_subscription_result_2 = media_subscriptions_repo.get_media_subscription(self.sid)
         assert get_media_subscription_result_2 is not None
         revision = int(get_media_subscription_result_2["revision"])
-        duplicate = db.finalize_media_subscription_check(
+        duplicate = media_subscriptions_repo.finalize_media_subscription_check(
             self.sid,
             run_id,
             status="missing",
@@ -117,9 +118,9 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
 
     def test_stale_run_does_not_enqueue(self) -> None:
         self._enable_rule(notify_on_missing=True)
-        run_id = db.claim_media_subscription_check_run(self.sid, "manual")
+        run_id = media_subscriptions_repo.claim_media_subscription_check_run(self.sid, "manual")
         assert (run_id) is not None
-        get_media_subscription_result_3 = db.get_media_subscription(self.sid)
+        get_media_subscription_result_3 = media_subscriptions_repo.get_media_subscription(self.sid)
         assert get_media_subscription_result_3 is not None
         old_revision = int(get_media_subscription_result_3["revision"])
         with db.get_conn() as conn:
@@ -127,7 +128,7 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
                 "UPDATE media_subscriptions SET revision=revision+1,status='new' WHERE id=?",
                 (self.sid,),
             )
-        committed = db.finalize_media_subscription_check(
+        committed = media_subscriptions_repo.finalize_media_subscription_check(
             self.sid,
             run_id,
             status="missing",
@@ -147,12 +148,12 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
 
     def test_failure_event_is_enqueued_without_error_body(self) -> None:
         self._enable_rule(notify_on_error=True)
-        run_id = db.claim_media_subscription_check_run(self.sid, "manual")
+        run_id = media_subscriptions_repo.claim_media_subscription_check_run(self.sid, "manual")
         assert (run_id) is not None
-        get_media_subscription_result_4 = db.get_media_subscription(self.sid)
+        get_media_subscription_result_4 = media_subscriptions_repo.get_media_subscription(self.sid)
         assert get_media_subscription_result_4 is not None
         revision = int(get_media_subscription_result_4["revision"])
-        self.assertTrue(db.fail_media_subscription_check(
+        self.assertTrue(media_subscriptions_repo.fail_media_subscription_check(
             self.sid,
             run_id,
             interval_minutes=60,

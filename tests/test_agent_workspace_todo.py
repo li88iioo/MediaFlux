@@ -7,6 +7,9 @@ from typing import Any
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.modules.workspace import _backlog
 from tests.support import IsolatedDatabaseTestCase
 
@@ -76,14 +79,14 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                 conn.execute("DELETE FROM download_requests")
 
         self.addCleanup(cleanup)
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "workspace-health-secret", "magnet", title="PRIVATE-TITLE", origin="agent"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="qb", status="submitted", qb_status="submitted"
         )
         self.assertEqual(
-            db.enqueue_agent_download_verification(
+            agent_download_verification_repo.enqueue_agent_download_verification(
                 request_id,
                 targets=[
                     {
@@ -97,7 +100,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
             ),
             "queued",
         )
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 20:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 20:00:00")
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE agent_download_verifications SET status='attention' WHERE request_id=?",
@@ -201,7 +204,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                 },
             ),
             patch(
-                "app.modules.workspace.db.get_local_media_diagnostic_summary",
+                "app.repositories.local_media.get_local_media_diagnostic_summary",
                 return_value=local,
             ),
             patch(
@@ -350,7 +353,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                     },
                 ),
                 patch(
-                    "app.modules.workspace.db.get_local_media_diagnostic_summary",
+                    "app.repositories.local_media.get_local_media_diagnostic_summary",
                     return_value=local,
                 ),
             ):
@@ -395,7 +398,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                     },
                 ),
                 patch(
-                    "app.modules.workspace.db.get_local_media_diagnostic_summary",
+                    "app.repositories.local_media.get_local_media_diagnostic_summary",
                     return_value=_local_media(),
                 ),
             ):
@@ -442,7 +445,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                     },
                 ),
                 patch(
-                    "app.modules.workspace.db.get_local_media_diagnostic_summary",
+                    "app.repositories.local_media.get_local_media_diagnostic_summary",
                     return_value=_local_media(),
                 ),
             ):
@@ -460,7 +463,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                 side_effect=RuntimeError("token=PRIVATE-A /secret/a"),
             ),
             patch(
-                "app.modules.workspace.db.get_local_media_diagnostic_summary",
+                "app.repositories.local_media.get_local_media_diagnostic_summary",
                 return_value=_local_media(failed=2),
             ),
         ):
@@ -478,7 +481,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
                 side_effect=RuntimeError("PRIVATE-A"),
             ),
             patch(
-                "app.modules.workspace.db.get_local_media_diagnostic_summary",
+                "app.repositories.local_media.get_local_media_diagnostic_summary",
                 side_effect=RuntimeError("PRIVATE-B"),
             ),
             patch(

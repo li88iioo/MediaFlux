@@ -5,7 +5,9 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Query, Request
 
-from app import database as db
+from app.repositories import rss as rss_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
+from app.repositories import discovery as discovery_repo
 from app.discovery.models import ProviderError
 from app.discovery.service import get_discovery_service
 from app.logger import get_logger
@@ -96,7 +98,7 @@ def _watchlist_row(
 def subscription_stats(request: Request):
     require_api_login(request)
     media = get_media_subscription_service().stats()
-    rss = db.get_rss_stats()
+    rss = rss_repo.get_rss_stats()
     return api_response({
         **media,
         "rss_total": rss.get("subscription_total", 0),
@@ -209,7 +211,7 @@ async def download_media_candidate(
         candidate_id = int(payload.get("candidate_id") or 0)
         if candidate_id <= 0:
             raise MediaSubscriptionError("candidate_id 无效")
-        candidate = db.get_media_subscription_candidate(candidate_id)
+        candidate = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
         if candidate is None or int(candidate["subscription_id"]) != subscription_id:
             raise MediaSubscriptionError("候选资源不存在", status_code=404, code="not_found")
         result = await get_media_subscription_service().download_candidate(
@@ -242,7 +244,7 @@ def list_watchlist(request: Request, limit: int = Query(default=200, ge=1, le=20
     require_api_login(request)
     page = get_discovery_service().list_watchlist(limit=limit, before_number=before_number)
     rows = page["items"]
-    external_id_map = db.list_media_external_ids([
+    external_id_map = discovery_repo.list_media_external_ids([
         (
             str(row.get("provider") or ""),
             str(row.get("external_id") or ""),
@@ -278,7 +280,7 @@ async def create_from_watchlist(request: Request, data: Any = Body(default=None)
         if not external_id or len(external_id) > 128 or any(char.isspace() for char in external_id):
             raise MediaSubscriptionError("收藏媒体 ID 无效")
 
-        watchlist_row = db.get_media_watchlist(provider, external_id, media_type)
+        watchlist_row = discovery_repo.get_media_watchlist(provider, external_id, media_type)
         watchlist_item = dict(watchlist_row) if watchlist_row is not None else None
         if watchlist_item is None:
             raise MediaSubscriptionError(

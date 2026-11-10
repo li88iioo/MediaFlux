@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.indexers import downloads as indexer_downloads
 from app.indexers.models import ResolvedDownload
 from app.modules import download_dispatcher
@@ -39,7 +40,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         self._serial += 1
         infohash = f"{self._serial:040x}"
         source = source_value or f"magnet:?xt=urn:btih:{infohash}"
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             f"display-title-test:{self._serial}",
             "magnet",
             title=title,
@@ -58,7 +59,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         )
 
     def _track_guangya(self, request_id: int, task_ids: list[str], tasks: list[dict]) -> None:
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="submitted",
             targets="guangya",
@@ -68,7 +69,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             gy_batch_count=len(task_ids),
         )
         self.tracker._update_request(
-            db.get_download_request(request_id), [], tasks, qb_available=False
+            download_requests_repo.get_download_request(request_id), [], tasks, qb_available=False
         )
 
     def test_fresh_database_has_display_title_column(self) -> None:
@@ -86,7 +87,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
 
     def test_v31_migration_preserves_business_data_and_is_idempotent(self) -> None:
         request_id, _ = self._create_request(title="业务标题不变")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             targets="qb",
@@ -152,20 +153,20 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             )
 
         request_id = result["request_id"]
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["title"], item.title)
         self.assertEqual(row["display_title"], stored.title)
         self.assertEqual(row["source_value"], magnet)
         self.assertEqual(row["request_key"], expected_key)
         self.assertEqual(backend_rows[0]["title"], item.title)
-        logs = [log for log in db.list_download_logs() if log["request_id"] == request_id]
+        logs = [log for log in download_requests_repo.list_download_logs() if log["request_id"] == request_id]
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0]["title"], stored.title)
 
     def test_exact_guangya_task_match_enriches_title_and_backfills_existing_log(self) -> None:
         request_id, _ = self._create_request()
-        log_id = db.add_download_log(
+        log_id = download_requests_repo.add_download_log(
             "guangya", title="磁力任务", request_id=request_id, status="submitted",
             backend_task_id="gy-exact",
         )
@@ -174,11 +175,11 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             request_id, ["gy-exact"], [self._gy_task("gy-exact", "光鸭实际名称")]
         )
 
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["display_title"], "光鸭实际名称")
         self.assertEqual(row["title"], "磁力任务")
-        logs = [log for log in db.list_download_logs() if log["request_id"] == request_id]
+        logs = [log for log in download_requests_repo.list_download_logs() if log["request_id"] == request_id]
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0]["id"], log_id)
         self.assertEqual(logs[0]["title"], "光鸭实际名称")
@@ -188,7 +189,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         self._track_guangya(
             request_id, ["gy-kept"], [self._gy_task("gy-kept", "云端另一个名称")]
         )
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["display_title"], "用户确认的标题")
         self.assertEqual(row["title"], "磁力任务")
@@ -198,7 +199,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         self._track_guangya(
             request_id, ["expected-id"], [self._gy_task("unrelated-id", "不可认领名称")]
         )
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["display_title"], "")
         self.assertEqual(download_display_title(row), "磁力任务")
@@ -214,7 +215,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
                 request_id, _ = self._create_request()
                 tasks = [self._gy_task(task_id, name) for task_id, name in zip(ids, names)]
                 self._track_guangya(request_id, ids, tasks)
-                get_download_request_result = db.get_download_request(request_id)
+                get_download_request_result = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result is not None
                 self.assertEqual(get_download_request_result["display_title"], expected)
 
@@ -223,7 +224,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         request_id, _ = self._create_request(
             source_value=f"magnet:?xt=urn:btih:{infohash}"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="submitted",
             targets="qb",
@@ -235,33 +236,33 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             content_path="",
         )
         self.tracker._update_request(
-            db.get_download_request(request_id), [task], [], gy_available=False
+            download_requests_repo.get_download_request(request_id), [task], [], gy_available=False
         )
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["display_title"], "qB 任务名称")
         self.assertEqual(row["title"], "磁力任务")
 
     def test_stale_snapshot_and_cancelled_request_reject_display_metadata(self) -> None:
         stale_id, _ = self._create_request()
-        stale_snapshot = db.get_download_request(stale_id)
-        db.update_download_request(stale_id, error="state advanced")
+        stale_snapshot = download_requests_repo.get_download_request(stale_id)
+        download_requests_repo.update_download_request(stale_id, error="state advanced")
         assert stale_snapshot is not None
         self.assertIsNone(apply_download_tracker_update(
             stale_snapshot, display_title="过期观察名称", status="downloading"
         ))
-        get_download_request_result_2 = db.get_download_request(stale_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(stale_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2["display_title"], "")
 
         cancelled_id, _ = self._create_request()
-        cancelled_snapshot = db.get_download_request(cancelled_id)
-        db.update_download_request(cancelled_id, status="cancelled")
+        cancelled_snapshot = download_requests_repo.get_download_request(cancelled_id)
+        download_requests_repo.update_download_request(cancelled_id, status="cancelled")
         assert cancelled_snapshot is not None
         self.assertIsNone(apply_download_tracker_update(
             cancelled_snapshot, display_title="取消后的名称", status="downloading"
         ))
-        get_download_request_result_3 = db.get_download_request(cancelled_id)
+        get_download_request_result_3 = download_requests_repo.get_download_request(cancelled_id)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["display_title"], "")
 
@@ -275,7 +276,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         copied = replace(original)
         self.assertEqual(copied.display_title, original.display_title)
         created = download_dispatcher.create_request(copied, "", "", origin="indexer")
-        row = db.get_download_request(created["id"])
+        row = download_requests_repo.get_download_request(created["id"])
         assert row is not None
         self.assertEqual(row["title"], original.title)
         self.assertEqual(row["display_title"], original.display_title)
@@ -288,7 +289,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         )
         first = download_dispatcher.create_request(replace(item, display_title=""), "", "", origin="indexer")
         request_id = first["id"]
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="submitted",
             targets="guangya",
@@ -297,7 +298,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             gy_task_ids='["gy-existing"]',
             gy_batch_count=1,
         )
-        log_id = db.add_download_log(
+        log_id = download_requests_repo.add_download_log(
             "guangya", title="磁力任务", request_id=request_id,
             backend_task_id="gy-existing", status="submitted",
         )
@@ -311,12 +312,12 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
                 "SELECT COUNT(*) FROM download_requests WHERE request_key=?",
                 (download_dispatcher.request_key(item),),
             ).fetchone()[0]
-        logs = [log for log in db.list_download_logs() if log["request_id"] == request_id]
+        logs = [log for log in download_requests_repo.list_download_logs() if log["request_id"] == request_id]
         self.assertEqual(request_count, 1)
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0]["id"], log_id)
         self.assertEqual(logs[0]["title"], item.display_title)
-        get_download_request_result_4 = db.get_download_request(request_id)
+        get_download_request_result_4 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["title"], item.title)
 
@@ -326,7 +327,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             source_value="magnet:?xt=urn:btih:" + "e" * 40,
         )
         old_id = download_dispatcher.create_request(item, "", "")["id"]
-        db.update_download_request(old_id, status="failed", targets="guangya", gy_status="failed")
+        download_requests_repo.update_download_request(old_id, status="failed", targets="guangya", gy_status="failed")
         with (
             patch.object(download_dispatcher, "analyze_offline_url", return_value=SimpleNamespace(allowed=True, reason="")),
             patch.object(download_dispatcher, "_submit_guangya", return_value={
@@ -337,7 +338,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
             result = download_dispatcher.resubmit_download_request(old_id, "guangya")
         self.assertTrue(result["ok"], result)
         self.assertNotEqual(result["request_id"], old_id)
-        row = db.get_download_request(result["request_id"])
+        row = download_requests_repo.get_download_request(result["request_id"])
         assert row is not None
         self.assertEqual((row["title"], row["display_title"]), (item.title, item.display_title))
         self.assertEqual(row["source_value"], item.source_value)
@@ -350,13 +351,13 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         )
 
         request_id, _ = self._create_request(display_title="通知中的媒体名")
-        db.update_download_request(request_id, status="completed", gy_status="completed",
+        download_requests_repo.update_download_request(request_id, status="completed", gy_status="completed",
                                    notification_payload_json=json.dumps({"title": "磁力任务"}),
                                    notification_delivery_status="sent")
         with patch("app.modules.telegram_download_lifecycle.get_notification_thread_event", return_value=None):
-            event = build_download_lifecycle_event(db.get_download_request(request_id))
+            event = build_download_lifecycle_event(download_requests_repo.get_download_request(request_id))
         self.assertEqual(dict(event.fields)["媒体"], "通知中的媒体名")
-        get_download_request_result_5 = db.get_download_request(request_id)
+        get_download_request_result_5 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5["notification_delivery_status"], "sent")
 
@@ -371,10 +372,10 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
 
     def test_web_attention_and_agent_public_title_use_display_projection(self) -> None:
         request_id, _ = self._create_request(display_title="公开展示标题")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="manual_review", error="需要人工核对"
         )
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
 
         from app import sdk
         from app.routes import downloads_api
@@ -387,7 +388,7 @@ class DownloadDisplayTitleTests(IsolatedDatabaseTestCase):
         from app import sdk
 
         request_id, _ = self._create_request()
-        db.update_download_request(request_id, status="submitted", targets="guangya",
+        download_requests_repo.update_download_request(request_id, status="submitted", targets="guangya",
                                    gy_status="submitted", gy_task_id="bound-task")
         before = sdk.activity.timeline("download", request_id)
         self.assertEqual(before["data"]["title"], "磁力任务")

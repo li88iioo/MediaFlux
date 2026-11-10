@@ -13,6 +13,8 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
+from app.repositories import rss as rss_repo
 from app.modules import backup
 from app.modules.local_move_transaction import LocalMoveError, LocalMoveTransaction
 from app.modules.local_storage import LocalFilesystemAdapter
@@ -53,6 +55,7 @@ db.init_db()
         self.child(
             r"""
 import os, json
+from app.repositories import local_media as local_media_repo
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -64,10 +67,10 @@ incoming, library = root / "incoming", root / "library"
 incoming.mkdir(); library.mkdir()
 source, target = incoming / "Movie.mkv", library / "Movie.mkv"
 source.write_bytes(b"process-only-copy")
-sid = db.create_local_media_source(name="interrupted-link", qb_profile="", qb_path_prefix="", local_root=str(incoming), owner="admin")
-task = db.create_local_media_task(sid, "", str(source), trigger="manual")
-assert db.claim_local_media_task(task, owner="admin")
-db.update_local_media_task(task, status="moving")
+sid = local_media_repo.create_local_media_source(name="interrupted-link", qb_profile="", qb_path_prefix="", local_root=str(incoming), owner="admin")
+task = local_media_repo.create_local_media_task(sid, "", str(source), trigger="manual")
+assert local_media_repo.claim_local_media_task(task, owner="admin")
+local_media_repo.update_local_media_task(task, status="moving")
 (root / "local-manifest.json").write_text(json.dumps({"task":task, "source":str(source), "target":str(target)}))
 real_link = os.link
 def link_then_exit(*args, **kwargs):
@@ -84,14 +87,14 @@ with patch("ctypes.CDLL", return_value=SimpleNamespace(renameat2=None)), patch("
         self.assertTrue(source.samefile(target))
         self.assertEqual(target.read_bytes(), b"process-only-copy")
         db.init_db()
-        task = db.get_local_media_task(manifest["task"], owner="admin")
+        task = local_media_repo.get_local_media_task(manifest["task"], owner="admin")
         assert task is not None
         self.assertEqual(task.status, "requires_manual")
-        self.assertFalse(db.reset_local_media_task(task.id, owner="admin"))
-        steps = db.list_local_media_operation_steps(task.id, owner="admin")
+        self.assertFalse(local_media_repo.reset_local_media_task(task.id, owner="admin"))
+        steps = local_media_repo.list_local_media_operation_steps(task.id, owner="admin")
         self.assertEqual([row["status"] for row in steps], ["failed"])
         db.init_db()
-        self.assertEqual(db.get_local_media_task(task.id, owner="admin"), task)
+        self.assertEqual(local_media_repo.get_local_media_task(task.id, owner="admin"), task)
         self.assertTrue(source.samefile(target))
         self.assertEqual(source.read_bytes(), b"process-only-copy")
 
@@ -160,13 +163,14 @@ with patch("ctypes.CDLL", return_value=SimpleNamespace(renameat2=None)), patch("
         self.child(
             r"""
 import os, json
+from app.repositories import rss as rss_repo
 from pathlib import Path
 from unittest.mock import patch
 from app.modules.rss import RSSEngine
-sid = db.add_rss_subscription("Process backlog", "https://synthetic.invalid/feed")
-db.update_rss_subscription(sid, {"action":"download"})
+sid = rss_repo.add_rss_subscription("Process backlog", "https://synthetic.invalid/feed")
+rss_repo.update_rss_subscription(sid, {"action":"download"})
 for n in range(451):
-    db.add_rss_entry_with_media(sid, f"Episode {n}", f"process:{n}")
+    rss_repo.add_rss_entry_with_media(sid, f"Episode {n}", f"process:{n}")
 submitted = []
 def complete(entry, **kwargs):
     submitted.append(int(entry["id"]))
@@ -194,15 +198,15 @@ os._exit(32)
         )
 
     def test_rss_backup_roundtrip_preserves_count_and_bounded_submission(self):
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Restored backlog", "https://synthetic.invalid/feed"
         )
-        db.update_rss_subscription(sid, {"action": "download"})
+        rss_repo.update_rss_subscription(sid, {"action": "download"})
         for number in range(451):
-            db.add_rss_entry_with_media(sid, f"Episode {number}", f"backup:{number}")
+            rss_repo.add_rss_entry_with_media(sid, f"Episode {number}", f"backup:{number}")
         paths = runtime_paths(self.path)
         archive = backup.create_backup(paths)
-        db.delete_rss_subscription(sid)
+        rss_repo.delete_rss_subscription(sid)
         backup.restore_backup(paths, archive)
         db.configure_database(self.path, test_mode=True)
         db.init_db()

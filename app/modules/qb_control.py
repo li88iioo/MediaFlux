@@ -6,7 +6,9 @@ from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
-from app import config, database as db
+from app import config
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
 from app.clients.qbittorrent import QBittorrentClient, close_qbittorrent_client
 from app.logger import get_logger
 from app.modules.process_lock import CrossProcessLock
@@ -201,7 +203,7 @@ def assert_qb_control_allowed(hashes: Iterable[str], *, operation: str) -> None:
     if normalized_operation not in {"resume", "delete"}:
         raise ValueError("不支持的 qBittorrent 控制操作")
     try:
-        conflicts = db.list_local_media_qb_write_conflicts(list(hashes))
+        conflicts = local_media_repo.list_local_media_qb_write_conflicts(list(hashes))
     except Exception as exc:
         logger.error(
             "qB 控制安全状态读取失败 operation=%s type=%s",
@@ -230,7 +232,7 @@ def remove_qb_tasks(client, hashes: Iterable[str]) -> bool:
     normalized = list(dict.fromkeys((value or "").strip().lower() for value in hashes))
     with qb_submission_write_lease(normalized):
         try:
-            changed = db.cancel_qb_download_tracking(normalized)
+            changed = download_requests_repo.cancel_qb_download_tracking(normalized)
         except Exception as exc:
             raise QBControlSafetyUnavailable("下载跟踪状态暂不可用，未执行 qB 任务移除") from exc
         if changed:

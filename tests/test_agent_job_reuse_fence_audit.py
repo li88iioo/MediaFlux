@@ -11,6 +11,7 @@ from typing import TypedDict
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import agent_jobs as agent_jobs_repo
 from app.modules import library_audit_jobs as actions
 from app.modules.library_patrol import empty_patrol_projection
 from app.modules.library_audit_jobs import (
@@ -49,7 +50,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             ),
         ):
             projection = json.dumps(empty_patrol_projection(as_of=ARGUMENTS["as_of"]))
-            first, created = db.create_agent_job(
+            first, created = agent_jobs_repo.create_agent_job(
                 owner=OWNER,
                 job_type="library_episode_audit",
                 dedupe_key="2026-01-01:2",
@@ -61,7 +62,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             )
             self.assertTrue(created)
             first_id = str(first["job_id"])
-            running = db.claim_due_agent_job(job_type="library_episode_audit")
+            running = agent_jobs_repo.claim_due_agent_job(job_type="library_episode_audit")
             assert running is not None
             self.assertEqual(running["job_id"], first_id)
             context = OWNER
@@ -96,7 +97,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             def complete_existing():
                 try:
                     assert running is not None
-                    outcomes["completed"] = db.complete_agent_job(
+                    outcomes["completed"] = agent_jobs_repo.complete_agent_job(
                         first_id,
                         expected_lease_generation=int(running["lease_generation"]),
                         projection_json=projection,
@@ -143,10 +144,10 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             assert isinstance(failures[0], AgentJobError)
             self.assertEqual(failures[0].code, "confirmation_stale")
             self.assertNotIn("confirmed", outcomes)
-            get_agent_job_result = db.get_agent_job(owner=OWNER, job_id=first_id)
+            get_agent_job_result = agent_jobs_repo.get_agent_job(owner=OWNER, job_id=first_id)
             assert get_agent_job_result is not None
             self.assertEqual(get_agent_job_result["status"], "succeeded")
-            self.assertEqual(len(db.list_agent_jobs(owner=OWNER)), 1)
+            self.assertEqual(len(agent_jobs_repo.list_agent_jobs(owner=OWNER)), 1)
 
     def test_current_reuse_and_other_owner_keep_single_owner_scoped_job(self):
         from app.modules import agent_jobs_scheduler
@@ -173,7 +174,7 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
             )
             self.assertTrue(second["data"]["created"])
             self.assertNotEqual(second["data"]["job_id"], first["data"]["job_id"])
-            self.assertEqual(len(db.list_agent_jobs(owner=OWNER)), 1)
+            self.assertEqual(len(agent_jobs_repo.list_agent_jobs(owner=OWNER)), 1)
 
     def test_cancelled_reuse_cannot_attach_to_new_active_replacement(self):
         from app.modules import agent_jobs_scheduler
@@ -213,4 +214,4 @@ class AgentJobReuseFenceAuditTests(unittest.TestCase):
                         owner=context, expected_snapshot=reuse_fingerprint, **args
                     )
             self.assertEqual(raised.exception.code, "confirmation_stale")
-            self.assertEqual(len(db.list_agent_jobs(owner=OWNER)), 2)
+            self.assertEqual(len(agent_jobs_repo.list_agent_jobs(owner=OWNER)), 2)

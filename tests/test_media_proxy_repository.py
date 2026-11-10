@@ -1,4 +1,4 @@
-"""媒体反代 Repository 与 app.database 兼容门面契约。"""
+"""媒体反代 Repository 契约。"""
 from __future__ import annotations
 
 import unittest
@@ -10,24 +10,6 @@ from tests.support import isolated_test_database
 
 
 class MediaProxyRepositoryTests(unittest.TestCase):
-    def test_database_facade_reexports_repository_objects(self):
-        for name in (
-            "add_media_proxy_instance",
-            "list_media_proxy_instances",
-            "get_media_proxy_instance",
-            "update_media_proxy_instance",
-            "delete_media_proxy_instance",
-            "add_media_proxy_binding",
-            "create_media_proxy_binding",
-            "list_media_proxy_bindings",
-            "get_media_proxy_binding",
-            "delete_media_proxy_binding",
-            "record_media_proxy_playback_attempt",
-            "list_media_proxy_playback_records",
-            "list_media_proxy_playback_sessions",
-            "clear_media_proxy_playback_records",
-        ):
-            self.assertIs(getattr(db, name), getattr(repository, name))
 
     def test_repository_uses_active_test_database_and_preserves_binding_fallback(self):
         with isolated_test_database("media-proxy-repository.db"):
@@ -116,7 +98,7 @@ class MediaProxyRepositoryTests(unittest.TestCase):
 
     def test_record_contract_and_redaction_remain_behind_facade(self):
         with isolated_test_database("media-proxy-record-repository.db"):
-            record_id = db.record_media_proxy_playback_attempt(
+            record_id = repository.record_media_proxy_playback_attempt(
                 instance_id=3,
                 route_class="video",
                 method="get",

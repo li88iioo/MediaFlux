@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.lifecycle import AgentSessionLifecycle
 from app.agent.kernel.state_types import (
@@ -124,7 +125,7 @@ def test_confirmed_write_blocks_cross_worker_mutation_until_receipt_persisted(is
         state = await other_store.load(owner=OWNER, session_id=SESSION)
         request_id = result["data"]["items"][0]["request_id"]
         assert any(f"下载请求 #{request_id}" in item.get("public_content", "") for item in state.conversation)
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         assert get_download_request_result["status"] == "submitted"
         assert isolated_chain[0].call_count == 1
@@ -577,7 +578,7 @@ def test_cancellation_during_confirmed_finalization_keeps_receipt_and_terminal_f
         state = await other_store.load(owner=OWNER, session_id=SESSION)
         assert not state.pending_effect_plan_id
         assert any(f"下载请求 #{request_id}" in item.get("public_content", "") for item in state.conversation)
-        get_download_request_result_2 = db.get_download_request(request_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         assert get_download_request_result_2["status"] == "submitted"
         assert not await other_store.is_current(old)

@@ -8,7 +8,8 @@ import time
 from fastapi import APIRouter, Body, Query, Request
 
 from app import config
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
 from app.clients.qbittorrent import (
     QBConnectionTestError,
     QBittorrentClient,
@@ -376,7 +377,7 @@ def clear_logs_batch(request: Request, data: dict | None = Body(default=None)):
         log_ids = _normalize_record_ids(data.get("log_ids"), field="log_ids")
     except ValueError as exc:
         return api_error(str(exc), 400)
-    deleted_ids = db.delete_download_logs(log_ids)
+    deleted_ids = download_requests_repo.delete_download_logs(log_ids)
     return api_response({
         "ok": True,
         "requested": len(log_ids),
@@ -393,10 +394,10 @@ def issues(
 ):
     """返回与看板“下载待处理”相同口径的异常请求。"""
     require_api_login(request)
-    total = db.count_download_requests_requiring_attention()
+    total = download_requests_repo.count_download_requests_requiring_attention()
     pages = (total + page_size - 1) // page_size if total else 0
     effective_page = min(page, pages) if pages else 1
-    rows = db.list_download_requests_requiring_attention(
+    rows = download_requests_repo.list_download_requests_requiring_attention(
         limit=page_size,
         offset=(effective_page - 1) * page_size,
     )
@@ -426,7 +427,7 @@ def resubmit_issues_batch(request: Request, data: dict | None = Body(default=Non
     items: list[dict] = []
     counts = {"succeeded": 0, "partial": 0, "failed": 0, "skipped": 0}
     for request_id in request_ids:
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         if not row:
             counts["skipped"] += 1
             items.append({
@@ -509,7 +510,7 @@ def clear_issues_batch(request: Request, data: dict | None = Body(default=None))
         request_ids = _normalize_record_ids(data.get("request_ids"), field="request_ids")
     except ValueError as exc:
         return api_error(str(exc), 400)
-    result = db.clear_download_request_attentions(request_ids)
+    result = download_requests_repo.clear_download_request_attentions(request_ids)
     skipped = len(result["not_attention"]) + len(result["not_found"])
     return api_response({
         "ok": True,
@@ -524,9 +525,9 @@ def clear_issues_batch(request: Request, data: dict | None = Body(default=None))
 def retry_local_import_issue(request_id: int, request: Request):
     """修正来源配置后只恢复本地整理，不创建第二个下载请求。"""
     require_api_login(request)
-    if db.get_download_request(request_id) is None:
+    if download_requests_repo.get_download_request(request_id) is None:
         return api_error("下载请求不存在", 404)
-    if not db.list_local_media_sources(owner="admin", enabled_only=True):
+    if not local_media_repo.list_local_media_sources(owner="admin", enabled_only=True):
         return api_error("请先配置并启用本地媒体来源，再重试整理", 400)
     if not retry_download_local_import(request_id):
         return api_error("该请求不能重试本地整理；已绑定任务请在本地媒体任务页重试", 409)
@@ -550,7 +551,7 @@ def resubmit_issue(
     if target not in SUPPORTED_TARGETS:
         return api_error("下载目标无效", 400)
 
-    row = db.get_download_request(request_id)
+    row = download_requests_repo.get_download_request(request_id)
     if not row:
         return api_error("待处理请求不存在", 404)
     if not _attention_stages(row):
@@ -586,7 +587,7 @@ def resubmit_issue(
 def clear_issue(request_id: int, request: Request):
     """仅确认并隐藏待处理告警，不删除任务、文件、请求或日志。"""
     require_api_login(request)
-    result = db.clear_download_request_attentions([request_id], batch=False)
+    result = download_requests_repo.clear_download_request_attentions([request_id], batch=False)
     if result["not_found"] or not any(result.values()):
         return api_error("待处理请求不存在", 404)
     if result["not_attention"]:

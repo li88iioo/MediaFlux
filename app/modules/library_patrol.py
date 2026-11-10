@@ -10,6 +10,7 @@ from datetime import date, datetime
 from typing import Any
 
 from app import config, database as db
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.repositories.agent_library_patrol import patrol_task_state
 
 _ALLOWED_FINDING_STATUS = {"updates_available"}
@@ -142,7 +143,7 @@ def patrol_status(run_id: int | None = None) -> dict[str, Any]:
             raise ValueError("run_id 必须是正整数")
         return _run_status(run_id)
     enabled = config.get_bool("AGENT_LIBRARY_PATROL_ENABLED", False)
-    row = db.get_agent_library_patrol()
+    row = agent_library_patrol_repo.get_agent_library_patrol()
     if row is None:
         return {
             "ok": True,
@@ -582,7 +583,7 @@ def patrol_policy() -> dict[str, Any]:
 
 def prepare_patrol() -> dict[str, Any]:
     """只读冻结策略及单例任务身份；不创建任务或预留运行编号。"""
-    return {"policy": patrol_policy(), "state": patrol_task_state(db.get_agent_library_patrol())}
+    return {"policy": patrol_policy(), "state": patrol_task_state(agent_library_patrol_repo.get_agent_library_patrol())}
 
 
 def run_patrol(

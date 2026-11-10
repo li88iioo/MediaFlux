@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.agent.kernel.model import (
     ModelEvent,
     ModelEventType,
@@ -466,21 +467,21 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             )
 
     def test_silent_local_confirmation_uses_same_review_queue(self) -> None:
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name="本地下载",
             qb_profile="",
             qb_path_prefix="",
             local_root="/downloads",
             owner="admin",
         )
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id,
             "",
             "/downloads/测试动画.S01E01.mkv",
             owner="admin",
             trigger="scan",
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task_id,
             owner="admin",
             status="requires_manual",
@@ -488,8 +489,8 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             rules_snapshot="{}",
             error="候选接近，需要复核",
         )
-        task = db.get_local_media_task(task_id, owner="admin")
-        source = db.get_local_media_source(source_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
+        source = local_media_repo.get_local_media_source(source_id, owner="admin")
         preview = {
             "reason": "候选接近，需要复核",
             "snapshot_digest": "digest-1",

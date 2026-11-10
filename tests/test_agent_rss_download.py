@@ -6,6 +6,8 @@ import json
 from unittest.mock import MagicMock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
 from app.modules import rss_delivery
 from app.modules.rss import RSSEngine
@@ -56,7 +58,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _subscription(name: str = "Private RSS", method: str = "qb") -> int:
-        return db.add_rss_subscription(
+        return rss_repo.add_rss_subscription(
             name=name,
             urls="https://secret.example/rss?passkey=RSS_SECRET",
             download_method=method,
@@ -75,7 +77,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             if url
             else "{}"
         )
-        entry_id = db.add_rss_entry_with_media(
+        entry_id = rss_repo.add_rss_entry_with_media(
             sub_id, f"Private Episode {index}", f"secret-guid-{index}", payload=payload
         )["id"]
         assert entry_id is not None
@@ -133,7 +135,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual([item["id"] for item in expected_rows], [second, first])
         self.assertEqual(runtime, self.runtime)
         self.assertIs(
-            submit.call_args.kwargs["claim"], db.claim_pending_rss_entries
+            submit.call_args.kwargs["claim"], rss_repo.claim_pending_rss_entries
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "partial")
@@ -396,7 +398,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         sub_id = self._subscription()
         first = self._entry(sub_id, 1)
         second = self._entry(sub_id, 2)
-        rows = db.get_pending_rss_snapshot(default_method="qb", limit=2)
+        rows = rss_repo.get_pending_rss_snapshot(default_method="qb", limit=2)
         expected = [
             {
                 "id": int(row["id"]),
@@ -411,14 +413,14 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         ]
         with db.get_conn() as conn:
             conn.execute("UPDATE rss_entries SET payload='{}' WHERE id=?", (first,))
-        self.assertEqual(db.claim_pending_rss_entries(expected), [])
-        get_rss_entry_result = db.get_rss_entry(first)
+        self.assertEqual(rss_repo.claim_pending_rss_entries(expected), [])
+        get_rss_entry_result = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result is not None
         self.assertEqual(get_rss_entry_result["status"], "pending")
-        get_rss_entry_result_2 = db.get_rss_entry(second)
+        get_rss_entry_result_2 = rss_repo.get_rss_entry(second)
         assert get_rss_entry_result_2 is not None
         self.assertEqual(get_rss_entry_result_2["status"], "pending")
-        fresh = db.get_pending_rss_snapshot(default_method="qb", limit=2)
+        fresh = rss_repo.get_pending_rss_snapshot(default_method="qb", limit=2)
         fresh_expected = [
             {
                 "id": int(row["id"]),
@@ -431,17 +433,17 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             }
             for row in fresh
         ]
-        claimed = db.claim_pending_rss_entries(fresh_expected)
+        claimed = rss_repo.claim_pending_rss_entries(fresh_expected)
         self.assertEqual(len(claimed), 2)
-        get_rss_entry_result_3 = db.get_rss_entry(first)
+        get_rss_entry_result_3 = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result_3 is not None
         self.assertEqual(get_rss_entry_result_3["status"], "submitting")
-        get_rss_entry_result_4 = db.get_rss_entry(second)
+        get_rss_entry_result_4 = rss_repo.get_rss_entry(second)
         assert get_rss_entry_result_4 is not None
         self.assertEqual(get_rss_entry_result_4["status"], "submitting")
         guangya_sub = self._subscription("GuangYa RSS", "guangya")
         guangya_entry = self._entry(guangya_sub, 90)
-        guangya_row = db.get_rss_entry(guangya_entry)
+        guangya_row = rss_repo.get_rss_entry(guangya_entry)
         assert guangya_row is not None
         forged = [
             {
@@ -455,8 +457,8 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             }
         ]
         forged[0]["download_method"] = "qb"
-        self.assertEqual(db.claim_pending_rss_entries(forged, default_method="qb"), [])
-        get_rss_entry_result_5 = db.get_rss_entry(guangya_entry)
+        self.assertEqual(rss_repo.claim_pending_rss_entries(forged, default_method="qb"), [])
+        get_rss_entry_result_5 = rss_repo.get_rss_entry(guangya_entry)
         assert get_rss_entry_result_5 is not None
         self.assertEqual(get_rss_entry_result_5["status"], "pending")
 
@@ -465,7 +467,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         sub_id = self._subscription()
         valid = self._entry(sub_id, 1)
         invalid = self._entry(sub_id, 2, url=False)
-        rows = db.get_pending_rss_snapshot(default_method="qb", limit=2)
+        rows = rss_repo.get_pending_rss_snapshot(default_method="qb", limit=2)
         expected = [
             {
                 "id": int(row["id"]),
@@ -488,7 +490,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             ) as add,
         ):
             result = RSSEngine().submit_snapshot(
-                expected, self.runtime, claim=db.claim_pending_rss_entries
+                expected, self.runtime, claim=rss_repo.claim_pending_rss_entries
             )
         self.assertEqual(result["submitted"], 1)
         self.assertEqual(result["failed"], 1)
@@ -505,13 +507,13 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             category="rss-agent",
             torrents=None,
         )
-        get_rss_entry_result_6 = db.get_rss_entry(valid)
+        get_rss_entry_result_6 = rss_repo.get_rss_entry(valid)
         assert get_rss_entry_result_6 is not None
         self.assertEqual(get_rss_entry_result_6["status"], "downloaded")
-        get_rss_entry_result_7 = db.get_rss_entry(invalid)
+        get_rss_entry_result_7 = rss_repo.get_rss_entry(invalid)
         assert get_rss_entry_result_7 is not None
         self.assertEqual(get_rss_entry_result_7["status"], "failed")
-        logs = db.list_download_logs(source="qb", limit=5)
+        logs = download_requests_repo.list_download_logs(source="qb", limit=5)
         serialized_logs = json.dumps([dict(row) for row in logs], ensure_ascii=False)
         self.assertNotIn("PRIVATESECRET1", serialized_logs)
         self.assertNotIn("magnet:?", serialized_logs)
@@ -530,7 +532,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
                     entry_id,
                 ),
             )
-        rows = db.get_pending_rss_snapshot(default_method="qb", limit=1)
+        rows = rss_repo.get_pending_rss_snapshot(default_method="qb", limit=1)
         expected = [
             {
                 "id": int(row["id"]),
@@ -548,7 +550,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             return_value=TorrentAddResult(False, "qb_outcome_unknown", False),
         ):
             result = RSSEngine().submit_snapshot(
-                expected, self.runtime, claim=db.claim_pending_rss_entries
+                expected, self.runtime, claim=rss_repo.claim_pending_rss_entries
             )
         self.assertEqual(result["failed"], 1)
         self.assertEqual(result["outcome_unknown"], 1)
@@ -564,7 +566,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
                 "UPDATE rss_entries SET payload=? WHERE id IN (?,?)",
                 (json.dumps({"torrent_url": opaque_url}), first, second),
             )
-        rows = db.get_pending_rss_snapshot(default_method="qb", limit=2)
+        rows = rss_repo.get_pending_rss_snapshot(default_method="qb", limit=2)
         expected = [
             {
                 "id": int(row["id"]),
@@ -587,16 +589,16 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             ) as add,
         ):
             result = RSSEngine().submit_snapshot(
-                expected, self.runtime, claim=db.claim_pending_rss_entries
+                expected, self.runtime, claim=rss_repo.claim_pending_rss_entries
             )
         self.assertTrue(result["ok"])
         self.assertEqual(result["submitted"], 2)
         self.assertEqual(result["failed"], 0)
         add.assert_called_once()
-        get_rss_entry_result_8 = db.get_rss_entry(first)
+        get_rss_entry_result_8 = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result_8 is not None
         self.assertEqual(str(get_rss_entry_result_8["status"]), "downloaded")
-        get_rss_entry_result_9 = db.get_rss_entry(second)
+        get_rss_entry_result_9 = rss_repo.get_rss_entry(second)
         assert get_rss_entry_result_9 is not None
         self.assertEqual(str(get_rss_entry_result_9["status"]), "downloaded")
 
@@ -611,7 +613,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         result = RSSEngine().download(entry_id)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "条目数据无效")
-        get_rss_entry_result_10 = db.get_rss_entry(entry_id)
+        get_rss_entry_result_10 = rss_repo.get_rss_entry(entry_id)
         assert get_rss_entry_result_10 is not None
         self.assertEqual(get_rss_entry_result_10["status"], "failed")
 

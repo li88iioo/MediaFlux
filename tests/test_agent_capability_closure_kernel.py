@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from app import config, sdk
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.database import media_owner_digest
 from app.agent.errors import AgentToolError
 from app.agent.owner_routes import web_kernel_owner
@@ -58,10 +59,10 @@ class ClosureKernelTests(InitializedWebTestCase):
 
     def test_activity_id_follow_and_stop_use_same_confirmation_path(self):
         owner = web_kernel_owner("follow-kernel-owner")
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "kernel-follow", "magnet", title="下载纵切示例"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="downloading", gy_status="downloading"
         )
         original_get = config.get

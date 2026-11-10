@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmission,
     RecentDownloadVerification,
@@ -116,7 +118,7 @@ class DownloadLibraryVerificationScheduler:
     def reload(self) -> None:
         with self._notification_gate:
             if not self._notifications_enabled():
-                db.discard_agent_download_verification_notifications()
+                agent_download_verification_repo.discard_agent_download_verification_notifications()
         self._wake_event.set()
 
     def status(self) -> dict[str, object]:
@@ -142,7 +144,7 @@ class DownloadLibraryVerificationScheduler:
         last_checked_at=None,
     ) -> bool:
         """无损释放尚未发布终态的核验租约。"""
-        return db.update_agent_download_verification(
+        return agent_download_verification_repo.update_agent_download_verification(
             int(job["request_id"]),
             status="pending",
             result=str(job["result"] or ""),
@@ -169,7 +171,7 @@ class DownloadLibraryVerificationScheduler:
             stale_before = self._format(
                 self._clock() - timedelta(seconds=_RUNNING_LEASE_SECONDS)
             )
-            job = db.claim_due_agent_download_verification(
+            job = agent_download_verification_repo.claim_due_agent_download_verification(
                 current_time=current,
                 stale_before=stale_before,
             )
@@ -280,7 +282,7 @@ class DownloadLibraryVerificationScheduler:
         if not self._runtime_allows(runtime_generation):
             self._release_verification_job(job, current=current)
             return
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         if not self._runtime_allows(runtime_generation):
             self._release_verification_job(job, current=current)
             return
@@ -296,7 +298,7 @@ class DownloadLibraryVerificationScheduler:
 
         if request["status"] in {"pending", "submitting"}:
             # 原子登记的意图可能早于目标后端配置；等待原提交链，绝不代它重投。
-            db.update_agent_download_verification(
+            agent_download_verification_repo.update_agent_download_verification(
                 request_id, status="pending", result=result, attempts=attempts,
                 next_check_at=self._after(self.interval), last_checked_at=job["last_checked_at"],
                 expected_lease_generation=int(job["lease_generation"]),
@@ -321,7 +323,7 @@ class DownloadLibraryVerificationScheduler:
         status_data = status_result.data if isinstance(status_result.data, dict) else {}
         phase = str(status_data.get("phase") or "unknown")
         if phase in _ACTIVE_PHASES:
-            db.update_agent_download_verification(
+            agent_download_verification_repo.update_agent_download_verification(
                 request_id,
                 status="pending",
                 result=result,
@@ -348,7 +350,7 @@ class DownloadLibraryVerificationScheduler:
         if attempts == 0 and not job["last_checked_at"]:
             # 下载 tracker 会先提交完成态，再关联本地导入/云盘整理。等待一个
             # 完整轮询周期，避免在两次事务之间把“下载完成”误判为“入库完成”。
-            db.update_agent_download_verification(
+            agent_download_verification_repo.update_agent_download_verification(
                 request_id,
                 status="pending",
                 result=result,
@@ -365,7 +367,7 @@ class DownloadLibraryVerificationScheduler:
         attempts += 1
         # 在调用媒体服务前先持久化尝试次数；即使进程中止，重启后的
         # running 恢复也不会绕过最大尝试预算。
-        claimed = db.update_agent_download_verification(
+        claimed = agent_download_verification_repo.update_agent_download_verification(
             request_id,
             status="running",
             result=result,
@@ -385,7 +387,7 @@ class DownloadLibraryVerificationScheduler:
             for group in groups.values():
                 if not self._runtime_allows(runtime_generation):
                     break
-                if not db.renew_agent_download_verification_lease(
+                if not agent_download_verification_repo.renew_agent_download_verification_lease(
                     request_id, expected_lease_generation=int(job["lease_generation"]),
                 ):
                     return  # 新目标已合并/租约已变化，旧批次不得继续核对或发布终态。
@@ -439,7 +441,7 @@ class DownloadLibraryVerificationScheduler:
                 current=current,
             )
             return
-        db.update_agent_download_verification(
+        agent_download_verification_repo.update_agent_download_verification(
             request_id,
             status="retry_wait",
             result=verification_result,
@@ -458,7 +460,7 @@ class DownloadLibraryVerificationScheduler:
         def renew_loop() -> None:
             while not stopped.wait(_VERIFICATION_LEASE_HEARTBEAT_SECONDS):
                 try:
-                    if not db.renew_agent_download_verification_lease(
+                    if not agent_download_verification_repo.renew_agent_download_verification_lease(
                         request_id,
                         expected_lease_generation=generation,
                     ):
@@ -486,7 +488,7 @@ class DownloadLibraryVerificationScheduler:
         request_id = int(job["request_id"])
         try:
             lease_generation = int(job["lease_generation"] or 0)
-            latest = db.get_agent_download_verification(request_id)
+            latest = agent_download_verification_repo.get_agent_download_verification(request_id)
             if (
                 latest is not None
                 and int(latest["lease_generation"] or 0) != lease_generation
@@ -508,7 +510,7 @@ class DownloadLibraryVerificationScheduler:
                     current=current,
                 )
             else:
-                db.update_agent_download_verification(
+                agent_download_verification_repo.update_agent_download_verification(
                     request_id,
                     status="retry_wait",
                     result=normalized_result,
@@ -540,7 +542,7 @@ class DownloadLibraryVerificationScheduler:
             result=result,
             attempts=attempts,
         )
-        finished = db.finish_agent_download_verification(
+        finished = agent_download_verification_repo.finish_agent_download_verification(
             request_id,
             status=status,
             result=result,
@@ -584,13 +586,13 @@ class DownloadLibraryVerificationScheduler:
             if not self._runtime_allows(generation_guard):
                 return 0
             if not self._notifications_enabled():
-                db.discard_agent_download_verification_notifications()
+                agent_download_verification_repo.discard_agent_download_verification_notifications()
                 return 0
             current = self._now()
             stale_before = self._format(
                 self._clock() - timedelta(seconds=_NOTIFICATION_LEASE_SECONDS)
             )
-            item = db.claim_due_agent_download_verification_notification(
+            item = agent_download_verification_repo.claim_due_agent_download_verification_notification(
                 current_time=current,
                 stale_before=stale_before,
             )
@@ -599,14 +601,14 @@ class DownloadLibraryVerificationScheduler:
             notification_id = int(item["id"])
             generation = int(item["lease_generation"])
             if not self._runtime_allows(generation_guard):
-                db.release_agent_download_verification_notification(
+                agent_download_verification_repo.release_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     next_attempt_at=current,
                 )
                 return 0
             if not self._notifications_enabled():
-                db.discard_agent_download_verification_notification(
+                agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="NotificationsDisabled",
@@ -615,7 +617,7 @@ class DownloadLibraryVerificationScheduler:
             try:
                 load_download_verification_payload(item["payload_json"])
             except (TypeError, ValueError):
-                db.discard_agent_download_verification_notification(
+                agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="InvalidPayload",
@@ -625,7 +627,7 @@ class DownloadLibraryVerificationScheduler:
             chat_id = str(item["chat_id"] or "").strip()
             route = parse_telegram_owner_route(owner)
             if route is None or not chat_id or route.chat_id != chat_id:
-                db.discard_agent_download_verification_notification(
+                agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="MissingRoute"
@@ -637,14 +639,14 @@ class DownloadLibraryVerificationScheduler:
                 route,
                 chat_id=chat_id,
             ):
-                db.discard_agent_download_verification_notification(
+                agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="AuthorizationRevoked",
                 )
                 return 1
             if not self._runtime_allows(generation_guard):
-                db.release_agent_download_verification_notification(
+                agent_download_verification_repo.release_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     next_attempt_at=current,
@@ -653,7 +655,7 @@ class DownloadLibraryVerificationScheduler:
             try:
                 with agent_runtime_effect_admission(generation_guard):
                     if not self._runtime_allows(generation_guard):
-                        db.release_agent_download_verification_notification(
+                        agent_download_verification_repo.release_agent_download_verification_notification(
                             notification_id,
                             expected_lease_generation=generation,
                             next_attempt_at=current,
@@ -674,7 +676,7 @@ class DownloadLibraryVerificationScheduler:
                     )
                 )
             except AgentRuntimeDisabled:
-                db.release_agent_download_verification_notification(
+                agent_download_verification_repo.release_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     next_attempt_at=current,
@@ -688,20 +690,20 @@ class DownloadLibraryVerificationScheduler:
                 if self._runtime_allows(generation_guard):
                     self._retry_notification(item, error_type=type(exc).__name__)
                 else:
-                    db.release_agent_download_verification_notification(
+                    agent_download_verification_repo.release_agent_download_verification_notification(
                         notification_id,
                         expected_lease_generation=generation,
                         next_attempt_at=current,
                     )
                 return 1
             if result.ok:
-                db.complete_agent_download_verification_notification(
+                agent_download_verification_repo.complete_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     sent_at=current,
                 )
             elif result.outcome_unknown:
-                db.discard_agent_download_verification_notification(
+                agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="DeliveryOutcomeUnknown",
@@ -711,7 +713,7 @@ class DownloadLibraryVerificationScheduler:
                 "AuthorizationRevoked",
                 "InvalidRoute",
             }:
-                db.discard_agent_download_verification_notification(
+                agent_download_verification_repo.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type=result.error,
@@ -724,7 +726,7 @@ class DownloadLibraryVerificationScheduler:
                         delay_override=result.retry_after_seconds,
                     )
                 else:
-                    db.release_agent_download_verification_notification(
+                    agent_download_verification_repo.release_agent_download_verification_notification(
                         notification_id,
                         expected_lease_generation=generation,
                         next_attempt_at=current,
@@ -740,7 +742,7 @@ class DownloadLibraryVerificationScheduler:
     ) -> None:
         attempts = max(0, int(item["attempts"] or 0))
         if attempts + 1 >= _NOTIFICATION_MAX_ATTEMPTS:
-            db.discard_agent_download_verification_notification(
+            agent_download_verification_repo.discard_agent_download_verification_notification(
                 int(item["id"]),
                 expected_lease_generation=int(item["lease_generation"]),
                 error_type=error_type,
@@ -752,7 +754,7 @@ class DownloadLibraryVerificationScheduler:
                 min(attempts, len(_NOTIFICATION_RETRY_DELAYS) - 1)
             ]
         )
-        db.retry_agent_download_verification_notification(
+        agent_download_verification_repo.retry_agent_download_verification_notification(
             int(item["id"]),
             expected_lease_generation=int(item["lease_generation"]),
             next_attempt_at=self._after(delay),

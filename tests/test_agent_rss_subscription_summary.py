@@ -61,7 +61,7 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
             "/volume/private/rss",
             "cloud-directory-secret",
         )
-        subscription_id = db.add_rss_subscription(
+        subscription_id = rss_repository.add_rss_subscription(
             name=subscription_name,
             urls=f"https://example.invalid/feed?passkey={secret_values[0]}",
             exclude_keywords=secret_values[1],
@@ -69,7 +69,7 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
             qb_save_path=secret_values[4],
             gy_target_dir=secret_values[5],
         )
-        entry_id = db.add_rss_entry_with_media(
+        entry_id = rss_repository.add_rss_entry_with_media(
             subscription_id,
             "private-entry-title",
             secret_values[2],
@@ -94,12 +94,12 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
 
     def test_recent_activity_total_is_not_truncated_by_subscription_breakdown(self):
         for index in range(20):
-            subscription_id = db.add_rss_subscription(
+            subscription_id = rss_repository.add_rss_subscription(
                 name=f"Feed {index:02d}",
                 urls=f"https://example.invalid/{index}",
                 enabled=1,
             )
-            entry_id = db.add_rss_entry_with_media(
+            entry_id = rss_repository.add_rss_entry_with_media(
                 subscription_id,
                 f"entry-{index}",
                 f"guid-{index}",

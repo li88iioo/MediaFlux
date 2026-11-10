@@ -4,7 +4,6 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from app import database as db
 from app.clients.base import MediaItem, MediaServerClient
 from app.clients.emby import EmbyClient
 from app.clients.http import HttpSecurityError
@@ -22,16 +21,16 @@ class SingleTrackBusinessContractTests(unittest.TestCase):
     def test_subscription_check_has_no_unpaired_legacy_claim_path(self):
         self.assertFalse(hasattr(media_subscriptions, "claim_media_subscription_check"))
         with isolated_test_database():
-            subscription_id = db.add_media_subscription(
+            subscription_id = media_subscriptions.add_media_subscription(
                 provider="tmdb", external_id="1", tmdb_id="1", media_type="tv", title="Test",
             )
-            run_id = db.claim_media_subscription_check_run(subscription_id)
+            run_id = media_subscriptions.claim_media_subscription_check_run(subscription_id)
             assert isinstance(run_id, int)
-            get_media_subscription_result = db.get_media_subscription(subscription_id)
+            get_media_subscription_result = media_subscriptions.get_media_subscription(subscription_id)
             assert get_media_subscription_result is not None
             self.assertEqual(get_media_subscription_result["status"], "checking")
-            self.assertEqual(db.list_media_subscription_runs(subscription_id=subscription_id)[0]["id"], run_id)
-            self.assertIsNone(db.claim_media_subscription_check_run(subscription_id))
+            self.assertEqual(media_subscriptions.list_media_subscription_runs(subscription_id=subscription_id)[0]["id"], run_id)
+            self.assertIsNone(media_subscriptions.claim_media_subscription_check_run(subscription_id))
 
     def test_resume_operation_has_one_implementation_for_both_servers(self):
         self.assertIs(EmbyClient.continue_watching, JellyfinClient.continue_watching)

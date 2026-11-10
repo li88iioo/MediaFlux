@@ -1,5 +1,6 @@
 """v24 -> v25 保留交接队列并补齐事件令牌；重复初始化不改变事件身份。"""
 from app import database as db
+from app.repositories import strm as strm_repo
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -14,7 +15,7 @@ class DurableHandoffMigrationTests(IsolatedDatabaseTestCase):
             )
             conn.execute("PRAGMA user_version=24")
         db.init_db()
-        entries = db.list_strm_refresh_entries()
+        entries = strm_repo.list_strm_refresh_entries()
         self.assertEqual(len(entries), 2)
         tokens = {entry["event_token"] for entry in entries}
         self.assertEqual(len(tokens), 2)
@@ -26,5 +27,5 @@ class DurableHandoffMigrationTests(IsolatedDatabaseTestCase):
             columns = {row[1]: row for row in conn.execute("PRAGMA table_info(organize_probe_queue)")}
             self.assertEqual(columns["pending_strm_changes_json"][4], "'[]'")
         db.init_db()
-        self.assertEqual(db.list_strm_refresh_entries(), entries)
-        self.assertEqual(db.acknowledge_strm_refresh_paths(entries), 2)
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), entries)
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(entries), 2)

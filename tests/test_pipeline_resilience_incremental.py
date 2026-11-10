@@ -20,6 +20,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
 from app.clients.qbittorrent import TorrentAddResult
 from app.modules.download_dispatcher import (
     _submit_qb,
@@ -66,11 +68,11 @@ class _LocalScraper:
 
 class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
     def test_tracker_recovers_only_stale_submitting_backends(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"stale-submit-{uuid.uuid4().hex}", "magnet", title="Stale",
             source_value="magnet:?xt=urn:btih:stale",
         )
-        self.assertTrue(db.claim_download_request(request_id, "both"))
+        self.assertTrue(download_requests_repo.claim_download_request(request_id, "both"))
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE download_requests SET qb_status='submitted',"
@@ -82,35 +84,35 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         with patch.object(
             tracker, "_run_torrent_data_cleanup_if_due", return_value=0,
         ), patch(
-            "app.modules.download_tracker.db.list_active_download_requests",
+            "app.repositories.download_requests.list_active_download_requests",
             return_value=[],
         ):
             self.assertEqual(tracker.run_once(), 0)
 
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "manual_review")
         self.assertEqual(row["qb_status"], "submitted")
         self.assertEqual(row["gy_status"], "manual_review")
         self.assertIn("远端接收结果未知", row["error"])
         self.assertIn("勿直接重复提交", row["error"])
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
 
     def test_recent_submitting_download_is_not_recovered_early(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"recent-submit-{uuid.uuid4().hex}", "magnet", title="Recent",
             source_value="magnet:?xt=urn:btih:recent",
         )
-        self.assertTrue(db.claim_download_request(request_id, "qb"))
+        self.assertTrue(download_requests_repo.claim_download_request(request_id, "qb"))
 
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
-        row = db.get_download_request(request_id)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "submitting")
         self.assertEqual(row["qb_status"], "submitting")
 
     def test_late_dispatch_result_cannot_reactivate_resubmitted_request(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"late-submit-{uuid.uuid4().hex}", "magnet", title="Late",
             source_value="magnet:?xt=urn:btih:late",
         )
@@ -145,9 +147,9 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
                         (request_id,),
                     )
                 self.assertEqual(
-                    db.recover_stale_submitting_download_requests(), 1
+                    download_requests_repo.recover_stale_submitting_download_requests(), 1
                 )
-                self.assertTrue(db.mark_download_request_resubmitted(
+                self.assertTrue(download_requests_repo.mark_download_request_resubmitted(
                     request_id, successor_request_id=9001, targets="qb",
                 ))
             finally:
@@ -157,7 +159,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertFalse(worker.is_alive())
         if failures:
             raise failures[0]
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "resubmitted")
         self.assertEqual(row["qb_status"], "resubmitted")
@@ -166,11 +168,11 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertTrue(outcome["review_required"])
 
     def test_late_missing_target_result_cannot_reactivate_resubmitted_request(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"late-missing-{uuid.uuid4().hex}", "magnet", title="Late missing",
             source_value="magnet:?xt=urn:btih:late-missing",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="qb", status="submitted",
             qb_status="submitted", gy_status="failed",
         )
@@ -209,9 +211,9 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
                         (request_id,),
                     )
                 self.assertEqual(
-                    db.recover_stale_submitting_download_requests(), 1
+                    download_requests_repo.recover_stale_submitting_download_requests(), 1
                 )
-                self.assertTrue(db.mark_download_request_resubmitted(
+                self.assertTrue(download_requests_repo.mark_download_request_resubmitted(
                     request_id, successor_request_id=9002, targets="guangya",
                 ))
             finally:
@@ -221,7 +223,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertFalse(worker.is_alive())
         if failures:
             raise failures[0]
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "resubmitted")
         self.assertEqual(row["gy_status"], "resubmitted")
@@ -230,10 +232,10 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertTrue(outcome["stale_result"])
 
     def test_stale_retried_share_requires_manual_without_cloud_replay(self):
-        request_id, _ = db.create_share_transfer_request(
+        request_id, _ = download_requests_repo.create_share_transfer_request(
             f"share-retry-{uuid.uuid4().hex}", title="Share", origin="web",
         )
-        db.finish_share_transfer_request(
+        download_requests_repo.finish_share_transfer_request(
             request_id,
             success=False,
             target_dir_id="target",
@@ -241,8 +243,8 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             title="Share",
             error="temporary failure",
         )
-        self.assertTrue(db.claim_failed_share_transfer_request(request_id))
-        claimed = db.get_download_request(request_id)
+        self.assertTrue(download_requests_repo.claim_failed_share_transfer_request(request_id))
+        claimed = download_requests_repo.get_download_request(request_id)
         assert claimed is not None
         self.assertEqual(claimed["status"], "submitting")
         self.assertEqual(claimed["gy_status"], "submitting")
@@ -259,13 +261,13 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         ), patch.object(
             tracker, "_gy_tasks", return_value=(True, []),
         ) as gy_tasks, patch(
-            "app.modules.download_tracker.db.list_active_download_requests",
+            "app.repositories.download_requests.list_active_download_requests",
             return_value=[],
         ):
             self.assertEqual(tracker.run_once(), 0)
 
         gy_tasks.assert_not_called()
-        recovered = db.get_download_request(request_id)
+        recovered = download_requests_repo.get_download_request(request_id)
         assert recovered is not None
         self.assertEqual(recovered["status"], "manual_review")
         self.assertEqual(recovered["gy_status"], "manual_review")
@@ -273,10 +275,10 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertIn("勿直接重试", recovered["error"])
 
     def test_recent_retried_share_is_not_recovered_early(self):
-        request_id, _ = db.create_share_transfer_request(
+        request_id, _ = download_requests_repo.create_share_transfer_request(
             f"share-recent-{uuid.uuid4().hex}", title="Share", origin="web",
         )
-        db.finish_share_transfer_request(
+        download_requests_repo.finish_share_transfer_request(
             request_id,
             success=False,
             target_dir_id="target",
@@ -284,19 +286,19 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             title="Share",
             error="temporary failure",
         )
-        self.assertTrue(db.claim_failed_share_transfer_request(request_id))
+        self.assertTrue(download_requests_repo.claim_failed_share_transfer_request(request_id))
 
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
-        row = db.get_download_request(request_id)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "submitting")
         self.assertEqual(row["gy_status"], "submitting")
 
     def test_download_notification_is_claimed_by_exactly_one_tracker(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "notification-claim", "magnet", title="并发通知"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             notification_event_status="completed",
@@ -306,7 +308,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
 
         def claim():
             barrier.wait()
-            return db.claim_download_request_notification(request_id)
+            return download_requests_repo.claim_download_request_notification(request_id)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(claim) for _ in range(2)]
@@ -316,52 +318,52 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         winners = [item for item in claims if item is not None]
         self.assertEqual(len(winners), 1)
         token = str(winners[0]["token"])
-        self.assertFalse(db.finalize_download_request_notification(
+        self.assertFalse(download_requests_repo.finalize_download_request_notification(
             request_id, "stale-token", delivered=True,
         ))
-        self.assertTrue(db.finalize_download_request_notification(
+        self.assertTrue(download_requests_repo.finalize_download_request_notification(
             request_id, token, delivered=True,
         ))
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["notification_delivery_status"], "sent")
         self.assertEqual(row["notification_lease_token"], "")
 
     def test_expired_notification_handoff_lease_is_reclaimed_and_old_owner_is_fenced(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "notification-reclaim", "magnet", title="中断的通知交接"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="completed", notification_event_status="completed",
             notification_delivery_status="pending",
         )
-        first = db.claim_download_request_notification(request_id, lease_seconds=30)
+        first = download_requests_repo.claim_download_request_notification(request_id, lease_seconds=30)
         assert (first) is not None
-        self.assertIsNone(db.claim_download_request_notification(request_id))
+        self.assertIsNone(download_requests_repo.claim_download_request_notification(request_id))
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE download_requests SET notification_lease_expires_at=? WHERE id=?",
                 ("2000-01-01 00:00:00", request_id),
             )
-        second = db.claim_download_request_notification(request_id)
+        second = download_requests_repo.claim_download_request_notification(request_id)
         assert (second) is not None
         self.assertNotEqual(first["token"], second["token"])
-        self.assertFalse(db.finalize_download_request_notification(
+        self.assertFalse(download_requests_repo.finalize_download_request_notification(
             request_id, first["token"], delivered=True,
         ))
-        self.assertTrue(db.finalize_download_request_notification(
+        self.assertTrue(download_requests_repo.finalize_download_request_notification(
             request_id, second["token"], delivered=True,
         ))
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["notification_delivery_status"], "sent")
         self.assertEqual(row["notification_lease_token"], "")
 
     def test_guangya_organize_claim_survives_qb_manual_review(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "mixed-terminal-organize", "magnet", title="混合终态资源"
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="both",
             status="manual_review",
@@ -370,8 +372,8 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             organize_started=0,
         )
 
-        self.assertTrue(db.claim_download_request_organize(request_id))
-        row = db.get_download_request(request_id)
+        self.assertTrue(download_requests_repo.claim_download_request_organize(request_id))
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(int(row["organize_started"]), 1)
         self.assertEqual(str(row["status"]), "manual_review")
@@ -383,11 +385,11 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         source_root.mkdir()
         target_root.mkdir()
         (source_root / "Movie.2026.mkv").write_bytes(b"movie")
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"source-{uuid.uuid4().hex}", qb_profile="", qb_path_prefix="",
             local_root=str(source_root), stable_seconds=0, owner="admin",
         )
-        db.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
+        local_media_repo.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
         service = LocalMediaService(scraper=cast(TMDBScraper, _LocalScraper(confidence)))
         inspection = service.inspect_source("admin", source_id, source_root)
         return root, service, inspection
@@ -448,11 +450,11 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(backend["failure_code"], "qb_outcome_unknown")
         self.assertIn("勿直接重复提交", backend["error"])
 
-        with patch("app.database.get_download_request", return_value=row), patch(
-            "app.database.claim_download_request", return_value=True,
+        with patch("app.repositories.download_requests.get_download_request", return_value=row), patch(
+            "app.repositories.download_requests.claim_download_request", return_value=True,
         ), patch("app.modules.download_dispatcher._submit_qb", return_value=backend), patch(
-            "app.database.finalize_download_request_submission", return_value="submitted",
-        ) as finalize, patch("app.database.add_download_log") as add_log:
+            "app.repositories.download_requests.finalize_download_request_submission", return_value="submitted",
+        ) as finalize, patch("app.repositories.download_requests.add_download_log") as add_log:
             result = dispatch_request(91, "qb")
 
         self.assertEqual(result["status"], "submitted")
@@ -515,11 +517,11 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(update.call_args.kwargs["status"], "manual_review")
 
     def test_manual_review_notification_retries_until_delivery_succeeds(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"notify-{uuid.uuid4().hex}", "magnet", title="Notify",
             source_value="magnet:?xt=urn:btih:notify", chat_id="100",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="submitted",
             qb_status="outcome_unknown",
@@ -527,26 +529,26 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             gy_status="",
         )
         tracker = DownloadTracker()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         with patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle", return_value=False):
             tracker._update_request(row, [], [], qb_available=True)
 
-        pending = db.get_download_request(request_id)
+        pending = download_requests_repo.get_download_request(request_id)
         assert pending is not None
         self.assertEqual(pending["status"], "manual_review")
         self.assertEqual(pending["notification_delivery_status"], "retry_wait")
         self.assertEqual(int(pending["notification_attempts"]), 1)
 
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             title="Changed after terminal state",
             notification_next_retry_at="2000-01-01 00:00:00",
         )
-        retry_row = db.get_download_request(request_id)
+        retry_row = download_requests_repo.get_download_request(request_id)
         with patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle", return_value=True) as send:
             tracker._update_request(retry_row, [], [], qb_available=True)
 
-        delivered = db.get_download_request(request_id)
+        delivered = download_requests_repo.get_download_request(request_id)
         assert delivered is not None
         self.assertEqual(delivered["notification_delivery_status"], "sent")
         self.assertTrue(delivered["notification_sent_at"])
@@ -557,19 +559,19 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(dict(event.fields)["媒体"], "Notify")
 
     def test_manual_review_targets_require_explicit_successor_resubmit(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"retry-{uuid.uuid4().hex}", "magnet", title="Retry",
             source_value="magnet:?xt=urn:btih:retry",
         )
         stale = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="both", status="manual_review",
             qb_status="manual_review", gy_status="manual_review",
             qb_task_missing_since=stale, gy_task_missing_since=stale,
         )
 
-        claimed = db.claim_download_request_targets(request_id, "both")
-        row = db.get_download_request(request_id)
+        claimed = download_requests_repo.claim_download_request_targets(request_id, "both")
+        row = download_requests_repo.get_download_request(request_id)
 
         self.assertEqual(claimed, ())
         assert row is not None
@@ -582,11 +584,11 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
     def test_tracker_cursor_reaches_active_rows_beyond_first_hundred(self):
         ids = []
         for index in range(150):
-            request_id, _ = db.create_download_request(
+            request_id, _ = download_requests_repo.create_download_request(
                 f"cursor-{uuid.uuid4().hex}", "magnet", title=f"Task {index}",
                 source_value=f"magnet:?xt=urn:btih:{index}",
             )
-            db.update_download_request(request_id, status="submitted")
+            download_requests_repo.update_download_request(request_id, status="submitted")
             ids.append(request_id)
         tracker = DownloadTracker()
         visited: list[int] = []
@@ -596,27 +598,27 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertTrue(set(ids).issubset(set(visited)))
 
     def test_init_db_recovers_interrupted_share_without_replaying_cloud_write(self):
-        request_id, _ = db.create_share_transfer_request(
+        request_id, _ = download_requests_repo.create_share_transfer_request(
             f"share-{uuid.uuid4().hex}", title="Share", origin="web",
         )
-        db.update_download_request(request_id, status="submitting", gy_status="submitting")
+        download_requests_repo.update_download_request(request_id, status="submitting", gy_status="submitting")
         db.init_db()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row["status"], "manual_review")
         self.assertEqual(row["gy_status"], "manual_review")
         self.assertIn("勿直接重试", row["error"])
 
     def test_init_db_recovers_interrupted_regular_submit_without_backend_replay(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"regular-{uuid.uuid4().hex}", "magnet", title="Regular",
             source_value="magnet:?xt=urn:btih:regular",
         )
-        self.assertTrue(db.claim_download_request(request_id, "both"))
-        db.update_download_request(request_id, qb_status="submitted")
+        self.assertTrue(download_requests_repo.claim_download_request(request_id, "both"))
+        download_requests_repo.update_download_request(request_id, qb_status="submitted")
 
         db.init_db()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
 
         assert row is not None
         self.assertEqual(row["status"], "manual_review")
@@ -626,15 +628,15 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertIn("勿直接重复提交", row["error"])
         attention_ids = {
             int(item["id"])
-            for item in db.list_download_requests_requiring_attention(limit=20, offset=0)
+            for item in download_requests_repo.list_download_requests_requiring_attention(limit=20, offset=0)
         }
         self.assertIn(request_id, attention_ids)
-        active_ids = {int(item["id"]) for item in db.list_active_download_requests()}
+        active_ids = {int(item["id"]) for item in download_requests_repo.list_active_download_requests()}
         self.assertIn(request_id, active_ids)
 
         first_error = row["error"]
         db.init_db()
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["error"], first_error)
 

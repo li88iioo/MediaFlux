@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import download_staging_cleanup as cleanup
 from app.modules.directory_scrape_errors import (
@@ -49,7 +50,7 @@ class _DeleteCase:
 
     def request(self, **fields):
         self.sequence += 1
-        request_id, created = db.create_download_request(f"active-delete-{self.sequence}", "magnet")
+        request_id, created = download_requests_repo.create_download_request(f"active-delete-{self.sequence}", "magnet")
         assert created
         state = {
             "targets": "guangya", "status": "submitted", "gy_status": "downloading", "gy_isolated": 1,
@@ -57,7 +58,7 @@ class _DeleteCase:
             "gy_staging_cleanup_status": "retained", "organize_started": 0, "organize_status": "",
         }
         state.update(fields)
-        db.update_download_request(request_id, **state)
+        download_requests_repo.update_download_request(request_id, **state)
         return request_id
 
     def confirmation(self, status, *, source_id="stage"):
@@ -289,14 +290,14 @@ def test_download_created_after_scheduling_is_protected(delete_case):
 def test_download_reactivated_after_scheduling_is_protected(delete_case):
     request_id = delete_case.request(status="completed", gy_status="completed", organize_status="completed")
     callback = delete_case.schedule()
-    db.update_download_request(request_id, gy_status="downloading")
+    download_requests_repo.update_download_request(request_id, gy_status="downloading")
     delete_case.blocked(callback, request_id=request_id)
 
 
 def test_download_finished_after_scheduling_is_allowed(delete_case):
     request_id = delete_case.request()
     callback = delete_case.schedule()
-    db.update_download_request(request_id, status="completed", gy_status="completed", organize_status="completed")
+    download_requests_repo.update_download_request(request_id, status="completed", gy_status="completed", organize_status="completed")
     delete_case.allowed(callback)
 
 

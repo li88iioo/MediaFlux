@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.repositories.agent_download_verification import (
     SQLiteMissingMediaWorkflowRepository,
 )
@@ -27,7 +29,7 @@ def frozen_workflow():
             candidate_title="The.Show.S02E03.1080p", target="qb",
         )
         assert workflow_id is not None and reference is not None
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "rescan-followup", "magnet", title="The.Show.S02E03", origin="agent",
         )
         yield SimpleNamespace(repository=repository, workflow_id=workflow_id,
@@ -59,13 +61,13 @@ def test_rescan_preserves_actual_submission_until_real_scheduler_completion(froz
     else:
         assert row["state"] == rescan_at
         assert row["download_request_id"] == case.request_id
-    db.update_download_request(case.request_id, targets="qb", status="completed", qb_status="completed")
-    assert db.enqueue_agent_download_verification(case.request_id, targets=[{**_VERIFICATION}], owner='owner') == "queued"
-    job = db.claim_due_agent_download_verification(current_time="2099-01-01 00:00:00")
+    download_requests_repo.update_download_request(case.request_id, targets="qb", status="completed", qb_status="completed")
+    assert agent_download_verification_repo.enqueue_agent_download_verification(case.request_id, targets=[{**_VERIFICATION}], owner='owner') == "queued"
+    job = agent_download_verification_repo.claim_due_agent_download_verification(current_time="2099-01-01 00:00:00")
     assert job is not None
     job["targets"] = [{**target, "result": "visible"} for target in job["targets"]]
     DownloadLibraryVerificationScheduler()._finish(job, status="visible", result="visible", attempts=1, current=db.now())
-    verification = db.get_agent_download_verification(case.request_id)
+    verification = agent_download_verification_repo.get_agent_download_verification(case.request_id)
     assert verification is not None and verification["status"] == "visible"
     old = next(row for row in cold.list_for_owner(owner="owner") if row["workflow_id"] == case.workflow_id)
     assert old["item_state"] == old["state"] == "visible"
@@ -87,7 +89,7 @@ def test_rescan_refreshes_mixed_season_without_losing_accepted_or_terminal_items
         selected = repository.select_candidate(owner="owner", verification={**_VERIFICATION, "episode": accepted_episode},
                                                candidate_title=f"The.Show.S02E{accepted_episode:02d}.1080p", target="qb")
         assert selected is not None
-        request, _ = db.create_download_request("mixed-season", "magnet", title=f"The.Show.S02E{accepted_episode:02d}", origin="agent")
+        request, _ = download_requests_repo.create_download_request("mixed-season", "magnet", title=f"The.Show.S02E{accepted_episode:02d}", origin="agent")
         assert repository.attach_submission(workflow_ref=asdict(selected), request_id=request, verification_enqueued=True)
         if accepted_state != "verification_pending":
             assert repository.finish_verification(request_id=request, status=accepted_state,
@@ -125,7 +127,7 @@ def test_season_is_publicly_visible_only_when_every_episode_is_visible():
             reference = repository.select_candidate(owner="owner", verification={**_VERIFICATION, "episode": episode},
                                                     candidate_title=f"The.Show.S02E{episode:02d}", target="qb")
             assert reference is not None
-            request, _ = db.create_download_request(f"all-visible-{episode}", "magnet", origin="agent")
+            request, _ = download_requests_repo.create_download_request(f"all-visible-{episode}", "magnet", origin="agent")
             assert repository.attach_submission(workflow_ref=asdict(reference), request_id=request, verification_enqueued=True)
             assert repository.finish_verification(request_id=request, status="visible", result="visible", targets=[{**_VERIFICATION, "episode": episode, "result": 'visible'}])
         public = query_workflows(repository, owner="owner", limit=10)
@@ -143,9 +145,9 @@ def test_attach_absorbs_real_scheduler_terminal_that_arrives_first(frozen_workfl
     case = frozen_workflow
     if rescan:
         case.repository.capture_search(owner="owner", **_search_result())
-    db.update_download_request(case.request_id, targets="qb", status="completed", qb_status="completed")
-    assert db.enqueue_agent_download_verification(case.request_id, targets=[{**_VERIFICATION}], owner='owner') == "queued"
-    job = db.claim_due_agent_download_verification(current_time="2099-01-01 00:00:00")
+    download_requests_repo.update_download_request(case.request_id, targets="qb", status="completed", qb_status="completed")
+    assert agent_download_verification_repo.enqueue_agent_download_verification(case.request_id, targets=[{**_VERIFICATION}], owner='owner') == "queued"
+    job = agent_download_verification_repo.claim_due_agent_download_verification(current_time="2099-01-01 00:00:00")
     assert job is not None
     job["targets"] = [{**target, "result": result} for target in job["targets"]]
     DownloadLibraryVerificationScheduler()._finish(job, status=terminal, result=result, attempts=1, current=db.now())
@@ -180,7 +182,7 @@ def test_stale_unselected_search_item_is_not_a_frozen_confirmation(candidate):
         assert item is not None
         reference = {"workflow_id": original, "item_id": item["item_id"], "revision": item["revision"]}
         repository.capture_search(owner="owner", **_search_result())
-        request, _ = db.create_download_request("unfrozen", "magnet", title="The.Show.S02E03", origin="agent")
+        request, _ = download_requests_repo.create_download_request("unfrozen", "magnet", title="The.Show.S02E03", origin="agent")
         assert not repository.attach_submission(workflow_ref=reference, request_id=request, verification_enqueued=True)
 
 
@@ -188,7 +190,7 @@ def test_actual_submission_cannot_be_rebound_by_duplicate_or_stale_reference(fro
     case = frozen_workflow
     case.repository.capture_search(owner="owner", **_search_result())
     assert case.repository.attach_submission(workflow_ref=case.reference, request_id=case.request_id, verification_enqueued=True)
-    other, _ = db.create_download_request("other-submission", "magnet", title="The.Show.S02E03.Other", origin="agent")
+    other, _ = download_requests_repo.create_download_request("other-submission", "magnet", title="The.Show.S02E03.Other", origin="agent")
     for request in (case.request_id, other):
         assert not case.repository.attach_submission(workflow_ref=case.reference, request_id=request, verification_enqueued=True)
     old = next(row for row in case.repository.list_for_owner(owner="owner") if row["workflow_id"] == case.workflow_id)

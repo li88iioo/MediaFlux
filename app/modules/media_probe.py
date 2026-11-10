@@ -16,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol
 
-from app import database as db
+from app.repositories import media_probe as media_probe_repo
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 
 
@@ -539,7 +539,7 @@ def _read_probe_cache(
 ) -> str:
     """缓存不可用时直接降级，媒体探测本身不能因迁移/磁盘异常阻断整理。"""
     try:
-        return db.get_media_probe_cache(
+        return media_probe_repo.get_media_probe_cache(
             file_id, (etag or ""), (size or 0),
             allow_fingerprint_fallback=allow_fingerprint_fallback,
         )
@@ -554,7 +554,7 @@ def _read_probe_cache(
 def _write_success_cache(file_id: str, etag: str, size: int, profile: MediaProfile) -> None:
     """成功探测结果即使缓存写入失败也照常用于本次命名。"""
     try:
-        db.upsert_media_probe_cache(
+        media_probe_repo.upsert_media_probe_cache(
             file_id, (etag or ""), (size or 0),
             json.dumps(asdict(profile), ensure_ascii=False),
         )
@@ -572,7 +572,7 @@ def _write_failure_cache(file, reason: str, ttl_seconds: int = 600) -> None:
         "reason": (reason or "probe_failed")[:120],
     }, ensure_ascii=False)
     try:
-        db.upsert_media_probe_failure_cache(
+        media_probe_repo.upsert_media_probe_failure_cache(
             str(file.file_id), str(file.etag or ""), int(file.size or 0), payload,
         )
     except Exception as exc:

@@ -7,7 +7,7 @@ import json
 import unittest
 from unittest.mock import Mock, PropertyMock, patch
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, IncompleteOfflineTaskListError
 from app.modules.download_dispatcher import create_request, normalize_download_url
 from app.modules.download_tracker import DownloadTracker
@@ -94,7 +94,7 @@ class GuangYaPagingTrackerBoundaryTests(unittest.TestCase):
     @staticmethod
     def _request(missing_since=None):
         request_id = create_request(normalize_download_url("magnet:?xt=urn:btih:" + "a" * 40), "100", "1")["id"]
-        db.update_download_request(request_id, status="submitted", targets="guangya",
+        download_requests_repo.update_download_request(request_id, status="submitted", targets="guangya",
             gy_status="submitted", gy_task_id="gy-10000", gy_task_ids=json.dumps(["gy-10000"]),
             gy_batch_count=1, gy_task_missing_since=missing_since)
         return request_id
@@ -105,9 +105,9 @@ class GuangYaPagingTrackerBoundaryTests(unittest.TestCase):
              patch.object(GuangYaClient, "logged_in", new_callable=PropertyMock, return_value=True), \
              patch("app.modules.download_tracker.close_guangya_client"):
             available, tasks = DownloadTracker._gy_tasks()
-        self.tracker._update_request(db.get_download_request(request_id), [], tasks,
+        self.tracker._update_request(download_requests_repo.get_download_request(request_id), [], tasks,
                                      qb_available=False, gy_available=available)
-        return available, raw, db.get_download_request(request_id)
+        return available, raw, download_requests_repo.get_download_request(request_id)
 
     def test_incomplete_snapshot_neither_starts_nor_expires_missing_grace(self):
         for reason in ("budget", "repeat"):
@@ -135,7 +135,7 @@ class GuangYaPagingTrackerBoundaryTests(unittest.TestCase):
         assert row is not None
         self.assertTrue(row["gy_task_missing_since"])
         self.assertEqual(row["gy_status"], "submitted")
-        db.update_download_request(request_id, gy_task_missing_since="2000-01-01 00:00:00")
+        download_requests_repo.update_download_request(request_id, gy_task_missing_since="2000-01-01 00:00:00")
         available, _, row = self._read_and_update(request_id, [[]])
         self.assertTrue(available)
         assert row is not None

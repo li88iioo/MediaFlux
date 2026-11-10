@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app import sdk
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -25,7 +26,7 @@ from tests.test_agent_sdk_effects import context_for, executor
 def test_full_configuration_and_real_pages_keep_fields_and_redact_url_credentials():
     with isolated_test_database():
         identities = [
-            db.add_rss_subscription(
+            rss_repo.add_rss_subscription(
                 "长" * 150 + str(i),
                 f"https://user:pwd@example.invalid/{i}?passkey=PRIVATE",
                 exclude_keywords="界" * 1000,
@@ -77,7 +78,7 @@ def test_cold_confirmation_uses_real_identity_and_never_replays_unknown(change):
     async def run():
         store = SQLiteKernelStore()
         context = await context_for(store)
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "Existing", "https://example.invalid/old", refresh_interval_minutes=30
         )
         name = "rss.create" if change in {"duplicate", "unknown"} else "rss.update"
@@ -90,17 +91,17 @@ def test_cold_confirmation_uses_real_identity_and_never_replays_unknown(change):
         prepared = await effects.prepare(name, arguments, context=context)
         plan = prepared.effect_plan
         assert plan is not None
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         assert row is not None and row["enabled"] == 1
         if change == "statistics":
-            db.add_rss_entry_with_media(sid, "new entry", "new-guid")
-            db.update_rss_subscription(
+            rss_repo.add_rss_entry_with_media(sid, "new entry", "new-guid")
+            rss_repo.update_rss_subscription(
                 sid, {"last_refreshed_at": "2026-11-05 12:00:00"}
             )
         elif change == "configuration":
-            db.update_rss_subscription(sid, {"urls": "https://example.invalid/changed"})
+            rss_repo.update_rss_subscription(sid, {"urls": "https://example.invalid/changed"})
         elif change == "duplicate":
-            db.add_rss_subscription("New", "https://example.invalid/new")
+            rss_repo.add_rss_subscription("New", "https://example.invalid/new")
         elif change == "cancel":
             assert await effects.cancel_effect(plan.plan_id, lease=context.lease)
         elif change in {"owner", "session"}:
@@ -113,14 +114,14 @@ def test_cold_confirmation_uses_real_identity_and_never_replays_unknown(change):
         if change in {"cancel", "owner", "session"}:
             with pytest.raises(ToolPipelineError):
                 await rebuilt.execute_confirmed(plan.plan_id, context=context)
-            row = db.get_rss_subscription(sid)
+            row = rss_repo.get_rss_subscription(sid)
             assert row is not None and row["enabled"] == 1
             return
         if change == "unknown":
-            with patch.object(service.db, "get_rss_subscription", return_value=None):
+            with patch("app.repositories.rss.get_rss_subscription", return_value=None):
                 result = await rebuilt.execute_confirmed(plan.plan_id, context=context)
             assert result.outcome.public_content["status"] == "outcome_unknown"
-            assert len(db.list_rss_subscriptions()) == 2
+            assert len(rss_repo.list_rss_subscriptions()) == 2
         else:
             result = await rebuilt.execute_confirmed(plan.plan_id, context=context)
             assert result.outcome.public_content["status"] == (
@@ -138,7 +139,7 @@ def test_cold_confirmation_uses_real_identity_and_never_replays_unknown(change):
 
 def test_delete_refuses_running_refresh_or_submission_without_losing_rows():
     with isolated_test_database():
-        sid = db.add_rss_subscription("Feed", "https://example.invalid/rss")
+        sid = rss_repo.add_rss_subscription("Feed", "https://example.invalid/rss")
         args = {"subscription_id": sid}
         snapshot = service.prepare_change("delete", args)["snapshot"]
         assert _try_acquire_rss_refresh(sid)
@@ -147,7 +148,7 @@ def test_delete_refuses_running_refresh_or_submission_without_losing_rows():
                 service.apply_change("delete", args, expected_snapshot=snapshot)
         finally:
             _release_rss_refresh(sid)
-        eid = db.add_rss_entry_with_media(sid, "entry", "guid")["id"]
+        eid = rss_repo.add_rss_entry_with_media(sid, "entry", "guid")["id"]
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE rss_entries SET status='submitting' WHERE id=?", (eid,)
@@ -156,8 +157,8 @@ def test_delete_refuses_running_refresh_or_submission_without_losing_rows():
         with pytest.raises(service.RSSSubscriptionError, match="提交"):
             service.apply_change("delete", args, expected_snapshot=snapshot)
         assert (
-            db.get_rss_subscription(sid) is not None
-            and db.get_rss_entry(eid) is not None
+            rss_repo.get_rss_subscription(sid) is not None
+            and rss_repo.get_rss_entry(eid) is not None
         )
 
 
@@ -190,7 +191,7 @@ def test_rss_rpc_cold_confirmation_and_full_result_file(tmp_path):
             await bridge.dispatch(request.name)
             assert bridge.proposal and bridge.proposal.effect_plan
             plan = bridge.proposal.effect_plan
-            assert db.list_rss_subscriptions() == []
+            assert rss_repo.list_rss_subscriptions() == []
         finally:
             await bridge.close()
         result = await executor(SQLiteKernelStore()).execute_confirmed(
@@ -199,7 +200,7 @@ def test_rss_rpc_cold_confirmation_and_full_result_file(tmp_path):
         sid = result.outcome.public_content["data"]["subscription_id"]
         with sdk.call_owner(context.owner):
             assert sdk.rss.subscription(sid)["data"]["exclude_keywords"] == "完整" * 300
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         assert row is not None and row["urls"].endswith("PRIVATE")
         catalog = ToolCatalog()
         pipeline = ToolPipeline(
@@ -251,18 +252,18 @@ def test_create_snapshot_uses_both_name_and_urls(other_name, other_url, conflict
     ):
         arguments = {"name": "Target", "urls": ["https://example.invalid/rss"]}
         snapshot = service.prepare_change("create", arguments)["snapshot"]
-        db.add_rss_subscription(other_name, other_url)
+        rss_repo.add_rss_subscription(other_name, other_url)
         result = service.apply_change("create", arguments, expected_snapshot=snapshot)
         assert result["status"] == ("conflict" if conflict else "completed")
-        assert len(db.list_rss_subscriptions()) == (1 if conflict else 2)
+        assert len(rss_repo.list_rss_subscriptions()) == (1 if conflict else 2)
 
 
 def test_public_config_and_binding_write_roll_back_together():
     with isolated_test_database():
-        sid = db.add_rss_subscription("Original", "https://example.invalid/rss")
+        sid = rss_repo.add_rss_subscription("Original", "https://example.invalid/rss")
         arguments = {"subscription_id": sid, "name": "Changed", "media_tmdb_id": "123"}
         snapshot = service.prepare_change("update", arguments)["snapshot"]
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         assert row is not None
         before = dict(row)
         with db.get_conn() as conn:
@@ -271,5 +272,5 @@ def test_public_config_and_binding_write_roll_back_together():
             )
         with pytest.raises(sqlite3.IntegrityError):
             service.apply_change("update", arguments, expected_snapshot=snapshot)
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         assert row is not None and dict(row) == before

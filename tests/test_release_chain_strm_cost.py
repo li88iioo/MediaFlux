@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm, strm_recovery
 from app.modules.scheduler import STRMScheduler
@@ -17,7 +17,7 @@ def test_no_orphans_does_not_reread_all_indexed_pointers():
         for i in range(30):
             file = GuangYaFile(str(i), f"E{i}.mkv", False, 100, "e")
             path = strm.generate_strm(file, "Series", "http://play.invalid", root)
-            db.upsert_strm_index("guangya:s", str(i), "e", 100, file.name, str(path), strm._content_fingerprint(path))
+            strm_repo.upsert_strm_index("guangya:s", str(i), "e", 100, file.name, str(path), strm._content_fingerprint(path))
         stats = STRMScheduler._empty_stats()
         with patch.object(strm_recovery, "_pointer", wraps=strm_recovery._pointer) as read:
             strm_recovery.reconcile_historical_strm(root, "http://play.invalid", [{"id": "s"}], stats)
@@ -31,7 +31,7 @@ def test_orphan_needs_a_verified_real_replacement_even_with_matching_index():
         with isolated_test_database(), tempfile.TemporaryDirectory() as root:
             file = GuangYaFile("video", "E1.mkv", False, 100, "e")
             path = strm.generate_strm(file, "New", "http://play.invalid", root)
-            db.upsert_strm_index("guangya:s", "video", "e", 100, file.name, str(path), strm._content_fingerprint(path))
+            strm_repo.upsert_strm_index("guangya:s", "video", "e", 100, file.name, str(path), strm._content_fingerprint(path))
             orphan = Path(root) / strm.STRM_SUBDIR / "Old.strm"
             orphan.write_bytes(path.read_bytes())
             if changed:

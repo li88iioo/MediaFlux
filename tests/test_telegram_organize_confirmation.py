@@ -15,6 +15,8 @@ from unittest.mock import patch
 from telebot import TeleBot
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
 from app import notifier
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.modules import organize_confirmations as confirmation_module
@@ -833,8 +835,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
     def test_acceptance_enqueue_failure_rolls_back_confirmation_claim(self):
         actions = create_confirmation_actions(self._group(), OrganizeRules(), chat_id="100")
         token = actions[0].callback_data.split(":")[1]
-        with patch.object(
-            db.telegram_notifications, "_enqueue_confirmation_delivery",
+        with patch(
+            "app.repositories.telegram_notifications._enqueue_confirmation_delivery",
             side_effect=RuntimeError("outbox write failed"),
         ), patch.object(confirmation_module, "_dispatch_next_queued_confirmation"), patch.object(
             confirmation_module, "wake_confirmation_dispatcher", return_value=False,
@@ -2184,21 +2186,21 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM download_requests")
             conn.execute("DELETE FROM local_media_tasks")
             conn.execute("DELETE FROM local_media_sources")
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media_repo.create_local_media_source(
             name="本地下载",
             qb_profile="",
             qb_path_prefix="",
             local_root="/downloads",
             owner="admin",
         )
-        self.task_id = db.create_local_media_task(
+        self.task_id = local_media_repo.create_local_media_task(
             self.source_id,
             "",
             "/downloads/Movie.2026.mkv",
             owner="admin",
             trigger="scan",
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             self.task_id,
             owner="admin",
             status="requires_manual",
@@ -2210,8 +2212,8 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         stop_confirmation_dispatcher()
 
     def _context(self):
-        task = db.get_local_media_task(self.task_id, owner="admin")
-        source = db.get_local_media_source(self.source_id, owner="admin")
+        task = local_media_repo.get_local_media_task(self.task_id, owner="admin")
+        source = local_media_repo.get_local_media_source(self.source_id, owner="admin")
         preview = {
             "reason": "匹配置信度不足",
             "snapshot_digest": "digest-1",
@@ -2285,13 +2287,13 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         local.assert_not_called()
 
     def test_local_candidate_executes_through_shared_queue(self):
-        request_id, _created = db.create_download_request(
+        request_id, _created = download_requests_repo.create_download_request(
             "local-confirmation-status", "magnet", title="Movie.2026"
         )
-        self.assertTrue(db.link_download_request_to_local_media_task(
+        self.assertTrue(download_requests_repo.link_download_request_to_local_media_task(
             request_id, self.task_id, "/downloads/Movie.2026.mkv"
         ))
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             self.task_id, status="requires_manual", error="匹配置信度不足"
         )
         actions = self._actions()
@@ -2307,7 +2309,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             self.assertEqual(owner, "admin")
             self.assertEqual(task_id, self.task_id)
             self.assertIsNone(qb_client)
-            db.update_local_media_task(
+            local_media_repo.update_local_media_task(
                 task_id, owner=owner, status="completed", completed_at=db.now()
             )
             return {
@@ -2342,10 +2344,10 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(queued["status"], "running")
         self.assertEqual(worker_result["local_task_id"], self.task_id)
-        get_local_media_task_result = db.get_local_media_task(self.task_id, owner="admin")
+        get_local_media_task_result = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         assert get_local_media_task_result is not None
         self.assertEqual(get_local_media_task_result.status, "completed")
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["local_import_status"], "completed")
         self.assertEqual(request["local_import_error"], "")
@@ -2357,13 +2359,13 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertIn(("媒体库刷新", "已刷新 🎯"), published[-1].fields)
 
     def test_local_confirmation_failure_settles_linked_download_request(self):
-        request_id, _created = db.create_download_request(
+        request_id, _created = download_requests_repo.create_download_request(
             "local-confirmation-failure", "magnet", title="Movie.2026"
         )
-        self.assertTrue(db.link_download_request_to_local_media_task(
+        self.assertTrue(download_requests_repo.link_download_request_to_local_media_task(
             request_id, self.task_id, "/downloads/Movie.2026.mkv"
         ))
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             self.task_id, status="requires_manual", error="匹配置信度不足"
         )
         actions = self._actions()
@@ -2395,8 +2397,8 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             with self.assertRaisesRegex(RuntimeError, "归档写入失败"):
                 callbacks[0]()
 
-        task = db.get_local_media_task(self.task_id, owner="admin")
-        request = db.get_download_request(request_id)
+        task = local_media_repo.get_local_media_task(self.task_id, owner="admin")
+        request = download_requests_repo.get_download_request(request_id)
         assert task is not None
         self.assertEqual(task.status, "failed")
         assert request is not None
@@ -2434,7 +2436,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             with self.assertRaisesRegex(ValueError, "源文件在通知后发生变化"):
                 callbacks[0]()
 
-        get_local_media_task_result_2 = db.get_local_media_task(self.task_id, owner="admin")
+        get_local_media_task_result_2 = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         assert get_local_media_task_result_2 is not None
         self.assertEqual(
             get_local_media_task_result_2.status,
@@ -2456,7 +2458,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         get_organize_confirmation_result_22 = db.get_organize_confirmation(token)
         assert get_organize_confirmation_result_22 is not None
         self.assertEqual(get_organize_confirmation_result_22["status"], "cancelled")
-        get_local_media_task_result_3 = db.get_local_media_task(self.task_id, owner="admin")
+        get_local_media_task_result_3 = local_media_repo.get_local_media_task(self.task_id, owner="admin")
         assert get_local_media_task_result_3 is not None
         self.assertEqual(
             get_local_media_task_result_3.status,

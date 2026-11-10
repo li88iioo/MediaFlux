@@ -6,6 +6,7 @@ from threading import Barrier
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules.media_automation_rules import digests
 from app.agent.models import ToolContext
 from app.repositories import activity as follows
@@ -24,7 +25,7 @@ class AutomationRuleLookupAuditTests(IsolatedDatabaseTestCase):
             conn.execute('DELETE FROM download_requests')
         self.context = ToolContext(owner='lookup-audit-owner', session_id='lookup-session')
         self.owner = agent_job_owner_digest(self.context.owner)
-        identifier, _ = db.create_download_request('lookup-fixture', 'magnet', title='Audit')
+        identifier, _ = download_requests_repo.create_download_request('lookup-fixture', 'magnet', title='Audit')
         self.target = {'kind': 'download', 'id': identifier}
         self.arguments = {'kind': 'download', 'identifier': identifier, 'hours': 24}
         route = patch.object(follows, 'notification_route_settings', return_value={'notification_owner': self.context.owner, 'notification_chat_id': '123'})

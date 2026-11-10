@@ -39,19 +39,19 @@ OLD_NAMES = {"local_media." + name for name in ("diagnose", "task_summaries", "i
 
 
 def current_task(task_id: int):
-    current = db.get_local_media_task(task_id)
+    current = repository.get_local_media_task(task_id)
     assert current is not None
     return current
 
 
 def task(backend: Backend, *, name: str = "one", status: str = "failed", source_id: int | None = None) -> int:
     identifier = source(backend, name) if source_id is None else source_id
-    current_source = db.get_local_media_source(identifier)
+    current_source = repository.get_local_media_source(identifier)
     assert current_source is not None
     video = Path(current_source.local_root) / (name + ".S02E24.mkv")
     video.write_bytes(b"temporary-media")
-    task_id = db.create_local_media_task(identifier, "qb-" + name, str(video), trigger="qb_completed")
-    db.update_local_media_task(task_id, status=status, title=name, tmdb_id="42", media_type="tv",
+    task_id = repository.create_local_media_task(identifier, "qb-" + name, str(video), trigger="qb_completed")
+    repository.update_local_media_task(task_id, status=status, title=name, tmdb_id="42", media_type="tv",
         season_override=2, episode_override=24, snapshot_digest="source-digest", error="完整错误" * 1200 + " password=private-password")
     return task_id
 
@@ -72,11 +72,11 @@ async def context_for(effects: EffectExecutor, *, owner: str = OWNER, session: s
 
 def test_complete_error_files_real_ids_and_no_domain_context(backend):
     removed = task(backend, name="removed")
-    db.update_local_media_task(removed, status="completed")
-    db.delete_local_media_tasks([removed])
+    repository.update_local_media_task(removed, status="completed")
+    repository.delete_local_media_tasks([removed])
     selected = task(backend)
     for index in range(65):
-        db.add_local_media_task_item(selected, f"/temporary/source/{index}.mkv", f"/temporary/target/{index}.mkv", role="video", action="skip")
+        repository.add_local_media_task_item(selected, f"/temporary/source/{index}.mkv", f"/temporary/target/{index}.mkv", role="video", action="skip")
     detail = sdk.local.task(selected)
     assert detail["task"]["task_id"] == selected and selected != 1
     assert len(detail["items"]) == 65 and len(detail["task"]["file_names"]) == 65
@@ -185,11 +185,11 @@ def test_cold_confirmation_cancellation_drift_and_scope_do_not_write(backend, ch
         elif change == "token":
             context.cancellation.cancel()
         elif change == "task":
-            db.update_local_media_task(selected, error="different error")
+            repository.update_local_media_task(selected, error="different error")
         elif change == "targets":
             current = current_task(selected)
             assert current is not None
-            db.upsert_local_library_target(current.source_id, "movie", str(backend.target))
+            repository.upsert_local_library_target(current.source_id, "movie", str(backend.target))
         elif change == "owner":
             context = await context_for(executor(), owner="webk:v1:" + "a" * 64)
         elif change == "session":
@@ -223,9 +223,9 @@ def test_retry_transaction_checks_frozen_facts_after_service_recheck(backend, ch
             with db.get_conn() as conn:
                 conn.execute("UPDATE local_media_tasks SET error='raced' WHERE id=?", (selected,))
         elif change == "source":
-            db.update_local_media_source(before.source_id, enabled=False)
+            repository.update_local_media_source(before.source_id, enabled=False)
         else:
-            db.upsert_local_library_target(before.source_id, "movie", str(backend.target))
+            repository.upsert_local_library_target(before.source_id, "movie", str(backend.target))
         return writer(*args, **kwargs)
     with patch.object(repository, "reset_local_media_task", side_effect=race), pytest.raises(repository.LocalMediaTaskChanged):
         tasks.retry_local_task(selected, expected_fingerprint=prepared["fingerprint"])
@@ -260,7 +260,7 @@ def test_unknown_after_retry_commit_is_consumed_never_replayed(backend, error_ty
 @pytest.fixture
 def media_server(backend, monkeypatch):
     selected = task(backend, status="completed")
-    db.add_local_media_task_item(selected, str(backend.directory / "one/one.S02E24.mkv"), str(backend.target / "Show/Season 2/E24.mkv"), role="video", action="move")
+    repository.add_local_media_task_item(selected, str(backend.directory / "one/one.S02E24.mkv"), str(backend.target / "Show/Season 2/E24.mkv"), role="video", action="move")
     client = Mock()
     client.list_virtual_folders.return_value = [{"id": "real-library-id", "name": "剧集"}]
     client.refresh_for_paths.return_value = {"ok": True, "scope": "item", "matched": 1}
@@ -290,7 +290,7 @@ def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, med
         elif change == "target":
             current = current_task(selected)
             assert current is not None
-            db.upsert_local_library_target(current.source_id, "tv", str(backend.target), provider="jellyfin", library_id="real-library-id", library_name="剧集", server_path="/changed")
+            repository.upsert_local_library_target(current.source_id, "tv", str(backend.target), provider="jellyfin", library_id="real-library-id", library_name="剧集", server_path="/changed")
         elif change == "cancel":
             assert await effects.cancel_effect(plan.plan_id, lease=context.lease)
         if change == "none":
@@ -394,7 +394,7 @@ def test_native_read_complete_error_then_cold_retry_without_replaying_script(bac
             if outcome == "cancel":
                 assert await cold.cancel_effect(plan.plan_id, lease=context.lease)
             elif outcome == "drift":
-                db.update_local_media_task(selected, error="changed")
+                repository.update_local_media_task(selected, error="changed")
                 with pytest.raises(ToolPipelineError):
                     await cold.execute_confirmed(plan.plan_id, context=context)
             else:

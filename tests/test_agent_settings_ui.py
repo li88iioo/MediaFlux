@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import URL
 from starlette.requests import Request
 
-from app import config, database as db
+from app import config
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.agent.feature_gate import is_agent_enabled
 from app.defaults import (
     DEFAULT_AGENT_STREAM_DISPLAY_ENABLED,
@@ -1182,10 +1183,10 @@ class AgentSettingsUiTests(unittest.TestCase):
             patch("app.agent.kernel.bootstrap.invalidate_agent_kernel_runtime"),
         ):
             cache_key, cached = "a" * 64, {"fixture": "reader-cache"}
-            db.set_agent_web_search_cache(cache_key, cached, ttl_seconds=600)
-            self.assertEqual(db.get_agent_web_search_cache(cache_key), cached)
+            agent_web_search_repo.set_agent_web_search_cache(cache_key, cached, ttl_seconds=600)
+            self.assertEqual(agent_web_search_repo.get_agent_web_search_cache(cache_key), cached)
             result = save_config(self._request(), values)
-            self.assertIsNone(db.get_agent_web_search_cache(cache_key))
+            self.assertIsNone(agent_web_search_repo.get_agent_web_search_cache(cache_key))
         self.assertEqual(result, {"success": True})
         persist.assert_called_once_with(values)
 

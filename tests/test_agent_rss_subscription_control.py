@@ -6,6 +6,7 @@ import json
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.database import media_owner_digest
 from app.modules.rss_subscriptions import RSSSubscriptionError, prepare_change
 from app.agent.errors import AgentToolError
@@ -31,7 +32,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM rss_items")
             conn.execute("DELETE FROM agent_action_history")
         reset_agent_service_for_tests()
-        self.sid = db.add_rss_subscription(
+        self.sid = rss_repo.add_rss_subscription(
             "Private Feed",
             "https://secret.invalid/rss?passkey=RSS_SECRET",
             exclude_keywords="PRIVATE_FILTER",
@@ -63,7 +64,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
                 {"subscription_id": self.sid, "refresh_interval_minutes": 0},
             )
         self.assertEqual(scheduler.reload.call_count, 2)
-        row = db.get_rss_subscription(self.sid)
+        row = rss_repo.get_rss_subscription(self.sid)
         assert row is not None
         self.assertEqual(int(row["enabled"]), 0)
         self.assertEqual(int(row["refresh_interval_minutes"]), 0)
@@ -94,34 +95,34 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             {"subscription_id": self.sid, "enabled": False},
             owner="owner",
         )
-        db.update_rss_subscription(self.sid, {"exclude_keywords": "CHANGED_SECRET"})
+        rss_repo.update_rss_subscription(self.sid, {"exclude_keywords": "CHANGED_SECRET"})
         confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
-        get_rss_subscription_result = db.get_rss_subscription(self.sid)
+        get_rss_subscription_result = rss_repo.get_rss_subscription(self.sid)
         assert get_rss_subscription_result is not None
         self.assertEqual(int(get_rss_subscription_result["enabled"]), 1)
 
     def test_delete_is_cascaded_locally_and_stale_entry_count_conflicts(self):
-        db.add_rss_entry_with_media(self.sid, "PRIVATE_TITLE", "secret-guid")
-        other = db.add_rss_subscription("Other", "https://other.invalid/rss")
-        db.add_rss_entry_with_media(other, "OTHER_TITLE", "other-guid")
+        rss_repo.add_rss_entry_with_media(self.sid, "PRIVATE_TITLE", "secret-guid")
+        other = rss_repo.add_rss_subscription("Other", "https://other.invalid/rss")
+        rss_repo.add_rss_entry_with_media(other, "OTHER_TITLE", "other-guid")
         service = get_agent_service()
         prepared = service.prepare(
             "rss.delete", {"subscription_id": self.sid}, owner="owner"
         )
-        db.add_rss_entry_with_media(self.sid, "LATE_PRIVATE_TITLE", "late-guid")
+        rss_repo.add_rss_entry_with_media(self.sid, "LATE_PRIVATE_TITLE", "late-guid")
         conflict = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(conflict["result"]["status"], "conflict")
-        assert (db.get_rss_subscription(self.sid)) is not None
+        assert (rss_repo.get_rss_subscription(self.sid)) is not None
         with patch("app.modules.rss_scheduler.get_rss_scheduler", return_value=Mock()):
             _, confirmed = self._confirm(
                 "rss.delete", {"subscription_id": self.sid}
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["data"]["deleted_entries"], 2)
-        self.assertIsNone(db.get_rss_subscription(self.sid))
-        assert (db.get_rss_subscription(other)) is not None
+        self.assertIsNone(rss_repo.get_rss_subscription(self.sid))
+        assert (rss_repo.get_rss_subscription(other)) is not None
         with db.get_conn() as conn:
             self.assertEqual(
                 conn.execute(
@@ -141,7 +142,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertFalse(confirmed["result"]["data"]["runtime_refreshed"])
-        get_rss_subscription_result_2 = db.get_rss_subscription(self.sid)
+        get_rss_subscription_result_2 = rss_repo.get_rss_subscription(self.sid)
         assert get_rss_subscription_result_2 is not None
         self.assertEqual(int(get_rss_subscription_result_2["enabled"]), 0)
         history = db.list_agent_action_history(
@@ -185,7 +186,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         self.assertIn("核验", created["result"]["summary"])
         created_id = int(created["result"]["data"]["subscription_id"])
         self.assertEqual(created["result"]["data"]["subscription_id"], created_id)
-        row = db.get_rss_subscription(created_id)
+        row = rss_repo.get_rss_subscription(created_id)
         assert row is not None
         self.assertEqual(row["name"], "Anime Feed")
         self.assertEqual(row["media_tmdb_id"], "12345")
@@ -200,7 +201,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             )
             updated = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertTrue(updated["result"]["ok"])
-        row = db.get_rss_subscription(created_id)
+        row = rss_repo.get_rss_subscription(created_id)
         assert row is not None
         self.assertEqual(row["name"], "Anime Feed Updated")
         self.assertEqual(int(row["refresh_interval_minutes"]), 60)
@@ -217,7 +218,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         }
         prepared = service.prepare("rss.create", arguments, owner="owner")
         with patch(
-            "app.modules.rss_subscriptions.db.get_rss_subscription",
+            "app.repositories.rss.get_rss_subscription",
             return_value=None,
         ):
             confirmed = service.confirm(
@@ -251,7 +252,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
                 prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(confirmed["result"]["ok"])
-        get_rss_subscription_result_3 = db.get_rss_subscription(self.sid)
+        get_rss_subscription_result_3 = rss_repo.get_rss_subscription(self.sid)
         assert get_rss_subscription_result_3 is not None
         self.assertEqual(
             get_rss_subscription_result_3["urls"], "https://updated.example/rss"
@@ -317,7 +318,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             },
             owner="owner",
         )
-        original_update = db.update_rss_subscription
+        original_update = rss_repo.update_rss_subscription
         observed: list[tuple[bool, bool]] = []
 
         def update_in_transaction(sub_id, fields, **kwargs):
@@ -327,7 +328,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             return original_update(sub_id, fields, **kwargs)
 
         with patch(
-            "app.modules.rss_subscriptions.db.update_rss_subscription",
+            "app.repositories.rss.update_rss_subscription",
             side_effect=update_in_transaction,
         ):
             confirmed = service.confirm(
@@ -335,7 +336,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(observed, [(True, True)])
-        current = db.get_rss_subscription(self.sid)
+        current = rss_repo.get_rss_subscription(self.sid)
         assert current is not None
         self.assertEqual(current["name"], "Atomic Feed")
         self.assertEqual(current["media_tmdb_id"], "12345")
@@ -348,11 +349,11 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             {"subscription_id": self.sid, "exclude_keywords": "SAFE"},
             owner="owner",
         )
-        db.update_rss_subscription(self.sid, {"refresh_interval_minutes": 31})
+        rss_repo.update_rss_subscription(self.sid, {"refresh_interval_minutes": 31})
         confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
-        get_rss_subscription_result_4 = db.get_rss_subscription(self.sid)
+        get_rss_subscription_result_4 = rss_repo.get_rss_subscription(self.sid)
         assert get_rss_subscription_result_4 is not None
         self.assertEqual(
             get_rss_subscription_result_4["exclude_keywords"], "PRIVATE_FILTER"

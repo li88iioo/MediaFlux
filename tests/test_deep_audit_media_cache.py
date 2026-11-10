@@ -148,7 +148,7 @@ def test_history_missing_fingerprint_preserves_exact_failure_backoff():
         failure = json.dumps(
             {"_media_probe_cache": "failure", "retry_after": 9999999999}
         )
-        db.upsert_media_probe_cache("file", "", 20, failure)
+        cache.upsert_media_probe_cache("file", "", 20, failure)
         key = ("file", "", 20)
         assert (
             cache.get_media_probe_cache(*key, allow_fingerprint_fallback=True)

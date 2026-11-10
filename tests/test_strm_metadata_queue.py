@@ -14,6 +14,7 @@ import tempfile
 import time
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.modules import strm_metadata_worker as metadata
 from app.modules.process_lock import CrossProcessLock
 from app.repositories.media_refresh_queue import media_refresh_queue_status
@@ -39,7 +40,7 @@ def _job(**updates) -> dict:
 
 
 def _refresh_paths_and_scopes():
-    entries = db.list_strm_refresh_entries()
+    entries = strm_repo.list_strm_refresh_entries()
     assert all(len(str(entry["event_token"])) == 32 for entry in entries)
     return [{"path": entry["path"], "allow_emby": entry["allow_emby"]} for entry in entries]
 
@@ -51,18 +52,18 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM strm_refresh_outbox")
 
     def _rows(self, status: str = "all") -> list[dict]:
-        return [dict(row) for row in db.list_strm_metadata_queue(status=status)]
+        return [dict(row) for row in strm_repo.list_strm_metadata_queue(status=status)]
 
     def test_enqueue_is_idempotent_and_completed_same_snapshot_stays_completed(self):
-        first = db.enqueue_strm_metadata_jobs([_job()])
-        second = db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker")
-        state = db.settle_strm_metadata_job(
+        first = strm_repo.enqueue_strm_metadata_jobs([_job()])
+        second = strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker")
+        state = strm_repo.settle_strm_metadata_job(
             claimed[0]["id"],
             expected_lease_generation=claimed[0]["lease_generation"],
             expected_revision=claimed[0]["revision"],
         )
-        third = db.enqueue_strm_metadata_jobs([_job()])
+        third = strm_repo.enqueue_strm_metadata_jobs([_job()])
 
         self.assertEqual(first["created"], 1)
         self.assertEqual(second["deduped"], 1)
@@ -72,15 +73,15 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(self._rows()[0]["status"], "completed")
 
     def test_changed_snapshot_reopens_completed_job(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker")
-        db.settle_strm_metadata_job(
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker")
+        strm_repo.settle_strm_metadata_job(
             claimed[0]["id"],
             expected_lease_generation=claimed[0]["lease_generation"],
             expected_revision=claimed[0]["revision"],
         )
 
-        result = db.enqueue_strm_metadata_jobs([_job(etag="etag-2", size=256)])
+        result = strm_repo.enqueue_strm_metadata_jobs([_job(etag="etag-2", size=256)])
 
         row = self._rows()[0]
         self.assertEqual(result["updated"], 1)
@@ -90,66 +91,66 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
 
     def test_policy_only_change_reopens_completed_job(self):
         original = _job(refresh_policy={"media_root": "/strm", "enabled": False})
-        db.enqueue_strm_metadata_jobs([original])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker")[0]
-        db.settle_strm_metadata_job(
+        strm_repo.enqueue_strm_metadata_jobs([original])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker")[0]
+        strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
         )
 
         updated = {**original, "refresh_policy": {"media_root": "/strm", "allow_emby": False}}
-        result = db.enqueue_strm_metadata_jobs([updated])
+        result = strm_repo.enqueue_strm_metadata_jobs([updated])
 
         self.assertEqual(result["updated"], 1)
         self.assertEqual(self._rows()[0]["status"], "queued")
         self.assertEqual(self._rows()[0]["revision"], claimed["revision"] + 1)
-        self.assertEqual(db.enqueue_strm_metadata_jobs([updated])["deduped"], 1)
+        self.assertEqual(strm_repo.enqueue_strm_metadata_jobs([updated])["deduped"], 1)
 
     def test_legacy_empty_policy_matches_explicit_defaults_without_revision_change(self):
         from dataclasses import asdict
 
         from app.repositories.strm import StrmRefreshPolicy
 
-        db.enqueue_strm_metadata_jobs([_job()])
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_metadata_queue SET refresh_policy_json='{}'")
         before = self._rows()[0]
-        result = db.enqueue_strm_metadata_jobs([_job(refresh_policy=asdict(StrmRefreshPolicy()))])
+        result = strm_repo.enqueue_strm_metadata_jobs([_job(refresh_policy=asdict(StrmRefreshPolicy()))])
 
         self.assertEqual(result["deduped"], 1)
         self.assertEqual(self._rows()[0]["revision"], before["revision"])
 
     def test_policy_only_change_fences_running_revision_and_uses_latest_scope(self):
         original = _job(refresh_policy={"media_root": "/strm"})
-        db.enqueue_strm_metadata_jobs([original])
-        first = db.claim_due_strm_metadata_jobs(owner="worker")[0]
-        result = db.enqueue_strm_metadata_jobs([{
+        strm_repo.enqueue_strm_metadata_jobs([original])
+        first = strm_repo.claim_due_strm_metadata_jobs(owner="worker")[0]
+        result = strm_repo.enqueue_strm_metadata_jobs([{
             **original, "refresh_policy": {"media_root": "/strm", "allow_emby": False},
         }])
 
         self.assertEqual(result["dirty"], 1)
         self.assertEqual(self._rows()[0]["revision"], first["revision"] + 1)
-        self.assertEqual(db.settle_strm_metadata_job(
+        self.assertEqual(strm_repo.settle_strm_metadata_job(
             first["id"], expected_lease_generation=first["lease_generation"],
             expected_revision=first["revision"], refresh_paths=["/strm/Film/Movie.nfo"],
         ), "queued")
-        self.assertEqual(db.list_strm_refresh_entries(), [])
-        latest = db.claim_due_strm_metadata_jobs(owner="successor")[0]
-        self.assertEqual(db.settle_strm_metadata_job(
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+        latest = strm_repo.claim_due_strm_metadata_jobs(owner="successor")[0]
+        self.assertEqual(strm_repo.settle_strm_metadata_job(
             latest["id"], expected_lease_generation=latest["lease_generation"],
             expected_revision=latest["revision"], refresh_paths=["/strm/Film/Movie.nfo"],
         ), "completed")
         self.assertEqual(
-            [entry["allow_emby"] for entry in db.list_strm_refresh_entries()], [False],
+            [entry["allow_emby"] for entry in strm_repo.list_strm_refresh_entries()], [False],
         )
 
     def test_change_while_running_marks_dirty_and_fences_old_revision(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker")
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker")
 
-        result = db.enqueue_strm_metadata_jobs([_job(etag="etag-2")])
-        state = db.settle_strm_metadata_job(
+        result = strm_repo.enqueue_strm_metadata_jobs([_job(etag="etag-2")])
+        state = strm_repo.settle_strm_metadata_job(
             claimed[0]["id"],
             expected_lease_generation=claimed[0]["lease_generation"],
             expected_revision=claimed[0]["revision"],
@@ -162,21 +163,21 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["status"], "queued")
 
     def test_expired_lease_reclaim_rejects_late_worker_result(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        first = db.claim_due_strm_metadata_jobs(owner="worker-a", lease_seconds=1)[0]
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        first = strm_repo.claim_due_strm_metadata_jobs(owner="worker-a", lease_seconds=1)[0]
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE strm_metadata_queue SET lease_until=? WHERE id=?",
                 (time.time() - 1, first["id"]),
             )
-        second = db.claim_due_strm_metadata_jobs(owner="worker-b", lease_seconds=60)[0]
+        second = strm_repo.claim_due_strm_metadata_jobs(owner="worker-b", lease_seconds=60)[0]
 
-        stale = db.settle_strm_metadata_job(
+        stale = strm_repo.settle_strm_metadata_job(
             first["id"],
             expected_lease_generation=first["lease_generation"],
             expected_revision=first["revision"],
         )
-        current = db.settle_strm_metadata_job(
+        current = strm_repo.settle_strm_metadata_job(
             second["id"],
             expected_lease_generation=second["lease_generation"],
             expected_revision=second["revision"],
@@ -186,19 +187,19 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(current, "completed")
 
     def test_lease_renewal_is_fenced_by_owner_and_generation(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(
             owner="worker-a", lease_seconds=30
         )[0]
         before = float(claimed["lease_until"] or 0)
 
-        renewed = db.renew_strm_metadata_job_lease(
+        renewed = strm_repo.renew_strm_metadata_job_lease(
             claimed["id"],
             expected_owner="worker-a",
             expected_lease_generation=claimed["lease_generation"],
             lease_seconds=120,
         )
-        wrong_owner = db.renew_strm_metadata_job_lease(
+        wrong_owner = strm_repo.renew_strm_metadata_job_lease(
             claimed["id"],
             expected_owner="worker-b",
             expected_lease_generation=claimed["lease_generation"],
@@ -211,16 +212,16 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertGreater(float(row["lease_until"] or 0), before)
 
     def test_completion_rejects_wrong_lease_owner(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker-a")[0]
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker-a")[0]
 
-        stale = db.settle_strm_metadata_job(
+        stale = strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker-b",
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
         )
-        current = db.settle_strm_metadata_job(
+        current = strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker-a",
             expected_lease_generation=claimed["lease_generation"],
@@ -231,11 +232,11 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(current, "completed")
 
     def test_completed_metadata_persists_media_refresh_until_acknowledged(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker-a")[0]
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker-a")[0]
         refresh_path = "/strm/电影/Movie/Movie.nfo"
 
-        state = db.settle_strm_metadata_job(
+        state = strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker-a",
             expected_lease_generation=claimed["lease_generation"],
@@ -248,18 +249,18 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
             _refresh_paths_and_scopes(),
             [{"path": refresh_path, "allow_emby": True}],
         )
-        self.assertEqual(db.count_strm_refresh_paths(), 1)
-        self.assertEqual(db.acknowledge_strm_refresh_paths(db.list_strm_refresh_entries()), 1)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 1)
+        self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries()), 1)
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_refresh_outbox_preserves_provider_scope_for_same_path(self):
         refresh_path = "/strm/剧集/Example/Season 01"
 
         self.assertEqual(
-            len(db.enqueue_strm_refresh_paths([refresh_path], allow_emby=False)), 1
+            len(strm_repo.enqueue_strm_refresh_paths([refresh_path], allow_emby=False)), 1
         )
         self.assertEqual(
-            len(db.enqueue_strm_refresh_paths([refresh_path], allow_emby=True)), 1
+            len(strm_repo.enqueue_strm_refresh_paths([refresh_path], allow_emby=True)), 1
         )
 
         self.assertEqual(
@@ -269,10 +270,10 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
                 {"path": refresh_path, "allow_emby": True},
             ],
         )
-        self.assertEqual(db.count_strm_refresh_paths(), 2)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 2)
         self.assertEqual(
-            db.acknowledge_strm_refresh_paths(
-                [entry for entry in db.list_strm_refresh_entries() if not entry["allow_emby"]]
+            strm_repo.acknowledge_strm_refresh_paths(
+                [entry for entry in strm_repo.list_strm_refresh_entries() if not entry["allow_emby"]]
             ),
             1,
         )
@@ -281,17 +282,17 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
             [{"path": refresh_path, "allow_emby": True}],
         )
         self.assertEqual(
-            db.acknowledge_strm_refresh_paths(
-                db.list_strm_refresh_entries()
+            strm_repo.acknowledge_strm_refresh_paths(
+                strm_repo.list_strm_refresh_entries()
             ),
             1,
         )
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_failures_use_exponential_retry_and_end_in_failed(self):
-        db.enqueue_strm_metadata_jobs([_job()], max_attempts=2)
-        first = db.claim_due_strm_metadata_jobs(owner="worker")[0]
-        state = db.fail_or_retry_strm_metadata_job(
+        strm_repo.enqueue_strm_metadata_jobs([_job()], max_attempts=2)
+        first = strm_repo.claim_due_strm_metadata_jobs(owner="worker")[0]
+        state = strm_repo.fail_or_retry_strm_metadata_job(
             first["id"],
             expected_lease_generation=first["lease_generation"],
             expected_revision=first["revision"],
@@ -307,8 +308,8 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
                 "UPDATE strm_metadata_queue SET next_attempt_at=? WHERE id=?",
                 (db.now(), first["id"]),
             )
-        second = db.claim_due_strm_metadata_jobs(owner="worker")[0]
-        state = db.fail_or_retry_strm_metadata_job(
+        second = strm_repo.claim_due_strm_metadata_jobs(owner="worker")[0]
+        state = strm_repo.fail_or_retry_strm_metadata_job(
             second["id"],
             expected_lease_generation=second["lease_generation"],
             expected_revision=second["revision"],
@@ -320,10 +321,10 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(self._rows()[0]["attempts"], 2)
 
     def test_startup_recovery_requeues_running_without_incrementing_attempts(self):
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="old-worker")[0]
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="old-worker")[0]
 
-        recovered = db.recover_stale_strm_metadata_jobs(force=True)
+        recovered = strm_repo.recover_stale_strm_metadata_jobs(force=True)
 
         row = self._rows()[0]
         self.assertEqual(recovered, 1)
@@ -332,14 +333,14 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertGreater(row["lease_generation"], claimed["lease_generation"])
 
     def test_forced_recovery_can_be_scoped_to_one_worker_owner(self):
-        db.enqueue_strm_metadata_jobs([
+        strm_repo.enqueue_strm_metadata_jobs([
             _job(file_id="meta-a", filename="a.nfo"),
             _job(file_id="meta-b", filename="b.nfo"),
         ])
-        first = db.claim_due_strm_metadata_jobs(owner="worker-a", limit=1)[0]
-        second = db.claim_due_strm_metadata_jobs(owner="worker-b", limit=1)[0]
+        first = strm_repo.claim_due_strm_metadata_jobs(owner="worker-a", limit=1)[0]
+        second = strm_repo.claim_due_strm_metadata_jobs(owner="worker-b", limit=1)[0]
 
-        recovered = db.recover_stale_strm_metadata_jobs(
+        recovered = strm_repo.recover_stale_strm_metadata_jobs(
             force=True, owner="worker-a"
         )
 
@@ -349,10 +350,10 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(rows[second["id"]]["status"], "running")
 
     def test_full_scan_can_cancel_stale_jobs_and_reappearance_reopens(self):
-        db.enqueue_strm_metadata_jobs([_job(file_id="keep"), _job(file_id="stale")])
+        strm_repo.enqueue_strm_metadata_jobs([_job(file_id="keep"), _job(file_id="stale")])
 
-        cancelled = db.cancel_stale_strm_metadata_jobs("source", {"keep"})
-        reopened = db.enqueue_strm_metadata_jobs([_job(file_id="stale", etag="etag-2")])
+        cancelled = strm_repo.cancel_stale_strm_metadata_jobs("source", {"keep"})
+        reopened = strm_repo.enqueue_strm_metadata_jobs([_job(file_id="stale", etag="etag-2")])
 
         rows = {row["file_id"]: row for row in self._rows()}
         self.assertEqual(cancelled, 1)
@@ -361,15 +362,15 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(rows["stale"]["status"], "queued")
 
     def test_summary_reports_pending_and_terminal_counts(self):
-        db.enqueue_strm_metadata_jobs([_job(file_id="a"), _job(file_id="b")])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker", limit=1)[0]
-        db.settle_strm_metadata_job(
+        strm_repo.enqueue_strm_metadata_jobs([_job(file_id="a"), _job(file_id="b")])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker", limit=1)[0]
+        strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
         )
 
-        summary = db.count_strm_metadata_jobs()
+        summary = strm_repo.count_strm_metadata_jobs()
 
         self.assertEqual(summary["queued"], 1)
         self.assertEqual(summary["completed"], 1)
@@ -454,7 +455,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             self.assertTrue(list((Path(root) / STRM_SUBDIR).rglob("*.strm")))
             self.assertFalse(list((Path(root) / STRM_SUBDIR).rglob("*.nfo")))
             client.get_download_url.assert_not_called()
-            rows = [dict(row) for row in db.list_strm_metadata_queue()]
+            rows = [dict(row) for row in strm_repo.list_strm_metadata_queue()]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["status"], "queued")
 
@@ -514,9 +515,9 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
                          patch("app.modules.strm.requests.get", return_value=_Response()), \
                          patch.object(worker, "_flush_media_refresh"):
                         self.assertTrue(worker._process_one())
-                    self.assertEqual(dict(db.list_strm_metadata_queue()[0])["status"], "completed")
+                    self.assertEqual(dict(strm_repo.list_strm_metadata_queue()[0])["status"], "completed")
                     self.assertEqual(
-                        [entry["allow_emby"] for entry in db.list_strm_refresh_entries()],
+                        [entry["allow_emby"] for entry in strm_repo.list_strm_refresh_entries()],
                         [allow_emby] if enabled else [],
                     )
 
@@ -534,7 +535,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         client = _TreeClient({source_id: [metadata]})
 
         with tempfile.TemporaryDirectory() as root:
-            db.enqueue_strm_metadata_jobs([{
+            strm_repo.enqueue_strm_metadata_jobs([{
                 "source_id": source_id,
                 "source_name": "整理",
                 "file_id": metadata.file_id,
@@ -561,11 +562,11 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
                 worked = worker._process_one()
 
             self.assertTrue(worked)
-            row = dict(db.list_strm_metadata_queue()[0])
+            row = dict(strm_repo.list_strm_metadata_queue()[0])
             self.assertEqual(row["status"], "completed")
             target = Path(root) / STRM_SUBDIR / "Movie" / "Movie.nfo"
             self.assertEqual(target.read_bytes(), b"metadata")
-            index = db.list_strm_index(f"guangya-meta:{source_id}")
+            index = strm_repo.list_strm_index(f"guangya-meta:{source_id}")
             self.assertEqual([item["file_id"] for item in index], ["meta"])
 
     def test_media_refresh_failure_keeps_durable_outbox_until_retry_succeeds(self):
@@ -573,10 +574,10 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
 
         from app.modules.strm_metadata_worker import STRMMetadataWorker
 
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="worker")[0]
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="worker")[0]
         path = "/strm/Movie/Movie.nfo"
-        db.settle_strm_metadata_job(
+        strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker",
             expected_lease_generation=claimed["lease_generation"],
@@ -608,7 +609,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         self.assertEqual(refresh.call_count, 2)
         self.assertEqual(refresh.call_args_list[0].args[0], [path])
         self.assertTrue(refresh.call_args_list[0].kwargs["immediate"])
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
         self.assertFalse(worker._refresh_retry_pending)
 
     def test_new_worker_replays_durable_media_refresh_after_restart(self):
@@ -616,10 +617,10 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
 
         from app.modules.strm_metadata_worker import STRMMetadataWorker
 
-        db.enqueue_strm_metadata_jobs([_job()])
-        claimed = db.claim_due_strm_metadata_jobs(owner="old-worker")[0]
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        claimed = strm_repo.claim_due_strm_metadata_jobs(owner="old-worker")[0]
         path = "/strm/Movie/Movie.nfo"
-        db.settle_strm_metadata_job(
+        strm_repo.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="old-worker",
             expected_lease_generation=claimed["lease_generation"],
@@ -640,7 +641,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         refresh.assert_called_once()
         self.assertEqual(refresh.call_args.args[0], [path])
         self.assertFalse(refresh.call_args.kwargs["immediate"])
-        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
 
     def test_worker_flushes_each_provider_scope_and_acks_only_success(self):
         from unittest.mock import patch
@@ -648,8 +649,8 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         from app.modules.strm_metadata_worker import STRMMetadataWorker
 
         path = "/strm/剧集/Example/Season 01"
-        db.enqueue_strm_refresh_paths([path], allow_emby=False)
-        db.enqueue_strm_refresh_paths([path], allow_emby=True)
+        strm_repo.enqueue_strm_refresh_paths([path], allow_emby=False)
+        strm_repo.enqueue_strm_refresh_paths([path], allow_emby=True)
         worker = STRMMetadataWorker()
 
         with patch(
@@ -677,7 +678,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(refresh.call_count, 3)
         self.assertTrue(refresh.call_args_list[2].kwargs["allow_emby"])
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
         self.assertFalse(worker._refresh_retry_pending)
 
     def test_stop_does_not_discard_worker_restarted_during_join(self):
@@ -752,7 +753,7 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             "app.modules.media_refresh_coordinator._configured_provider_names", return_value=("jellyfin",),
         ))
         self.enterContext(patch("threading.excepthook", side_effect=lambda args: self.thread_errors.append(args.exc_value)))
-        acknowledge = db.acknowledge_strm_refresh_paths
+        acknowledge = strm_repo.acknowledge_strm_refresh_paths
         wait = self.worker._wake_event.wait
 
         def handoff(entries):
@@ -764,7 +765,7 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             self.backoff.set()
             return wait(timeout)
 
-        self.enterContext(patch.object(db, "acknowledge_strm_refresh_paths", side_effect=handoff))
+        self.enterContext(patch.object(strm_repo, "acknowledge_strm_refresh_paths", side_effect=handoff))
         self.enterContext(patch.object(self.worker._wake_event, "wait", side_effect=idle_wait))
         self.addCleanup(self._stop_worker, self.worker)
 
@@ -784,27 +785,27 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
         self.assertTrue(self.handed_off.wait(7), "存储恢复后未继续完成元数据与刷新交接")
         self.assertTrue(self.worker.stop(timeout=3))
         self.assertEqual(self.download.call_count, 1)
-        self.assertEqual(dict(db.list_strm_metadata_queue()[0])["status"], "completed")
+        self.assertEqual(dict(strm_repo.list_strm_metadata_queue()[0])["status"], "completed")
         self.assertEqual(list(self.root.rglob("*.nfo"))[0].read_bytes(), b"metadata")
-        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
         self.assertEqual(media_refresh_queue_status()["paths"], 1)
         self.assertEqual(self.thread_errors, [])
         self._assert_lock_released()
 
     def test_idle_refresh_read_error_retries_then_downloads_new_work(self):
         restored = Event()
-        read = db.list_strm_refresh_entries
+        read = strm_repo.list_strm_refresh_entries
 
         def read_outbox(**kwargs):
             if not restored.is_set():
                 raise sqlite3.OperationalError("isolated outbox read failure")
             return read(**kwargs)
 
-        with patch.object(db, "list_strm_refresh_entries", side_effect=read_outbox):
+        with patch.object(strm_repo, "list_strm_refresh_entries", side_effect=read_outbox):
             self.worker.start()
             self.assertTrue(self.backoff.wait(2), "刷新读取失败逃出了消费循环")
             self.assertTrue(self.worker.status()["worker_running"])
-            db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
+            strm_repo.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
             restored.set()
             self.worker.wake()
             self._assert_download_and_handoff()
@@ -818,32 +819,32 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
                 raise OSError("isolated client initialization failure")
             return runtime_client()
 
-        db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
+        strm_repo.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
         with patch.object(self.worker, "_runtime_client", side_effect=client):
             self.worker.start()
             self.assertTrue(self.backoff.wait(2))
-            self.assertEqual(dict(db.list_strm_metadata_queue()[0])["status"], "queued")
+            self.assertEqual(dict(strm_repo.list_strm_metadata_queue()[0])["status"], "queued")
             restored.set()
             self.worker.wake()
             self._assert_download_and_handoff()
 
     def test_startup_recovery_retries_before_claiming_or_flushing(self):
         restored = Event()
-        recover = db.recover_stale_strm_metadata_jobs
-        db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
-        db.claim_due_strm_metadata_jobs(owner="previous-process")
+        recover = strm_repo.recover_stale_strm_metadata_jobs
+        strm_repo.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
+        strm_repo.claim_due_strm_metadata_jobs(owner="previous-process")
 
         def recover_jobs(**kwargs):
             if not kwargs.get("owner") and not restored.is_set():
                 raise sqlite3.OperationalError("isolated startup recovery failure")
             return recover(**kwargs)
 
-        with patch.object(db, "recover_stale_strm_metadata_jobs", side_effect=recover_jobs), \
-             patch.object(db, "list_strm_refresh_entries", wraps=db.list_strm_refresh_entries) as read:
+        with patch.object(strm_repo, "recover_stale_strm_metadata_jobs", side_effect=recover_jobs), \
+             patch.object(strm_repo, "list_strm_refresh_entries", wraps=strm_repo.list_strm_refresh_entries) as read:
             self.worker.start()
             self.assertTrue(self.backoff.wait(2), "首次恢复失败终止了消费者")
             self.assertTrue(self.worker.status()["worker_running"])
-            self.assertEqual(dict(db.list_strm_metadata_queue()[0])["lease_owner"], "previous-process")
+            self.assertEqual(dict(strm_repo.list_strm_metadata_queue()[0])["lease_owner"], "previous-process")
             self.download.assert_not_called()
             read.assert_not_called()
             restored.set()
@@ -852,13 +853,13 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
 
     def _exit_with_storage_failure(self, *, recovery_fails):
         claimed = Event()
-        db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8), _job(file_id="other")])
-        entries = db.enqueue_strm_refresh_paths([str(self.root / "Film")], allow_emby=False)
-        recover = db.recover_stale_strm_metadata_jobs
+        strm_repo.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8), _job(file_id="other")])
+        entries = strm_repo.enqueue_strm_refresh_paths([str(self.root / "Film")], allow_emby=False)
+        recover = strm_repo.recover_stale_strm_metadata_jobs
 
         def process():
-            db.claim_due_strm_metadata_jobs(owner=self.worker._owner)
-            db.claim_due_strm_metadata_jobs(owner="other-worker")
+            strm_repo.claim_due_strm_metadata_jobs(owner=self.worker._owner)
+            strm_repo.claim_due_strm_metadata_jobs(owner="other-worker")
             claimed.set()
             if not self.worker._stop_event.wait(10):
                 raise AssertionError("测试未及时停止消费者")
@@ -870,18 +871,18 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             return recover(**kwargs)
 
         with patch.object(self.worker, "_process_one", side_effect=process), \
-             patch.object(db, "list_strm_refresh_entries", side_effect=sqlite3.OperationalError("isolated exit flush failure")), \
-             patch.object(db, "recover_stale_strm_metadata_jobs", side_effect=recover_jobs) as recovery:
+             patch.object(strm_repo, "list_strm_refresh_entries", side_effect=sqlite3.OperationalError("isolated exit flush failure")), \
+             patch.object(strm_repo, "recover_stale_strm_metadata_jobs", side_effect=recover_jobs) as recovery:
             self.worker.start()
             self.assertTrue(claimed.wait(2))
             self.assertTrue(self.worker.stop(timeout=3))
             self.assertTrue(any(call.kwargs.get("owner") == self.worker._owner for call in recovery.call_args_list))
 
-        rows = {row["file_id"]: dict(row) for row in db.list_strm_metadata_queue()}
+        rows = {row["file_id"]: dict(row) for row in strm_repo.list_strm_metadata_queue()}
         self.assertEqual(rows["meta-1"]["status"], "running" if recovery_fails else "retry_wait")
         self.assertEqual(rows["meta-1"]["attempts"], 0)
         self.assertEqual(rows["other"]["lease_owner"], "other-worker")
-        self.assertEqual(db.list_strm_refresh_entries(), entries)
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), entries)
         self.assertEqual(self.thread_errors, [])
         self._assert_lock_released()
 
@@ -892,9 +893,9 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             successor.start()
             self.assertTrue(self.handed_off.wait(7))
             self.assertTrue(successor.stop(timeout=3))
-        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
         self.assertEqual(media_refresh_queue_status()["paths"], 1)
-        self.assertEqual(db.count_strm_metadata_jobs()["running"], 0)
+        self.assertEqual(strm_repo.count_strm_metadata_jobs()["running"], 0)
         self.download.assert_not_called()
 
     def test_exit_refresh_error_still_recovers_own_lease_and_releases_lock(self):
@@ -907,9 +908,9 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
         holder = CrossProcessLock("strm-metadata-worker")
         self.assertTrue(holder.acquire(blocking=False))
         self.addCleanup(holder.release)
-        db.enqueue_strm_metadata_jobs([_job()])
-        db.claim_due_strm_metadata_jobs(owner="active-consumer")
-        entries = db.enqueue_strm_refresh_paths([str(self.root / "Film")], allow_emby=False)
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        strm_repo.claim_due_strm_metadata_jobs(owner="active-consumer")
+        entries = strm_repo.enqueue_strm_refresh_paths([str(self.root / "Film")], allow_emby=False)
         attempted = Event()
         acquire = self.worker._worker_lock.acquire
 
@@ -919,8 +920,8 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             return acquired
 
         with patch.object(self.worker._worker_lock, "acquire", side_effect=acquire_lock), \
-             patch.object(db, "recover_stale_strm_metadata_jobs", wraps=db.recover_stale_strm_metadata_jobs) as recover, \
-             patch.object(db, "list_strm_refresh_entries", wraps=db.list_strm_refresh_entries) as read:
+             patch.object(strm_repo, "recover_stale_strm_metadata_jobs", wraps=strm_repo.recover_stale_strm_metadata_jobs) as recover, \
+             patch.object(strm_repo, "list_strm_refresh_entries", wraps=strm_repo.list_strm_refresh_entries) as read:
             self.worker.start()
             self.assertTrue(attempted.wait(2))
             self.assertFalse(self.worker.status()["consumer_active"])
@@ -928,7 +929,7 @@ class StrmMetadataWorkerLifecycleTests(TestCase):
             recover.assert_not_called()
             read.assert_not_called()
 
-        self.assertEqual(db.list_strm_refresh_entries(), entries)
-        self.assertEqual(dict(db.list_strm_metadata_queue()[0])["lease_owner"], "active-consumer")
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), entries)
+        self.assertEqual(dict(strm_repo.list_strm_metadata_queue()[0])["lease_owner"], "active-consumer")
         self.assertEqual(media_refresh_queue_status()["paths"], 0)
         self.assertEqual(self.thread_errors, [])

@@ -828,14 +828,14 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
             "app.modules.telegram_notification_center.publish_notification_event",
             side_effect=lambda _key, event, **kwargs: sent.append((event, kwargs)) or True,
         ), patch(
-            "app.modules.download_tracker.db.claim_download_request_notification",
+            "app.repositories.download_requests.claim_download_request_notification",
             return_value={"token": "lease", "attempts": 0},
         ), patch.object(
             download_tracker.DownloadTracker,
             "_publish_lifecycle",
             return_value=True,
         ) as publish_lifecycle, patch(
-            "app.modules.download_tracker.db.finalize_download_request_notification",
+            "app.repositories.download_requests.finalize_download_request_notification",
         ) as finalize:
             download_tracker.DownloadTracker._notify_completion(
                 row, "completed", "", {"status": "completed"}

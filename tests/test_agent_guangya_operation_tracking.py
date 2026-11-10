@@ -8,6 +8,9 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
+from app.repositories import agent_jobs as agent_jobs_repo
 from app.agent.completion_observers import _CompletionTracker, _patrol_status
 from app.modules.organize_tasks import get_organize_operation_status
 from app.modules.organize_results import organize_status
@@ -517,7 +520,7 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
 
     def test_patrol_tracker_does_not_treat_intermediate_batch_as_terminal(self) -> None:
         with isolated_test_database():
-            admitted = db.trigger_agent_library_patrol(next_run_at="2026-09-20 01:00:00")
+            admitted = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at="2026-09-20 01:00:00")
             tracker = _CompletionTracker("library_patrol", {"run_id": admitted["run_id"], "operation": "run"})
             result = _patrol_status(tracker)
         self.assertTrue(result.ok)
@@ -992,7 +995,7 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
         database = isolated_test_database("local-scan-completion.db")
         database.__enter__()
         self.addCleanup(database.__exit__, None, None, None)
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media_repo.create_local_media_source(
             name="扫描测试来源", qb_profile="", qb_path_prefix="",
             local_root="/private/scan", owner="admin",
         )
@@ -1002,14 +1005,14 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
     def _task(self, status="completed", action="move", *, warning=""):
         self.sequence += 1
         path = f"/private/scan/{self.sequence}.mkv"
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             self.source_id, "", path, owner="admin", trigger="scan"
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task_id, status=status, warning=warning, error="private-error-token"
         )
         if action is not None:
-            db.add_local_media_task_item(
+            local_media_repo.add_local_media_task_item(
                 task_id, path, f"/private/library/{self.sequence}.mkv",
                 role="video", action=action,
             )
@@ -1051,7 +1054,7 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
                 yield conn
 
         async def worker_finishes(_seconds):
-            db.update_local_media_task(members[-1], status="completed")
+            local_media_repo.update_local_media_task(members[-1], status="completed")
             # 即使回执被后续改写，等待器也只追踪第一次解析冻结的成员。
             with db.get_conn() as conn:
                 row = conn.execute("SELECT result FROM task_runs WHERE id=?", (int(scan_ref[2:]),)).fetchone()
@@ -1098,7 +1101,7 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
                 accepted = self._accepted([member, self._task(), busy])
 
                 async def finish(_seconds):
-                    db.update_local_media_task(busy, status="completed")
+                    local_media_repo.update_local_media_task(busy, status="completed")
 
                 with patch("app.agent.effect_completion.asyncio.sleep", new=AsyncMock(side_effect=finish)) as sleep:
                     result = await self._wait(accepted)
@@ -1231,7 +1234,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
     def create_agent_job(self):
         from app.modules.library_patrol import empty_patrol_projection
 
-        row, created = db.create_agent_job(
+        row, created = agent_jobs_repo.create_agent_job(
             owner=self.scope_args["owner"], job_type="library_episode_audit",
             dedupe_key="2026-10-08:1", input_json='{"as_of":"2026-10-08","max_series":1}',
             checkpoint_json="{}",
@@ -1268,7 +1271,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.metadata["effect_waits"][self.plan_id]["last_status"], "pending")
         next_lease, _ = await self.store.begin_turn(**self.scope_args, request_id="next-question")
         await self.store.commit(next_lease, conversation=[{"role": "user", "content": "后续问题"}])
-        _, outcome = db.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        _, outcome = agent_jobs_repo.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
         self.assertEqual(outcome, "cancelled")
         await self.make_due()
         reopened = SQLiteKernelStore()
@@ -1285,16 +1288,16 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
         from app.agent.effect_completion import poll_effect_receipts
 
         job = self.create_agent_job()
-        claimed = db.claim_due_agent_job(job_type="library_episode_audit")
+        claimed = agent_jobs_repo.claim_due_agent_job(job_type="library_episode_audit")
         assert (claimed) is not None
-        _, outcome = db.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        _, outcome = agent_jobs_repo.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
         self.assertEqual(outcome, "requested")
         result = await self.handoff_agent_job(job, operation="cancel")
         self.assertEqual(result.status, "running")
         self.assertEqual(result.data["background_job"]["status"], "running")
         await self.make_due()
         self.assertEqual(await poll_effect_receipts(self.store), 0)
-        self.assertTrue(db.finalize_cancelled_agent_job(
+        self.assertTrue(agent_jobs_repo.finalize_cancelled_agent_job(
             job["job_id"], expected_lease_generation=claimed["lease_generation"],
         ))
         await self.make_due()
@@ -1303,7 +1306,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_already_terminal_agent_job_returns_final_receipt_without_handoff(self):
         job = self.create_agent_job()
-        _, outcome = db.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        _, outcome = agent_jobs_repo.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
         self.assertEqual(outcome, "cancelled")
         result = await self.handoff_agent_job(job, operation="cancel")
         self.assertTrue(result.ok)
@@ -1321,7 +1324,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(OSError):
                 await self.handoff_agent_job(job)
         poll.assert_not_awaited()
-        get_agent_job_result = db.get_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        get_agent_job_result = agent_jobs_repo.get_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
         assert get_agent_job_result is not None
         self.assertEqual(get_agent_job_result["status"], "pending")
         self.assertEqual((await self.store.load(**self.scope_args)).metadata.get("effect_waits", {}), {})
@@ -1333,7 +1336,7 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
             recovered = start_audit(owner=self.scope_args["owner"], expected_snapshot=snapshot, **arguments)
         self.assertFalse(recovered["data"]["created"])
         self.assertEqual(recovered["data"]["job_id"], job["job_id"])
-        self.assertEqual(len(db.list_agent_jobs(owner=self.scope_args["owner"])), 1)
+        self.assertEqual(len(agent_jobs_repo.list_agent_jobs(owner=self.scope_args["owner"])), 1)
 
     async def test_many_already_accepted_tasks_are_not_rejected_after_the_write(self):
         from app.agent.completion_observers import _CompletionTracker

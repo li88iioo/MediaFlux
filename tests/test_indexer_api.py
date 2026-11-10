@@ -190,12 +190,12 @@ class IndexerAPITests(unittest.TestCase):
 
         first_run._reset_startup_state_for_tests()
         self.request_lookup_patch = patch(
-            "app.indexers.downloads.db.get_download_request_by_request_key",
+            "app.repositories.download_requests.get_download_request_by_request_key",
             return_value=None,
         )
         self.request_lookup_patch.start()
         self.request_alias_lookup_patch = patch(
-            "app.indexers.downloads.db.get_download_request_by_request_keys",
+            "app.repositories.download_requests.get_download_request_by_request_keys",
             return_value=None,
         )
         self.request_alias_lookup_patch.start()
@@ -469,7 +469,7 @@ class IndexerAPITests(unittest.TestCase):
             "id": 7, "status": "completed", "qb_status": "completed", "gy_status": "failed",
         }
         item = DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:" + "a" * 40, torrent_data=None)
-        with patch("app.indexers.downloads.db.get_download_request_by_request_key", return_value=existing), patch(
+        with patch("app.repositories.download_requests.get_download_request_by_request_key", return_value=existing), patch(
             "app.indexers.downloads.create_request", return_value={"id": 8, "created": True}
         ) as create, patch("app.indexers.downloads.dispatch_request", return_value={"ok": True}) as dispatch:
             created, request_id, _result = indexer_download._persist_and_dispatch(
@@ -501,7 +501,7 @@ class IndexerAPITests(unittest.TestCase):
             torrent_data=None,
         )
         with patch(
-            "app.indexers.downloads.db.get_download_request_by_request_key",
+            "app.repositories.download_requests.get_download_request_by_request_key",
             return_value=existing,
         ), patch(
             "app.indexers.downloads.dispatch_missing_targets"
@@ -540,7 +540,7 @@ class IndexerAPITests(unittest.TestCase):
             "both": {"enabled": False, "reason": ""},
         }
         with patch(
-            "app.indexers.downloads.db.get_download_request_by_request_key",
+            "app.repositories.download_requests.get_download_request_by_request_key",
             return_value=existing,
         ), patch(
             "app.indexers.downloads.download_resubmit_capabilities",
@@ -575,7 +575,7 @@ class IndexerAPITests(unittest.TestCase):
             torrent_data=None,
         )
         with patch(
-            "app.indexers.downloads.db.get_download_request_by_request_key",
+            "app.repositories.download_requests.get_download_request_by_request_key",
             return_value=existing,
         ), patch(
             "app.indexers.downloads.create_request",
@@ -1443,7 +1443,7 @@ class IndexerAPITests(unittest.TestCase):
                     "app.indexers.downloads.normalize_download_url",
                     return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
                 ), patch(
-                    "app.indexers.downloads.db.get_download_request_by_request_key",
+                    "app.repositories.download_requests.get_download_request_by_request_key",
                     return_value=None,
                 ), patch(
                     "app.indexers.downloads.create_request",

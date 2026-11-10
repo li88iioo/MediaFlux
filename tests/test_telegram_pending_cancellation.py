@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.bot import handlers
 from tests.support import isolated_test_database
 
@@ -39,26 +40,26 @@ class TelegramPendingCancellationTests(unittest.TestCase):
             )
 
     def test_cancel_does_not_depend_on_a_second_database_commit(self):
-        request, _ = db.create_download_request(
+        request, _ = download_requests_repo.create_download_request(
             "cancel-pending", "magnet", chat_id="100", user_id="9"
         )
         with patch.object(
-            db,
+            download_requests_repo,
             "update_download_request",
             side_effect=OSError("second commit unavailable"),
         ):
             self.invoke(request)
-        get_download_request_result = db.get_download_request(request)
+        get_download_request_result = download_requests_repo.get_download_request(request)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["status"], "cancelled")
         db.init_db()
-        get_download_request_result_2 = db.get_download_request(request)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2["status"], "cancelled")
-        self.assertEqual(db.count_download_requests_requiring_attention(), 0)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
 
     def test_webpage_rejection_does_not_leave_a_submitting_orphan(self):
-        request, _ = db.create_download_request(
+        request, _ = download_requests_repo.create_download_request(
             "webpage-pending",
             "http",
             source_value="http://192.168.0.195:1258/guangya/offline",
@@ -66,17 +67,17 @@ class TelegramPendingCancellationTests(unittest.TestCase):
             user_id="9",
         )
         with patch.object(
-            db,
+            download_requests_repo,
             "update_download_request",
             side_effect=OSError("second commit unavailable"),
         ):
             self.invoke(request, "confirm")
-        row = db.get_download_request(request)
+        row = download_requests_repo.get_download_request(request)
         assert row is not None
         self.assertEqual(row["status"], "cancelled")
         self.assertIn("普通网页", row["error"])
         db.init_db()
-        get_download_request_result_3 = db.get_download_request(request)
+        get_download_request_result_3 = download_requests_repo.get_download_request(request)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["status"], "cancelled")
 
@@ -85,35 +86,35 @@ class TelegramPendingCancellationTests(unittest.TestCase):
         from concurrent.futures import ThreadPoolExecutor
 
         for index in range(8):
-            request, _ = db.create_download_request(f"cancel-race-{index}", "magnet")
+            request, _ = download_requests_repo.create_download_request(f"cancel-race-{index}", "magnet")
             gate = threading.Barrier(2)
 
             def cancel():
                 gate.wait(timeout=5)
-                return db.cancel_pending_download_request(request)
+                return download_requests_repo.cancel_pending_download_request(request)
 
             def submit():
                 gate.wait(timeout=5)
-                return db.claim_download_request(request, "qb")
+                return download_requests_repo.claim_download_request(request, "qb")
 
             with ThreadPoolExecutor(max_workers=2) as pool:
                 first, second = pool.submit(cancel), pool.submit(submit)
                 cancelled, submitted = first.result(timeout=5), second.result(timeout=5)
             self.assertNotEqual(cancelled, submitted)
-            row = db.get_download_request(request)
+            row = download_requests_repo.get_download_request(request)
             assert row is not None
             self.assertEqual(row["status"], "cancelled" if cancelled else "submitting")
             self.assertEqual(row["qb_status"], "" if cancelled else "submitting")
-            self.assertFalse(db.cancel_pending_download_request(request))
+            self.assertFalse(download_requests_repo.cancel_pending_download_request(request))
 
     def test_cancel_is_not_an_alternate_submission_target(self):
-        request, _ = db.create_download_request("reject-cancel-target", "magnet")
-        self.assertFalse(db.claim_download_request(request, "cancelled"))
-        get_download_request_result_4 = db.get_download_request(request)
+        request, _ = download_requests_repo.create_download_request("reject-cancel-target", "magnet")
+        self.assertFalse(download_requests_repo.claim_download_request(request, "cancelled"))
+        get_download_request_result_4 = download_requests_repo.get_download_request(request)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["status"], "pending")
-        self.assertTrue(db.cancel_pending_download_request(request))
-        self.assertFalse(db.claim_download_request(request, "qb"))
+        self.assertTrue(download_requests_repo.cancel_pending_download_request(request))
+        self.assertFalse(download_requests_repo.claim_download_request(request, "qb"))
 
 
 class TelegramCancellationProcessRestoreTests(unittest.TestCase):
@@ -136,12 +137,13 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.bot import handlers
 from app.repositories import download_requests as repository
 socket.socket.connect = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("network forbidden"))
 db.configure_database(sys.argv[1], test_mode=True)
 db.init_db()
-request, _ = db.create_download_request("process-cancel", "magnet", chat_id="100", user_id="9")
+request, _ = download_requests_repo.create_download_request("process-cancel", "magnet", chat_id="100", user_id="9")
 actual = db.get_conn
 @contextmanager
 def exit_after_cancel_commit():
@@ -170,20 +172,20 @@ raise AssertionError("cancel commit window not reached")
                 assert (row["completed_at"]) is not None
             archive = backup.create_backup(paths, reason="committed-cancel")
             backup.verify_backup(archive)
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request, status="failed", error="post-backup-change"
             )
             backup.restore_backup(paths, archive)
             db.init_db()
-            restored_row = db.get_download_request(request)
+            restored_row = download_requests_repo.get_download_request(request)
             assert restored_row is not None
             restored = dict(restored_row)
             self.assertEqual(restored["status"], "cancelled")
-            self.assertFalse(db.cancel_pending_download_request(request))
-            self.assertFalse(db.claim_download_request(request, "qb"))
-            self.assertEqual(db.count_download_requests_requiring_attention(), 0)
+            self.assertFalse(download_requests_repo.cancel_pending_download_request(request))
+            self.assertFalse(download_requests_repo.claim_download_request(request, "qb"))
+            self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
             db.init_db()
-            current = db.get_download_request(request)
+            current = download_requests_repo.get_download_request(request)
             assert current is not None
             self.assertEqual(dict(current), restored)
             self.assertTrue(Path(path).exists())
@@ -203,9 +205,9 @@ class LegacyPendingCancellationRecoveryTests(unittest.TestCase):
                 self.subTest(boot=boot, legacy_status=legacy_status),
                 isolated_test_database(),
             ):
-                cancelled, _ = db.create_download_request("old-cancel", "magnet")
-                ordinary, _ = db.create_download_request("ordinary-pending", "magnet")
-                unknown, _ = db.create_download_request("unknown-work", "magnet")
+                cancelled, _ = download_requests_repo.create_download_request("old-cancel", "magnet")
+                ordinary, _ = download_requests_repo.create_download_request("ordinary-pending", "magnet")
+                unknown, _ = download_requests_repo.create_download_request("unknown-work", "magnet")
                 with db.get_conn() as conn:
                     conn.execute(
                         "UPDATE download_requests SET status='submitting',targets='cancelled',created_at='2000-01-01 00:00:00',updated_at='2000-01-01 00:00:00' WHERE id IN (?,?)",
@@ -219,10 +221,10 @@ class LegacyPendingCancellationRecoveryTests(unittest.TestCase):
                         "UPDATE download_requests SET qb_status='submitting' WHERE id=?",
                         (unknown,),
                     )
-                identity_only, _ = db.create_download_request(
+                identity_only, _ = download_requests_repo.create_download_request(
                     "unknown-with-id", "magnet"
                 )
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     identity_only,
                     status="submitting",
                     targets="cancelled",
@@ -236,27 +238,27 @@ class LegacyPendingCancellationRecoveryTests(unittest.TestCase):
                 if boot:
                     db.init_db()
                 else:
-                    self.assertEqual(db.recover_stale_submitting_download_requests(), 2)
-                get_download_request_result_5 = db.get_download_request(cancelled)
+                    self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 2)
+                get_download_request_result_5 = download_requests_repo.get_download_request(cancelled)
                 assert get_download_request_result_5 is not None
                 self.assertEqual(
                     get_download_request_result_5["status"], "cancelled"
                 )
-                get_download_request_result_6 = db.get_download_request(cancelled)
+                get_download_request_result_6 = download_requests_repo.get_download_request(cancelled)
                 assert get_download_request_result_6 is not None
                 assert (get_download_request_result_6["completed_at"]) is not None
-                get_download_request_result_7 = db.get_download_request(ordinary)
+                get_download_request_result_7 = download_requests_repo.get_download_request(ordinary)
                 assert get_download_request_result_7 is not None
                 self.assertEqual(get_download_request_result_7["status"], "pending")
-                get_download_request_result_8 = db.get_download_request(unknown)
+                get_download_request_result_8 = download_requests_repo.get_download_request(unknown)
                 assert get_download_request_result_8 is not None
                 self.assertEqual(
                     get_download_request_result_8["status"], "manual_review"
                 )
-                get_download_request_result_9 = db.get_download_request(identity_only)
+                get_download_request_result_9 = download_requests_repo.get_download_request(identity_only)
                 assert get_download_request_result_9 is not None
                 self.assertEqual(
                     get_download_request_result_9["status"], "manual_review"
                 )
-                self.assertEqual(db.count_download_requests_requiring_attention(), 2)
-                self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+                self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 2)
+                self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 0)

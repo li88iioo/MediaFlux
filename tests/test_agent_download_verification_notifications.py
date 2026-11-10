@@ -12,6 +12,8 @@ from unittest.mock import patch
 from starlette.requests import Request
 
 from app import database as db, notifier
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.modules import telegram_notification_center as center
 from app.modules.agent_download_verification_notifications import (
     dump_download_verification_payload,
@@ -56,19 +58,19 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
 
     def _request(self, *, status="visible", result="visible", payload_title="The <Show>",
                  request_chat_id="100", origin="agent"):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"{self.id()}:{origin}", "magnet", title="The <Show> S02E03", origin=origin, chat_id=request_chat_id,
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="qb", status="completed", qb_status="completed",
             local_import_status="completed", strm_status="completed",
         )
-        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[{'title': 'The <Show>', 'tmdb_id': '123', 'season': 2, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f200', chat_id='100'), "queued")
-        job = db.claim_due_agent_download_verification()
+        self.assertEqual(agent_download_verification_repo.enqueue_agent_download_verification(request_id, targets=[{'title': 'The <Show>', 'tmdb_id': '123', 'season': 2, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f200', chat_id='100'), "queued")
+        job = agent_download_verification_repo.claim_due_agent_download_verification()
         assert job is not None
         serialized = dump_download_verification_payload(targets=[{'title': payload_title, 'season': 2, 'episode': 3, 'result': result}], status=status, result=result, attempts=2)
         payload = load_download_verification_payload(serialized)
-        self.assertTrue(db.finish_agent_download_verification(
+        self.assertTrue(agent_download_verification_repo.finish_agent_download_verification(
             request_id, status=payload["status"], result=payload["result"], attempts=payload["attempts"],
             next_check_at=db.now(), expected_lease_generation=job["lease_generation"], payload_json=serialized,
         targets=[{**target, "result": payload['result']} for target in job["targets"]]))
@@ -111,7 +113,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
         self.assertIn("下载入库需要处理", rendered)
         self.assertIn("无法得出可靠结论", rendered)
         self.assertNotIn("private backend error", rendered)
-        payload = load_download_verification_payload(db.list_agent_download_verification_notifications()[0]["payload_json"])
+        payload = load_download_verification_payload(agent_download_verification_repo.list_agent_download_verification_notifications()[0]["payload_json"])
         self.assertEqual(payload["targets"][0]["title"], "未命名剧集")
         self.assertEqual(payload["result"], "inconclusive")
 
@@ -124,7 +126,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
         ).ok)
 
         rendered = render_event(self._event(request_id))
-        payload = db.list_agent_download_verification_notifications()[0]["payload_json"]
+        payload = agent_download_verification_repo.list_agent_download_verification_notifications()[0]["payload_json"]
         self.assertEqual(load_download_verification_payload(payload)["targets"][0]["title"], "未命名剧集")
         self.assertNotIn("private.invalid", payload)
         self.assertNotIn("SECRET", payload)
@@ -146,7 +148,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
 
     def test_visible_library_with_partial_backend_still_notifies_overall_attention(self):
         request_id = self._request()
-        db.update_download_request(request_id, targets="both", status="manual_review",
+        download_requests_repo.update_download_request(request_id, targets="both", status="manual_review",
                                    qb_status="completed", gy_status="manual_review")
         self.assertTrue(notify_download_verification_terminal_result(
             owner="tg:v1:100\x1f200", chat_id="100", request_id=request_id,
@@ -166,7 +168,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
 
         self.assertFalse(sent.ok)
         self.sender.assert_not_called()
-        self.assertEqual(db.list_agent_download_verification_notifications()[0]["status"], "pending")
+        self.assertEqual(agent_download_verification_repo.list_agent_download_verification_notifications()[0]["status"], "pending")
 
     def test_enabled_notification_calls_sender(self):
         request_id = self._request()
@@ -199,11 +201,11 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
                 self.sender.reset_mock()
                 request_id = self._request(origin=origin, request_chat_id=request_chat)
                 if origin == "rss":
-                    db.update_download_request(request_id, notification_payload_json='{"chat_id":"999"}')
-                stored_row_2 = db.get_download_request(request_id)
+                    download_requests_repo.update_download_request(request_id, notification_payload_json='{"chat_id":"999"}')
+                stored_row_2 = download_requests_repo.get_download_request(request_id)
                 assert stored_row_2 is not None
                 request = dict(stored_row_2)
-                job = db.get_agent_download_verification(request_id)
+                job = agent_download_verification_repo.get_agent_download_verification(request_id)
 
                 sent = notify_download_verification_terminal_result(
                     owner="tg:v1:100\x1f200", chat_id="100", request_id=request_id,
@@ -212,12 +214,12 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
                 self.assertEqual(sent.error, "InvalidRoute")
                 self.sender.assert_not_called()
                 self.assertEqual(DownloadLibraryVerificationScheduler().dispatch_notification_once(), 1)
-                notification = next(item for item in db.list_agent_download_verification_notifications()
+                notification = next(item for item in agent_download_verification_repo.list_agent_download_verification_notifications()
                                     if item["request_id"] == request_id)
                 self.assertEqual(notification["status"], "discarded")
                 self.assertEqual(notification["last_error_type"], "InvalidRoute")
-                self.assertEqual(db.get_agent_download_verification(request_id), job)
-                stored_row_3 = db.get_download_request(request_id)
+                self.assertEqual(agent_download_verification_repo.get_agent_download_verification(request_id), job)
+                stored_row_3 = download_requests_repo.get_download_request(request_id)
                 assert stored_row_3 is not None
                 self.assertEqual(dict(stored_row_3), request)
 
@@ -228,7 +230,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
                 self.assertIsNone(get_notification_thread_snapshot(
                     f"download:{request_id}", topic=NotificationTopic.DOWNLOAD, chat_id="100",
                 ))
-                stored_row_4 = db.get_download_request(request_id)
+                stored_row_4 = download_requests_repo.get_download_request(request_id)
                 assert stored_row_4 is not None
                 self.assertEqual(dict(stored_row_4), request)
 
@@ -239,7 +241,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
         ).ok)
         self.assertEqual(self.sender.call_args.kwargs["chat_id"], "100")
         self.assertIn("入库复核", dict(self.sender.call_args.args[0].fields))
-        stored_row_1 = db.get_download_request(request_id)
+        stored_row_1 = download_requests_repo.get_download_request(request_id)
         assert stored_row_1 is not None
         self.assertEqual(stored_row_1["chat_id"], "")
 
@@ -299,7 +301,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
         ))
         assert row is not None
         self.assertEqual(row["status"], "outcome_unknown")
-        self.assertEqual(db.list_agent_download_verification_notifications()[0]["status"], "sent")
+        self.assertEqual(agent_download_verification_repo.list_agent_download_verification_notifications()[0]["status"], "sent")
 
     def test_notification_switch_is_accepted_by_config_api(self):
         request = SimpleNamespace(

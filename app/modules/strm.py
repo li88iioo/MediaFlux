@@ -37,6 +37,7 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import (
     DirectoryEntryLimitError,
     GuangYaClient,
@@ -697,7 +698,7 @@ def _row_snapshot(row) -> dict:
 
 
 def _restore_index_row(source_key: str, row: dict) -> None:
-    db.upsert_strm_index(
+    strm_repo.upsert_strm_index(
         source_key,
         row["file_id"],
         row["etag"],
@@ -721,7 +722,7 @@ def _rollback_index(
         if current_row:
             _restore_index_row(source_key, current_row)
         else:
-            db.delete_strm_index_ids(source_key, [new_file_id])
+            strm_repo.delete_strm_index_ids(source_key, [new_file_id])
         for row in conflicting_rows:
             _restore_index_row(source_key, row)
     except Exception as exc:
@@ -939,7 +940,7 @@ def _flush_fingerprint_backfills(
             continue
         current_items.append(item)
     if current_items:
-        db.upsert_strm_index_batch(source_key, current_items)
+        strm_repo.upsert_strm_index_batch(source_key, current_items)
 
 
 def _update_video_index_snapshot(
@@ -1012,7 +1013,7 @@ def _install_video_candidate(
         if indexed_target:
             # 已索引文件可自动修复；替换前仍复核快照，保护并发外部写入。
             target_fingerprint = _content_fingerprint(expected)
-        elif not target_owners and not db.list_strm_path_owners(str(expected)):
+        elif not target_owners and not strm_repo.list_strm_path_owners(str(expected)):
             # 首次安装和迁移共用恢复判定：全局无所有者且逐字节等于本轮
             # 签名 URL 才补索引与刷新，不能仅凭文件存在认领陌生内容。
             expected_url = build_play_url(base_url, file.file_id, file.etag, file.size, file.name)
@@ -1046,7 +1047,7 @@ def _install_video_candidate(
                 "installed_fingerprint", fingerprint
             ),
         )
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             source_key, file.file_id, file.etag, file.size, file.name, str(expected),
             state["installed_fingerprint"],
             conflicting_file_ids=tuple(row["file_id"] for row in conflicts),
@@ -1142,7 +1143,7 @@ def _install_metadata_candidate(
             _require_owned_file(expected, target_owners, "覆盖元数据")
             prepared.temp.replace(expected)
             state["installed_fingerprint"] = prepared.fingerprint
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             source_key, file.file_id, file.etag, file.size, file.name, str(expected),
             prepared.fingerprint,
             conflicting_file_ids=tuple(row["file_id"] for row in conflicts),
@@ -1208,7 +1209,7 @@ def _prepare_strm_metadata_job_with_client(
             raise RuntimeError("远端元数据快照已变化，等待下轮扫描更新队列")
     rel_dir = str(job.get("rel_dir") or "")
     expected = _metadata_target(remote, rel_dir, strm_root)
-    current = next((row for row in db.list_strm_installation_rows(
+    current = next((row for row in strm_repo.list_strm_installation_rows(
         f"guangya-meta:{job.get('source_id') or ''}", file_id, str(expected)
     ) if str(row["file_id"]) == file_id), None)
     if current and _metadata_state_matches(current, remote, expected):
@@ -1261,7 +1262,7 @@ def commit_strm_metadata_job(
     rel_dir = str(prepared_job.get("rel_dir") or job.get("rel_dir") or "")
     expected = _metadata_target(remote, rel_dir, strm_root)
     metadata_source_key = f"guangya-meta:{source_id}"
-    existing_rows = db.list_strm_installation_rows(
+    existing_rows = strm_repo.list_strm_installation_rows(
         metadata_source_key, file_id, str(expected)
     )
     current = next(
@@ -1327,7 +1328,7 @@ def _remove_indexed_item(
             deleted = _delete_owned_file(
                 indexed_path, [current], "删除失效 STRM"
             )
-        db.delete_strm_index_ids(
+        strm_repo.delete_strm_index_ids(
             source_key, [file_id], refresh_policy=refresh_policy,
             refresh_paths=[str(indexed_path)] if indexed_path and not shared_path else [],
         )
@@ -1647,7 +1648,7 @@ def _flush_failure_resolutions(
                         "_revalidation": True,
                     })
                 try:
-                    db.enqueue_strm_change_targets(changes, not_before_seconds=60.0)
+                    strm_repo.enqueue_strm_change_targets(changes, not_before_seconds=60.0)
                 except Exception as exc:
                     feedback = f"{reason}；自动重验目标登记失败，可手动重试（{type(exc).__name__}）"
                 else:
@@ -1742,9 +1743,9 @@ def _sync_strm_incremental_impl(
 
     video_key = f"guangya:{source_dir_id}"
     metadata_key = f"guangya-meta:{source_dir_id}"
-    video_by_id, video_by_path = _build_video_index_maps(db.list_strm_index(video_key))
+    video_by_id, video_by_path = _build_video_index_maps(strm_repo.list_strm_index(video_key))
     metadata_by_id, metadata_by_path = _build_video_index_maps(
-        db.list_strm_index(metadata_key)
+        strm_repo.list_strm_index(metadata_key)
     )
     upserts = [item for item in normalized.values() if item["action"] == "upsert"]
     total_work = len(normalized)
@@ -1864,7 +1865,7 @@ def _sync_strm_incremental_impl(
                     stats["metadata_skipped"] += 1
                     pending_resolutions["metadata"][file_id] = (file, rel_dir)
                 else:
-                    queued = db.enqueue_strm_metadata_jobs([
+                    queued = strm_repo.enqueue_strm_metadata_jobs([
                         _metadata_queue_payload(
                             file, rel_dir, strm_root,
                             source_id=source_dir_id,
@@ -1906,7 +1907,7 @@ def _sync_strm_incremental_impl(
                 by_id = metadata_by_id if kind == "metadata" else video_by_id
                 by_path = metadata_by_path if kind == "metadata" else video_by_path
                 if kind == "metadata":
-                    db.cancel_strm_metadata_job(
+                    strm_repo.cancel_strm_metadata_job(
                         source_dir_id, file_id,
                         reason="精准增量确认远端元数据已删除",
                     )
@@ -2025,7 +2026,7 @@ def _source_snapshot_directories(
     # 断链/非目录父节点/循环不能作为删除证据，无关孤儿不拖垮全部同步。
     resolved = {"0", source_id}
     for namespace in (f"guangya:{source_id}", f"guangya-meta:{source_id}"):
-        for row in db.list_strm_index(namespace):
+        for row in strm_repo.list_strm_index(namespace):
             file_id = str(row["file_id"])
             if file_id not in snapshot:
                 continue
@@ -2423,7 +2424,7 @@ def _sync_strm_impl(
         return stats
 
     failure_snapshots = db.get_strm_failure_resolution_snapshot(source_dir_id)
-    existing_rows = db.list_strm_index(source_key)
+    existing_rows = strm_repo.list_strm_index(source_key)
     existing_by_id, existing_by_path = _build_video_index_maps(existing_rows)
     fingerprint_backfills: list[dict[str, Any]] = []
     video_progress_total = len(video_candidates)
@@ -2595,7 +2596,7 @@ def _sync_strm_impl(
     metadata_progress_completed = 0
     if metadata:
         progress.emit("metadata", 0, metadata_progress_total, "同步元数据")
-        existing_metadata_rows = db.list_strm_index(metadata_source_key)
+        existing_metadata_rows = strm_repo.list_strm_index(metadata_source_key)
         metadata_rows_by_id: dict[str, Any] = {}
         metadata_rows_by_path: dict[str, list[sqlite3.Row | dict[str, Any]]] = {}
         for row in existing_metadata_rows:
@@ -2615,7 +2616,7 @@ def _sync_strm_impl(
                 if not queue_batch:
                     return
                 try:
-                    queued = db.enqueue_strm_metadata_jobs(queue_batch)
+                    queued = strm_repo.enqueue_strm_metadata_jobs(queue_batch)
                     failed_count = (queued.get("failed", 0) or 0)
                     stats["metadata_queue_failed"] += failed_count
                     stats["metadata_queued"] += max(0, len(queue_batch) - failed_count)
@@ -2770,7 +2771,7 @@ def _sync_strm_impl(
                 metadata_queue_cleanup_ready = True
                 if metadata:
                     try:
-                        stats["metadata_queue_cancelled"] += db.cancel_stale_strm_metadata_jobs(
+                        stats["metadata_queue_cancelled"] += strm_repo.cancel_stale_strm_metadata_jobs(
                             source_dir_id, metadata_seen_ids
                         )
                     except Exception as exc:
@@ -3487,7 +3488,7 @@ def _process_claimed_strm_failures(
                     source_key = source["source_key"]
                     maps = index_maps.get(source_key)
                     if maps is None:
-                        maps = _build_video_index_maps(db.list_strm_index(source_key))
+                        maps = _build_video_index_maps(strm_repo.list_strm_index(source_key))
                         index_maps[source_key] = maps
                     existing_by_id, existing_by_path = maps
                     current_before_install = existing_by_id.get(file.file_id)
@@ -3709,7 +3710,7 @@ def clean_retired_strm_sources(
     active_paths = {
         str(row["strm_path"] or "")
         for prefix in ("guangya:", "guangya-meta:")
-        for row in db.list_strm_index_by_prefix(prefix)
+        for row in strm_repo.list_strm_index_by_prefix(prefix)
         if str(row["source"] or "") in active_namespaces and str(row["strm_path"] or "")
     }
     result: dict[str, Any] = {
@@ -3742,7 +3743,7 @@ def clean_retired_strm_sources(
         namespaces = (f"guangya:{source_id}", f"guangya-meta:{source_id}")
         rows = []
         for namespace in namespaces:
-            rows.extend(db.list_strm_index(namespace))
+            rows.extend(strm_repo.list_strm_index(namespace))
         blocked = 0
         for row in rows:
             if should_stop and should_stop():
@@ -3753,7 +3754,7 @@ def clean_retired_strm_sources(
             file_id = str(row["file_id"] or "")
             path_text = str(row["strm_path"] or "").strip()
             if not path_text:
-                db.delete_strm_index_ids(namespace, [file_id])
+                strm_repo.delete_strm_index_ids(namespace, [file_id])
                 result["index_cleaned"] += 1
                 continue
             try:
@@ -3768,11 +3769,11 @@ def clean_retired_strm_sources(
                 result["errors"].append(f"{source_id}: 索引路径越界 {path_text}")
                 continue
             if path_text in active_paths or str(resolved) in active_paths:
-                db.delete_strm_index_ids(namespace, [file_id])
+                strm_repo.delete_strm_index_ids(namespace, [file_id])
                 result["index_cleaned"] += 1
                 continue
             if not resolved.exists():
-                db.delete_strm_index_ids(
+                strm_repo.delete_strm_index_ids(
                     namespace, [file_id], refresh_policy=retired_refresh,
                     refresh_paths=[str(resolved)],
                 )
@@ -3799,7 +3800,7 @@ def clean_retired_strm_sources(
                 result["blocked"] += 1
                 result["errors"].append(f"{source_id}: 删除失败 {exc}")
                 continue
-            db.delete_strm_index_ids(
+            strm_repo.delete_strm_index_ids(
                 namespace, [file_id], refresh_policy=retired_refresh,
                 refresh_paths=[str(resolved)],
             )
@@ -3918,7 +3919,7 @@ def clean_invalid_strm(
             "skipped": True, "removed_paths": [], "removed_dir_paths": [],
         }
 
-    rows = db.list_strm_index(source_key)
+    rows = strm_repo.list_strm_index(source_key)
     if strm_only:
         rows = [
             row for row in rows
@@ -3982,7 +3983,7 @@ def clean_invalid_strm(
         except OSError as exc:
             blocked_paths.append(path_text)
             logger.debug("清理无效 STRM 失败 type=%s", type(exc).__name__)
-    db.delete_strm_index_ids(
+    strm_repo.delete_strm_index_ids(
         source_key, removed_ids, refresh_policy=refresh_policy,
         refresh_paths=removed_paths,
     )

@@ -137,7 +137,7 @@ def test_lifecycle_matches_tail_verification_by_id_after_receipt_reordering():
     assert len(followups) == 20 and followups[:19] == (None,) * 19
     items = [{"result_id": f"capacity-resource-{pos:03}", "position": pos, "title": f"Example {pos}",
               "target": "guangya", "status": "submitted", "request_id": pos} for pos in range(20, 0, -1)]
-    with patch("app.agent.domains.library.missing_workflow_runtime.db.get_agent_download_verification",
+    with patch("app.repositories.agent_download_verification.get_agent_download_verification",
                return_value={"owner": ux.OWNER, "targets": [{**proof, "library_name": ""}]}) as get_job:
         runtime.complete_submission(owner=ux.OWNER, tool_name="resources.download",
             result=ToolResult(True, "accepted", "done", data={"items": items}), followups=followups)

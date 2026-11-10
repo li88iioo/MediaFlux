@@ -5,20 +5,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
+from app.repositories import rss as rss_repo
 from app.services import build_automation_summary
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 
 class DashboardAutomationSummaryTests(IsolatedDatabaseTestCase):
     def test_subscription_count_is_not_pending_entry_count(self):
-        enabled_id = db.add_rss_subscription(
+        enabled_id = rss_repo.add_rss_subscription(
             name="Mikan 动画", urls="https://example.invalid/rss", enabled=1
         )
-        db.add_rss_subscription(
+        rss_repo.add_rss_subscription(
             name="停用订阅", urls="https://example.invalid/disabled", enabled=0
         )
         for index in range(3):
-            db.add_rss_entry_with_media(enabled_id, f"第 {index + 1} 集", f"guid-{index}")
+            rss_repo.add_rss_entry_with_media(enabled_id, f"第 {index + 1} 集", f"guid-{index}")
 
         summary = build_automation_summary()
 
@@ -52,10 +54,10 @@ class DashboardAutomationSummaryTests(IsolatedDatabaseTestCase):
         with isolated_test_database() as database_path:
             # 生产本地状态形状是 24 完成、1 失败、1 待确认，不应冒充光鸭的 23 项。
             root = str(database_path.parent)
-            source_id = db.create_local_media_source("本地来源", "default", root, root)
+            source_id = local_media_repo.create_local_media_source("本地来源", "default", root, root)
             for index, status in enumerate(["completed"] * 24 + ["failed", "requires_manual"]):
-                task_id = db.create_local_media_task(source_id, "", f"{root}/task-{index}")
-                db.update_local_media_task(task_id, status=status)
+                task_id = local_media_repo.create_local_media_task(source_id, "", f"{root}/task-{index}")
+                local_media_repo.update_local_media_task(task_id, status=status)
             summary = build_automation_summary()
             self.assertEqual(summary["organize_issues"], 0)
             self.assertEqual(summary["issues"], 0)

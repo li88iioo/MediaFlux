@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_scan_runs import (
     UNRECORDED_LOCAL_SCAN,
     finish_local_media_scan_report,
@@ -75,11 +76,11 @@ class LocalMediaScanRunTests(IsolatedDatabaseTestCase):
             download.mkdir()
             library.mkdir()
             (download / "Demo.S01E01.mkv").write_bytes(b"test")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="Downloads", qb_profile="", qb_path_prefix="",
                 local_root=str(download), stable_seconds=0, owner="admin"
             )
-            db.upsert_local_library_target(source_id, "default", str(library), owner="admin")
+            local_media_repo.upsert_local_library_target(source_id, "default", str(library), owner="admin")
             scheduler = LocalMediaScheduler(service=Mock())
             seen = []
             scheduler.reload = lambda: seen.append(resolve_local_media_scan())

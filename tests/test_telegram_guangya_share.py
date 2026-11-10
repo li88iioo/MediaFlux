@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient
 from app.config import web_credentials
 from tests.support import IsolatedDatabaseTestCase
@@ -321,7 +322,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         ])
         tracker.reload.assert_called_once_with()
 
-        row = db.get_download_request(first["request_id"])
+        row = download_requests_repo.get_download_request(first["request_id"])
         assert (row) is not None
         self.assertRegex(str(row["request_key"]), r"^[0-9a-f]{64}$")
         self.assertEqual(row["kind"], "guangya_share")
@@ -332,7 +333,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["gy_isolated"], 1)
         self.assertEqual(row["gy_staging_parent_dir"], "dir-target")
         self.assertEqual(row["gy_staging_cleanup_status"], "pending")
-        persisted = repr(dict(row)) + repr([dict(item) for item in db.list_download_logs(source="guangya_share")])
+        persisted = repr(dict(row)) + repr([dict(item) for item in download_requests_repo.list_download_logs(source="guangya_share")])
         self.assertNotIn(SECRET_TOKEN, persisted)
         self.assertNotIn(SHARE_URL, persisted)
         self.assertNotIn(SIGNED_URL, persisted)
@@ -367,7 +368,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.client.restore_calls, [
             (SECRET_TOKEN, ["file-1"], "staging-recovered"),
         ])
-        row = db.get_download_request(result["request_id"])
+        row = download_requests_repo.get_download_request(result["request_id"])
         assert row is not None
         self.assertEqual(row["gy_target_dir"], "staging-recovered")
         self.assertEqual(row["gy_staging_name"], "MediaFlux-share-recovered")
@@ -434,7 +435,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         self.assertFalse(result["success"])
         self.assertIn("多个同名", result["error"])
         self.assertEqual(self.client.restore_calls, [])
-        row = db.get_download_request(result["request_id"])
+        row = download_requests_repo.get_download_request(result["request_id"])
         assert row is not None
         self.assertEqual(row["status"], "failed")
 
@@ -461,7 +462,7 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         key = share_request_key(
             "demo123", ["file-1"], "dir-target", "chat-100", "user-200",
         )
-        existing_id, created = db.create_share_transfer_request(
+        existing_id, created = download_requests_repo.create_share_transfer_request(
             key, title="existing", chat_id="chat-100", origin="telegram",
         )
         self.assertTrue(created)
@@ -491,10 +492,10 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
 
         self.assertFalse(result["success"])
         self.assertNotIn(SIGNED_URL, repr(result))
-        row = db.get_download_request(result["request_id"])
+        row = download_requests_repo.get_download_request(result["request_id"])
         assert row is not None
         persisted = repr(dict(row)) + repr([
-            dict(item) for item in db.list_download_logs(source="guangya_share")
+            dict(item) for item in download_requests_repo.list_download_logs(source="guangya_share")
         ])
         self.assertNotIn(SIGNED_URL, persisted)
 
@@ -591,19 +592,19 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
             )
 
         first = submit()
-        row = db.get_download_request(first["request_id"])
+        row = download_requests_repo.get_download_request(first["request_id"])
         assert row is not None
         self.assertEqual((row["status"], row["share_retry_count"]), ("failed", 0))
-        db.delete_download_logs([row["id"] for row in db.list_download_logs(source="guangya_share")])
+        download_requests_repo.delete_download_logs([row["id"] for row in download_requests_repo.list_download_logs(source="guangya_share")])
         second = submit()
         self.assertTrue(second["retried"])
         self.assertFalse(second["success"])
         self.assertEqual(second["request_id"], first["request_id"])
-        db.delete_download_logs([row["id"] for row in db.list_download_logs(source="guangya_share")])
+        download_requests_repo.delete_download_logs([row["id"] for row in download_requests_repo.list_download_logs(source="guangya_share")])
         third = submit()
         self.assertTrue(third["duplicate"])
         self.assertEqual(third["status"], "failed")
-        row = db.get_download_request(first["request_id"])
+        row = download_requests_repo.get_download_request(first["request_id"])
         assert row is not None
         self.assertEqual(row["share_retry_count"], 1)
         self.assertEqual(self.client.restore_share.call_count, 2)

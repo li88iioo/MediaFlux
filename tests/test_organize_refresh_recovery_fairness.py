@@ -7,6 +7,7 @@ import socket
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.modules import telegram_notification_center as center
 from app.modules import telegram_notification_policy as policy
 from app.modules import telegram_organize_lifecycle as lifecycle
@@ -36,7 +37,7 @@ def test_policy_blocked_unknown_send_still_persists_recovery_without_replay(tran
     route = {"chat_id": "100", "message_thread_id": 701}
     original = _parent({"delivery_route": route})
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     before = _row()
     assert before["status"] == "outcome_unknown" and not before["message_id"]
     if blocked_policy == "essential":
@@ -96,12 +97,12 @@ def test_recovery_reaches_delivered_thread_after_100_policy_blocked_unknown_send
     for index, task in enumerate(unknown_tasks):
         _parent(task=task)
         entries = _refresh_failure(task=task, paths=(f"/isolated-strm/unknown-{index}.strm",))
-        assert db.acknowledge_strm_refresh_paths(entries) == 1
+        assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
         assert _row(task)["status"] == "outcome_unknown"
     transport.send.return_value = TelegramSendResult(True, message_id=501)
     _parent(task="delivered")
     entries = _refresh_failure(task="delivered", paths=("/isolated-strm/delivered.strm",))
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert _row("delivered")["status"] == "sent"
     assert transport.send.call_count == 101
     transport.send.reset_mock()
@@ -125,7 +126,7 @@ def test_bounded_recovery_passes_persistent_blockers_and_revisits_them_after_rep
     for task in (*blocked_tasks, "delivered"):
         _parent(task=task)
         entries = _refresh_failure(task=task, paths=(f"/isolated-strm/{task}.strm",))
-        assert db.acknowledge_strm_refresh_paths(entries) == 1
+        assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     originals = {task: _row(task) for task in blocked_tasks}
     with db.get_conn() as conn:
         if blocker == "write_refused":

@@ -1798,7 +1798,7 @@ def link_download_request_to_local_media_task(
             ),
         )
         if cur.rowcount == 1:
-            db.reconcile_local_media_downloads(conn, task_id=task_id)
+            local_media_repo.reconcile_local_media_downloads(conn, task_id=task_id)
         return cur.rowcount == 1
 
 
@@ -2051,3 +2051,4 @@ def _recover_after_restart(conn, timestamp: str) -> None:
 
 # 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。
 from app import database as db  # noqa: E402
+from app.repositories import local_media as local_media_repo  # noqa: E402

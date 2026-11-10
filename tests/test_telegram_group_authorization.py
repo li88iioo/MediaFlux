@@ -242,15 +242,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 return_value=store,
             ),
             patch(
-                "app.bot.handlers.db.bind_pending_download_request_owner",
+                "app.repositories.download_requests.bind_pending_download_request_owner",
                 return_value=row,
             ),
             patch(
-                "app.bot.handlers.db.cancel_pending_download_request",
+                "app.repositories.download_requests.cancel_pending_download_request",
                 return_value=True,
             ) as claim_request,
             patch(
-                "app.bot.handlers.db.update_download_request",
+                "app.repositories.download_requests.update_download_request",
             ) as update_request,
             patch(
                 "app.bot.handlers._dispatch_download_callback",
@@ -453,7 +453,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 },
             ),
             patch(
-                "app.bot.handlers.db.bind_pending_download_request_owner",
+                "app.repositories.download_requests.bind_pending_download_request_owner",
                 return_value=persisted,
             ) as bind_owner,
         ):
@@ -511,7 +511,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             first,
             second,
             patch(
-                "app.bot.handlers.db.bind_pending_download_request_owner",
+                "app.repositories.download_requests.bind_pending_download_request_owner",
                 return_value=row,
             ) as bind_owner,
             patch("app.bot.handlers._dispatch_download_callback") as dispatch,
@@ -610,7 +610,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             }
             with (
                 patch(
-                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    "app.repositories.download_requests.bind_pending_download_request_owner",
                     return_value=row,
                 ) as bind_owner,
                 patch("app.bot.handlers.threading.Thread") as thread,
@@ -704,7 +704,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    "app.repositories.download_requests.bind_pending_download_request_owner",
                     return_value=row,
                 ),
                 patch("app.bot.handlers.threading.Thread") as thread,
@@ -771,10 +771,10 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    "app.repositories.download_requests.bind_pending_download_request_owner",
                     return_value=row,
                 ),
-                patch("app.bot.handlers.db.cancel_pending_download_request") as cancel,
+                patch("app.repositories.download_requests.cancel_pending_download_request") as cancel,
                 patch("app.bot.handlers.threading.Thread") as thread,
             ):
                 handlers._handle_write_confirmation_callback(bot, call, telebot)
@@ -841,7 +841,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    "app.repositories.download_requests.bind_pending_download_request_owner",
                     return_value=row,
                 ),
                 patch("app.bot.handlers.threading.Thread") as thread,

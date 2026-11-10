@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules.media_subscriptions import (
     MediaSubscriptionError,
     MediaSubscriptionService,
@@ -16,7 +17,7 @@ from tests.support import isolated_test_database
 class SeasonCompletenessTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.enterContext(isolated_test_database())
-        self.sid = db.add_media_subscription(
+        self.sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb", external_id="31", tmdb_id="31", media_type="tv", title="Long Show",
             monitor_mode="missing", action="auto", download_target="qb", check_interval_minutes=60,
         )
@@ -57,14 +58,14 @@ class SeasonCompletenessTests(unittest.IsolatedAsyncioTestCase):
             await MediaSubscriptionService().check_subscription(self.sid)
         self.assertEqual(error.exception.code, "season_limit_exceeded")
         self.assertEqual(self.calls, [])
-        get_media_subscription_result = db.get_media_subscription(self.sid)
+        get_media_subscription_result = media_subscriptions_repo.get_media_subscription(self.sid)
         assert get_media_subscription_result is not None
         self.assertEqual(get_media_subscription_result["status"], "error")
         self.search.assert_not_awaited()
 
     async def test_selected_seasons_allow_late_season_of_oversized_show(self):
         self.season_count = 101
-        db.update_media_subscription_config(self.sid, monitor_mode="selected", seasons_json="[99]")
+        media_subscriptions_repo.update_media_subscription_config(self.sid, monitor_mode="selected", seasons_json="[99]")
         result = (await MediaSubscriptionService().check_subscription(self.sid))["result"]
         self.assertEqual(result["expected_count"], 1)
         self.assertEqual(result["missing"][0]["season"], 99)
@@ -74,7 +75,7 @@ class SeasonCompletenessTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.modules.media_subscriptions.monotonic", Mock(side_effect=[0, 0, 61]), create=True):
             with self.assertRaises(MediaSubscriptionError) as error:
                 await MediaSubscriptionService()._expected_tv(
-                    db.get_media_subscription(self.sid), self.client.detail(), require_active_check=False,
+                    media_subscriptions_repo.get_media_subscription(self.sid), self.client.detail(), require_active_check=False,
                 )
         self.assertEqual(error.exception.code, "season_budget_exceeded")
         self.assertEqual(self.calls, [1])

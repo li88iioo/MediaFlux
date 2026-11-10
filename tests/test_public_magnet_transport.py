@@ -286,7 +286,7 @@ def test_guangya_submit_routes_from_raw_input_but_resolves_and_submits_enriched_
         patch.object(download_dispatcher, "submit_offline", side_effect=submit_with_fixture_client),
         patch.object(download_dispatcher, "_recover_guangya_magnet_torrent", return_value=None),
         patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[]),
-        patch.object(download_dispatcher.db, "bind_download_request_guangya_staging", return_value=True),
+        patch("app.repositories.download_requests.bind_download_request_guangya_staging", return_value=True),
     ):
         result = download_dispatcher._submit_guangya(row)
 

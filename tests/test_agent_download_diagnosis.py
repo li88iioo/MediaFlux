@@ -210,7 +210,7 @@ class DownloadRequestSummaryScopeTests(IsolatedDatabaseTestCase):
         self.assertFalse(empty["has_more"])
         self.assertIsNone(empty["next_offset"])
 
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests.create_download_request(
             "request-summary-local-scope", "magnet", title="测试本地下载记录"
         )
         self.assertTrue(created)
@@ -238,7 +238,7 @@ class DownloadRequestSummaryScopeTests(IsolatedDatabaseTestCase):
                 download_requests.list_download_request_summaries(**arguments)
 
     def test_recent_pagination_returns_actual_request_ids_without_omissions(self):
-        ids = [db.create_download_request(f"summary-page-{i}", "magnet")[0] for i in range(3)]
+        ids = [download_requests.create_download_request(f"summary-page-{i}", "magnet")[0] for i in range(3)]
         first = download_requests.list_download_request_summaries(scope="recent", limit=2)
         second = download_requests.list_download_request_summaries(
             scope="recent", limit=2, offset=first["next_offset"],
@@ -261,16 +261,16 @@ class DownloadRequestSummaryScopeTests(IsolatedDatabaseTestCase):
             ("cancelled", "cancelled", "submitted"),
             ("notifying", "completed", "completed"),
         ):
-            request_id, _ = db.create_download_request(f"summary-{key}", "magnet")
+            request_id, _ = download_requests.create_download_request(f"summary-{key}", "magnet")
             ids[key] = request_id
-            db.update_download_request(request_id, status=state, targets="qb", qb_status=backend,
+            download_requests.update_download_request(request_id, status=state, targets="qb", qb_status=backend,
                                        notification_delivery_status="sent")
-        db.clear_download_request_attentions([ids["cleared"]])
-        db.update_download_request(ids["notifying"], notification_delivery_status="pending")
+        download_requests.clear_download_request_attentions([ids["cleared"]])
+        download_requests.update_download_request(ids["notifying"], notification_delivery_status="pending")
         def snapshot():
             rows = []
             for value in ids.values():
-                row = db.get_download_request(value)
+                row = download_requests.get_download_request(value)
                 assert row is not None
                 rows.append(dict(row))
             return rows
@@ -283,9 +283,9 @@ class DownloadRequestSummaryScopeTests(IsolatedDatabaseTestCase):
                          [ids["running"], ids["unknown"], ids["notifying"]])
         self.assertEqual({item["request_number"] for item in attention["items"]},
                          {ids["failed"], ids["unknown"]})
-        self.assertEqual([row["id"] for row in db.list_active_download_requests()],
+        self.assertEqual([row["id"] for row in download_requests.list_active_download_requests()],
                          [item["request_number"] for item in active["items"]])
-        self.assertEqual([row["id"] for row in db.list_download_requests_requiring_attention()],
+        self.assertEqual([row["id"] for row in download_requests.list_download_requests_requiring_attention()],
                          [item["request_number"] for item in attention["items"]])
         first = download_requests.list_download_request_summaries(limit=2)
         second = download_requests.list_download_request_summaries(offset=first["next_offset"], limit=2)
@@ -300,11 +300,11 @@ class DownloadRequestSummaryScopeTests(IsolatedDatabaseTestCase):
         self.assertEqual(snapshot(), before)
 
     def test_summary_preserves_unknown_and_partial_facts_without_private_values(self):
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests.create_download_request(
             "summary-private", "magnet", title="magnet:?xt=private-source",
             source_value="https://private.invalid/file?token=SECRET",
         )
-        db.update_download_request(request_id, targets="both", status="manual_review",
+        download_requests.update_download_request(request_id, targets="both", status="manual_review",
                                    qb_status="completed", gy_status="outcome_unknown",
                                    error="guangya: token=SECRET", organize_status="partial",
                                    organize_error="整理部分完成，仍有文件需要处理",

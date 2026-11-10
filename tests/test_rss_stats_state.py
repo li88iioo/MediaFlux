@@ -9,6 +9,7 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
 from tests.support import seed_rss_entry_state
@@ -30,11 +31,11 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         return match.group(1)
 
     def _seed(self) -> tuple[int, list[int]]:
-        active = db.add_rss_subscription("active", "https://example.invalid/a", refresh_interval_minutes=10)
-        db.add_rss_subscription("disabled", "https://example.invalid/b", enabled=0, refresh_interval_minutes=10)
-        db.add_rss_subscription("manual", "https://example.invalid/c", refresh_interval_minutes=0)
+        active = rss_repo.add_rss_subscription("active", "https://example.invalid/a", refresh_interval_minutes=10)
+        rss_repo.add_rss_subscription("disabled", "https://example.invalid/b", enabled=0, refresh_interval_minutes=10)
+        rss_repo.add_rss_subscription("manual", "https://example.invalid/c", refresh_interval_minutes=0)
         entry_ids = [
-            db.add_rss_entry_with_media(active, f"entry-{index}", f"guid-{index}")["id"]
+            rss_repo.add_rss_entry_with_media(active, f"entry-{index}", f"guid-{index}")["id"]
             for index in range(5)
         ]
         for entry_id, status in zip(entry_ids, ["pending", "failed", "skipped", "submitting", "downloaded"]):
@@ -45,7 +46,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         self.assertFalse(hasattr(db, "add_rss_entry"))
 
     def test_paginated_entries_cover_all_matches_and_empty_page_keeps_total(self):
-        sid = db.add_rss_subscription("paged", "https://example.invalid/feed")
+        sid = rss_repo.add_rss_subscription("paged", "https://example.invalid/feed")
         with db.get_conn() as conn:
             conn.executemany(
                 "INSERT INTO rss_entries(rss_item_id,title,guid,status,processed,payload,created_at) "
@@ -54,7 +55,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             )
         ids = []
         for offset in (0, 100, 200, 300, 400):
-            page = db.list_rss_entries(sub_id=sid, status="pending", keyword="match", limit=100, offset=offset, order="unprocessed_first")
+            page = rss_repo.list_rss_entries(sub_id=sid, status="pending", keyword="match", limit=100, offset=offset, order="unprocessed_first")
             self.assertEqual(page.total, 301)
             self.assertEqual(page.offset, offset)
             self.assertEqual(page.limit, 100)
@@ -62,7 +63,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             ids.extend(row["id"] for row in page.items)
         self.assertEqual(len(set(ids)), 301)
         self.assertEqual(len(ids), 301)
-        empty = db.list_rss_entries(sub_id=sid, keyword="absent", limit=100, offset=100)
+        empty = rss_repo.list_rss_entries(sub_id=sid, keyword="absent", limit=100, offset=100)
         self.assertEqual((empty.items, empty.total), ([], 0))
 
     def test_paged_route_reports_total_and_validates_page_bounds(self):
@@ -103,15 +104,15 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             conn.set_trace_callback(trace)
             return conn
         with patch.object(db, "_connect", side_effect=traced_connect):
-            page = db.list_rss_entries(limit=100)
+            page = rss_repo.list_rss_entries(limit=100)
         self.assertTrue(inserted)
         self.assertEqual(page.total, 5)
         self.assertEqual(len(page.items), 5)
 
     def test_duplicate_guid_insert_is_atomic_and_returns_none(self) -> None:
-        sid = db.add_rss_subscription("dedupe", "https://example.invalid/dedupe")
-        first = db.add_rss_entry_with_media(sid, "first", "same-guid")["id"]
-        second = db.add_rss_entry_with_media(sid, "second", "same-guid")["id"]
+        sid = rss_repo.add_rss_subscription("dedupe", "https://example.invalid/dedupe")
+        first = rss_repo.add_rss_entry_with_media(sid, "first", "same-guid")["id"]
+        second = rss_repo.add_rss_entry_with_media(sid, "second", "same-guid")["id"]
 
         assert isinstance(first, int)
         self.assertIsNone(second)
@@ -128,39 +129,39 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         self.assertIn("idx_rss_entries_item_status_id", indexes)
 
     def test_rss_entries_sort_by_published_time_with_stable_fallback(self) -> None:
-        sid = db.add_rss_subscription("sorted", "https://example.invalid/sorted")
-        newest = db.add_rss_entry_with_media(sid, "newest", "newest", pub_date="2026-08-15 12:00")["id"]
-        oldest = db.add_rss_entry_with_media(sid, "oldest", "oldest", pub_date="2026-08-13 12:00")["id"]
-        middle = db.add_rss_entry_with_media(sid, "middle", "middle", pub_date="2026-08-14 12:00")["id"]
-        unknown = db.add_rss_entry_with_media(sid, "unknown", "unknown", pub_date="not-a-date")["id"]
+        sid = rss_repo.add_rss_subscription("sorted", "https://example.invalid/sorted")
+        newest = rss_repo.add_rss_entry_with_media(sid, "newest", "newest", pub_date="2026-08-15 12:00")["id"]
+        oldest = rss_repo.add_rss_entry_with_media(sid, "oldest", "oldest", pub_date="2026-08-13 12:00")["id"]
+        middle = rss_repo.add_rss_entry_with_media(sid, "middle", "middle", pub_date="2026-08-14 12:00")["id"]
+        unknown = rss_repo.add_rss_entry_with_media(sid, "unknown", "unknown", pub_date="not-a-date")["id"]
 
-        rows = db.list_rss_entries(sub_id=sid).items
+        rows = rss_repo.list_rss_entries(sub_id=sid).items
 
         self.assertEqual(
             [int(row["id"]) for row in rows],
             [int(newest), int(middle), int(oldest), int(unknown)],
         )
-        received = db.list_rss_entries(sub_id=sid, order="received_desc").items
+        received = rss_repo.list_rss_entries(sub_id=sid, order="received_desc").items
         self.assertEqual(int(received[0]["id"]), int(unknown))
 
     def test_unprocessed_sort_precedes_limit_and_preserves_filters(self) -> None:
-        sid = db.add_rss_subscription("priority", "https://example.invalid/priority")
-        pending = db.add_rss_entry_with_media(sid, "keep pending", "old", pub_date="2020-01-01 12:00")["id"]
-        failed = db.add_rss_entry_with_media(sid, "keep failed", "failed", pub_date="2021-01-01 12:00")["id"]
+        sid = rss_repo.add_rss_subscription("priority", "https://example.invalid/priority")
+        pending = rss_repo.add_rss_entry_with_media(sid, "keep pending", "old", pub_date="2020-01-01 12:00")["id"]
+        failed = rss_repo.add_rss_entry_with_media(sid, "keep failed", "failed", pub_date="2021-01-01 12:00")["id"]
         seed_rss_entry_state(failed, "failed")
         for i in range(305):
-            processed = db.add_rss_entry_with_media(sid, f"keep processed {i}", f"new-{i}", pub_date="2026-10-04 12:00")["id"]
+            processed = rss_repo.add_rss_entry_with_media(sid, f"keep processed {i}", f"new-{i}", pub_date="2026-10-04 12:00")["id"]
             seed_rss_entry_state(processed, "downloaded")
         for _ in range(2):
-            rows = db.list_rss_entries(sub_id=sid, keyword="keep", order="unprocessed_first", limit=300).items
+            rows = rss_repo.list_rss_entries(sub_id=sid, keyword="keep", order="unprocessed_first", limit=300).items
             self.assertEqual([row["id"] for row in rows[:2]], [failed, pending])
             self.assertEqual(len(rows), 300)
-        filtered = db.list_rss_entries(sub_id=sid, status="pending", keyword="pending", order="unprocessed_first").items
+        filtered = rss_repo.list_rss_entries(sub_id=sid, status="pending", keyword="pending", order="unprocessed_first").items
         self.assertEqual([row["id"] for row in filtered], [pending])
-        self.assertNotIn(pending, [row["id"] for row in db.list_rss_entries(sub_id=sid, limit=300).items])
+        self.assertNotIn(pending, [row["id"] for row in rss_repo.list_rss_entries(sub_id=sid, limit=300).items])
 
     def test_repeated_entry_reads_do_not_scan_or_write_legacy_history(self) -> None:
-        sid = db.add_rss_subscription(
+        sid = rss_repo.add_rss_subscription(
             "legacy-read-trace", "https://example.invalid/legacy-read-trace"
         )
         timestamp = db.now()
@@ -193,7 +194,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
 
         with patch.object(db, "_connect", side_effect=traced_connect):
             for _ in range(10):
-                rows = db.list_rss_entries(limit=300).items
+                rows = rss_repo.list_rss_entries(limit=300).items
                 self.assertEqual(len(rows), 300)
 
         queries = [statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]
@@ -207,18 +208,18 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                              for statement in statements))
 
     def test_generic_retry_snapshot_and_claim_match_backend_and_safe_codes(self) -> None:
-        qb_sub = db.add_rss_subscription(
+        qb_sub = rss_repo.add_rss_subscription(
             "retry-qb", "https://example.invalid/retry-qb", download_method="qb",
             qb_save_path="/downloads/qb",
         )
-        gy_sub = db.add_rss_subscription(
+        gy_sub = rss_repo.add_rss_subscription(
             "retry-gy", "https://example.invalid/retry-gy", download_method="guangya",
             gy_target_dir="target-gy", gy_target_dir_name="动漫",
         )
 
         def failed(sub_id: int, title: str, code: str, retryable: bool = True) -> int:
-            entry_id = int(db.add_rss_entry_with_media(sub_id, title, title)["id"])
-            db.record_rss_entry_failure(entry_id, code, retryable)
+            entry_id = int(rss_repo.add_rss_entry_with_media(sub_id, title, title)["id"])
+            rss_repo.record_rss_entry_failure(entry_id, code, retryable)
             return entry_id
 
         qb_entry = failed(qb_sub, "qb-safe", "qb_unavailable")
@@ -227,27 +228,27 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         failed(qb_sub, "gy-code-on-qb", "guangya_unavailable")
         failed(qb_sub, "ordinary-qb-rejection", "qb_rejected")
 
-        snapshot = db.get_retryable_failed_rss_snapshot(default_method="qb", limit=21)
+        snapshot = rss_repo.get_retryable_failed_rss_snapshot(default_method="qb", limit=21)
         by_id = {int(row["id"]): row for row in snapshot}
         self.assertEqual(set(by_id), {qb_entry, gy_entry})
         self.assertEqual(by_id[gy_entry]["gy_target_dir"], "target-gy")
         self.assertEqual(by_id[gy_entry]["gy_target_dir_name"], "动漫")
-        self.assertEqual(len(db.claim_retryable_failed_rss_entries(snapshot)), 2)
-        get_rss_entry_result = db.get_rss_entry(qb_entry)
+        self.assertEqual(len(rss_repo.claim_retryable_failed_rss_entries(snapshot)), 2)
+        get_rss_entry_result = rss_repo.get_rss_entry(qb_entry)
         assert get_rss_entry_result is not None
         self.assertEqual(get_rss_entry_result["retry_count"], 1)
-        get_rss_entry_result_2 = db.get_rss_entry(gy_entry)
+        get_rss_entry_result_2 = rss_repo.get_rss_entry(gy_entry)
         assert get_rss_entry_result_2 is not None
         self.assertEqual(get_rss_entry_result_2["retry_count"], 1)
 
     def test_manual_failed_claim_obeys_backend_attempts_and_rate_cooldown(self) -> None:
-        gy_sub = db.add_rss_subscription(
+        gy_sub = rss_repo.add_rss_subscription(
             "manual-gy", "https://example.invalid/manual-gy", download_method="guangya"
         )
 
         def failed(title: str, code: str, retry_count: int = 0) -> int:
-            entry_id = int(db.add_rss_entry_with_media(gy_sub, title, title)["id"])
-            db.record_rss_entry_failure(entry_id, code, True)
+            entry_id = int(rss_repo.add_rss_entry_with_media(gy_sub, title, title)["id"])
+            rss_repo.record_rss_entry_failure(entry_id, code, True)
             if retry_count:
                 with db.get_conn() as conn:
                     conn.execute(
@@ -260,51 +261,51 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         capped = failed("capped", "guangya_unavailable", 5)
         mismatched = failed("mismatched", "qb_unavailable")
         ordinary = failed("ordinary", "guangya_submit_failed")
-        pending = int(db.add_rss_entry_with_media(gy_sub, "pending", "pending")["id"])
+        pending = int(rss_repo.add_rss_entry_with_media(gy_sub, "pending", "pending")["id"])
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE rss_entries SET retry_count=5 WHERE id=?", (pending,)
             )
 
-        self.assertFalse(db.claim_rss_entry(cooling))
-        self.assertFalse(db.claim_rss_entry(capped))
-        self.assertFalse(db.claim_rss_entry(mismatched))
-        self.assertFalse(db.claim_rss_entry(ordinary))
-        self.assertTrue(db.claim_rss_entry(pending))
+        self.assertFalse(rss_repo.claim_rss_entry(cooling))
+        self.assertFalse(rss_repo.claim_rss_entry(capped))
+        self.assertFalse(rss_repo.claim_rss_entry(mismatched))
+        self.assertFalse(rss_repo.claim_rss_entry(ordinary))
+        self.assertTrue(rss_repo.claim_rss_entry(pending))
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE rss_entries SET failed_at=datetime('now','localtime','-61 seconds') WHERE id=?",
                 (cooling,),
             )
-        self.assertTrue(db.claim_rss_entry(cooling))
-        get_rss_entry_result_3 = db.get_rss_entry(cooling)
+        self.assertTrue(rss_repo.claim_rss_entry(cooling))
+        get_rss_entry_result_3 = rss_repo.get_rss_entry(cooling)
         assert get_rss_entry_result_3 is not None
         self.assertEqual(get_rss_entry_result_3["retry_count"], 1)
 
     def test_exhausted_retries_remain_in_manual_review_until_explicitly_resolved(self) -> None:
-        sid = db.add_rss_subscription("exhausted", "https://example.invalid/exhausted", download_method="qb")
+        sid = rss_repo.add_rss_subscription("exhausted", "https://example.invalid/exhausted", download_method="qb")
         for retry_count in (4, 5, 6):
             with self.subTest(retry_count=retry_count):
-                eid = int(db.add_rss_entry_with_media(sid, str(retry_count), str(retry_count))["id"])
-                db.record_rss_entry_failure(eid, "qb_unavailable", True)
+                eid = int(rss_repo.add_rss_entry_with_media(sid, str(retry_count), str(retry_count))["id"])
+                rss_repo.record_rss_entry_failure(eid, "qb_unavailable", True)
                 with db.get_conn() as conn:
                     conn.execute("UPDATE rss_entries SET retry_count=? WHERE id=?", (retry_count, eid))
-                summary = db.get_rss_manual_review_summary(sid)
+                summary = rss_repo.get_rss_manual_review_summary(sid)
                 self.assertEqual(summary, {
                     "outcome_unknown_count": 0, "failed_count": int(retry_count >= 5),
                 })
-                retry_ids = {row["id"] for row in db.get_retryable_failed_rss_snapshot(default_method="qb")}
+                retry_ids = {row["id"] for row in rss_repo.get_retryable_failed_rss_snapshot(default_method="qb")}
                 self.assertEqual(eid in retry_ids, retry_count < 5)
                 # 显式跳过/重开仍可用；自动重试上限不应封死人工恢复入口。
-                self.assertEqual(db.update_rss_entries_processed([eid], True), 1)
-                self.assertEqual(db.get_rss_manual_review_summary(sid)["failed_count"], 0)
-                self.assertEqual(db.update_rss_entries_processed([eid], False), 1)
-                self.assertTrue(db.claim_rss_entry(eid))
-                self.assertEqual(db.get_rss_manual_review_summary(sid)["failed_count"], 0)
+                self.assertEqual(rss_repo.update_rss_entries_processed([eid], True), 1)
+                self.assertEqual(rss_repo.get_rss_manual_review_summary(sid)["failed_count"], 0)
+                self.assertEqual(rss_repo.update_rss_entries_processed([eid], False), 1)
+                self.assertTrue(rss_repo.claim_rss_entry(eid))
+                self.assertEqual(rss_repo.get_rss_manual_review_summary(sid)["failed_count"], 0)
 
     def test_rss_stats_counts_global_active_and_pending_entries(self) -> None:
         self._seed()
-        self.assertEqual(db.get_rss_stats(), {
+        self.assertEqual(rss_repo.get_rss_stats(), {
             "subscription_total": 3,
             "active_subscriptions": 1,
             "entry_total": 5,
@@ -324,20 +325,20 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
 
     def test_subscription_update_cannot_override_url_target(self):
         from app.routes import rss_api
-        selected = db.add_rss_subscription("selected", "https://example.invalid/selected")
-        other = db.add_rss_subscription("other", "https://example.invalid/other")
+        selected = rss_repo.add_rss_subscription("selected", "https://example.invalid/selected")
+        other = rss_repo.add_rss_subscription("other", "https://example.invalid/other")
         with patch.object(rss_api, "require_api_login"), patch("app.modules.rss_subscriptions.wake_rss_scheduler"):
             result = rss_api.update_sub(selected, Request({"type": "http"}), {"subscription_id": other, "name": "wrong"})
         self.assertEqual(result.status_code, 400)
-        selected_row = db.get_rss_subscription(selected)
-        other_row = db.get_rss_subscription(other)
+        selected_row = rss_repo.get_rss_subscription(selected)
+        other_row = rss_repo.get_rss_subscription(other)
         assert selected_row is not None and other_row is not None
         self.assertEqual(selected_row["name"], "selected")
         self.assertEqual(other_row["name"], "other")
 
     def test_subscription_api_does_not_report_unknown_write_as_success(self):
         from app.routes import rss_api
-        sid = db.add_rss_subscription("existing", "https://example.invalid/existing")
+        sid = rss_repo.add_rss_subscription("existing", "https://example.invalid/existing")
         unknown = {"ok": False, "status": "outcome_unknown", "summary": "写入结果无法核验", "error": "先查询状态，不要重复提交", "data": {"subscription_id": sid}}
         with patch.object(rss_api, "require_api_login"), patch.object(rss_api, "apply_change", return_value=unknown):
             for operation in (
@@ -368,7 +369,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                         })
                         self.assertEqual(created.status_code, 200, created.text)
                         sid = created.json()["id"]
-                        get_rss_subscription_result = db.get_rss_subscription(sid)
+                        get_rss_subscription_result = rss_repo.get_rss_subscription(sid)
                         assert get_rss_subscription_result is not None
                         self.assertEqual(get_rss_subscription_result["refresh_interval_minutes"], initial)
                         changed = client.put(f"/api/rss/subscriptions/{sid}", headers=headers,
@@ -377,14 +378,14 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                         saved = next(row for row in client.get("/api/rss/subscriptions").json() if row["id"] == sid)
                         self.assertEqual(saved["refresh_interval_minutes"], updated)
                         base = datetime(2026, 10, 14, 8, tzinfo=timezone(timedelta(hours=8)))
-                        db.update_rss_subscription(sid, {"last_refreshed_at": base.strftime("%Y-%m-%d %H:%M:%S")})
+                        rss_repo.update_rss_subscription(sid, {"last_refreshed_at": base.strftime("%Y-%m-%d %H:%M:%S")})
                         due = base + timedelta(minutes=updated)
                         before = (due - timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
-                        self.assertNotIn(sid, [row["id"] for row in db.list_due_rss_subscriptions(before)])
-                        self.assertIn(sid, [row["id"] for row in db.list_due_rss_subscriptions(due.strftime("%Y-%m-%d %H:%M:%S"))])
+                        self.assertNotIn(sid, [row["id"] for row in rss_repo.list_due_rss_subscriptions(before)])
+                        self.assertIn(sid, [row["id"] for row in rss_repo.list_due_rss_subscriptions(due.strftime("%Y-%m-%d %H:%M:%S"))])
 
     def test_subscription_enabled_api_directly_pauses_and_resumes_scheduled_refresh(self) -> None:
-        subscription_id = db.add_rss_subscription(
+        subscription_id = rss_repo.add_rss_subscription(
             "toggle", "https://example.invalid/toggle", refresh_interval_minutes=10
         )
 
@@ -404,12 +405,12 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                     headers=headers,
                 )
                 self.assertEqual(paused.status_code, 200, paused.text)
-                get_rss_subscription_result_2 = db.get_rss_subscription(subscription_id)
+                get_rss_subscription_result_2 = rss_repo.get_rss_subscription(subscription_id)
                 assert get_rss_subscription_result_2 is not None
                 self.assertEqual(int(get_rss_subscription_result_2["enabled"]), 0)
                 self.assertNotIn(
                     subscription_id,
-                    [int(row["id"]) for row in db.list_due_rss_subscriptions("2099-01-01 00:00:00")],
+                    [int(row["id"]) for row in rss_repo.list_due_rss_subscriptions("2099-01-01 00:00:00")],
                 )
 
                 resumed = client.put(
@@ -418,12 +419,12 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                     headers=headers,
                 )
                 self.assertEqual(resumed.status_code, 200, resumed.text)
-                get_rss_subscription_result_3 = db.get_rss_subscription(subscription_id)
+                get_rss_subscription_result_3 = rss_repo.get_rss_subscription(subscription_id)
                 assert get_rss_subscription_result_3 is not None
                 self.assertEqual(int(get_rss_subscription_result_3["enabled"]), 1)
                 self.assertIn(
                     subscription_id,
-                    [int(row["id"]) for row in db.list_due_rss_subscriptions("2099-01-01 00:00:00")],
+                    [int(row["id"]) for row in rss_repo.list_due_rss_subscriptions("2099-01-01 00:00:00")],
                 )
                 self.assertEqual(wake_scheduler.call_count, 2)
 
@@ -516,20 +517,20 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                 self.assertEqual(empty_create.status_code, 200, empty_create.text)
                 interval_id = int(empty_create.json()["id"])
 
-        get_rss_subscription_result_4 = db.get_rss_subscription(legacy_id)
+        get_rss_subscription_result_4 = rss_repo.get_rss_subscription(legacy_id)
         assert get_rss_subscription_result_4 is not None
         self.assertEqual(get_rss_subscription_result_4["name"], "legacy-renamed")
-        get_rss_subscription_result_5 = db.get_rss_subscription(legacy_id)
+        get_rss_subscription_result_5 = rss_repo.get_rss_subscription(legacy_id)
         assert get_rss_subscription_result_5 is not None
         self.assertEqual(get_rss_subscription_result_5["refresh_cron"], "0 4 * * *")
         self.assertIn(
             interval_id,
-            [int(row["id"]) for row in db.list_due_rss_subscriptions("2099-01-01 00:00:00")],
+            [int(row["id"]) for row in rss_repo.list_due_rss_subscriptions("2099-01-01 00:00:00")],
         )
 
     def test_bulk_processed_updates_preserve_inflight_and_downloaded_states(self) -> None:
         _active, entry_ids = self._seed()
-        self.assertEqual(db.update_rss_entries_processed(entry_ids, True), 3)
+        self.assertEqual(rss_repo.update_rss_entries_processed(entry_ids, True), 3)
         with db.get_conn() as conn:
             states = {
                 int(row["id"]): (str(row["status"]), int(row["processed"] or 0))
@@ -543,7 +544,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             ("submitting", 0), ("downloaded", 1),
         ])
 
-        self.assertEqual(db.update_rss_entries_processed(entry_ids, False), 3)
+        self.assertEqual(rss_repo.update_rss_entries_processed(entry_ids, False), 3)
         with db.get_conn() as conn:
             states = {
                 int(row["id"]): (str(row["status"]), int(row["processed"] or 0), row["processed_at"])

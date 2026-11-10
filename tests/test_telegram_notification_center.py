@@ -15,6 +15,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.modules import telegram_notification_center as notification_center
 from app.modules.telegram_notification_center import (
     deserialize_notification_event,
@@ -1371,11 +1374,11 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
             build_download_lifecycle_event,
         )
 
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "tg-qb-path-mapping-failure", "magnet", title="测试剧", chat_id="100",
         )
         reason = "qB 完成路径未匹配任何已启用的本地媒体来源"
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -1383,7 +1386,7 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
             local_import_error=reason,
         )
 
-        event = build_download_lifecycle_event(db.get_download_request(request_id))
+        event = build_download_lifecycle_event(download_requests_repo.get_download_request(request_id))
 
         self.assertEqual(event.title, "⚠️ 下载入库部分完成")
         self.assertIn(("下载", "qB 完成"), event.fields)
@@ -1402,9 +1405,9 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         )
         for index, (fields, title, state) in enumerate(cases):
             with self.subTest(fields=fields):
-                request_id, _ = db.create_download_request(f"tg-archive-evidence-{index}", "magnet", title="任务", chat_id="100")
-                db.update_download_request(request_id, **fields)
-                event = build_download_lifecycle_event(db.get_download_request(request_id), probe_progress={})
+                request_id, _ = download_requests_repo.create_download_request(f"tg-archive-evidence-{index}", "magnet", title="任务", chat_id="100")
+                download_requests_repo.update_download_request(request_id, **fields)
+                event = build_download_lifecycle_event(download_requests_repo.get_download_request(request_id), probe_progress={})
                 self.assertEqual(event.title, title)
                 self.assertEqual(event.state, state)
 
@@ -1414,7 +1417,7 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         )
 
         task_id = 2**53 + 1
-        with patch.object(db, "get_local_media_task", return_value=None) as lookup:
+        with patch.object(local_media_repo, "get_local_media_task", return_value=None) as lookup:
             event = build_download_lifecycle_event({
                 "id": 0, "status": "completed", "local_import_status": "completed",
                 "local_import_target": f"local-media-task:{task_id}",
@@ -1425,8 +1428,8 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
     def test_manual_attention_keeps_action_priority_when_probe_fails(self) -> None:
         from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 
-        request_id, _ = db.create_download_request("tg-probe-attention", "magnet", title="任务", chat_id="100")
-        db.update_download_request(request_id, status="completed", qb_status="completed", local_import_status="requires_manual")
+        request_id, _ = download_requests_repo.create_download_request("tg-probe-attention", "magnet", title="任务", chat_id="100")
+        download_requests_repo.update_download_request(request_id, status="completed", qb_status="completed", local_import_status="requires_manual")
         with patch("app.modules.telegram_download_lifecycle._load_probe_progress", return_value={"total": 1, "failed": 1}), patch(
             "app.modules.telegram_download_lifecycle.publish_notification_thread"
         ) as publish:
@@ -1439,11 +1442,11 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
             build_download_lifecycle_event,
         )
 
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "tg-skipped-local-import", "magnet", title="测试剧", chat_id="100",
         )
         reason = "未命中可整理的本地媒体内容"
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -1451,7 +1454,7 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
             local_import_error=reason,
         )
 
-        event = build_download_lifecycle_event(db.get_download_request(request_id))
+        event = build_download_lifecycle_event(download_requests_repo.get_download_request(request_id))
 
         self.assertEqual(event.title, "✅ 下载完成（自动入库已跳过）")
         self.assertIn(("下载", "qB 完成"), event.fields)
@@ -1466,10 +1469,10 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
 
         sender.return_value = TelegramSendResult(ok=True, message_id=99)
         editor.return_value = TelegramSendResult(ok=True, message_id=99)
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "tg-lifecycle", "magnet", title="测试剧", chat_id="100", origin="agent",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="qb", status="completed", qb_status="completed",
             organize_status="running", strm_status="pending",
         )
@@ -1479,13 +1482,13 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
                 "season": 1, "episode": 3,
             }],
         })
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, organize_status="completed", strm_status="completed",
         )
-        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[{'title': '测试剧', 'tmdb_id': '123', 'season': 1, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f456', chat_id='100'), "queued")
-        job = db.claim_due_agent_download_verification()
+        self.assertEqual(agent_download_verification_repo.enqueue_agent_download_verification(request_id, targets=[{'title': '测试剧', 'tmdb_id': '123', 'season': 1, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f456', chat_id='100'), "queued")
+        job = agent_download_verification_repo.claim_due_agent_download_verification()
         assert job is not None
-        self.assertTrue(db.finish_agent_download_verification(
+        self.assertTrue(agent_download_verification_repo.finish_agent_download_verification(
             request_id, status="visible", result="visible", attempts=1, next_check_at=db.now(),
             expected_lease_generation=job["lease_generation"],
             payload_json=dump_download_verification_payload(targets=[{'title': '测试剧', 'season': 1, 'episode': 3, 'result': 'visible'}], status='visible', result='visible', attempts=1), targets=[{**target, "result": 'visible'} for target in job["targets"]]))
@@ -1531,10 +1534,10 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
             ))
 
     def _request(self, key: str) -> int:
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             key, "magnet", title="测试剧 S01E03", chat_id="100", origin="agent",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, targets="qb", status="completed", qb_status="completed",
             local_import_status="completed", strm_status="completed",
             notification_event_status="completed", notification_delivery_status="retry_wait",
@@ -1546,7 +1549,7 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
         from app.agent.models import ToolResult
         from app.modules.agent_download_verification_scheduler import DownloadLibraryVerificationScheduler
 
-        self.assertEqual(db.enqueue_agent_download_verification(request_id, targets=[{'title': '测试剧', 'tmdb_id': '123', 'season': 1, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f456', chat_id='100'), "queued")
+        self.assertEqual(agent_download_verification_repo.enqueue_agent_download_verification(request_id, targets=[{'title': '测试剧', 'tmdb_id': '123', 'season': 1, 'episode': 3, 'as_of': '2026-10-26'}], owner='tg:v1:100\x1f456', chat_id='100'), "queued")
         current = datetime.now() + timedelta(seconds=1)
         result = ToolResult(True, "up_to_date" if visible else "updates_available", "isolated audit", data={
             "missing_count": 0 if visible else 1,
@@ -1561,10 +1564,10 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(scheduler.run_once(), 1)
         current += timedelta(seconds=31)
         self.assertEqual(scheduler.run_once(), 1)
-        row = db.get_agent_download_verification(request_id)
+        row = agent_download_verification_repo.get_agent_download_verification(request_id)
         assert row is not None
         self.assertEqual(row["status"], "visible" if visible else "attention")
-        queued = db.list_agent_download_verification_notifications()
+        queued = agent_download_verification_repo.list_agent_download_verification_notifications()
         self.assertEqual(queued[-1]["status"], "sent")
 
     def _snapshot(self, request_id: int):
@@ -1615,10 +1618,10 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
                 retried = self._snapshot(request_id)
                 self.assertEqual(retried.event.state, expected_state)
                 self.assertEqual(dict(retried.event.fields).get("入库复核"), expected_result)
-                row = db.get_download_request(request_id)
+                row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["notification_delivery_status"], "sent")
-                durable = db.get_agent_download_verification(request_id)
+                durable = agent_download_verification_repo.get_agent_download_verification(request_id)
                 assert durable is not None
                 self.assertEqual(durable["status"], "visible" if visible else "attention")
 
@@ -1631,7 +1634,7 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
 
         request_id = self._request("r07-new-generation")
         self._verify(request_id, visible=False)
-        old = db.get_agent_download_verification(request_id)
+        old = agent_download_verification_repo.get_agent_download_verification(request_id)
         assert old is not None
         old_generation = old["lease_generation"]
         self.assertEqual(self._snapshot(request_id).event.state, "attention")
@@ -1652,7 +1655,7 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
                 self.assertEqual(waiting.state, "processing")
                 self.assertEqual(dict(waiting.fields)["入库复核"], "等待复核重试")
 
-                job = db.claim_due_agent_download_verification()
+                job = agent_download_verification_repo.claim_due_agent_download_verification()
                 assert job is not None
                 self.assertGreater(job["lease_generation"], old_generation)
                 old_generation = job["lease_generation"]
@@ -1660,7 +1663,7 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
                 running = self._snapshot(request_id).event
                 self.assertEqual(running.state, "processing")
                 self.assertEqual(dict(running.fields)["入库复核"], "复核中")
-                self.assertTrue(db.finish_agent_download_verification(
+                self.assertTrue(agent_download_verification_repo.finish_agent_download_verification(
                     request_id, status=status, result=result, attempts=2, next_check_at=db.now(),
                     expected_lease_generation=job["lease_generation"],
                     payload_json=dump_download_verification_payload(targets=[{'title': '测试剧', 'season': 1, 'episode': 3, 'result': result}], status=status, result=result, attempts=2), targets=[{**target, "result": result} for target in job["targets"]]))
@@ -1691,7 +1694,7 @@ class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(completed.event.state, "completed")
         self.assertEqual(completed.event.title, "✅ 下载与入库完成")
         self.assertNotIn("入库复核", dict(completed.event.fields))
-        db.update_download_request(request_id, local_import_status="", strm_status="")
+        download_requests_repo.update_download_request(request_id, local_import_status="", strm_status="")
         self.assertTrue(publish_download_lifecycle(request_id).delivered)
         downloaded = self._snapshot(request_id)
         self.assertEqual(downloaded.event.state, "downloaded")

@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.modules import rss_scheduler as module
 from tests.support import isolated_test_database
 
@@ -41,7 +42,7 @@ class RSSSchedulerFairnessAuditTests(unittest.TestCase):
             "error_code": "all_sources_failed",
         }
         self.ids = [
-            db.add_rss_subscription(
+            rss_repo.add_rss_subscription(
                 f"feed-{index}",
                 f"https://feed{index}.invalid/rss",
                 refresh_interval_minutes=10,
@@ -66,7 +67,7 @@ class RSSSchedulerFairnessAuditTests(unittest.TestCase):
         self.assertEqual(set(observed), set(self.ids))
         self.assertEqual(observed[:10], self.ids)
         self.assertTrue(
-            all(not assert_present(db.get_rss_subscription(i))["last_refreshed_at"] for i in self.ids)
+            all(not assert_present(rss_repo.get_rss_subscription(i))["last_refreshed_at"] for i in self.ids)
         )
 
     def test_new_scheduler_resumes_after_persisted_last_admission(self):
@@ -101,7 +102,7 @@ class RSSSchedulerFairnessAuditTests(unittest.TestCase):
         scheduler = module.RSSScheduler()
         scheduler.run_due()
         self.drain()
-        db.delete_rss_subscription(self.ids[3])
+        rss_repo.delete_rss_subscription(self.ids[3])
         scheduler.run_due()
         self.assertEqual(self.drain(), self.ids[4:8])
         for raw in ("not-an-integer", "-20", "999999999999999999"):

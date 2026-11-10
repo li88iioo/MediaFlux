@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app import sdk
 from tests.support import IsolatedDatabaseTestCase
 
@@ -52,7 +53,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "not_configured")
         self.assertEqual(result["data"]["subscriptions"]["total"], 0)
-        db.add_rss_subscription(
+        rss_repo.add_rss_subscription(
             name="disabled", urls="https://example.invalid/private", enabled=0
         )
         result = self._diagnose()
@@ -60,38 +61,38 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["data"]["subscriptions"]["disabled"], 1)
 
     def test_counts_schedule_backlog_stale_failed_and_inconsistent_states(self):
-        scheduled = db.add_rss_subscription(
+        scheduled = rss_repo.add_rss_subscription(
             name="scheduled",
             urls="https://example.invalid/a",
             enabled=1,
             refresh_interval_minutes=30,
         )
-        db.add_rss_subscription(
+        rss_repo.add_rss_subscription(
             name="disabled", urls="https://example.invalid/b", enabled=0
         )
-        manual = db.add_rss_subscription(
+        manual = rss_repo.add_rss_subscription(
             name="manual",
             urls="https://example.invalid/c",
             enabled=1,
             refresh_cron="0 4 * * *",
             refresh_interval_minutes=0,
         )
-        invalid_refresh = db.add_rss_subscription(
+        invalid_refresh = rss_repo.add_rss_subscription(
             name="invalid-refresh",
             urls="https://example.invalid/d",
             enabled=1,
             refresh_interval_minutes=30,
         )
-        db.update_rss_subscription(invalid_refresh, {"last_refreshed_at": "not-a-time"})
-        pending_old = db.add_rss_entry_with_media(scheduled, "old", "g-old")["id"]
-        pending_recent = db.add_rss_entry_with_media(scheduled, "recent", "g-recent")["id"]
-        submitting_old = db.add_rss_entry_with_media(scheduled, "sub-old", "g-sub-old")["id"]
-        submitting_recent = db.add_rss_entry_with_media(scheduled, "sub-recent", "g-sub-recent")["id"]
-        failed = db.add_rss_entry_with_media(manual, "failed", "g-failed")["id"]
-        downloaded = db.add_rss_entry_with_media(manual, "downloaded", "g-downloaded")["id"]
-        skipped = db.add_rss_entry_with_media(manual, "skipped", "g-skipped")["id"]
-        inconsistent = db.add_rss_entry_with_media(manual, "bad", "g-bad")["id"]
-        null_status = db.add_rss_entry_with_media(invalid_refresh, "null-status", "g-null-status")["id"]
+        rss_repo.update_rss_subscription(invalid_refresh, {"last_refreshed_at": "not-a-time"})
+        pending_old = rss_repo.add_rss_entry_with_media(scheduled, "old", "g-old")["id"]
+        pending_recent = rss_repo.add_rss_entry_with_media(scheduled, "recent", "g-recent")["id"]
+        submitting_old = rss_repo.add_rss_entry_with_media(scheduled, "sub-old", "g-sub-old")["id"]
+        submitting_recent = rss_repo.add_rss_entry_with_media(scheduled, "sub-recent", "g-sub-recent")["id"]
+        failed = rss_repo.add_rss_entry_with_media(manual, "failed", "g-failed")["id"]
+        downloaded = rss_repo.add_rss_entry_with_media(manual, "downloaded", "g-downloaded")["id"]
+        skipped = rss_repo.add_rss_entry_with_media(manual, "skipped", "g-skipped")["id"]
+        inconsistent = rss_repo.add_rss_entry_with_media(manual, "bad", "g-bad")["id"]
+        null_status = rss_repo.add_rss_entry_with_media(invalid_refresh, "null-status", "g-null-status")["id"]
         assert all(
 
                 item is not None
@@ -172,14 +173,14 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         )
         self.assertIn(
             invalid_refresh,
-            {row["id"] for row in db.list_due_rss_subscriptions(_SNAPSHOT)},
+            {row["id"] for row in rss_repo.list_due_rss_subscriptions(_SNAPSHOT)},
         )
 
     def test_nullable_enabled_subscription_is_consistently_disabled(self):
-        sub_id = db.add_rss_subscription(
+        sub_id = rss_repo.add_rss_subscription(
             name="nullable-enabled", urls="https://example.invalid/nullable", enabled=1
         )
-        entry_id = db.add_rss_entry_with_media(sub_id, "failed", "nullable-guid")["id"]
+        entry_id = rss_repo.add_rss_entry_with_media(sub_id, "failed", "nullable-guid")["id"]
         assert entry_id is not None
         _set_entry(entry_id, status="failed")
         with db.get_conn() as conn:
@@ -198,7 +199,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
             "RSS_PATH_SECRET",
             "RSS_TITLE_SECRET",
         ]
-        sub_id = db.add_rss_subscription(
+        sub_id = rss_repo.add_rss_subscription(
             name="RSS_TITLE_SECRET",
             urls="https://tracker.invalid/rss?passkey=RSS_PASSKEY_9f",
             enabled=1,
@@ -206,7 +207,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
             gy_target_dir="C:\\RSS_PATH_SECRET",
             gy_target_dir_name="RSS_PATH_SECRET",
         )
-        entry_id = db.add_rss_entry_with_media(
+        entry_id = rss_repo.add_rss_entry_with_media(
             sub_id,
             "RSS_TITLE_SECRET magnet:?xt=urn:btih:RSS_PAYLOAD_SECRET",
             "RSS_GUID_SECRET",
@@ -237,10 +238,10 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
 
     def test_attention_projection_is_bounded_and_marks_truncation(self):
         for index in range(25):
-            sub_id = db.add_rss_subscription(
+            sub_id = rss_repo.add_rss_subscription(
                 name=f"sub-{index}", urls=f"https://example.invalid/{index}", enabled=1
             )
-            entry_id = db.add_rss_entry_with_media(sub_id, f"failed-{index}", f"guid-{index}")["id"]
+            entry_id = rss_repo.add_rss_entry_with_media(sub_id, f"failed-{index}", f"guid-{index}")["id"]
             assert entry_id is not None
             _set_entry(entry_id, status="failed")
         result = self._diagnose()
@@ -249,7 +250,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["data"]["attention"]["truncated"])
 
     def test_database_exception_is_fixed_and_sanitized(self):
-        with patch("app.modules.rss_subscriptions.db.get_rss_diagnostic_summary") as mocked:
+        with patch("app.repositories.rss.get_rss_diagnostic_summary") as mocked:
             mocked.side_effect = RuntimeError("RSS_PASSKEY_9f /srv/RSS_PATH_SECRET")
             result = self._diagnose()
         self.assertFalse(result["ok"])

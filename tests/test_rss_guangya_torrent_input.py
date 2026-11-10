@@ -10,7 +10,8 @@ import unittest
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.modules import offline
 from app.modules.download_dispatcher import parse_torrent_metadata
 from app.modules.rss import RSSEngine
@@ -135,14 +136,14 @@ class RssGuangyaTorrentInputTests(RssTorrentFixture):
         self.assertNotIn("fixture-secret", client.selection_calls[0]["url"])
 
     def test_real_rss_dispatch_keeps_http_identity_but_submits_torrent_contents(self):
-        sub = db.add_rss_subscription(
+        sub = rss_repo.add_rss_subscription(
             name="RSS BT",
             urls="https://feed.invalid/rss",
             download_method="guangya",
             gy_target_dir="rss-target",
             gy_target_dir_name="RSS目标",
         )
-        entry = db.add_rss_entry_with_media(
+        entry = rss_repo.add_rss_entry_with_media(
             sub,
             "Movie Episode 1",
             "rss-guid",
@@ -154,7 +155,7 @@ class RssGuangyaTorrentInputTests(RssTorrentFixture):
             factory.normalize_offline_files = normalize
             result = RSSEngine().download(entry)
         self.assertTrue(result["ok"], result)
-        row = db.get_download_request(result["request_id"])
+        row = download_requests_repo.get_download_request(result["request_id"])
         assert row is not None
         self.assertEqual(row["kind"], "http")
         self.assertEqual(row["source_value"], TORRENT_URL)
@@ -259,10 +260,10 @@ class RssGuangyaTorrentInputTests(RssTorrentFixture):
             normalize_download_url(TORRENT_URL), "", "", origin="rss:old"
         )
         request_id = int(row["id"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="failed", gy_status="failed", error="HTTP 协议已禁用"
         )
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         self.assertTrue(download_resubmit_capabilities(row)["guangya"]["enabled"])
         client = self.client()
         normalize = offline.GuangYaClient.normalize_offline_files

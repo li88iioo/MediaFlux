@@ -19,11 +19,12 @@ warnings.filterwarnings(
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from tests.support import IsolatedDatabaseTestCase
 
 
 def _insert_index(source: str, path: Path) -> int:
-    db.upsert_strm_index(
+    strm_repo.upsert_strm_index(
         source,
         f"file-{uuid.uuid4().hex}",
         "etag",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules.backup import create_backup, recover_pending_restore, restore_backup
 from app.repositories import media_refresh_queue as queue
 from app.runtime_paths import RuntimePaths
@@ -27,14 +28,14 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
             paths.ensure_writable_dirs()
             self.assertEqual(paths.database_path, database_path)
             paths.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
-            sid = db.add_media_subscription(
+            sid = media_subscriptions_repo.add_media_subscription(
                 provider="tmdb",
                 external_id="1",
                 tmdb_id="1",
                 media_type="tv",
                 title="Synthetic restored show",
             )
-            old_run = db.claim_media_subscription_check_run(
+            old_run = media_subscriptions_repo.claim_media_subscription_check_run(
                 sid, trigger_type="scheduler"
             )
             with db.get_conn() as conn:
@@ -54,7 +55,7 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
             archive = create_backup(paths)
 
             # 模拟备份后停用/清空；恢复必须以归档快照为准，而不是当前连接缓存。
-            db.delete_media_subscription(sid)
+            media_subscriptions_repo.delete_media_subscription(sid)
             queue.clear_media_refresh_queue()
             paths.env_file.write_text("WEB_PORT=9999\n", encoding="utf-8")
             restore_backup(paths, archive)
@@ -64,25 +65,25 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
                 paths.env_file.read_text(encoding="utf-8"), "WEB_PORT=1258\n"
             )
             self.assertFalse(recover_pending_restore(paths))
-            get_media_subscription_result = db.get_media_subscription(sid)
+            get_media_subscription_result = media_subscriptions_repo.get_media_subscription(sid)
             assert get_media_subscription_result is not None
             self.assertEqual(
                 get_media_subscription_result["title"], "Synthetic restored show"
             )
-            get_media_subscription_result_2 = db.get_media_subscription(sid)
+            get_media_subscription_result_2 = media_subscriptions_repo.get_media_subscription(sid)
             assert get_media_subscription_result_2 is not None
             self.assertTrue(get_media_subscription_result_2["enabled"])
 
-            self.assertEqual(db.recover_stale_media_subscription_checks(), 1)
-            self.assertEqual(db.recover_stale_media_subscription_checks(), 0)
-            runs = db.list_media_subscription_runs(subscription_id=sid)
+            self.assertEqual(media_subscriptions_repo.recover_stale_media_subscription_checks(), 1)
+            self.assertEqual(media_subscriptions_repo.recover_stale_media_subscription_checks(), 0)
+            runs = media_subscriptions_repo.list_media_subscription_runs(subscription_id=sid)
             self.assertEqual(
                 [(row["id"], row["status"]) for row in runs], [(old_run, "failed")]
             )
-            new_run = db.claim_media_subscription_check_run(sid, trigger_type="retry")
+            new_run = media_subscriptions_repo.claim_media_subscription_check_run(sid, trigger_type="retry")
             self.assertNotEqual(new_run, old_run)
-            self.assertFalse(db.media_subscription_check_is_active(sid, run_id=old_run))
-            self.assertTrue(db.media_subscription_check_is_active(sid, run_id=new_run))
+            self.assertFalse(media_subscriptions_repo.media_subscription_check_is_active(sid, run_id=old_run))
+            self.assertTrue(media_subscriptions_repo.media_subscription_check_is_active(sid, run_id=new_run))
 
             self.assertEqual(queue.recover_media_refresh_leases(now_epoch=102), 1)
             self.assertEqual(queue.recover_media_refresh_leases(now_epoch=102), 0)
@@ -121,6 +122,6 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
                 ("series-1",),
             )
             self.assertEqual(
-                len(db.list_media_subscription_runs(subscription_id=sid)), 2
+                len(media_subscriptions_repo.list_media_subscription_runs(subscription_id=sid)), 2
             )
-            self.assertTrue(db.media_subscription_check_is_active(sid, run_id=new_run))
+            self.assertTrue(media_subscriptions_repo.media_subscription_check_is_active(sid, run_id=new_run))

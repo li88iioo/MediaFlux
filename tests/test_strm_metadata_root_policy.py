@@ -12,6 +12,9 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
+from app.repositories import strm_request_ownership as strm_request_ownership_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.modules import strm
 from app.modules.strm_metadata_worker import STRMMetadataWorker
@@ -42,8 +45,8 @@ def runtime(tmp_path):
             "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
             return_value={"Jellyfin": "pending"},
         ))
-        request, _ = db.create_download_request("metadata-root-policy", "magnet")
-        owners = db.current_strm_request_owners([request])
+        request, _ = download_requests_repo.create_download_request("metadata-root-policy", "magnet")
+        owners = strm_request_ownership_repo.current_strm_request_owners([request])
         yield tmp_path, remote, client, worker, settings, handoff, owners
 
 
@@ -72,16 +75,16 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
         allow_emby=allow_emby, request_owners=owners,
     )
     assert scan(client, old_root, policy)["metadata_queued"] == 1
-    queued = dict(db.list_strm_metadata_queue()[0])
+    queued = dict(strm_repo.list_strm_metadata_queue()[0])
     settings["STRM_ROOT"] = str(new_root)
     assert worker._process_one()
     assert target(old_root).is_file(), "旧任务必须在冻结旧根落盘，禁用刷新也不能丢掉根"
     assert target(old_root).read_bytes() == b"metadata"
     assert not target(new_root).exists()
-    completed = dict(db.list_strm_metadata_queue()[0])
+    completed = dict(strm_repo.list_strm_metadata_queue()[0])
     assert completed["status"] == "completed"
     assert completed["refresh_policy_json"] == queued["refresh_policy_json"]
-    old_events = db.list_strm_refresh_entries()
+    old_events = strm_repo.list_strm_refresh_entries()
     assert {e["path"] for e in old_events} == ({str(target(old_root).parent)} if enabled else set())
     assert all(e["allow_emby"] == allow_emby for e in old_events)
 
@@ -89,14 +92,14 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
     latest_policy = replace(policy, media_root=str(new_root / strm.STRM_SUBDIR))
     stats = scan(client, new_root, latest_policy)
     assert stats["metadata_queued"] == 1, stats
-    latest = dict(db.list_strm_metadata_queue()[0])
+    latest = dict(strm_repo.list_strm_metadata_queue()[0])
     assert latest["revision"] == queued["revision"] + 1
     assert json.loads(latest["refresh_policy_json"])["request_owners"] == owners
-    assert db.list_strm_refresh_entries() == old_events
+    assert strm_repo.list_strm_refresh_entries() == old_events
     assert worker._process_one()
     assert target(new_root).read_bytes() == b"metadata"
-    assert db.list_strm_index("guangya-meta:source")[0]["strm_path"] == str(target(new_root))
-    entries = db.list_strm_refresh_entries()
+    assert strm_repo.list_strm_index("guangya-meta:source")[0]["strm_path"] == str(target(new_root))
+    entries = strm_repo.list_strm_refresh_entries()
     paths = {str(target(root).parent) for root in (old_root, new_root)} if enabled else set()
     assert {e["path"] for e in entries} == paths
     assert all(e["allow_emby"] == allow_emby for e in entries)
@@ -106,7 +109,7 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
         assert {key: row[key] for key in owners[0]} == owners[0]
     # 随后的已同步 full 不重置事件令牌、扩大 provider 或丢弃请求归属。
     assert scan(client, new_root, latest_policy)["metadata_skipped"] == 1
-    assert db.list_strm_refresh_entries() == entries
+    assert strm_repo.list_strm_refresh_entries() == entries
     handoff.reset_mock()
     handoff.return_value = {"Jellyfin": "queued"}
     worker._flush_media_refresh(force=True)
@@ -114,7 +117,7 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
         handoff.assert_called_once_with(sorted(paths), immediate=True, allow_emby=allow_emby)
     else:
         handoff.assert_not_called()
-    assert db.list_strm_refresh_entries() == []
+    assert strm_repo.list_strm_refresh_entries() == []
     assert refresh_work() == []
 
 
@@ -125,18 +128,18 @@ def test_legacy_empty_media_root_uses_current_root_and_keeps_owner_scope(runtime
         refresh_policy=StrmRefreshPolicy(allow_emby=False, request_owners=owners),
     )
     assert payload["refresh_policy"]["media_root"] == ""
-    db.enqueue_strm_metadata_jobs([payload])
+    strm_repo.enqueue_strm_metadata_jobs([payload])
     settings["STRM_ROOT"] = str(base / "B")
     assert worker._process_one()
     assert not target(base / "A").exists()
     assert target(base / "B").read_bytes() == b"metadata"
-    assert dict(db.list_strm_metadata_queue()[0])["status"] == "completed"
-    entries = db.list_strm_refresh_entries()
+    assert dict(strm_repo.list_strm_metadata_queue()[0])["status"] == "completed"
+    entries = strm_repo.list_strm_refresh_entries()
     assert [(e["path"], e["allow_emby"]) for e in entries] == [(str(target(base / "B")), False)]
     assert refresh_work()[0]["request_id"] == owners[0]["request_id"]
     policy = StrmRefreshPolicy(media_root=str(base / "B" / strm.STRM_SUBDIR))
     assert scan(client, base / "B", policy)["metadata_skipped"] == 1
-    assert db.list_strm_refresh_entries() == entries
+    assert strm_repo.list_strm_refresh_entries() == entries
 
 
 def test_new_revision_during_download_fences_old_root_and_freezes_successor(runtime):
@@ -157,25 +160,25 @@ def test_new_revision_during_download_fences_old_root_and_freezes_successor(runt
 
     with patch("app.modules.strm_metadata_worker.prepare_strm_metadata_job", side_effect=supersede_after_download):
         assert worker._process_one()
-    row = dict(db.list_strm_metadata_queue()[0])
+    row = dict(strm_repo.list_strm_metadata_queue()[0])
     assert row["status"] == "queued" and row["revision"] == 2
     assert not list(base.rglob("*.nfo"))
     assert not list(base.rglob("*.part"))
-    assert db.list_strm_refresh_entries() == []
+    assert strm_repo.list_strm_refresh_entries() == []
     settings["STRM_ROOT"] = str(base / "C")
     assert worker._process_one()
     assert target(base / "B").is_file(), "新 revision 同样必须使用自己的冻结根，不随再次改配置漂移"
     assert not target(base / "C").exists()
-    entries = db.list_strm_refresh_entries()
+    entries = strm_repo.list_strm_refresh_entries()
     assert [(e["path"], e["allow_emby"]) for e in entries] == [(str(target(base / "B").parent), True)]
     assert refresh_work()[0]["request_id"] == owners[0]["request_id"]
     current_policy = replace(new_policy, media_root=str(base / "C" / strm.STRM_SUBDIR))
     assert scan(client, base / "C", current_policy)["metadata_queued"] == 1
-    assert db.list_strm_refresh_entries() == entries
+    assert strm_repo.list_strm_refresh_entries() == entries
     assert worker._process_one()
     assert target(base / "C").read_bytes() == b"metadata"
     paths = {str(target(base / root).parent) for root in ("B", "C")}
-    assert {entry["path"] for entry in db.list_strm_refresh_entries()} == paths
+    assert {entry["path"] for entry in strm_repo.list_strm_refresh_entries()} == paths
     assert {row["work_key"] for row in refresh_work()} == {refresh_work_key(path, True) for path in paths}
 
 
@@ -186,16 +189,16 @@ def test_mismatched_refresh_root_cannot_ack_completed_and_silently_drop_outbox(r
         allow_emby=False, request_owners=owners,
     )
     scan(client, base / "A", policy)
-    claimed = db.claim_due_strm_metadata_jobs(owner="root-policy-test")[0]
+    claimed = strm_repo.claim_due_strm_metadata_jobs(owner="root-policy-test")[0]
     options = {
         "expected_owner": claimed["lease_owner"],
         "expected_lease_generation": claimed["lease_generation"],
         "expected_revision": claimed["revision"],
     }
     with pytest.raises(ValueError, match="刷新"):
-        db.settle_strm_metadata_job(claimed["id"], refresh_paths=[str(target(base / "B"))], **options)
-    assert dict(db.list_strm_metadata_queue()[0])["status"] == "running"
-    assert db.list_strm_refresh_entries() == []
-    assert db.settle_strm_metadata_job(claimed["id"], refresh_paths=[str(target(base / "A"))], **options) == "completed"
-    assert db.list_strm_refresh_entries()[0]["allow_emby"] is False
+        strm_repo.settle_strm_metadata_job(claimed["id"], refresh_paths=[str(target(base / "B"))], **options)
+    assert dict(strm_repo.list_strm_metadata_queue()[0])["status"] == "running"
+    assert strm_repo.list_strm_refresh_entries() == []
+    assert strm_repo.settle_strm_metadata_job(claimed["id"], refresh_paths=[str(target(base / "A"))], **options) == "completed"
+    assert strm_repo.list_strm_refresh_entries()[0]["allow_emby"] is False
     assert refresh_work()[0]["request_id"] == owners[0]["request_id"]

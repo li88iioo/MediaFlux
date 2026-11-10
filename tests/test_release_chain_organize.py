@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_history as organize_history_repo
+from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules.organize_correction import OrganizeCorrectionService
@@ -337,7 +339,7 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
         cloud = MemoryCloud("rename")
         worker = OrganizeProbeWorker()
         worker._client = cast(GuangYaClient, cloud)
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="Archive", rules={}
         )
         with (
@@ -369,7 +371,7 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
         cloud = MemoryCloud("rename", unreadable=True)
         worker = OrganizeProbeWorker()
         worker._client = cast(GuangYaClient, cloud)
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="Archive", rules={}
         )
         with (
@@ -411,10 +413,10 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
         cloud.files["video"].name = "Archive-1080p.mkv"
         worker = OrganizeProbeWorker()
         worker._client = cast(GuangYaClient, cloud)
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="Archive", rules={}
         )
-        db.add_organize_operation_step(
+        organize_history_repo.add_organize_operation_step(
             log_id,
             f"probe:{job_id}:interrupted-test",
             1,
@@ -438,10 +440,10 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
     def test_probe_committed_rename_only_finishes_interrupted_step(self):
         log_id = self._log()
         worker = OrganizeProbeWorker()
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="Archive", rules={}
         )
-        step_id = db.add_organize_operation_step(
+        step_id = organize_history_repo.add_organize_operation_step(
             log_id,
             f"probe:{job_id}:committed-test",
             1,
@@ -461,7 +463,7 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
         ):
             worker._recover_unfinished_rename({"id": job_id, "organize_log_id": log_id})
         steps = {
-            row["id"]: row["status"] for row in db.list_organize_operation_steps(log_id)
+            row["id"]: row["status"] for row in organize_history_repo.list_organize_operation_steps(log_id)
         }
         self.assertEqual(steps[step_id], "success")
 
@@ -473,10 +475,10 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
         cloud.files["video"].name = "Archive-1080p.mkv"
         worker = OrganizeProbeWorker()
         worker._client = cast(GuangYaClient, cloud)
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="Archive", rules={}
         )
-        pending_id = db.add_organize_operation_step(
+        pending_id = organize_history_repo.add_organize_operation_step(
             log_id,
             f"probe:{job_id}:old-intent",
             1,
@@ -489,7 +491,7 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
             status="interrupted",
         )
         for index in range(1010):
-            db.add_organize_operation_step(
+            organize_history_repo.add_organize_operation_step(
                 log_id, "later-audit", index + 1, "audit_note", status="success"
             )
         self._due(job_id)
@@ -602,7 +604,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
 
         log_id, cloud, service = self._fixture()
         self.assertTrue(db.update_organize_log(log_id, confirmation_actor="agent"))
-        before = db.capture_organize_business_snapshot(log_id)
+        before = organize_history_repo.capture_organize_business_snapshot(log_id)
         self.assertEqual(list_manual_episode_confirmations("1"), [])
         service.reorganize(
             log_id,
@@ -638,7 +640,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         self.assertIn("S02E03", cloud.files["video"].name)
         self.assertEqual(row["original_name"], "First.S01E07.mkv")
         service.revert_latest(log_id, "undo-human-correction", service.detail(log_id)["version"])
-        self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(organize_history_repo.capture_organize_business_snapshot(log_id), before)
         self.assertEqual(service.detail(log_id)["confirmation_actor"], "agent")
         self.assertEqual(list_manual_episode_confirmations("1"), [])
 
@@ -668,7 +670,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             log_id, "first-confirmation", service.detail(log_id)["version"],
             "1", "tv", season=1, episode=8,
         )
-        before = db.capture_organize_business_snapshot(log_id)
+        before = organize_history_repo.capture_organize_business_snapshot(log_id)
         archived = replace(cloud.files["video"])
         learning_before = [dict(row) for row in list_manual_episode_confirmations("1")]
         self.assertEqual(len(learning_before), 1)
@@ -688,10 +690,10 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             (changed_learning[0]["log_id"], changed_learning[0]["season"], changed_learning[0]["episode"]),
             (log_id, 2, 3),
         )
-        steps = [dict(row) for row in db.list_organize_operation_steps(log_id)]
+        steps = [dict(row) for row in organize_history_repo.list_organize_operation_steps(log_id)]
         self.assertTrue(any(step["state_before_json"] for step in steps))
         service.revert_latest(log_id, "undo", service.detail(log_id)["version"])
-        self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(organize_history_repo.capture_organize_business_snapshot(log_id), before)
         self.assertEqual(cloud.files["video"], archived)
         self.assertEqual(
             [dict(row) for row in list_manual_episode_confirmations("1")], learning_before,
@@ -715,7 +717,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         self.assertEqual(cloud.files["video"], archived)
         detail = service.detail(log_id)
         self.assertEqual((detail["status"], detail["confirmation_actor"]), ("reverted", "human"))
-        self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(organize_history_repo.capture_organize_business_snapshot(log_id), before)
         self.assertEqual(
             [dict(row) for row in list_manual_episode_confirmations("1")], learning_before,
         )
@@ -782,7 +784,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         learning_before = [dict(row) for row in list_manual_episode_confirmations("2")]
         self.assertEqual(len(learning_before), 1)
         with patch.object(
-            db,
+            organize_history_repo,
             "restore_organize_business_snapshot",
             side_effect=sqlite3.OperationalError("isolated commit failure"),
         ):
@@ -829,7 +831,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
                 }
             )
         db.add_organize_log_items(log_id, members)
-        before = db.capture_organize_business_snapshot(log_id)
+        before = organize_history_repo.capture_organize_business_snapshot(log_id)
         originals = {file_id: replace(item) for file_id, item in cloud.files.items()}
         service.reorganize(
             log_id,
@@ -841,7 +843,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             episode=3,
         )
         self.assertEqual(len(service.detail(log_id)["operations"]), 300)
-        steps = db.list_latest_reversible_organize_steps(log_id)
+        steps = organize_history_repo.list_latest_reversible_organize_steps(log_id)
         self.assertEqual(len(steps), 306)
         self.assertEqual(sum(bool(row["state_before_json"]) for row in steps), 1)
         result = service.revert_latest(
@@ -849,7 +851,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(result["item_count"], 306)
         self.assertEqual(cloud.files, originals)
-        self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(organize_history_repo.capture_organize_business_snapshot(log_id), before)
 
     def test_special_zero_position_is_confirmed_and_movie_clears_marker(self):
         import json

@@ -12,6 +12,7 @@ import httpx
 
 from tests.support import isolated_test_database
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.modules import offline, rss
 from tests.test_guangya_offline_selection import FakeSelectionClient
 from tests.test_rss_guangya_torrent_input import INFOHASH, TORRENT, TREE
@@ -80,7 +81,7 @@ class RSSTorrentEnclosureBoundaryTests(_TorrentBoundaryCase):
         self.handler = lambda request: httpx.Response(
             200, content=feed if request.url.path == "/rss.xml" else TORRENT
         )
-        sub = db.add_rss_subscription(
+        sub = rss_repo.add_rss_subscription(
             name="R04", urls="https://feed.invalid/rss.xml", download_method="guangya",
             gy_target_dir="target",
         )

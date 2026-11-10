@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmissionStore,
     explain_recent_download_status,
@@ -25,14 +26,14 @@ SENSITIVE_VALUES = (
 
 class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
     def _request(self, suffix: str, *, target: str = "qb") -> int:
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"recent-explanation-{suffix}",
             "magnet",
             title="PRIVATE-TITLE",
             source_value="magnet:?xt=urn:btih:TOPSECRET",
             origin="agent",
         )
-        db.update_download_request(request_id, targets=target, status="submitted")
+        download_requests_repo.update_download_request(request_id, targets=target, status="submitted")
         return request_id
 
     @staticmethod
@@ -71,7 +72,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
             failed=("qb",),
         )
         with patch(
-            "app.agent.domains.downloads.recent_submissions.db.get_download_request_status_snapshot"
+            "app.repositories.download_requests.get_download_request_status_snapshot"
         ) as reader:
             result = explain_recent_download_status(record, position=1)
         reader.assert_not_called()
@@ -83,7 +84,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
 
     def test_failed_partial_and_active_states_have_safe_fixed_explanations(self):
         failed_id = self._request("failed", target="both")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             failed_id, status="failed", qb_status="failed", gy_status="cancelled"
         )
         failed = explain_recent_download_status(
@@ -94,7 +95,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(failed.status, "attention")
         partial_id = self._request("partial-active", target="both")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             partial_id, status="partial", qb_status="failed", gy_status="downloading"
         )
         partial = explain_recent_download_status(
@@ -113,7 +114,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
         self.assertIn("qBittorrent：失败。", partial.data["explanation"]["details"])
         self.assertIn("光鸭：下载中。", partial.data["explanation"]["details"])
         active_id = self._request("active")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             active_id, status="downloading", qb_status="downloading"
         )
         active = explain_recent_download_status(self._record(active_id), position=1)
@@ -124,7 +125,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
 
     def test_partial_failed_manual_review_and_post_processing_are_distinct(self):
         partial_id = self._request("partial-failed", target="both")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             partial_id, status="partial", qb_status="completed", gy_status="failed"
         )
         partial = explain_recent_download_status(
@@ -140,7 +141,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
             partial.data["explanation"]["classification"], "partial_failure"
         )
         manual_id = self._request("manual")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             manual_id,
             status="completed",
             qb_status="completed",
@@ -152,7 +153,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
             manual.data["explanation"]["classification"], "manual_review_required"
         )
         post_id = self._request("post")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             post_id,
             status="completed",
             qb_status="completed",
@@ -177,7 +178,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
 
     def test_explanation_never_exposes_sensitive_request_or_log_columns(self):
         request_id = self._request("secrets")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="failed",
             qb_status="failed",
@@ -185,7 +186,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
             qb_content_path="/private/media/secret.mkv",
             error="SECRET-ERROR",
         )
-        db.add_download_log(
+        download_requests_repo.add_download_log(
             "qb",
             title="PRIVATE-TITLE",
             path="magnet:?xt=SECRET-URL",
@@ -202,7 +203,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
 
     def test_completed_duplicate_and_persisted_unknown_have_distinct_meanings(self):
         completed_id = self._request("completed")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             completed_id, status="completed", qb_status="completed"
         )
         completed = explain_recent_download_status(
@@ -216,7 +217,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
             123, dispatch_status="duplicate", result_status="conflict", succeeded=()
         )
         with patch(
-            "app.agent.domains.downloads.recent_submissions.db.get_download_request_status_snapshot"
+            "app.repositories.download_requests.get_download_request_status_snapshot"
         ) as reader:
             duplicate_result = explain_recent_download_status(duplicate, position=1)
         reader.assert_not_called()
@@ -227,7 +228,7 @@ class RecentDownloadExplanationProjectionTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(duplicate_result.data["explanation"]["certainty"], "limited")
         unknown_id = self._request("persisted-unknown")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             unknown_id, status="completed", qb_status="unexpected-backend-value"
         )
         unknown = explain_recent_download_status(self._record(unknown_id), position=1)

@@ -23,6 +23,8 @@ import pytest
 import requests
 
 from app import database, sdk
+from app.repositories import strm as strm_repo
+from app.repositories import discovery as discovery_repo
 from app.clients.guangya import GuangYaFile
 from app.indexers.models import (
     AggregatedIndexerResult, IndexerCapabilities, IndexerItem, IndexerProviderError,
@@ -93,7 +95,7 @@ def test_media_resolve_respects_discovery_switch_before_service_creation(monkeyp
 def test_watchlist_cursor_preserves_all_provider_identities():
     with isolated_test_database():
         for provider, identity, title in (("tmdb", "100", "第一部"), ("tmdb", "200", "第二部"), ("bangumi", "100", "第三部")):
-            database.add_media_watchlist(provider, identity, "tv", title, "2026")
+            discovery_repo.add_media_watchlist(provider, identity, "tv", title, "2026")
         result = sdk.watchlist.list(limit=2)
         identities = list(result["items"])
         assert result["total"] == 3 and result["has_more"]
@@ -764,14 +766,14 @@ def test_metadata_status_reads_real_queue_and_does_not_default_query_failure_to_
     with isolated_test_database():
         empty = sdk.strm.metadata_status()
         assert empty["total"] == 0 and empty["state"] == "paused"
-        database.enqueue_strm_metadata_jobs([_job(file_id=str(i)) for i in range(65)])
+        strm_repo.enqueue_strm_metadata_jobs([_job(file_id=str(i)) for i in range(65)])
         with patch.object(get_strm_metadata_worker(), "start", side_effect=AssertionError("只读不得启动工作线程")):
             result = sdk.strm.metadata_status()
         assert result["queued"] == result["pending"] == result["total"] == 65
         assert result["state"] == "paused" and result["worker_scope"] == "current_process"
         assert result["cancellable"] == 65 and result["sampled_at"]
         json.dumps(result, allow_nan=False)
-        with patch.object(database, "count_strm_metadata_jobs", side_effect=sqlite3.OperationalError("query failed")):
+        with patch.object(strm_repo, "count_strm_metadata_jobs", side_effect=sqlite3.OperationalError("query failed")):
             with pytest.raises(sqlite3.OperationalError, match="query failed"):
                 sdk.strm.metadata_status()
 
@@ -809,9 +811,9 @@ def test_read_methods_use_real_sdk_file_dispatch_and_business_services(tmp_path,
             await rpc.close()
 
     with isolated_test_database():
-        database.enqueue_strm_metadata_jobs([_job()])
-        database.add_media_watchlist("bangumi", "100", "tv", "收藏剧集", "2026")
-        row = database.get_media_watchlist("bangumi", "100", "tv")
+        strm_repo.enqueue_strm_metadata_jobs([_job()])
+        discovery_repo.add_media_watchlist("bangumi", "100", "tv", "收藏剧集", "2026")
+        row = discovery_repo.get_media_watchlist("bangumi", "100", "tv")
         assert row is not None
         number = int(row["id"])
         calls.extend([
@@ -967,7 +969,7 @@ def test_sdk_help_examples_read_real_response_paths(sdk_client):
               patch("app.modules.media_library._client", return_value=nullcontext((SimpleNamespace(server_type="jellyfin"), client))),
               patch("app.discovery.service.require_discovery_enabled"),
               patch("app.discovery.service.get_discovery_service", return_value=discovery)):
-            database.add_media_watchlist("tmdb", "12345", "tv", "目标剧", "2026")
+            discovery_repo.add_media_watchlist("tmdb", "12345", "tv", "目标剧", "2026")
             runner = doctest.DocTestRunner()
             for name in methods:
                 function = module._METHODS[name]

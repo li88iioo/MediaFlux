@@ -11,7 +11,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app import config, database as db
+from app import config
+from app.repositories import download_requests as download_requests_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -94,14 +95,14 @@ def test_shared_freeze_allows_progress_but_rejects_readded_identity(qb_backend):
 
 
 def test_shared_cancel_before_delete_keeps_tracking_and_remote_task(qb_backend):
-    request_id, _ = db.create_download_request("cancel-qb-control", "magnet")
-    db.update_download_request(request_id, qb_status="downloading", qb_task_id="a" * 40)
+    request_id, _ = download_requests_repo.create_download_request("cancel-qb-control", "magnet")
+    download_requests_repo.update_download_request(request_id, qb_status="downloading", qb_task_id="a" * 40)
     snapshot = qb_control.prepare_qb_control("delete", ["a" * 40])
     def cancelled():
         raise asyncio.CancelledError()
     with pytest.raises(asyncio.CancelledError):
         qb_control.execute_qb_control(snapshot, cancel_check=cancelled)
-    saved = db.get_download_request(request_id)
+    saved = download_requests_repo.get_download_request(request_id)
     assert saved is not None and saved["qb_status"] == "downloading"
     assert qb_backend.client.writes == []
 

@@ -155,8 +155,8 @@ def test_detail_preserves_identity_unknown_counts_and_confirmation(enabled, prov
         try:
             with patch.object(service, "get_detail", return_value=item), patch("app.discovery.service.get_discovery_service", return_value=service):
                 for confirmed in (False, True):
-                    from app import database
-                    database.upsert_media_external_id(provider, "42", "tv", "4242", confirmed=confirmed)
+                    from app.repositories import discovery as discovery_repo
+                    discovery_repo.upsert_media_external_id(provider, "42", "tv", "4242", confirmed=confirmed)
                     result = sdk.media.detail(provider, "tv", "42")["item"]
                     assert result["external_id"] == "42" and result["stable_id"] == f"{provider}:tv:42"
                     assert result["mapping_confirmed"] is (provider == "tmdb" or confirmed)
@@ -168,12 +168,12 @@ def test_detail_preserves_identity_unknown_counts_and_confirmation(enabled, prov
 
 
 def test_search_carries_only_confirmed_mapping_without_changing_source_cards(enabled):
-    from app import database
+    from app.repositories import discovery as discovery_repo
 
     with isolated_test_database():
         items = [card(42, provider="douban"), card(43, provider="douban")]
-        database.upsert_media_external_id("douban", "42", "movie", "4242", confirmed=True)
-        database.upsert_media_external_id("douban", "43", "movie", "4343", confirmed=False)
+        discovery_repo.upsert_media_external_id("douban", "42", "movie", "4242", confirmed=True)
+        discovery_repo.upsert_media_external_id("douban", "43", "movie", "4343", confirmed=False)
         provider = SimpleNamespace(search=Mock(return_value=(items, False)))
         service = DiscoverySearchService(providers={"douban": provider})
         try:

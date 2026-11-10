@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import config, database as db, sdk
+from app.repositories import discovery as discovery_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -73,7 +74,7 @@ def backend(monkeypatch):
 
 
 def stored_mapping(external_id="101", provider="douban", media_type="movie"):
-    row = db.get_media_external_id(provider, external_id, media_type)
+    row = discovery_repo.get_media_external_id(provider, external_id, media_type)
     assert row is not None
     return dict(row)
 
@@ -101,11 +102,11 @@ def test_resolve_returns_every_real_candidate_without_saving(backend):
     result = sdk.media.resolve("douban", "101", "movie", detail["title"], detail["year"])
     assert len(result["candidates"]) == 8
     assert result["candidates"][-1] == {"tmdb_id": "90108", "title": "候选-7", "year": "2026", "media_type": "movie", "score": 0.99}
-    assert not result["confirmed"] and db.get_media_external_id("douban", "101", "movie") is None
+    assert not result["confirmed"] and discovery_repo.get_media_external_id("douban", "101", "movie") is None
     backend.scraper.match_from_tmdb.assert_not_called()
     with pytest.raises(ValueError, match="EffectExecutor"):
         sdk.media.confirm_mapping(**ARGS)
-    assert db.get_media_external_id("douban", "101", "movie") is None
+    assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
 
 
 def test_real_id_plans_stay_in_their_owner_and_session_after_restart(backend):
@@ -121,7 +122,7 @@ def test_real_id_plans_stay_in_their_owner_and_session_after_restart(backend):
         public = first_plan.public_dict()
         assert dict(first_plan.arguments) == ARGS
         assert "已核验-90101" in json.dumps(public, ensure_ascii=False)
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
         cold = executor(SQLiteKernelStore())
         for owner, session in [(OWNER, "other-session"), ("webk:v1:" + "b" * 64, "session-a")]:
             foreign = await context_for(store, owner=owner, session=session)
@@ -130,7 +131,7 @@ def test_real_id_plans_stay_in_their_owner_and_session_after_restart(backend):
         for context, plan, arguments in [(first, first_plan, ARGS), (second, second_plan, second_args)]:
             result = await cold.execute_confirmed(plan.plan_id, context=context)
             assert result.outcome.public_content["data"]["tmdb_id"] == arguments["tmdb_id"]
-            row = db.get_media_external_id("douban", arguments["external_id"], "movie")
+            row = discovery_repo.get_media_external_id("douban", arguments["external_id"], "movie")
             assert row is not None and row["tmdb_id"] == arguments["tmdb_id"] and row["confirmed"]
             before = dict(row)
             with pytest.raises(ToolPipelineError):
@@ -156,7 +157,7 @@ def test_lifecycle_invalidates_only_its_native_mapping_plan(backend, operation, 
             await receiver.session.pipeline.execute_confirmed(plan_a.plan_id, context=fresh)
         result = await first.session.pipeline.execute_confirmed(plan_b.plan_id, context=b)
         assert result.outcome.public_content["ok"]
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
         assert stored_mapping("202")["tmdb_id"] == "90202"
     asyncio.run(exercise())
 
@@ -174,7 +175,7 @@ def test_lifecycle_surfaces_confirmation_revocation_failure(backend, operation):
             change.assert_not_called()
         pending = await native.session.pipeline.get_pending_plan(owner=OWNER, session_id=context.session_id)
         assert pending is not None and pending.plan_id == plan.plan_id
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
         await getattr(native.lifecycle, operation)(owner=OWNER, session_id=context.session_id)
         assert await native.session.pipeline.get_pending_plan(owner=OWNER, session_id=context.session_id) is None
     asyncio.run(exercise())
@@ -206,7 +207,7 @@ def test_lifecycle_rejects_late_native_preview_without_harming_other_session(bac
         assert isinstance(outcome, Exception)
         assert await first.session.pipeline.get_pending_plan(owner=OWNER, session_id="session-a") is None
         assert (await first.session.pipeline.execute_confirmed(plan_b.plan_id, context=b)).outcome.public_content["ok"]
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -225,7 +226,7 @@ def test_source_changes_never_save_the_frozen_mapping(backend, field, value):
         with pytest.raises(ToolPipelineError) as error:
             await executor(SQLiteKernelStore()).execute_confirmed(plan.plan_id, context=context)
         assert error.value.code == "confirmation_stale" and error.value.execution_started is False
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -244,7 +245,7 @@ def test_reverified_target_must_equal_the_frozen_id_type_and_detail(backend, fie
         with pytest.raises(ToolPipelineError) as error:
             await executor(SQLiteKernelStore()).execute_confirmed(plan.plan_id, context=context)
         assert error.value.code == "confirmation_stale" and error.value.execution_started is False
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -252,25 +253,25 @@ def test_reverified_target_must_equal_the_frozen_id_type_and_detail(backend, fie
 def test_mapping_cas_preserves_concurrent_changes_even_with_the_same_timestamp(backend, change):
     async def exercise():
         if change != "insert":
-            db.upsert_media_external_id("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
+            discovery_repo.upsert_media_external_id("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
         store = SQLiteKernelStore()
         context = await context_for(store, owner=OWNER)
         plan = await prepare(executor(store), context)
-        before = db.get_media_external_id("douban", "101", "movie")
+        before = discovery_repo.get_media_external_id("douban", "101", "movie")
         with patch("app.database.now", return_value=str(before["updated_at"]) if before else "fixed-timestamp"):
             if change == "delete":
                 with db.get_conn() as conn:
                     conn.execute("DELETE FROM media_external_ids WHERE provider='douban' AND external_id='101'")
             else:
-                db.upsert_media_external_id("douban", "101", "movie", "200", "并发确认", "2026", 1.0, True)
+                discovery_repo.upsert_media_external_id("douban", "101", "movie", "200", "并发确认", "2026", 1.0, True)
                 if change == "aba":
-                    db.upsert_media_external_id("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
-            current = db.get_media_external_id("douban", "101", "movie")
+                    discovery_repo.upsert_media_external_id("douban", "101", "movie", "100", "旧候选", "2025", 0.8, False)
+            current = discovery_repo.get_media_external_id("douban", "101", "movie")
             expected = dict(current) if current is not None else None
             with pytest.raises(ToolPipelineError) as error:
                 await executor(SQLiteKernelStore()).execute_confirmed(plan.plan_id, context=context)
         assert error.value.code == "confirmation_stale" and error.value.execution_started is False
-        saved = db.get_media_external_id("douban", "101", "movie")
+        saved = discovery_repo.get_media_external_id("douban", "101", "movie")
         assert (dict(saved) if saved is not None else None) == expected
     asyncio.run(exercise())
 
@@ -305,7 +306,7 @@ def test_cancellation_at_each_mapping_boundary_never_writes(backend, phase):
                 (backend.detail if phase.endswith("source") else backend.scraper.match_from_tmdb).side_effect = cancel_source if phase.endswith("source") else cancel_target
             with pytest.raises(ToolPipelineError if phase == "cancel_ticket" else asyncio.CancelledError):
                 await effects.execute_confirmed(plan.plan_id, context=context)
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -325,7 +326,7 @@ def test_runtime_and_authority_are_rechecked_before_mapping_write(backend, chang
             await effects.execute_confirmed(plan.plan_id, context=context)
         assert error.value.code == ("confirmation_stale" if change == "config_aba" else "agent_disabled")
         assert error.value.execution_started is False
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -348,7 +349,7 @@ def test_invalid_identity_never_publishes_a_confirmation(backend, arguments):
 
 
 def test_existing_identical_confirmation_does_not_write_or_publish_a_plan(backend):
-    db.upsert_media_external_id("douban", "101", "movie", "90101", "已确认", "2026", 1.0, True)
+    discovery_repo.upsert_media_external_id("douban", "101", "movie", "90101", "已确认", "2026", 1.0, True)
     before = stored_mapping()
 
     async def exercise():
@@ -379,7 +380,7 @@ def test_retired_candidate_number_ticket_never_executes_as_native(backend):
         assert error.value.code == "tool_not_found" and error.value.execution_started is False
         assert await cold.get_pending_plan(owner=OWNER, session_id=context.session_id) is None
         backend.detail.assert_not_called()
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -419,13 +420,13 @@ def test_real_source_provider_and_media_type_are_preserved(backend, provider, me
         if provider == "tmdb":
             assert result.effect_plan is None and result.outcome.public_content["status"] == "no_changes"
             assert sdk.media.resolve(provider, "101", media_type, "原生 TMDB 来源")["tmdb_id"] == "101"
-            assert db.get_media_external_id(provider, "101", media_type) is None
+            assert discovery_repo.get_media_external_id(provider, "101", media_type) is None
         else:
             assert result.effect_plan is not None
             completed = await effects.execute_confirmed(result.effect_plan.plan_id, context=context)
             assert completed.outcome.public_content["data"]["media_type"] == media_type
             assert stored_mapping("101", provider, media_type)["tmdb_id"] == "90101"
-            assert db.get_media_external_id(provider, "101", "movie") is None
+            assert discovery_repo.get_media_external_id(provider, "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -449,7 +450,7 @@ def test_unverifiable_mapping_never_creates_a_live_plan(backend, failure):
             await effects.prepare("media.confirm_mapping", arguments, context=context)
         assert error.value.code == ("not_found" if failure == "missing_source" else "disabled" if failure == "disabled" else "precondition_failed")
         assert await effects.get_pending_plan(owner=OWNER, session_id=context.session_id) is None
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -463,7 +464,7 @@ def test_mapping_rate_budget_is_shared_across_workers_and_separates_confirmation
             await MediaFluxToolRateLimiter().acquire(owner=OWNER, tool_name="media.confirm_mapping", cost=1, arguments=ARGS)
         assert error.value.code == "rate_limited"
         await MediaFluxToolRateLimiter().acquire(owner=OWNER, tool_name="confirm:media.confirm_mapping", cost=1, arguments=ARGS)
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())
 
 
@@ -493,7 +494,7 @@ Path("tail.txt").write_text("must not resume")
         plan = result.effect_plan
         assert plan is not None and plan.tool_name == "media.confirm_mapping"
         assert plan.arguments["tmdb_id"] == "90108"
-        assert db.get_media_external_id("douban", "101", "movie") is None
+        assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
         root, _ = sandbox._workspace_location(context.owner, context.session_id)
         assert len(json.loads((root / "work/candidates.json").read_text())["candidates"]) == 8
         cold = executor(SQLiteKernelStore())

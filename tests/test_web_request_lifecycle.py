@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
-from app import database as db
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.modules import web_evidence as read
 from app.modules import web_evidence as search
 from app.modules.web_evidence import (
@@ -141,7 +141,7 @@ class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
                 with (
                     patch.object(module, provider_name, side_effect=provider),
                     patch.object(
-                        db,
+                        agent_web_search_repo,
                         "refund_agent_web_search_credits",
                         side_effect=RuntimeError("database busy"),
                     ),

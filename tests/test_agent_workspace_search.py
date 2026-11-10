@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.base import MediaItem
 from app.modules import workspace_search as service
 from tests.support import IsolatedDatabaseTestCase
@@ -182,7 +183,7 @@ class WorkspaceSearchDataTests(IsolatedDatabaseTestCase):
     def test_download_union_pagination_keeps_request_ids_distinct_from_log_ids(self):
         stamp = db.now()
         with db.get_conn() as conn:
-            request, _ = db.create_download_request(
+            request, _ = download_requests_repo.create_download_request(
                 "workspace-search", "magnet", title="Dune", origin="agent"
             )
             log = conn.execute(

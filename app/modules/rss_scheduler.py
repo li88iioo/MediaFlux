@@ -9,6 +9,7 @@ import uuid
 from typing import Any
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.logger import get_logger, log_throttled
 from app.modules.rss import RSSEngine, rss_subscription_refresh_revision
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
@@ -82,7 +83,7 @@ class RSSScheduler:
                 }
                 self._save_alert(sub_id, alert)
             assert alert is not None
-            subscription = db.get_rss_subscription(sub_id)
+            subscription = rss_repo.get_rss_subscription(sub_id)
         except Exception as exc:
             logger.warning(
                 "RSS 周期告警状态读取异常 sub#%s type=%s",
@@ -198,7 +199,7 @@ class RSSScheduler:
         if self._stop_event.is_set():
             return 0
         self._run_cleanup_if_due()
-        recovered = db.recover_stale_submitting_rss_entries(stale_minutes=15)
+        recovered = rss_repo.recover_stale_submitting_rss_entries(stale_minutes=15)
         if recovered:
             logger.warning(
                 "已将 %s 条提交结果未知的 RSS 条目转为人工核对状态", recovered
@@ -207,7 +208,7 @@ class RSSScheduler:
             cursor = max(0, int(db.kv_get(_ADMISSION_CURSOR_KEY, "0") or 0))
         except (TypeError, ValueError):
             cursor = 0
-        due = db.list_due_rss_subscriptions()
+        due = rss_repo.list_due_rss_subscriptions()
         # 失败刷新不应伪造 last_refreshed_at；独立记录最后一次真实准入，
         # 让超过并发窗口的订阅也有执行机会，重启后继续而非总从最小 ID 开始。
         ordered = [row for row in due if int(row["id"]) > cursor]
@@ -249,7 +250,7 @@ class RSSScheduler:
         current = time.monotonic()
         if self._last_cleanup_at and current - self._last_cleanup_at < self._cleanup_interval_seconds:
             return 0
-        deleted = db.purge_processed_rss_entries(retention_days=7)
+        deleted = rss_repo.purge_processed_rss_entries(retention_days=7)
         self._last_cleanup_at = current
         if deleted:
             logger.info(f"已清理 {deleted} 条超过 7 天的已处理 RSS 条目")
@@ -311,7 +312,7 @@ class RSSScheduler:
                     [("状态", "部分订阅源刷新失败")],
                 )
             else:
-                unresolved = db.get_rss_manual_review_summary(sub_id)
+                unresolved = rss_repo.get_rss_manual_review_summary(sub_id)
                 outcome_unknown = (unresolved.get("outcome_unknown_count") or 0)
                 failed = (unresolved.get("failed_count") or 0)
                 if outcome_unknown:

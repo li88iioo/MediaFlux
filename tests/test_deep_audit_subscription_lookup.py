@@ -17,7 +17,7 @@ class SubscriptionCandidateLookupTests(unittest.TestCase):
 
     def seed(self, count, *, expired=False):
         self._sequence += 1
-        subscription_id = db.add_media_subscription(
+        subscription_id = repository.add_media_subscription(
             provider="tmdb", external_id=str(self._sequence), tmdb_id=str(self._sequence),
             media_type="tv", title="本地验收剧集",
         )
@@ -59,7 +59,7 @@ class SubscriptionCandidateLookupTests(unittest.TestCase):
 
         with mock.patch.object(repository, "get_conn", measured_connection):
             for _ in range(repetitions):
-                result = db.get_media_subscription_candidate(candidate_id)
+                result = repository.get_media_subscription_candidate(candidate_id)
                 assert result is not None
                 self.assertEqual(result["status"], "available")
         return ticks
@@ -75,14 +75,14 @@ class SubscriptionCandidateLookupTests(unittest.TestCase):
         candidate_id = self.seed(1)[0]
         with mock.patch.object(repository, "get_conn", wraps=repository.get_conn) as connection:
             for _ in range(5):
-                get_media_subscription_candidate_result = db.get_media_subscription_candidate(candidate_id)
+                get_media_subscription_candidate_result = repository.get_media_subscription_candidate(candidate_id)
                 assert get_media_subscription_candidate_result is not None
                 self.assertEqual(get_media_subscription_candidate_result["status"], "available")
         self.assertEqual(connection.call_count, 5)
 
     def test_expired_lookup_updates_only_the_requested_candidate(self):
         first, other = self.seed(2, expired=True)
-        result = db.get_media_subscription_candidate(first)
+        result = repository.get_media_subscription_candidate(first)
         assert result is not None
         self.assertEqual(result["status"], "expired")
         with db.get_conn() as connection:
@@ -92,18 +92,18 @@ class SubscriptionCandidateLookupTests(unittest.TestCase):
         self.assertEqual(untouched, "available")
         # 全量到期维护仍可明确执行，不改变它的旧接口。
         self.assertEqual(repository.expire_media_subscription_candidates(), 1)
-        get_media_subscription_candidate_result_2 = db.get_media_subscription_candidate(other)
+        get_media_subscription_candidate_result_2 = repository.get_media_subscription_candidate(other)
         assert get_media_subscription_candidate_result_2 is not None
         self.assertEqual(get_media_subscription_candidate_result_2["status"], "expired")
 
     def test_repeated_expired_lookup_preserves_submitted_history(self):
         expired, submitted = self.seed(2, expired=True)
-        db.update_media_subscription_candidate(submitted, status="submitted")
+        repository.update_media_subscription_candidate(submitted, status="submitted")
         for _ in range(2):
-            get_media_subscription_candidate_result_3 = db.get_media_subscription_candidate(expired)
+            get_media_subscription_candidate_result_3 = repository.get_media_subscription_candidate(expired)
             assert get_media_subscription_candidate_result_3 is not None
             self.assertEqual(get_media_subscription_candidate_result_3["status"], "expired")
-            get_media_subscription_candidate_result_4 = db.get_media_subscription_candidate(submitted)
+            get_media_subscription_candidate_result_4 = repository.get_media_subscription_candidate(submitted)
             assert get_media_subscription_candidate_result_4 is not None
             self.assertEqual(get_media_subscription_candidate_result_4["status"], "submitted")
-        self.assertIsNone(db.get_media_subscription_candidate(999_999))
+        self.assertIsNone(repository.get_media_subscription_candidate(999_999))

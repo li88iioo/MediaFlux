@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules import telegram_notification_center as center
 from app.modules.download_tracker import DownloadTracker
 from app.modules.telegram_download_lifecycle import publish_download_lifecycle
@@ -26,8 +27,8 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         self.enterContext(patch.object(center, 'wake_telegram_notification_dispatcher'))
 
     def request(self, suffix='a', *, gy=''):
-        request_id, _ = db.create_download_request('notify-reconcile-'+suffix, 'magnet', title='通知任务 '+suffix, chat_id='100')
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request('notify-reconcile-'+suffix, 'magnet', title='通知任务 '+suffix, chat_id='100')
+        download_requests_repo.update_download_request(
             request_id, status='manual_review', qb_status='manual_review', qb_task_id=suffix*40,
             gy_status=gy, targets='both' if gy else 'qb',
             qb_task_missing_since='2000-01-01 00:00:00',
@@ -42,24 +43,24 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
 
     def test_cancelled_qb_only_does_not_emit_queued_attention_after_restart(self):
         request_id, event_key = self.request()
-        db.cancel_qb_download_tracking(['a'*40])
+        download_requests_repo.cancel_qb_download_tracking(['a'*40])
         db.init_db()
         center.drain_telegram_notifications(event_key=event_key)
         self.sender.assert_not_called()
         get_notification_result_2 = get_notification(event_key)
         assert get_notification_result_2 is not None
         self.assertEqual(get_notification_result_2['status'], 'suppressed')
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result['status'], 'cancelled')
 
     def test_other_backend_failure_is_preserved_but_old_qb_alert_is_not_sent(self):
         request_id, event_key = self.request(gy='failed')
-        db.cancel_qb_download_tracking(['a'*40])
-        row = db.get_download_request(request_id)
+        download_requests_repo.cancel_qb_download_tracking(['a'*40])
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row['notification_delivery_status'], 'pending')
-        self.assertIn(request_id, [value['id'] for value in db.list_active_download_requests()])
+        self.assertIn(request_id, [value['id'] for value in download_requests_repo.list_active_download_requests()])
         get_notification_result_3 = get_notification(event_key)
         assert get_notification_result_3 is not None
         self.assertEqual(get_notification_result_3['status'], 'suppressed')
@@ -69,14 +70,14 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         event = self.sender.call_args.args[0]
         self.assertEqual(dict(event.fields)['下载'], 'qB 已停止跟踪 · 光鸭 失败')
         self.assertNotIn('发现 qB 缺失', dict(event.fields))
-        get_download_request_result_2 = db.get_download_request(request_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2['gy_status'], 'failed')
 
     def test_cancel_is_exact_and_leaves_another_pending_request_notification(self):
         first, first_key = self.request('a')
         second, second_key = self.request('b')
-        db.cancel_qb_download_tracking(['a'*40])
+        download_requests_repo.cancel_qb_download_tracking(['a'*40])
         center.drain_telegram_notifications()
         self.sender.assert_called_once()
         self.assertEqual(dict(self.sender.call_args.args[0].fields)['媒体'], '通知任务 b')
@@ -86,34 +87,34 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         get_notification_result_5 = get_notification(second_key)
         assert get_notification_result_5 is not None
         self.assertEqual(get_notification_result_5['status'], 'sent')
-        get_download_request_result_3 = db.get_download_request(second)
+        get_download_request_result_3 = download_requests_repo.get_download_request(second)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3['qb_status'], 'manual_review')
-        get_download_request_result_4 = db.get_download_request(first)
+        get_download_request_result_4 = download_requests_repo.get_download_request(first)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4['qb_status'], 'cancelled')
 
     def test_other_backend_still_running_gets_latest_processing_projection(self):
         request_id, event_key = self.request(gy='downloading')
-        db.cancel_qb_download_tracking(['a'*40])
+        download_requests_repo.cancel_qb_download_tracking(['a'*40])
         tracker = DownloadTracker()
         with patch.object(tracker, '_match_gy', return_value=None):
-            tracker._update_request(db.get_download_request(request_id), [], [], gy_available=False)
+            tracker._update_request(download_requests_repo.get_download_request(request_id), [], [], gy_available=False)
         center.drain_telegram_notifications(event_key=event_key)
         self.sender.assert_called_once()
         event = self.sender.call_args.args[0]
         self.assertEqual(dict(event.fields)['下载'], 'qB 已停止跟踪 · 光鸭 下载中')
-        get_download_request_result_5 = db.get_download_request(request_id)
+        get_download_request_result_5 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5['gy_status'], 'downloading')
 
     def test_legacy_cancelled_row_and_stale_snapshot_repair_through_original_producer(self):
         request_id, event_key = self.request(gy='failed')
         # 模拟旧备份里的混合状态：不调用新撤销方法，不预先设置刷新标记。
-        db.update_download_request(request_id, qb_status='cancelled', status='failed')
+        download_requests_repo.update_download_request(request_id, qb_status='cancelled', status='failed')
         center.drain_telegram_notifications(event_key=event_key)
         self.sender.assert_not_called()
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual(row['notification_delivery_status'], 'pending')
         DownloadTracker()._update_request(row, [], [])
@@ -124,14 +125,14 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
     def test_cancel_after_claim_is_checked_before_transport(self):
         request_id, event_key = self.request()
         claimed = center.claim_due_notifications(event_key=event_key)[0]
-        db.cancel_qb_download_tracking(['a'*40])
+        download_requests_repo.cancel_qb_download_tracking(['a'*40])
         center._dispatch_item(claimed)
         self.sender.assert_not_called()
         self.editor.assert_not_called()
         get_notification_result_6 = get_notification(event_key)
         assert get_notification_result_6 is not None
         self.assertEqual(get_notification_result_6['status'], 'suppressed')
-        get_download_request_result_6 = db.get_download_request(request_id)
+        get_download_request_result_6 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_6 is not None
         self.assertEqual(get_download_request_result_6['status'], 'cancelled')
 
@@ -142,8 +143,8 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
         get_notification_result_7 = get_notification(event_key)
         assert get_notification_result_7 is not None
         self.assertEqual(get_notification_result_7['status'], 'outcome_unknown')
-        db.cancel_qb_download_tracking(['a'*40])
-        DownloadTracker()._update_request(db.get_download_request(request_id), [], [])
+        download_requests_repo.cancel_qb_download_tracking(['a'*40])
+        DownloadTracker()._update_request(download_requests_repo.get_download_request(request_id), [], [])
         db.init_db()
         center.drain_telegram_notifications(event_key=event_key)
         self.sender.assert_called_once()
@@ -154,7 +155,7 @@ class DownloadNotificationReconciliationTests(unittest.TestCase):
 
     def test_download_state_read_failure_does_not_send_unverified_old_message(self):
         _, event_key = self.request()
-        with patch.object(db, 'get_download_request', side_effect=RuntimeError('temporary DB error')):
+        with patch.object(download_requests_repo, 'get_download_request', side_effect=RuntimeError('temporary DB error')):
             center.drain_telegram_notifications(event_key=event_key)
         self.sender.assert_not_called()
         get_notification_result_8 = get_notification(event_key)

@@ -9,6 +9,9 @@ import json
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
+from app.repositories import organize_probe as organize_probe_repo
 from app.modules.organize import Organizer, OrganizeRules
 from app.modules.organize_probe_worker import OrganizeProbeWorker
 from tests.support import IsolatedDatabaseTestCase
@@ -127,7 +130,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
 
         for index in range(250):
             log_id = db.add_organize_log("guangya", "old", "new", f"video-{index}", "success", "1")
-            job_id = db.enqueue_organize_probe_completion(log_id, source_id="s", rel_dir="season", rules={}, notification_context=context)
+            job_id = organize_probe_repo.enqueue_organize_probe_completion(log_id, source_id="s", rel_dir="season", rules={}, notification_context=context)
             with db.get_conn() as conn:
                 conn.execute("UPDATE organize_probe_queue SET next_attempt_at='2000-01-01 00:00:00',pending_strm_changes_json=? WHERE id=?", (json.dumps([{
                     "source_id": "s", "rel_dir": "season", "kind": "video", "file_id": f"video-{index}", "name": f"new-{index}.mkv",
@@ -145,11 +148,11 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         details.assert_not_called()
         self.assertEqual(len(captured), 250)
         self.assertEqual({json.dumps(notification_scopes(item), sort_keys=True) for item in captured}, {json.dumps([self.scope(context)], sort_keys=True)})
-        self.assertEqual(db.count_organize_probe_jobs()["completed"], 250)
+        self.assertEqual(organize_probe_repo.count_organize_probe_jobs()["completed"], 250)
         self.assertEqual(len(self.rows()), 1)
         self.assertEqual(self.send.call_count, 1)  # 只有初始父消息
         self.assertEqual(self.edit.call_count, 1)  # 稳定 payload 聚合，不逐项反复编辑
-        claimed = db.claim_strm_change_targets(owner="restart", limit=10)
+        claimed = strm_repo.claim_strm_change_targets(owner="restart", limit=10)
         self.assertEqual(sum(len(row["changes"]) for row in claimed), 250)
         self.assertTrue(all(change["_probe_notification_context"] == context for row in claimed for change in row["changes"]))
 
@@ -271,7 +274,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
 
     def pending_job(self, context, file_id="video", *, status="queued"):
         log_id = db.add_organize_log("guangya", "old", "new", file_id, "success", "1")
-        job_id = db.enqueue_organize_probe_completion(log_id, source_id="s", rel_dir="season", rules={}, notification_context=context)
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(log_id, source_id="s", rel_dir="season", rules={}, notification_context=context)
         change = {"source_id": "s", "rel_dir": "season", "kind": "video", "file_id": file_id, "name": file_id + ".mkv"}
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_probe_queue SET status=?,next_attempt_at='2000-01-01 00:00:00',pending_strm_changes_json=? WHERE id=?", (status, json.dumps([change]), job_id))
@@ -290,13 +293,13 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.pending_job(self.context(chat="another-chat"), "other")
         self.publish(context)
         self.assertIn("后台规格补全进行中", self.rows()[0]["event_json"])
-        db.enqueue_strm_change_targets(tag_probe_changes([change], context, notify_enabled=True))
+        strm_repo.enqueue_strm_change_targets(tag_probe_changes([change], context, notify_enabled=True))
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_probe_queue SET status='completed',pending_strm_changes_json='[]' WHERE id IN (?,?)", (first, second))
         self.publish(context)
         self.assertIn("后台规格补全进行中", self.rows()[0]["event_json"])
-        target = db.claim_strm_change_targets(owner="finisher")[0]
-        self.assertEqual(db.complete_strm_change_target(target["id"], expected_owner="finisher", expected_lease_generation=target["lease_generation"]), "completed")
+        target = strm_repo.claim_strm_change_targets(owner="finisher")[0]
+        self.assertEqual(strm_repo.complete_strm_change_target(target["id"], expected_owner="finisher", expected_lease_generation=target["lease_generation"]), "completed")
         self.publish(context)
         self.assertNotIn("后台规格补全进行中", self.rows()[0]["event_json"])
         self.assertEqual(self.rows()[0]["importance"], "result")
@@ -328,8 +331,8 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
 
         def run_before_ack(trigger, options):
             scheduler._run_lock.release()
-            target = db.claim_strm_change_targets(owner="early-finisher")[0]
-            db.complete_strm_change_target(target["id"], expected_owner="early-finisher", expected_lease_generation=target["lease_generation"])
+            target = strm_repo.claim_strm_change_targets(owner="early-finisher")[0]
+            strm_repo.complete_strm_change_target(target["id"], expected_owner="early-finisher", expected_lease_generation=target["lease_generation"])
             _publish_linked_notification_threads(options, strm_status="完成", media_refresh="完成")
             self.assertIn("后台规格补全进行中", self.rows()[0]["event_json"])
             return {"ok": True}
@@ -349,7 +352,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         context = self.context()
         self.parent(context)
         _job, change = self.pending_job(context, status="completed")
-        db.enqueue_strm_change_targets(tag_probe_changes([change], context, notify_enabled=True))
+        strm_repo.enqueue_strm_change_targets(tag_probe_changes([change], context, notify_enabled=True))
         restarted = STRMScheduler()
         stats = restarted._empty_stats()
         stats.update(total=1, generated=1)
@@ -370,7 +373,7 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.send.call_count, 1)
         self.assertEqual(self.edit.call_count, 1)
         self.assertIn("organize:parent-a", self.rows()[0]["thread_key"])
-        self.assertEqual(db.claim_strm_change_targets(owner="check"), [])
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="check"), [])
 
     def test_confirmation_context_uses_only_explicit_verified_refs_not_business_task(self):
         from app.modules.organize_probe_notifications import build_notification_context
@@ -435,12 +438,12 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         new = GuangYaFile("same-video", "New.mkv", False, 100, "etag", "target")
         change = {"source_id": "s", "kind": "video", "action": "upsert", "file_id": new.file_id,
                   "name": new.name, "parent_id": "target", "etag": "etag", "size": 100, "rel_dir": "season"}
-        db.enqueue_strm_change_targets(tag_probe_changes([change], context, notify_enabled=True))
-        target = db.claim_strm_change_targets(owner="real-incremental")[0]
+        strm_repo.enqueue_strm_change_targets(tag_probe_changes([change], context, notify_enabled=True))
+        target = strm_repo.claim_strm_change_targets(owner="real-incremental")[0]
         self.assertEqual(target["changes"][0]["_probe_notification_context"], context)
         with tempfile.TemporaryDirectory() as root:
             old_path = generate_strm(old, "season", "http://example.invalid", root)
-            db.upsert_strm_index("guangya:s", old.file_id, old.etag, old.size, old.name, str(old_path), "sha256:" + hashlib.sha256(old_path.read_bytes()).hexdigest())
+            strm_repo.upsert_strm_index("guangya:s", old.file_id, old.etag, old.size, old.name, str(old_path), "sha256:" + hashlib.sha256(old_path.read_bytes()).hexdigest())
             client = _IncrementalClient({new.file_id: new})
             stats = sync_strm_incremental("s", target["changes"], "http://example.invalid", root, client=cast(GuangYaClient, client))
             self.assertFalse(stats["fallback_required"])
@@ -451,11 +454,11 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
     def test_download_parent_routes_remain_frozen_after_request_route_changes(self):
         from app.modules.organize_probe_notifications import build_notification_context
         from app.notifier import NotificationEvent
-        request_id, _created = db.create_download_request("probe-notify-download", "magnet", chat_id="chat-a")
+        request_id, _created = download_requests_repo.create_download_request("probe-notify-download", "magnet", chat_id="chat-a")
         context = build_notification_context(download_request_ids=[request_id])
         self.assertEqual(context["notification_threads"][0]["chat_id"], "chat-a")
         self.center.publish_notification_thread(f"download:{request_id}", NotificationEvent("✅ 下载完成", fields=(("STRM", "排队"), ("媒体库", "未完成")), state="completed"), topic="download", chat_id="chat-a")
-        db.update_download_request(request_id, chat_id="chat-b")
+        download_requests_repo.update_download_request(request_id, chat_id="chat-b")
         self.publish(context)
         self.assertEqual(self.edit.call_args.kwargs["chat_id"], "chat-a")
         self.assertEqual({row["chat_id"] for row in self.rows()}, {"chat-a"})

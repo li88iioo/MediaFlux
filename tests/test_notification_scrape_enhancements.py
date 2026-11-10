@@ -609,7 +609,7 @@ class _FailingTreeClient(PagedDirectoryTestMixin):
 class StrmDetailedNotificationTests(IsolatedDatabaseTestCase):
     def test_sync_stats_include_directories_timing_and_error_samples(self):
         with tempfile.TemporaryDirectory() as root, patch(
-            "app.modules.strm.db.list_strm_index", return_value=[]
+            "app.repositories.strm.list_strm_index", return_value=[]
         ):
             stats = sync_strm(
                 "root", "http://media", root, client=cast(GuangYaClient, _FailingTreeClient()),

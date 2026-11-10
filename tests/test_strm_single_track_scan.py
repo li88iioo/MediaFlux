@@ -25,7 +25,7 @@ class StrmSingleTrackScanTests(unittest.TestCase):
         client = SnapshotOnlyClient()
         with (
             tempfile.TemporaryDirectory() as root,
-            patch("app.modules.strm.db.list_strm_index", return_value=[]),
+            patch("app.repositories.strm.list_strm_index", return_value=[]),
             patch("app.modules.strm.clean_invalid_strm") as cleanup,
         ):
             stats = sync_strm("root", "http://play.invalid", root, client=cast(GuangYaClient, client), clean_invalid=True)
@@ -47,7 +47,7 @@ class StrmSingleTrackScanTests(unittest.TestCase):
         with (
             isolated_test_database(),
             tempfile.TemporaryDirectory() as root,
-            patch("app.modules.strm.db.list_strm_index", return_value=[]),
+            patch("app.repositories.strm.list_strm_index", return_value=[]),
             patch("app.modules.strm._scan_limits", return_value=(100, 17, 100, 60)),
             patch("inspect.signature", side_effect=AssertionError("不得探测旧协议")),
         ):
@@ -65,7 +65,7 @@ class StrmSingleTrackScanTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as root,
             patch.object(client, "_call_read", return_value=files),
-            patch("app.modules.strm.db.list_strm_index", return_value=[]),
+            patch("app.repositories.strm.list_strm_index", return_value=[]),
             patch("app.modules.strm._scan_limits", return_value=(100, 1, 100, 60)),
             patch("app.modules.strm.clean_invalid_strm") as cleanup,
         ):

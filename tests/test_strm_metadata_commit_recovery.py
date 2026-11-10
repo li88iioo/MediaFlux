@@ -14,6 +14,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import strm as strm_repo
+from app.repositories import strm_request_ownership as strm_request_ownership_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from app.modules.strm import STRM_SUBDIR
@@ -57,7 +60,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.enterContext(patch.object(self.worker, "_flush_media_refresh"))
 
     def queue_row(self):
-        return dict(db.list_strm_metadata_queue()[0])
+        return dict(strm_repo.list_strm_metadata_queue()[0])
 
     def make_due(self):
         with db.get_conn() as conn:
@@ -68,7 +71,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
     def fail_manual_job(self):
         self.job.update(rel_dir="", target_rel_path=f"{STRM_SUBDIR}/Movie.nfo")
         self.target = self.root / STRM_SUBDIR / "Movie.nfo"
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         with patch("app.modules.strm.requests.get", side_effect=OSError("isolated download failure")):
             self.worker._process_one()
         self.assertEqual(self.queue_row()["status"], "failed")
@@ -87,16 +90,16 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertEqual(download.call_count, 1)
         self.assertEqual(self.queue_row()["status"], "completed")
-        self.assertEqual(db.count_strm_metadata_jobs()["failed"], 0)
+        self.assertEqual(strm_repo.count_strm_metadata_jobs()["failed"], 0)
         self.assertEqual(db.list_strm_failures(status="open"), [])
-        self.assertEqual(len(db.list_strm_refresh_entries()), 1)
-        self.assertEqual(db.claim_due_strm_metadata_jobs(owner="after-repair"), [])
+        self.assertEqual(len(strm_repo.list_strm_refresh_entries()), 1)
+        self.assertEqual(strm_repo.claim_due_strm_metadata_jobs(owner="after-repair"), [])
 
     def test_manual_recovery_keeps_original_refresh_scope_and_request_owner(self):
         from app.repositories.strm_request_ownership import refresh_work_key
 
-        request, _ = db.create_download_request("manual-recovery-owner", "magnet")
-        owners = db.current_strm_request_owners([request])
+        request, _ = download_requests_repo.create_download_request("manual-recovery-owner", "magnet")
+        owners = strm_request_ownership_repo.current_strm_request_owners([request])
         media_root = str(self.root / STRM_SUBDIR)
         self.job["refresh_policy"] = {"media_root": media_root, "allow_emby": False, "request_owners": owners}
         self.fail_manual_job()
@@ -109,7 +112,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         # 根下单文件只刷新文件本身，不把人工恢复扩大为全媒体根扫描。
         refresh_target = str(self.target)
         self.assertEqual([(row["request_id"], row["work_key"]) for row in work], [(request, refresh_work_key(refresh_target, False))])
-        self.assertIn((refresh_target, False), [(event["path"], event["allow_emby"]) for event in db.list_strm_refresh_entries()])
+        self.assertIn((refresh_target, False), [(event["path"], event["allow_emby"]) for event in strm_repo.list_strm_refresh_entries()])
 
     def test_manual_recovery_ack_failure_rolls_back_and_reuses_installed_file(self):
         self.fail_manual_job()
@@ -121,7 +124,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertEqual(self.queue_row()["status"], "failed")
         self.assertEqual(len(db.list_strm_failures(status="open")), 1)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
         with db.get_conn() as conn:
             conn.execute("DROP TRIGGER reject_manual_refresh")
         with patch("app.modules.strm.requests.get", side_effect=AssertionError("installed metadata must not download again")) as download:
@@ -158,15 +161,15 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
             with self.subTest(change=change):
                 with db.get_conn() as conn:
                     conn.execute("DELETE FROM strm_metadata_queue")
-                db.enqueue_strm_metadata_jobs([{**self.job, "filename": "Movie.jpg", "target_rel_path": "整理/Movie/Movie.jpg"}])
+                strm_repo.enqueue_strm_metadata_jobs([{**self.job, "filename": "Movie.jpg", "target_rel_path": "整理/Movie/Movie.jpg"}])
                 successor = []
                 def settings(key, default="", *, change=change, successor=successor):
                     if key == "STRM_METADATA_EXTS":
                         if change == "revision":
-                            db.enqueue_strm_metadata_jobs([self.job])
+                            strm_repo.enqueue_strm_metadata_jobs([self.job])
                         elif change == "lease":
-                            db.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
-                            successor.extend(db.claim_due_strm_metadata_jobs(owner="successor"))
+                            strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
+                            successor.extend(strm_repo.claim_due_strm_metadata_jobs(owner="successor"))
                         return "nfo"
                     return str(self.root) if key == "STRM_ROOT" else default
                 with (
@@ -177,7 +180,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
                 prepare.assert_not_called()
                 row = self.queue_row()
                 self.assertEqual(row["status"], {"unchanged": "cancelled", "revision": "queued", "lease": "running"}[change])
-                self.assertEqual(db.list_strm_refresh_entries(), [])
+                self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
                 self.assertEqual(db.list_strm_failures(status="open"), [])
                 self.assertEqual(self.worker._completed_session, 0)
                 self.assertEqual(self.worker._failed_session, 0)
@@ -203,7 +206,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
     def test_completed_file_at_attempt_limit_retries_handoff_without_redownloading(
         self,
     ):
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         with db.get_conn() as conn:
             conn.execute(
                 "CREATE TRIGGER fail_metadata_refresh BEFORE INSERT ON strm_refresh_outbox BEGIN SELECT RAISE(ABORT,'isolated-refresh-store'); END"
@@ -214,8 +217,8 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
             self.assertTrue(self.worker._process_one())
         self.assertEqual(download.call_count, 1)
         self.assertEqual(self.target.read_bytes(), b"metadata")
-        self.assertEqual(len(db.list_strm_index("guangya-meta:source")), 1)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(len(strm_repo.list_strm_index("guangya-meta:source")), 1)
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
         self.assertEqual(self.queue_row()["status"], "retry_wait")
         self.assertEqual(self.queue_row()["attempts"], 0)
         with db.get_conn() as conn:
@@ -233,13 +236,13 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.queue_row()["status"], "completed")
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertIn(
-            str(self.target), {row["path"] for row in db.list_strm_refresh_entries()}
+            str(self.target), {row["path"] for row in strm_repo.list_strm_refresh_entries()}
         )
         self.assertEqual(self.worker._failed_session, 0)
         self.assertEqual(self.worker._completed_session, 1)
 
     def test_real_download_failure_still_exhausts_budget_and_records_failure(self):
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         with patch(
             "app.modules.strm.requests.get",
             side_effect=OSError("isolated download failure"),
@@ -250,10 +253,10 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.queue_row()["attempts"], 1)
         self.assertEqual(len(db.list_strm_failures(status="open")), 1)
         self.assertEqual(self.worker._failed_session, 1)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_six_ack_failures_keep_prior_attempt_count_without_download_breaker(self):
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=2)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=2)
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_metadata_queue SET attempts=1")
             conn.execute(
@@ -298,7 +301,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
 
     def test_failure_ledger_ack_refresh_and_completion_share_one_transaction(self):
         self.record_old_failure()
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         with db.get_conn() as conn:
             conn.execute(
                 "CREATE TRIGGER fail_old_failure_ack BEFORE UPDATE OF status ON strm_failures WHEN new.status='resolved' BEGIN SELECT RAISE(ABORT,'isolated-ledger-store'); END"
@@ -308,7 +311,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertEqual(self.queue_row()["status"], "retry_wait")
         self.assertEqual(self.queue_row()["attempts"], 0)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
         self.assertEqual(len(db.list_strm_failures(status="open")), 1)
         self.assertEqual(db.list_strm_failures(status="resolved"), [])
         with db.get_conn() as conn:
@@ -322,7 +325,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.queue_row()["status"], "completed")
         self.assertEqual(db.list_strm_failures(status="open"), [])
         self.assertEqual(len(db.list_strm_failures(status="resolved")), 1)
-        self.assertEqual(len(db.list_strm_refresh_entries()), 1)
+        self.assertEqual(len(strm_repo.list_strm_refresh_entries()), 1)
 
     def test_superseded_postcommit_error_never_changes_new_revision_or_owner(self):
         import sqlite3
@@ -339,29 +342,29 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
                         conn.execute(f"DELETE FROM {table}")
                 self.target.unlink(missing_ok=True)
                 self.record_old_failure()
-                db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+                strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
 
                 def interrupt(*_args, interruption=interruption, **_kwargs):
                     if interruption == "revision":
-                        db.enqueue_strm_metadata_jobs(
+                        strm_repo.enqueue_strm_metadata_jobs(
                             [{**self.job, "etag": "new-version"}]
                         )
                     elif interruption == "cancel":
-                        db.cancel_strm_metadata_job(
+                        strm_repo.cancel_strm_metadata_job(
                             "source", "meta", reason="source removed"
                         )
                     else:
-                        db.recover_stale_strm_metadata_jobs(
+                        strm_repo.recover_stale_strm_metadata_jobs(
                             force=True, owner=self.worker._owner
                         )
                         self.assertEqual(
-                            len(db.claim_due_strm_metadata_jobs(owner="successor")), 1
+                            len(strm_repo.claim_due_strm_metadata_jobs(owner="successor")), 1
                         )
                     raise sqlite3.OperationalError("isolated stale completion")
 
                 with (
                     patch.object(
-                        db, "settle_strm_metadata_job", side_effect=interrupt
+                        strm_repo, "settle_strm_metadata_job", side_effect=interrupt
                     ),
                     patch("app.modules.strm.requests.get", return_value=_Response()),
                 ):
@@ -378,18 +381,18 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
                     self.assertEqual(row["lease_owner"], "successor")
                 self.assertEqual(self.worker._failed_session, 0)
                 self.assertEqual(len(db.list_strm_failures(status="open")), 1)
-                self.assertEqual(db.list_strm_refresh_entries(), [])
+                self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_changed_revision_success_does_not_ack_the_new_failure_ledger(self):
         from app.modules import strm_metadata_worker as metadata
 
         self.record_old_failure()
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         original = metadata.commit_strm_metadata_job
 
         def commit_then_revise(*args, **kwargs):
             result = original(*args, **kwargs)
-            db.enqueue_strm_metadata_jobs([{**self.job, "etag": "new-version"}])
+            strm_repo.enqueue_strm_metadata_jobs([{**self.job, "etag": "new-version"}])
             return result
 
         with (
@@ -402,7 +405,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         self.assertEqual(self.queue_row()["status"], "queued")
         self.assertEqual(self.queue_row()["etag"], "new-version")
         self.assertEqual(len(db.list_strm_failures(status="open")), 1)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def crash_after_install(self, stage="before_ack", *, check_empty_refresh=True):
         import subprocess
@@ -421,7 +424,7 @@ socket.socket.connect=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("ext
 db.configure_database(Path(sys.argv[1]),test_mode=True)
 worker=STRMMetadataWorker()
 worker._client=_TreeClient({"source":[GuangYaFile("meta","Movie.nfo",False,8,"m1","source")]})
-checkpoint={"after_index":"app.modules.strm._delete_owned_file","after_delete":"app.modules.strm.recover_pending_paths","after_refresh":"app.modules.strm_recovery.db.delete_strm_path_cleanup","before_ack":"app.modules.strm_metadata_worker.db.settle_strm_metadata_job"}[sys.argv[3]]
+checkpoint={"after_index":"app.modules.strm._delete_owned_file","after_delete":"app.modules.strm.recover_pending_paths","after_refresh":"app.repositories.strm.delete_strm_path_cleanup","before_ack":"app.repositories.strm.settle_strm_metadata_job"}[sys.argv[3]]
 with patch("app.modules.strm_metadata_worker.get_bool",return_value=True), patch("app.modules.strm_metadata_worker.get",side_effect=lambda key,default="": {"STRM_ROOT":sys.argv[2],"STRM_METADATA_EXTS":"nfo"}.get(key,default)), patch("app.modules.strm.requests.get",return_value=_Response()), patch(checkpoint,side_effect=lambda *_a,**_k: os._exit(79)):
  worker._process_one()
 raise AssertionError("crash checkpoint not reached")
@@ -436,13 +439,13 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertEqual(self.queue_row()["status"], "running")
         if check_empty_refresh:
-            self.assertEqual(db.list_strm_refresh_entries(), [])
+            self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def queue_move(self, *, enabled=True, allow_emby=True):
         old = self.root / STRM_SUBDIR / "Old" / "Movie.nfo"
         old.parent.mkdir(parents=True, exist_ok=True)
         old.write_bytes(b"metadata")
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             "guangya-meta:source", "meta", "m1", 8, old.name,
             str(old), strm._content_fingerprint(old),
         )
@@ -454,31 +457,31 @@ raise AssertionError("crash checkpoint not reached")
                 "enabled": enabled, "allow_emby": allow_emby,
             },
         )
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         return old
 
     def assert_move_restart(self, stage):
         old = self.queue_move()
         self.crash_after_install(stage, check_empty_refresh=False)
-        entries = {row["path"] for row in db.list_strm_refresh_entries()}
+        entries = {row["path"] for row in strm_repo.list_strm_refresh_entries()}
         self.assertTrue(
-            str(old.parent) in entries or db.list_strm_path_cleanup("guangya-meta:source"),
+            str(old.parent) in entries or strm_repo.list_strm_path_cleanup("guangya-meta:source"),
             "确认旧凭据前必须先持久化刷新",
         )
-        self.assertEqual(db.recover_stale_strm_metadata_jobs(force=True), 1)
+        self.assertEqual(strm_repo.recover_stale_strm_metadata_jobs(force=True), 1)
         with patch("app.modules.strm.requests.get", side_effect=AssertionError("must reuse installed bytes")):
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "completed")
         self.assertFalse(old.exists())
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertEqual(
-            {row["path"] for row in db.list_strm_refresh_entries()},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()},
             {str(old.parent), str(self.target.parent)},
         )
-        self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
-        db.acknowledge_strm_refresh_paths(db.list_strm_refresh_entries())
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
+        strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
         self.assertFalse(self.worker._process_one())
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
 
     def test_move_exit_after_index_recovers_without_scan_or_download(self):
         self.assert_move_restart("after_index")
@@ -498,9 +501,9 @@ raise AssertionError("crash checkpoint not reached")
             self.assertTrue(self.worker._process_one())
         self.assertEqual(download.call_count, 1)
         self.assertEqual(self.queue_row()["status"], "completed")
-        self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
-            {row["path"] for row in db.list_strm_refresh_entries()},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()},
             {str(old.parent), str(self.target.parent)},
         )
 
@@ -519,17 +522,17 @@ raise AssertionError("crash checkpoint not reached")
         self.assertNotEqual(self.queue_row()["status"], "completed")
         self.assertEqual(self.queue_row()["attempts"], 0)
         self.assertEqual(self.worker._failed_session, 0)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
-        self.assertEqual(len(db.list_strm_path_cleanup("guangya-meta:source")), 1)
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+        self.assertEqual(len(strm_repo.list_strm_path_cleanup("guangya-meta:source")), 1)
         with db.get_conn() as conn:
             conn.execute("DROP TRIGGER fail_old_refresh")
         self.make_due()
         with patch("app.modules.strm.requests.get", side_effect=AssertionError("must not redownload")):
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "completed")
-        self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
-            {row["path"] for row in db.list_strm_refresh_entries()},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()},
             {str(old.parent), str(self.target.parent)},
         )
 
@@ -544,9 +547,9 @@ raise AssertionError("crash checkpoint not reached")
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "retry_wait")
         self.assertEqual(self.queue_row()["attempts"], 0)
-        self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
-            {row["path"] for row in db.list_strm_refresh_entries()}, {str(old.parent)},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()}, {str(old.parent)},
         )
         with db.get_conn() as conn:
             conn.execute("DROP TRIGGER fail_move_ack")
@@ -555,7 +558,7 @@ raise AssertionError("crash checkpoint not reached")
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "completed")
         self.assertEqual(
-            {row["path"] for row in db.list_strm_refresh_entries()},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()},
             {str(old.parent), str(self.target.parent)},
         )
 
@@ -571,15 +574,15 @@ raise AssertionError("crash checkpoint not reached")
             self.assertFalse(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "retry_wait")
         self.assertEqual(self.queue_row()["attempts"], 0)
-        self.assertEqual(len(db.list_strm_path_cleanup("guangya-meta:source")), 1)
-        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertEqual(len(strm_repo.list_strm_path_cleanup("guangya-meta:source")), 1)
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
         self.worker._stop_event.clear()
         with patch("app.modules.strm.requests.get", side_effect=AssertionError("must reuse installed bytes")):
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "completed")
-        self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
-            {row["path"] for row in db.list_strm_refresh_entries()},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()},
             {str(old.parent), str(self.target.parent)},
         )
 
@@ -588,39 +591,39 @@ raise AssertionError("crash checkpoint not reached")
             with self.subTest(enabled=enabled, allow_emby=allow_emby):
                 old = self.queue_move(enabled=enabled, allow_emby=allow_emby)
                 self.crash_after_install("after_index", check_empty_refresh=False)
-                self.assertEqual(db.recover_stale_strm_metadata_jobs(force=True), 1)
+                self.assertEqual(strm_repo.recover_stale_strm_metadata_jobs(force=True), 1)
                 with patch("app.modules.strm.requests.get", side_effect=AssertionError("must reuse installed bytes")):
                     self.assertTrue(self.worker._process_one())
                 self.assertEqual(self.queue_row()["status"], "completed")
-                entries = db.list_strm_refresh_entries()
+                entries = strm_repo.list_strm_refresh_entries()
                 self.assertEqual(
                     {row["path"] for row in entries},
                     {str(old.parent), str(self.target.parent)} if enabled else set(),
                 )
                 self.assertTrue(all(not row["allow_emby"] for row in entries))
-                self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+                self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
                 with db.get_conn() as conn:
                     for table in ("strm_metadata_queue", "strm_index", "strm_refresh_outbox"):
                         conn.execute(f"DELETE FROM {table}")
                 self.target.unlink()
 
     def test_moved_receipt_handoff_does_not_ack_new_revision_cancel_or_lease(self):
-        original = db.settle_strm_metadata_job
+        original = strm_repo.settle_strm_metadata_job
         for change in ("revision", "cancel", "lease"):
             with self.subTest(change=change):
                 old = self.queue_move()
 
                 def change_then_settle(*args, change=change, **kwargs):
                     if change == "revision":
-                        db.enqueue_strm_metadata_jobs([{**self.job, "etag": "new"}])
+                        strm_repo.enqueue_strm_metadata_jobs([{**self.job, "etag": "new"}])
                     elif change == "cancel":
-                        db.cancel_strm_metadata_job("source", "meta", reason="removed")
+                        strm_repo.cancel_strm_metadata_job("source", "meta", reason="removed")
                     else:
-                        db.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
-                        self.assertEqual(len(db.claim_due_strm_metadata_jobs(owner="successor")), 1)
+                        strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
+                        self.assertEqual(len(strm_repo.claim_due_strm_metadata_jobs(owner="successor")), 1)
                     return original(*args, **kwargs)
 
-                with patch.object(db, "settle_strm_metadata_job", side_effect=change_then_settle), patch("app.modules.strm.requests.get", return_value=_Response()):
+                with patch.object(strm_repo, "settle_strm_metadata_job", side_effect=change_then_settle), patch("app.modules.strm.requests.get", return_value=_Response()):
                     self.assertTrue(self.worker._process_one())
                 row = self.queue_row()
                 self.assertEqual(row["status"], {"revision": "queued", "cancel": "cancelled", "lease": "running"}[change])
@@ -628,11 +631,11 @@ raise AssertionError("crash checkpoint not reached")
                 if change == "lease":
                     self.assertEqual(row["lease_owner"], "successor")
                 self.assertEqual(
-                    {entry["path"] for entry in db.list_strm_refresh_entries()},
+                    {entry["path"] for entry in strm_repo.list_strm_refresh_entries()},
                     {str(old.parent)},
                     "已落盘旧目录变化持久交接，但不能提前确认新目录或继任任务",
                 )
-                self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+                self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
                 with db.get_conn() as conn:
                     for table in ("strm_metadata_queue", "strm_index", "strm_path_cleanup", "strm_refresh_outbox"):
                         conn.execute(f"DELETE FROM {table}")
@@ -646,21 +649,21 @@ raise AssertionError("crash checkpoint not reached")
                 def prepare_then_change(*args, change=change, **kwargs):
                     result = strm.prepare_strm_metadata_job(*args, **kwargs)
                     if change == "revision":
-                        db.enqueue_strm_metadata_jobs([{**self.job, "etag": "new"}])
+                        strm_repo.enqueue_strm_metadata_jobs([{**self.job, "etag": "new"}])
                     elif change == "cancel":
-                        db.cancel_strm_metadata_job("source", "meta", reason="removed")
+                        strm_repo.cancel_strm_metadata_job("source", "meta", reason="removed")
                     else:
-                        db.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
-                        self.assertEqual(len(db.claim_due_strm_metadata_jobs(owner="successor")), 1)
+                        strm_repo.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
+                        self.assertEqual(len(strm_repo.claim_due_strm_metadata_jobs(owner="successor")), 1)
                     return result
 
                 with patch("app.modules.strm_metadata_worker.prepare_strm_metadata_job", side_effect=prepare_then_change), patch("app.modules.strm.requests.get", return_value=_Response()):
                     self.assertTrue(self.worker._process_one())
                 self.assertEqual(old.read_bytes(), b"metadata")
                 self.assertFalse(self.target.exists())
-                self.assertEqual(db.list_strm_index("guangya-meta:source")[0]["strm_path"], str(old))
-                self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
-                self.assertEqual(db.list_strm_refresh_entries(), [])
+                self.assertEqual(strm_repo.list_strm_index("guangya-meta:source")[0]["strm_path"], str(old))
+                self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
+                self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
                 row = self.queue_row()
                 self.assertEqual(row["status"], {"revision": "queued", "cancel": "cancelled", "lease": "running"}[change])
                 if change == "lease":
@@ -677,24 +680,24 @@ raise AssertionError("crash checkpoint not reached")
                 if change == "edited":
                     old.write_bytes(b"user-edited")
                 else:
-                    db.upsert_strm_index(
+                    strm_repo.upsert_strm_index(
                         "guangya-meta:other", "owner", "other", 8, old.name,
                         str(old), strm._content_fingerprint(old),
                     )
-                self.assertEqual(db.recover_stale_strm_metadata_jobs(force=True), 1)
+                self.assertEqual(strm_repo.recover_stale_strm_metadata_jobs(force=True), 1)
                 with patch("app.modules.strm.requests.get", side_effect=AssertionError("must reuse installed bytes")):
                     self.assertTrue(self.worker._process_one())
                 self.assertEqual(old.read_bytes(), b"user-edited" if change == "edited" else b"metadata")
                 self.assertEqual(self.target.read_bytes(), b"metadata")
                 self.assertEqual(self.queue_row()["status"], "completed")
                 self.assertEqual(
-                    len(db.list_strm_path_cleanup("guangya-meta:source")),
+                    len(strm_repo.list_strm_path_cleanup("guangya-meta:source")),
                     int(change == "edited"),
                 )
                 if change == "other_owner":
-                    self.assertEqual(db.list_strm_index("guangya-meta:other")[0]["strm_path"], str(old))
+                    self.assertEqual(strm_repo.list_strm_index("guangya-meta:other")[0]["strm_path"], str(old))
                 self.assertEqual(
-                    {entry["path"] for entry in db.list_strm_refresh_entries()},
+                    {entry["path"] for entry in strm_repo.list_strm_refresh_entries()},
                     {str(self.target.parent)},
                 )
                 with db.get_conn() as conn:
@@ -703,7 +706,7 @@ raise AssertionError("crash checkpoint not reached")
                 self.target.unlink()
 
     def recover_without_download(self, expected_refresh_count=1):
-        self.assertEqual(db.recover_stale_strm_metadata_jobs(force=True), 1)
+        self.assertEqual(strm_repo.recover_stale_strm_metadata_jobs(force=True), 1)
         with patch(
             "app.modules.strm.requests.get",
             side_effect=AssertionError("restart must reuse committed bytes"),
@@ -711,10 +714,10 @@ raise AssertionError("crash checkpoint not reached")
             self.assertTrue(self.worker._process_one())
         self.assertEqual(self.queue_row()["status"], "completed")
         self.assertEqual(db.list_strm_failures(status="open"), [])
-        self.assertEqual(len(db.list_strm_refresh_entries()), expected_refresh_count)
+        self.assertEqual(len(strm_repo.list_strm_refresh_entries()), expected_refresh_count)
 
     def assert_refresh_policy_survives_crash(self, *, enabled, allow_emby):
-        db.enqueue_strm_metadata_jobs([{
+        strm_repo.enqueue_strm_metadata_jobs([{
             **self.job,
             "refresh_policy": {
                 "media_root": str(self.root / STRM_SUBDIR),
@@ -724,7 +727,7 @@ raise AssertionError("crash checkpoint not reached")
         self.crash_after_install()
         self.recover_without_download(expected_refresh_count=int(enabled))
         self.assertEqual(
-            [entry["allow_emby"] for entry in db.list_strm_refresh_entries()],
+            [entry["allow_emby"] for entry in strm_repo.list_strm_refresh_entries()],
             [allow_emby] if enabled else [],
         )
 
@@ -738,7 +741,7 @@ raise AssertionError("crash checkpoint not reached")
         self,
     ):
         self.record_old_failure()
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         self.crash_after_install()
         self.assertEqual(len(db.list_strm_failures(status="open")), 1)
         self.recover_without_download()
@@ -749,13 +752,13 @@ raise AssertionError("crash checkpoint not reached")
         from tests.test_ten_pass_process_restore_audit import runtime_paths
 
         self.record_old_failure()
-        db.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
+        strm_repo.enqueue_strm_metadata_jobs([self.job], max_attempts=1)
         self.crash_after_install()
         paths = runtime_paths(self.database_path)
         archive = backup.create_backup(paths, reason="metadata-installed-before-ack")
         backup.verify_backup(archive)
         self.recover_without_download()
-        db.acknowledge_strm_refresh_paths(db.list_strm_refresh_entries())
+        strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
         backup.restore_backup(paths, archive)
         db.init_db()
         self.assertEqual(self.queue_row()["status"], "running")

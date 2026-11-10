@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app import database as db
+from app.repositories import agent_jobs as agent_jobs_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.modules.library_patrol import empty_patrol_projection
 from app.agent.effect_completion import wait_for_effect_completion
@@ -63,7 +63,7 @@ async def _native_stop_race(*, stopper: str, tracker_registered: bool, cutover: 
 
             async def execute(arguments, expected, context):
                 assert expected == "stop-generation-snapshot"
-                job, created = db.create_agent_job(
+                job, created = agent_jobs_repo.create_agent_job(
                     owner=owner, job_type="library_episode_audit", dedupe_key=name,
                     input_json="{}", checkpoint_json="{}",
                     projection_json=json.dumps(empty_patrol_projection(as_of="2026-10-19")),
@@ -176,7 +176,7 @@ async def _native_stop_race(*, stopper: str, tracker_registered: bool, cutover: 
                         assert new_state.lifecycle_id != old_state.lifecycle_id
                     else:
                         assert new_state.lifecycle_id == old_state.lifecycle_id
-                    pending_job = db.get_agent_job(owner=owner, job_id=jobs["stop_test.new"])
+                    pending_job = agent_jobs_repo.get_agent_job(owner=owner, job_id=jobs["stop_test.new"])
                     assert pending_job is not None and pending_job["status"] == "pending"
 
                 release_marker.set()
@@ -188,11 +188,11 @@ async def _native_stop_race(*, stopper: str, tracker_registered: bool, cutover: 
                 release_turn_stop.set()
                 await asyncio.gather(confirmation, stopping, return_exceptions=True)
 
-        stopped_job = db.get_agent_job(owner=owner, job_id=jobs["stop_test.old"])
+        stopped_job = agent_jobs_repo.get_agent_job(owner=owner, job_id=jobs["stop_test.old"])
         assert stopped_job is not None and stopped_job["status"] == "cancelled"
         assert result["background_tasks"] == [{"plan_id": old_plan, "kind": "agent_job", "status": "cancelled"}]
         if cutover != "same":
-            pending_job = db.get_agent_job(owner=owner, job_id=jobs["stop_test.new"])
+            pending_job = agent_jobs_repo.get_agent_job(owner=owner, job_id=jobs["stop_test.new"])
             assert pending_job is not None and pending_job["status"] == "pending"
             current = await SQLiteKernelStore(secret_provider=lambda: "stop-generation-only").load(
                 owner=owner, session_id=session_id,

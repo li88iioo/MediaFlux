@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import database as db
+from app.repositories import discovery as discovery_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
 from app.agent.kernel.capabilities import ToolCatalog, ToolEffect
@@ -104,13 +104,13 @@ def test_default_off_explicit_scope_allows_different_items_and_debits_once(rig):
             await rig.pipeline.execute_confirmed(first.plan_id, context=context, scoped_trust=True)
         grant = await rig.grant(context, first)
         assert grant["active"] and grant["remaining"] == 5 and grant["scope"] == SCOPE
-        assert rig.attempts == [] and db.get_media_watchlist("tmdb", "100", "tv") is None
+        assert rig.attempts == [] and discovery_repo.get_media_watchlist("tmdb", "100", "tv") is None
         for number in range(101, 106):
             plan = await rig.preview(context, arguments(number))
             assert await rig.pipeline.scoped_trust.allows(plan, context=context)
             result = await rig.pipeline.execute_confirmed(plan.plan_id, context=context, scoped_trust=True)
             assert result.outcome.public_content["ok"] is True
-            assert db.get_media_watchlist("tmdb", str(number), "tv") is not None
+            assert discovery_repo.get_media_watchlist("tmdb", str(number), "tv") is not None
             assert await rig.remaining() == 105 - number
             with pytest.raises(ConfirmationClaimError):
                 await rig.pipeline.execute_confirmed(plan.plan_id, context=context, scoped_trust=True)
@@ -119,7 +119,7 @@ def test_default_off_explicit_scope_allows_different_items_and_debits_once(rig):
         assert not await rig.pipeline.scoped_trust.allows(sixth, context=context)
         with pytest.raises(ConfirmationClaimError):
             await rig.pipeline.execute_confirmed(sixth.plan_id, context=context, scoped_trust=True)
-        assert len(rig.attempts) == 5 and db.get_media_watchlist("tmdb", "106", "tv") is None
+        assert len(rig.attempts) == 5 and discovery_repo.get_media_watchlist("tmdb", "106", "tv") is None
         assert (await rig.pipeline.get_pending_plan(owner=OWNER, session_id=SESSION)).plan_id == sixth.plan_id
     asyncio.run(run())
 
@@ -215,7 +215,7 @@ def test_expiry_and_revoke_restore_manual_confirmation(rig):
             await rig.pipeline.execute_confirmed(plan.plan_id, context=context, scoped_trust=True)
         assert rig.attempts == []
         await rig.pipeline.execute_confirmed(plan.plan_id, context=context)
-        assert db.get_media_watchlist("tmdb", "100", "tv") is not None
+        assert discovery_repo.get_media_watchlist("tmdb", "100", "tv") is not None
     asyncio.run(run())
 
 
@@ -232,7 +232,7 @@ def test_handler_failure_spends_once_and_duplicate_never_spends_or_writes_again(
         with pytest.raises(ConfirmationClaimError):
             await rig.pipeline.execute_confirmed(plan.plan_id, context=context, scoped_trust=True)
         assert await rig.remaining() == 4 and len(rig.attempts) == 1
-        assert db.get_media_watchlist("tmdb", "100", "tv") is None
+        assert discovery_repo.get_media_watchlist("tmdb", "100", "tv") is None
     asyncio.run(run())
 
 
@@ -301,16 +301,16 @@ def test_full_session_different_tv_automatic_movie_and_revoked_scope_pause(rig):
         auto = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message="把另一部电视剧也加入探索收藏")))
         assert not any(event.type is Event.EFFECT_APPROVAL_REQUIRED for event in auto)
         assert any(event.type is Event.EFFECT_COMPLETED and event.payload["scoped_trust"]["remaining"] == 4 for event in auto)
-        assert db.get_media_watchlist("tmdb", "501", "tv") is not None
-        assert db.get_media_watchlist("tmdb", "100", "tv") is None
+        assert discovery_repo.get_media_watchlist("tmdb", "501", "tv") is not None
+        assert discovery_repo.get_media_watchlist("tmdb", "100", "tv") is None
         assert await rig.remaining() == 4 and len(rig.attempts) == 1
         movie = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message="把这部电影也加入探索收藏")))
         assert any(event.type is Event.EFFECT_APPROVAL_REQUIRED for event in movie)
-        assert db.get_media_watchlist("tmdb", "502", "movie") is None
+        assert discovery_repo.get_media_watchlist("tmdb", "502", "movie") is None
         await session.set_scoped_trust(owner=OWNER, session_id=SESSION, operation="revoke")
         revoked = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message="把下一部剧加入探索收藏")))
         assert any(event.type is Event.EFFECT_APPROVAL_REQUIRED for event in revoked)
-        assert db.get_media_watchlist("tmdb", "503", "tv") is None
+        assert discovery_repo.get_media_watchlist("tmdb", "503", "tv") is None
         state = await rig.store.load(owner=OWNER, session_id=SESSION)
         assert "scope_digest" not in json.dumps(rig.pipeline.scoped_trust.view(state))
     asyncio.run(run())

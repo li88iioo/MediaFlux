@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules import download_dispatcher
 from app.modules.download_tracker import DownloadTracker
 from tests.support import IsolatedDatabaseTestCase
@@ -27,7 +28,7 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
         qb_status: str = "",
         gy_status: str = "",
     ) -> int:
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             f"torrent-retention:{name}",
             "torrent",
             title=name,
@@ -53,8 +54,8 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
             qb_status="completed",
         )
 
-        self.assertEqual(db.purge_expired_download_request_torrent_data(0), 0)
-        get_download_request_result = db.get_download_request(request_id)
+        self.assertEqual(download_requests_repo.purge_expired_download_request_torrent_data(0), 0)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(
             get_download_request_result["torrent_data"],
@@ -105,7 +106,7 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
             ),
         }
         audited_id = next(iter(clearable))
-        db.add_download_log(
+        download_requests_repo.add_download_log(
             "qb",
             title="保留日志",
             request_id=audited_id,
@@ -113,17 +114,17 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
         )
 
         self.assertEqual(
-            db.purge_expired_download_request_torrent_data(30, limit=50),
+            download_requests_repo.purge_expired_download_request_torrent_data(30, limit=50),
             len(clearable),
         )
 
         for request_id in clearable:
-            row = db.get_download_request(request_id)
+            row = download_requests_repo.get_download_request(request_id)
             assert (row) is not None
             self.assertIsNone(row["torrent_data"])
             self.assertTrue(str(row["source_value"] or "").startswith("magnet:?"))
         for request_id in retained:
-            get_download_request_result_2 = db.get_download_request(request_id)
+            get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
             assert get_download_request_result_2 is not None
             assert (get_download_request_result_2["torrent_data"]) is not None
         with db.get_conn() as conn:
@@ -145,17 +146,17 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
         ]
 
         self.assertEqual(
-            db.purge_expired_download_request_torrent_data(30, limit=2),
+            download_requests_repo.purge_expired_download_request_torrent_data(30, limit=2),
             2,
         )
         remaining = sum(
             1
             for request_id in request_ids
-            if assert_present(db.get_download_request(request_id))["torrent_data"] is not None
+            if assert_present(download_requests_repo.get_download_request(request_id))["torrent_data"] is not None
         )
         self.assertEqual(remaining, 1)
         self.assertEqual(
-            db.purge_expired_download_request_torrent_data(30, limit=2),
+            download_requests_repo.purge_expired_download_request_torrent_data(30, limit=2),
             1,
         )
 
@@ -166,7 +167,7 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
             age_days=60,
             qb_status="failed",
         )
-        self.assertEqual(db.purge_expired_download_request_torrent_data(30), 1)
+        self.assertEqual(download_requests_repo.purge_expired_download_request_torrent_data(30), 1)
 
         with patch(
             "app.modules.download_dispatcher.get",
@@ -175,7 +176,7 @@ class TorrentDataRetentionRepositoryTests(IsolatedDatabaseTestCase):
             ),
         ):
             capabilities = download_dispatcher.download_resubmit_capabilities(
-                db.get_download_request(request_id)
+                download_requests_repo.get_download_request(request_id)
             )
 
         self.assertFalse(capabilities["qb"]["enabled"])
@@ -194,7 +195,7 @@ class TorrentDataRetentionTrackerTests(unittest.TestCase):
             "app.modules.download_tracker.time.monotonic",
             side_effect=[100.0, 101.0],
         ), patch(
-            "app.modules.download_tracker.db.purge_expired_download_request_torrent_data",
+            "app.repositories.download_requests.purge_expired_download_request_torrent_data",
             return_value=4,
         ) as purge:
             self.assertEqual(tracker._run_torrent_data_cleanup_if_due(), 4)
@@ -209,7 +210,7 @@ class TorrentDataRetentionTrackerTests(unittest.TestCase):
                 "app.modules.download_tracker.get",
                 return_value=configured,
             ), patch(
-                "app.modules.download_tracker.db.purge_expired_download_request_torrent_data"
+                "app.repositories.download_requests.purge_expired_download_request_torrent_data"
             ) as purge:
                 self.assertEqual(tracker._run_torrent_data_cleanup_if_due(), 0)
             purge.assert_not_called()

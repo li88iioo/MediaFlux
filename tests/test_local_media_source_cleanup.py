@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_cleanup import delete_cleanup_items
 from app.modules.local_media_service import (
     LocalMediaPostMoveError,
@@ -39,11 +39,11 @@ class LocalMediaSourceCleanupTests(IsolatedDatabaseTestCase):
         self.nested.mkdir(parents=True)
         self.video = self.nested / "Show.S01E01.mkv"
         self.video.write_bytes(b"episode-one")
-        self.source_id = db.create_local_media_source(
+        self.source_id = local_media_repo.create_local_media_source(
             name=f"source-cleanup-{base.name}", qb_profile="", qb_path_prefix="",
             local_root=str(self.source), stable_seconds=0, owner="admin",
         )
-        db.upsert_local_library_target(self.source_id, "tv", str(self.target), owner="admin")
+        local_media_repo.upsert_local_library_target(self.source_id, "tv", str(self.target), owner="admin")
         self.service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(
             tmdb_id="1", title="Show", year="2026", media_type="tv", confidence=1.0,
         ))))
@@ -54,15 +54,15 @@ class LocalMediaSourceCleanupTests(IsolatedDatabaseTestCase):
         )
 
     def _create_task(self, *, selected_path=None, qb_hash=""):
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             self.source_id, qb_hash, str(selected_path or self.selected), owner="admin",
             trigger="qb_completed" if qb_hash else "scan",
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task_id, owner="admin",
             rules_snapshot=self.service._serialize_rules_snapshot(self.rules),
         )
-        self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+        self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
         return task_id
 
     def test_successful_move_removes_nested_source_directories_without_junk(self):
@@ -234,7 +234,7 @@ class LocalMediaSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertTrue(self.selected.is_dir())
         self.assertEqual(list(self.target.rglob("*.mkv")), [])
         self.assertEqual(qb.calls, [("pause", "hash-1"), ("resume", "hash-1")])
-        get_local_media_task_result = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result is not None
         self.assertEqual(get_local_media_task_result.status, "failed")
 
@@ -261,6 +261,6 @@ class LocalMediaSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertEqual(list(self.nested.iterdir()), [])
         self.assertEqual(len(list(self.target.rglob("*.mkv"))), 1)
         self.assertEqual(qb.calls, [("pause", "hash-1")])
-        get_local_media_task_result_2 = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result_2 = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result_2 is not None
         self.assertEqual(get_local_media_task_result_2.status, "requires_manual")

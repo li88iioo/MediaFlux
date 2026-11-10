@@ -8,6 +8,7 @@ import pytest
 import unittest
 from app.repositories.download_requests import download_request_public_summary
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.adapters import TurnView
 from app.agent.kernel.capabilities import ToolCatalog
@@ -191,7 +192,7 @@ def test_direct_submission_receipt_matches_real_dispatch(
         assert result.data["duplicate"] is repeat
         qb.assert_called_once()
         gy.assert_called_once()
-        row = db.get_download_request(request_number)
+        row = download_requests_repo.get_download_request(request_number)
         assert row is not None
         assert row["qb_status"] == ("submitted" if qb_ok else "failed")
         assert row["gy_status"] == ("submitted" if gy_ok else "failed")

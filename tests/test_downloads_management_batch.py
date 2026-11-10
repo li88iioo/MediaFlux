@@ -12,6 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.config import web_credentials
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
@@ -53,7 +54,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _attention(key: str) -> int:
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             key,
             "magnet",
             title=key,
@@ -62,7 +63,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         )
         if not created:
             raise AssertionError("测试下载请求未创建")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="failed",
             qb_status="failed",
@@ -73,14 +74,14 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
     def test_batch_clear_issues_preserves_requests_logs_tasks_and_files_boundary(self):
         first = self._attention("batch-clear:first")
         second = self._attention("batch-clear:second")
-        normal, created = db.create_download_request(
+        normal, created = download_requests_repo.create_download_request(
             "batch-clear:normal",
             "magnet",
             title="normal",
             source_value=f"magnet:?xt=urn:btih:{'b' * 40}",
         )
         self.assertTrue(created)
-        log_id = db.add_download_log("qb", title="audit", request_id=first)
+        log_id = download_requests_repo.add_download_log("qb", title="audit", request_id=first)
 
         response = self.client.post(
             "/api/downloads/issues/batch/clear",
@@ -96,23 +97,23 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
             "already_cleared": 0,
             "skipped": 2,
         })
-        assert (db.get_download_request(first)) is not None
-        assert (db.get_download_request(second)) is not None
-        self.assertEqual(db.count_download_requests_requiring_attention(), 0)
-        self.assertEqual(db.count_download_logs(), 1)
-        self.assertEqual(db.list_download_logs()[0]["id"], log_id)
-        self.assertIn("批量", assert_present(db.get_download_request(first))["attention_clear_note"])
+        assert (download_requests_repo.get_download_request(first)) is not None
+        assert (download_requests_repo.get_download_request(second)) is not None
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
+        self.assertEqual(download_requests_repo.count_download_logs(), 1)
+        self.assertEqual(download_requests_repo.list_download_logs()[0]["id"], log_id)
+        self.assertIn("批量", assert_present(download_requests_repo.get_download_request(first))["attention_clear_note"])
 
     def test_batch_clear_uses_bounded_sql_and_preserves_all_other_fields(self):
         request_ids = [self._attention(f"query-budget:{index}") for index in range(80)]
         self.assertEqual(
-            db.clear_download_request_attentions(request_ids[30:50])["cleared"],
+            download_requests_repo.clear_download_request_attentions(request_ids[30:50])["cleared"],
             request_ids[30:50],
         )
         for request_id in request_ids[50:]:
-            db.update_download_request(request_id, status="pending", qb_status="")
-        before = {request_id: dict(assert_present(db.get_download_request(request_id))) for request_id in request_ids}
-        log_id = db.add_download_log("qb", title="审计记录", request_id=request_ids[0])
+            download_requests_repo.update_download_request(request_id, status="pending", qb_status="")
+        before = {request_id: dict(assert_present(download_requests_repo.get_download_request(request_id))) for request_id in request_ids}
+        log_id = download_requests_repo.add_download_log("qb", title="审计记录", request_id=request_ids[0])
         headers = self._headers()
         statements = []
         original_connect = db._connect
@@ -133,7 +134,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
             "already_cleared": 20, "skipped": 50,
         })
         for request_id, original in before.items():
-            get_download_request_result_3 = db.get_download_request(request_id)
+            get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
             assert get_download_request_result_3 is not None
             current = dict(get_download_request_result_3)
             if request_id in request_ids[:30]:
@@ -142,7 +143,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
                 for field in ("attention_cleared_at", "attention_clear_note", "updated_at"):
                     current[field] = original[field]
             self.assertEqual(current, original)
-        self.assertEqual([row["id"] for row in db.list_download_logs()], [log_id])
+        self.assertEqual([row["id"] for row in download_requests_repo.list_download_logs()], [log_id])
         queries = [sql for sql in statements if "download_requests" in sql.lower()
                    and sql.lstrip().upper().startswith(("SELECT", "UPDATE"))]
         self.assertLessEqual(len(queries), 2, f"100条记录执行了{len(queries)}条下载请求SQL")
@@ -157,18 +158,18 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
             "ok": True, "request_id": request_id,
             "already_cleared": False, "message": "已移出待处理",
         })
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(
             get_download_request_result["attention_clear_note"],
             "用户已将本记录移出待处理；原状态、错误与下载日志均保留",
         )
-        get_download_request_result_4 = db.get_download_request(request_id)
+        get_download_request_result_4 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_4 is not None
         snapshot = dict(get_download_request_result_4)
         repeated = self.client.post(path, headers=headers)
         self.assertEqual(repeated.json(), {**first.json(), "already_cleared": True})
-        get_download_request_result_5 = db.get_download_request(request_id)
+        get_download_request_result_5 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_5 is not None
         self.assertEqual(dict(get_download_request_result_5), snapshot)
         for missing in (0, -1, 999999):
@@ -178,7 +179,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
 
     def test_batch_clear_sql_failure_rolls_back_every_record(self):
         ids = [self._attention(f"clear-rollback:{index}") for index in range(3)]
-        before = [dict(assert_present(db.get_download_request(request_id))) for request_id in ids]
+        before = [dict(assert_present(download_requests_repo.get_download_request(request_id))) for request_id in ids]
         with db.get_conn() as conn:
             conn.execute(
                 "CREATE TRIGGER reject_attention_clear BEFORE UPDATE OF attention_cleared_at "
@@ -187,8 +188,8 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
             )
         try:
             with self.assertRaisesRegex(sqlite3.IntegrityError, "synthetic write failure"):
-                db.clear_download_request_attentions(ids)
-            self.assertEqual([dict(assert_present(db.get_download_request(request_id))) for request_id in ids], before)
+                download_requests_repo.clear_download_request_attentions(ids)
+            self.assertEqual([dict(assert_present(download_requests_repo.get_download_request(request_id))) for request_id in ids], before)
         finally:
             with db.get_conn() as conn:
                 conn.execute("DROP TRIGGER reject_attention_clear")
@@ -201,7 +202,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         def clear(batch):
             try:
                 gate.wait(timeout=5)
-                results.append((batch, db.clear_download_request_attentions(
+                results.append((batch, download_requests_repo.clear_download_request_attentions(
                     ids if batch else ids[:1], batch=batch,
                 )))
             except Exception as exc:
@@ -219,7 +220,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(sum(len(result["already_cleared"]) for _, result in results), 1)
         for batch, result in results:
             for request_id in result["cleared"]:
-                get_download_request_result_2 = db.get_download_request(request_id)
+                get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result_2 is not None
                 self.assertEqual(
                     get_download_request_result_2["attention_clear_note"],
@@ -228,9 +229,9 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
 
     def test_batch_clear_logs_deletes_only_selected_audit_rows(self):
         request_id = self._attention("batch-log:request")
-        first = db.add_download_log("qb", title="first", request_id=request_id)
-        second = db.add_download_log("guangya", title="second", request_id=request_id)
-        third = db.add_download_log("qb", title="third", request_id=request_id)
+        first = download_requests_repo.add_download_log("qb", title="first", request_id=request_id)
+        second = download_requests_repo.add_download_log("guangya", title="second", request_id=request_id)
+        third = download_requests_repo.add_download_log("qb", title="third", request_id=request_id)
 
         response = self.client.post(
             "/api/downloads/logs/batch/clear",
@@ -245,12 +246,12 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
             "deleted": 2,
             "missing": 1,
         })
-        self.assertEqual([int(row["id"]) for row in db.list_download_logs()], [third])
-        assert (db.get_download_request(request_id)) is not None
-        self.assertEqual(db.count_download_requests_requiring_attention(), 1)
+        self.assertEqual([int(row["id"]) for row in download_requests_repo.list_download_logs()], [third])
+        assert (download_requests_repo.get_download_request(request_id)) is not None
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
 
     def test_log_page_is_clamped_after_last_page_batch_cleanup(self):
-        log_ids = [db.add_download_log("qb", title=f"log-{index}") for index in range(21)]
+        log_ids = [download_requests_repo.add_download_log("qb", title=f"log-{index}") for index in range(21)]
         headers = self._headers()
         before = self.client.get(
             "/api/downloads/logs?page=2&page_size=20",
@@ -280,23 +281,23 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
 
     def test_filtered_log_clear_spans_pages_and_preserves_new_logs_requests_and_files(self):
         request_id = self._attention("filtered-clear")
-        original = dict(assert_present(db.get_download_request(request_id)))
+        original = dict(assert_present(download_requests_repo.get_download_request(request_id)))
         media = db.resolve_db_path().with_name("preserved.mkv")
         media.write_bytes(b"downloaded media")
         matching = [
-            db.add_download_log("guangya_share", status="failed", request_id=request_id,
+            download_requests_repo.add_download_log("guangya_share", status="failed", request_id=request_id,
                                 title=title, path=path, backend_task_id=backend, error=error)
             for title, path, backend, error in (
                 ("needle", "", "", ""), ("", "needle", "", ""),
                 ("", "", "needle", ""), ("", "", "", "needle"),
             )
         ]
-        matching.extend(db.add_download_log("guangya_share", title="needle", status="failed",
+        matching.extend(download_requests_repo.add_download_log("guangya_share", title="needle", status="failed",
                                             request_id=request_id) for _ in range(101))
         preserved = [
-            db.add_download_log("qb", title="needle", status="failed"),
-            db.add_download_log("guangya_share", title="needle", status="success"),
-            db.add_download_log("guangya_share", title="other", status="failed"),
+            download_requests_repo.add_download_log("qb", title="needle", status="failed"),
+            download_requests_repo.add_download_log("guangya_share", title="needle", status="success"),
+            download_requests_repo.add_download_log("guangya_share", title="other", status="failed"),
         ]
         filters = {"source": "guangya_share", "status": "failed", "keyword": " needle "}
         headers = self._headers()
@@ -305,7 +306,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         self.assertEqual((page["total"], page["pages"], page["page"]), (105, 6, 3))
         self.assertEqual(page["through_id"], matching[-1])
         self.assertGreater(page["through_id"], page["items"][0]["id"])
-        newer = db.add_download_log("guangya_share", title="needle", status="failed")
+        newer = download_requests_repo.add_download_log("guangya_share", title="needle", status="failed")
 
         with patch("app.routes.downloads_api.remove_qb_tasks") as remove, patch(
             "app.routes.downloads_api._qb"
@@ -315,8 +316,8 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
                                               "through_id": page["through_id"]})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"ok": True, "requested": 105, "deleted": 105, "missing": 0})
-        self.assertEqual({row["id"] for row in db.list_download_logs()}, {*preserved, newer})
-        self.assertEqual(dict(assert_present(db.get_download_request(request_id))), original)
+        self.assertEqual({row["id"] for row in download_requests_repo.list_download_logs()}, {*preserved, newer})
+        self.assertEqual(dict(assert_present(download_requests_repo.get_download_request(request_id))), original)
         self.assertEqual(media.read_bytes(), b"downloaded media")
         remove.assert_not_called()
         backend.assert_not_called()
@@ -326,7 +327,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(after["through_id"], newer)
 
     def test_filtered_log_clear_requires_explicit_filters_and_integer_snapshot(self):
-        log_id = db.add_download_log("qb", title="keep")
+        log_id = download_requests_repo.add_download_log("qb", title="keep")
         headers = self._headers()
         valid = {"scope": "filtered", "source": "", "status": "", "keyword": "", "through_id": log_id}
         invalid: list[dict[str, Any]] = [
@@ -344,28 +345,28 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
             with self.subTest(body=body):
                 response = self.client.post("/api/downloads/logs/batch/clear", headers=headers, json=body)
                 self.assertEqual(response.status_code, 400)
-                self.assertEqual(db.count_download_logs(), 1)
+                self.assertEqual(download_requests_repo.count_download_logs(), 1)
 
     def test_empty_snapshot_and_explicit_unfiltered_clear_do_not_delete_newer_logs(self):
         headers = self._headers()
         filters = {"scope": "filtered", "source": "", "status": "", "keyword": ""}
         empty = self.client.get("/api/downloads/logs", headers=headers).json()
         self.assertEqual((empty["through_id"], empty["total"], empty["pages"], empty["page"]), (0, 0, 0, 1))
-        first = db.add_download_log("qb", title="first")
+        first = download_requests_repo.add_download_log("qb", title="first")
         cleared = self.client.post("/api/downloads/logs/batch/clear", headers=headers,
                                    json={**filters, "through_id": 0})
         self.assertEqual(cleared.json(), {"ok": True, "requested": 0, "deleted": 0, "missing": 0})
-        self.assertEqual(db.count_download_logs(), 1)
+        self.assertEqual(download_requests_repo.count_download_logs(), 1)
         snapshot = self.client.get("/api/downloads/logs", headers=headers).json()
         self.assertEqual(snapshot["through_id"], first)
-        newer = db.add_download_log("guangya", title="newer", status="success")
+        newer = download_requests_repo.add_download_log("guangya", title="newer", status="success")
         response = self.client.post("/api/downloads/logs/batch/clear", headers=headers,
                                     json={**filters, "through_id": snapshot["through_id"]})
         self.assertEqual(response.json()["deleted"], 1)
-        self.assertEqual([row["id"] for row in db.list_download_logs()], [newer])
+        self.assertEqual([row["id"] for row in download_requests_repo.list_download_logs()], [newer])
 
     def test_log_page_metadata_and_items_share_a_read_snapshot(self):
-        first = db.add_download_log("qb", title="visible")
+        first = download_requests_repo.add_download_log("qb", title="visible")
         headers = self._headers()
         original_connect = db._connect
         inserted = []
@@ -390,7 +391,7 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(inserted), 1)
         self.assertEqual((page["total"], page["through_id"]), (1, first))
         self.assertEqual([item["id"] for item in page["items"]], [first])
-        self.assertEqual(db.count_download_logs(), 2)
+        self.assertEqual(download_requests_repo.count_download_logs(), 2)
 
     def test_batch_resubmit_contains_partial_failures_and_skips(self):
         succeeded_id = self._attention("batch-resubmit:succeeded")

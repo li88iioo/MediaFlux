@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import media_subscriptions as media_subscriptions_repo
+from app.repositories import discovery as discovery_repo
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
 
@@ -34,16 +36,16 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(empty, {"items": [], "total": 0, "has_more": False, "next": None})
             self.assertEqual(self.client.get("/api/subscriptions/watchlist").json(), empty)
             for number in range(1, 202):
-                db.add_media_subscription(provider="tmdb", external_id=str(number), tmdb_id=str(number), media_type="tv", title=f"Test {number}")
+                media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id=str(number), tmdb_id=str(number), media_type="tv", title=f"Test {number}")
                 if number == 200:
                     boundary = self.client.get("/api/subscriptions/media").json()
                     self.assertEqual((len(boundary["items"]), boundary["has_more"], boundary["next"]), (200, False, None))
             for number in [*range(2, 502), 1]:
-                db.add_media_watchlist("tmdb", str(number), "tv", f"Test {number}", "2026", "")
+                discovery_repo.add_media_watchlist("tmdb", str(number), "tv", f"Test {number}", "2026", "")
             media = self.client.get("/api/subscriptions/media?limit=200").json()
             self.assertEqual((len(media["items"]), media["total"], media["has_more"]), (200, 201, True))
             # 页间新增以及删除已读项不能让 offset 漂移而漏掉旧订阅。
-            db.add_media_subscription(provider="tmdb", external_id="202", tmdb_id="202", media_type="tv", title="New")
+            media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id="202", tmdb_id="202", media_type="tv", title="New")
             with db.get_conn() as conn:
                 conn.execute("UPDATE media_subscriptions SET deleted_at=? WHERE id=?", (db.now(), media["items"][0]["id"]))
             last = self.client.get("/api/subscriptions/media", params=media["next"]).json()
@@ -56,8 +58,8 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
             oldest = next(item for item in watch["items"] if item["external_id"] == "1")
             self.assertEqual(oldest["subscription"]["tmdb_id"], "1")
             seen = [item["external_id"] for item in watch["items"]]
-            db.add_media_watchlist("tmdb", "9999", "tv", "New", "2026", "")
-            db.delete_media_watchlist("tmdb", watch["items"][1]["external_id"], "tv")
+            discovery_repo.add_media_watchlist("tmdb", "9999", "tv", "New", "2026", "")
+            discovery_repo.delete_media_watchlist("tmdb", watch["items"][1]["external_id"], "tv")
             while watch["has_more"]:
                 watch = self.client.get("/api/subscriptions/watchlist", params=watch["next"]).json()
                 seen.extend(item["external_id"] for item in watch["items"])
@@ -157,15 +159,15 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         service.check_subscription.assert_awaited_once_with(7, trigger="manual")
         service.delete_subscription.assert_called_once_with(7)
 
-        subscription_id = db.add_media_subscription(
+        subscription_id = media_subscriptions_repo.add_media_subscription(
             provider="tmdb", external_id="86034", tmdb_id="86034", media_type="tv",
             title="平凡职业造就世界最强",
         )
-        other_id = db.add_media_subscription(
+        other_id = media_subscriptions_repo.add_media_subscription(
             provider="tmdb", external_id="127532", tmdb_id="127532", media_type="tv",
             title="我独自升级",
         )
-        candidate_id = db.replace_media_subscription_candidates(
+        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
             other_id,
             "tmdb:127532:tv:S01E001",
             season=1,
@@ -209,7 +211,7 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
             "app.routes.subscriptions_api.get_media_subscription_service",
             return_value=service,
         ), patch(
-            "app.routes.subscriptions_api.db.list_media_external_ids",
+            "app.repositories.discovery.list_media_external_ids",
             return_value={},
         ) as batch_lookup:
             response = self.client.get("/api/subscriptions/watchlist", headers=headers)
@@ -239,7 +241,7 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         with patch("app.routes.subscriptions_api.get_discovery_service", return_value=discovery), patch(
             "app.routes.subscriptions_api.get_media_subscription_service", return_value=service
         ), patch(
-            "app.routes.subscriptions_api.db.get_media_watchlist",
+            "app.repositories.discovery.get_media_watchlist",
             return_value=watchlist[0],
         ), patch("app.routes.subscriptions_api._wake_scheduler"):
             pending = self.client.post(
@@ -265,7 +267,7 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         with patch("app.routes.subscriptions_api.get_discovery_service", return_value=discovery), patch(
             "app.routes.subscriptions_api.get_media_subscription_service", return_value=service
         ), patch(
-            "app.routes.subscriptions_api.db.get_media_watchlist",
+            "app.repositories.discovery.get_media_watchlist",
             return_value=watchlist[0],
         ), patch("app.routes.subscriptions_api._wake_scheduler"):
             created = self.client.post(
@@ -440,9 +442,7 @@ class SubscriptionMappingAsyncContractTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 subscriptions_api, "get_discovery_service", return_value=discovery
             ),
-            patch.object(
-                subscriptions_api.db,
-                "get_media_watchlist",
+            patch("app.repositories.discovery.get_media_watchlist",
                 return_value=self._watchlist()[0],
             ),
         ):
@@ -490,9 +490,7 @@ class SubscriptionMappingAsyncContractTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 subscriptions_api, "get_discovery_service", return_value=discovery
             ),
-            patch.object(
-                subscriptions_api.db,
-                "get_media_watchlist",
+            patch("app.repositories.discovery.get_media_watchlist",
                 return_value=self._watchlist()[0],
             ),
             patch.object(

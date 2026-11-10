@@ -151,7 +151,7 @@ class DiscoveryDatabaseTests(unittest.TestCase):
                         )
                     }
                     self.assertTrue({"discovery_cache", "media_external_ids", "media_watchlist"} <= tables)
-                    database.add_media_watchlist("tmdb", "1", "movie", "A", "2026", "poster")
+                    discovery_repository.add_media_watchlist("tmdb", "1", "movie", "A", "2026", "poster")
                     with self.assertRaises(sqlite3.IntegrityError):
                         conn.execute(
                             "INSERT INTO media_watchlist(provider,external_id,media_type,title,year,poster_key,created_at) "
@@ -182,21 +182,21 @@ class DiscoveryDatabaseTests(unittest.TestCase):
             test_db = Path(root) / "discovery.db"
             with patch("app.database.DB_PATH", test_db):
                 database.init_db()
-                database.add_media_watchlist("bangumi", "42", "tv", "番组", "2026", "bgm/42")
-                database.add_media_watchlist("bangumi", "42", "tv", "番组更新", "2026", "bgm/42")
-                self.assertEqual(database.list_media_watchlist_keys([("bangumi", "42", "tv")]), {"bangumi:tv:42"})
-                self.assertEqual(len(database.list_media_watchlist()), 1)
-                self.assertTrue(database.delete_media_watchlist("bangumi", "42", "tv"))
-                self.assertFalse(database.delete_media_watchlist("bangumi", "42", "tv"))
+                discovery_repository.add_media_watchlist("bangumi", "42", "tv", "番组", "2026", "bgm/42")
+                discovery_repository.add_media_watchlist("bangumi", "42", "tv", "番组更新", "2026", "bgm/42")
+                self.assertEqual(discovery_repository.list_media_watchlist_keys([("bangumi", "42", "tv")]), {"bangumi:tv:42"})
+                self.assertEqual(len(discovery_repository.list_media_watchlist()), 1)
+                self.assertTrue(discovery_repository.delete_media_watchlist("bangumi", "42", "tv"))
+                self.assertFalse(discovery_repository.delete_media_watchlist("bangumi", "42", "tv"))
 
-                database.upsert_media_external_id("douban", "7", "movie", "550", "Movie", "1999", 0.95, False)
-                database.upsert_media_external_id("douban", "7", "movie", "551", "Wrong", "2000", 0.99, False)
-                row = database.get_media_external_id("douban", "7", "movie")
+                discovery_repository.upsert_media_external_id("douban", "7", "movie", "550", "Movie", "1999", 0.95, False)
+                discovery_repository.upsert_media_external_id("douban", "7", "movie", "551", "Wrong", "2000", 0.99, False)
+                row = discovery_repository.get_media_external_id("douban", "7", "movie")
                 assert row is not None
                 self.assertEqual(row["tmdb_id"], "551")
-                database.upsert_media_external_id("douban", "7", "movie", "550", "Confirmed", "1999", 1.0, True)
-                database.upsert_media_external_id("douban", "7", "movie", "999", "Auto", "2020", 1.0, False)
-                row = database.get_media_external_id("douban", "7", "movie")
+                discovery_repository.upsert_media_external_id("douban", "7", "movie", "550", "Confirmed", "1999", 1.0, True)
+                discovery_repository.upsert_media_external_id("douban", "7", "movie", "999", "Auto", "2020", 1.0, False)
+                row = discovery_repository.get_media_external_id("douban", "7", "movie")
                 assert row is not None
                 self.assertEqual((row["tmdb_id"], row["confirmed"]), ("550", 1))
 
@@ -209,11 +209,11 @@ class DiscoveryDatabaseTests(unittest.TestCase):
                     "tmdb", "42", "tv", "Original", "2026", "poster", expected_absent=True,
                 )
                 self.assertIsNotNone(number)
-                snapshot = discovery_repository.media_watchlist_snapshot(database.get_media_watchlist_by_id(number))
+                snapshot = discovery_repository.media_watchlist_snapshot(discovery_repository.get_media_watchlist_by_id(number))
                 self.assertIsNone(discovery_repository.add_media_watchlist(
                     "tmdb", "42", "tv", "Overwrite", expected_absent=True,
                 ))
-                saved = database.get_media_watchlist_by_id(number)
+                saved = discovery_repository.get_media_watchlist_by_id(number)
                 assert saved is not None
                 self.assertEqual(saved["title"], "Original")
                 with database.get_conn() as conn:
@@ -221,7 +221,7 @@ class DiscoveryDatabaseTests(unittest.TestCase):
                 self.assertFalse(discovery_repository.delete_media_watchlist(
                     "tmdb", "42", "tv", expected_snapshot=snapshot,
                 ))
-                current = discovery_repository.media_watchlist_snapshot(database.get_media_watchlist_by_id(number))
+                current = discovery_repository.media_watchlist_snapshot(discovery_repository.get_media_watchlist_by_id(number))
                 with database.get_conn() as conn:
                     conn.execute("UPDATE media_watchlist SET external_id='43' WHERE id=?", (number,))
                 self.assertFalse(discovery_repository.delete_media_watchlist(
@@ -229,14 +229,14 @@ class DiscoveryDatabaseTests(unittest.TestCase):
                 ))
                 with database.get_conn() as conn:
                     conn.execute("UPDATE media_watchlist SET external_id='42' WHERE id=?", (number,))
-                self.assertTrue(database.delete_media_watchlist("tmdb", "42", "tv"))
+                self.assertTrue(discovery_repository.delete_media_watchlist("tmdb", "42", "tv"))
                 replacement = discovery_repository.add_media_watchlist("tmdb", "42", "tv", "Original", "2026", "poster")
                 assert replacement is not None
                 self.assertNotEqual(replacement, number)
                 self.assertFalse(discovery_repository.delete_media_watchlist(
                     "tmdb", "42", "tv", expected_snapshot=snapshot,
                 ))
-                current = discovery_repository.media_watchlist_snapshot(database.get_media_watchlist_by_id(replacement))
+                current = discovery_repository.media_watchlist_snapshot(discovery_repository.get_media_watchlist_by_id(replacement))
                 self.assertTrue(discovery_repository.delete_media_watchlist(
                     "tmdb", "42", "tv", expected_snapshot=current,
                 ))
@@ -295,7 +295,7 @@ class DiscoveryCacheTests(unittest.TestCase):
     def test_detail_metadata_ignores_malformed_or_mismatched_cache_payload(self):
         identity = ("douban", "movie", "42")
         key = self.cache.make_detail_key(*identity)
-        database.upsert_discovery_cache(
+        discovery_repository.upsert_discovery_cache(
             key, identity[0], "not-json", self.now.strftime("%Y-%m-%d %H:%M:%S"),
             (self.now + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S"),
             (self.now + timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S"),
@@ -378,7 +378,7 @@ class DiscoveryCacheTests(unittest.TestCase):
 
     def test_malformed_payload_is_a_cache_miss(self):
         key = "bad"
-        database.upsert_discovery_cache(
+        discovery_repository.upsert_discovery_cache(
             key, "tmdb", "{bad json", self.now.strftime("%Y-%m-%d %H:%M:%S"),
             (self.now + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S"),
             (self.now + timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S"), "",
@@ -408,7 +408,7 @@ class DiscoveryCacheTests(unittest.TestCase):
                 rows,
             )
 
-        deleted = database.purge_discovery_cache(
+        deleted = discovery_repository.purge_discovery_cache(
             "2026-07-25 12:00:00", max_rows=1, batch_size=10
         )
 
@@ -423,7 +423,7 @@ class DiscoveryCacheTests(unittest.TestCase):
         self.assertEqual(remaining, ["new-live"])
 
     def test_cache_maintenance_is_rate_limited(self):
-        with patch.object(database, "purge_discovery_cache") as purge:
+        with patch.object(discovery_repository, "purge_discovery_cache") as purge:
             self.cache.set_success(
                 "one", "tmdb", {"items": []},
                 ttl_seconds=60, stale_seconds=120,

@@ -21,6 +21,7 @@ from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.agent.kernel.ux_display import next_actions_view
 from app.modules import workspace
+from app.repositories import local_media as local_media_repo
 from tests.support import isolated_test_database
 
 
@@ -115,9 +116,7 @@ def test_partial_sources_keep_data_actions_and_unknown_connection_counts(
         "get_dashboard_automation_summary",
         lambda: {"downloads_review": 2},
     )
-    monkeypatch.setattr(
-        workspace.db,
-        "get_local_media_diagnostic_summary",
+    monkeypatch.setattr("app.repositories.local_media.get_local_media_diagnostic_summary",
         Mock(side_effect=RuntimeError("token=PRIVATE")),
     )
     monkeypatch.setattr(
@@ -195,14 +194,12 @@ def test_probe_preserves_full_connection_payload_and_offline_is_attention(
 def test_all_failed_sources_are_unavailable_and_no_healthy_claim(
     local_workspace, monkeypatch
 ):
-    for name in (
-        "get_dashboard_automation_summary",
-        "get_local_media_diagnostic_summary",
-        "get_agent_persistent_health_summary",
+    for owner, name in (
+        (workspace.db, "get_dashboard_automation_summary"),
+        (local_media_repo, "get_local_media_diagnostic_summary"),
+        (workspace.db, "get_agent_persistent_health_summary"),
     ):
-        monkeypatch.setattr(
-            workspace.db, name, Mock(side_effect=RuntimeError("unavailable"))
-        )
+        monkeypatch.setattr(owner, name, Mock(side_effect=RuntimeError("unavailable")))
     monkeypatch.setattr(workspace, "source_readiness", Mock(side_effect=RuntimeError))
     monkeypatch.setattr(
         workspace.diagnostics, "configuration", Mock(side_effect=RuntimeError)

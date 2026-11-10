@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from app.modules.scheduler import STRMScheduler
@@ -49,7 +49,7 @@ class RefreshFixesTests(unittest.TestCase):
                     stats = strm.sync_strm("source", "http://play.invalid", root,
                                            client=cast(GuangYaClient, Cloud("NewSeries")), clean_empty_dirs=False)
                 strm.finalize_changed_paths(stats)
-                new = Path(db.list_strm_index("guangya:source")[0]["strm_path"])
+                new = Path(strm_repo.list_strm_index("guangya:source")[0]["strm_path"])
                 self.assertFalse(old.exists())
                 self.assertTrue(new.is_file())
                 self.assertEqual(stats["cleaned"], 1)
@@ -57,7 +57,7 @@ class RefreshFixesTests(unittest.TestCase):
                 with patch("app.modules.scheduler.get", side_effect=lambda k, d="": root if k == "STRM_ROOT" else d):
                     STRMScheduler._refresh_media_servers(changed_paths=stats["changed_strm_paths"],
                         changed_dirs=stats["changed_dirs"], persist_only=True)
-                self.assertEqual({e["path"] for e in db.list_strm_refresh_entries()},
+                self.assertEqual({e["path"] for e in strm_repo.list_strm_refresh_entries()},
                                  {str(old.parent), str(new.parent)})
 
     def test_C01_failed_move_does_not_report_deleted_old_directory(self):
@@ -71,7 +71,7 @@ class RefreshFixesTests(unittest.TestCase):
             self.assertTrue(old.is_file())
             self.assertEqual(stats["failed"], 1)
             self.assertEqual(stats["changed_strm_paths"], [])
-            self.assertEqual(db.list_strm_index("guangya:source")[0]["strm_path"], str(old))
+            self.assertEqual(strm_repo.list_strm_index("guangya:source")[0]["strm_path"], str(old))
 
     def test_C02_saturation_persists_exact_batches_and_bounds_in_memory_samples(self):
         with isolated_test_database(), tempfile.TemporaryDirectory() as root:
@@ -79,14 +79,14 @@ class RefreshFixesTests(unittest.TestCase):
             stats = {}
             for i in range(5300):
                 strm._record_changed_path(stats, source_root / f"Library{i}" / "E.strm",
-                                          on_refresh_paths=db.enqueue_strm_refresh_paths)
+                                          on_refresh_paths=strm_repo.enqueue_strm_refresh_paths)
             strm.finalize_changed_paths(stats)
             self.assertLessEqual(len(stats["changed_strm_paths"]), 5000)
             self.assertLessEqual(len(stats["changed_overflow_dirs"]), 256)
             self.assertEqual(stats["changed_paths_omitted"], 300)
             self.assertNotIn(str(source_root), stats["changed_dirs"])
             self.assertNotIn(str(source_root.parent), stats["changed_dirs"])
-            persisted = {entry["path"] for entry in db.list_strm_refresh_entries()}
+            persisted = {entry["path"] for entry in strm_repo.list_strm_refresh_entries()}
             self.assertEqual(len(persisted), 257)
             self.assertEqual(persisted | set(stats["changed_dirs"]),
                              {str(source_root / f"Library{i}") for i in range(5300)})
@@ -97,12 +97,12 @@ class RefreshFixesTests(unittest.TestCase):
             changed = [Path(root) / strm.STRM_SUBDIR / f"Library{i}" / "E.strm" for i in range(6)]
             with patch.object(strm, "_MAX_TRACKED_CHANGED_PATHS", 1), patch.object(strm, "_MAX_TRACKED_OVERFLOW_DIRS", 1):
                 for path in changed:
-                    strm._record_changed_path(stats, path, on_refresh_paths=db.enqueue_strm_refresh_paths)
+                    strm._record_changed_path(stats, path, on_refresh_paths=strm_repo.enqueue_strm_refresh_paths)
             strm.finalize_changed_paths(stats)
             with patch("app.modules.scheduler.get", side_effect=lambda k, d="": root if k == "STRM_ROOT" else d):
                 STRMScheduler._refresh_media_servers(changed_paths=stats["changed_strm_paths"],
                     changed_dirs=stats["changed_dirs"], persist_only=True)
-            queued = {entry["path"] for entry in db.list_strm_refresh_entries()}
+            queued = {entry["path"] for entry in strm_repo.list_strm_refresh_entries()}
             self.assertTrue(all(any(str(path.parent) == q or str(path.parent).startswith(q + "/") for q in queued)
                                 for path in changed), f"漏刷新：{queued}")
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules.download_tracker import _TRACKER_CURSOR_KEY, DownloadTracker
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
@@ -26,8 +27,8 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
             self.addCleanup(mock.stop)
 
     def _request(self, title: str) -> int:
-        request_id, _ = db.create_download_request(title, "magnet", title=title)
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request(title, "magnet", title=title)
+        download_requests_repo.update_download_request(
             request_id, status="submitted", qb_status="submitted", qb_task_id=title,
         )
         return request_id
@@ -43,10 +44,10 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
             DownloadTracker, "_qb_tasks", return_value=(True, [self._task("bad", "invalid"), self._task("good")]),
         ):
             self.assertEqual(DownloadTracker().run_once(), 2)
-        get_download_request_result = db.get_download_request(bad)
+        get_download_request_result = download_requests_repo.get_download_request(bad)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["qb_status"], "submitted")
-        get_download_request_result_2 = db.get_download_request(good)
+        get_download_request_result_2 = download_requests_repo.get_download_request(good)
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2["qb_status"], "downloading")
         self.assertEqual(db.kv_get(_TRACKER_CURSOR_KEY), str(good))
@@ -57,10 +58,10 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
         ):
             self.assertEqual(DownloadTracker().run_once(), 2)
             self.assertEqual(DownloadTracker().run_once(), 2)
-        get_download_request_result_3 = db.get_download_request(bad)
+        get_download_request_result_3 = download_requests_repo.get_download_request(bad)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["qb_status"], "downloading")
-        get_download_request_result_4 = db.get_download_request(good)
+        get_download_request_result_4 = download_requests_repo.get_download_request(good)
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["qb_status"], "downloading")
 
@@ -82,7 +83,7 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
         ):
             self.assertEqual(DownloadTracker().run_once(), 2)
         self.assertEqual(seen, [first, second])
-        get_download_request_result_5 = db.get_download_request(second)
+        get_download_request_result_5 = download_requests_repo.get_download_request(second)
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5["qb_status"], "downloading")
         self.assertEqual(db.kv_get(_TRACKER_CURSOR_KEY), str(second))
@@ -91,7 +92,7 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
         for final_state, expected in (("failed", "failed"), ("completed", "manual_review")):
             with self.subTest(final_state=final_state), isolated_test_database():
                 request_id = self._request("gy-batch")
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     request_id, targets="guangya", qb_status="", gy_status="submitted",
                     gy_task_id="gy-1", gy_task_ids='["gy-1","gy-2"]', gy_batch_count=2,
                 )
@@ -105,11 +106,11 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
                     patch.object(DownloadTracker, "_start_organize") as organize,
                 ):
                     self.assertEqual(DownloadTracker().run_once(), 1)
-                    get_download_request_result_6 = db.get_download_request(request_id)
+                    get_download_request_result_6 = download_requests_repo.get_download_request(request_id)
                     assert get_download_request_result_6 is not None
                     self.assertEqual(get_download_request_result_6["gy_status"], "downloading")
                     self.assertEqual(DownloadTracker().run_once(), 1)
-                get_download_request_result_7 = db.get_download_request(request_id)
+                get_download_request_result_7 = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result_7 is not None
                 self.assertEqual(get_download_request_result_7["gy_status"], expected)
                 self.assertEqual(tasks.call_count, 2)

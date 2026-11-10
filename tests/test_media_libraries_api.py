@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app import config
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.main import create_app
 from app.routes import media_libraries_api
 from app.modules.media_server_profiles import MediaServerProfile
@@ -292,7 +292,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             target_root = base / "library" / "动漫"
             source_root.mkdir(parents=True)
             target_root.mkdir(parents=True)
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="本地下载-保存", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), owner="admin",
             )
@@ -324,7 +324,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                     },
                 )
         self.assertEqual(response.status_code, 200, response.text)
-        targets = db.list_local_library_targets(source_id, owner="admin")
+        targets = local_media_repo.list_local_library_targets(source_id, owner="admin")
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].path, str(target_root))
         self.assertEqual(targets[0].server_path, "//NAS/媒体/动漫")
@@ -342,7 +342,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             target_root = base / "library-unbound"
             source_root.mkdir()
             target_root.mkdir()
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="本地下载-未绑定", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), owner="admin",
             )
@@ -364,7 +364,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("必须选择 Jellyfin 或 Emby", response.text)
-        self.assertEqual(db.list_local_library_targets(source_id, owner="admin"), [])
+        self.assertEqual(local_media_repo.list_local_library_targets(source_id, owner="admin"), [])
 
     def test_unified_save_rolls_back_local_bindings_when_config_save_fails(self):
         csrf = self.login()
@@ -377,11 +377,11 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             source_root.mkdir(parents=True)
             old_target.mkdir(parents=True)
             new_target.mkdir(parents=True)
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="本地下载-回滚", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(old_target), owner="admin"
             )
             with (
@@ -408,7 +408,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                     },
                 )
         self.assertEqual(response.status_code, 503, response.text)
-        targets = db.list_local_library_targets(source_id, owner="admin")
+        targets = local_media_repo.list_local_library_targets(source_id, owner="admin")
         self.assertEqual([item.path for item in targets], [str(old_target)])
 
     def test_unified_save_returns_conflict_and_rolls_back_on_concurrent_config_change(self):
@@ -422,11 +422,11 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             source_root.mkdir(parents=True)
             old_target.mkdir(parents=True)
             new_target.mkdir(parents=True)
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="本地下载-并发", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(old_target), owner="admin"
             )
             with (
@@ -454,7 +454,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                 )
         self.assertEqual(response.status_code, 409, response.text)
         self.assertNotIn("private detail", response.text)
-        targets = db.list_local_library_targets(source_id, owner="admin")
+        targets = local_media_repo.list_local_library_targets(source_id, owner="admin")
         self.assertEqual([item.path for item in targets], [str(old_target)])
 
     def test_path_test_reports_matched_covered_and_unmatched(self):

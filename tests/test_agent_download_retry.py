@@ -7,7 +7,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app import database as db, sdk
+from app import sdk
+from app.repositories import download_requests as download_requests_repo
 from app.modules import download_dispatcher as dispatcher
 from tests.support import IsolatedDatabaseTestCase
 
@@ -23,12 +24,12 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
     @staticmethod
     def request(**updates):
         identity = uuid.uuid4().hex + "a" * 8
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "private-key-" + identity, "magnet", title="Private.Show",
             source_value="magnet:?xt=urn:btih:" + identity,
             chat_id="private-chat", user_id="private-user", origin="agent",
         )
-        db.update_download_request(request_id, **{
+        download_requests_repo.update_download_request(request_id, **{
             "status": "manual_review", "targets": "both",
             "qb_status": "failed", "gy_status": "failed", "error": "private backend error", **updates,
         })
@@ -36,14 +37,14 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
 
     def test_prepare_is_read_only_and_public(self):
         request_id = self.request()
-        stored_row_1 = db.get_download_request(request_id)
+        stored_row_1 = download_requests_repo.get_download_request(request_id)
         assert stored_row_1 is not None
         before = dict(stored_row_1)
         with patch.object(dispatcher, "_submit_qb") as qb, patch.object(dispatcher, "_submit_guangya") as gy:
             preview = dispatcher.prepare_download_retry(request_id, "qb")
         qb.assert_not_called()
         gy.assert_not_called()
-        stored_row_2 = db.get_download_request(request_id)
+        stored_row_2 = download_requests_repo.get_download_request(request_id)
         assert stored_row_2 is not None
         self.assertEqual(dict(stored_row_2), before)
         self.assertEqual(preview["request_id"], request_id)
@@ -75,7 +76,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
                 request_id = self.request()
                 snapshot = dispatcher.prepare_download_retry(request_id, "qb")
                 if change != "config":
-                    db.update_download_request(request_id, **{
+                    download_requests_repo.update_download_request(request_id, **{
                         change: {"torrent_data": b"changed", "qb_status": "outcome_unknown"}.get(change, "changed"),
                     })
                 with patch.dict(os.environ, {"TG_QB_SAVE_PATH": "/changed"} if change == "config" else {}), \
@@ -94,7 +95,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
             result = dispatcher.resubmit_download_request(request_id, "qb")
         self.assertFalse(result["ok"])
         backend.assert_not_called()
-        stored_row_3 = db.get_download_request(request_id)
+        stored_row_3 = download_requests_repo.get_download_request(request_id)
         assert stored_row_3 is not None
         self.assertEqual(stored_row_3["qb_status"], "outcome_unknown")
 
@@ -110,7 +111,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["source_request_id"], request_id)
         self.assertEqual(result["succeeded"], ["qb"])
         self.assertTrue(result["source_attention_preserved"])
-        stored_row_4 = db.get_download_request(request_id)
+        stored_row_4 = download_requests_repo.get_download_request(request_id)
         assert stored_row_4 is not None
         self.assertEqual(stored_row_4["gy_status"], "outcome_unknown")
 

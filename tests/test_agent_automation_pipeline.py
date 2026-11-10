@@ -6,6 +6,7 @@ import json
 from unittest.mock import patch
 
 from app import database as db, sdk
+from app.repositories import rss as rss_repo
 from app.agent.kernel.bootstrap import build_tool_catalog
 from app.modules import diagnostics as diag
 from tests.support import IsolatedDatabaseTestCase
@@ -84,8 +85,8 @@ class AutomationPipelineTests(IsolatedDatabaseTestCase):
     def test_real_readonly_sqlite_rss_pages_are_exhaustive_and_match_public_service(self):
         ids = []
         for index in range(3):
-            identifier = db.add_rss_subscription(name=f"source-{index}", urls="https://rss.invalid/?passkey=SECRET", enabled=1)
-            row = db.add_rss_entry_with_media(identifier, f"entry-{index}", f"guid-{index}")
+            identifier = rss_repo.add_rss_subscription(name=f"source-{index}", urls="https://rss.invalid/?passkey=SECRET", enabled=1)
+            row = rss_repo.add_rss_entry_with_media(identifier, f"entry-{index}", f"guid-{index}")
             assert row is not None
             with db.get_conn() as conn:
                 conn.execute("UPDATE rss_entries SET status='failed' WHERE id=?", (row["id"],))

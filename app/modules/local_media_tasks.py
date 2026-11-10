@@ -98,7 +98,7 @@ def local_tasks(scope: str = "all", *, source_id: int | None = None, scan_ref: s
             status = old.get("status", task["status"])
             if _statuses(scope) and status not in _statuses(scope):
                 continue
-            if scope == "skipped" and not (old or _outcome(task, db.list_local_media_task_items(identifier))).get("skipped_video_count"):
+            if scope == "skipped" and not (old or _outcome(task, repository.list_local_media_task_items(identifier))).get("skipped_video_count"):
                 continue
             selected.append(task)
         total, tasks = len(selected), selected[offset:offset + limit]
@@ -113,7 +113,7 @@ def local_tasks(scope: str = "all", *, source_id: int | None = None, scan_ref: s
                                                        source_id=source_id, limit=limit, offset=offset)
     items = []
     for task in tasks:
-        item = _task_fact(task, db.list_local_media_task_items(task["id"]))
+        item = _task_fact(task, repository.list_local_media_task_items(task["id"]))
         if scan:
             old = snapshots.get(task["id"])
             item["outcome_basis"] = "scan_snapshot" if old else "current_task_state"
@@ -250,7 +250,7 @@ def local_task_completion(task_id: int) -> dict:
 
 def diagnose_local_tasks() -> dict:
     from app.modules.local_media_scheduler import peek_local_media_scheduler_status
-    aggregate = db.get_local_media_diagnostic_summary(owner="admin")
+    aggregate = repository.get_local_media_diagnostic_summary(owner="admin")
     runtime = peek_local_media_scheduler_status()
     sources, tasks = aggregate["sources"], aggregate["tasks"]
     categories = {"requires_manual": tasks["requires_manual"], "failed": tasks["failed"],

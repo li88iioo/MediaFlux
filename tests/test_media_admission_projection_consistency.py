@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from tests.support import isolated_test_database
 
 
@@ -14,7 +16,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
         for episode, (stage, label) in enumerate((("organize", "自动整理"), ("local_import", "本地入库"), ("strm", "STRM 联动")), 300):
             with self.subTest(stage=stage):
                 request, admission, _ = self.seed(episode, status="completed", **{f"{stage}_status": "failed", f"{stage}_error": "failed-stage"})
-                db.sync_media_download_admission_for_request(request)
+                media_subscriptions_repo.sync_media_download_admission_for_request(request)
                 self.assertEqual(self.view(admission)[:2], ("failed", f"下载后处理失败（{label}）：failed-stage"))
 
     def test_postprocessing_attention_is_consistent_and_retains_admission_until_recovered(self):
@@ -34,17 +36,17 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                               organize_status="completed", local_import_status="completed", strm_status="completed")
                 fields.update({f"{stage}_status": state, f"{stage}_error": reason})
                 request, admission, key = self.seed(episode, **fields)
-                db.sync_media_download_admission_for_request(request)
+                media_subscriptions_repo.sync_media_download_admission_for_request(request)
                 expected = self.view(admission)
                 self.assertEqual(expected[0], "processing")
                 self.assertIn(reason, expected[1])
                 self.assertIsNone(expected[2])
-                db.reconcile_startup_media_download_admissions()
+                media_subscriptions_repo.reconcile_startup_media_download_admissions()
                 for present in (False, True):
-                    db.reconcile_media_download_admissions(self.subscription, {key} if present else set(), expected_revision=1)
+                    media_subscriptions_repo.reconcile_media_download_admissions(self.subscription, {key} if present else set(), expected_revision=1)
                     self.assertEqual(self.view(admission), expected)
-                row = db.get_download_request(request)
-                self.assertEqual(db.count_download_requests_requiring_attention(request), 1)
+                row = download_requests_repo.get_download_request(request)
+                self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request), 1)
                 issues = _attention_stages(row)
                 self.assertTrue(any(item["key"] == stage and item["error"] == reason for item in issues))
                 summary = download_request_public_summary(row)
@@ -52,26 +54,26 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                 self.assertEqual(summary["local_import_status"], fields["local_import_status"])
                 self.assertIn(reason, summary["error"])
                 self.assertTrue(str(build_download_lifecycle_event(row).title).startswith("⚠️"))
-                workflow = db.list_media_subscription_workflows([self.subscription])[self.subscription]
+                workflow = media_subscriptions_repo.list_media_subscription_workflows([self.subscription])[self.subscription]
                 self.assertEqual(workflow["manual_review_count"], 1)
                 self.assertEqual(workflow["processing_count"], 0)
                 self.assertIn(reason, "；".join(workflow["attention_reasons"]))
-                alternative = db.replace_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
+                alternative = media_subscriptions_repo.replace_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
                     candidates=[{"result_id": f"alternative-{episode}", "title": key}], expires_at="2099-01-01 00:00:00")[0]
-                self.assertIsNone(db.claim_media_download_admission(media_key=key, tmdb_id="1", media_type="tv",
+                self.assertIsNone(media_subscriptions_repo.claim_media_download_admission(media_key=key, tmdb_id="1", media_type="tv",
                     subscription_id=self.subscription, candidate_id=alternative, season=1, episode=episode, subscription_revision=1))
-                db.update_download_request(request, **{f"{stage}_status": "completed", f"{stage}_error": ""})
-                db.reconcile_media_download_admissions(self.subscription, {key}, expected_revision=1)
+                download_requests_repo.update_download_request(request, **{f"{stage}_status": "completed", f"{stage}_error": ""})
+                media_subscriptions_repo.reconcile_media_download_admissions(self.subscription, {key}, expected_revision=1)
                 self.assertEqual(self.view(admission)[:2], ("completed", ""))
-                self.assertEqual(db.count_download_requests_requiring_attention(request), 0)
-                saved = db.get_download_request(request)
+                self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request), 0)
+                saved = download_requests_repo.get_download_request(request)
                 assert saved is not None
                 self.assertEqual((saved["qb_status"], saved["gy_status"]), ("completed", "completed"))
 
     def setUp(self):
         self.path = self.enterContext(isolated_test_database("mediaflux.db"))
         self.enterContext(patch.object(db, "now", return_value="2026-09-08 12:00:00"))
-        self.subscription = db.add_media_subscription(
+        self.subscription = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="1",
             tmdb_id="1",
@@ -85,7 +87,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
 
     def seed(self, episode=1, **fields):
         key = f"tmdb:1:tv:S01E{episode:03d}"
-        candidate = db.replace_media_subscription_candidates(
+        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
             self.subscription,
             key,
             season=1,
@@ -93,7 +95,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
             candidates=[{"result_id": f"candidate-{episode}", "title": key}],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        admission = db.claim_media_download_admission(
+        admission = media_subscriptions_repo.claim_media_download_admission(
             media_key=key,
             tmdb_id="1",
             media_type="tv",
@@ -105,14 +107,14 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
         )
         assert admission is not None
         self.assertTrue(
-            db.begin_media_download_dispatch(
+            media_subscriptions_repo.begin_media_download_dispatch(
                 admission, subscription_id=self.subscription, subscription_revision=1
             )
         )
-        request, _ = db.create_download_request(
+        request, _ = download_requests_repo.create_download_request(
             f"projection-{episode}", "magnet", admission_id=admission
         )
-        db.update_download_request(request, **fields)
+        download_requests_repo.update_download_request(request, **fields)
         return request, admission, key
 
     @staticmethod
@@ -145,29 +147,29 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
             with self.subTest(fields=fields):
                 request, admission, _ = self.seed(episode, **fields)
                 self.assertEqual(
-                    db.sync_media_download_admission_for_request(request), 1
+                    media_subscriptions_repo.sync_media_download_admission_for_request(request), 1
                 )
                 expected = self.view(admission)
                 assert admission is not None
-                db.update_media_download_admission(
+                media_subscriptions_repo.update_media_download_admission(
                     admission, status="dispatching", error="", completed_at=None
                 )
-                db.reconcile_media_download_admissions(
+                media_subscriptions_repo.reconcile_media_download_admissions(
                     self.subscription, set(), expected_revision=1
                 )
                 self.assertEqual(self.view(admission), expected)
 
     def test_live_timeout_is_visible_without_restart_or_releasing_duplicate_guard(self):
         request, admission, _ = self.seed(status="pending")
-        self.assertTrue(db.claim_download_request(request, "qb"))
+        self.assertTrue(download_requests_repo.claim_download_request(request, "qb"))
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE download_requests SET qb_submitting_at='2000-01-01 00:00:00' WHERE id=?",
                 (request,),
             )
-        self.assertEqual(db.recover_stale_submitting_download_requests(), 1)
+        self.assertEqual(download_requests_repo.recover_stale_submitting_download_requests(), 1)
         self.assertEqual(
-            db.reconcile_media_download_admissions(
+            media_subscriptions_repo.reconcile_media_download_admissions(
                 self.subscription, set(), expected_revision=1
             ),
             1,
@@ -177,7 +179,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
         self.assertIn("结果未知", error)
         self.assertIsNone(completed)
         self.assertEqual(
-            len(db.list_active_media_download_admissions(self.subscription)), 1
+            len(media_subscriptions_repo.list_active_media_download_admissions(self.subscription)), 1
         )
 
     def test_partial_both_targets_keep_attention_and_duplicate_guard_until_recovered(self):
@@ -189,46 +191,46 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                               organize_status='completed', local_import_status='completed', strm_status='completed')
                 fields[failed_field] = 'failed'
                 request, admission, key = self.seed(episode, **fields)
-                db.sync_media_download_admission_for_request(request)
+                media_subscriptions_repo.sync_media_download_admission_for_request(request)
                 expected = self.view(admission)
                 self.assertEqual(expected[0], 'processing')
                 self.assertIn('下载目标未全部完成', expected[1])
                 self.assertIsNone(expected[2])
-                db.reconcile_startup_media_download_admissions()
-                db.reconcile_media_download_admissions(self.subscription, {key} if present else set(), expected_revision=1)
+                media_subscriptions_repo.reconcile_startup_media_download_admissions()
+                media_subscriptions_repo.reconcile_media_download_admissions(self.subscription, {key} if present else set(), expected_revision=1)
                 self.assertEqual(self.view(admission), expected)
-                workflow = db.list_media_subscription_workflows([self.subscription])[self.subscription]
+                workflow = media_subscriptions_repo.list_media_subscription_workflows([self.subscription])[self.subscription]
                 self.assertEqual(workflow['manual_review_count'], 1)
                 self.assertEqual(workflow['processing_count'], 0)
-                alternative = db.replace_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
+                alternative = media_subscriptions_repo.replace_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
                     candidates=[{'result_id':f'alternative-{episode}', 'title':key}], expires_at='2099-01-01 00:00:00')[0]
-                self.assertIsNone(db.claim_media_download_admission(media_key=key, tmdb_id='1', media_type='tv',
+                self.assertIsNone(media_subscriptions_repo.claim_media_download_admission(media_key=key, tmdb_id='1', media_type='tv',
                     subscription_id=self.subscription, candidate_id=alternative, season=1, episode=episode, subscription_revision=1))
-                db.update_download_request(request, status='downloading', **{failed_field:'submitted'})
-                db.sync_media_download_admission_for_request(request)
+                download_requests_repo.update_download_request(request, status='downloading', **{failed_field:'submitted'})
+                media_subscriptions_repo.sync_media_download_admission_for_request(request)
                 self.assertEqual(self.view(admission)[:2], ('downloading', ''))
-                saved = db.get_download_request(request)
+                saved = download_requests_repo.get_download_request(request)
                 assert saved is not None
                 self.assertEqual(saved['gy_status' if failed_field == 'qb_status' else 'qb_status'], 'completed')
-                db.update_download_request(request, status='completed', **{failed_field:'completed'})
-                db.reconcile_media_download_admissions(self.subscription, {key}, expected_revision=1)
+                download_requests_repo.update_download_request(request, status='completed', **{failed_field:'completed'})
+                media_subscriptions_repo.reconcile_media_download_admissions(self.subscription, {key}, expected_revision=1)
                 self.assertEqual(self.view(admission)[:2], ('completed', ''))
-                self.assertEqual(db.list_media_subscription_workflows([self.subscription])[self.subscription]['manual_review_count'], 0)
+                self.assertEqual(media_subscriptions_repo.list_media_subscription_workflows([self.subscription])[self.subscription]['manual_review_count'], 0)
 
     def test_historical_completed_admission_does_not_hide_failed_requested_target(self):
         _, admission, _ = self.seed(status='completed', targets='both', qb_status='completed', gy_status='failed')
-        db.update_media_download_admission(admission, status='completed', error='')
-        workflow = db.list_media_subscription_workflows([self.subscription])[self.subscription]
+        media_subscriptions_repo.update_media_download_admission(admission, status='completed', error='')
+        workflow = media_subscriptions_repo.list_media_subscription_workflows([self.subscription])[self.subscription]
         self.assertEqual(workflow['manual_review_count'], 1)
         self.assertEqual(self.view(admission)[:2], ('completed', ''))  # 展示事实，不改写历史行。
 
     def test_unrequested_backend_failure_does_not_block_local_completion(self):
         request, admission, key = self.seed(status='completed', targets='qb', qb_status='completed', gy_status='failed')
-        db.sync_media_download_admission_for_request(request)
+        media_subscriptions_repo.sync_media_download_admission_for_request(request)
         self.assertEqual(self.view(admission)[:2], ('processing', ''))
-        db.reconcile_media_download_admissions(self.subscription, {key}, expected_revision=1)
+        media_subscriptions_repo.reconcile_media_download_admissions(self.subscription, {key}, expected_revision=1)
         self.assertEqual(self.view(admission)[:2], ('completed', ''))
-        self.assertEqual(db.list_media_subscription_workflows([self.subscription])[self.subscription]['manual_review_count'], 0)
+        self.assertEqual(media_subscriptions_repo.list_media_subscription_workflows([self.subscription])[self.subscription]['manual_review_count'], 0)
 
     def test_mixed_batch_keeps_local_presence_precedence_and_bounded_reads(self):
         from contextlib import contextmanager
@@ -254,7 +256,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
 
         with patch.object(db, "get_conn", traced):
             self.assertEqual(
-                db.reconcile_media_download_admissions(
+                media_subscriptions_repo.reconcile_media_download_admissions(
                     self.subscription, local_keys, expected_revision=1
                 ),
                 50,
@@ -291,12 +293,13 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
 import tests
 import os, sys, socket
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 socket.socket.connect = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("network forbidden"))
 db.configure_database(sys.argv[1], test_mode=True)
-assert db.claim_download_request(int(sys.argv[2]), "qb")
+assert download_requests_repo.claim_download_request(int(sys.argv[2]), "qb")
 with db.get_conn() as conn:
  conn.execute("UPDATE download_requests SET qb_submitting_at='2000-01-01 00:00:00' WHERE id=?", (int(sys.argv[2]),))
-assert db.recover_stale_submitting_download_requests() == 1
+assert download_requests_repo.recover_stale_submitting_download_requests() == 1
 os._exit(43)
 """
         child = subprocess.run(
@@ -309,7 +312,7 @@ os._exit(43)
         archive = backup.create_backup(paths, reason="unprojected-unknown")
         db.init_db()
         self.assertEqual(
-            db.reconcile_media_download_admissions(
+            media_subscriptions_repo.reconcile_media_download_admissions(
                 self.subscription, set(), expected_revision=1
             ),
             1,
@@ -319,14 +322,14 @@ os._exit(43)
         self.assertIn("结果未知", expected[1])
         backup.restore_backup(paths, archive)
         db.init_db()
-        projected, released = db.reconcile_startup_media_download_admissions()
+        projected, released = media_subscriptions_repo.reconcile_startup_media_download_admissions()
         self.assertEqual((projected, released), (1, 0))
         self.assertEqual(self.view(admission), expected)
         self.assertEqual(
-            len(db.list_active_media_download_admissions(self.subscription)), 1
+            len(media_subscriptions_repo.list_active_media_download_admissions(self.subscription)), 1
         )
         self.assertEqual(
-            db.reconcile_media_download_admissions(
+            media_subscriptions_repo.reconcile_media_download_admissions(
                 self.subscription, {key}, expected_revision=1
             ),
             1,

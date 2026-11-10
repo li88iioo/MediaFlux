@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import discovery as discovery_repo
 from app.agent.errors import AgentToolError
 from app.agent.rate_limit import agent_rate_limiter
 from app.discovery.models import MediaCard
@@ -53,10 +54,10 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
     def _insert(
         *, external_id: str = "100", title: str = "收藏影片", media_type: str = "movie"
     ) -> int:
-        db.add_media_watchlist(
+        discovery_repo.add_media_watchlist(
             "tmdb", external_id, media_type, title, "2026", "PRIVATE_POSTER_KEY"
         )
-        row = db.get_media_watchlist("tmdb", external_id, media_type)
+        row = discovery_repo.get_media_watchlist("tmdb", external_id, media_type)
         assert row is not None
         return int(row["id"])
 
@@ -132,7 +133,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         first = DiscoveryService.list_watchlist(limit=20)
         cursor = first["next"]["before_number"]
         self._insert(external_id="new")
-        db.delete_media_watchlist("tmdb", "24", "movie")
+        discovery_repo.delete_media_watchlist("tmdb", "24", "movie")
         second = DiscoveryService.list_watchlist(**first["next"])
         self.assertEqual(
             [item["id"] for item in second["items"]], list(reversed(ids[:5]))
@@ -191,7 +192,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                     DiscoveryService.list_watchlist(limit=value)
 
     def test_watchlist_statistics_empty_database(self) -> None:
-        self.assertEqual(db.get_media_watchlist_statistics(), [])
+        self.assertEqual(discovery_repo.get_media_watchlist_statistics(), [])
         result = DiscoveryService.watchlist_statistics()
         self.assertEqual(result, {"total": 0, "by_media_type": []})
 
@@ -315,7 +316,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         self._insert(external_id="tv", media_type="tv")
         first = DiscoveryService.watchlist_statistics()
         self.assertEqual(first["total"], 2)
-        self.assertTrue(db.delete_media_watchlist("tmdb", "movie", "movie"))
+        self.assertTrue(discovery_repo.delete_media_watchlist("tmdb", "movie", "movie"))
         remaining = DiscoveryService.watchlist_statistics()
         self.assertEqual(remaining["total"], 1)
         self.assertEqual(remaining["by_media_type"][0]["media_type"], "tv")
@@ -334,8 +335,8 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         self.assertEqual(group["latest"][0]["id"], replacement)
         self.assertGreater(replacement, movie)
         self.assertEqual(group["latest"][0]["title"], "更新标题")
-        db.delete_media_watchlist("tmdb", "replacement", "movie")
-        db.delete_media_watchlist("tmdb", "tv", "tv")
+        discovery_repo.delete_media_watchlist("tmdb", "replacement", "movie")
+        discovery_repo.delete_media_watchlist("tmdb", "tv", "tv")
         self.assertEqual(
             DiscoveryService.watchlist_statistics(), {"total": 0, "by_media_type": []}
         )
@@ -426,14 +427,14 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 {"provider": "tmdb", "external_id": "8801", "media_type": "movie"},
                 owner="owner-a",
             )
-        self.assertIsNone(db.get_media_watchlist("tmdb", "8801", "movie"))
+        self.assertIsNone(discovery_repo.get_media_watchlist("tmdb", "8801", "movie"))
         confirmation_id = prepared["action_plan"]["plan_id"]
         with self.assertRaises(AgentToolError):
             service.confirm(confirmation_id, owner="owner-b")
         confirmed = service.confirm(confirmation_id, owner="owner-a")
         detail.assert_called_once_with("tmdb", "movie", "8801")
         self.assertEqual(confirmed["result"]["status"], "success")
-        assert (db.get_media_watchlist("tmdb", "8801", "movie")) is not None
+        assert (discovery_repo.get_media_watchlist("tmdb", "8801", "movie")) is not None
         with self.assertRaises(AgentToolError):
             service.confirm(confirmation_id, owner="owner-a")
         serialized = json.dumps(
@@ -461,10 +462,10 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 {"provider": "tmdb", "external_id": "8802", "media_type": "movie"},
                 owner="owner",
             )
-        db.add_media_watchlist("tmdb", "8802", "movie", "并发收藏", "2026", "")
+        discovery_repo.add_media_watchlist("tmdb", "8802", "movie", "并发收藏", "2026", "")
         confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "conflict")
-        stored_row_1 = db.get_media_watchlist("tmdb", "8802", "movie")
+        stored_row_1 = discovery_repo.get_media_watchlist("tmdb", "8802", "movie")
         assert stored_row_1 is not None
         self.assertEqual(
             stored_row_1["title"], "并发收藏"
@@ -493,7 +494,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 owner="owner",
             )
         self.assertEqual(failure.exception.code, "unavailable")
-        self.assertIsNone(db.get_media_watchlist("tmdb", "8801", "movie"))
+        self.assertIsNone(discovery_repo.get_media_watchlist("tmdb", "8801", "movie"))
         serialized = str(failure.exception)
         for private in ("private.invalid", "api_key", "secret", "/srv/private"):
             self.assertNotIn(private, serialized)
@@ -520,7 +521,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             )
         stale = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(stale["result"]["status"], "conflict")
-        assert (db.get_media_watchlist_by_id(number)) is not None
+        assert (discovery_repo.get_media_watchlist_by_id(number)) is not None
         reset_agent_service_for_tests()
         service = get_agent_service()
         with patch(
@@ -533,4 +534,4 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             )
         confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "success")
-        self.assertIsNone(db.get_media_watchlist_by_id(number))
+        self.assertIsNone(discovery_repo.get_media_watchlist_by_id(number))

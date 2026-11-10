@@ -28,6 +28,8 @@ import feedparser
 import httpx
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.config import get, get_many
 from app.indexers.providers.base import magnet_infohash
 from app.logger import get_logger
@@ -616,7 +618,7 @@ class RSSEngine:
             # 获取单飞门后重新读取配置，以门内快照作为本次刷新边界。
             # 这既避免确认版本在排队期间失效后仍继续执行，也保证解析
             # 全程使用同一份订阅配置。
-            sub = db.get_rss_subscription(sub_id)
+            sub = rss_repo.get_rss_subscription(sub_id)
             if not sub:
                 return {"error": "订阅项不存在"}
             urls = [u.strip() for u in (sub["urls"] or "").splitlines() if u.strip()]
@@ -718,7 +720,7 @@ class RSSEngine:
             # 条目（含语义重开）与刷新时间共用此事务，失败时整批回滚。
             with db.get_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                current = db.get_rss_subscription(sub_id, connection=conn)
+                current = rss_repo.get_rss_subscription(sub_id, connection=conn)
                 if current is None or not secrets.compare_digest(
                     rss_subscription_refresh_revision(current), revision
                 ):
@@ -742,7 +744,7 @@ class RSSEngine:
                     elif media_tmdb_id and binding_allowed:
                         identity_unresolved += 1
 
-                    inserted = db.add_rss_entry_with_media(
+                    inserted = rss_repo.add_rss_entry_with_media(
                         sub_id=sub_id,
                         title=entry.title,
                         guid=entry.guid,
@@ -772,7 +774,7 @@ class RSSEngine:
                                 library_skipped += 1
                             else:
                                 semantic_duplicates += 1
-                db.update_rss_subscription(sub_id, {"last_refreshed_at": db.now()}, connection=conn)
+                rss_repo.update_rss_subscription(sub_id, {"last_refreshed_at": db.now()}, connection=conn)
             logger.info(
                 "RSS 刷新 sub#%s: 拉取 %s 新增 %s 排除 %s 库内 %s 语义重复 %s 失败源 %s",
                 sub_id, total, new, skipped, library_skipped, semantic_duplicates, failed_sources,
@@ -910,7 +912,7 @@ class RSSEngine:
         entry_id = int(entry["id"])
         if entry["status"] == "downloaded" or bool(entry["processed"]):
             # 同资源批量操作前一项可能已创建 successor；不能用批次旧失败视图回写。
-            entry = db.get_rss_entry(entry_id)
+            entry = rss_repo.get_rss_entry(entry_id)
             if entry is None:
                 return {"error": "条目不存在", "ok": False}
         # 已绑定的失败恢复沿原目标与内容身份，不因订阅配置 / feed URL 变化改投。
@@ -934,7 +936,7 @@ class RSSEngine:
         )
 
         linked_key = str(self._entry_value(entry, "download_request_key", "") or "")
-        retry_source = db.get_download_request(delivery["request_id"]) if delivery["request_id"] else None
+        retry_source = download_requests_repo.get_download_request(delivery["request_id"]) if delivery["request_id"] else None
         runtime = qb_runtime_config if isinstance(qb_runtime_config, dict) else None
         # 先复用下载中心的准入判断，再重开历史回执。配置/规则拒绝不等于
         # 后端提交失败，不得覆盖原受理记录或让用户丢失再次重试的入口。
@@ -944,8 +946,8 @@ class RSSEngine:
                 return {"ok": False, "existing": True, "method": method,
                         "request_id": delivery["request_id"], "status": delivery["status"],
                         "error": capability.get("reason") or "原下载请求不存在"}
-            if db.update_rss_entries_processed([entry_id], False):
-                entry = db.get_rss_entry(entry_id)
+            if rss_repo.update_rss_entries_processed([entry_id], False):
+                entry = rss_repo.get_rss_entry(entry_id)
         if entry["status"] == "downloaded" or bool(entry["processed"]):
             if entry["status"] == "downloaded" and (delivery["failed"] or delivery["review_required"]):
                 return {
@@ -964,8 +966,8 @@ class RSSEngine:
                 }
         if not torrent_url and not linked_key:
             code, message = ("missing_torrent_url", "条目无种子链接") if isinstance(payload, dict) else ("invalid_payload", "条目数据无效")
-            if entry_already_claimed or db.claim_rss_entry(entry_id):
-                db.record_rss_entry_failure(entry_id, code, False)
+            if entry_already_claimed or rss_repo.claim_rss_entry(entry_id):
+                rss_repo.record_rss_entry_failure(entry_id, code, False)
             return {"error": message, "ok": False, "method": method}
 
         # 自动任务在真正领取前重新读取配置；手动入口不传 guard，保留暂停后
@@ -973,7 +975,7 @@ class RSSEngine:
         if auto_guard is not None and not auto_guard():
             return {"ok": False, "cancelled": True, "error": RSS_REFRESH_CONFLICT_ERROR}
         admission: dict[str, Any] = {}
-        if not entry_already_claimed and not db.claim_rss_entry(entry_id, admission=admission):
+        if not entry_already_claimed and not rss_repo.claim_rss_entry(entry_id, admission=admission):
             if admission.get("retry_reason") == "submitting":
                 return {"ok": False, "pending": True, "status": "submitting",
                         "method": method, "infohash": infohash}
@@ -1005,13 +1007,13 @@ class RSSEngine:
                     raise ValueError("原下载请求不存在")
                 bind_rss_entry_download(entry_id, linked_key, method)
                 if not rss_retry_source_is_safe(retry_source, method):
-                    current = db.get_rss_entry(entry_id)
+                    current = rss_repo.get_rss_entry(entry_id)
                     assert current is not None
                     if current["status"] == "downloaded":
                         return {"ok": True, "existing": True, "method": method,
                                 "status": "downloaded", "request_id": int(retry_source["id"])}
                     code = "qb_outcome_unknown" if method == "qb" else "guangya_outcome_unknown"
-                    db.record_rss_entry_failure(entry_id, code, False, request_id=int(retry_source["id"]))
+                    rss_repo.record_rss_entry_failure(entry_id, code, False, request_id=int(retry_source["id"]))
                     return {"ok": False, "method": method, "review_required": True,
                             "request_id": int(retry_source["id"]),
                             "error": "原下载仍在处理或结果待核验，请在下载中心处理"}
@@ -1073,8 +1075,8 @@ class RSSEngine:
                 type(exc.__cause__).__name__ if exc.__cause__ is not None else "-",
                 (exc.http_status or "-") if isinstance(exc, TorrentPreparationError) else "-",
             )
-            db.record_rss_entry_failure(entry_id, failure_code, retryable)
-            db.add_download_log(
+            rss_repo.record_rss_entry_failure(entry_id, failure_code, retryable)
+            download_requests_repo.add_download_log(
                 source=method,
                 title=entry["title"],
                 path=_safe_download_source_marker(torrent_url),
@@ -1099,12 +1101,12 @@ class RSSEngine:
 
         summary = submission.get("summary") or {}
         dispatch = submission.get("dispatch") or {}
-        current_entry = db.get_rss_entry(entry_id)
+        current_entry = rss_repo.get_rss_entry(entry_id)
         if (linked_key and summary.get("duplicate") and retry_source is not None
                 and (current_entry is None or current_entry["download_request_id"] != request_id)):
             # 未接管的 canonical 冲突按原 owner 收尾；并发 successor 由仓储 owner 检查保护。
             request_id = int(retry_source["id"])
-        current_request = db.get_download_request(request_id) if request_id else None
+        current_request = download_requests_repo.get_download_request(request_id) if request_id else None
         existing = bool(summary.get("duplicate") and current_entry is not None
                         and current_entry["status"] == "downloaded")
         backend_field = "qb_status" if method == "qb" else "gy_status"
@@ -1123,7 +1125,7 @@ class RSSEngine:
         review_required = False
         if ok:
             if summary.get("duplicate"):
-                db.add_download_log(
+                download_requests_repo.add_download_log(
                     source=method,
                     title=entry["title"],
                     path=_safe_download_source_marker(torrent_url),
@@ -1151,7 +1153,7 @@ class RSSEngine:
                     )
                     retryable = False
                     review_required = True
-            db.record_rss_entry_failure(entry_id, failure_code, retryable, request_id=request_id)
+            rss_repo.record_rss_entry_failure(entry_id, failure_code, retryable, request_id=request_id)
             if review_required:
                 error = "提交结果待核对，请先检查下载器状态，勿直接重复提交"
             elif not error:
@@ -1174,11 +1176,11 @@ class RSSEngine:
 
     def download(self, entry_id: int) -> dict:
         """下载单条条目并建立可持续跟踪的统一下载请求。"""
-        return self._download_entry(db.get_rss_entry(entry_id))
+        return self._download_entry(rss_repo.get_rss_entry(entry_id))
 
     def download_many(self, entry_ids: list[int], *, auto_guard: Callable[[], bool] | None = None) -> dict:
         ids = list(dict.fromkeys(entry_ids))
-        entries_by_id = db.get_rss_entries_by_ids(ids)
+        entries_by_id = rss_repo.get_rss_entries_by_ids(ids)
         entries = [entries_by_id.get(entry_id) for entry_id in ids]
         succeeded: list[dict] = []
         existing: list[dict] = []
@@ -1342,7 +1344,7 @@ class RSSEngine:
 
     def auto_download(self, sub_id: int, *, expected_revision: str = "") -> dict:
         """刷新后自动下载所有 pending 条目。"""
-        subscription = db.get_rss_subscription(sub_id)
+        subscription = rss_repo.get_rss_subscription(sub_id)
         if subscription is None:
             return {"error": "订阅项不存在", "cancelled": True}
         revision = expected_revision or rss_subscription_refresh_revision(subscription)
@@ -1351,7 +1353,7 @@ class RSSEngine:
         auto_revision = rss_subscription_refresh_revision({**dict(subscription), "updated_at": ""})
 
         def auto_guard():
-            current = db.get_rss_subscription(sub_id)
+            current = rss_repo.get_rss_subscription(sub_id)
             return bool(
                 current is not None
                 and int(current["enabled"] or 0)
@@ -1368,11 +1370,11 @@ class RSSEngine:
             return refreshed
         if not auto_guard():
             return {"refresh": refreshed, "error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True}
-        page = db.list_rss_entries(
+        page = rss_repo.list_rss_entries(
             sub_id=sub_id, status="pending", order="received_desc",
         )
         rows, pending_total = page.items, page.total
-        subscription = db.get_rss_subscription(sub_id)
+        subscription = rss_repo.get_rss_subscription(sub_id)
         exclude = self._split_keywords(
             str(subscription["exclude_keywords"] or "") if subscription else ""
         )
@@ -1383,7 +1385,7 @@ class RSSEngine:
                 exclude,
             )
         ]
-        filtered = db.skip_pending_rss_entries(
+        filtered = rss_repo.skip_pending_rss_entries(
             excluded_ids, "命中当前订阅排除关键词"
         )
         excluded = set(excluded_ids)

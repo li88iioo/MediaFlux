@@ -10,6 +10,8 @@ from contextlib import ExitStack
 from unittest.mock import AsyncMock, Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules.media_subscriptions import MediaSubscriptionService, _ExpectedMedia
 from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules.organize_execution import execute_organize_plans
@@ -29,7 +31,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
                 side_effect=AssertionError("unexpected network"),
             )
         )
-        self.subscription = db.add_media_subscription(
+        self.subscription = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="991",
             tmdb_id="991",
@@ -43,7 +45,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
 
     def seed(self, *, episode=1, root="incoming", isolated=False):
         key = f"tmdb:991:tv:S01E{episode:03d}"
-        candidate = db.replace_media_subscription_candidates(
+        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
             self.subscription,
             key,
             season=1,
@@ -53,7 +55,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             ],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        admission = db.claim_media_download_admission(
+        admission = media_subscriptions_repo.claim_media_download_admission(
             media_key=key,
             tmdb_id="991",
             media_type="tv",
@@ -65,12 +67,12 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         )
         assert admission is not None
         self.assertTrue(
-            db.begin_media_download_dispatch(
+            media_subscriptions_repo.begin_media_download_dispatch(
                 admission, subscription_id=self.subscription, subscription_revision=1
             )
         )
-        request, _ = db.create_download_request(key, "magnet", admission_id=admission)
-        db.update_download_request(
+        request, _ = download_requests_repo.create_download_request(key, "magnet", admission_id=admission)
+        download_requests_repo.update_download_request(
             request,
             status="completed",
             gy_status="completed",
@@ -85,7 +87,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             gy_staging_name="MF-case" if isolated else "",
             targets="guangya",
         )
-        db.sync_media_download_admission_for_request(request)
+        media_subscriptions_repo.sync_media_download_admission_for_request(request)
         return request, admission, key
 
     @staticmethod
@@ -122,7 +124,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         manager = OrganizeTaskManager()
         run_id = db.add_task_run("guangya_organize", "download", result=json.dumps({"task_id": "test-task"}))
         for request in requests:
-            db.update_download_request(request, organize_task_id="test-task", organize_run_id=run_id)
+            download_requests_repo.update_download_request(request, organize_task_id="test-task", organize_run_id=run_id)
         manager._lock.acquire()
         manager._task = {"id": "test-task", "status": "running", "stats": {}}
         with ExitStack() as stack:
@@ -245,7 +247,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             cloud=cloud,
             isolated=isolated,
         )
-        row = db.get_download_request(request)
+        row = download_requests_repo.get_download_request(request)
         assert row is not None
         self.assertEqual(row["status"], "completed", "下载本身成功，不能改成下载失败")
         self.assertEqual(row["organize_status"], "failed")
@@ -255,7 +257,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         self.assertIn("未匹配", row["organize_error"])
         self.assertEqual(manager._task["status"], "partial")
         self.assertIn(
-            request, [r["id"] for r in db.list_download_requests_requiring_attention()]
+            request, [r["id"] for r in download_requests_repo.list_download_requests_requiring_attention()]
         )
         self.assertEqual(self.admission_status(admission), "failed")
         with db.get_conn() as conn:
@@ -269,7 +271,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             assert cloud is not None
             self.assertEqual(cloud.deleted, [])
         db.init_db()
-        db.reconcile_startup_media_download_admissions()
+        media_subscriptions_repo.reconcile_startup_media_download_admissions()
         self.assert_missing(key)
 
     def test_all_unmatched_skipped_remain_missing_after_restart(self):
@@ -286,12 +288,12 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             match=MatchResult(tmdb_id="991", title="Test series", media_type="tv")
         )
         self.execute({"incoming": (plans, self.stats(total=1, skipped=1))}, [request])
-        get_download_request_result = db.get_download_request(request)
+        get_download_request_result = download_requests_repo.get_download_request(request)
         assert get_download_request_result is not None
         self.assertEqual(
             get_download_request_result["organize_status"], "completed"
         )
-        db.reconcile_media_download_admissions(
+        media_subscriptions_repo.reconcile_media_download_admissions(
             self.subscription, {key}, expected_revision=1
         )
         self.assertEqual(self.admission_status(admission), "completed")
@@ -299,7 +301,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
     def test_empty_source_without_recognition_failure_keeps_completion(self):
         request, _, _ = self.seed()
         self.execute({"incoming": ([], self.stats())}, [request])
-        get_download_request_result_2 = db.get_download_request(request)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request)
         assert get_download_request_result_2 is not None
         self.assertEqual(
             get_download_request_result_2["organize_status"], "completed"
@@ -311,7 +313,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         self.execute(
             {"incoming": (plans, self.stats(total=1, need_confirm=1))}, [request]
         )
-        get_download_request_result_3 = db.get_download_request(request)
+        get_download_request_result_3 = download_requests_repo.get_download_request(request)
         assert get_download_request_result_3 is not None
         self.assertEqual(
             get_download_request_result_3["organize_status"], "requires_manual"
@@ -322,7 +324,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         request, _, _ = self.seed()
         plans = self.plans(probe_pending=True)
         self.execute({"incoming": (plans, self.stats(total=1, skipped=1))}, [request])
-        get_download_request_result_4 = db.get_download_request(request)
+        get_download_request_result_4 = download_requests_repo.get_download_request(request)
         assert get_download_request_result_4 is not None
         self.assertEqual(
             get_download_request_result_4["organize_status"], "completed"
@@ -347,14 +349,14 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             },
             [bad, good],
         )
-        get_download_request_result_5 = db.get_download_request(bad)
+        get_download_request_result_5 = download_requests_repo.get_download_request(bad)
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5["organize_status"], "failed")
-        get_download_request_result_6 = db.get_download_request(good)
+        get_download_request_result_6 = download_requests_repo.get_download_request(good)
         assert get_download_request_result_6 is not None
         self.assertEqual(get_download_request_result_6["organize_status"], "completed")
         self.assertEqual(self.admission_status(bad_admission), "failed")
-        db.reconcile_media_download_admissions(
+        media_subscriptions_repo.reconcile_media_download_admissions(
             self.subscription, {good_key}, expected_revision=1
         )
         self.assertEqual(self.admission_status(good_admission), "completed")

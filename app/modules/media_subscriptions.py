@@ -18,6 +18,9 @@ from typing import Any
 
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
+from app.repositories import discovery as discovery_repo
 from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.discovery.models import MediaCard, ProviderError, ProviderNotConfigured
 from app.discovery.service import get_discovery_service
@@ -464,7 +467,7 @@ def subscription_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def _resolved_subscription_identity(provider: str, external_id: str, media_type: str) -> str:
     if provider == "tmdb":
         return _numeric_tmdb_id(external_id)
-    mapping = db.get_media_external_id(provider, external_id, media_type)
+    mapping = discovery_repo.get_media_external_id(provider, external_id, media_type)
     if mapping is None or not bool(mapping["confirmed"]):
         raise MediaSubscriptionError("该来源尚未确认 TMDB 映射，请先确认媒体身份", code="precondition_failed")
     return _numeric_tmdb_id(mapping["tmdb_id"])
@@ -491,7 +494,7 @@ class MediaSubscriptionService:
             identity = (args["provider"], args["external_id"], args["media_type"])
             tmdb_id = _resolved_subscription_identity(*identity)
             with db.get_conn() as conn:
-                state = db.media_subscription_identity_snapshot(conn, tmdb_id, args["media_type"])
+                state = media_subscriptions_repo.media_subscription_identity_snapshot(conn, tmdb_id, args["media_type"])
             if state.get("exists") and not state.get("deleted_at"):
                 raise MediaSubscriptionError("该媒体已经在追更订阅中", code="precondition_failed")
             try:
@@ -616,7 +619,7 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError(exc.safe_message, status_code=exc.status_code, code=exc.code) from exc
         metadata = _metadata_from_detail(detail, media_type)
         check_cancelled()
-        subscription_id, created = db.upsert_media_subscription(
+        subscription_id, created = media_subscriptions_repo.upsert_media_subscription(
             provider=provider,
             external_id=external_id,
             tmdb_id=tmdb_id,
@@ -647,15 +650,15 @@ class MediaSubscriptionService:
             raise
 
     def get_subscription(self, subscription_id: int) -> dict[str, Any]:
-        row = db.get_media_subscription(subscription_id)
+        row = media_subscriptions_repo.get_media_subscription(subscription_id)
         if row is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
-        workflows = db.list_media_subscription_workflows([subscription_id])
+        workflows = media_subscriptions_repo.list_media_subscription_workflows([subscription_id])
         return _public_subscription(row, workflow=workflows.get(subscription_id))
 
     @staticmethod
     def _subscription_rows(rows) -> list[dict[str, Any]]:
-        workflows = db.list_media_subscription_workflows(row["id"] for row in rows)
+        workflows = media_subscriptions_repo.list_media_subscription_workflows(row["id"] for row in rows)
         return [
             _public_subscription(row, workflow=workflows.get(int(row["id"])))
             for row in rows
@@ -664,10 +667,10 @@ class MediaSubscriptionService:
     def list_subscriptions(self, *, status: str = "", enabled: bool | None = None,
                            limit: int = 200, before: tuple[str, int] | None = None) -> dict[str, Any]:
         limit = max(1, min(limit, 200))
-        rows = db.list_media_subscriptions(status=status, enabled=enabled, limit=limit + 1, before=before)
+        rows = media_subscriptions_repo.list_media_subscriptions(status=status, enabled=enabled, limit=limit + 1, before=before)
         has_more = len(rows) > limit
         rows = rows[:limit]
-        return {"items": self._subscription_rows(rows), "total": db.count_media_subscriptions(status=status, enabled=enabled),
+        return {"items": self._subscription_rows(rows), "total": media_subscriptions_repo.count_media_subscriptions(status=status, enabled=enabled),
                 "has_more": has_more, "next": {
                     "before_updated_at": rows[-1]["updated_at"], "before_id": rows[-1]["id"], "limit": limit,
                     "status": status, "enabled": "" if enabled is None else str(int(enabled)),
@@ -678,14 +681,14 @@ class MediaSubscriptionService:
         return {(row["tmdb_id"], row["media_type"]): row for row in rows}
 
     def list_runs(self, *, subscription_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        return [_public_run(row) for row in db.list_media_subscription_runs(
+        return [_public_run(row) for row in media_subscriptions_repo.list_media_subscription_runs(
             subscription_id=subscription_id, limit=limit
         )]
 
     def list_candidates(self, subscription_id: int) -> list[dict[str, Any]]:
-        if db.get_media_subscription(subscription_id) is None:
+        if media_subscriptions_repo.get_media_subscription(subscription_id) is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
-        rows = db.list_media_subscription_candidates(
+        rows = media_subscriptions_repo.list_media_subscription_candidates(
             subscription_id, statuses=("available", "submitted"), limit=500,
         )
         return [_public_candidate(row) for row in rows]
@@ -754,7 +757,7 @@ class MediaSubscriptionService:
             1,
             min(limit_per_media, _PREVIEW_MAX_CANDIDATES_PER_MEDIA),
         )
-        row = db.get_media_subscription(subscription_id)
+        row = media_subscriptions_repo.get_media_subscription(subscription_id)
         if row is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
 
@@ -789,7 +792,7 @@ class MediaSubscriptionService:
         else:
             result = await self._preview_movie(row, limit_per_media=limit_per_media)
 
-        current = db.get_media_subscription(subscription_id)
+        current = media_subscriptions_repo.get_media_subscription(subscription_id)
         if (
             current is None
             or int(current["revision"] or 1) != revision
@@ -832,7 +835,7 @@ class MediaSubscriptionService:
         if "check_interval_minutes" in data:
             fields["check_interval_minutes"] = normalize_subscription_interval(data["check_interval_minutes"])
         resume_only = expected_snapshot is not None and data.keys() == {"enabled"} and bool(data["enabled"])
-        changed = db.update_media_subscription_config(subscription_id, invalidate_related=not resume_only,
+        changed = media_subscriptions_repo.update_media_subscription_config(subscription_id, invalidate_related=not resume_only,
             expected_snapshot=expected_snapshot, check_cancelled=check_cancelled, **fields)
         if changed is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
@@ -852,7 +855,7 @@ class MediaSubscriptionService:
         self, subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None,
         check_cancelled: Callable[[], None] = lambda: None,
     ) -> bool:
-        return db.delete_media_subscription(
+        return media_subscriptions_repo.delete_media_subscription(
             subscription_id, expected_snapshot=expected_snapshot, check_cancelled=check_cancelled
         )
 
@@ -864,12 +867,12 @@ class MediaSubscriptionService:
         cancel_event: threading.Event | None = None,
         identity_batch: MediaIdentityBatch | None = None,
     ) -> dict[str, Any]:
-        if db.get_media_subscription(subscription_id) is None:
+        if media_subscriptions_repo.get_media_subscription(subscription_id) is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
-        run_id = db.claim_media_subscription_check_run(subscription_id, trigger)
+        run_id = media_subscriptions_repo.claim_media_subscription_check_run(subscription_id, trigger)
         if run_id is None:
             raise MediaSubscriptionError("该媒体订阅正在检查或已暂停", status_code=409, code="busy")
-        row = db.get_media_subscription(subscription_id)
+        row = media_subscriptions_repo.get_media_subscription(subscription_id)
         assert row is not None
         interval = int(row["check_interval_minutes"] or 4320)
         revision = int(row["revision"] or 1)
@@ -884,7 +887,7 @@ class MediaSubscriptionService:
             public_result = dict(result)
             public_result.pop("_search_rotation", None)
             status = str(public_result["status"])
-            committed = db.finalize_media_subscription_check(
+            committed = media_subscriptions_repo.finalize_media_subscription_check(
                 subscription_id,
                 run_id,
                 status=status,
@@ -920,7 +923,7 @@ class MediaSubscriptionService:
                 )
             return {"subscription": self.get_subscription(subscription_id), "result": public_result}
         except asyncio.CancelledError:
-            db.cancel_media_subscription_run(
+            media_subscriptions_repo.cancel_media_subscription_run(
                 run_id,
                 subscription_id=subscription_id,
                 subscription_revision=revision,
@@ -929,7 +932,7 @@ class MediaSubscriptionService:
             raise
         except MediaSubscriptionError as exc:
             if exc.code == "cancelled":
-                db.cancel_media_subscription_run(
+                media_subscriptions_repo.cancel_media_subscription_run(
                     run_id,
                     subscription_id=subscription_id,
                     subscription_revision=revision,
@@ -950,7 +953,7 @@ class MediaSubscriptionService:
     def _finish_failed_check(
         self, subscription_id: int, run_id: int, interval: int, revision: int, error: str
     ) -> None:
-        committed = db.fail_media_subscription_check(
+        committed = media_subscriptions_repo.fail_media_subscription_check(
             subscription_id,
             run_id,
             interval_minutes=interval,
@@ -979,7 +982,7 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError(
                 "应用正在停止，订阅检查已取消", status_code=409, code="cancelled"
             )
-        if not db.media_subscription_check_is_active(
+        if not media_subscriptions_repo.media_subscription_check_is_active(
             subscription_id,
             subscription_revision,
             run_id=_ACTIVE_CHECK_RUN_ID.get(),
@@ -1030,7 +1033,7 @@ class MediaSubscriptionService:
         await self._sync_admissions(row, local_keys)
         active_keys = {
             str(item["media_key"])
-            for item in db.list_active_media_download_admissions(int(row["id"]))
+            for item in media_subscriptions_repo.list_active_media_download_admissions(int(row["id"]))
         }
         missing_items = [
             item for item in expected
@@ -1238,7 +1241,7 @@ class MediaSubscriptionService:
         }
         active_keys = {
             str(item["media_key"])
-            for item in db.list_active_media_download_admissions(int(row["id"]))
+            for item in media_subscriptions_repo.list_active_media_download_admissions(int(row["id"]))
             if str(item["media_key"] or "") not in local_keys
         }
         missing_items = [
@@ -1329,7 +1332,7 @@ class MediaSubscriptionService:
         media_key = build_media_key(tmdb_id, "movie")
         active = any(
             str(item["media_key"] or "") == media_key
-            for item in db.list_active_media_download_admissions(int(row["id"]))
+            for item in media_subscriptions_repo.list_active_media_download_admissions(int(row["id"]))
         ) and not present
         facts = _movie_facts(
             detail.get("release_date"), present=present, active=active, inventory_complete=inventory_complete,
@@ -1388,7 +1391,7 @@ class MediaSubscriptionService:
         await self._sync_admissions(row, {key} if present else set())
         active = any(
             str(item["media_key"]) == key
-            for item in db.list_active_media_download_admissions(int(row["id"]))
+            for item in media_subscriptions_repo.list_active_media_download_admissions(int(row["id"]))
         )
         facts = _movie_facts(
             detail.get("release_date"), present=present, active=active, inventory_complete=complete,
@@ -1730,7 +1733,7 @@ class MediaSubscriptionService:
         # 该同步段原先按 admission 逐条开连接查询/更新；仓储现在在一个连接中
         # 完成 LEFT JOIN 与状态归并，并整体卸载出 ASGI event loop。
         await asyncio.to_thread(
-            db.reconcile_media_download_admissions,
+            media_subscriptions_repo.reconcile_media_download_admissions,
             int(row["id"]),
             set(local_keys),
             expected_revision=int(row["revision"] or 1),
@@ -1742,7 +1745,7 @@ class MediaSubscriptionService:
         candidates: list[dict[str, Any]],
     ) -> list[tuple[int, dict[str, Any]]]:
         """按持久化状态筛选候选，避免刷新后重试 submitted/dismissed 行。"""
-        rows = db.list_media_subscription_candidates_by_ids(candidate_ids)
+        rows = media_subscriptions_repo.list_media_subscription_candidates_by_ids(candidate_ids)
         available = {
             int(row["id"]): str(row["result_id"] or "")
             for row in rows
@@ -1803,7 +1806,7 @@ class MediaSubscriptionService:
                 })
                 if len(candidates) >= _MAX_CANDIDATES_PER_MEDIA:
                     break
-            ids = db.replace_media_subscription_candidates(
+            ids = media_subscriptions_repo.replace_media_subscription_candidates(
                 int(row["id"]), target.media_key,
                 season=target.season, episode=target.episode,
                 candidates=candidates, expires_at=self._candidate_expiry(),
@@ -1859,7 +1862,7 @@ class MediaSubscriptionService:
             if item.download_state in {"ready", "resolvable"}
             and (item.relevance_score or 0) >= 60
         ][:_MAX_CANDIDATES_PER_MEDIA]
-        ids = db.replace_media_subscription_candidates(
+        ids = media_subscriptions_repo.replace_media_subscription_candidates(
             int(row["id"]), media_key, season=None, episode=None,
             candidates=candidates, expires_at=self._candidate_expiry(),
         )
@@ -1961,12 +1964,12 @@ class MediaSubscriptionService:
         require_active_check: bool = False,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        candidate = db.get_media_subscription_candidate(candidate_id)
+        candidate = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
         if candidate is None:
             raise MediaSubscriptionError("候选资源不存在", status_code=404, code="not_found")
         if str(candidate["status"]) != "available":
             raise MediaSubscriptionError("候选资源已失效或已提交", status_code=409, code="unavailable")
-        subscription = db.get_media_subscription(int(candidate["subscription_id"]))
+        subscription = media_subscriptions_repo.get_media_subscription(int(candidate["subscription_id"]))
         if subscription is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
         if not bool(subscription["enabled"]):
@@ -1980,13 +1983,13 @@ class MediaSubscriptionService:
                 "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
             )
         if not await self._candidate_still_missing(subscription, candidate):
-            db.update_media_subscription_candidate(int(candidate["id"]), status="expired")
+            media_subscriptions_repo.update_media_subscription_candidate(int(candidate["id"]), status="expired")
             raise MediaSubscriptionError(
                 "该媒体已入库，候选已失效",
                 status_code=409,
                 code="already_present",
             )
-        admission_id = db.claim_media_download_admission(
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
             media_key=str(candidate["media_key"]), tmdb_id=str(subscription["tmdb_id"]),
             media_type=str(subscription["media_type"]), subscription_id=int(subscription["id"]),
             candidate_id=int(candidate["id"]), season=candidate["season"], episode=candidate["episode"],
@@ -2004,7 +2007,7 @@ class MediaSubscriptionService:
                 "error": "该媒体已在下载或入库处理中",
             }
         if cancel_event is not None and cancel_event.is_set():
-            db.update_media_download_admission(
+            media_subscriptions_repo.update_media_download_admission(
                 admission_id,
                 expected_statuses=("claimed",),
                 status="cancelled",
@@ -2014,7 +2017,7 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError(
                 "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
             )
-        if not db.begin_media_download_dispatch(
+        if not media_subscriptions_repo.begin_media_download_dispatch(
             admission_id,
             subscription_id=int(subscription["id"]),
             subscription_revision=revision,
@@ -2025,7 +2028,7 @@ class MediaSubscriptionService:
                 "订阅已暂停、删除或配置已变更", status_code=409, code="cancelled"
             )
         if cancel_event is not None and cancel_event.is_set():
-            db.update_media_download_admission(
+            media_subscriptions_repo.update_media_download_admission(
                 admission_id,
                 expected_statuses=("dispatching",),
                 status="cancelled",
@@ -2047,34 +2050,34 @@ class MediaSubscriptionService:
         except asyncio.CancelledError:
             # resolver 热关闭或调用方取消不属于普通 Exception。仓储 CAS 与请求
             # 原子绑定串行：未绑定则释放并拒绝迟到绑定；已绑定/未知结果仍防重。
-            db.fail_unbound_media_download_admission(admission_id, "下载提交已取消")
+            media_subscriptions_repo.fail_unbound_media_download_admission(admission_id, "下载提交已取消")
             raise
         except Exception as exc:
-            db.fail_unbound_media_download_admission(admission_id, "下载提交异常")
+            media_subscriptions_repo.fail_unbound_media_download_admission(admission_id, "下载提交异常")
             raise MediaSubscriptionError(
                 "下载提交失败", status_code=502, code="download_failed"
             ) from exc
         request_id = int(result.get("request_id") or 0)
-        request_row = db.get_download_request(request_id) if request_id else None
+        request_row = download_requests_repo.get_download_request(request_id) if request_id else None
         request_status = str(request_row["status"] or "") if request_row else ""
         if request_status == "cancelled":
             # pending 请求可在准入绑定与后端认领之间取消；duplicate 不是提交证据。
             # 也同步取消后才绑定的准入，候选仍保持 available，允许用户重新选择。
-            db.sync_media_download_admission_for_request(request_id)
+            media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
             raise MediaSubscriptionError(
                 "下载请求已取消，可重新选择候选资源", status_code=409, code="cancelled"
             )
         manual_review = str(result.get("status") or "") == "manual_review"
         accepted = bool(result.get("ok") or result.get("duplicate") or manual_review)
         if accepted:
-            db.update_media_subscription_candidate(
+            media_subscriptions_repo.update_media_subscription_candidate(
                 int(candidate["id"]), status="submitted", request_id=request_id or None
             )
         if request_id:
             # 请求在写入前已与准入绑定；只从事务内的当前请求投影，不能回写旧快照。
-            db.sync_media_download_admission_for_request(request_id)
+            media_subscriptions_repo.sync_media_download_admission_for_request(request_id)
         elif accepted:
-            db.update_media_download_admission(
+            media_subscriptions_repo.update_media_download_admission(
                 admission_id, expected_statuses=("claimed", "dispatching"),
                 status="processing" if manual_review else "submitted",
                 error=str(result.get("error") or "")[:500] if manual_review else "",
@@ -2087,7 +2090,7 @@ class MediaSubscriptionService:
                     message = redact_sensitive_text(dispatch_error)[:500]
             released = False
             if not request_id:
-                released = db.fail_unbound_media_download_admission(admission_id, message)
+                released = media_subscriptions_repo.fail_unbound_media_download_admission(admission_id, message)
                 if require_active_check:
                     self._ensure_active_check(int(subscription["id"]), revision, cancel_event)
                 elif cancel_event is not None and cancel_event.is_set():
@@ -2105,7 +2108,7 @@ class MediaSubscriptionService:
         return {**result, "candidate_id": int(candidate["id"]), "admission_id": admission_id}
 
     def stats(self) -> dict[str, int]:
-        return db.get_media_subscription_stats()
+        return media_subscriptions_repo.get_media_subscription_stats()
 
 
 _service = MediaSubscriptionService()

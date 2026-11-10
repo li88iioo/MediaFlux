@@ -9,6 +9,7 @@ from dataclasses import asdict
 from typing import Any
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.logger import get_logger
 from app.modules.rss import (
     RSSEngine,
@@ -116,7 +117,7 @@ def entries(
     _integer(offset, 0)
     if not isinstance(query, str):
         raise RSSSubscriptionError("query 必须是字符串")
-    page = db.list_rss_entries(
+    page = rss_repo.list_rss_entries(
         sub_id=subscription_id,
         status=None if status == "all" else status,
         limit=limit,
@@ -171,9 +172,9 @@ def entries(
 def _capture(operation: str, arguments: dict) -> dict:
     if operation == "refresh":
         rows = (
-            db.list_rss_subscriptions()
+            rss_repo.list_rss_subscriptions()
             if arguments.get("scope")
-            else [db.get_rss_subscription(i) for i in arguments["subscription_ids"]]
+            else [rss_repo.get_rss_subscription(i) for i in arguments["subscription_ids"]]
         )
         if not rows or any(
             row is None or not str(row["urls"] or "").strip() for row in rows
@@ -193,7 +194,7 @@ def _capture(operation: str, arguments: dict) -> dict:
             ]
         }
     if operation == "mark":
-        by_id = db.get_rss_entries_by_ids(arguments["entry_ids"])
+        by_id = rss_repo.get_rss_entries_by_ids(arguments["entry_ids"])
         rows = [by_id.get(i) for i in arguments["entry_ids"]]
         eligible = (
             {"pending", "failed", "skipped"}
@@ -223,9 +224,9 @@ def _capture(operation: str, arguments: dict) -> dict:
 
     runtime, config_error = capture_rss_qb_runtime_config()
     query = (
-        db.get_pending_rss_snapshot
+        rss_repo.get_pending_rss_snapshot
         if operation == "download"
-        else db.get_retryable_failed_rss_snapshot
+        else rss_repo.get_retryable_failed_rss_snapshot
     )
     selected = arguments.get("entry_ids")
     rows = query(
@@ -246,9 +247,9 @@ def _capture(operation: str, arguments: dict) -> dict:
             code="missing_torrent_url",
         )
     snapshot = (
-        db.rss_pending_entry_snapshot
+        rss_repo.rss_pending_entry_snapshot
         if operation == "download"
-        else db.rss_retry_entry_snapshot
+        else rss_repo.rss_retry_entry_snapshot
     )
     items = [snapshot(row) for row in rows]
     targets = sorted(
@@ -365,7 +366,7 @@ def execute(
     if check_cancelled:
         check_cancelled()
     if operation == "mark":
-        updated = db.update_rss_entries_processed_snapshot(
+        updated = rss_repo.update_rss_entries_processed_snapshot(
             state["rows"], arguments["processed"]
         )
         if updated != len(state["rows"]):
@@ -401,9 +402,9 @@ def execute(
     raw = RSSEngine().submit_snapshot(
         state["entries"],
         state["runtime_config"],
-        claim=db.claim_pending_rss_entries
+        claim=rss_repo.claim_pending_rss_entries
         if operation == "download"
-        else db.claim_retryable_failed_rss_entries,
+        else rss_repo.claim_retryable_failed_rss_entries,
         check_cancelled=check_cancelled,
         guangya_credential_generation=state.get("guangya_credential_generation"),
     )

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.repositories import media_subscriptions as repository
 from tests.support import isolated_test_database
 
@@ -16,7 +17,7 @@ from tests.support import isolated_test_database
 class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.path = self.enterContext(isolated_test_database("mediaflux.db"))
-        self.subscription = db.add_media_subscription(
+        self.subscription = repository.add_media_subscription(
             provider="tmdb",
             external_id="1",
             tmdb_id="1",
@@ -37,7 +38,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
         existing_request=None,
     ):
         key = f"tmdb:1:tv:S01E{episode:03d}"
-        candidate = db.replace_media_subscription_candidates(
+        candidate = repository.replace_media_subscription_candidates(
             self.subscription,
             key,
             season=1,
@@ -45,7 +46,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
             candidates=[{"result_id": f"candidate-{episode}", "title": key}],
             expires_at="2099-01-01 00:00:00",
         )[0]
-        admission = db.claim_media_download_admission(
+        admission = repository.claim_media_download_admission(
             media_key=key,
             tmdb_id="1",
             media_type="tv",
@@ -57,21 +58,21 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
         )
         assert admission is not None
         self.assertTrue(
-            db.begin_media_download_dispatch(
+            repository.begin_media_download_dispatch(
                 admission, subscription_id=self.subscription, subscription_revision=1
             )
         )
         if existing_request is None:
-            request, _ = db.create_download_request(
+            request, _ = download_requests_repo.create_download_request(
                 f"transaction-{episode}", "magnet", admission_id=admission
             )
         else:
             request = existing_request
             assert admission is not None
             self.assertTrue(
-                db.bind_media_download_admission_request(admission, request)
+                download_requests_repo.bind_media_download_admission_request(admission, request)
             )
-        db.update_download_request(request, status=status, error=error)
+        download_requests_repo.update_download_request(request, status=status, error=error)
         return request, admission
 
     @staticmethod
@@ -89,7 +90,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
         for mode in ("immediate", "batch"):
             with self.subTest(mode=mode):
                 request, admission = self.seed(1 if mode == "immediate" else 2)
-                db.sync_media_download_admission_for_request(request)
+                repository.sync_media_download_admission_for_request(request)
                 read_old, newer_started, newer_done = (
                     threading.Event(),
                     threading.Event(),
@@ -126,8 +127,8 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
 
                 def old_writer():
                     if mode == "immediate":
-                        return db.sync_media_download_admission_for_request(request)
-                    return db.reconcile_media_download_admissions(
+                        return repository.sync_media_download_admission_for_request(request)
+                    return repository.reconcile_media_download_admissions(
                         self.subscription, set(), expected_revision=1
                     )
 
@@ -136,7 +137,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
                         raise RuntimeError("old snapshot not reached")
                     newer_started.set()
                     try:
-                        return db.update_download_request_and_sync_media_admission(
+                        return download_requests_repo.update_download_request_and_sync_media_admission(
                             request, status="manual_review", error=new_reason
                         )
                     finally:
@@ -160,7 +161,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
                         newer = new_pool.submit(new_writer)
                         self.assertGreaterEqual(older.result(timeout=10), 1)
                         self.assertEqual(newer.result(timeout=10), 1)
-                get_download_request_result = db.get_download_request(request)
+                get_download_request_result = download_requests_repo.get_download_request(request)
                 assert get_download_request_result is not None
                 self.assertEqual(get_download_request_result["error"], new_reason)
                 result = self.admission(admission)
@@ -186,7 +187,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
                     conn.set_trace_callback(None)
 
         with patch.object(db, "get_conn", tracked):
-            projected, released = db.reconcile_startup_media_download_admissions()
+            projected, released = repository.reconcile_startup_media_download_admissions()
         self.assertEqual((projected, released), (60, 0))
         reads = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
         self.assertEqual(
@@ -206,12 +207,12 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
         _, second = self.seed(2, existing_request=request)
         _, terminal = self.seed(3, existing_request=request)
         assert terminal is not None
-        db.update_media_download_admission(
+        repository.update_media_download_admission(
             terminal, status="cancelled", error="用户已取消"
         )
         before = self.admission(terminal)
-        self.assertEqual(db.sync_media_download_admission_for_request(request), 2)
-        self.assertEqual(db.reconcile_startup_media_download_admissions(), (2, 0))
+        self.assertEqual(repository.sync_media_download_admission_for_request(request), 2)
+        self.assertEqual(repository.reconcile_startup_media_download_admissions(), (2, 0))
         self.assertEqual(self.admission(first)["status"], "processing")
         self.assertEqual(self.admission(second)["status"], "processing")
         self.assertEqual(self.admission(terminal), before)
@@ -228,9 +229,9 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
                         f"CREATE TRIGGER abort_projection BEFORE UPDATE ON media_download_admissions WHEN NEW.id={entries[-1][1]} BEGIN SELECT RAISE(ABORT,'projection-write-failure'); END"
                     )
                 operation = (
-                    db.reconcile_startup_media_download_admissions
+                    repository.reconcile_startup_media_download_admissions
                     if mode == "startup"
-                    else lambda: db.reconcile_media_download_admissions(
+                    else lambda: repository.reconcile_media_download_admissions(
                         self.subscription, set(), expected_revision=1
                     )
                 )
@@ -241,8 +242,8 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
                 self.assertEqual([self.admission(a) for _, a in entries], before)
                 with db.get_conn() as conn:
                     conn.execute("DROP TRIGGER abort_projection")
-        self.assertEqual(db.reconcile_startup_media_download_admissions(), (4, 0))
-        self.assertEqual(db.reconcile_startup_media_download_admissions(), (0, 0))
+        self.assertEqual(repository.reconcile_startup_media_download_admissions(), (4, 0))
+        self.assertEqual(repository.reconcile_startup_media_download_admissions(), (0, 0))
 
     def test_primary_key_updates_avoid_repeated_queue_scans(self):
         entries = [self.seed(i) for i in range(1, 11)]
@@ -267,7 +268,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
                     conn.set_trace_callback(None)
 
         with patch.object(db, "get_conn", tracked):
-            self.assertEqual(db.reconcile_startup_media_download_admissions(), (10, 0))
+            self.assertEqual(repository.reconcile_startup_media_download_admissions(), (10, 0))
         projected = [sql for sql in updates if "status='processing'" in sql]
         self.assertEqual(len(projected), len(entries))
         with db.get_conn() as conn:
@@ -296,6 +297,7 @@ import os, sys, socket
 from contextlib import contextmanager
 from unittest.mock import patch
 from app import database as db
+from app.repositories import media_subscriptions as repository
 socket.socket.connect = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("network forbidden"))
 db.configure_database(sys.argv[1], test_mode=True)
 actual = db.get_conn
@@ -311,7 +313,7 @@ def tracked():
   conn.set_trace_callback(interrupt)
   yield conn
 with patch.object(db, "get_conn", tracked):
- db.reconcile_startup_media_download_admissions()
+ repository.reconcile_startup_media_download_admissions()
 raise AssertionError("bulk publication window not reached")
 """
         child = subprocess.run(
@@ -326,7 +328,7 @@ raise AssertionError("bulk publication window not reached")
         archive = backup.create_backup(paths, reason="uncommitted-projection")
         backup.verify_backup(archive)
         db.init_db()
-        self.assertEqual(db.reconcile_startup_media_download_admissions(), (10, 0))
+        self.assertEqual(repository.reconcile_startup_media_download_admissions(), (10, 0))
         expected = [
             (
                 self.admission(a)["status"],
@@ -336,11 +338,11 @@ raise AssertionError("bulk publication window not reached")
             for _, a in entries
         ]
         self.assertEqual(
-            len(db.list_active_media_download_admissions(self.subscription)), 5
+            len(repository.list_active_media_download_admissions(self.subscription)), 5
         )
         backup.restore_backup(paths, archive)
         db.init_db()
-        self.assertEqual(db.reconcile_startup_media_download_admissions(), (10, 0))
+        self.assertEqual(repository.reconcile_startup_media_download_admissions(), (10, 0))
         restored = [
             (
                 self.admission(a)["status"],
@@ -350,4 +352,4 @@ raise AssertionError("bulk publication window not reached")
             for _, a in entries
         ]
         self.assertEqual(restored, expected)
-        self.assertEqual(db.reconcile_startup_media_download_admissions(), (5, 0))
+        self.assertEqual(repository.reconcile_startup_media_download_admissions(), (5, 0))

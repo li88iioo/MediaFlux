@@ -48,6 +48,7 @@ from fastapi.responses import (
 from starlette.requests import ClientDisconnect
 
 from app import database
+from app.repositories import media_proxy as media_proxy_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get
 from app.logger import get_logger, log_throttled
@@ -416,7 +417,7 @@ def signed_url_cache_metrics(instance_id: int | None = None) -> dict:
 
 
 def _resolved_instance(instance_id: int) -> dict[str, Any] | None:
-    row = database.get_media_proxy_instance(instance_id)
+    row = media_proxy_repo.get_media_proxy_instance(instance_id)
     if not row:
         return None
     return resolve_proxy_instance(row)
@@ -2528,7 +2529,7 @@ async def probe_media_proxy_instance(
     timeout_seconds: float = 8.0,
 ) -> dict[str, int]:
     """安全探测一个已保存实例；固定 DNS 快照且不返回地址或凭据。"""
-    row = await asyncio.to_thread(database.get_media_proxy_instance, instance_id)
+    row = await asyncio.to_thread(media_proxy_repo.get_media_proxy_instance, instance_id)
     if row is None:
         raise LookupError("media proxy instance not found")
     resolved = resolve_proxy_instance(row)
@@ -3932,7 +3933,7 @@ def _media_proxy_binding(
     binding = None
     for item_variant in _media_identifier_variants(item_id):
         for source_variant in _media_identifier_variants(requested_source):
-            candidate = database.get_media_proxy_binding(
+            candidate = media_proxy_repo.get_media_proxy_binding(
                 instance_id, item_variant, source_variant
             )
             if not candidate:
@@ -6049,7 +6050,7 @@ class MediaProxyManager:
             if self._stopping:
                 return {"restarted": False, "reason": "stopping"}
             row = await asyncio.to_thread(
-                database.get_media_proxy_instance, instance_id
+                media_proxy_repo.get_media_proxy_instance, instance_id
             )
             if row is None or not int(row["enabled"] or 0):
                 return {"restarted": False, "reason": "not_enabled"}
@@ -6073,7 +6074,7 @@ class MediaProxyManager:
                 resolved = state["effective"] if state is not None else resolve_proxy_instance(row)
             except ValueError as exc:
                 await asyncio.to_thread(
-                    database.update_media_proxy_instance,
+                    media_proxy_repo.update_media_proxy_instance,
                     instance_id,
                     {"status": "error", "last_error": str(exc)},
                 )
@@ -6087,7 +6088,7 @@ class MediaProxyManager:
                 replacement = await self._start_runtime(resolved)
             except Exception as exc:
                 await asyncio.to_thread(
-                    database.update_media_proxy_instance,
+                    media_proxy_repo.update_media_proxy_instance,
                     instance_id,
                     {"status": "error", "last_error": str(exc)},
                 )
@@ -6114,7 +6115,7 @@ class MediaProxyManager:
             if self._stopping:
                 return {"started": [], "stopped": [], "failed": {}}
             instance_rows = await asyncio.to_thread(
-                database.list_media_proxy_instances
+                media_proxy_repo.list_media_proxy_instances
             )
             raw_rows = {int(row["id"]): row for row in instance_rows}
             rows: dict[int, Any] = {}
@@ -6132,7 +6133,7 @@ class MediaProxyManager:
                     message = str(exc)
                     failed[instance_id] = message
                     await asyncio.to_thread(
-                        database.update_media_proxy_instance,
+                        media_proxy_repo.update_media_proxy_instance,
                         instance_id,
                         {"status": "error", "last_error": message},
                     )
@@ -6151,7 +6152,7 @@ class MediaProxyManager:
                     stopped.append(instance_id)
                     if row:
                         await asyncio.to_thread(
-                            database.update_media_proxy_instance,
+                            media_proxy_repo.update_media_proxy_instance,
                             instance_id,
                             {"status": "stopped", "last_error": ""},
                         )
@@ -6170,7 +6171,7 @@ class MediaProxyManager:
                     self._runtimes.pop(instance_id, None)
                     stopped.append(instance_id)
                     await asyncio.to_thread(
-                        database.update_media_proxy_instance,
+                        media_proxy_repo.update_media_proxy_instance,
                         instance_id,
                         {"status": "error", "last_error": "媒体反代运行任务意外退出"},
                     )
@@ -6185,14 +6186,14 @@ class MediaProxyManager:
                     self._runtimes.pop(instance_id, None)
                     stopped.append(instance_id)
                     await asyncio.to_thread(
-                        database.update_media_proxy_instance,
+                        media_proxy_repo.update_media_proxy_instance,
                         instance_id,
                         {"status": "error", "last_error": message},
                     )
                     continue
                 if desired == runtime.bind and desired_forwarding == runtime.forwarding:
                     await asyncio.to_thread(
-                        database.update_media_proxy_instance,
+                        media_proxy_repo.update_media_proxy_instance,
                         instance_id,
                         {"status": "running", "last_error": ""},
                     )
@@ -6209,7 +6210,7 @@ class MediaProxyManager:
                         message = str(exc)
                         failed[instance_id] = message
                         await asyncio.to_thread(
-                            database.update_media_proxy_instance,
+                            media_proxy_repo.update_media_proxy_instance,
                             instance_id,
                             {"status": "error", "last_error": message},
                         )
@@ -6231,7 +6232,7 @@ class MediaProxyManager:
                     message = str(exc)
                     failed[instance_id] = message
                     await asyncio.to_thread(
-                        database.update_media_proxy_instance,
+                        media_proxy_repo.update_media_proxy_instance,
                         instance_id,
                         {"status": "error", "last_error": message},
                     )
@@ -6252,7 +6253,7 @@ class MediaProxyManager:
                     message = str(exc)
                     failed[instance_id] = message
                     await asyncio.to_thread(
-                        database.update_media_proxy_instance,
+                        media_proxy_repo.update_media_proxy_instance,
                         instance_id,
                         {"status": "error", "last_error": message},
                     )
@@ -6333,7 +6334,7 @@ class MediaProxyManager:
                     f"媒体反代启动失败: {error or 'unknown error'}"
                 )
             await asyncio.to_thread(
-                database.update_media_proxy_instance,
+                media_proxy_repo.update_media_proxy_instance,
                 instance_id,
                 {"status": "running", "last_error": ""},
             )
@@ -6474,7 +6475,7 @@ def _proxy_credentials(rows) -> tuple[str, ...]:
 
 def playback_proxy_instances() -> dict:
     """只读当前配置、有效上游和本进程运行事实，不启动监听或探测上游。"""
-    rows = database.list_media_proxy_instances()
+    rows = media_proxy_repo.list_media_proxy_instances()
     known_credentials = _proxy_credentials(rows)
     runtime_error = ""
     try:
@@ -6515,7 +6516,7 @@ def playback_proxy_failures(hours: int = 24, instance_id: int | None = None,
     data["instance_id"] = instance_id
     return {"ok": True, "status": "attention" if data["failed"] else "empty" if not data["total_recorded"] else "completed",
             "summary": f"最近 {hours} 小时已记录 {data['failed']} 次媒体反代失败",
-            "data": _proxy_public(data, _proxy_credentials(database.list_media_proxy_instances()))}
+            "data": _proxy_public(data, _proxy_credentials(media_proxy_repo.list_media_proxy_instances()))}
 
 
 def test_playback_proxy(instance_id: int) -> dict:

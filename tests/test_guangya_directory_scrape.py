@@ -1890,7 +1890,7 @@ class DirectoryScrapeServiceTests(unittest.TestCase):
 
         file = _file("probe", "Movie.2026.1080p.mkv", "movie-dir")
         client = Mock()
-        with patch("app.modules.media_probe.db.get_media_probe_cache", return_value=None):
+        with patch("app.repositories.media_probe.get_media_probe_cache", return_value=None):
             profile = probe_media_profile(
                 file, client, enabled=True, timeout=90, cache_only=True,
             )

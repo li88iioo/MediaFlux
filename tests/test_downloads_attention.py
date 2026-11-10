@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app import sdk
 from app.clients.qbittorrent import TorrentAddResult
 from app.config import web_credentials
@@ -27,7 +28,7 @@ TORRENT_DATA = (
 
 
 def _create_interrupted_request() -> int:
-    request_id, created = db.create_download_request(
+    request_id, created = download_requests_repo.create_download_request(
         "attention:test-request",
         "torrent",
         title="E.T.外星人.1982.2160p",
@@ -40,7 +41,7 @@ def _create_interrupted_request() -> int:
     )
     if not created:
         raise AssertionError("测试下载请求未创建")
-    db.update_download_request(
+    download_requests_repo.update_download_request(
         request_id,
         status="completed",
         gy_status="completed",
@@ -64,8 +65,8 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
 
         request_id = _create_interrupted_request()
 
-        self.assertEqual(db.count_download_requests_requiring_attention(), 1)
-        rows = db.list_download_requests_requiring_attention(limit=20, offset=0)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        rows = download_requests_repo.list_download_requests_requiring_attention(limit=20, offset=0)
         self.assertEqual([int(row["id"]) for row in rows], [request_id])
         self.assertEqual(db.get_dashboard_automation_summary()["downloads_review"], 1)
         public = list_download_request_summaries(scope="attention")
@@ -76,14 +77,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
     def test_retained_staging_directory_is_visible_as_attention(self):
         from app.repositories.download_requests import list_download_request_summaries
 
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "attention:staging-retained",
             "magnet",
             title="Residual staging",
             source_value="magnet:?xt=urn:btih:staging-retained",
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             gy_status="completed",
@@ -93,8 +94,8 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             gy_staging_cleanup_error="隔离目录仍有 2 项未整理或未识别：sample.txt、poster.jpg",
         )
 
-        self.assertEqual(db.count_download_requests_requiring_attention(), 1)
-        rows = db.list_download_requests_requiring_attention(limit=20, offset=0)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        rows = download_requests_repo.list_download_requests_requiring_attention(limit=20, offset=0)
         self.assertEqual([int(row["id"]) for row in rows], [request_id])
         item = list_download_request_summaries(scope="attention")["items"][0]
         self.assertEqual(item["request_number"], request_id)
@@ -129,7 +130,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["ok"])
         successor_id = int(result["request_id"])
         self.assertNotEqual(successor_id, request_id)
-        successor = db.get_download_request(successor_id)
+        successor = download_requests_repo.get_download_request(successor_id)
         assert successor is not None
         self.assertEqual(successor["message_id"], f"resubmit:{request_id}")
         self.assertEqual(successor["origin"], "web")
@@ -139,17 +140,17 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(successor["torrent_data"], TORRENT_DATA)
         attention_ids = {
             int(row["id"])
-            for row in db.list_download_requests_requiring_attention(limit=100, offset=0)
+            for row in download_requests_repo.list_download_requests_requiring_attention(limit=100, offset=0)
         }
         self.assertNotIn(request_id, attention_ids)
         self.assertNotIn(successor_id, attention_ids)
-        original = db.get_download_request(request_id)
+        original = download_requests_repo.get_download_request(request_id)
         assert original is not None
         self.assertEqual(original["organize_started"], 1)
         self.assertEqual(original["organize_status"], "resubmitted")
         self.assertEqual(original["strm_status"], "resubmitted")
         self.assertIn(f"请求 #{successor_id}", original["error"])
-        active_ids = {int(row["id"]) for row in db.list_active_download_requests()}
+        active_ids = {int(row["id"]) for row in download_requests_repo.list_active_download_requests()}
         self.assertNotIn(request_id, active_ids)
 
     def test_manual_review_resubmit_creates_explicit_successor_and_tracks_other_backend(self):
@@ -158,7 +159,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Recovered request",
             source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
@@ -168,14 +169,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             message_id="456",
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="both",
             status="manual_review",
             qb_status="submitted",
             gy_status="manual_review",
         )
-        duplicate_id, duplicate_created = db.create_download_request(
+        duplicate_id, duplicate_created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
@@ -209,8 +210,8 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         dispatch.assert_called_once()
         self.assertEqual(int(dispatch.call_args.args[0]["id"]), successor_id)
         self.assertEqual(dispatch.call_args.args[1], ("guangya",))
-        original = db.get_download_request(request_id)
-        successor = db.get_download_request(successor_id)
+        original = download_requests_repo.get_download_request(request_id)
+        successor = download_requests_repo.get_download_request(successor_id)
         assert original is not None
         self.assertEqual(original["status"], "resubmitted")
         self.assertIn(":history:", original["request_key"])
@@ -218,29 +219,29 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(successor["status"], "submitting")
         self.assertEqual(successor["chat_id"], "-100123")
         self.assertEqual(successor["user_id"], "9988")
-        active_ids = {int(row["id"]) for row in db.list_active_download_requests()}
+        active_ids = {int(row["id"]) for row in download_requests_repo.list_active_download_requests()}
         self.assertIn(request_id, active_ids)
 
         tracker = DownloadTracker()
         completed_task = SimpleNamespace(hash="qb-active", progress=1.0, state="uploading")
-        db.update_download_request(request_id, qb_task_id="qb-active")
+        download_requests_repo.update_download_request(request_id, qb_task_id="qb-active")
         with (
             patch.object(tracker, "_match_qb", return_value=completed_task),
             patch.object(tracker, "_start_local_import"),
             patch.object(tracker, "_notify_completion"),
         ):
             tracker._update_request(
-                db.get_download_request(request_id),
+                download_requests_repo.get_download_request(request_id),
                 [completed_task],
                 [],
                 qb_available=True,
                 gy_available=False,
             )
-        settled_original = db.get_download_request(request_id)
+        settled_original = download_requests_repo.get_download_request(request_id)
         assert settled_original is not None
         self.assertEqual(settled_original["status"], "resubmitted")
         self.assertEqual(settled_original["qb_status"], "completed")
-        settled_active_ids = {int(row["id"]) for row in db.list_active_download_requests()}
+        settled_active_ids = {int(row["id"]) for row in download_requests_repo.list_active_download_requests()}
         self.assertNotIn(request_id, settled_active_ids)
 
     def test_qb_manual_review_successor_clears_old_attention(self):
@@ -249,14 +250,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Recovered qB request",
             source_value="magnet:?xt=urn:btih:1123456789abcdef0123456789abcdef01234567",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
             source_value=item.source_value,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="both",
             status="manual_review",
@@ -284,18 +285,18 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             result = download_dispatcher.resubmit_download_request(request_id, "qb")
 
         self.assertTrue(result["ok"])
-        original = db.get_download_request(request_id)
+        original = download_requests_repo.get_download_request(request_id)
         assert original is not None
         self.assertEqual(original["status"], "resubmitted")
         self.assertEqual(original["qb_status"], "resubmitted")
         attention_ids = {
             int(row["id"])
-            for row in db.list_download_requests_requiring_attention(limit=100, offset=0)
+            for row in download_requests_repo.list_download_requests_requiring_attention(limit=100, offset=0)
         }
         self.assertNotIn(request_id, attention_ids)
         self.assertIn(
             request_id,
-            {int(row["id"]) for row in db.list_active_download_requests()},
+            {int(row["id"]) for row in download_requests_repo.list_active_download_requests()},
         )
 
     def test_resubmitted_requests_keep_real_status_across_sdk_pages(self):
@@ -303,7 +304,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             "magnet", "Transferred query fixture", "magnet:?xt=urn:btih:" + "a" * 40
         )
         request_id = int(download_dispatcher.create_request(item, "", "", origin="agent")["id"])
-        db.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
+        download_requests_repo.update_download_request(request_id, targets="qb", status="failed", qb_status="failed")
         with patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "a" * 40}) as submit:
             result = download_dispatcher.resubmit_download_request(
                 request_id, "qb", qb_runtime_config={"url": "http://fixture.invalid"}
@@ -348,7 +349,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             origin="rss:1",
         )
         request_id = int(created["id"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb",
             status="manual_review",
@@ -374,7 +375,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             result = download_dispatcher.resubmit_download_request(request_id, "qb")
 
         self.assertTrue(result["ok"])
-        successor = db.get_download_request(int(result["request_id"]))
+        successor = download_requests_repo.get_download_request(int(result["request_id"]))
         assert successor is not None
         self.assertEqual(successor["qb_task_id"], infohash)
         self.assertEqual(successor["qb_status"], "submitted")
@@ -385,7 +386,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
                 source_value=f"magnet:?xt=urn:btih:{infohash}",
             )
         )
-        get_download_request_by_request_key_result = db.get_download_request_by_request_key(canonical)
+        get_download_request_by_request_key_result = download_requests_repo.get_download_request_by_request_key(canonical)
         assert get_download_request_by_request_key_result is not None
         self.assertEqual(
             int(get_download_request_by_request_key_result["id"]),
@@ -408,7 +409,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             origin="rss:1",
         )
         request_id = int(created["id"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb",
             status="manual_review",
@@ -434,7 +435,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             result = download_dispatcher.resubmit_download_request(request_id, "qb")
 
         self.assertTrue(result["ok"])
-        successor = db.get_download_request(int(result["request_id"]))
+        successor = download_requests_repo.get_download_request(int(result["request_id"]))
         assert successor is not None
         self.assertEqual(successor["qb_task_id"], infohash)
         self.assertEqual(successor["qb_status"], "submitted")
@@ -445,7 +446,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             TORRENT_DATA,
         )
         _title, torrent_id = download_dispatcher.parse_torrent_metadata(TORRENT_DATA)
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
@@ -453,7 +454,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             torrent_data=item.torrent_data,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb",
             status="failed",
@@ -496,7 +497,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(result["ok"])
         export_torrent.assert_called_once_with(torrent_id)
-        successor = db.get_download_request(int(result["request_id"]))
+        successor = download_requests_repo.get_download_request(int(result["request_id"]))
         assert successor is not None
         self.assertEqual(successor["kind"], "torrent")
         self.assertEqual(successor["torrent_data"], TORRENT_DATA)
@@ -506,7 +507,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             "recover-from-magnet.torrent",
             TORRENT_DATA,
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
@@ -514,7 +515,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             torrent_data=None,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb",
             status="failed",
@@ -537,13 +538,13 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             ),
         ):
             capabilities = download_dispatcher.download_resubmit_capabilities(
-                db.get_download_request(request_id)
+                download_requests_repo.get_download_request(request_id)
             )
             result = download_dispatcher.resubmit_download_request(request_id, "qb")
 
         self.assertTrue(capabilities["qb"]["enabled"])
         self.assertTrue(result["ok"])
-        successor = db.get_download_request(int(result["request_id"]))
+        successor = download_requests_repo.get_download_request(int(result["request_id"]))
         assert successor is not None
         self.assertEqual(successor["kind"], "magnet")
         self.assertIsNone(successor["torrent_data"])
@@ -554,14 +555,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Uncertain qB request",
             source_value="magnet:?xt=urn:btih:2123456789abcdef0123456789abcdef01234567",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
             source_value=item.source_value,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb",
             status="manual_review",
@@ -576,7 +577,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         def fail_dispatch(row, claimed_targets: tuple[str, ...]):
             successor_id = int(row["id"])
             targets = "both" if len(claimed_targets) == 2 else claimed_targets[0]
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 successor_id,
                 targets=targets,
                 status="failed",
@@ -602,9 +603,9 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["source_attention_preserved"])
         self.assertIn("原请求仍保留在待处理列表", result["error"])
-        original = db.get_download_request(request_id)
+        original = download_requests_repo.get_download_request(request_id)
         successor_id = int(result["request_id"])
-        successor = db.get_download_request(successor_id)
+        successor = download_requests_repo.get_download_request(successor_id)
         assert original is not None
         self.assertEqual(original["status"], "manual_review")
         self.assertEqual(original["qb_status"], "manual_review")
@@ -612,7 +613,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(successor["status"], "failed")
         attention_ids = {
             int(row["id"])
-            for row in db.list_download_requests_requiring_attention(limit=100, offset=0)
+            for row in download_requests_repo.list_download_requests_requiring_attention(limit=100, offset=0)
         }
         self.assertIn(request_id, attention_ids)
         self.assertIn(successor_id, attention_ids)
@@ -623,14 +624,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Partially uncertain request",
             source_value="magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
             source_value=item.source_value,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="both",
             status="manual_review",
@@ -645,7 +646,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             analyze.return_value.allowed = True
             analyze.return_value.reason = ""
             capabilities = download_dispatcher.download_resubmit_capabilities(
-                db.get_download_request(request_id)
+                download_requests_repo.get_download_request(request_id)
             )
 
         self.assertFalse(capabilities["qb"]["enabled"])
@@ -660,14 +661,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Completed download with post-processing failure",
             source_value="magnet:?xt=urn:btih:1234567890abcdef1234567890abcdef12345678",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
             source_value=item.source_value,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="both",
             status="completed",
@@ -683,7 +684,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             analyze.return_value.allowed = True
             analyze.return_value.reason = ""
             capabilities = download_dispatcher.download_resubmit_capabilities(
-                db.get_download_request(request_id)
+                download_requests_repo.get_download_request(request_id)
             )
 
         self.assertFalse(capabilities["qb"]["enabled"])
@@ -698,7 +699,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Deleted remote task",
             source_value="magnet:?xt=urn:btih:4234567890abcdef1234567890abcdef12345678",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
@@ -706,7 +707,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             origin="indexer:nyaa",
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="guangya",
             status="completed",
@@ -720,7 +721,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             analyze.return_value.allowed = True
             analyze.return_value.reason = ""
             capabilities = download_dispatcher.download_resubmit_capabilities(
-                db.get_download_request(request_id),
+                download_requests_repo.get_download_request(request_id),
                 allow_completed=True,
             )
 
@@ -749,10 +750,10 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(result["ok"])
         self.assertNotEqual(result["request_id"], request_id)
-        successor = db.get_download_request(int(result["request_id"]))
+        successor = download_requests_repo.get_download_request(int(result["request_id"]))
         assert successor is not None
         self.assertEqual(successor["origin"], "indexer:nyaa")
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["status"], "completed")
 
@@ -762,14 +763,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             title="Already resubmitted download",
             source_value="magnet:?xt=urn:btih:876543210fedcba9876543210fedcba987654321",
         )
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             download_dispatcher.request_key(item),
             item.kind,
             title=item.title,
             source_value=item.source_value,
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="both",
             status="manual_review",
@@ -784,7 +785,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             analyze.return_value.allowed = True
             analyze.return_value.reason = ""
             capabilities = download_dispatcher.download_resubmit_capabilities(
-                db.get_download_request(request_id)
+                download_requests_repo.get_download_request(request_id)
             )
 
         self.assertTrue(capabilities["qb"]["enabled"])
@@ -795,14 +796,14 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
 
     def test_clear_attention_preserves_original_failure_and_audit_data(self):
         request_id = _create_interrupted_request()
-        before = db.get_download_request(request_id)
+        before = download_requests_repo.get_download_request(request_id)
 
-        result = db.clear_download_request_attentions([request_id], batch=False)
+        result = download_requests_repo.clear_download_request_attentions([request_id], batch=False)
 
         self.assertEqual(result["cleared"], [request_id])
-        self.assertEqual(db.count_download_requests_requiring_attention(), 0)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         self.assertEqual(db.get_dashboard_automation_summary()["downloads_review"], 0)
-        after = db.get_download_request(request_id)
+        after = download_requests_repo.get_download_request(request_id)
         assert after is not None
         assert before is not None
         self.assertEqual(after["status"], before["status"])
@@ -812,7 +813,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertTrue(after["attention_cleared_at"])
         self.assertIn("原状态", after["attention_clear_note"])
         self.assertEqual(
-            db.clear_download_request_attentions([request_id], batch=False)["already_cleared"],
+            download_requests_repo.clear_download_request_attentions([request_id], batch=False)["already_cleared"],
             [request_id],
         )
 
@@ -901,14 +902,14 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
         resubmit.assert_called_once_with(request_id, "both")
 
     def test_issues_api_does_not_duplicate_backend_failure_as_request_failure(self):
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "attention:backend-failure",
             "magnet",
             title="Backend failure",
             source_value="magnet:?xt=urn:btih:backend-failure",
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="failed",
             gy_status="failed",
@@ -927,14 +928,14 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
         )
 
     def test_issues_api_exposes_retained_staging_cleanup(self):
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "attention:staging-api",
             "magnet",
             title="Residual staging",
             source_value="magnet:?xt=urn:btih:staging-api",
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             gy_status="completed",
@@ -962,8 +963,8 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
-        assert (db.get_download_request(request_id)) is not None
-        self.assertEqual(db.count_download_requests_requiring_attention(), 0)
+        assert (download_requests_repo.get_download_request(request_id)) is not None
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         repeated = self.client.post(
             f"/api/downloads/issues/{request_id}/clear",
             headers=self._headers(),
@@ -1012,14 +1013,14 @@ def test_strm_refresh_pending_remains_visible_until_request_reconciles_completed
     from tests.support import isolated_test_database
 
     with isolated_test_database("refresh-attention.db"):
-        request_id, _created = db.create_download_request("refresh-attention", "magnet")
-        db.update_download_request(
+        request_id, _created = download_requests_repo.create_download_request("refresh-attention", "magnet")
+        download_requests_repo.update_download_request(
             request_id, status="completed", gy_status="completed", organize_status="completed",
             strm_status="partial", strm_error="STRM 已完成，媒体库刷新等待后台重试",
             gy_staging_cleanup_status="completed",
         )
-        assert db.count_download_requests_requiring_attention(request_id) == 1
-        stages = downloads_api._attention_json(db.get_download_request(request_id))["stages"]
+        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 1
+        stages = downloads_api._attention_json(download_requests_repo.get_download_request(request_id))["stages"]
         assert any(stage["key"] == "strm" and stage["status"] == "partial" for stage in stages)
-        db.update_download_request(request_id, strm_status="completed", strm_error="")
-        assert db.count_download_requests_requiring_attention(request_id) == 0
+        download_requests_repo.update_download_request(request_id, strm_status="completed", strm_error="")
+        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 0

@@ -162,10 +162,10 @@ class PlayGyQualityTests(unittest.TestCase):
             for name in ("_dynamic_guangya_mappings", "_item_level_binding_scopes",
                          "_playback_grants", "_playback_sessions"):
                 stack.enter_context(patch.object(media_proxy, name, type(getattr(media_proxy, name))()))
-            stack.enter_context(patch.object(media_proxy.database, "get_media_proxy_instance", return_value={
+            stack.enter_context(patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={
                 "id": 7, "enabled": enabled, "upstream_url": "http://127.0.0.1:8096", "local_root": "",
             }))
-            stack.enter_context(patch.object(media_proxy.database, "get_media_proxy_binding",
+            stack.enter_context(patch("app.repositories.media_proxy.get_media_proxy_binding",
                 side_effect=lambda _instance, _item, source: binding if source == "cloud" else None))
             stack.enter_context(patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kwargs:
                 async_client(transport=httpx.MockTransport(upstream), **kwargs)))
@@ -362,7 +362,7 @@ class PlayGyQualityTests(unittest.TestCase):
                            "MediaFluxPlayback": {"protocol": "stale", "source_url": self.strm_url}}]}
                 binding = {"id": 1, "source_type": "guangya", "guangya_file_id": file_id,
                            "media_source_id": "cloud"}
-                with patch.object(media_proxy.database, "get_media_proxy_binding", return_value=binding):
+                with patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=binding):
                     result, changed = media_proxy.rewrite_playback_info(payload, 7, "quality-item")
                 self.assertTrue(changed)
                 self.assertNotIn("MediaFluxPlayback", result["MediaSources"][0])

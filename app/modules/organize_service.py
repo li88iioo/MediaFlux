@@ -7,7 +7,8 @@ import json
 import secrets
 from typing import Any
 
-from app import config, database as db
+from app import config
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot
@@ -84,7 +85,7 @@ def preview_sources(sources, rules, *, max_files=100, client=None) -> dict:
     plans_out = []
     scan_errors = 0
     remaining = max_files
-    protected_staging_ids = db.list_protected_guangya_staging_ids()
+    protected_staging_ids = download_requests_repo.list_protected_guangya_staging_ids()
     protected = _protected_source_ids(sources, staging_ids=protected_staging_ids)
     for source in sources:
         if remaining <= 0:

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.agent.errors import AgentToolError
 from app.agent.public_safety import public_followup_prompt
 from app.indexers.runtime import source_readiness
@@ -89,7 +90,7 @@ def _backlog() -> dict[str, Any]:
         unavailable_sources.append("automation")
         logger.warning("Agent 工作区待办读取自动化汇总失败 type=%s", type(exc).__name__)
     try:
-        raw_local_media = db.get_local_media_diagnostic_summary(owner="admin")
+        raw_local_media = local_media_repo.get_local_media_diagnostic_summary(owner="admin")
         local_media = raw_local_media if isinstance(raw_local_media, dict) else {}
     except Exception as exc:  # noqa: BLE001 - 各本地来源独立降级，不返回异常正文。
         unavailable_sources.append("local_media")

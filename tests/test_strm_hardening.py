@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm as strm_module
 from tests.support import IsolatedDatabaseTestCase
@@ -84,8 +85,8 @@ class _Response:
 
 def _cleanup_source_indexes(source_id: str) -> None:
     for source_key in (f"guangya:{source_id}", f"guangya-meta:{source_id}"):
-        rows = db.list_strm_index(source_key)
-        db.delete_strm_index_ids(source_key, [row["file_id"] for row in rows])
+        rows = strm_repo.list_strm_index(source_key)
+        strm_repo.delete_strm_index_ids(source_key, [row["file_id"] for row in rows])
 
 
 def _drain_metadata_jobs(client, root: str, metadata_exts: set[str]) -> int:
@@ -208,7 +209,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 legacy_path = generate_strm(
                     files[source_b], "同名 (abc123)", base_url, root,
                 )
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     f"guangya:{source_b}", files[source_b].file_id,
                     files[source_b].etag, files[source_b].size, files[source_b].name,
                     str(legacy_path),
@@ -226,7 +227,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     f"/playgy/{files[source_b].file_id}/",
                     legacy_path.read_text(encoding="utf-8"),
                 )
-                self.assertEqual(db.list_strm_index(f"guangya:{source_a}"), [])
+                self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_a}"), [])
 
                 # 旧 owner 先搬到新 prefix 并清理旧路径后，A 下一轮才能安全恢复。
                 moved_b = sync_strm(
@@ -296,7 +297,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     files[source_a], by_id[source_a]["rel_prefix"], base_url, root,
                 )
                 legacy_payload = legacy_path.read_bytes()
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     f"guangya:{source_a}", files[source_a].file_id,
                     files[source_a].etag, files[source_a].size, files[source_a].name,
                     str(legacy_path),
@@ -367,9 +368,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertFalse(paths[source_b].exists())
                 self.assertTrue(paths[source_a].is_file())
                 self.assertTrue(paths[source_c].is_file())
-                self.assertEqual(db.list_strm_index(f"guangya:{source_b}"), [])
-                self.assertEqual(len(db.list_strm_index(f"guangya:{source_a}")), 1)
-                self.assertEqual(len(db.list_strm_index(f"guangya:{source_c}")), 1)
+                self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_b}"), [])
+                self.assertEqual(len(strm_repo.list_strm_index(f"guangya:{source_a}")), 1)
+                self.assertEqual(len(strm_repo.list_strm_index(f"guangya:{source_c}")), 1)
         finally:
             for source_id in source_ids:
                 _cleanup_source_indexes(source_id)
@@ -445,7 +446,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 )
                 old_path.write_text(payload, encoding="utf-8")
                 fingerprint = f"sha256:{hashlib.sha256(payload.encode()).hexdigest()}"
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key, video.file_id, video.etag, video.size,
                     video.name, str(old_path), fingerprint,
                 )
@@ -455,7 +456,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     clean_invalid=False,
                 )
                 new_path = Path(root) / STRM_SUBDIR / "Movie.strm"
-                row = db.list_strm_index(source_key)[0]
+                row = strm_repo.list_strm_index(source_key)[0]
 
                 self.assertTrue(new_path.is_file())
                 self.assertFalse(old_path.exists())
@@ -537,7 +538,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["generated"], 1)
                 self.assertEqual(result["duplicates_skipped"], 2)
                 self.assertIn("/playgy/a-large/", target.read_text(encoding="utf-8"))
-                rows = db.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
                 self.assertEqual([row["file_id"] for row in rows], ["a-large"])
         finally:
             _cleanup_source_indexes(source_id)
@@ -605,7 +606,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertTrue(target.exists())
                 self.assertIn("/playgy/new/", target.read_text(encoding="utf-8"))
                 self.assertEqual(result["cleaned"], 0)
-                rows = db.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
                 self.assertEqual([row["file_id"] for row in rows], ["new"])
         finally:
             _cleanup_source_indexes(source_id)
@@ -672,9 +673,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         client.get_download_url = lambda file_id: "https://download.invalid/meta"
         coordinator = threading.get_ident()
         call_threads = []
-        original_upsert = db.upsert_strm_index
-        original_list = db.list_strm_index
-        original_delete = db.delete_strm_index_ids
+        original_upsert = strm_repo.upsert_strm_index
+        original_list = strm_repo.list_strm_index
+        original_delete = strm_repo.delete_strm_index_ids
 
         def record(callable_):
             def wrapper(*args, **kwargs):
@@ -685,9 +686,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         try:
             with tempfile.TemporaryDirectory() as root, \
                     patch("app.modules.strm.requests.get", return_value=_Response(b"nfo")), \
-                    patch("app.modules.strm.db.upsert_strm_index", side_effect=record(original_upsert)), \
-                    patch("app.modules.strm.db.list_strm_index", side_effect=record(original_list)), \
-                    patch("app.modules.strm.db.delete_strm_index_ids", side_effect=record(original_delete)):
+                    patch("app.repositories.strm.upsert_strm_index", side_effect=record(original_upsert)), \
+                    patch("app.repositories.strm.list_strm_index", side_effect=record(original_list)), \
+                    patch("app.repositories.strm.delete_strm_index_ids", side_effect=record(original_delete)):
                 sync_strm(
                     source_id,
                     "http://example",
@@ -704,8 +705,8 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
 
     def test_failed_winner_install_preserves_old_file_and_index_and_skips_cleanup(self):
         """新赢家安装任一步失败，都必须回滚到旧赢家并熔断 stale cleanup。"""
-        original_upsert = db.upsert_strm_index
-        original_delete = db.delete_strm_index_ids
+        original_upsert = strm_repo.upsert_strm_index
+        original_delete = strm_repo.delete_strm_index_ids
         original_replace = Path.replace
 
         for stage in ("generate", "replace", "upsert", "old_index"):
@@ -740,7 +741,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                                 if file_id == "new":
                                     raise RuntimeError("upsert failed")
                                 return original_upsert(source, file_id, *args, **kwargs)
-                            patches.append(patch("app.modules.strm.db.upsert_strm_index", side_effect=fail_new_upsert))
+                            patches.append(patch("app.repositories.strm.upsert_strm_index", side_effect=fail_new_upsert))
                         else:
                             def fail_conflict_transaction(source, file_id, *args, **kwargs):
                                 if file_id == "new" and tuple(
@@ -749,7 +750,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                                     raise RuntimeError("old index delete failed")
                                 return original_upsert(source, file_id, *args, **kwargs)
                             patches.append(patch(
-                                "app.modules.strm.db.upsert_strm_index",
+                                "app.repositories.strm.upsert_strm_index",
                                 side_effect=fail_conflict_transaction,
                             ))
 
@@ -767,11 +768,11 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                         self.assertTrue(result.get("clean_skipped"), stage)
                         self.assertTrue(target.exists(), stage)
                         self.assertEqual(target.read_text(encoding="utf-8"), old_text, stage)
-                        rows = db.list_strm_index(source_key)
+                        rows = strm_repo.list_strm_index(source_key)
                         self.assertEqual([row["file_id"] for row in rows], ["old"], stage)
                 finally:
                     for cleanup_key in (source_key, f"guangya-meta:{source_id}"):
-                        rows = db.list_strm_index(cleanup_key)
+                        rows = strm_repo.list_strm_index(cleanup_key)
                         original_delete(cleanup_key, [row["file_id"] for row in rows])
 
     def test_old_path_unlink_failure_rolls_back_new_path_and_index(self):
@@ -805,7 +806,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertTrue(old_path.exists())
                 self.assertEqual(old_path.read_text(encoding="utf-8"), old_text)
                 self.assertFalse(new_path.exists())
-                rows = db.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["file_id"], "same-id")
                 self.assertEqual(rows[0]["etag"], "old-etag")
@@ -1046,7 +1047,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
 
                 self.assertEqual(second["metadata_skipped"], 0)
                 self.assertEqual(target.read_bytes(), b"new-data")
-                rows = db.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
                 self.assertEqual([row["file_id"] for row in rows], ["meta-new"])
                 self.assertEqual(rows[0]["etag"], "etag-new")
                 self.assertEqual(rows[0]["strm_path"], str(target))
@@ -1062,7 +1063,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         }
         client = _TreeClient(tree)
         client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
-        original_upsert = db.upsert_strm_index
+        original_upsert = strm_repo.upsert_strm_index
 
         def fake_get(url, stream, timeout):
             return _Response(b"old-data" if url.endswith("meta-old") else b"new-data")
@@ -1088,7 +1089,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     return original_upsert(source, file_id, *args, **kwargs)
 
                 with patch(
-                    "app.modules.strm.db.upsert_strm_index", side_effect=fail_new_upsert
+                    "app.repositories.strm.upsert_strm_index", side_effect=fail_new_upsert
                 ):
                     result = sync_strm(
                         source_id, "http://example", root, client=cast(GuangYaClient, client),
@@ -1099,10 +1100,10 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
 
                 self.assertTrue(target.exists())
                 self.assertEqual(target.read_bytes(), old_text)
-                rows = db.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
                 self.assertEqual([row["file_id"] for row in rows], ["meta-old"])
                 queue = [
-                    dict(row) for row in db.list_strm_metadata_queue()
+                    dict(row) for row in strm_repo.list_strm_metadata_queue()
                     if row["file_id"] == "meta-new"
                 ]
                 self.assertEqual(queue[0]["status"], "retry_wait")
@@ -1140,7 +1141,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(disabled["metadata_total"], 0)
                 self.assertEqual(disabled["metadata_cleaned"], 0)
                 self.assertTrue(target.exists())
-                rows = db.list_strm_index(metadata_key)
+                rows = strm_repo.list_strm_index(metadata_key)
                 self.assertEqual([row["file_id"] for row in rows], ["poster"])
                 self.assertEqual(rows[0]["strm_path"], str(target))
         finally:
@@ -1182,8 +1183,8 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["metadata_cleaned"], 1)
                 self.assertFalse(video_path.exists())
                 self.assertFalse(metadata_path.exists())
-                self.assertEqual(db.list_strm_index(video_key), [])
-                self.assertEqual(db.list_strm_index(metadata_key), [])
+                self.assertEqual(strm_repo.list_strm_index(video_key), [])
+                self.assertEqual(strm_repo.list_strm_index(metadata_key), [])
         finally:
             _cleanup_source_indexes(source_id)
 
@@ -1227,8 +1228,8 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["metadata_cleaned"], 0)
                 self.assertTrue(video_path.exists())
                 self.assertTrue(metadata_path.exists())
-                self.assertEqual([row["file_id"] for row in db.list_strm_index(video_key)], ["video"])
-                self.assertEqual([row["file_id"] for row in db.list_strm_index(metadata_key)], ["poster"])
+                self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index(video_key)], ["video"])
+                self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index(metadata_key)], ["poster"])
         finally:
             _cleanup_source_indexes(source_id)
 
@@ -1245,11 +1246,11 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 legacy_metadata.parent.mkdir(parents=True)
                 legacy_metadata.write_bytes(b"legacy")
                 stale_strm.write_text("old", encoding="utf-8")
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key, "legacy-meta", "meta-etag", 6,
                     "legacy.jpg", str(legacy_metadata),
                 )
-                db.upsert_strm_index(
+                strm_repo.upsert_strm_index(
                     source_key, "stale-video", "video-etag", 3,
                     "stale.mkv", str(stale_strm),
                 )
@@ -1264,7 +1265,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertTrue(result["clean_skipped"])
                 self.assertTrue(legacy_metadata.exists())
                 self.assertTrue(stale_strm.exists())
-                rows = db.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
                 self.assertEqual(
                     [row["file_id"] for row in rows],
                     ["legacy-meta", "stale-video"],
@@ -1305,7 +1306,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 stale_path = Path(root) / STRM_SUBDIR / "Stale.mkv.strm"
                 stale_path.parent.mkdir(parents=True)
                 stale_path.write_text("old", encoding="utf-8")
-                db.upsert_strm_index(source_key, stale_id, "e", 1, "Stale.mkv", str(stale_path))
+                strm_repo.upsert_strm_index(source_key, stale_id, "e", 1, "Stale.mkv", str(stale_path))
 
                 result = sync_strm(source_id, "http://example", root, client=cast(GuangYaClient, client))
 
@@ -1314,7 +1315,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["generated"], 0)
                 self.assertFalse((Path(root) / STRM_SUBDIR / "New.strm").exists())
                 self.assertTrue(stale_path.exists())
-                self.assertEqual([row["file_id"] for row in db.list_strm_index(source_key)], [stale_id])
+                self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index(source_key)], [stale_id])
         finally:
             _cleanup_source_indexes(source_id)
 
@@ -1332,7 +1333,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 stale_path = Path(root) / STRM_SUBDIR / "Stale.mkv.strm"
                 stale_path.parent.mkdir(parents=True)
                 stale_path.write_text("old", encoding="utf-8")
-                db.upsert_strm_index(source_key, "stale", "e", 1, "Stale.mkv", str(stale_path))
+                strm_repo.upsert_strm_index(source_key, "stale", "e", 1, "Stale.mkv", str(stale_path))
 
                 with patch("app.modules.strm._scan_limits", return_value=(100, 1, 100, 60)):
                     result = sync_strm(source_id, "http://example", root, client=cast(GuangYaClient, client))
@@ -1344,7 +1345,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertTrue(stale_path.exists())
                 self.assertFalse((Path(root) / STRM_SUBDIR / "A.strm").exists())
                 self.assertEqual(
-                    [row["file_id"] for row in db.list_strm_index(source_key)],
+                    [row["file_id"] for row in strm_repo.list_strm_index(source_key)],
                     ["stale"],
                 )
         finally:
@@ -1361,7 +1362,7 @@ class StrmSnapshotOwnershipTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _record_history(source_key: str, file_id: str) -> None:
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             source_key, file_id, "etag", 1, f"{file_id}.nfo", f"/{file_id}.strm",
         )
 
@@ -1463,7 +1464,7 @@ class StrmSnapshotOwnershipTests(IsolatedDatabaseTestCase):
 
         # 真实 SQLite 索引行用于确保 metadata 命名空间也参与归属核验。
         self.assertEqual(
-            [row["file_id"] for row in db.list_strm_index(source_key)], ["legacy-meta"],
+            [row["file_id"] for row in strm_repo.list_strm_index(source_key)], ["legacy-meta"],
         )
         with self.assertRaises(RuntimeError):
             strm_module._source_snapshot_directories(snapshot, source_id, {})

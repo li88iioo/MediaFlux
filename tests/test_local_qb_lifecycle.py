@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import (
     LocalMediaService,
     LocalMovePlan,
@@ -40,13 +40,13 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         source.mkdir(); target.mkdir(); (source / "Movie.2025.mkv").write_bytes(b"movie")
         (source / "下载必看.txt").write_bytes(b"ad")
         (source / "fonts.zip").write_bytes(b"font")
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"qb-{base.name}", qb_profile="configured:qb", qb_path_prefix="/downloads",
             local_root=str(source), stable_seconds=0, owner="admin",
         )
-        db.upsert_local_library_target(source_id, "movie", str(target), owner="admin")
-        task_id = db.create_local_media_task(source_id, "hash-1", str(source), owner="admin")
-        db.claim_local_media_task(task_id, expected="waiting_stable", owner="admin")
+        local_media_repo.upsert_local_library_target(source_id, "movie", str(target), owner="admin")
+        task_id = local_media_repo.create_local_media_task(source_id, "hash-1", str(source), owner="admin")
+        local_media_repo.claim_local_media_task(task_id, expected="waiting_stable", owner="admin")
         scraper = FakeScraper(MatchResult(tmdb_id="1", title="Movie", year="2025", media_type="movie", confidence=1))
         return root, source, target, task_id, LocalMediaService(scraper=cast(TMDBScraper, scraper))
 
@@ -71,7 +71,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
             with self.assertRaisesRegex(OSError, "move failed"):
                 service.execute_task("admin", task_id, qb_client=qb)
         self.assertEqual(qb.calls, [("pause", "hash-1"), ("resume", "hash-1")])
-        get_local_media_task_result = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result is not None
         self.assertEqual(get_local_media_task_result.status, "failed")
 
@@ -92,7 +92,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         root, source, target, task_id, service = self._fixture()
         self.addCleanup(root.cleanup)
         qb = FakeQB()
-        original_update = db.update_local_media_task
+        original_update = local_media_repo.update_local_media_task
 
         def fail_verifying(*args, **kwargs):
             if kwargs.get("status") == "verifying":
@@ -100,7 +100,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
             return original_update(*args, **kwargs)
 
         with patch(
-            "app.modules.local_media_service.db.update_local_media_task",
+            "app.repositories.local_media.update_local_media_task",
             side_effect=fail_verifying,
         ):
             with self.assertRaisesRegex(Exception, "已完成移动.*收尾失败"):
@@ -110,7 +110,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         self.assertFalse((source / "Movie.2025.mkv").exists())
         moved = list(target.rglob("*.mkv"))
         self.assertEqual(len(moved), 1)
-        task = db.get_local_media_task(task_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert task is not None
         self.assertEqual(task.status, "requires_manual")
         self.assertIn(str(moved[0]), task.error)
@@ -133,7 +133,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         )
         self.assertFalse((source / "Movie.2025.mkv").exists())
         self.assertTrue(any(target.rglob("*.mkv")))
-        get_local_media_task_result_2 = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result_2 = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result_2 is not None
         self.assertEqual(
             get_local_media_task_result_2.status,
@@ -183,7 +183,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
             [("pause", "hash-1"), ("delete", "hash-1", False)],
         )
         self.assertTrue(source_file.exists())
-        task = db.get_local_media_task(task_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert task is not None
         self.assertEqual(task.status, "requires_manual")
         self.assertIn("qB 任务已完成移除", task.error)
@@ -194,7 +194,7 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         with self.assertRaisesRegex(Exception, "缺少可用客户端"):
             service.execute_task("admin", task_id, qb_client=None)
         self.assertTrue((source / "Movie.2025.mkv").exists())
-        get_local_media_task_result_3 = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result_3 = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result_3 is not None
         self.assertEqual(get_local_media_task_result_3.status, "failed")
 

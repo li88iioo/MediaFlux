@@ -15,7 +15,9 @@ from pathlib import PurePosixPath
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
-from app import config, database as db
+from app import config
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.clients.http import HttpError, HttpInvalidResponse, HttpResponseTooLarge
 from app.indexers.config import AIPAN_URL, DYGANG_URL, YS5266_URL, SENSITIVE_INDEXER_SITE_IDS
@@ -158,10 +160,10 @@ def enqueue_download_verification(
 
     route = parse_telegram_owner_route(owner)
     try:
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         if request is None or request["targets"] != receipt["target"]:
             return result
-        status = db.enqueue_agent_download_verification(
+        status = agent_download_verification_repo.enqueue_agent_download_verification(
             request_id, targets=proofs, owner=owner, chat_id=route.chat_id if route else "",
         )
         return {**result, "status": status}
@@ -457,7 +459,7 @@ def resubmit_indexer_download_request(
     normalized_target = (target or "").strip().lower()
     if normalized_target not in DOWNLOAD_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
-    existing = db.get_download_request(request_id)
+    existing = download_requests_repo.get_download_request(request_id)
     if existing is None:
         return {"ok": False, "not_found": True, "error": "下载请求不存在"}
     existing_status = str(existing["status"] or "").strip().lower()
@@ -483,9 +485,9 @@ def resubmit_indexer_download_request(
 
 def _existing_download_request(item: DownloadInput, keys: tuple[str, ...]):
     """分组与提交共享仓库的内容身份/HTTP来源别名匹配规则。"""
-    existing = db.get_download_request_by_request_key(keys[0])
+    existing = download_requests_repo.get_download_request_by_request_key(keys[0])
     if existing is None and len(keys) > 1:
-        existing = db.get_download_request_by_request_keys(
+        existing = download_requests_repo.get_download_request_by_request_keys(
             keys, source_alias_key=request_source_alias_key(item),
         )
     return existing
@@ -555,7 +557,7 @@ def _persist_and_dispatch(
             int(existing["id"]), item.source_value, item.torrent_data, keys, pending_only=True,
             source_alias_key=request_source_alias_key(item),
         )
-        existing = db.get_download_request(owner)
+        existing = download_requests_repo.get_download_request(owner)
     dispatch_target = target
     created: dict[str, Any] | None = None
     request_id = 0
@@ -567,7 +569,7 @@ def _persist_and_dispatch(
         if verification_targets and not missing:
             # pending 恢复、补后端以及纯去重都绑定原请求；绑定先于任何远端提交。
             # 同源请求可能属于其他会话，仓库负责保留原 owner，不能改通知归属。
-            registration = db.enqueue_agent_download_verification(
+            registration = agent_download_verification_repo.enqueue_agent_download_verification(
                 existing_id, targets=verification_targets, owner=verification_owner, chat_id=chat_id,
             )
             if registration not in {"queued", "existing"} and (
@@ -580,7 +582,7 @@ def _persist_and_dispatch(
             enrich_download_display_title(existing_id, item.display_title)
         if existing_status == "manual_review":
             if admission_id is not None:
-                db.bind_media_download_admission_request(admission_id, existing_id)
+                download_requests_repo.bind_media_download_admission_request(admission_id, existing_id)
             return (
                 {"id": existing_id, "created": False},
                 existing_id,
@@ -589,7 +591,7 @@ def _persist_and_dispatch(
         if existing_status in {"completed", "failed", "cancelled"}:
             if not missing:
                 if admission_id is not None:
-                    db.bind_media_download_admission_request(admission_id, existing_id)
+                    download_requests_repo.bind_media_download_admission_request(admission_id, existing_id)
                 return {
                     "id": existing_id,
                     "created": False,
@@ -600,12 +602,12 @@ def _persist_and_dispatch(
             # 复用原请求并走 dispatch_request 的原子 pending -> submitting CAS，
             # 不能把它误判成已经提交的重复请求。
             if admission_id is not None:
-                db.bind_media_download_admission_request(admission_id, existing_id)
+                download_requests_repo.bind_media_download_admission_request(admission_id, existing_id)
             created = {"id": existing_id, "created": False}
             request_id = existing_id
         else:
             if admission_id is not None:
-                db.bind_media_download_admission_request(admission_id, existing_id)
+                download_requests_repo.bind_media_download_admission_request(admission_id, existing_id)
             if (item.kind == existing["kind"] == "http" and item.torrent_data
                     and existing["torrent_data"] is None
                     and item.source_value == existing["source_value"]
@@ -642,7 +644,7 @@ def _persist_and_dispatch(
             raise DownloadRequestCreationError()
         if verification_targets and not created["created"] and created["status"] == "pending":
             # 创建竞争被另一个 pending 请求接管时，也须先确认本次意图已绑定。
-            registration = db.enqueue_agent_download_verification(
+            registration = agent_download_verification_repo.enqueue_agent_download_verification(
                 request_id, targets=verification_targets, owner=verification_owner, chat_id=chat_id,
             )
             if registration not in {"queued", "existing"}:
@@ -655,7 +657,7 @@ def _persist_and_dispatch(
         )
     except asyncio.CancelledError:
         if created.get("created"):
-            db.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
+            download_requests_repo.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
         raise
     except Exception as exc:
         # 只将仍持有认领、受理未知的目标转人工核验；已收尾/已取消的
@@ -665,7 +667,7 @@ def _persist_and_dispatch(
             if dispatch_target not in {source, "both"}:
                 continue
             try:
-                db.finalize_download_request_submission(
+                download_requests_repo.finalize_download_request_submission(
                     request_id, (source,),
                     **{f"{prefix}_status": "manual_review", "error": f"{source}: {unknown_error}"},
                 )
@@ -679,7 +681,7 @@ def _persist_and_dispatch(
             request_id, type(exc).__name__,
         )
         try:
-            current = db.get_download_request(request_id)
+            current = download_requests_repo.get_download_request(request_id)
         except Exception as read_exc:
             logger.error(
                 "下载异常状态读取失败 request_id=%s type=%s",
@@ -816,7 +818,7 @@ def submit_download_url(url: str, target: str, *, origin: str,
         dispatch = dispatch_request(request_id, target, check_cancelled=check_cancelled, **credentials)
     except asyncio.CancelledError:
         if created["created"]:
-            db.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
+            download_requests_repo.cancel_pending_download_request(request_id, error="操作已取消，未提交下载后端")
         raise
     summary = public_dispatch_summary(dispatch)
     message = {
@@ -915,7 +917,7 @@ def _attach_download_verification(items: list[dict], owner: str) -> None:
             continue
         if request_id not in statuses:
             try:
-                job = db.get_agent_download_verification(request_id)
+                job = agent_download_verification_repo.get_agent_download_verification(request_id)
                 if job is not None and job["owner"] == owner:
                     status = {"status": job["status"], "target_count": len(job["targets"])}
                 else:

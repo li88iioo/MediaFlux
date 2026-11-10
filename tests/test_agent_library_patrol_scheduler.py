@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.modules.library_patrol import patrol_status
 from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
@@ -138,19 +139,19 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM agent_library_patrol")
 
     def test_singleton_claim_and_generation_cas(self):
-        first = db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        second = db.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
+        first = agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        second = agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
         self.assertEqual(first["patrol_key"], "default")
         self.assertEqual(second["next_run_at"], "2026-08-03 12:00:00")
-        claimed = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         assert claimed is not None
         self.assertEqual(claimed["status"], "running")
         self.assertEqual(claimed["lease_generation"], 1)
         self.assertIsNone(
-            db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+            agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         )
         self.assertTrue(
-            db.update_agent_library_patrol(
+            agent_library_patrol_repo.update_agent_library_patrol(
                 status="pending",
                 outcome="up_to_date",
                 attempts=0,
@@ -160,7 +161,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
             )
         )
         self.assertFalse(
-            db.update_agent_library_patrol(
+            agent_library_patrol_repo.update_agent_library_patrol(
                 status="pending",
                 outcome="up_to_date",
                 attempts=0,
@@ -171,14 +172,14 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         )
 
     def test_stale_lease_is_reclaimed_and_old_worker_cannot_finish(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        old_job = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        old_job = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE agent_library_patrol SET updated_at=? WHERE patrol_key='default'",
                 ("2026-08-03 11:00:00",),
             )
-        new_job = db.claim_due_agent_library_patrol(
+        new_job = agent_library_patrol_repo.claim_due_agent_library_patrol(
             current_time="2026-08-03 12:31:00", stale_before="2026-08-03 12:01:00"
         )
         assert old_job is not None
@@ -186,7 +187,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         assert new_job is not None
         self.assertEqual(new_job["lease_generation"], 2)
         self.assertFalse(
-            db.update_agent_library_patrol(
+            agent_library_patrol_repo.update_agent_library_patrol(
                 status="pending",
                 outcome="up_to_date",
                 attempts=0,
@@ -195,7 +196,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
             )
         )
         self.assertTrue(
-            db.update_agent_library_patrol(
+            agent_library_patrol_repo.update_agent_library_patrol(
                 status="pending",
                 outcome="up_to_date",
                 attempts=0,
@@ -205,40 +206,40 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         )
 
     def test_reschedule_moves_non_running_task_but_not_active_lease(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
         self.assertTrue(
-            db.reschedule_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+            agent_library_patrol_repo.reschedule_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
         )
-        get_agent_library_patrol_result = db.get_agent_library_patrol()
+        get_agent_library_patrol_result = agent_library_patrol_repo.get_agent_library_patrol()
         assert get_agent_library_patrol_result is not None
         self.assertEqual(
             get_agent_library_patrol_result["next_run_at"], "2026-08-03 12:00:00"
         )
-        running = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        running = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         assert (running) is not None
         self.assertFalse(
-            db.reschedule_agent_library_patrol(next_run_at="2026-08-03 11:00:00")
+            agent_library_patrol_repo.reschedule_agent_library_patrol(next_run_at="2026-08-03 11:00:00")
         )
-        get_agent_library_patrol_result_2 = db.get_agent_library_patrol()
+        get_agent_library_patrol_result_2 = agent_library_patrol_repo.get_agent_library_patrol()
         assert get_agent_library_patrol_result_2 is not None
         self.assertEqual(get_agent_library_patrol_result_2["status"], "running")
 
     def test_cancel_running_lease_invalidates_old_worker(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        job = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        job = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         assert job is not None
         self.assertTrue(
-            db.cancel_agent_library_patrol_lease(
+            agent_library_patrol_repo.cancel_agent_library_patrol_lease(
                 next_run_at="2026-08-03 12:00:01",
                 expected_lease_generation=job["lease_generation"],
             )
         )
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["lease_generation"], job["lease_generation"] + 1)
         self.assertFalse(
-            db.update_agent_library_patrol(
+            agent_library_patrol_repo.update_agent_library_patrol(
                 status="pending",
                 outcome="up_to_date",
                 attempts=0,
@@ -258,49 +259,49 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
                     "2026-08-03 12:00:00",
                 ),
             )
-        first = db.claim_due_agent_library_patrol_notification(
+        first = agent_library_patrol_repo.claim_due_agent_library_patrol_notification(
             current_time="2026-08-03 12:00:00"
         )
         assert first is not None
         self.assertEqual(first["status"], "sending")
         self.assertEqual(first["lease_generation"], 1)
         self.assertIsNone(
-            db.claim_due_agent_library_patrol_notification(
+            agent_library_patrol_repo.claim_due_agent_library_patrol_notification(
                 current_time="2026-08-03 12:00:00"
             )
         )
         self.assertTrue(
-            db.retry_agent_library_patrol_notification(
+            agent_library_patrol_repo.retry_agent_library_patrol_notification(
                 first["id"],
                 expected_lease_generation=first["lease_generation"],
                 next_attempt_at="2026-08-03 12:01:00",
                 error_type="RuntimeError: token=SECRET",
             )
         )
-        second = db.claim_due_agent_library_patrol_notification(
+        second = agent_library_patrol_repo.claim_due_agent_library_patrol_notification(
             current_time="2026-08-03 12:01:00"
         )
         assert second is not None
         self.assertEqual(second["lease_generation"], 2)
         self.assertFalse(
-            db.complete_agent_library_patrol_notification(
+            agent_library_patrol_repo.complete_agent_library_patrol_notification(
                 first["id"], expected_lease_generation=first["lease_generation"]
             )
         )
         self.assertTrue(
-            db.complete_agent_library_patrol_notification(
+            agent_library_patrol_repo.complete_agent_library_patrol_notification(
                 second["id"],
                 expected_lease_generation=second["lease_generation"],
                 sent_at="2026-08-03 12:01:01",
             )
         )
-        row = db.list_agent_library_patrol_notifications()[0]
+        row = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         self.assertEqual(row["status"], "sent")
         self.assertEqual(row["attempts"], 1)
         self.assertNotIn("SECRET", row["last_error_type"] or "")
 
     def test_retention_purges_only_expired_terminal_notifications(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
         rows = (
             (1, "sent", "2026-07-20 12:00:00", "2026-07-20 12:00:00"),
             (2, "sent", None, "2026-07-20 12:00:00"),
@@ -340,7 +341,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(deleted["patrol_notification_outbox"], 3)
         remaining = {
             int(row["result_revision"]): str(row["status"])
-            for row in db.list_agent_library_patrol_notifications()
+            for row in agent_library_patrol_repo.list_agent_library_patrol_notifications()
         }
         self.assertEqual(
             remaining,
@@ -353,14 +354,14 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
                 8: "retry_wait",
             },
         )
-        assert (db.get_agent_library_patrol()) is not None
-        recovered = db.claim_due_agent_library_patrol_notification(
+        assert (agent_library_patrol_repo.get_agent_library_patrol()) is not None
+        recovered = agent_library_patrol_repo.claim_due_agent_library_patrol_notification(
             current_time="2026-08-03 12:00:00", stale_before="2026-08-03 11:58:00"
         )
         self.assertIsNone(recovered)
         rows_by_revision = {
             int(row["result_revision"]): row
-            for row in db.list_agent_library_patrol_notifications()
+            for row in agent_library_patrol_repo.list_agent_library_patrol_notifications()
         }
         self.assertEqual(rows_by_revision[7]["status"], "discarded")
         self.assertEqual(
@@ -380,25 +381,25 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
                 ),
             )
         db.init_db()
-        row = db.list_agent_library_patrol_notifications()[0]
+        row = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         self.assertEqual(row["status"], "discarded")
         self.assertEqual(row["lease_generation"], 2)
         self.assertEqual(row["last_error_type"], "DeliveryOutcomeUnknown")
 
     def test_init_recovers_interrupted_running_patrol(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        claimed = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         assert claimed is not None
         self.assertEqual(claimed["lease_generation"], 1)
         db.init_db()
-        recovered = db.get_agent_library_patrol()
+        recovered = agent_library_patrol_repo.get_agent_library_patrol()
         assert recovered is not None
         self.assertEqual(recovered["status"], "retry_wait")
         self.assertEqual(recovered["lease_generation"], 2)
 
     def test_continuation_progress_survives_database_recovery(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        claimed = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         accumulator = {
             "as_of": "2026-08-03",
             "patrol_status": "inconclusive",
@@ -412,7 +413,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         }
         assert claimed is not None
         self.assertTrue(
-            db.continue_agent_library_patrol(
+            agent_library_patrol_repo.continue_agent_library_patrol(
                 expected_lease_generation=claimed["lease_generation"],
                 next_run_at="2026-08-03 12:00:01",
                 cycle_as_of="2026-08-03",
@@ -422,7 +423,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
             )
         )
         db.init_db()
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["cycle_cursor_tmdb_id"], "12345")
@@ -431,8 +432,8 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         )
 
     def test_continuation_rejects_rollback_or_unmarked_stall(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        claimed = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         accumulator = {
             "as_of": "2026-08-03",
             "patrol_status": "inconclusive",
@@ -446,7 +447,7 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         }
         assert claimed is not None
         self.assertTrue(
-            db.continue_agent_library_patrol(
+            agent_library_patrol_repo.continue_agent_library_patrol(
                 expected_lease_generation=claimed["lease_generation"],
                 next_run_at="2026-08-03 12:00:01",
                 cycle_as_of="2026-08-03",
@@ -454,10 +455,10 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
                 cycle_accumulator_json=json.dumps(accumulator),
             )
         )
-        claimed = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:01")
+        claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:01")
         assert claimed is not None
         self.assertFalse(
-            db.continue_agent_library_patrol(
+            agent_library_patrol_repo.continue_agent_library_patrol(
                 expected_lease_generation=claimed["lease_generation"],
                 next_run_at="2026-08-03 12:00:02",
                 cycle_as_of="2026-08-03",
@@ -511,17 +512,17 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config(enabled=False):
             self.assertEqual(scheduler.run_once(), 0)
         executor.assert_not_called()
-        self.assertIsNone(db.get_agent_library_patrol())
+        self.assertIsNone(agent_library_patrol_repo.get_agent_library_patrol())
 
     def test_reload_reschedules_future_task_immediately_when_enabled(self):
         executor = Mock(return_value=(_patrol_result(status="up_to_date"), 10))
         scheduler = AgentLibraryPatrolScheduler(
             audit_executor=executor, clock=self.clock
         )
-        db.ensure_agent_library_patrol(next_run_at="2026-08-10 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-10 12:00:00")
         with self._config(enabled=True):
             scheduler.reload()
-            get_agent_library_patrol_result_3 = db.get_agent_library_patrol()
+            get_agent_library_patrol_result_3 = agent_library_patrol_repo.get_agent_library_patrol()
             assert get_agent_library_patrol_result_3 is not None
             self.assertEqual(
                 get_agent_library_patrol_result_3["next_run_at"], "2026-08-03 12:00:00"
@@ -537,7 +538,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
         executor.assert_called_once_with({"as_of": "2026-08-03", "max_series": 50})
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["outcome"], "updates_available")
@@ -578,7 +579,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         )
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
-            interim = db.get_agent_library_patrol()
+            interim = agent_library_patrol_repo.get_agent_library_patrol()
             assert interim is not None
             self.assertEqual(interim["status"], "pending")
             self.assertEqual(interim["cycle_cursor_tmdb_id"], "12345")
@@ -595,7 +596,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
                 ),
             ]
         )
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["outcome"], "updates_available")
@@ -641,7 +642,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         )
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
-            first = db.get_agent_library_patrol()
+            first = agent_library_patrol_repo.get_agent_library_patrol()
             assert first is not None
             self.assertEqual(first["cycle_cursor_tmdb_id"], "")
             self.assertEqual(first["cycle_stall_attempts"], 1)
@@ -649,11 +650,11 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             self.assertTrue(status["data"]["continuation_pending"])
             self.assertEqual(status["data"]["cycle_checked_series_count"], 0)
             self.assertEqual(scheduler.run_once(), 1)
-            get_agent_library_patrol_result_4 = db.get_agent_library_patrol()
+            get_agent_library_patrol_result_4 = agent_library_patrol_repo.get_agent_library_patrol()
             assert get_agent_library_patrol_result_4 is not None
             self.assertEqual(get_agent_library_patrol_result_4["cycle_stall_attempts"], 2)
             self.assertEqual(scheduler.run_once(), 1)
-            skipped = db.get_agent_library_patrol()
+            skipped = agent_library_patrol_repo.get_agent_library_patrol()
             assert skipped is not None
             self.assertEqual(skipped["cycle_cursor_tmdb_id"], "12345")
             self.assertEqual(skipped["cycle_stall_attempts"], 0)
@@ -671,7 +672,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
                 ),
             ]
         )
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "retry_wait")
         self.assertEqual(row["outcome"], "inconclusive")
@@ -693,7 +694,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
             scheduler.reload()
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["cycle_cursor_tmdb_id"], "12345")
@@ -710,8 +711,8 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(scheduler.run_once(), 1)
             self.clock.value = datetime(2026, 8, 4, 12, 0, 0)
             self.assertEqual(scheduler.run_once(), 1)
-        row = db.get_agent_library_patrol()
-        notifications = db.list_agent_library_patrol_notifications()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
+        notifications = agent_library_patrol_repo.list_agent_library_patrol_notifications()
         assert row is not None
         self.assertEqual(row["result_revision"], 1)
         self.assertEqual(len(notifications), 1)
@@ -733,10 +734,10 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         )
         with self._config(notify=True):
             self.assertEqual(scheduler.run_once(), 1)
-        get_agent_library_patrol_result_5 = db.get_agent_library_patrol()
+        get_agent_library_patrol_result_5 = agent_library_patrol_repo.get_agent_library_patrol()
         assert get_agent_library_patrol_result_5 is not None
         self.assertEqual(get_agent_library_patrol_result_5["result_revision"], 1)
-        self.assertEqual(db.list_agent_library_patrol_notifications(), [])
+        self.assertEqual(agent_library_patrol_repo.list_agent_library_patrol_notifications(), [])
 
     def test_a_b_a_transitions_each_enqueue_a_new_revision(self):
         results = [
@@ -755,9 +756,9 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             for day in (3, 4, 5):
                 self.clock.value = datetime(2026, 8, day, 12, 0, 0)
                 self.assertEqual(scheduler.run_once(), 1)
-        notifications = db.list_agent_library_patrol_notifications()
+        notifications = agent_library_patrol_repo.list_agent_library_patrol_notifications()
         self.assertEqual([row["result_revision"] for row in notifications], [1, 2, 3])
-        get_agent_library_patrol_result_6 = db.get_agent_library_patrol()
+        get_agent_library_patrol_result_6 = agent_library_patrol_repo.get_agent_library_patrol()
         assert get_agent_library_patrol_result_6 is not None
         self.assertEqual(get_agent_library_patrol_result_6["result_revision"], 3)
 
@@ -772,7 +773,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             scheduler.run_once()
             self.assertEqual(scheduler.dispatch_notification_once(), 1)
         sender.assert_called_once()
-        notification = db.list_agent_library_patrol_notifications()[0]
+        notification = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         self.assertEqual(notification["status"], "sent")
         self.assertEqual(notification["sent_at"], "2026-08-03 12:00:00")
         self.assertEqual(notification["payload_json"], "")
@@ -786,8 +787,8 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config(notify=True):
             scheduler.run_once()
             self.assertEqual(scheduler.dispatch_notification_once(), 1)
-        patrol = db.get_agent_library_patrol()
-        notification = db.list_agent_library_patrol_notifications()[0]
+        patrol = agent_library_patrol_repo.get_agent_library_patrol()
+        notification = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         assert patrol is not None
         self.assertEqual(patrol["outcome"], "updates_available")
         self.assertEqual(notification["status"], "retry_wait")
@@ -808,7 +809,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config(notify=True):
             scheduler.run_once()
             self.assertEqual(scheduler.dispatch_notification_once(), 1)
-        notification = db.list_agent_library_patrol_notifications()[0]
+        notification = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         self.assertEqual(notification["status"], "discarded")
         self.assertEqual(notification["attempts"], 0)
         self.assertEqual(notification["payload_json"], "")
@@ -822,7 +823,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             scheduler.run_once()
         with self._config(notify=False):
             scheduler.reload()
-        notification = db.list_agent_library_patrol_notifications()[0]
+        notification = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         self.assertEqual(notification["status"], "discarded")
         self.assertEqual(notification["payload_json"], "")
 
@@ -836,7 +837,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config(notify=True):
             scheduler.run_once()
         notification_enabled = True
-        original_claim = db.claim_due_agent_library_patrol_notification
+        original_claim = agent_library_patrol_repo.claim_due_agent_library_patrol_notification
 
         def get_bool(key: str, default: bool = False) -> bool:
             if key == "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED":
@@ -856,13 +857,13 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
                 "app.modules.agent_library_patrol_scheduler.config", get_bool=get_bool
             ),
             patch(
-                "app.modules.agent_library_patrol_scheduler.db.claim_due_agent_library_patrol_notification",
+                "app.repositories.agent_library_patrol.claim_due_agent_library_patrol_notification",
                 side_effect=claim_then_disable,
             ),
         ):
             self.assertEqual(scheduler.dispatch_notification_once(), 0)
         sender.assert_not_called()
-        notification = db.list_agent_library_patrol_notifications()[0]
+        notification = agent_library_patrol_repo.list_agent_library_patrol_notifications()[0]
         self.assertEqual(notification["status"], "discarded")
         self.assertEqual(notification["payload_json"], "")
 
@@ -873,7 +874,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         )
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "retry_wait")
         self.assertEqual(row["outcome"], "inconclusive")
@@ -892,7 +893,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(scheduler.run_once(), 1)
             self.clock.value = datetime(2026, 8, 3, 13, 15, 0)
             self.assertEqual(scheduler.run_once(), 1)
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         self.assertEqual(executor.call_count, 3)
         assert row is not None
         self.assertEqual(row["status"], "pending")
@@ -907,19 +908,19 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with patch.object(scheduler, "_enabled", side_effect=(True, False)):
             self.assertEqual(scheduler.run_once(), 0)
         executor.assert_not_called()
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["lease_generation"], 2)
         self.assertEqual(row["outcome"], "")
 
     def test_reload_while_disabled_invalidates_active_lease(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
-        job = db.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")
+        job = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time="2026-08-03 12:00:00")
         scheduler = AgentLibraryPatrolScheduler(clock=self.clock)
         with patch.object(scheduler, "_enabled", return_value=False):
             scheduler.reload()
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "pending")
         assert job is not None
@@ -942,7 +943,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
             self.assertEqual(scheduler.run_once(), 1)
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["status"], "retry_wait")
         self.assertEqual(row["attempts"], 1)
@@ -960,7 +961,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         )
         with self._config():
             self.assertEqual(scheduler.run_once(), 1)
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         self.assertEqual(row["outcome"], "failed")
         self.assertEqual(row["error_type"], "RuntimeError")
@@ -995,7 +996,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         )
         with self._config():
             scheduler.run_once()
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         assert row is not None
         projection = json.loads(row["projection_json"])
         self.assertEqual(row["outcome"], "failed")
@@ -1005,7 +1006,7 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         self.assertNotIn("/mnt/", repr(dict(row)))
 
     def test_tampered_projection_fails_closed(self):
-        db.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at="2026-08-04 12:00:00")
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE agent_library_patrol SET outcome='updates_available',projection_json=?,last_finished_at=? WHERE patrol_key='default'",
@@ -1036,67 +1037,67 @@ class AgentLibraryPatrolCycleIdentityTests(IsolatedDatabaseTestCase):
 
     def test_trigger_reserves_one_identity_for_queued_and_running_cycle(self):
         current = "2026-08-03 12:00:00"
-        first = db.trigger_agent_library_patrol(next_run_at=current)
-        second = db.trigger_agent_library_patrol(next_run_at=current)
+        first = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
+        second = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
         self.assertEqual(first["run_id"], second["run_id"])
         self.assertEqual(first["status"], "queued")
-        job = db.claim_due_agent_library_patrol(current_time=current)
+        job = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=current)
         assert job is not None
         self.assertEqual(job["cycle_run_id"], first["run_id"])
-        reused = db.trigger_agent_library_patrol(next_run_at=current)
+        reused = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
         self.assertEqual(reused["status"], "already_running")
         self.assertEqual(reused["run_id"], first["run_id"])
 
     def test_cycle_survives_batches_restart_and_rejects_old_lease_terminal(self):
         from app.modules.library_patrol import serialize_patrol_projection
         current = "2026-08-03 12:00:00"
-        first = db.trigger_agent_library_patrol(next_run_at=current)
-        initial = db.claim_due_agent_library_patrol(current_time=current)
+        first = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
+        initial = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=current)
         assert initial is not None
         raw, _projection = serialize_patrol_projection(asdict(_patrol_result()))
-        self.assertTrue(db.continue_agent_library_patrol(
+        self.assertTrue(agent_library_patrol_repo.continue_agent_library_patrol(
             expected_lease_generation=int(initial["lease_generation"]), next_run_at=current,
             cycle_as_of="2026-08-03", cycle_cursor_tmdb_id="12345", cycle_accumulator_json=raw,
         ))
-        second = db.claim_due_agent_library_patrol(current_time=current)
+        second = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=current)
         assert second is not None
         self.assertEqual(second["cycle_run_id"], first["run_id"])
         db.init_db()
-        recovered = db.claim_due_agent_library_patrol(current_time=db.now())
+        recovered = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=db.now())
         assert recovered is not None
         self.assertEqual(recovered["cycle_run_id"], first["run_id"])
-        self.assertFalse(db.update_agent_library_patrol(
+        self.assertFalse(agent_library_patrol_repo.update_agent_library_patrol(
             status="pending", outcome="failed", attempts=0, next_run_at=current,
             expected_lease_generation=int(initial["lease_generation"]), projection_json=raw,
         ))
         run = db.get_task_run(int(first["run_id"]))
         assert run is not None
         self.assertEqual(run["status"], "running")
-        self.assertTrue(db.update_agent_library_patrol(
+        self.assertTrue(agent_library_patrol_repo.update_agent_library_patrol(
             status="pending", outcome="up_to_date", attempts=0, next_run_at=current,
             expected_lease_generation=int(recovered["lease_generation"]), projection_json=raw,
         ))
         run = db.get_task_run(int(first["run_id"]))
         assert run is not None
         self.assertEqual(run["status"], "up_to_date")
-        next_cycle = db.trigger_agent_library_patrol(next_run_at=current)
+        next_cycle = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
         self.assertNotEqual(next_cycle["run_id"], first["run_id"])
 
     def test_cancel_queued_cycle_closes_exact_run_before_reusing_singleton(self):
         current = "2026-08-03 12:00:00"
-        first = db.trigger_agent_library_patrol(next_run_at=current)
-        self.assertTrue(db.cancel_agent_library_patrol_lease(next_run_at=current))
+        first = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
+        self.assertTrue(agent_library_patrol_repo.cancel_agent_library_patrol_lease(next_run_at=current))
         run = db.get_task_run(int(first["run_id"]))
         assert run is not None
         self.assertEqual(run["status"], "cancelled")
-        next_cycle = db.trigger_agent_library_patrol(next_run_at=current)
+        next_cycle = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
         self.assertNotEqual(next_cycle["run_id"], first["run_id"])
 
     def test_notification_failure_rolls_back_cycle_and_task_terminal_together(self):
         import sqlite3
         current = "2026-08-03 12:00:00"
-        admitted = db.trigger_agent_library_patrol(next_run_at=current)
-        job = db.claim_due_agent_library_patrol(current_time=current)
+        admitted = agent_library_patrol_repo.trigger_agent_library_patrol(next_run_at=current)
+        job = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=current)
         assert job is not None
         with db.get_conn() as conn:
             conn.execute("CREATE TRIGGER fail_patrol_notice BEFORE INSERT ON agent_library_patrol_notification_outbox BEGIN SELECT RAISE(ABORT,'notice unavailable'); END")
@@ -1105,15 +1106,15 @@ class AgentLibraryPatrolCycleIdentityTests(IsolatedDatabaseTestCase):
                 conn.execute("DROP TRIGGER IF EXISTS fail_patrol_notice")
         self.addCleanup(remove_fault)
         with self.assertRaises(sqlite3.IntegrityError):
-            db.update_agent_library_patrol(
+            agent_library_patrol_repo.update_agent_library_patrol(
                 status="pending", outcome="updates_available", attempts=0, next_run_at=current,
                 expected_lease_generation=int(job["lease_generation"]),
                 result_fingerprint="a" * 64, notification_payload_json="{}", enqueue_notification=True,
             )
-        row = db.get_agent_library_patrol()
+        row = agent_library_patrol_repo.get_agent_library_patrol()
         run = db.get_task_run(int(admitted["run_id"]))
         assert row is not None and run is not None
         self.assertEqual(row["status"], "running")
         self.assertEqual(row["cycle_run_id"], admitted["run_id"])
         self.assertEqual(run["status"], "running")
-        self.assertEqual(db.list_agent_library_patrol_notifications(), [])
+        self.assertEqual(agent_library_patrol_repo.list_agent_library_patrol_notifications(), [])

@@ -10,7 +10,7 @@ from typing import Any
 from typing import Callable
 
 from app import config
-from app import database as db
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.modules.library_patrol import (
     finalize_patrol_progress,
     load_patrol_progress,
@@ -105,12 +105,12 @@ class AgentLibraryPatrolScheduler:
         current = self._now()
         if self._enabled():
             next_run_at = current if immediate else self._after(self._interval_seconds())
-            db.reschedule_agent_library_patrol(next_run_at=next_run_at)
+            agent_library_patrol_repo.reschedule_agent_library_patrol(next_run_at=next_run_at)
         else:
-            db.cancel_agent_library_patrol_lease(next_run_at=current)
+            agent_library_patrol_repo.cancel_agent_library_patrol_lease(next_run_at=current)
         with self._notification_gate:
             if not self._notifications_enabled():
-                db.discard_agent_library_patrol_notifications()
+                agent_library_patrol_repo.discard_agent_library_patrol_notifications()
         self._wake_event.set()
 
     def trigger_now(self, *, expected_state: dict[str, Any] | None = None,
@@ -119,7 +119,7 @@ class AgentLibraryPatrolScheduler:
         if not self._enabled():
             return {"ok": False, "status": "disabled"}
         current = self._now()
-        outcome = db.trigger_agent_library_patrol(
+        outcome = agent_library_patrol_repo.trigger_agent_library_patrol(
             next_run_at=current, expected_state=expected_state, check_cancelled=check_cancelled,
         )
         if outcome["ok"]:
@@ -138,11 +138,11 @@ class AgentLibraryPatrolScheduler:
             return 0
         runtime_generation = current_agent_runtime_generation()
         current = self._now()
-        db.ensure_agent_library_patrol(next_run_at=current)
+        agent_library_patrol_repo.ensure_agent_library_patrol(next_run_at=current)
         stale_before = self._format(
             self._clock() - timedelta(seconds=_RUNNING_LEASE_SECONDS)
         )
-        job = db.claim_due_agent_library_patrol(
+        job = agent_library_patrol_repo.claim_due_agent_library_patrol(
             current_time=current,
             stale_before=stale_before,
         )
@@ -150,7 +150,7 @@ class AgentLibraryPatrolScheduler:
             return 0
         # 配置可能在领取租约后被关闭；执行前再次确认并使本租约失效。
         if not self._enabled():
-            db.cancel_agent_library_patrol_lease(
+            agent_library_patrol_repo.cancel_agent_library_patrol_lease(
                 next_run_at=current,
                 expected_lease_generation=int(job["lease_generation"]),
             )
@@ -166,7 +166,7 @@ class AgentLibraryPatrolScheduler:
             if self._runtime_allows(runtime_generation):
                 self._complete_failure(job, current=current, error_type=type(exc).__name__)
             else:
-                db.cancel_agent_library_patrol_lease(
+                agent_library_patrol_repo.cancel_agent_library_patrol_lease(
                     next_run_at=current,
                     expected_lease_generation=int(job["lease_generation"]),
                 )
@@ -187,7 +187,7 @@ class AgentLibraryPatrolScheduler:
         )
         result, _elapsed_ms = self._audit_executor(arguments)
         if not agent_runtime_generation_is_current(runtime_generation):
-            db.cancel_agent_library_patrol_lease(
+            agent_library_patrol_repo.cancel_agent_library_patrol_lease(
                 next_run_at=current,
                 expected_lease_generation=int(job["lease_generation"]),
             )
@@ -227,7 +227,7 @@ class AgentLibraryPatrolScheduler:
             accumulator_json = json.dumps(
                 merged, ensure_ascii=False, separators=(",", ":"), sort_keys=True
             )
-            updated = db.continue_agent_library_patrol(
+            updated = agent_library_patrol_repo.continue_agent_library_patrol(
                 expected_lease_generation=int(job["lease_generation"]),
                 next_run_at=current,
                 cycle_as_of=as_of,
@@ -274,7 +274,7 @@ class AgentLibraryPatrolScheduler:
             result_fingerprint = build_patrol_result_fingerprint(projection)
             notification_payload_json = serialize_patrol_notification_payload(projection)
         with self._notification_gate:
-            updated = db.update_agent_library_patrol(
+            updated = agent_library_patrol_repo.update_agent_library_patrol(
                 status=status,
                 outcome=persisted_outcome,
                 attempts=attempts,
@@ -307,7 +307,7 @@ class AgentLibraryPatrolScheduler:
             next_run_at = self._after(self._interval_seconds())
         if (
             str(job["cycle_as_of"] or "").strip()
-            and db.retry_agent_library_patrol_cycle(
+            and agent_library_patrol_repo.retry_agent_library_patrol_cycle(
                 expected_lease_generation=int(job["lease_generation"]),
                 status=status,
                 attempts=attempts,
@@ -318,7 +318,7 @@ class AgentLibraryPatrolScheduler:
             return
         failed = EpisodeAuditResult(False, "failed", "自动缺集巡检未完成")
         projection_json, projection = serialize_patrol_projection(asdict(failed))
-        updated = db.update_agent_library_patrol(
+        updated = agent_library_patrol_repo.update_agent_library_patrol(
             status=status,
             outcome="failed",
             attempts=attempts,
@@ -342,13 +342,13 @@ class AgentLibraryPatrolScheduler:
             if not self._runtime_allows(generation_guard):
                 return 0
             if not self._notifications_enabled():
-                db.discard_agent_library_patrol_notifications()
+                agent_library_patrol_repo.discard_agent_library_patrol_notifications()
                 return 0
             current = self._now()
             stale_before = self._format(
                 self._clock() - timedelta(seconds=_NOTIFICATION_LEASE_SECONDS)
             )
-            item = db.claim_due_agent_library_patrol_notification(
+            item = agent_library_patrol_repo.claim_due_agent_library_patrol_notification(
                 current_time=current,
                 stale_before=stale_before,
             )
@@ -357,14 +357,14 @@ class AgentLibraryPatrolScheduler:
             notification_id = int(item["id"])
             generation = int(item["lease_generation"])
             if not self._runtime_allows(generation_guard):
-                db.release_agent_library_patrol_notification(
+                agent_library_patrol_repo.release_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     next_attempt_at=current,
                 )
                 return 0
             if not self._notifications_enabled():
-                db.discard_agent_library_patrol_notification(
+                agent_library_patrol_repo.discard_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="NotificationsDisabled",
@@ -373,7 +373,7 @@ class AgentLibraryPatrolScheduler:
             try:
                 projection = load_patrol_notification_payload(item["payload_json"])
             except ValueError:
-                db.discard_agent_library_patrol_notification(
+                agent_library_patrol_repo.discard_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="InvalidPayload",
@@ -382,7 +382,7 @@ class AgentLibraryPatrolScheduler:
             try:
                 with agent_runtime_effect_admission(generation_guard):
                     if not self._runtime_allows(generation_guard):
-                        db.release_agent_library_patrol_notification(
+                        agent_library_patrol_repo.release_agent_library_patrol_notification(
                             notification_id,
                             expected_lease_generation=generation,
                             next_attempt_at=current,
@@ -398,7 +398,7 @@ class AgentLibraryPatrolScheduler:
                     )
                 )
             except AgentRuntimeDisabled:
-                db.release_agent_library_patrol_notification(
+                agent_library_patrol_repo.release_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     next_attempt_at=current,
@@ -412,20 +412,20 @@ class AgentLibraryPatrolScheduler:
                 if self._runtime_allows(generation_guard):
                     self._retry_notification(item, error_type=type(exc).__name__)
                 else:
-                    db.release_agent_library_patrol_notification(
+                    agent_library_patrol_repo.release_agent_library_patrol_notification(
                         notification_id,
                         expected_lease_generation=generation,
                         next_attempt_at=current,
                     )
                 return 1
             if result.ok:
-                db.complete_agent_library_patrol_notification(
+                agent_library_patrol_repo.complete_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     sent_at=current,
                 )
             elif result.outcome_unknown:
-                db.discard_agent_library_patrol_notification(
+                agent_library_patrol_repo.discard_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     error_type="DeliveryOutcomeUnknown",
@@ -437,7 +437,7 @@ class AgentLibraryPatrolScheduler:
                     delay_override=result.retry_after_seconds,
                 )
             else:
-                db.release_agent_library_patrol_notification(
+                agent_library_patrol_repo.release_agent_library_patrol_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     next_attempt_at=current,
@@ -449,7 +449,7 @@ class AgentLibraryPatrolScheduler:
     ) -> None:
         attempts = max(0, int(item["attempts"] or 0))
         if attempts + 1 >= _NOTIFICATION_MAX_ATTEMPTS:
-            db.discard_agent_library_patrol_notification(
+            agent_library_patrol_repo.discard_agent_library_patrol_notification(
                 int(item["id"]),
                 expected_lease_generation=int(item["lease_generation"]),
                 error_type=error_type,
@@ -458,7 +458,7 @@ class AgentLibraryPatrolScheduler:
         delay = max(0, (delay_override or 0)) or _NOTIFICATION_RETRY_DELAYS[
             min(attempts, len(_NOTIFICATION_RETRY_DELAYS) - 1)
         ]
-        db.retry_agent_library_patrol_notification(
+        agent_library_patrol_repo.retry_agent_library_patrol_notification(
             int(item["id"]),
             expected_lease_generation=int(item["lease_generation"]),
             next_attempt_at=self._after(delay),

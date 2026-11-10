@@ -11,6 +11,8 @@ from unittest.mock import Mock
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
+from app.repositories import organize_probe as organize_probe_repo
 from app.modules import telegram_notification_center as center
 from app.modules import telegram_notification_policy as policy
 from app.modules import telegram_organize_lifecycle as lifecycle
@@ -70,7 +72,7 @@ def _parent(stats=None, *, task=TASK, chat=CHAT, strm_status="已排队"):
 
 
 def _refresh_failure(*, paths=PATHS[:1], allow_emby=True, task=TASK, chat=CHAT):
-    entries = db.enqueue_strm_refresh_paths(paths, allow_emby=allow_emby)
+    entries = strm_repo.enqueue_strm_refresh_paths(paths, allow_emby=allow_emby)
     assert lifecycle.update_organize_lifecycle_downstream(
         task, chat_id=chat, strm_status="完成", media_refresh="Jellyfin 失败",
         partial=True, error="媒体库刷新入队失败",
@@ -85,7 +87,7 @@ def test_clean_parent_recovers_to_queued_refresh_once(transport):
     assert original.state == "queued"
     entries = _refresh_failure()
     assert lifecycle.reconcile_organize_refresh_notifications() == 0
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     event = _event()
     assert event.title == "✅ 光鸭整理完成"
@@ -108,7 +110,7 @@ def test_clean_parent_recovers_to_queued_refresh_once(transport):
 def test_recovery_preserves_parent_business_result(transport, stats, title, state, summary):
     original = _parent(stats)
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == len(entries)
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == len(entries)
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     event = _event()
     assert (event.title, event.state, event.footer) == (title, state, original.footer)
@@ -123,7 +125,7 @@ def test_failed_parent_machine_state_survives_recovery(transport):
     original = _parent({"moved": 0, "failed": 1}, strm_status="未执行")
     assert original.state == "failed"
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _event().state == "failed"
     assert "失败 1" in str(dict(_event().fields)["整理"])
@@ -134,17 +136,17 @@ def test_all_exact_paths_and_provider_boundary_control_readiness(transport):
     enabled = _refresh_failure(task="emby-enabled", paths=PATHS)
     _parent(task="emby-disabled")
     disabled = _refresh_failure(task="emby-disabled", paths=PATHS, allow_emby=False)
-    db.enqueue_strm_refresh_paths([PATHS[0] + ".other"], allow_emby=True)
-    assert db.acknowledge_strm_refresh_paths(enabled[:1]) == 1
+    strm_repo.enqueue_strm_refresh_paths([PATHS[0] + ".other"], allow_emby=True)
+    assert strm_repo.acknowledge_strm_refresh_paths(enabled[:1]) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 0
-    assert db.acknowledge_strm_refresh_paths(disabled) == 2
+    assert strm_repo.acknowledge_strm_refresh_paths(disabled) == 2
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _event("emby-disabled").state == "completed"
     assert "refresh" in _event("emby-enabled").lifecycle
-    assert db.acknowledge_strm_refresh_paths(enabled[1:]) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(enabled[1:]) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _event("emby-enabled").state == "completed"
-    assert db.count_strm_refresh_paths() == 1  # 无关的相似路径不能阻止精确批次恢复。
+    assert strm_repo.count_strm_refresh_paths() == 1  # 无关的相似路径不能阻止精确批次恢复。
 
 
 def test_recovery_keeps_chat_and_topic_route_when_edit_falls_back(transport):
@@ -161,13 +163,13 @@ def test_recovery_keeps_chat_and_topic_route_when_edit_falls_back(transport):
         False, status_code=400, error="Bad Request: message to edit not found",
     )
     transport.send.reset_mock()
-    assert db.acknowledge_strm_refresh_paths(entries["100"]) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries["100"]) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _row(chat="200")["event_json"] == other_chat["event_json"]
     assert _row(topic="strm")["revision"] == other_topic["revision"]
     transport.send.assert_called_once()
     assert transport.send.call_args.kwargs == {"chat_id": "100", "message_thread_id": 500}
-    assert db.acknowledge_strm_refresh_paths(entries["200"]) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries["200"]) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert transport.send.call_args.kwargs == {"chat_id": "200", "message_thread_id": 600}
     for chat, thread in (("100", 500), ("200", 600)):
@@ -182,7 +184,7 @@ def test_confirmation_rollup_survives_refresh_recovery(transport, monkeypatch, a
              "notification_actionable_confirmation_groups": 1}
     _parent(stats)
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
 
     def confirm():
         assert lifecycle.update_organize_lifecycle_confirmations(
@@ -223,7 +225,7 @@ def test_stale_downstream_write_cannot_revert_confirmation_or_revive_refresh(tra
              "notification_actionable_confirmation_groups": 1}
     _parent(stats)
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     project = lifecycle._project_downstream
     interleaved = False
 
@@ -259,7 +261,7 @@ def test_failed_notification_write_can_recover_after_database_reopen(transport, 
     _parent()
     entries = _refresh_failure()
     before = _row()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     with monkeypatch.context() as patcher:
         patcher.setattr(center, "upsert_notification", Mock(side_effect=sqlite3.OperationalError("写入失败")))
         assert lifecycle.reconcile_organize_refresh_notifications() == 0
@@ -278,7 +280,7 @@ def test_unknown_initial_send_is_never_replayed_by_recovery(transport):
     _parent()
     assert _row()["status"] == "outcome_unknown"
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     row = _row()
     assert row["status"] == "outcome_unknown"
@@ -299,7 +301,7 @@ def test_legacy_event_without_lifecycle_keeps_unattributed_warning(transport):
     )
     assert not _event().lifecycle
     entries = _refresh_failure()
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     event = _event()
     assert (event.title, event.footer, event.state) == (previous.title, previous.footer, previous.state)
@@ -342,7 +344,7 @@ def test_refresh_recovery_preserves_later_non_refresh_failure(transport):
         partial=True, error="新的 STRM 同步失败",
     )
     assert "refresh" in _event().lifecycle
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert "refresh" not in _event().lifecycle
     assert _event().state == "partial"
@@ -359,7 +361,7 @@ def test_later_success_does_not_hide_pending_refresh_failure(transport):
     assert _event().state == "partial"
     assert "refresh" in _event().lifecycle
     assert lifecycle.reconcile_organize_refresh_notifications() == 0
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _event().state == "completed"
 
@@ -385,10 +387,10 @@ def test_same_parent_waits_for_all_failed_refresh_batches(transport, second_path
     _parent()
     first = _refresh_failure()
     second = _refresh_failure(paths=second_paths, allow_emby=second_allow_emby)
-    assert db.acknowledge_strm_refresh_paths(first) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(first) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 0
     assert _event().state == "partial"
-    assert db.acknowledge_strm_refresh_paths(second) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(second) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _event().state == "completed"
 
@@ -401,13 +403,13 @@ def test_refresh_ack_does_not_clear_probe_work(transport, probe_status, strm_sta
     _parent()
     entries = _refresh_failure()
     log_id = db.add_organize_log("guangya", "old", "new", "file", "success", "1")
-    job_id = db.enqueue_organize_probe_completion(
+    job_id = organize_probe_repo.enqueue_organize_probe_completion(
         log_id, source_id="source", rel_dir="series", rules={},
         notification_context=build_notification_context(task_id=TASK, chat_id=CHAT),
     )
     with db.get_conn() as conn:
         conn.execute("UPDATE organize_probe_queue SET status=? WHERE id=?", (probe_status, job_id))
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     event = _event()
     assert event.state == state
@@ -423,11 +425,11 @@ def test_completed_probe_leaves_parent_failure_without_staying_queued(transport)
     _parent({"total": 2, "failed": 1})
     entries = _refresh_failure()
     log_id = db.add_organize_log("guangya", "old", "new", "file", "success", "1")
-    job_id = db.enqueue_organize_probe_completion(
+    job_id = organize_probe_repo.enqueue_organize_probe_completion(
         log_id, source_id="source", rel_dir="series", rules={},
         notification_context=build_notification_context(task_id=TASK, chat_id=CHAT),
     )
-    assert db.acknowledge_strm_refresh_paths(entries) == 1
+    assert strm_repo.acknowledge_strm_refresh_paths(entries) == 1
     assert lifecycle.reconcile_organize_refresh_notifications() == 1
     assert _event().state == "queued"
     assert "失败 1" in str(dict(_event().fields)["整理"])

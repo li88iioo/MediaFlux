@@ -9,6 +9,8 @@ import sys
 import unittest
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
+from app.repositories import rss as rss_repo
 from app.modules import backup
 from app.modules.local_media_scheduler import LocalMediaScheduler
 from app.repositories import telegram_notifications as notifications
@@ -52,6 +54,7 @@ import os, sys, json, socket
 from pathlib import Path
 from unittest.mock import patch
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaService
 from app.modules.local_move_transaction import LocalMoveTransaction
 from app.modules.organize import OrganizeRules
@@ -65,8 +68,8 @@ incoming_root, library = root / "incoming", root / "library"
 incoming_root.mkdir(); library.mkdir()
 incoming = incoming_root / "Movie.2026.mkv"
 incoming.write_bytes(b"new-process-media-larger")
-source = db.create_local_media_source(name="process-audit", qb_profile="", qb_path_prefix="", local_root=str(incoming_root), owner="admin", media_type="movie")
-db.upsert_local_library_target(source, "movie", str(library), owner="admin")
+source = local_media_repo.create_local_media_source(name="process-audit", qb_profile="", qb_path_prefix="", local_root=str(incoming_root), owner="admin", media_type="movie")
+local_media_repo.upsert_local_library_target(source, "movie", str(library), owner="admin")
 service = LocalMediaService(scraper=FakeScraper(MatchResult(tmdb_id="1", title="Movie", year="2026", media_type="movie", confidence=1.0)))
 rules = OrganizeRules(region_split=False, year_split=False, naming_scope="both", conflict_strategy=2, emby_refresh=False, media_probe_enabled=False, clean_empty=False)
 with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules), patch("app.modules.local_media_service.probe_local_media_profile", return_value=None):
@@ -76,7 +79,7 @@ with patch("app.modules.local_media_service.OrganizeRules.from_config", return_v
  target.parent.mkdir(parents=True); target.write_bytes(b"old-process-media")
  preview = service.preview("admin", inspection["inspection_id"], tmdb_id="1", media_type="movie")
  task = service.create_manual_task("admin", inspection["inspection_id"], preview_digest=preview["preview_digest"])
- assert db.claim_local_media_task(task, owner="admin")
+ assert local_media_repo.claim_local_media_task(task, owner="admin")
  (root / "process-manifest.json").write_text(json.dumps({"task": task, "source": source, "incoming": str(incoming), "target": str(target)}))
  original = LocalMoveTransaction._backup_replaced_target
  def retire_then_exit(transaction, *args, **kwargs):
@@ -89,21 +92,21 @@ raise AssertionError("child did not reach retirement")
             self.child(script, path, expected_exit=23)
             manifest = json.loads((path.parent / "process-manifest.json").read_text())
             task_id = manifest["task"]
-            get_local_media_task_result = db.get_local_media_task(task_id)
+            get_local_media_task_result = local_media_repo.get_local_media_task(task_id)
             assert get_local_media_task_result is not None
             self.assertEqual(get_local_media_task_result.status, "moving")
             db.init_db()
-            recovered = db.get_local_media_task(task_id)
+            recovered = local_media_repo.get_local_media_task(task_id)
             assert recovered is not None
             self.assertEqual(recovered.status, "requires_manual")
             self.assertTrue(db.is_interrupted_local_media_write_error(recovered.error))
             with self.assertRaisesRegex(ValueError, "核验"):
-                db.prepare_manual_local_media_task(
+                local_media_repo.prepare_manual_local_media_task(
                     manifest["source"], manifest["incoming"], snapshot_digest="preview:fixture", owner="admin"
                 )
-            self.assertFalse(db.reset_local_media_task(task_id, owner="admin"))
+            self.assertFalse(local_media_repo.reset_local_media_task(task_id, owner="admin"))
             db.init_db()
-            self.assertEqual(db.get_local_media_task(task_id), recovered)
+            self.assertEqual(local_media_repo.get_local_media_task(task_id), recovered)
             target = Path(manifest["target"])
             retired = list(target.parent.glob(".*.mediaflux-replaced-*"))
             self.assertEqual(len(retired), 1)
@@ -118,26 +121,26 @@ raise AssertionError("child did not reach retirement")
     ):
         with isolated_test_database("mediaflux.db") as path:
             paths = runtime_paths(path)
-            sub_id = db.add_rss_subscription(
+            sub_id = rss_repo.add_rss_subscription(
                 "history-feed", "https://feed.invalid/rss", refresh_interval_minutes=10
             )
             db.kv_set("rss.scheduler.last_admitted_id", str(sub_id))
-            source = db.create_local_media_source(
+            source = local_media_repo.create_local_media_source(
                 name="history-local",
                 qb_profile="",
                 qb_path_prefix="",
                 local_root="/synthetic",
                 owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source,
                 "",
                 "/synthetic/file.mkv",
                 trigger="scan",
                 operation_token="silent-manual-scan:history",
             )
-            db.update_local_media_task(task_id, status="failed")
-            old_task = db.get_local_media_task(task_id)
+            local_media_repo.update_local_media_task(task_id, status="failed")
+            old_task = local_media_repo.get_local_media_task(task_id)
             notification = notifications.upsert_notification(
                 "restore-receipt",
                 topic="confirmation",
@@ -158,7 +161,7 @@ raise AssertionError("child did not reach retirement")
             )
             archive = backup.create_backup(paths)
             db.kv_set("rss.scheduler.last_admitted_id", "9999")
-            db.reset_local_media_task(task_id)
+            local_media_repo.reset_local_media_task(task_id)
             notifications.upsert_notification(
                 "restore-receipt",
                 topic="confirmation",
@@ -173,7 +176,7 @@ raise AssertionError("child did not reach retirement")
             db.init_db()
             self.assertFalse(backup.recover_pending_restore(paths))
             self.assertEqual(db.kv_get("rss.scheduler.last_admitted_id"), str(sub_id))
-            self.assertEqual(db.get_local_media_task(task_id), old_task)
+            self.assertEqual(local_media_repo.get_local_media_task(task_id), old_task)
             restored = notifications.get_notification("restore-receipt")
             assert notification is not None
             assert restored is not None
@@ -192,13 +195,13 @@ raise AssertionError("child did not reach retirement")
             )
             assert updated is not None
             self.assertEqual(updated["status"], "pending")
-            self.assertTrue(db.reset_local_media_task(task_id))
-            retried = db.get_local_media_task(task_id)
+            self.assertTrue(local_media_repo.reset_local_media_task(task_id))
+            retried = local_media_repo.get_local_media_task(task_id)
             self.assertTrue(LocalMediaScheduler._is_silent_task(retried))
             assert old_task is not None
             assert retried is not None
             self.assertNotEqual(retried.operation_token, old_task.operation_token)
-            self.assertFalse(db.reset_local_media_task(task_id))
+            self.assertFalse(local_media_repo.reset_local_media_task(task_id))
 
     def test_process_loss_mid_restore_rolls_back_live_state_once(self):
         with isolated_test_database("mediaflux.db") as path:

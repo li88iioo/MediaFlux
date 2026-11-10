@@ -96,7 +96,7 @@ class StrmDirectoryConcurrencyTests(unittest.TestCase):
     def test_full_scan_reaches_fifteen_directory_workers(self):
         client = _ConcurrentTreeClient(15)
         with isolated_test_database(), tempfile.TemporaryDirectory() as root, patch(
-            "app.modules.strm.db.list_strm_index", return_value=[],
+            "app.repositories.strm.list_strm_index", return_value=[],
         ):
             stats = sync_strm(
                 "root",
@@ -116,7 +116,7 @@ class StrmDirectoryConcurrencyTests(unittest.TestCase):
 
     def test_one_directory_failure_aborts_generation_and_cleanup(self):
         client = _FailingConcurrentTreeClient(15)
-        with patch("app.modules.strm.db.list_strm_index", return_value=[]), patch(
+        with patch("app.repositories.strm.list_strm_index", return_value=[]), patch(
             "app.modules.strm.clean_invalid_strm"
         ) as cleanup:
             stats = sync_strm(
@@ -143,7 +143,7 @@ class StrmDirectoryConcurrencyTests(unittest.TestCase):
 
         with patch(
             "app.modules.strm._scan_limits", return_value=(100, 100, 100, 0.001)
-        ), patch("app.modules.strm.db.list_strm_index", return_value=[]), patch(
+        ), patch("app.repositories.strm.list_strm_index", return_value=[]), patch(
             "app.modules.strm.clean_invalid_strm"
         ) as cleanup:
             stats = sync_strm(
@@ -164,7 +164,7 @@ class StrmDirectoryConcurrencyTests(unittest.TestCase):
         client = _BudgetTreeClient()
         with patch(
             "app.modules.strm._scan_limits", return_value=(100, 10, 100, 60)
-        ), patch("app.modules.strm.db.list_strm_index", return_value=[]):
+        ), patch("app.repositories.strm.list_strm_index", return_value=[]):
             stats = sync_strm(
                 "root",
                 "http://media.invalid",
@@ -942,7 +942,7 @@ class GuangYaAdaptiveScanIntegrationTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as root,
-            patch("app.modules.strm.db.list_strm_index", return_value=[]),
+            patch("app.repositories.strm.list_strm_index", return_value=[]),
             patch("app.modules.strm.clean_invalid_strm") as cleanup,
         ):
             stats = sync_strm("root", "http://media.invalid", root, client=cast(GuangYaClient, Client()),
@@ -994,7 +994,7 @@ class GuangYaSnapshotScanTests(unittest.TestCase):
         return sync_strm("root", "http://media.invalid", root, client=client, **kwargs)
 
     def test_bulk_scan_repeat_and_verified_removal_use_the_same_index_pipeline(self):
-        from app import database as db
+        from app.repositories import strm as strm_repo
         client = _SnapshotTreeClient()
         # 账号中的无关孤儿、来源外视频都不能变成来源内候选。
         client.rows.extend([
@@ -1020,11 +1020,12 @@ class GuangYaSnapshotScanTests(unittest.TestCase):
             client.rows = [r for r in client.rows if r["fileId"] != "f0"]
             last = self.run_sync(root, client)
             self.assertEqual(last["cleaned"], 1)
-            self.assertEqual(len(db.list_strm_index("guangya:root")), 63)
+            self.assertEqual(len(strm_repo.list_strm_index("guangya:root")), 63)
             self.assertEqual(len(list(Path(root).rglob("*.strm"))), 63)
 
     def test_multi_page_snapshot_preserves_metadata_and_conflict_winners(self):
         from app import database as db
+        from app.repositories import strm as strm_repo
         client = _SnapshotTreeClient(300)
         for i in range(300):
             for episode in range(2, 5):
@@ -1046,7 +1047,7 @@ class GuangYaSnapshotScanTests(unittest.TestCase):
             self.assertIn("/f1/", output.read_text())
             with db.get_conn() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM strm_metadata_queue").fetchone()[0], 299)
-            self.assertEqual(len(db.list_strm_index("guangya:root")), 1196)
+            self.assertEqual(len(strm_repo.list_strm_index("guangya:root")), 1196)
 
     def test_snapshot_deadline_is_not_a_directory_error(self):
         client = _SnapshotTreeClient()

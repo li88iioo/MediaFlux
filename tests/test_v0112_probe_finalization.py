@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_history as organize_history_repo
+from app.repositories import organize_probe as organize_probe_repo
 from app.modules.organize import OrganizeRules
 from app.modules.organize_probe_worker import OrganizeProbeWorker
 from tests import test_release_chain_organize as fixtures
@@ -23,7 +25,7 @@ class ProbeCommittedFinalizationTests(unittest.TestCase):
         self.log_id = self.fixture._log()
         self.cloud = fixtures.MemoryCloud()
         self.worker = self.new_worker()
-        self.job_id = db.enqueue_organize_probe_completion(
+        self.job_id = organize_probe_repo.enqueue_organize_probe_completion(
             self.log_id, source_id="target", rel_dir="Archive", rules={}
         )
         self.probe = self.enterContext(patch(
@@ -65,40 +67,40 @@ class ProbeCommittedFinalizationTests(unittest.TestCase):
         self.assert_committed()
 
     def test_audit_completion_failure_recovers_without_reprobing(self):
-        with patch.object(db, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy")):
+        with patch.object(organize_history_repo, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy")):
             self.assertTrue(self.run_due())
         self.assertEqual(self.row()["status"], "retry_wait")
         self.assert_committed()
         self.finish_without_external_read()
 
     def test_repeated_recovery_audit_errors_do_not_consume_probe_attempts(self):
-        with patch.object(db, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy")):
+        with patch.object(organize_history_repo, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy")):
             self.run_due()
         for _ in range(3):
-            with patch.object(db, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy")):
+            with patch.object(organize_history_repo, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy")):
                 self.assertTrue(self.run_due(self.new_worker()))
             self.assertEqual(self.row()["status"], "retry_wait")
             self.assert_committed()
         self.finish_without_external_read()
 
     def test_task_ack_errors_keep_successful_steps_as_durable_completion_fact(self):
-        with patch.object(db, "complete_organize_probe_job", side_effect=sqlite3.OperationalError("busy")):
+        with patch.object(organize_probe_repo, "complete_organize_probe_job", side_effect=sqlite3.OperationalError("busy")):
             self.run_due()
         self.assertEqual(self.row()["status"], "retry_wait")
         self.assert_committed()
-        self.assertEqual(db.list_organize_operation_steps(self.log_id)[0]["status"], "success")
+        self.assertEqual(organize_history_repo.list_organize_operation_steps(self.log_id)[0]["status"], "success")
         # 新进程/新worker没有内存标记；即使所有步骤早已成功，也只能继续ack。
         for _ in range(3):
             worker = self.new_worker()
             with patch.object(worker, "_runtime_client", side_effect=AssertionError("不得重探")), \
-                 patch.object(db, "complete_organize_probe_job", side_effect=sqlite3.OperationalError("busy")):
+                 patch.object(organize_probe_repo, "complete_organize_probe_job", side_effect=sqlite3.OperationalError("busy")):
                 self.assertTrue(self.run_due(worker))
             self.assertEqual(self.row()["status"], "retry_wait")
             self.assert_committed()
         self.finish_without_external_read()
 
     def test_lost_ack_lease_does_not_hide_completed_steps_behind_display_limit(self):
-        with patch.object(db, "complete_organize_probe_job", return_value=False):
+        with patch.object(organize_probe_repo, "complete_organize_probe_job", return_value=False):
             self.run_due()
         with db.get_conn() as conn:
             conn.executemany(
@@ -108,21 +110,21 @@ class ProbeCommittedFinalizationTests(unittest.TestCase):
         self.finish_without_external_read()
 
     def test_repeated_enqueue_is_same_job_not_a_new_probe_cycle(self):
-        with patch.object(db, "complete_organize_probe_job", return_value=False):
+        with patch.object(organize_probe_repo, "complete_organize_probe_job", return_value=False):
             self.run_due()
-        same = db.enqueue_organize_probe_completion(
+        same = organize_probe_repo.enqueue_organize_probe_completion(
             self.log_id, source_id="target", rel_dir="Archive", rules={}
         )
         self.assertEqual(same, self.job_id)
         self.finish_without_external_read()
-        self.assertEqual(db.enqueue_organize_probe_completion(
+        self.assertEqual(organize_probe_repo.enqueue_organize_probe_completion(
             self.log_id, source_id="target", rel_dir="Archive", rules={}
         ), self.job_id)
         self.assertFalse(self.run_due(self.new_worker()))
         self.assert_committed()
 
     def test_other_job_success_cannot_short_circuit_a_fresh_probe(self):
-        db.add_organize_operation_step(
+        organize_history_repo.add_organize_operation_step(
             self.log_id, f"probe:{self.job_id + 1}:old-job", 1, "probe_rename",
             file_id="video", to_name="Archive.mkv", to_parent_id="target", status="success",
         )
@@ -131,19 +133,24 @@ class ProbeCommittedFinalizationTests(unittest.TestCase):
         self.assert_committed()
 
     def test_recovery_state_database_outage_does_not_exhaust_committed_job(self):
-        with patch.object(db, "complete_organize_probe_job", return_value=False):
+        with patch.object(organize_probe_repo, "complete_organize_probe_job", return_value=False):
             self.run_due()
-        for name in ("list_pending_organize_probe_steps", "get_organize_log", "list_organize_log_items"):
+        reads = (
+            (organize_history_repo, "list_pending_organize_probe_steps"),
+            (db, "get_organize_log"),
+            (db, "list_organize_log_items"),
+        )
+        for owner, name in reads:
             with self.subTest(read=name):
                 for _ in range(3):
-                    with patch.object(db, name, side_effect=sqlite3.OperationalError("database is locked")):
+                    with patch.object(owner, name, side_effect=sqlite3.OperationalError("database is locked")):
                         self.assertTrue(self.run_due(self.new_worker()))
                     self.assertEqual(self.row()["status"], "retry_wait")
                     self.assert_committed()
         self.finish_without_external_read()
 
     def test_precommit_database_error_still_rolls_back_remote_and_does_not_ack(self):
-        with patch.object(db, "commit_organize_probe_rename", side_effect=sqlite3.OperationalError("busy")):
+        with patch.object(organize_probe_repo, "commit_organize_probe_rename", side_effect=sqlite3.OperationalError("busy")):
             self.run_due()
         self.assertEqual(self.cloud.files["video"].name, "Archive.mkv")
         get_organize_log_result_2 = db.get_organize_log(self.log_id)
@@ -151,7 +158,7 @@ class ProbeCommittedFinalizationTests(unittest.TestCase):
         self.assertEqual(get_organize_log_result_2["current_name"], "Archive.mkv")
         self.assertEqual(self.row()["status"], "retry_wait")
         self.assertEqual(self.row()["attempts"], 1)
-        self.assertTrue(all(row["status"] != "success" for row in db.list_organize_operation_steps(self.log_id)))
+        self.assertTrue(all(row["status"] != "success" for row in organize_history_repo.list_organize_operation_steps(self.log_id)))
 
 
 class ProbeSupersededFinalizationTests(unittest.TestCase):
@@ -164,17 +171,17 @@ class ProbeSupersededFinalizationTests(unittest.TestCase):
                     log_id, cloud, service = fixture._fixture()
                     worker = OrganizeProbeWorker()
                     worker._client = cast(GuangYaClient, cloud)
-                    job_id = db.enqueue_organize_probe_completion(log_id, source_id="target", rel_dir="Archive", rules={})
-                    real_complete = db.complete_organize_probe_job
+                    job_id = organize_probe_repo.enqueue_organize_probe_completion(log_id, source_id="target", rel_dir="Archive", rules={})
+                    real_complete = organize_probe_repo.complete_organize_probe_job
 
                     def expired_ack(*args, **kwargs):
                         until = clock._job(job_id)["lease_until"]
                         with patch("app.repositories.organize_probe.time.time", return_value=until + 1):
                             return real_complete(*args, **kwargs)
 
-                    failure = (patch.object(db, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy"))
+                    failure = (patch.object(organize_history_repo, "finish_organize_operation_step", side_effect=sqlite3.OperationalError("busy"))
                                if failed_stage == "audit" else
-                               patch.object(db, "complete_organize_probe_job", side_effect=expired_ack))
+                               patch.object(organize_probe_repo, "complete_organize_probe_job", side_effect=expired_ack))
                     with patch("app.modules.media_probe.probe_media_profile", return_value=object()), \
                          patch.object(worker, "_desired_plan", return_value=(object(), OrganizeRules(link_strm=False),
                             SimpleNamespace(new_name="First.2025.S01E07-1080p.mkv"))), failure:

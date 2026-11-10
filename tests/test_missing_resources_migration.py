@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app import database_migrations, database_schema
 
 
@@ -211,7 +212,7 @@ def test_real_file_database_startup_migrates_old_rows_and_keeps_submission(
     ]
     members = [tuple(r) for r in legacy.execute(f"SELECT * FROM {child} ORDER BY id")]
     with isolated_test_database():
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             "source-migration-real-db", "magnet", origin="agent"
         )
         members = [(*r[:11], request_id, *r[12:]) for r in members]

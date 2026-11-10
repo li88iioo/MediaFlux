@@ -8,6 +8,7 @@ from inspect import getattr_static
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from app import database as db
+from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.logger import get_logger
 from app.modules.directory_scrape_errors import safe_organize_failure
@@ -659,7 +660,7 @@ def execute_organize_plans(
                     try:
                         from app.modules.organize import organize_rules_snapshot
 
-                        db.enqueue_organize_probe_completion(
+                        organize_probe_repo.enqueue_organize_probe_completion(
                             log_id,
                             source_id=(rules.target_dir_id or ""),
                             rel_dir=(p.target_path or ""),

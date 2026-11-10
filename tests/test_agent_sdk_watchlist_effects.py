@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from app import config, database as db
+from app import config
+from app.repositories import discovery as discovery_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -74,7 +75,7 @@ def test_add_freezes_metadata_and_confirms_once_after_restart(backend):
         prepared = await effects.prepare("watchlist.add", ADD, context=context)
         plan = prepared.effect_plan
         assert plan is not None and plan.tool_name == "watchlist.add"
-        assert db.get_media_watchlist("tmdb", "42", "movie") is None
+        assert discovery_repo.get_media_watchlist("tmdb", "42", "movie") is None
         public = json.dumps(plan.public_dict(), ensure_ascii=False)
         assert "预检标题" in public
         assert all(secret not in public for secret in ("private.invalid", "api_key", "poster_key"))
@@ -89,7 +90,7 @@ def test_add_freezes_metadata_and_confirms_once_after_restart(backend):
         assert restored is not None and restored.plan_id == plan.plan_id
         completed = await restarted.execute_confirmed(plan.plan_id, context=context)
         assert completed.outcome.public_content["ok"] is True
-        row = db.get_media_watchlist("tmdb", "42", "movie")
+        row = discovery_repo.get_media_watchlist("tmdb", "42", "movie")
         assert row is not None
         assert (row["title"], row["year"], row["poster_key"]) == (CARD.title, CARD.year, CARD.poster_key)
         assert completed.outcome.public_content["data"]["id"] == row["id"]
@@ -97,7 +98,7 @@ def test_add_freezes_metadata_and_confirms_once_after_restart(backend):
         backend.get_detail.assert_called_once_with("42", "movie")
         with pytest.raises(ToolPipelineError):
             await restarted.execute_confirmed(plan.plan_id, context=context)
-        assert len(db.list_media_watchlist()) == 1
+        assert len(discovery_repo.list_media_watchlist()) == 1
     asyncio.run(check())
 
 
@@ -115,7 +116,7 @@ def test_no_changes_does_not_freeze_a_confirmation(backend, operation):
         assert result.outcome.public_content["status"] == "no_changes"
         assert await effects.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
         backend.get_detail.assert_not_called()
-        assert len(db.list_media_watchlist()) == (1 if operation == "add" else 0)
+        assert len(discovery_repo.list_media_watchlist()) == (1 if operation == "add" else 0)
     asyncio.run(check())
 
 
@@ -132,13 +133,13 @@ def test_confirmation_conflicts_preserve_current_record(backend, change):
         if change == "recreated_row":
             assert DiscoveryService.remove_watchlist("tmdb", "movie", "42")
         DiscoveryService.add_watchlist(MediaCard(**ADD, title="并发标题", poster_key="changed-poster"))
-        stored_row_1 = db.get_media_watchlist("tmdb", "42", "movie")
+        stored_row_1 = discovery_repo.get_media_watchlist("tmdb", "42", "movie")
         assert stored_row_1 is not None
         before = dict(stored_row_1)
         result = await effects.execute_confirmed(prepared.effect_plan.plan_id, context=context)
         assert result.outcome.public_content["ok"] is False
         assert result.outcome.public_content["status"] == "conflict"
-        stored_row_2 = db.get_media_watchlist("tmdb", "42", "movie")
+        stored_row_2 = discovery_repo.get_media_watchlist("tmdb", "42", "movie")
         assert stored_row_2 is not None
         assert dict(stored_row_2) == before
     asyncio.run(check())
@@ -154,11 +155,11 @@ def test_remove_only_deletes_the_confirmed_record(backend):
         effects = executor(store)
         prepared = await effects.prepare("watchlist.remove", {"watchlist_id": number}, context=context)
         assert prepared.effect_plan is not None
-        assert db.get_media_watchlist_by_id(number) is not None
+        assert discovery_repo.get_media_watchlist_by_id(number) is not None
         result = await effects.execute_confirmed(prepared.effect_plan.plan_id, context=context)
         assert result.outcome.public_content["data"]["id"] == number
-        assert db.get_media_watchlist_by_id(number) is None
-        assert db.get_media_watchlist_by_id(other) is not None
+        assert discovery_repo.get_media_watchlist_by_id(number) is None
+        assert discovery_repo.get_media_watchlist_by_id(other) is not None
         backend.get_detail.assert_not_called()
     asyncio.run(check())
 
@@ -167,7 +168,7 @@ def test_remove_only_deletes_the_confirmed_record(backend):
 def test_cancel_never_writes(backend, operation, ending):
     async def check():
         number = DiscoveryService.add_watchlist(CARD) if operation == "remove" else None
-        before = [dict(row) for row in db.list_media_watchlist()]
+        before = [dict(row) for row in discovery_repo.list_media_watchlist()]
         store = SQLiteKernelStore()
         context = await context_for(store)
         effects = executor(store)
@@ -180,7 +181,7 @@ def test_cancel_never_writes(backend, operation, ending):
             context.cancellation.cancel()
         with pytest.raises(ToolPipelineError if ending == "cancel_ticket" else asyncio.CancelledError):
             await effects.execute_confirmed(prepared.effect_plan.plan_id, context=context)
-        assert [dict(row) for row in db.list_media_watchlist()] == before
+        assert [dict(row) for row in discovery_repo.list_media_watchlist()] == before
     asyncio.run(check())
 
 
@@ -195,7 +196,7 @@ def test_cancel_during_source_lookup_does_not_publish_a_plan(backend):
         backend.get_detail.side_effect = cancelled_detail
         with pytest.raises(asyncio.CancelledError):
             await effects.prepare("watchlist.add", ADD, context=context)
-        assert db.list_media_watchlist() == []
+        assert discovery_repo.list_media_watchlist() == []
         assert await effects.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
     asyncio.run(check())
 
@@ -214,7 +215,7 @@ def test_confirmation_runtime_rejects_configuration_aba(backend):
             await effects.execute_confirmed(prepared.effect_plan.plan_id, context=context)
         assert error.value.code == "confirmation_stale"
         assert error.value.execution_started is False
-        assert db.list_media_watchlist() == []
+        assert discovery_repo.list_media_watchlist() == []
     asyncio.run(check())
 
 
@@ -231,7 +232,7 @@ def test_invalid_identity_never_prepares_a_write(backend, name, arguments):
             await effects.prepare(name, arguments, context=context)
         assert await effects.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
         backend.get_detail.assert_not_called()
-        assert db.list_media_watchlist() == []
+        assert discovery_repo.list_media_watchlist() == []
     asyncio.run(check())
 
 
@@ -282,7 +283,7 @@ def test_native_grant_reuses_scope_debits_once_and_never_authorizes_remove(backe
             await effects.scoped_trust.set(context=context, operation="grant", plan_id=remove.plan_id,
                 tool_name="watchlist.remove", scope=scope, ttl_seconds=300, max_actions=5)
         assert denied.value.code == "scoped_trust_denied"
-        assert db.get_media_watchlist_by_id(number) is not None
+        assert discovery_repo.get_media_watchlist_by_id(number) is not None
         assert (await store.load(owner=context.owner, session_id=context.session_id)).metadata["scoped_trust"] == saved
     asyncio.run(check())
 
@@ -306,7 +307,7 @@ def test_persisted_legacy_grant_migrates_with_the_existing_debit(backend):
         await native.execute_confirmed(current.plan_id, context=context, scoped_trust=True)
         saved = (await restarted_store.load(owner=context.owner, session_id=context.session_id)).metadata["scoped_trust"]
         assert saved == {**previous, "tool_name": "watchlist.add", "remaining": previous["remaining"] - 1}
-        assert len(db.list_media_watchlist()) == 1
+        assert len(discovery_repo.list_media_watchlist()) == 1
     asyncio.run(check())
 
 
@@ -314,7 +315,7 @@ def test_persisted_legacy_grant_migrates_with_the_existing_debit(backend):
 def test_unexpired_retired_ticket_never_executes_as_native(backend, retired):
     async def check():
         number = DiscoveryService.add_watchlist(CARD) if retired.endswith("remove_watchlist") else None
-        before = [dict(row) for row in db.list_media_watchlist()]
+        before = [dict(row) for row in discovery_repo.list_media_watchlist()]
         store = SQLiteKernelStore()
         context = await context_for(store)
         effects = executor(store)
@@ -341,7 +342,7 @@ def test_unexpired_retired_ticket_never_executes_as_native(backend, retired):
             await restarted.execute_confirmed(ticket.plan_id, context=context)
         assert failure.value.code == "tool_not_found" and failure.value.execution_started is False
         assert await restarted.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
-        assert [dict(row) for row in db.list_media_watchlist()] == before
+        assert [dict(row) for row in discovery_repo.list_media_watchlist()] == before
         assert (await store.load(owner=context.owner, session_id=context.session_id)).metadata["scoped_trust"] == grant
         backend.get_detail.assert_not_called()
     asyncio.run(check())
@@ -383,13 +384,13 @@ Path("tail-{label}.txt").write_text("must not resume")
         assert plan["tool_name"] == "watchlist.add"
         await session.set_scoped_trust(owner=owner, session_id=session_id, operation="grant", plan_id=plan["plan_id"],
             tool_name="watchlist.add", scope={"provider": "tmdb", "media_type": "tv"}, ttl_seconds=300, max_actions=5)
-        assert db.list_media_watchlist() == []
+        assert discovery_repo.list_media_watchlist() == []
         auto = await collect(session.run(AgentInput(owner=owner, session_id=session_id, message="改为收藏第二部电视剧")))
         assert not any(event.type is Event.EFFECT_APPROVAL_REQUIRED for event in auto)
         completed = [event for event in auto if event.type is Event.EFFECT_COMPLETED]
         assert len(completed) == 1 and completed[0].payload["scoped_trust"]["remaining"] == 4
-        assert db.get_media_watchlist("tmdb", "700", "tv") is None
-        assert db.get_media_watchlist("tmdb", "701", "tv") is not None
+        assert discovery_repo.get_media_watchlist("tmdb", "700", "tv") is None
+        assert discovery_repo.get_media_watchlist("tmdb", "701", "tv") is not None
         root, _ = sandbox._workspace_location(owner, session_id)
         assert (root / "work/runs.txt").read_text() == "initial\nauto\n"
         assert not (root / "work/tail-initial.txt").exists()

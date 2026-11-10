@@ -1,8 +1,10 @@
 """数据层拆分后仍使用单一连接入口、迁移登记表和跨表事务。"""
 from __future__ import annotations
 
+import importlib
 import inspect
 import os
+import pkgutil
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -11,35 +13,21 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
-from app import database_migrations, database_schema
+from app import database_migrations, database_schema, repositories
 from app.repositories import local_media
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 
 class DatabaseModuleImportTests(unittest.TestCase):
-    def test_facade_exports_the_single_local_media_implementation(self):
-        repository_only = {
-            "_recover_after_restart",  # 启动 hook 接收既有事务，不属于 CRUD 门面API。
-            "_check_source_snapshot",
-            "local_media_source_snapshot",
-            "local_media_task_snapshot",
-            "local_media_task_page",
-        }
-        owned = set()
-        for name, function in inspect.getmembers(local_media, inspect.isfunction):
-            if function.__module__ != local_media.__name__:
-                continue
-            owned.add(name)
-            with self.subTest(name=name):
-                if name in repository_only:
-                    self.assertFalse(hasattr(db, name))
-                else:
-                    self.assertIs(getattr(db, name), function)
-        self.assertTrue(repository_only <= owned)
-        self.assertIs(
-            db._LOCAL_MEDIA_TERMINAL_TASK_STATUSES,
-            local_media._LOCAL_MEDIA_TERMINAL_TASK_STATUSES,
-        )
+    def test_database_does_not_reexport_repository_functions(self):
+        """仓储函数只有一个访问入口，`app.database` 只负责连接、时钟和自有表。"""
+        for info in pkgutil.iter_modules(repositories.__path__):
+            module = importlib.import_module(f"{repositories.__name__}.{info.name}")
+            for name, function in inspect.getmembers(module, inspect.isfunction):
+                if function.__module__ != module.__name__:
+                    continue
+                with self.subTest(module=info.name, name=name):
+                    self.assertIsNot(getattr(db, name, None), function)
 
     def test_unused_single_target_delete_is_not_exported(self):
         self.assertFalse(hasattr(local_media, "delete_local_library_target"))
@@ -119,7 +107,8 @@ with patch("sqlite3.connect", side_effect=AssertionError("import opened database
         import_module(name)
 from app import database
 from app.repositories import local_media
-assert database.create_local_media_task is local_media.create_local_media_task
+assert callable(local_media.create_local_media_task)
+assert not hasattr(database, "create_local_media_task")
 '''
                 completed = subprocess.run(
                     [sys.executable, "-c", code],
@@ -195,7 +184,7 @@ class LocalMediaRepositoryBoundaryTests(IsolatedDatabaseTestCase):
                 name="only-in-switched-database", qb_profile="", qb_path_prefix="",
                 local_root="/downloads/switched", owner="boundary-switch",
             )
-            self.assertEqual(len(db.list_local_media_sources(owner="boundary-switch")), 1)
+            self.assertEqual(len(local_media.list_local_media_sources(owner="boundary-switch")), 1)
         self.assertEqual(db.resolve_db_path(), previous_path)
         self.assertEqual(local_media.list_local_media_sources(owner="boundary-switch"), [])
 

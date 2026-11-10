@@ -10,6 +10,9 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.clients.guangya import (
     GuangYaClient,
     close_guangya_client,
@@ -133,7 +136,7 @@ class DownloadTracker:
                 return
             generation = self._lifecycle_generation
         try:
-            projected, released = db.reconcile_startup_media_download_admissions()
+            projected, released = media_subscriptions_repo.reconcile_startup_media_download_admissions()
             if projected or released:
                 logger.info(
                     "启动恢复下载准入：投影 %s 条，释放 %s 条可重试记录",
@@ -190,7 +193,7 @@ class DownloadTracker:
         self._run_staging_reconciliation_if_due()
         self._run_torrent_data_cleanup_if_due()
         try:
-            recovered = db.recover_stale_submitting_download_requests(
+            recovered = download_requests_repo.recover_stale_submitting_download_requests(
                 stale_minutes=_STALE_SUBMISSION_MINUTES,
             )
         except Exception as exc:
@@ -205,12 +208,12 @@ class DownloadTracker:
         else:
             if recovered:
                 logger.warning("已将 %s 条超时下载提交转为人工核验", recovered)
-        local_media_enabled = bool(db.list_local_media_sources(owner="admin", enabled_only=True))
+        local_media_enabled = bool(local_media_repo.list_local_media_sources(owner="admin", enabled_only=True))
         try:
             cursor = max(0, int(db.kv_get(_TRACKER_CURSOR_KEY, "0") or 0))
         except (TypeError, ValueError):
             cursor = 0
-        rows = db.list_active_download_requests(
+        rows = download_requests_repo.list_active_download_requests(
             include_local_import=local_media_enabled, after_id=cursor, wrap=True,
         )
         if not rows:
@@ -289,7 +292,7 @@ class DownloadTracker:
             self._last_torrent_data_cleanup_at = current
             return 0
         try:
-            cleared = db.purge_expired_download_request_torrent_data(
+            cleared = download_requests_repo.purge_expired_download_request_torrent_data(
                 retention_days,
                 limit=_TORRENT_DATA_CLEANUP_BATCH_SIZE,
             )
@@ -617,14 +620,14 @@ class DownloadTracker:
         scheduler = get_local_media_scheduler()
         linked_task_id = self._linked_local_media_task_id(row)
         if linked_task_id is not None:
-            linked_task = db.get_local_media_task(linked_task_id, owner="admin")
+            linked_task = local_media_repo.get_local_media_task(linked_task_id, owner="admin")
             if linked_task is None:
                 self._record_local_import_configuration_failure(
                     row, task, RuntimeError("已关联的本地整理任务不存在")
                 )
                 return
             with db.get_conn() as conn:
-                db.reconcile_local_media_downloads(conn, task_id=linked_task_id)
+                local_media_repo.reconcile_local_media_downloads(conn, task_id=linked_task_id)
             if str(linked_task.status) not in {"completed", "failed", "requires_manual"}:
                 scheduler.reload()
             return
@@ -649,7 +652,7 @@ class DownloadTracker:
             return
         if local_task_id is not None:
             scheduler.reload()
-            linked_task = db.get_local_media_task(local_task_id, owner="admin")
+            linked_task = local_media_repo.get_local_media_task(local_task_id, owner="admin")
             if linked_task is None:
                 self._record_local_import_configuration_failure(
                     row, task, RuntimeError("新建的本地整理任务不存在")
@@ -657,7 +660,7 @@ class DownloadTracker:
                 return
             return
         content_path = str(getattr(task, "content_path", "") or "")
-        db.mark_download_request_local_media_skipped(
+        download_requests_repo.mark_download_request_local_media_skipped(
             int(row["id"]), content_path, "未命中可整理的本地媒体内容"
         )
         logger.info(
@@ -668,7 +671,7 @@ class DownloadTracker:
     def _record_local_import_configuration_failure(self, row, task, error: Exception) -> None:
         request_id = int(row["id"])
         message = str(error or "本地媒体来源配置无效")[:1000]
-        updated = db.mark_download_request_local_media_failed(
+        updated = download_requests_repo.mark_download_request_local_media_failed(
             request_id,
             str(getattr(task, "content_path", "") or ""),
             message,
@@ -687,7 +690,7 @@ class DownloadTracker:
         exhausted = attempts >= _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS
         timestamp = db.now()
         message = str(error or "本地媒体路径暂时不可读")[:1000]
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             qb_content_path=str(getattr(task, "content_path", "") or ""),
             local_import_status="failed" if exhausted else "pending",
@@ -751,7 +754,7 @@ class DownloadTracker:
         # 随后继续更新大小/etag。统一要求两次快照一致，避免整理到半写入文件。
         ready = bool(count and stable_count >= 2 and (expected <= 0 or count >= expected))
         if ready:
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id, gy_settle_observed_file_count=count, gy_settle_snapshot=snapshot,
                 gy_settle_stable_count=stable_count, organize_status="queued",
                 organize_next_retry_at=None, organize_error="", error="",
@@ -804,7 +807,7 @@ class DownloadTracker:
         delay = self._settle_delay(attempts)
         next_retry = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
         first_notice = str(self._row_value(row, "organize_status", "") or "") != "settling"
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, organize_started=0, organize_status="settling", organize_error=error,
             organize_next_retry_at=next_retry, gy_settle_attempts=attempts,
             gy_settle_observed_file_count=max(0, observed),
@@ -823,7 +826,7 @@ class DownloadTracker:
     @staticmethod
     def _fail_settle(row, message: str) -> None:
         request_id = int(row["id"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, organize_started=-1, organize_status="failed",
             organize_error=message, organize_finished_at=db.now(), organize_next_retry_at=None,
             strm_status="skipped", strm_error=message, strm_finished_at=db.now(), error=message,
@@ -834,7 +837,7 @@ class DownloadTracker:
     def _retain_staging_without_organize(self, row, reason: str) -> None:
         """保留无法安全收口的隔离目录，并让待处理页给出明确原因。"""
         message = (reason or "下载目录需要人工核验")[:500]
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             int(row["id"]),
             organize_started=-1, organize_status="skipped", organize_error="",
             organize_finished_at=db.now(), organize_next_retry_at=None,
@@ -859,7 +862,7 @@ class DownloadTracker:
             )
             return True
 
-        if not db.claim_download_request_staging_finalize(
+        if not download_requests_repo.claim_download_request_staging_finalize(
             request_id,
             staging_id=staging_id,
             parent_id=parent_id,
@@ -872,7 +875,7 @@ class DownloadTracker:
             return True
 
         def finalize() -> dict:
-            current = db.get_download_request(request_id)
+            current = download_requests_repo.get_download_request(request_id)
             if current is None:
                 return {"ok": True, "stats": {"skipped": 1}}
             if (
@@ -915,7 +918,7 @@ class DownloadTracker:
             retry_at = (datetime.now() + timedelta(seconds=5)).strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id,
                 organize_started=0,
                 organize_status="queued",
@@ -1017,7 +1020,7 @@ class DownloadTracker:
                     row, f"暂存内容收口失败: {type(exc).__name__}"
                 )
                 return True
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 request_id,
                 gy_target_dir=parent_id, gy_target_name=str(
                     self._row_value(row, "gy_staging_parent_name", "")
@@ -1060,7 +1063,7 @@ class DownloadTracker:
                 row, f"资源目录收口失败: {type(exc).__name__}"
             )
             return True
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             gy_target_dir=staging_id, gy_target_name=final_name,
             gy_isolated=0, gy_staging_name=final_name,
@@ -1083,7 +1086,7 @@ class DownloadTracker:
             return
         if source_id in {"", "0"} or not target_id:
             message = "下载完成，但未配置有效的光鸭整理源/目标目录"
-            db.update_download_request(
+            download_requests_repo.update_download_request(
                 int(row["id"]), organize_started=-1,
                 organize_status="skipped", organize_error=message,
                 organize_finished_at=db.now(), strm_status="skipped",
@@ -1091,7 +1094,7 @@ class DownloadTracker:
             )
             self._publish_lifecycle(int(row["id"]))
             return
-        if not db.claim_download_request_organize(int(row["id"])):
+        if not download_requests_repo.claim_download_request_organize(int(row["id"])):
             logger.info(
                 "跳过已失效或已被认领的下载整理请求 request=%s",
                 int(row["id"]),
@@ -1111,7 +1114,7 @@ class DownloadTracker:
                 # 保持 organize_started=0，让下载跟踪器按 request id 顺序继续消费；
                 # queued 状态用于抑制重复通知，并明确这是串行等待而非失败。
                 already_queued = str(row["organize_status"] or "") == "queued"
-                db.update_download_request(
+                download_requests_repo.update_download_request(
                     int(row["id"]), organize_started=0,
                     organize_status="queued", organize_error="",
                     strm_status="pending", strm_error="",
@@ -1127,7 +1130,7 @@ class DownloadTracker:
                 if not permanent and attempts <= 4:
                     delay = (30, 60, 120, 300)[attempts - 1]
                     next_retry = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
-                    db.update_download_request(
+                    download_requests_repo.update_download_request(
                         int(row["id"]), organize_started=0, organize_status="queued",
                         organize_attempts=attempts, organize_next_retry_at=next_retry,
                         organize_error=error, strm_status="pending", strm_error="", error=error,
@@ -1137,7 +1140,7 @@ class DownloadTracker:
                         int(row["id"]), attempts, delay, error,
                     )
                 else:
-                    db.update_download_request(
+                    download_requests_repo.update_download_request(
                         int(row["id"]), organize_started=-1, organize_status="failed",
                         organize_attempts=attempts, organize_next_retry_at=None,
                         organize_error=error, organize_finished_at=db.now(),
@@ -1197,7 +1200,7 @@ class DownloadTracker:
             or request_id <= 0
         ):
             return
-        claim = db.claim_download_request_notification(
+        claim = download_requests_repo.claim_download_request_notification(
             request_id, lease_seconds=_NOTIFICATION_LEASE_SECONDS,
         )
         if claim is None:
@@ -1210,7 +1213,7 @@ class DownloadTracker:
             "%Y-%m-%d %H:%M:%S"
         )
         try:
-            db.finalize_download_request_notification(
+            download_requests_repo.finalize_download_request_notification(
                 request_id,
                 token,
                 delivered=accepted,
@@ -1240,7 +1243,7 @@ class DownloadTracker:
                 (request_id, source),
             ).fetchone()
         if row:
-            db.update_download_log(
+            download_requests_repo.update_download_log(
                 int(row["id"]), status="success" if status == "completed" else status,
                 progress=progress, backend_task_id=task_id,
                 completed_at=db.now() if status in {"completed", "failed"} else None,

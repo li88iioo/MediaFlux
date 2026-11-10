@@ -117,10 +117,10 @@ class PatrolPolicyUnitTests(unittest.TestCase):
             patch.object(scheduler, "_interval_seconds", return_value=6 * 60 * 60),
             patch.object(scheduler, "_notifications_enabled", return_value=False),
             patch(
-                "app.modules.agent_library_patrol_scheduler.db.reschedule_agent_library_patrol"
+                "app.repositories.agent_library_patrol.reschedule_agent_library_patrol"
             ) as reschedule,
             patch(
-                "app.modules.agent_library_patrol_scheduler.db.discard_agent_library_patrol_notifications"
+                "app.repositories.agent_library_patrol.discard_agent_library_patrol_notifications"
             ) as discard_notifications,
         ):
             scheduler.reload(immediate=False)

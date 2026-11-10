@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.agent.models import Evidence, ToolResult
 from app.agent.session_context import AgentSessionContextRepository
 from app.modules.media_identity import normalize_episode_verification
@@ -409,7 +410,7 @@ def build_recent_download_status(
     if record.request_id is None:
         return _immediate_result(record, position=position)
 
-    row, logs = db.get_download_request_status_snapshot(record.request_id)
+    row, logs = download_requests_repo.get_download_request_status_snapshot(record.request_id)
     if row is None:
         return ToolResult(
             False,
@@ -491,7 +492,7 @@ def build_recent_download_status(
 
 
 def _automatic_verification_projection(request_id: int) -> dict[str, Any]:
-    row = db.get_agent_download_verification(request_id)
+    row = agent_download_verification_repo.get_agent_download_verification(request_id)
     if row is None:
         return {}
     status = str(row["status"] or "")

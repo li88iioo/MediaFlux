@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.share_transfer import (
@@ -149,7 +149,7 @@ def share_request_status(request_id: int, request: Request):
     }
     if request_id not in remembered:
         return JSONResponse({"error": "转存请求不存在"}, status_code=404)
-    row = db.get_download_request(request_id)
+    row = download_requests_repo.get_download_request(request_id)
     if row is None or str(row["kind"] or "") != "guangya_share" or str(row["origin"] or "") != "web":
         return JSONResponse({"error": "转存请求不存在"}, status_code=404)
     status = str(row["status"] or "pending")

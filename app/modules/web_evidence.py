@@ -18,7 +18,7 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 import httpx
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from app import database as db
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.clients.http import (
     FixedHostHttpClient, HttpError, HttpInvalidResponse, HttpResponse,
     HttpResponseTooLarge, HttpSecurityError,
@@ -77,7 +77,7 @@ def _result(ok: bool, status: str, message: str, *, data: dict | None = None, er
 
 
 def _cached_result(key: str) -> dict[str, Any] | None:
-    payload = db.get_agent_web_search_cache(key)
+    payload = agent_web_search_repo.get_agent_web_search_cache(key)
     if not isinstance(payload, dict) or payload.get("kind") != _CACHE_KIND:
         return None
     result = payload.get("result")
@@ -92,12 +92,12 @@ def _cached_result(key: str) -> dict[str, Any] | None:
 
 def _store_cached_result(key: str, result: dict[str, Any], *, ttl_key: str) -> None:
     ttl = _int_config(ttl_key, 900, minimum=30, maximum=86_400)
-    db.set_agent_web_search_cache(key, {"kind": _CACHE_KIND, "result": result}, ttl_seconds=ttl)
+    agent_web_search_repo.set_agent_web_search_cache(key, {"kind": _CACHE_KIND, "result": result}, ttl_seconds=ttl)
 
 
 def clear_web_cache() -> None:
     """失效搜索与正文缓存，并释放本进程中等待相同请求的调用方。"""
-    web_request_singleflight.clear(clear_cache=db.clear_agent_web_search_cache)
+    web_request_singleflight.clear(clear_cache=agent_web_search_repo.clear_agent_web_search_cache)
 
 
 
@@ -388,7 +388,7 @@ def _map_search_response(payload: Any, arguments: dict[str, Any], elapsed_ms: in
     result = _result(True, "ok" if results else "empty",
                      f"找到 {len(results)} 条网页结果" if results else f"没有找到与“{_safe_search_text(arguments['query'], 120)}”匹配的网页结果",
                      data=data)
-    result["collected_at"] = db.current_agent_web_search_usage_date()
+    result["collected_at"] = agent_web_search_repo.current_agent_web_search_usage_date()
     return result
 
 
@@ -543,7 +543,7 @@ def _map_page_response(response: HttpResponse, arguments: dict[str, Any], elapse
         "elapsed_ms": max(0, elapsed_ms), "credits_used": 0,
         "links": links, "links_total": len(links),
     })
-    result["collected_at"] = db.current_agent_web_search_usage_date()
+    result["collected_at"] = agent_web_search_repo.current_agent_web_search_usage_date()
     return result
 
 
@@ -709,13 +709,13 @@ def search_web(
 
     def compute() -> dict[str, Any]:
         cost = 2 if depth == "advanced" else 1
-        usage_date = db.current_agent_web_search_usage_date()
+        usage_date = agent_web_search_repo.current_agent_web_search_usage_date()
         charged = False
         try:
             daily_limit = _int_config(
                 "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
             )
-            if not db.reserve_agent_web_search_credits(
+            if not agent_web_search_repo.reserve_agent_web_search_credits(
                 provider="tavily",
                 usage_date=usage_date,
                 cost=cost,
@@ -745,7 +745,7 @@ def search_web(
             return result
         finally:
             if charged:
-                db.refund_agent_web_search_credits(
+                agent_web_search_repo.refund_agent_web_search_credits(
                     provider="tavily", usage_date=usage_date, cost=cost
                 )
 

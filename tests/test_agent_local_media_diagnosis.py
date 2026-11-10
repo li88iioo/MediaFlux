@@ -6,6 +6,7 @@ import json
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app import sdk
 from app.agent.models import ToolResult
 
@@ -32,7 +33,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         mode: str = "move",
         suffix: str = "one",
     ) -> int:
-        return db.create_local_media_source(
+        return local_media_repo.create_local_media_source(
             name=f"SECRET_SOURCE_{suffix}",
             qb_profile="configured:qb",
             qb_path_prefix=f"/remote/SECRET_{suffix}",
@@ -51,7 +52,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         owner: str = "admin",
         suffix: str = "one",
     ) -> int:
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id,
             f"HASH_SECRET_{suffix}",
             f"/private/TITLE_SECRET_{suffix}.mkv",
@@ -59,7 +60,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             trigger=trigger,
         )
         if status != "waiting_stable":
-            db.update_local_media_task(
+            local_media_repo.update_local_media_task(
                 task_id,
                 owner=owner,
                 status=status,
@@ -77,7 +78,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
 
     def test_database_summary_is_owner_scoped_and_classifies_states(self):
         source = self._source()
-        db.upsert_local_library_target(
+        local_media_repo.upsert_local_library_target(
             source, "movie", "/library/SECRET", owner="admin"
         )
         self._task(source, "waiting_stable", trigger="qb_completed", suffix="waiting")
@@ -88,7 +89,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self._task(source, "completed", trigger="qb_completed", suffix="completed")
         other = self._source(owner="other", suffix="other")
         self._task(other, "failed", owner="other", suffix="other")
-        summary = db.get_local_media_diagnostic_summary(owner="admin")
+        summary = local_media_repo.get_local_media_diagnostic_summary(owner="admin")
         self.assertEqual(
             summary["sources"],
             {
@@ -131,7 +132,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
 
     def test_attention_and_active_states_preserve_planned_semantics(self):
         source = self._source()
-        db.upsert_local_library_target(
+        local_media_repo.upsert_local_library_target(
             source, "default", "/library/default", owner="admin"
         )
         self._task(source, "planned", suffix="planned")
@@ -170,7 +171,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
 
     def test_scheduler_stopped_and_inactive_failures_keep_attention_consistent(self):
         source = self._source()
-        db.upsert_local_library_target(
+        local_media_repo.upsert_local_library_target(
             source, "default", "/library/default", owner="admin"
         )
         with patch(
@@ -241,6 +242,6 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         self.assertFalse(result.data["network_accessed"])
 
     def test_exception_does_not_turn_into_zero_task_facts(self):
-        with patch("app.modules.local_media_tasks.db.get_local_media_diagnostic_summary", side_effect=RuntimeError("database unavailable")):
+        with patch("app.repositories.local_media.get_local_media_diagnostic_summary", side_effect=RuntimeError("database unavailable")):
             with self.assertRaisesRegex(RuntimeError, "database unavailable"):
                 sdk.local.diagnose()

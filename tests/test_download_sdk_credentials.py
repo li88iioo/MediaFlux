@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import ToolCatalog
@@ -91,8 +92,8 @@ def test_confirmation_allows_token_refresh_but_rejects_new_login(credentials, mo
             authorization=MediaFluxAuthorizationPolicy())
         context = await context_for(store, owner=OWNER)
         if method == "downloads.retry":
-            request_id, _ = db.create_download_request("credential-retry", "ed2k", title="audit", source_value=URL)
-            db.update_download_request(request_id, targets="guangya", status="failed", gy_status="failed")
+            request_id, _ = download_requests_repo.create_download_request("credential-retry", "ed2k", title="audit", source_value=URL)
+            download_requests_repo.update_download_request(request_id, targets="guangya", status="failed", gy_status="failed")
             arguments = {"request_id": request_id, "target": "guangya"}
         elif method == "resources.download":
             from app import config
@@ -121,13 +122,13 @@ def test_confirmation_allows_token_refresh_but_rejects_new_login(credentials, mo
 
 def test_generation_change_after_admission_never_submits_to_new_account(credentials, monkeypatch):
     _, snapshot = downloads.preview_download_url(URL, "guangya")
-    claim = db.claim_download_request
+    claim = download_requests_repo.claim_download_request
     def change_after_claim(*args, **kwargs):
         result = claim(*args, **kwargs)
         if result:
             credentials.change("relogin")
         return result
-    monkeypatch.setattr(db, "claim_download_request", change_after_claim)
+    monkeypatch.setattr(download_requests_repo, "claim_download_request", change_after_claim)
     result = downloads.submit_download_url(URL, "guangya", origin="agent", expected_snapshot=snapshot)
     credentials.backend.assert_not_called()
     assert result["failed"] == ["guangya"] and not result["ok"]

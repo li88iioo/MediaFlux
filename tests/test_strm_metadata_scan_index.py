@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from tests.support import isolated_test_database
@@ -46,7 +47,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
                 ],
             )
         reads = []
-        original = db.list_strm_index
+        original = strm_repo.list_strm_index
 
         class ObservedRow(dict):
             def __getitem__(self, key):
@@ -62,7 +63,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
                 else rows
             )
 
-        with patch.object(db, "list_strm_index", side_effect=observed):
+        with patch.object(strm_repo, "list_strm_index", side_effect=observed):
             stats = strm.sync_strm(
                 "source",
                 "http://media.invalid",
@@ -78,8 +79,8 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         stats, reads = self.seed_and_scan(200, 1000)
         self.assertEqual(stats["metadata_queued"], 200)
         self.assertEqual(stats["metadata_failed"], 0)
-        self.assertEqual(db.count_strm_metadata_jobs()["queued"], 200)
-        self.assertEqual(len(db.list_strm_index("guangya-meta:source")), 1000)
+        self.assertEqual(strm_repo.count_strm_metadata_jobs()["queued"], 200)
+        self.assertEqual(len(strm_repo.list_strm_index("guangya-meta:source")), 1000)
         self.assertEqual(list(self.root.rglob("*.nfo")), [])
         # 建图最多读取每个历史路径一次，另有每候选的旧路径与当前状态两次读取。
         self.assertLessEqual(reads, 1000 + 2 * 200)
@@ -89,7 +90,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         target.parent.mkdir(parents=True)
         target.write_bytes(b"metadata")
         fingerprint = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             "guangya-meta:source",
             "valid-owner",
             "old",
@@ -98,7 +99,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
             str(target),
             fingerprint,
         )
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             "guangya-meta:source",
             "bad-owner",
             "old",
@@ -108,14 +109,14 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
             "sha256:old-missing-copy",
         )
         remote = GuangYaFile("valid-owner", target.name, False, 8, "new", "source")
-        original = db.list_strm_index
+        original = strm_repo.list_strm_index
 
         def valid_first(source):
             return sorted(
                 original(source), key=lambda row: str(row["file_id"]) != "valid-owner"
             )
 
-        with patch.object(db, "list_strm_index", side_effect=valid_first):
+        with patch.object(strm_repo, "list_strm_index", side_effect=valid_first):
             stats = strm.sync_strm(
                 "source",
                 "http://media.invalid",
@@ -128,7 +129,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         self.assertEqual(stats["metadata_queued"], 1)
         self.assertEqual(stats["metadata_failed"], 0)
         self.assertEqual(target.read_bytes(), b"metadata")
-        self.assertEqual(len(db.list_strm_index("guangya-meta:source")), 2)
+        self.assertEqual(len(strm_repo.list_strm_index("guangya-meta:source")), 2)
 
     def test_unindexed_subtitle_is_queued_then_adopted_only_after_cloud_bytes_match(self):
         target = self.root / strm.STRM_SUBDIR / "Movie.ass"
@@ -141,8 +142,8 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
                                metadata_exts={"ass"}, clean_invalid=False)
         self.assertEqual(stats["metadata_queued"], 1)
         self.assertEqual(stats["metadata_failed"], 0)
-        self.assertEqual(db.list_strm_index("guangya-meta:source"), [])
-        job = dict(db.list_strm_metadata_queue()[0])
+        self.assertEqual(strm_repo.list_strm_index("guangya-meta:source"), [])
+        job = dict(strm_repo.list_strm_metadata_queue()[0])
         temp = strm._temporary_path(target)
         temp.write_bytes(b"subtitle")
         prepared = {"file": remote, "prepared": strm.PreparedMetadataDownload(
@@ -152,7 +153,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(target.stat().st_mtime_ns, stamp)
         self.assertFalse(temp.exists())
-        row = db.list_strm_index("guangya-meta:source")[0]
+        row = strm_repo.list_strm_index("guangya-meta:source")[0]
         self.assertTrue(strm._metadata_state_matches(row, remote, target))
         again = strm.sync_strm("source", "http://media.invalid", str(self.root), client=cast(GuangYaClient, client),
                                metadata_exts={"ass"}, clean_invalid=False)
@@ -171,7 +172,7 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
                 prepared=strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp)))
         self.assertEqual(target.read_bytes(), b"my edits")
         self.assertFalse(temp.exists())
-        self.assertEqual(db.list_strm_index("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_index("guangya-meta:source"), [])
 
     def test_adoption_index_failure_never_deletes_existing_subtitle(self):
         target = self.root / strm.STRM_SUBDIR / "Movie.ass"
@@ -180,12 +181,12 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         remote = GuangYaFile("legacy", target.name, False, 8, "cloud", "source")
         temp = strm._temporary_path(target)
         temp.write_bytes(b"subtitle")
-        with patch.object(db, "upsert_strm_index", side_effect=RuntimeError("disk busy")), self.assertRaisesRegex(RuntimeError, "disk busy"):
+        with patch.object(strm_repo, "upsert_strm_index", side_effect=RuntimeError("disk busy")), self.assertRaisesRegex(RuntimeError, "disk busy"):
             strm._install_metadata_candidate(remote, "", target, str(self.root), "guangya-meta:source", [], "",
                 prepared=strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp)))
         self.assertEqual(target.read_bytes(), b"subtitle")
         self.assertFalse(temp.exists())
-        self.assertEqual(db.list_strm_index("guangya-meta:source"), [])
+        self.assertEqual(strm_repo.list_strm_index("guangya-meta:source"), [])
 
     def test_real_http_truncated_body_is_retried_without_publishing_partial_content(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

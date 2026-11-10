@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.config import web_credentials
 from app.main import create_app
 from app.modules.qb_control import QBControlConflict
@@ -103,7 +103,7 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         first = "A" * 40
         second = "b" * 64
         with patch(
-            "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+            "app.repositories.local_media.list_local_media_qb_write_conflicts",
             return_value=[],
         ), patch("app.routes.downloads_api._qb", return_value=client):
             response = self.client.post(
@@ -161,7 +161,7 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         torrent_hash = "d" * 40
         for action in ("resume", "delete"):
             with self.subTest(action=action), patch(
-                "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+                "app.repositories.local_media.list_local_media_qb_write_conflicts",
                 side_effect=sqlite3.OperationalError("no such table: local_media_tasks"),
             ), patch("app.routes.downloads_api._qb") as qb:
                 response = self.client.post(
@@ -179,7 +179,7 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         torrent_hash = "e" * 40
         client = Mock()
         with patch(
-            "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+            "app.repositories.local_media.list_local_media_qb_write_conflicts",
         ) as safety_state, patch(
             "app.routes.downloads_api._qb", return_value=client,
         ):
@@ -214,7 +214,7 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         client = Mock()
         torrent_hash = "3" * 40
         with isolated_test_database(), patch(
-            "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+            "app.repositories.local_media.list_local_media_qb_write_conflicts",
             return_value=[],
         ), patch("app.routes.downloads_api._qb", return_value=client):
             response = self.client.post(
@@ -276,14 +276,14 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         headers = self._headers()
         torrent_hash = "7" * 40
         with isolated_test_database():
-            request_id, _ = db.create_download_request("web-delete", "magnet", title="Web delete")
-            db.update_download_request(request_id, status="downloading", qb_status="downloading", qb_task_id=torrent_hash)
+            request_id, _ = download_requests_repo.create_download_request("web-delete", "magnet", title="Web delete")
+            download_requests_repo.update_download_request(request_id, status="downloading", qb_status="downloading", qb_task_id=torrent_hash)
             client = Mock()
 
             def delete(hashes, *, delete_files):
                 self.assertEqual(hashes, torrent_hash)
                 self.assertFalse(delete_files)
-                get_download_request_result = db.get_download_request(request_id)
+                get_download_request_result = download_requests_repo.get_download_request(request_id)
                 assert get_download_request_result is not None
                 self.assertEqual(get_download_request_result["qb_status"], "cancelled")
                 return True
@@ -292,7 +292,7 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
             with patch("app.routes.downloads_api._qb", return_value=client):
                 response = self.client.post("/api/downloads/qb/delete", headers=headers, json={"hashes": [torrent_hash]})
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(db.list_active_download_requests(), [])
+            self.assertEqual(download_requests_repo.list_active_download_requests(), [])
 
     def test_web_delete_timeout_reports_unknown_not_success(self):
         headers = self._headers()

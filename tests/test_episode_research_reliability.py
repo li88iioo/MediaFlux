@@ -15,7 +15,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app import database as db
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.clients.tmdb import TMDBClient
 from app.concurrency import KeyedSingleFlight
 from app.modules import agent_episode_research as runner
@@ -51,8 +51,8 @@ class _OfflineCase(unittest.TestCase):
         self.enterContext(patch.object(repository, "get_episode_research_cache", side_effect=self._cache_get))
         self.enterContext(patch.object(repository, "put_episode_research_cache", side_effect=self._cache_put))
         self.enterContext(patch.object(repository, "invalidate_episode_research_cache", side_effect=lambda key: self.cache.pop(key, None)))
-        self.charge = self.enterContext(patch.object(db, "reserve_agent_web_search_credits", return_value=True))
-        self.enterContext(patch.object(db, "current_agent_web_search_usage_date", return_value="2026-09-11"))
+        self.charge = self.enterContext(patch.object(agent_web_search_repo, "reserve_agent_web_search_credits", return_value=True))
+        self.enterContext(patch.object(agent_web_search_repo, "current_agent_web_search_usage_date", return_value="2026-09-11"))
 
     def _cache_get(self, key, **_kwargs):
         return copy.deepcopy(self.cache.get(key))

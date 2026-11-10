@@ -17,6 +17,8 @@ from unittest.mock import Mock, patch
 import httpx
 
 from app import database as db
+from app.repositories import local_media as local_media_repo
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.agent import completion_observers as observers
 from app.agent import effect_completion as effects
 from app.agent.confirmation import SQLiteConfirmationStore
@@ -180,7 +182,7 @@ async def assert_patrol_identity(case):
         if case != "overwritten-cycle":
             library_patrol.run_patrol(library_patrol.prepare_patrol())
             assert scheduler.run_once() == 1
-            prior_row = db.get_agent_library_patrol()
+            prior_row = agent_library_patrol_repo.get_agent_library_patrol()
             assert prior_row is not None
             prior = dict(prior_row)
         else:
@@ -198,7 +200,7 @@ async def assert_patrol_identity(case):
             if case == "separate-second":
                 state["clock"] += timedelta(seconds=2)
             assert scheduler.run_once() == 1
-            original_row = db.get_agent_library_patrol()
+            original_row = agent_library_patrol_repo.get_agent_library_patrol()
             assert original_row is not None
             original.update(dict(original_row))
             if case == "overwritten-cycle":
@@ -211,7 +213,7 @@ async def assert_patrol_identity(case):
         with patch.object(effects, "wait_for_effect_completion", run_before_observe):
             confirmed = [e async for e in session.confirm(**context, plan_id=plan_id,
                 request_id="patrol-confirm", channel="web")]
-        current_row = db.get_agent_library_patrol()
+        current_row = agent_library_patrol_repo.get_agent_library_patrol()
         assert current_row is not None
         current = dict(current_row)
         saved = await store.load(**context)
@@ -371,9 +373,9 @@ async def assert_local_file_outcome(root: Path, mode: str):
         target_root.mkdir()
         movie = source_root / "Movie.2026.mkv"
         movie.write_bytes(b"video")
-        source_id = db.create_local_media_source(name="source", qb_profile="", qb_path_prefix="",
+        source_id = local_media_repo.create_local_media_source(name="source", qb_profile="", qb_path_prefix="",
             local_root=str(source_root), stable_seconds=0, mode=mode, owner="admin")
-        db.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
+        local_media_repo.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
         service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(
             tmdb_id="1", title="Movie", year="2026", media_type="movie", confidence=1.0))))
         service_patch = patch("app.modules.local_media_tasks.get_local_media_service", return_value=service)
@@ -382,7 +384,7 @@ async def assert_local_file_outcome(root: Path, mode: str):
             inspection = service.inspect_source("admin", source_id, movie)
             preview = service.preview("admin", inspection["inspection_id"], tmdb_id="1", media_type="movie")
             task_id = service.create_manual_task("admin", inspection["inspection_id"], preview_digest=preview["preview_digest"])
-            db.update_local_media_task(task_id, status="failed", error="transient prewrite failure")
+            local_media_repo.update_local_media_task(task_id, status="failed", error="transient prewrite failure")
             read, write = "local.tasks", "local.retry"
             session, store, script = completion_session([read, write], [
                 (read, {"scope": "attention", "limit": 12}), (write, {"task_id": task_id})])
@@ -392,7 +394,7 @@ async def assert_local_file_outcome(root: Path, mode: str):
             assert events[-1].payload["status"] == "approval_required", events[-1].payload
             plan_id = (await store.load(**context)).pending_effect_plan_id
             async def finish_before_wait(result, **options):
-                assert db.claim_local_media_task(task_id, owner="admin")
+                assert local_media_repo.claim_local_media_task(task_id, owner="admin")
                 service.execute_task("admin", task_id)
                 return await wait_for_effect_completion(result, timeout_seconds=0, **options)
             from app.agent.kernel.ports import sdk_effects

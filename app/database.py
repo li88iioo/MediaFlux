@@ -703,59 +703,14 @@ def now() -> str:
 
 # ===== Agent 网页搜索每日额度 =====
 # 统一数据访问门面：调用方使用 app.database.*，事务实现按业务域唯一归属。
-from app.repositories.agent_web_search import (  # noqa: E402,F401
-    _validate_agent_web_search_usage_date,
-    clear_agent_web_search_cache,
-    current_agent_web_search_usage_date,
-    get_agent_web_search_cache,
-    get_agent_web_search_daily_usage,
-    refund_agent_web_search_credits,
-    reserve_agent_web_search_credits,
-    set_agent_web_search_cache,
-)
 
 # ===== 媒体探测缓存 =====
 # 统一数据访问门面：批量读取保持单连接契约。
-from app.repositories.media_probe import (  # noqa: E402,F401
-    get_media_probe_cache,
-    get_media_probe_cache_many,
-    prune_media_probe_cache,
-    upsert_media_probe_cache,
-    upsert_media_probe_failure_cache,
-)
 
 # ===== Emby / Jellyfin 多实例媒体反代 =====
 # 统一数据访问门面：schema/连接仍由本模块持有。
-from app.repositories.media_proxy import (  # noqa: E402,F401
-    add_media_proxy_binding,
-    add_media_proxy_instance,
-    clear_media_proxy_playback_records,
-    create_media_proxy_binding,
-    delete_media_proxy_binding,
-    delete_media_proxy_instance,
-    get_media_proxy_binding,
-    get_media_proxy_instance,
-    get_media_proxy_playback_failure_summary,
-    list_media_proxy_bindings,
-    list_media_proxy_instances,
-    list_media_proxy_playback_records,
-    list_media_proxy_playback_sessions,
-    record_media_proxy_playback_attempt,
-    update_media_proxy_instance,
-)
 
 # ===== 整理后媒体规格补全队列 =====
-from app.repositories.organize_probe import (  # noqa: E402,F401
-    cancel_organize_probe_job,
-    claim_due_organize_probe_jobs,
-    commit_organize_probe_rename,
-    complete_organize_probe_job,
-    count_organize_probe_jobs,
-    enqueue_organize_probe_completion,
-    fail_or_retry_organize_probe_job,
-    recover_stale_organize_probe_jobs,
-    release_organize_probe_job,
-)
 
 
 # ===== 便捷 CRUD（按需扩展）=====
@@ -1315,7 +1270,7 @@ def _organize_timeline_query(
         )
         SELECT * FROM timeline WHERE 1=1
     """
-    params: list[object] = [_local_media_owner(owner)]
+    params: list[object] = [local_media_repo._local_media_owner(owner)]
     if normalized_origin != "all":
         sql += " AND origin=?"
         params.append(normalized_origin)
@@ -1504,17 +1459,6 @@ def claim_organize_log_operations_batch(
 
 
 # 操作步骤与可逆业务快照由同一仓储持有；保留原有数据库门面。
-from app.repositories.organize_history import (  # noqa: E402,F401
-    active_organize_confirmation_refs,
-    add_organize_operation_step,
-    capture_organize_business_snapshot,
-    finish_organize_operation_step,
-    list_latest_reversible_organize_steps,
-    list_organize_operation_steps,
-    list_related_organize_logs,
-    list_pending_organize_probe_steps,
-    restore_organize_business_snapshot,
-)
 
 
 def update_organize_log(log_id: int, **fields) -> bool:
@@ -1602,13 +1546,13 @@ def clear_organize_logs(
             f"SELECT t.origin,t.id,t.status,t.raw_status,l.file_id,l.operation_token FROM ({sql}) t "
             "LEFT JOIN organize_log l ON t.origin='guangya' AND l.id=t.id", params,
         ).fetchall()
-        active_files, active_local, active_tokens = active_organize_confirmation_refs(conn)
+        active_files, active_local, active_tokens = organize_history_repo.active_organize_confirmation_refs(conn)
         selected: dict[str, list[int]] = {"guangya": [], "local": []}
         for row in rows:
             row_origin = row["origin"]
             # 批量清空不是放弃人工任务；显式选中的本地清理仍保留原有放弃入口。
             protected = row["status"] in {"manual", "processing"} or (
-                not can_clear_local_media_task(row["id"], row["raw_status"], active_local)
+                not local_media_repo.can_clear_local_media_task(row["id"], row["raw_status"], active_local)
                 if row_origin == "local" else row["file_id"] in active_files or row["operation_token"] in active_tokens
             )
             if protected:
@@ -1629,7 +1573,7 @@ def clear_organize_logs(
         if selected["local"]:
             deleted["local"] = conn.execute(
                 "DELETE FROM local_media_tasks WHERE owner=? AND id IN (SELECT value FROM json_each(?))",
-                (_local_media_owner(owner), json.dumps(selected["local"])),
+                (local_media_repo._local_media_owner(owner), json.dumps(selected["local"])),
             ).rowcount
     return {
         "deleted": sum(deleted.values()), "skipped_busy": sum(skipped.values()),
@@ -1674,52 +1618,9 @@ def count_logs_by_status(table: str = "organize_log") -> dict:
 # 统一数据访问门面：管理 API 与识别业务共享同一 Repository 实现。
 # ===== Agent 下载结果自动复核 =====
 # 统一数据访问门面：终态与通知发件箱保持单事务写入。
-from app.repositories.agent_download_verification import (  # noqa: E402,F401
-    claim_due_agent_download_verification,
-    claim_due_agent_download_verification_notification,
-    complete_agent_download_verification_notification,
-    discard_agent_download_verification_notification,
-    discard_agent_download_verification_notifications,
-    enqueue_agent_download_verification,
-    finish_agent_download_verification,
-    get_agent_download_verification,
-    list_agent_download_verification_notifications,
-    release_agent_download_verification_notification,
-    renew_agent_download_verification_lease,
-    retry_agent_download_verification_notification,
-    update_agent_download_verification,
-)
 
 # ===== 下载日志与统一下载请求 =====
 # 统一数据访问门面：Repository 复用本模块持有的连接状态与迁移。
-from app.repositories.download_requests import (  # noqa: E402,F401
-    _DOWNLOAD_ATTENTION_WHERE,
-    add_download_log,
-    bind_download_request_guangya_staging,
-    bind_media_download_admission_request,
-    bind_pending_download_request_owner,
-    claim_failed_share_transfer_request,
-    clear_download_request_attentions,
-    count_download_logs,
-    count_download_requests_requiring_attention,
-    create_download_request,
-    create_share_transfer_request,
-    delete_download_logs,
-    finish_share_transfer_request,
-    get_download_request,
-    get_download_request_status_snapshot,
-    list_download_logs,
-    list_download_requests_requiring_attention,
-    mark_download_request_resubmitted,
-    purge_expired_download_request_torrent_data,
-    update_download_log,
-)
-from app.repositories.recognition import (  # noqa: E402,F401
-    delete_tmdb_lock,
-    get_tmdb_lock,
-    list_tmdb_locks,
-    upsert_tmdb_lock,
-)
 
 
 def purge_expired_agent_task_history(
@@ -1998,193 +1899,17 @@ def purge_agent_subject_data(
 # ===== Agent 媒体库巡检 =====
 # 统一数据访问门面：巡检结果、版本与通知发件箱保持单事务一致性。
 # ===== Agent owner 隔离的可恢复长任务 =====
-from app.repositories.agent_jobs import (  # noqa: E402,F401
-    cancel_agent_job,
-    claim_due_agent_job,
-    complete_agent_job,
-    continue_agent_job,
-    create_agent_job,
-    fail_or_retry_agent_job,
-    finalize_cancelled_agent_job,
-    find_active_agent_job,
-    find_latest_active_agent_job,
-    get_agent_job,
-    is_agent_job_cancel_requested,
-    list_agent_jobs,
-    release_agent_job_lease,
-    renew_agent_job_lease,
-)
-from app.repositories.agent_library_patrol import (  # noqa: E402,F401
-    cancel_agent_library_patrol_lease,
-    claim_due_agent_library_patrol,
-    claim_due_agent_library_patrol_notification,
-    complete_agent_library_patrol_notification,
-    continue_agent_library_patrol,
-    discard_agent_library_patrol_notification,
-    discard_agent_library_patrol_notifications,
-    ensure_agent_library_patrol,
-    get_agent_library_patrol,
-    list_agent_library_patrol_notifications,
-    release_agent_library_patrol_notification,
-    reschedule_agent_library_patrol,
-    trigger_agent_library_patrol,
-    retry_agent_library_patrol_cycle,
-    retry_agent_library_patrol_notification,
-    update_agent_library_patrol,
-)
 
 # ===== 下载请求认领与本地入库状态 =====
-from app.repositories.download_requests import (  # noqa: E402,F401
-    cancel_pending_download_request,
-    cancel_qb_download_tracking,
-    claim_download_request,
-    claim_download_request_notification,
-    claim_download_request_organize,
-    claim_download_request_staging_finalize,
-    claim_download_request_targets,
-    finalize_download_request_notification,
-    finalize_download_request_submission,
-    get_download_request_by_request_key,
-    get_download_request_by_request_keys,
-    link_download_request_to_local_media_task,
-    list_active_download_requests,
-    list_protected_guangya_staging_ids,
-    mark_download_request_local_media_failed,
-    mark_download_request_local_media_skipped,
-    recover_stale_submitting_download_requests,
-    update_download_request,
-    update_download_request_and_sync_media_admission,
-)
 
 # ===== 媒体订阅、候选资源与下载准入 =====
 # 独立于 RSS schema；统一订阅中心只在应用层聚合。
-from app.repositories.media_subscriptions import (  # noqa: E402,F401
-    add_media_subscription,
-    add_media_subscription_run,
-    begin_media_download_dispatch,
-    cancel_media_subscription_run,
-    claim_media_download_admission,
-    claim_media_subscription_check_run,
-    complete_media_download_admissions,
-    count_media_subscriptions,
-    delete_media_subscription,
-    fail_media_subscription_check,
-    fail_unbound_media_download_admission,
-    finalize_media_subscription_check,
-    finish_media_subscription_run,
-    get_media_subscription,
-    get_media_subscription_candidate,
-    get_media_subscription_stats,
-    list_active_media_download_admissions,
-    list_due_media_subscriptions,
-    list_media_subscription_candidates,
-    list_media_subscription_candidates_by_ids,
-    list_media_subscription_runs,
-    list_media_subscription_workflows,
-    list_media_subscriptions,
-    media_subscription_check_is_active,
-    media_subscription_identity_snapshot,
-    media_subscription_mutation_snapshot,
-    reconcile_media_download_admissions,
-    reconcile_startup_media_download_admissions,
-    recover_stale_media_subscription_checks,
-    replace_media_subscription_candidates,
-    sync_media_download_admission_for_request,
-    update_media_download_admission,
-    update_media_subscription_candidate,
-    update_media_subscription_config,
-    upsert_media_subscription,
-)
 
 # ===== RSS 订阅、条目状态机与诊断 =====
 # 统一数据访问门面：schema/migration 由 init_db 集中持有。
-from app.repositories.rss import (  # noqa: E402,F401
-    RSSEntryPage,
-    add_rss_entry_with_media,
-    add_rss_subscription,
-    claim_pending_rss_entries,
-    claim_retryable_failed_rss_entries,
-    claim_rss_entry,
-    count_rss_downloaded_entries_since,
-    delete_rss_subscription,
-    find_rss_subscriptions_by_normalized_name,
-    get_pending_rss_snapshot,
-    get_retryable_failed_rss_snapshot,
-    get_rss_diagnostic_summary,
-    get_rss_entries_by_ids,
-    get_rss_entry,
-    get_rss_manual_review_summary,
-    get_rss_stats,
-    get_rss_subscription,
-    get_rss_subscription_safe_summary,
-    list_due_rss_subscriptions,
-    list_enabled_rss_subscription_safe_targets,
-    list_enabled_rss_subscriptions,
-    list_rss_entries,
-    list_rss_subscription_safe_summaries,
-    list_rss_subscriptions,
-    purge_processed_rss_entries,
-    record_rss_entry_failure,
-    recover_stale_submitting_rss_entries,
-    rss_retry_entry_snapshot,
-    rss_pending_entry_snapshot,
-    skip_pending_rss_entries,
-    update_rss_entries_processed,
-    update_rss_entries_processed_snapshot,
-    update_rss_subscription,
-)
 
 # ===== STRM 索引 =====
 # 统一数据访问门面：核心索引 CRUD 按业务域拆分并共享同一实现。
-from app.repositories.strm import (  # noqa: E402,F401
-    acknowledge_strm_refresh_paths,
-    cancel_retired_strm_metadata_jobs,
-    cancel_stale_strm_metadata_jobs,
-    cancel_strm_metadata_job,
-    claim_due_strm_metadata_jobs,
-    claim_strm_change_targets,
-    complete_strm_change_target,
-    count_due_strm_change_targets,
-    count_pending_strm_change_targets,
-    count_strm_metadata_jobs,
-    count_strm_refresh_paths,
-    delete_strm_index_ids,
-    delete_strm_path_cleanup,
-    enqueue_strm_change_targets,
-    enqueue_strm_metadata_jobs,
-    enqueue_strm_path_cleanup,
-    enqueue_strm_refresh_paths,
-    fail_or_retry_strm_metadata_job,
-    fail_strm_change_target,
-    group_changes_by_target,
-    list_strm_change_queue,
-    list_strm_index,
-    list_strm_index_by_prefix,
-    list_strm_indexes_by_file_id,
-    list_strm_installation_rows,
-    list_strm_metadata_queue,
-    list_strm_path_cleanup,
-    list_strm_path_owners,
-    list_strm_refresh_entries,
-    merge_strm_changes,
-    recover_stale_strm_change_targets,
-    recover_stale_strm_metadata_jobs,
-    release_strm_change_targets,
-    renew_strm_change_target_leases,
-    renew_strm_metadata_job_lease,
-    reschedule_strm_change_targets,
-    seconds_until_next_strm_change_target,
-    settle_strm_metadata_job,
-    strm_metadata_job_is_current,
-    upsert_strm_index,
-    upsert_strm_index_batch,
-)
-from app.repositories.strm_request_ownership import (  # noqa: E402,F401
-    current_strm_request_owners,
-    has_pending_strm_request_refresh,
-    request_owners_for_work,
-    update_strm_request_state,
-)
 
 _STRM_SOURCE_SNAPSHOT_KEY = "strm.configured_sources.snapshot.v1"
 
@@ -2918,7 +2643,7 @@ def list_strm_index_diagnostics(strm_root: str) -> dict:
             "existing": 0,
             "missing": 0,
         },
-        "metadata_queue": count_strm_metadata_jobs(),
+        "metadata_queue": strm_repo.count_strm_metadata_jobs(),
     }
     for row in rows:
         classification = _classify_strm_index_row(row, strm_root, configured_source_ids, temp_root)
@@ -4230,7 +3955,7 @@ def get_dashboard_automation_summary() -> dict:
         )
         downloads_review = int(
             conn.execute(
-                f"SELECT COUNT(*) FROM download_requests WHERE {_DOWNLOAD_ATTENTION_WHERE}"
+                f"SELECT COUNT(*) FROM download_requests WHERE {download_requests_repo._DOWNLOAD_ATTENTION_WHERE}"
             ).fetchone()[0]
         )
         rss_subscriptions = int(
@@ -4345,69 +4070,8 @@ def get_agent_persistent_health_summary() -> dict[str, dict[str, Any]]:
 
 # ===== 媒体探索缓存、跨来源映射与收藏 =====
 # 统一数据访问门面：外部调用与测试共享按业务域拆分的单一实现。
-from app.repositories.discovery import (  # noqa: E402,F401
-    add_media_watchlist,
-    confirm_media_external_id_if_unchanged,
-    delete_media_watchlist,
-    get_discovery_cache,
-    get_discovery_cache_many,
-    get_media_external_id,
-    get_media_watchlist,
-    get_media_watchlist_by_id,
-    get_media_watchlist_statistics,
-    list_media_external_ids,
-    list_media_watchlist,
-    list_media_watchlist_keys,
-    purge_discovery_cache,
-    update_discovery_cache_error,
-    upsert_discovery_cache,
-    upsert_media_external_id,
-)
 
 # ===== 本地媒体自动整理 =====
-from app.repositories.local_media import (  # noqa: E402,F401
-    _LOCAL_MEDIA_TERMINAL_TASK_STATUSES,
-    _active_local_media_task_for_path,
-    _bind_qb_hash_to_active_local_media_task,
-    _canonical_local_media_content_path,
-    _latest_terminal_local_media_task_for_path,
-    _local_media_owner,
-    _local_media_source_has_active_task,
-    _local_media_target_signature,
-    _normalize_local_media_task_path,
-    add_local_media_operation_step,
-    add_local_media_task_item,
-    can_clear_local_media_task,
-    claim_local_media_confirmation_task,
-    claim_local_media_task,
-    create_and_link_qb_local_media_task,
-    create_local_media_source,
-    create_local_media_task,
-    delete_local_media_source,
-    delete_local_media_tasks,
-    get_local_media_diagnostic_summary,
-    get_local_media_source,
-    get_local_media_task,
-    list_download_requests_for_local_media_task,
-    list_local_library_bindings,
-    list_local_library_targets,
-    list_local_media_operation_steps,
-    list_local_media_qb_write_conflicts,
-    list_local_media_sources,
-    list_local_media_task_items,
-    list_local_media_tasks,
-    list_waiting_local_media_tasks,
-    prepare_manual_local_media_task,
-    reconcile_local_media_downloads,
-    replace_local_library_targets,
-    reset_local_media_task,
-    reset_local_media_task_if_current,
-    save_local_media_source_bundle,
-    update_local_media_operation_step,
-    update_local_media_source,
-    update_local_media_task,
-    upsert_local_library_target,
-)
 
 
 def _workspace_title_pattern(query: str) -> str:
@@ -4465,7 +4129,7 @@ def search_workspace_local_media(query: str, *, owner: str = "admin", limit: int
         "SELECT id,source_id,title,media_type,year,status,trigger,created_at,updated_at "
         "FROM local_media_tasks WHERE owner=? AND COALESCE(title,'') LIKE ? ESCAPE '\\' "
         "ORDER BY id DESC LIMIT ? OFFSET ?",
-        (_local_media_owner(owner), _workspace_title_pattern(query)), limit, offset,
+        (local_media_repo._local_media_owner(owner), _workspace_title_pattern(query)), limit, offset,
     )
 
 
@@ -4491,3 +4155,7 @@ def claim_agent_action_lease(lease_key: str, *, ttl_seconds: int = 90) -> str | 
 
 
 from app.repositories import telegram_notifications  # noqa: E402
+from app.repositories import download_requests as download_requests_repo  # noqa: E402
+from app.repositories import local_media as local_media_repo  # noqa: E402
+from app.repositories import organize_history as organize_history_repo  # noqa: E402
+from app.repositories import strm as strm_repo  # noqa: E402

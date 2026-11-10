@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app import database as db, sdk
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
 from app.agent.kernel.pipeline import ToolPipeline
@@ -21,7 +22,7 @@ backend = fixtures.backend
 
 
 def seed(**values):
-    return db.add_media_subscription(provider="tmdb", external_id="123", tmdb_id="123", media_type="tv", title="完整追更", **values)
+    return media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id="123", tmdb_id="123", media_type="tv", title="完整追更", **values)
 
 
 def arguments_for(operation, identifier):
@@ -30,10 +31,10 @@ def arguments_for(operation, identifier):
 
 def test_full_pages_real_ids_and_saved_errors_have_no_old_summary_limits(backend):
     removed = seed()
-    assert db.delete_media_subscription(removed)
+    assert media_subscriptions_repo.delete_media_subscription(removed)
     ids = []
     for index in range(203):
-        ids.append(db.add_media_subscription(provider="tmdb", external_id=str(1000 + index), tmdb_id=str(1000 + index), media_type="tv", title=f"完整{index}"))
+        ids.append(media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id=str(1000 + index), tmdb_id=str(1000 + index), media_type="tv", title=f"完整{index}"))
     saved_error = "已保存故障详情" * 100
     with db.get_conn() as conn:
         conn.execute("UPDATE media_subscriptions SET last_error=? WHERE id=?", (saved_error, ids[-1]))
@@ -57,8 +58,8 @@ def test_check_updates_pages_complete_results_without_persisting_runs(backend, m
     empty = sdk.subscriptions.check_updates()
     assert empty["status"] == "not_configured" and empty["total"] == empty["returned"] == 0
     assert empty["summary"] == "尚未创建媒体追更订阅"
-    ids = [db.add_media_subscription(provider="tmdb", external_id=str(100 + i), tmdb_id=str(100 + i), media_type="tv", title=f"追更{i}") for i in range(19)]
-    before = [dict(row) for row in db.list_media_subscriptions(limit=200)]
+    ids = [media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id=str(100 + i), tmdb_id=str(100 + i), media_type="tv", title=f"追更{i}") for i in range(19)]
+    before = [dict(row) for row in media_subscriptions_repo.list_media_subscriptions(limit=200)]
     preview = AsyncMock(side_effect=lambda identifier, **_: {"subscription_number": identifier, "status": "missing", "missing_count": 15,
         "missing": [{"season": 1, "episode": i} for i in range(1, 16)], "resource_search": {"status": "empty", "items": []}})
     monkeypatch.setattr(backend.subscriptions, "preview_subscription_updates", preview)
@@ -74,15 +75,15 @@ def test_check_updates_pages_complete_results_without_persisting_runs(backend, m
         page = sdk.subscriptions.check_updates(**page["next"])
     assert {row["subscription_number"] for row in items} == set(ids)
     assert all(len(row["missing"]) == 15 for row in items)
-    last = db.get_media_subscription(items[-1]["subscription_number"])
+    last = media_subscriptions_repo.get_media_subscription(items[-1]["subscription_number"])
     assert last is not None
     beyond = sdk.subscriptions.check_updates(before_updated_at=last["updated_at"], before_id=last["id"])
     assert beyond["ok"] and beyond["read_only"] and beyond["status"] == "empty"
     assert beyond["summary"] == "本页无媒体追更订阅" and beyond["total"] == 19 and beyond["returned"] == 0
     assert beyond["items"] == [] and not beyond["has_more"] and beyond["next"] is None
     assert preview.await_count == 19
-    assert [dict(row) for row in db.list_media_subscriptions(limit=200)] == before
-    assert db.list_media_subscription_runs() == []
+    assert [dict(row) for row in media_subscriptions_repo.list_media_subscriptions(limit=200)] == before
+    assert media_subscriptions_repo.list_media_subscription_runs() == []
     backend.publish.assert_not_called()
 
 
@@ -104,8 +105,8 @@ def test_real_read_preview_keeps_all_aired_missing_and_paused_saved_missing(back
     with db.get_conn() as conn:
         conn.execute("UPDATE media_subscriptions SET enabled=0,expected_count=35,local_count=?,missing_count=?,missing_json=?,last_checked_at=? WHERE id=?",
                      (local_count, item["missing_count"], json.dumps(item["missing"]), last_checked_at, identifier))
-    db.add_media_subscription(provider="tmdb", external_id="456", tmdb_id="456", media_type="movie", title="暂停电影", enabled=False)
-    before = [dict(row) for row in db.list_media_subscriptions(limit=200)]
+    media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id="456", tmdb_id="456", media_type="movie", title="暂停电影", enabled=False)
+    before = [dict(row) for row in media_subscriptions_repo.list_media_subscriptions(limit=200)]
     network = Mock(side_effect=AssertionError("暂停订阅不得访问元数据、媒体库或资源站"))
     for name in ("_tmdb_detail", "inspect_series_episode_sources", "inspect_media_identity_sources", "get_indexer_service"):
         monkeypatch.setattr("app.modules.media_subscriptions." + name, network)
@@ -123,9 +124,9 @@ def test_real_read_preview_keeps_all_aired_missing_and_paused_saved_missing(back
         assert all(row["status"] == "paused" and not row["inventory_complete"] and row["sources"] == []
                    and row["resource_search"] == backend.subscriptions._empty_preview_search("not_run") for row in page["items"])
     network.assert_not_called()
-    assert [dict(row) for row in db.list_media_subscriptions(limit=200)] == before
-    assert db.list_media_subscription_runs() == []
-    assert db.list_media_subscription_candidates(identifier, statuses=(), limit=50) == []
+    assert [dict(row) for row in media_subscriptions_repo.list_media_subscriptions(limit=200)] == before
+    assert media_subscriptions_repo.list_media_subscription_runs() == []
+    assert media_subscriptions_repo.list_media_subscription_candidates(identifier, statuses=(), limit=50) == []
     with db.get_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM media_download_admissions").fetchone()[0] == 0
     backend.publish.assert_not_called()
@@ -135,8 +136,8 @@ def test_real_read_preview_keeps_all_aired_missing_and_paused_saved_missing(back
 @pytest.mark.parametrize("checked_status", ["satisfied", "missing", "timeout"])
 def test_check_updates_preserves_checked_results_and_paused_coverage(backend, monkeypatch, include_paused, checked_status):
     identifier = seed()
-    paused_id = db.add_media_subscription(provider="tmdb", external_id="456", tmdb_id="456", media_type="tv", title="暂停追更", enabled=False) if include_paused else None
-    before = [dict(row) for row in db.list_media_subscriptions(limit=200)]
+    paused_id = media_subscriptions_repo.add_media_subscription(provider="tmdb", external_id="456", tmdb_id="456", media_type="tv", title="暂停追更", enabled=False) if include_paused else None
+    before = [dict(row) for row in media_subscriptions_repo.list_media_subscriptions(limit=200)]
     result = {"subscription_number": identifier, "status": checked_status, "inventory_complete": True,
               "missing_count": int(checked_status == "missing"), "resource_search": backend.subscriptions._empty_preview_search("not_run")}
     preview = AsyncMock(side_effect=TimeoutError() if checked_status == "timeout" else None, return_value=result)
@@ -157,8 +158,8 @@ def test_check_updates_preserves_checked_results_and_paused_coverage(backend, mo
         paused = next(row for row in page["items"] if row["subscription_number"] == paused_id)
         assert paused["status"] == "paused" and not paused["inventory_complete"]
     preview.assert_awaited_once()
-    assert [dict(row) for row in db.list_media_subscriptions(limit=200)] == before
-    assert db.list_media_subscription_runs() == []
+    assert [dict(row) for row in media_subscriptions_repo.list_media_subscriptions(limit=200)] == before
+    assert media_subscriptions_repo.list_media_subscription_runs() == []
     backend.publish.assert_not_called()
 
 
@@ -207,7 +208,7 @@ def test_cold_native_writes_keep_owner_scope_cancellation_and_real_rule_versions
             result = (await cold.execute_confirmed(plan.plan_id, context=context)).outcome.public_content
             assert result["ok"]
             if operation == "delete":
-                assert db.get_media_subscription(identifier) is None
+                assert media_subscriptions_repo.get_media_subscription(identifier) is None
             elif operation == "update":
                 assert not sdk.subscriptions.get(identifier)["enabled"]
             else:
@@ -249,7 +250,7 @@ def test_unknown_after_real_commit_is_consumed_and_never_replayed(backend, monke
             await executor().execute_confirmed(plan.plan_id, context=context)
         hook.assert_called_once()
         if operation == "delete":
-            assert db.get_media_subscription(identifier) is None
+            assert media_subscriptions_repo.get_media_subscription(identifier) is None
         elif operation == "update":
             assert not sdk.subscriptions.get(identifier)["enabled"]
         else:

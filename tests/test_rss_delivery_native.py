@@ -10,6 +10,8 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app import sdk
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import sandbox
@@ -31,7 +33,7 @@ RUNTIME = {"url": "http://qb.invalid", "default_method": "qb", "category": "rss"
 
 
 def feed(method="qb"):
-    return db.add_rss_subscription(
+    return rss_repo.add_rss_subscription(
         "公开订阅" * 50,
         "https://feed.invalid/rss?passkey=PRIVATE",
         download_method=method,
@@ -39,7 +41,7 @@ def feed(method="qb"):
 
 
 def entry(sid, number, title=""):
-    identifier = db.add_rss_entry_with_media(
+    identifier = rss_repo.add_rss_entry_with_media(
         sid,
         title or f"Episode {number}",
         f"guid-{sid}-{number}",
@@ -63,15 +65,15 @@ def test_sourceless_entries_fail_before_confirmation_without_claiming_the_batch(
     with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")):
         sid = feed()
         valid = entry(sid, 1)
-        invalid = db.add_rss_entry_with_media(sid, "没有下载来源", "no-source", payload="{}")["id"]
+        invalid = rss_repo.add_rss_entry_with_media(sid, "没有下载来源", "no-source", payload="{}")["id"]
         ids = [valid, invalid]
         if operation == "retry":
             for eid in ids:
-                db.record_rss_entry_failure(eid, "qb_unavailable", True)
-        before = [dict(assert_present(db.get_rss_entry(eid))) for eid in ids]
+                rss_repo.record_rss_entry_failure(eid, "qb_unavailable", True)
+        before = [dict(assert_present(rss_repo.get_rss_entry(eid))) for eid in ids]
         with pytest.raises(rss_delivery.RSSSubscriptionError, match=f"{invalid}.*下载链接"):
             rss_delivery.prepare(operation, {"entry_ids": ids})
-        assert [dict(assert_present(db.get_rss_entry(eid))) for eid in ids] == before
+        assert [dict(assert_present(rss_repo.get_rss_entry(eid))) for eid in ids] == before
 
 
 @pytest.mark.parametrize("operation,scope,language", [
@@ -84,8 +86,8 @@ def test_workspace_optional_defaults_prepare_full_scope_and_cancel(native_worksp
         sid = feed()
         eid = entry(sid, 1)
         if operation == "retry":
-            db.record_rss_entry_failure(eid, "qb_unavailable", True)
-        row = db.get_rss_entry(eid)
+            rss_repo.record_rss_entry_failure(eid, "qb_unavailable", True)
+        row = rss_repo.get_rss_entry(eid)
         assert row is not None
         before = dict(row)
         arguments = ({"subscription_ids": [sid]} if scope == "selected" else {"scope": "all_configured"}) if operation == "refresh" else ({"entry_ids": [eid]} if scope == "selected" else {})
@@ -115,7 +117,7 @@ def test_workspace_optional_defaults_prepare_full_scope_and_cancel(native_worksp
             with pytest.raises(ToolPipelineError):
                 await cold.execute_confirmed(plan.plan_id, context=context)
             submit.assert_not_called()
-        row = db.get_rss_entry(eid)
+        row = rss_repo.get_rss_entry(eid)
         assert row is not None and dict(row) == before
 
     with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "")):
@@ -193,7 +195,7 @@ def test_download_configuration_failure_does_not_freeze_an_unexecutable_plan():
             await effects.prepare("rss.download", {"entry_ids": [eid]}, context=context)
         assert failed.value.code == "not_configured"
         assert await effects.get_pending_plan(owner=context.owner, session_id=context.session_id) is None
-        row = db.get_rss_entry(eid)
+        row = rss_repo.get_rss_entry(eid)
         assert row is not None and row["status"] == "pending"
 
     with isolated_test_database(), patch("app.modules.rss.capture_rss_qb_runtime_config", return_value=(RUNTIME, "missing")):
@@ -232,7 +234,7 @@ def test_full_selected_batch_claims_both_targets_and_mark_has_no_old_count_cutof
         more = [entry(qb, i) for i in range(100, 171)]
         assert sdk.rss.mark(more, True)["data"]["affected"] == 71
         assert all(
-            (row := db.get_rss_entry(i)) is not None and row["status"] == "skipped"
+            (row := rss_repo.get_rss_entry(i)) is not None and row["status"] == "skipped"
             for i in more
         )
 
@@ -244,8 +246,8 @@ def test_batch_cancellation_preserves_started_receipt_and_restores_unstarted_ent
         ids = [entry(feed(), number) for number in range(1, 4)]
         if operation == "retry":
             for identifier in ids:
-                db.record_rss_entry_failure(identifier, "qb_unavailable", True)
-        before = {identifier: dict(assert_present(db.get_rss_entry(identifier))) for identifier in ids}
+                rss_repo.record_rss_entry_failure(identifier, "qb_unavailable", True)
+        before = {identifier: dict(assert_present(rss_repo.get_rss_entry(identifier))) for identifier in ids}
         args = {"entry_ids": ids}
         _, fingerprint = rss_delivery.prepare(operation, args)
         cancellation = CancellationToken()
@@ -259,13 +261,13 @@ def test_batch_cancellation_preserves_started_receipt_and_restores_unstarted_ent
         assert backend.call_count == 1
         assert result["status"] == ("partial" if accepted else "review_required")
         assert result["data"]["cancelled"] == 2 and result["data"]["submitted"] == int(accepted)
-        first = assert_present(db.get_rss_entry(ids[-1]))
+        first = assert_present(rss_repo.get_rss_entry(ids[-1]))
         assert first["status"] == ("downloaded" if accepted else "failed")
         if not accepted:
             assert result["data"]["outcome_unknown"] == 1 and first["failure_code"] == "qb_outcome_unknown"
         restored_fields = ("status", "submitted_at", "failure_code", "failure_retryable", "failed_at", "retry_count", "download_request_id", "download_request_key")
         for identifier in ids[:-1]:
-            current = assert_present(db.get_rss_entry(identifier))
+            current = assert_present(rss_repo.get_rss_entry(identifier))
             assert all(current[key] == before[identifier][key] for key in restored_fields)
         remaining = {"entry_ids": ids[:-1]}
         _, fresh = rss_delivery.prepare(operation, remaining)
@@ -281,24 +283,24 @@ def test_cancellation_after_claim_before_first_submission_restores_complete_scop
         ids = [entry(sid, number) for number in range(1, 3)]
         if operation == "retry":
             for identifier in ids:
-                db.record_rss_entry_failure(identifier, "qb_unavailable", True)
+                rss_repo.record_rss_entry_failure(identifier, "qb_unavailable", True)
         with db.get_conn() as conn:
             conn.execute("UPDATE rss_entries SET processed=NULL WHERE id=?", (ids[0],))
-        before = {identifier: dict(assert_present(db.get_rss_entry(identifier))) for identifier in ids}
+        before = {identifier: dict(assert_present(rss_repo.get_rss_entry(identifier))) for identifier in ids}
         args = {"entry_ids": ids}
         _, fingerprint = rss_delivery.prepare(operation, args)
         cancellation = CancellationToken()
         claim_name = "claim_pending_rss_entries" if operation == "download" else "claim_retryable_failed_rss_entries"
-        original_claim = getattr(db, claim_name)
+        original_claim = getattr(rss_repo, claim_name)
         def claim(*args, **kwargs):
             rows = original_claim(*args, **kwargs)
             cancellation.cancel("认领后取消")
             return rows
-        with patch.object(db, claim_name, side_effect=claim), patch.object(RSSEngine, "_download_entry") as backend:
+        with patch.object(rss_repo, claim_name, side_effect=claim), patch.object(RSSEngine, "_download_entry") as backend:
             result = rss_delivery.execute(operation, args, fingerprint, check_cancelled=cancellation.raise_if_cancelled)
         backend.assert_not_called()
         assert not result["ok"] and result["status"] == "cancelled" and result["data"]["cancelled"] == 2
-        assert all(dict(assert_present(db.get_rss_entry(identifier))) == before[identifier] for identifier in ids)
+        assert all(dict(assert_present(rss_repo.get_rss_entry(identifier))) == before[identifier] for identifier in ids)
 
 
 def test_batch_cancellation_preserves_late_receipts_and_reassigned_claims():
@@ -309,7 +311,7 @@ def test_batch_cancellation_preserves_late_receipts_and_reassigned_claims():
         _, fingerprint = rss_delivery.prepare("download", args)
         cancellation = CancellationToken()
         def submit(**kwargs):
-            db.record_rss_entry_failure(ids[0], "qb_outcome_unknown", False)
+            rss_repo.record_rss_entry_failure(ids[0], "qb_outcome_unknown", False)
             with db.get_conn() as conn:
                 conn.execute("UPDATE rss_entries SET submitted_at='2001-01-01 01:02:03' WHERE id=?", (ids[1],))
             cancellation.cancel("停止剩余投递")
@@ -318,12 +320,12 @@ def test_batch_cancellation_preserves_late_receipts_and_reassigned_claims():
             result = rss_delivery.execute("download", args, fingerprint, check_cancelled=cancellation.raise_if_cancelled)
         backend.assert_called_once()
         assert result["status"] == "partial" and result["data"]["cancelled"] == 3
-        assert assert_present(db.get_rss_entry(ids[-1]))["status"] == "downloaded"
-        late = assert_present(db.get_rss_entry(ids[0]))
+        assert assert_present(rss_repo.get_rss_entry(ids[-1]))["status"] == "downloaded"
+        late = assert_present(rss_repo.get_rss_entry(ids[0]))
         assert late["status"] == "failed" and late["failure_code"] == "qb_outcome_unknown"
-        reassigned = assert_present(db.get_rss_entry(ids[1]))
+        reassigned = assert_present(rss_repo.get_rss_entry(ids[1]))
         assert reassigned["status"] == "submitting" and reassigned["submitted_at"] == "2001-01-01 01:02:03"
-        assert assert_present(db.get_rss_entry(ids[2]))["status"] == "pending"
+        assert assert_present(rss_repo.get_rss_entry(ids[2]))["status"] == "pending"
 
 
 @pytest.mark.parametrize("source", ["pending", "unlinked_retry", "linked_retry"])
@@ -343,40 +345,40 @@ def test_cloud_confirmation_freezes_account_through_original_and_retry_dispatch(
         if source == "linked_retry":
             from app.repositories.rss import bind_rss_entry_download
             item = download_dispatcher.DownloadInput("magnet", "Episode", f"magnet:?xt=urn:btih:{1:040x}")
-            assert db.claim_rss_entry(eid)
+            assert rss_repo.claim_rss_entry(eid)
             bind_rss_entry_download(eid, download_dispatcher.request_key(item), "guangya")
             request = download_dispatcher.create_request(item, "", "", origin=f"rss:{sid}")
-            db.update_download_request(request["id"], targets="guangya", status="failed", gy_status="failed")
+            download_requests_repo.update_download_request(request["id"], targets="guangya", status="failed", gy_status="failed")
             # 已绑定请求的重试从原请求读取来源，不要求 RSS 再保留链接。
             with db.get_conn() as conn:
                 conn.execute("UPDATE rss_entries SET payload='{}' WHERE id=?", (eid,))
         if operation == "retry":
-            db.record_rss_entry_failure(eid, "guangya_unavailable", True)
+            rss_repo.record_rss_entry_failure(eid, "guangya_unavailable", True)
         args = {"entry_ids": [eid]}
         _, fingerprint = rss_delivery.prepare(operation, args)
-        before = dict(assert_present(db.get_rss_entry(eid)))
+        before = dict(assert_present(rss_repo.get_rss_entry(eid)))
         if change == "before_confirmation":
             cloud.credential_generation += 1
             with pytest.raises(rss_delivery.RSSSubscriptionError) as error:
                 rss_delivery.execute(operation, args, fingerprint)
             assert error.value.code == "confirmation_stale"
-            assert dict(assert_present(db.get_rss_entry(eid))) == before
+            assert dict(assert_present(rss_repo.get_rss_entry(eid))) == before
         else:
             claim_name = "claim_pending_rss_entries" if operation == "download" else "claim_retryable_failed_rss_entries"
-            original_claim = getattr(db, claim_name)
+            original_claim = getattr(rss_repo, claim_name)
             def claim(*args, **kwargs):
                 rows = original_claim(*args, **kwargs)
                 if change == "after_claim":
                     cloud.credential_generation += 1
                 return rows
-            with patch.object(db, claim_name, side_effect=claim):
+            with patch.object(rss_repo, claim_name, side_effect=claim):
                 result = rss_delivery.execute(operation, args, fingerprint)
             if change == "unchanged":
                 assert result["status"] == "completed"
                 assert remote.call_args.kwargs["client"] is cloud
             else:
                 assert result["status"] == "failed" and result["data"]["failed"] == 1
-                assert assert_present(db.get_rss_entry(eid))["failure_code"] == "guangya_credentials_changed"
+                assert assert_present(rss_repo.get_rss_entry(eid))["failure_code"] == "guangya_credentials_changed"
         assert remote.call_count == int(change == "unchanged")
 
 
@@ -396,13 +398,13 @@ def test_effect_confirmation_cold_restart_checks_scope_and_never_replays(change)
         plan = proposal.effect_plan
         assert (
             plan is not None
-            and (row := db.get_rss_entry(eid)) is not None
+            and (row := rss_repo.get_rss_entry(eid)) is not None
             and row["status"] == "pending"
         )
         if change == "row":
             seed_rss_entry_state(eid, "submitting")
         elif change == "configuration":
-            db.update_rss_subscription(sid, {"gy_target_dir": "changed"})
+            rss_repo.update_rss_subscription(sid, {"gy_target_dir": "changed"})
         elif change in {"owner", "session"}:
             context = await context_for(
                 store,
@@ -416,7 +418,7 @@ def test_effect_confirmation_cold_restart_checks_scope_and_never_replays(change)
         def submit(_engine, row, **kwargs):
             calls.append(row["id"])
             if change == "unknown":
-                db.record_rss_entry_failure(eid, "qb_outcome_unknown", False)
+                rss_repo.record_rss_entry_failure(eid, "qb_outcome_unknown", False)
                 return {"ok": False, "review_required": True}
             return {"pending": True}
 
@@ -497,7 +499,7 @@ def test_root_workspace_proposal_cold_confirm_and_full_persisted_readback(tmp_pa
             await bridge.dispatch(request.name)
             assert bridge.proposal and bridge.proposal.effect_plan
             plan = bridge.proposal.effect_plan
-            assert (row := db.get_rss_entry(eid)) is not None and row[
+            assert (row := rss_repo.get_rss_entry(eid)) is not None and row[
                 "status"
             ] == "pending"
         finally:
@@ -527,7 +529,7 @@ def test_root_workspace_proposal_cold_confirm_and_full_persisted_readback(tmp_pa
             (workspace / data["sdk_calls"][0]["response_path"].lstrip("/")).read_text()
         )
         assert "全文" * 600 in json.dumps(response, ensure_ascii=False)
-        assert (row := db.get_rss_entry(eid)) is not None and row[
+        assert (row := rss_repo.get_rss_entry(eid)) is not None and row[
             "title"
         ] == "全文" * 600
 

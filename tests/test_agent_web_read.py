@@ -14,7 +14,7 @@ from pathlib import Path
 
 import httpx
 
-from app import database as db
+from app.repositories import agent_web_search as agent_web_search_repo
 from app.modules.web_evidence import (
     WebEvidenceError,
     _read_cache_key, _http_error, _map_page_response, _read_local, read_web,
@@ -312,8 +312,8 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         self.values.pop("WEB_READ_ENABLED")
         with (
             patch(f"{MODULE}._read_local", return_value=_result()) as provider,
-            patch.object(db, "reserve_agent_web_search_credits", side_effect=AssertionError("must not charge")),
-            patch.object(db, "refund_agent_web_search_credits", side_effect=AssertionError("must not refund")),
+            patch.object(agent_web_search_repo, "reserve_agent_web_search_credits", side_effect=AssertionError("must not charge")),
+            patch.object(agent_web_search_repo, "refund_agent_web_search_credits", side_effect=AssertionError("must not refund")),
         ):
             first, second = read_web(**ARGS), read_web(**ARGS)
         self.assertTrue(first['ok'])
@@ -374,10 +374,10 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         from app.modules import web_evidence
 
         old_key = hashlib.sha256(b"mediaflux-web-read-cache:local-v6\0" + json.dumps([URL, 4_000], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-        db.set_agent_web_search_cache(old_key, {"kind": web_evidence._CACHE_KIND, "result": _result()}, ttl_seconds=900)
+        agent_web_search_repo.set_agent_web_search_cache(old_key, {"kind": web_evidence._CACHE_KIND, "result": _result()}, ttl_seconds=900)
         self.assertNotEqual(old_key, _read_cache_key(ARGS))
         self.values.update(WEB_READ_CACHE_TTL_SECONDS="60", TAVILY_CACHE_TTL_SECONDS="999")
-        with patch(f"{MODULE}._read_local", return_value=_result()) as provider, patch.object(db, "set_agent_web_search_cache", wraps=db.set_agent_web_search_cache) as store:
+        with patch(f"{MODULE}._read_local", return_value=_result()) as provider, patch.object(agent_web_search_repo, "set_agent_web_search_cache", wraps=agent_web_search_repo.set_agent_web_search_cache) as store:
             result = read_web(**ARGS)
         self.assertTrue(result['ok'])
         provider.assert_awaited_once()
@@ -396,7 +396,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         for legacy in layouts:
             with self.subTest(layout=legacy.get("kind", "direct_toolresult")):
                 clear_web_cache()
-                db.set_agent_web_search_cache(_read_cache_key(ARGS), legacy, ttl_seconds=900)
+                agent_web_search_repo.set_agent_web_search_cache(_read_cache_key(ARGS), legacy, ttl_seconds=900)
                 with patch(f"{MODULE}._read_local", return_value=fresh) as provider:
                     first, second = read_web(**ARGS), read_web(**ARGS)
                 provider.assert_awaited_once()
@@ -404,7 +404,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
                 self.assertTrue(second["data"]["cached"])
                 self.assertEqual(first["data"]["content"], fresh["data"]["content"])
                 self.assertEqual(second["data"]["content"], fresh["data"]["content"])
-                entry = db.get_agent_web_search_cache(_read_cache_key(ARGS))
+                entry = agent_web_search_repo.get_agent_web_search_cache(_read_cache_key(ARGS))
                 assert entry is not None
                 self.assertEqual(entry["kind"], web_evidence._CACHE_KIND)
 
@@ -459,7 +459,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(web_request_singleflight.active_count, 0)
 
     def test_cache_write_failure_does_not_discard_content(self):
-        with patch(f"{MODULE}._read_local", return_value=_result()), patch.object(db, "set_agent_web_search_cache", side_effect=RuntimeError("busy")):
+        with patch(f"{MODULE}._read_local", return_value=_result()), patch.object(agent_web_search_repo, "set_agent_web_search_cache", side_effect=RuntimeError("busy")):
             self.assertTrue(read_web(**ARGS)['ok'])
         self.assertEqual(web_request_singleflight.active_count, 0)
 
@@ -467,7 +467,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         with patch(f"{MODULE}._read_local", side_effect=asyncio.CancelledError), self.assertRaises(asyncio.CancelledError):
             read_web(**ARGS)
         self.assertEqual(web_request_singleflight.active_count, 0)
-        self.assertIsNone(db.get_agent_web_search_cache(_read_cache_key(ARGS)))
+        self.assertIsNone(agent_web_search_repo.get_agent_web_search_cache(_read_cache_key(ARGS)))
 
 
 

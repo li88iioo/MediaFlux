@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.logger import get_logger
 from app.modules.rss import _release_rss_refresh, _try_acquire_rss_refresh
 from app.modules.rss_subscription_config import (
@@ -95,10 +96,10 @@ def subscriptions(limit: int = 100, after_id: int | None = None) -> dict:
     if after_id is not None:
         subscription_id(after_id)
     try:
-        rows = db.list_rss_subscriptions(limit=limit + 1, after_id=after_id)
+        rows = rss_repo.list_rss_subscriptions(limit=limit + 1, after_id=after_id)
         has_more = len(rows) > limit
         page = rows[:limit]
-        summaries = db.list_rss_subscription_safe_summaries(
+        summaries = rss_repo.list_rss_subscription_safe_summaries(
             db.now(), limit=limit, after_id=after_id
         )
         states = {item["subscription_number"]: item for item in summaries["items"]}
@@ -129,14 +130,14 @@ def subscriptions(limit: int = 100, after_id: int | None = None) -> dict:
 def subscription(identifier: int) -> dict:
     subscription_id(identifier)
     try:
-        row = db.get_rss_subscription(identifier)
+        row = rss_repo.get_rss_subscription(identifier)
         if row is None:
             return {
                 "ok": False,
                 "status": "not_found",
                 "data": {"subscription_id": identifier},
             }
-        state = db.get_rss_subscription_safe_summary(identifier, db.now()) or {}
+        state = rss_repo.get_rss_subscription_safe_summary(identifier, db.now()) or {}
         return {
             "ok": True,
             "status": "attention" if state.get("attention_count") else "healthy",
@@ -163,7 +164,7 @@ def activity(limit: int = 100, after_id: int | None = None) -> dict:
         "status": "completed",
         "data": {
             "window_hours": 24,
-            "downloaded": db.count_rss_downloaded_entries_since(db.now(), hours=24),
+            "downloaded": rss_repo.count_rss_downloaded_entries_since(db.now(), hours=24),
             "subscriptions": [
                 {
                     "id": item["id"],
@@ -192,7 +193,7 @@ def _snapshot(conn, operation, arguments) -> dict[str, Any]:
             "existing_ids": [row["id"] for row in matches],
         }
     identifier = subscription_id(arguments.get("subscription_id"))
-    current = db.get_rss_subscription(identifier, connection=conn)
+    current = rss_repo.get_rss_subscription(identifier, connection=conn)
     if current is None:
         raise RSSSubscriptionError("未找到指定的 RSS 订阅", code="not_found")
     state = {
@@ -298,11 +299,11 @@ def apply_change(
             if check_cancelled:
                 check_cancelled()
             if operation == "create":
-                identifier = db.add_rss_subscription(
+                identifier = rss_repo.add_rss_subscription(
                     **snapshot["fields"], connection=conn
                 )
             elif operation == "update":
-                db.update_rss_subscription(
+                rss_repo.update_rss_subscription(
                     identifier, snapshot["fields"], connection=conn
                 )
             else:
@@ -313,10 +314,10 @@ def apply_change(
                     raise RSSSubscriptionError(
                         "RSS仍有提交中的条目，不能删除", code="busy"
                     )
-                db.delete_rss_subscription(identifier, connection=conn)
+                rss_repo.delete_rss_subscription(identifier, connection=conn)
         fields = snapshot.get("fields", {})
         try:
-            row = db.get_rss_subscription(identifier)
+            row = rss_repo.get_rss_subscription(identifier)
         except Exception:  # noqa: BLE001 - 写后回读失败必须保留unknown，不得提示重放
             return {
                 "ok": False,
@@ -395,7 +396,7 @@ def diagnose(limit: int = 20, offset: int = 0) -> dict:
         raise RSSSubscriptionError("offset 必须是非负整数")
     try:
         snapshot = db.now()
-        aggregate = db.get_rss_diagnostic_summary(
+        aggregate = rss_repo.get_rss_diagnostic_summary(
             snapshot,
             stale_submitting_minutes=_STALE_SUBMITTING_MINUTES,
             pending_backlog_hours=_PENDING_BACKLOG_HOURS,

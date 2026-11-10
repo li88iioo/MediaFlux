@@ -71,7 +71,7 @@ def test_cold_confirmation_is_owner_session_bound_accepted_and_once_only(schedul
             sdk.library.run_patrol()
         plan = await prepare(effects, context)
         assert plan.snapshot_fingerprint.startswith("mfkr2:")
-        assert runs() == [] and db.get_agent_library_patrol() is None
+        assert runs() == [] and repository.get_agent_library_patrol() is None
         cold = executor(SQLiteKernelStore())
         for owner, session in [(OWNER, "foreign-session"), ("webk:v1:" + "b" * 64, "patrol-session")]:
             foreign = await context_for(store, owner=owner, session=session)
@@ -129,7 +129,7 @@ def test_cancelled_or_changed_policy_cannot_create_a_patrol_run(scheduler, endin
             with patch.object(repository, "patrol_task_state", side_effect=cancelled_in_transaction) if ending == "cancel_in_transaction" else patch.object(repository, "patrol_task_state", wraps=original_state):
                 with pytest.raises(asyncio.CancelledError if ending.startswith("cancel_") and ending != "cancel_ticket" else ToolPipelineError):
                     await effects.execute_confirmed(plan.plan_id, context=context)
-        assert runs() == [] and db.get_agent_library_patrol() is None
+        assert runs() == [] and repository.get_agent_library_patrol() is None
         scheduler._audit_executor.assert_not_called()
     asyncio.run(exercise())
 
@@ -139,7 +139,7 @@ def test_atomic_trigger_rejects_task_that_arrived_after_service_recheck(schedule
     concurrent = {}
 
     def arrive_before_transaction(**options):
-        concurrent.update(db.trigger_agent_library_patrol(next_run_at=scheduler._now()))
+        concurrent.update(repository.trigger_agent_library_patrol(next_run_at=scheduler._now()))
         return original(**options)
 
     async def exercise():
@@ -152,7 +152,7 @@ def test_atomic_trigger_rejects_task_that_arrived_after_service_recheck(schedule
                 await effects.execute_confirmed(plan.plan_id, context=context)
         assert failure.value.code == "confirmation_stale" and failure.value.execution_started is False
         assert len(runs()) == 1 and runs()[0]["id"] == concurrent["run_id"]
-        current = db.get_agent_library_patrol()
+        current = repository.get_agent_library_patrol()
         assert current is not None and current["cycle_run_id"] == concurrent["run_id"]
         assert not scheduler._wake_event.is_set()
     asyncio.run(exercise())
@@ -162,7 +162,7 @@ def test_running_patrol_reuses_id_and_next_cycle_cannot_overwrite_original_query
     async def exercise():
         first = library_patrol.run_patrol(library_patrol.prepare_patrol())
         run_id = first["data"]["run_id"]
-        assert db.claim_due_agent_library_patrol(current_time=scheduler._now()) is not None
+        assert repository.claim_due_agent_library_patrol(current_time=scheduler._now()) is not None
         store = SQLiteKernelStore()
         context = await context_for(store, owner=OWNER)
         effects = executor(store)
@@ -170,7 +170,7 @@ def test_running_patrol_reuses_id_and_next_cycle_cannot_overwrite_original_query
         reused = (await effects.execute_confirmed(plan.plan_id, context=context)).outcome.public_content
         assert reused["status"] == "accepted" and reused["data"]["reused"]
         assert reused["data"]["run_id"] == run_id and len(runs()) == 1
-        db.cancel_agent_library_patrol_lease(next_run_at=scheduler._now())
+        repository.cancel_agent_library_patrol_lease(next_run_at=scheduler._now())
         assert sdk.library.patrol_status(run_id)["status"] == "cancelled"
         later = library_patrol.run_patrol(library_patrol.prepare_patrol())
         assert later["data"]["run_id"] != run_id
@@ -187,7 +187,7 @@ def test_task_lease_changes_invalidate_frozen_patrol(scheduler):
         context = await context_for(store, owner=OWNER)
         effects = executor(store)
         plan = await prepare(effects, context)
-        assert db.claim_due_agent_library_patrol(current_time=scheduler._now()) is not None
+        assert repository.claim_due_agent_library_patrol(current_time=scheduler._now()) is not None
         before = runs()
         with pytest.raises(ToolPipelineError) as failure:
             await effects.execute_confirmed(plan.plan_id, context=context)
@@ -234,7 +234,7 @@ def test_retired_patrol_confirmation_never_executes_as_native(scheduler):
         with pytest.raises(ToolPipelineError) as failure:
             await executor(SQLiteKernelStore()).execute_confirmed(old.plan_id, context=context)
         assert failure.value.code == "tool_not_found" and failure.value.execution_started is False
-        assert runs() == [] and db.get_agent_library_patrol() is None
+        assert runs() == [] and repository.get_agent_library_patrol() is None
     asyncio.run(exercise())
 
 
@@ -260,7 +260,7 @@ library.run_patrol()
 Path("tail.txt").write_text("must not resume")
 '''}, context=context)
         assert result.effect_plan is not None and result.effect_plan.tool_name == "library.run_patrol"
-        assert runs() == [] and db.get_agent_library_patrol() is None
+        assert runs() == [] and repository.get_agent_library_patrol() is None
         cold = executor(SQLiteKernelStore())
         accepted = (await cold.execute_confirmed(result.effect_plan.plan_id, context=context)).outcome.public_content
         assert accepted["status"] == "accepted" and sdk.library.patrol_status(accepted["data"]["run_id"])["status"] == "queued"

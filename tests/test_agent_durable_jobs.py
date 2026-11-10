@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import agent_jobs as agent_jobs_repo
 from app.modules.library_patrol import empty_patrol_projection
 from app.modules.library_audit_jobs import (
     audit_job,
@@ -77,7 +78,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         max_attempts: int = 3,
         job_id: str | None = None,
     ):
-        return db.create_agent_job(
+        return agent_jobs_repo.create_agent_job(
             owner=owner,
             job_type=_JOB_TYPE,
             dedupe_key=dedupe_key,
@@ -96,7 +97,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         scheduler = AgentJobsScheduler(audit_executor=executor)
         with (
             patch("app.agent.feature_gate.is_agent_enabled", return_value=False),
-            patch("app.modules.agent_jobs_scheduler.db.claim_due_agent_job") as claim,
+            patch("app.repositories.agent_jobs.claim_due_agent_job") as claim,
         ):
             self.assertEqual(scheduler.run_once(), 0)
         claim.assert_not_called()
@@ -105,13 +106,13 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
     def test_owner_isolation_and_no_raw_owner_persistence(self):
         row, created = self._create(owner="private-owner-a")
         self.assertTrue(created)
-        assert (db.get_agent_job(owner="private-owner-a", job_id=row["job_id"])) is not None
+        assert (agent_jobs_repo.get_agent_job(owner="private-owner-a", job_id=row["job_id"])) is not None
         self.assertIsNone(
-            db.get_agent_job(owner="private-owner-b", job_id=row["job_id"])
+            agent_jobs_repo.get_agent_job(owner="private-owner-b", job_id=row["job_id"])
         )
-        self.assertEqual(db.list_agent_jobs(owner="private-owner-b"), [])
+        self.assertEqual(agent_jobs_repo.list_agent_jobs(owner="private-owner-b"), [])
         self.assertIsNone(
-            db.find_active_agent_job(
+            agent_jobs_repo.find_active_agent_job(
                 owner="private-owner-b", job_type=_JOB_TYPE, dedupe_key=f"{_AS_OF}:2"
             )
         )
@@ -124,7 +125,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertFalse(created)
         self.assertEqual(first["job_id"], duplicate["job_id"])
 
-        cancelled, outcome = db.cancel_agent_job(
+        cancelled, outcome = agent_jobs_repo.cancel_agent_job(
             owner="owner-idempotent", job_id=str(first["job_id"])
         )
         self.assertEqual(outcome, "cancelled")
@@ -173,7 +174,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             self.assertEqual(receipt["state"], "terminal")
             self.assertEqual(receipt["final_result"]["status"], "up_to_date")
             self.assertTrue(receipt["delivered"])
-            self.assertIsNotNone(db.get_agent_job(owner=scope["owner"], job_id=first))
+            self.assertIsNotNone(agent_jobs_repo.get_agent_job(owner=scope["owner"], job_id=first))
             self.assertEqual(await effects.poll_effect_receipts(SQLiteKernelStore()), 0)
             self.assertEqual(executor.call_count, 52)
 
@@ -188,9 +189,9 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         start = datetime(2099, 1, 1)
         with patch.object(db, "now", return_value=start.strftime("%Y-%m-%d %H:%M:%S")):
             other, _ = self._create(owner="other-history-owner")
-            db.cancel_agent_job(owner="other-history-owner", job_id=other["job_id"])
+            agent_jobs_repo.cancel_agent_job(owner="other-history-owner", job_id=other["job_id"])
             running, _ = self._create(dedupe_key="running")
-            claimed = db.claim_due_agent_job(
+            claimed = agent_jobs_repo.claim_due_agent_job(
                 job_type=_JOB_TYPE, current_time=db.now(), stale_before="2098-12-31 23:00:00",
             )
             assert claimed is not None
@@ -199,18 +200,18 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             for index in range(52):
                 row, _ = self._create(job_id=f"job_{index:020d}")
                 oldest = oldest or str(row["job_id"])
-                db.cancel_agent_job(owner="web-owner-a", job_id=row["job_id"])
+                agent_jobs_repo.cancel_agent_job(owner="web-owner-a", job_id=row["job_id"])
 
         # 回执窗口边界内不因超过50条而删除任何终态；窗口外仍保留最近50条。
         boundary = start + timedelta(seconds=EFFECT_RECEIPT_RETENTION_SECONDS)
         with patch.object(db, "now", return_value=boundary.strftime("%Y-%m-%d %H:%M:%S")):
             self._create(dedupe_key="at-boundary")
-        self.assertIsNotNone(db.get_agent_job(owner="web-owner-a", job_id=oldest))
+        self.assertIsNotNone(agent_jobs_repo.get_agent_job(owner="web-owner-a", job_id=oldest))
         with patch.object(db, "now", return_value=(boundary + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")):
             self._create(dedupe_key="after-boundary")
-        self.assertIsNone(db.get_agent_job(owner="web-owner-a", job_id=oldest))
-        self.assertIsNotNone(db.get_agent_job(owner="other-history-owner", job_id=other["job_id"]))
-        active = db.get_agent_job(owner="web-owner-a", job_id=running["job_id"])
+        self.assertIsNone(agent_jobs_repo.get_agent_job(owner="web-owner-a", job_id=oldest))
+        self.assertIsNotNone(agent_jobs_repo.get_agent_job(owner="other-history-owner", job_id=other["job_id"]))
+        active = agent_jobs_repo.get_agent_job(owner="web-owner-a", job_id=running["job_id"])
         assert active is not None
         self.assertEqual(active["status"], "running")
         with db.get_conn() as conn:
@@ -222,7 +223,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
 
     def test_lease_renewal_and_generation_cas_reject_stale_worker(self):
         row, _ = self._create(owner="owner-lease")
-        claimed = db.claim_due_agent_job(
+        claimed = agent_jobs_repo.claim_due_agent_job(
             job_type=_JOB_TYPE,
             current_time="2099-01-01 00:00:00",
             stale_before="2098-12-31 23:55:00",
@@ -231,14 +232,14 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertEqual(claimed["job_id"], row["job_id"])
         generation = int(claimed["lease_generation"])
         self.assertTrue(
-            db.renew_agent_job_lease(
+            agent_jobs_repo.renew_agent_job_lease(
                 str(row["job_id"]),
                 expected_lease_generation=generation,
                 renewed_at="2099-01-01 00:01:00",
             )
         )
         self.assertFalse(
-            db.complete_agent_job(
+            agent_jobs_repo.complete_agent_job(
                 str(row["job_id"]),
                 expected_lease_generation=generation - 1,
                 projection_json=_projection_json(),
@@ -248,7 +249,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             )
         )
         self.assertTrue(
-            db.complete_agent_job(
+            agent_jobs_repo.complete_agent_job(
                 str(row["job_id"]),
                 expected_lease_generation=generation,
                 projection_json=_projection_json(),
@@ -260,18 +261,18 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
 
     def test_cancel_is_owner_scoped_and_running_job_stops_at_batch_boundary(self):
         row, _ = self._create(owner="owner-cancel")
-        missing, outcome = db.cancel_agent_job(
+        missing, outcome = agent_jobs_repo.cancel_agent_job(
             owner="other-owner", job_id=str(row["job_id"])
         )
         self.assertIsNone(missing)
         self.assertEqual(outcome, "not_found")
 
-        claimed = db.claim_due_agent_job(
+        claimed = agent_jobs_repo.claim_due_agent_job(
             job_type=_JOB_TYPE,
             current_time="2099-01-01 00:00:00",
             stale_before="2098-12-31 23:55:00",
         )
-        requested, outcome = db.cancel_agent_job(
+        requested, outcome = agent_jobs_repo.cancel_agent_job(
             owner="owner-cancel", job_id=str(row["job_id"])
         )
         self.assertEqual(outcome, "requested")
@@ -280,26 +281,26 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         assert claimed is not None
         generation = int(claimed["lease_generation"])
         self.assertTrue(
-            db.is_agent_job_cancel_requested(
+            agent_jobs_repo.is_agent_job_cancel_requested(
                 str(row["job_id"]), expected_lease_generation=generation
             )
         )
         self.assertTrue(
-            db.finalize_cancelled_agent_job(
+            agent_jobs_repo.finalize_cancelled_agent_job(
                 str(row["job_id"]), expected_lease_generation=generation
             )
         )
-        terminal = db.get_agent_job(owner="owner-cancel", job_id=str(row["job_id"]))
+        terminal = agent_jobs_repo.get_agent_job(owner="owner-cancel", job_id=str(row["job_id"]))
         assert terminal is not None
         self.assertEqual(terminal["status"], "cancelled")
 
     def test_cancel_racing_with_terminal_completion_is_finalized_immediately(self):
         row, _ = self._create(owner="owner-terminal-race")
         job_id = str(row["job_id"])
-        real_complete = db.complete_agent_job
+        real_complete = agent_jobs_repo.complete_agent_job
 
         def cancel_before_complete(*args, **kwargs):
-            _row, outcome = db.cancel_agent_job(
+            _row, outcome = agent_jobs_repo.cancel_agent_job(
                 owner="owner-terminal-race", job_id=job_id
             )
             self.assertEqual(outcome, "requested")
@@ -312,12 +313,12 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         with patch(
-            "app.modules.agent_jobs_scheduler.db.complete_agent_job",
+            "app.repositories.agent_jobs.complete_agent_job",
             side_effect=cancel_before_complete,
         ):
             self.assertEqual(scheduler.run_once(), 1)
 
-        stored = db.get_agent_job(owner="owner-terminal-race", job_id=job_id)
+        stored = agent_jobs_repo.get_agent_job(owner="owner-terminal-race", job_id=job_id)
         assert stored is not None
         self.assertEqual(stored["status"], "cancelled")
         self.assertTrue(stored["finished_at"])
@@ -327,10 +328,10 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             owner="owner-continuation-race", dedupe_key=f"{_AS_OF}:race"
         )
         job_id = str(row["job_id"])
-        real_continue = db.continue_agent_job
+        real_continue = agent_jobs_repo.continue_agent_job
 
         def cancel_before_continue(*args, **kwargs):
-            _row, outcome = db.cancel_agent_job(
+            _row, outcome = agent_jobs_repo.cancel_agent_job(
                 owner="owner-continuation-race", job_id=job_id
             )
             self.assertEqual(outcome, "requested")
@@ -343,19 +344,19 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         with patch(
-            "app.modules.agent_jobs_scheduler.db.continue_agent_job",
+            "app.repositories.agent_jobs.continue_agent_job",
             side_effect=cancel_before_continue,
         ):
             self.assertEqual(scheduler.run_once(), 1)
 
-        stored = db.get_agent_job(owner="owner-continuation-race", job_id=job_id)
+        stored = agent_jobs_repo.get_agent_job(owner="owner-continuation-race", job_id=job_id)
         assert stored is not None
         self.assertEqual(stored["status"], "cancelled")
         self.assertTrue(stored["finished_at"])
 
     def test_init_db_recovers_interrupted_running_job_and_invalidates_old_lease(self):
         row, _ = self._create(owner="owner-restart")
-        claimed = db.claim_due_agent_job(
+        claimed = agent_jobs_repo.claim_due_agent_job(
             job_type=_JOB_TYPE,
             current_time="2099-01-01 00:00:00",
             stale_before="2098-12-31 23:55:00",
@@ -363,13 +364,13 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         assert claimed is not None
         old_generation = int(claimed["lease_generation"])
         db.init_db()
-        recovered = db.get_agent_job(owner="owner-restart", job_id=str(row["job_id"]))
+        recovered = agent_jobs_repo.get_agent_job(owner="owner-restart", job_id=str(row["job_id"]))
         assert recovered is not None
         self.assertEqual(recovered["status"], "retry_wait")
         self.assertEqual(recovered["error_code"], "ProcessInterrupted")
         self.assertEqual(int(recovered["lease_generation"]), old_generation + 1)
         self.assertFalse(
-            db.complete_agent_job(
+            agent_jobs_repo.complete_agent_job(
                 str(row["job_id"]),
                 expected_lease_generation=old_generation,
                 projection_json=_projection_json(),
@@ -388,7 +389,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         self.assertEqual(scheduler.run_once(), 1)
-        stored = db.get_agent_job(
+        stored = agent_jobs_repo.get_agent_job(
             owner="owner-not-configured", job_id=str(row["job_id"])
         )
         assert stored is not None
@@ -406,7 +407,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         self.assertEqual(scheduler.run_once(), 1)
-        stored = db.get_agent_job(
+        stored = agent_jobs_repo.get_agent_job(
             owner="owner-unavailable", job_id=str(unavailable["job_id"])
         )
         assert stored is not None
@@ -423,7 +424,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         self.assertEqual(scheduler.run_once(), 1)
-        stored = db.get_agent_job(
+        stored = agent_jobs_repo.get_agent_job(
             owner="owner-inconclusive", job_id=str(inconclusive["job_id"])
         )
         assert stored is not None
@@ -450,7 +451,7 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             accepted = start_audit(owner=context, expected_snapshot=fingerprint, **arguments)
         self.assertEqual(accepted["status"], "accepted")
         self.assertIsNone(accepted["data"]["progress_total"])
-        row = db.get_agent_job(owner=context, job_id=accepted["data"]["job_id"])
+        row = agent_jobs_repo.get_agent_job(owner=context, job_id=accepted["data"]["job_id"])
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(json.loads(row["input_json"]), arguments)

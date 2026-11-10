@@ -7,6 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
 from app.clients.qbittorrent import TorrentAddResult, TorrentTask
 from app.modules.download_dispatcher import normalize_download_url, request_keys
 from app.modules.download_tracker import DownloadTracker
@@ -46,7 +48,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _subscription(name: str = "RSS", *, save_path: str = "/downloads") -> int:
-        return db.add_rss_subscription(
+        return rss_repo.add_rss_subscription(
             name=name,
             urls="https://example.com/feed.xml",
             download_method="qb",
@@ -55,7 +57,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _entry(sub_id: int, guid: str, url: str, *, processed: bool = False) -> int:
-        entry_id = db.add_rss_entry_with_media(
+        entry_id = rss_repo.add_rss_entry_with_media(
             sub_id,
             f"Episode {guid}",
             guid,
@@ -166,18 +168,18 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         client.add_torrent_detailed.assert_called_once()
         request_id = int((result["succeeded"] + result["existing"])[0]["request_id"])
         self.assertTrue(request_id)
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["origin"], f"rss:{first_sub}")
         self.assertEqual(request["qb_task_id"], infohash)
         self.assertEqual(request["qb_status"], "submitted")
-        get_rss_entry_result = db.get_rss_entry(first)
+        get_rss_entry_result = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result is not None
         self.assertEqual(get_rss_entry_result["status"], "downloaded")
-        get_rss_entry_result_2 = db.get_rss_entry(second)
+        get_rss_entry_result_2 = rss_repo.get_rss_entry(second)
         assert get_rss_entry_result_2 is not None
         self.assertEqual(get_rss_entry_result_2["status"], "downloaded")
-        logs = db.list_download_logs(source="qb", limit=10)
+        logs = download_requests_repo.list_download_logs(source="qb", limit=10)
         self.assertEqual(len(logs), 2)
         self.assertEqual({int(row["request_id"]) for row in logs}, {request_id})
         self.assertTrue(all("token=" not in str(row["path"] or "") for row in logs))
@@ -205,10 +207,10 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         self.assertFalse(second_result["ok"])
         self.assertTrue(second_result["review_required"])
         client_cls.return_value.add_torrent_detailed.assert_called_once()
-        get_rss_entry_result_3 = db.get_rss_entry(first)
+        get_rss_entry_result_3 = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result_3 is not None
         self.assertEqual(get_rss_entry_result_3["failure_code"], "qb_outcome_unknown")
-        get_rss_entry_result_4 = db.get_rss_entry(second)
+        get_rss_entry_result_4 = rss_repo.get_rss_entry(second)
         assert get_rss_entry_result_4 is not None
         self.assertEqual(get_rss_entry_result_4["failure_code"], "qb_outcome_unknown")
 
@@ -228,16 +230,16 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         engine = RSSEngine()
 
         first_result = engine.download(first)
-        get_rss_entry_result_5 = db.get_rss_entry(first)
+        get_rss_entry_result_5 = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result_5 is not None
         self.assertTrue(get_rss_entry_result_5["failure_retryable"])
         second_result = engine.download(second)
 
         self.assertFalse(first_result["ok"])
-        get_rss_entry_result_6 = db.get_rss_entry(first)
+        get_rss_entry_result_6 = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result_6 is not None
         self.assertEqual(get_rss_entry_result_6["status"], "downloaded")
-        get_rss_entry_result_7 = db.get_rss_entry(first)
+        get_rss_entry_result_7 = rss_repo.get_rss_entry(first)
         assert get_rss_entry_result_7 is not None
         self.assertFalse(get_rss_entry_result_7["failure_retryable"])
         self.assertTrue(second_result["ok"])
@@ -259,10 +261,10 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["unverified"])
-        request = db.get_download_request(result["request_id"])
+        request = download_requests_repo.get_download_request(result["request_id"])
         assert request is not None
         self.assertEqual(request["qb_task_id"], "")
-        log = db.list_download_logs(source="qb", limit=1)[0]
+        log = download_requests_repo.list_download_logs(source="qb", limit=1)[0]
         self.assertNotIn("secret", str(log["path"] or ""))
 
     @patch("app.modules.download_dispatcher.QBittorrentClient")
@@ -286,7 +288,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
     def test_processed_entries_preserve_receipt_despite_missing_or_invalid_payload(self, enqueue) -> None:
         payloads = ("{broken-json", "null", "[]", "{}", '{"torrent_url":""}')
         for method in ("qb", "guangya"):
-            sub_id = db.add_rss_subscription(
+            sub_id = rss_repo.add_rss_subscription(
                 name=method, urls="https://example.com/feed.xml", download_method=method,
             )
             for index, payload in enumerate(payloads):
@@ -294,7 +296,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                     entry_id = self._entry(sub_id, f"processed-{index}", "", processed=True)
                     with db.get_conn() as conn:
                         conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (payload, entry_id))
-                    get_rss_entry_result_9 = db.get_rss_entry(entry_id)
+                    get_rss_entry_result_9 = rss_repo.get_rss_entry(entry_id)
                     assert get_rss_entry_result_9 is not None
                     before = dict(get_rss_entry_result_9)
                     for _ in range(2):
@@ -303,7 +305,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                         self.assertTrue(result["existing"])
                         self.assertTrue(result["already_processed"])
                         self.assertEqual(result["method"], method)
-                    get_rss_entry_result_10 = db.get_rss_entry(entry_id)
+                    get_rss_entry_result_10 = rss_repo.get_rss_entry(entry_id)
                     assert get_rss_entry_result_10 is not None
                     self.assertEqual(dict(get_rss_entry_result_10), before)
         enqueue.assert_not_called()
@@ -320,7 +322,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                 with db.get_conn() as conn:
                     conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (payload, entry_id))
                 self.assertFalse(RSSEngine().download(entry_id)["ok"])
-                row = db.get_rss_entry(entry_id)
+                row = rss_repo.get_rss_entry(entry_id)
                 assert row is not None
                 self.assertEqual(row["status"], "failed")
                 self.assertEqual(row["failure_code"], code)
@@ -345,7 +347,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
             origin="rss:1",
         )
         request_id = int(created["id"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="submitted",
             targets="qb",
@@ -355,14 +357,14 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         tracker = DownloadTracker()
 
         tracker._update_request(
-            db.get_download_request(request_id),
+            download_requests_repo.get_download_request(request_id),
             [self._task(infohash, progress=0.99, state="downloading")],
             [],
             qb_available=True,
             gy_available=False,
         )
 
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["qb_status"], "downloading")
         start_local_import.assert_not_called()
@@ -386,7 +388,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
             origin="rss:1",
         )
         request_id = int(created["id"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="submitted",
             targets="qb",
@@ -396,14 +398,14 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         tracker = DownloadTracker()
 
         tracker._update_request(
-            db.get_download_request(request_id),
+            download_requests_repo.get_download_request(request_id),
             [self._task(infohash)],
             [],
             qb_available=True,
             gy_available=False,
         )
 
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["qb_status"], "completed")
         start_local_import.assert_called_once()
@@ -431,8 +433,8 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                 (entry_id,),
             )
 
-        self.assertEqual(db.recover_stale_submitting_rss_entries(stale_minutes=15), 1)
-        entry = db.get_rss_entry(entry_id)
+        self.assertEqual(rss_repo.recover_stale_submitting_rss_entries(stale_minutes=15), 1)
+        entry = rss_repo.get_rss_entry(entry_id)
         assert entry is not None
         self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["failure_code"], "submission_outcome_unknown")
@@ -449,7 +451,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
             for outcome in ('accepted', 'rejected', 'unknown'):
                 with self.subTest(backend=backend, outcome=outcome):
                     _clear()
-                    sid = db.add_rss_subscription('concurrent', 'https://fixture.invalid/rss', download_method=backend)
+                    sid = rss_repo.add_rss_subscription('concurrent', 'https://fixture.invalid/rss', download_method=backend)
                     entries = [self._entry(sid, str(i), 'magnet:?xt=urn:btih:' + 'a' * 40) for i in range(2)]
                     entered, release = threading.Event(), threading.Event()
 
@@ -467,7 +469,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                             self.assertTrue(entered.wait(5))
                             second = RSSEngine().download(entries[1])
                             same_entry = RSSEngine().download(entries[0])
-                            get_rss_entry_result_11 = db.get_rss_entry(entries[1])
+                            get_rss_entry_result_11 = rss_repo.get_rss_entry(entries[1])
                             assert get_rss_entry_result_11 is not None
                             before = dict(get_rss_entry_result_11)
                         finally:
@@ -480,7 +482,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                     self.assertEqual(second['status'], 'submitting')
                     self.assertEqual((before['status'], before['processed']), ('submitting', 0))
                     self.assertEqual(first['request_id'], second['request_id'])
-                    final = [db.get_rss_entry(entry_id) for entry_id in entries]
+                    final = [rss_repo.get_rss_entry(entry_id) for entry_id in entries]
                     self.assertEqual([assert_present(row)['status'] for row in final], ['downloaded' if outcome == 'accepted' else 'failed'] * 2)
                     self.assertEqual([assert_present(row)['processed'] for row in final], [int(outcome == 'accepted')] * 2)
                     if outcome != 'accepted':
@@ -495,12 +497,12 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         sid = self._subscription()
         entry = self._entry(sid, 'user-mark', 'magnet:?xt=urn:btih:' + 'b' * 40)
         def submit(*_args, **_kwargs):
-            self.assertEqual(db.update_rss_entries_processed([entry], True), 0)
+            self.assertEqual(rss_repo.update_rss_entries_processed([entry], True), 0)
             return {'ok': True, 'task_id': 'b' * 40}
         with patch.object(dispatcher, '_submit_qb', side_effect=submit):
             result = RSSEngine().download(entry)
         self.assertTrue(result['ok'])
-        get_rss_entry_result_8 = db.get_rss_entry(entry)
+        get_rss_entry_result_8 = rss_repo.get_rss_entry(entry)
         assert get_rss_entry_result_8 is not None
         self.assertEqual(get_rss_entry_result_8['status'], 'downloaded')
 
@@ -513,17 +515,17 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         url = 'magnet:?xt=urn:btih:' + 'c' * 40
         key = request_key(normalize_download_url(url))
         entries = [self._entry(sid, str(i), url) for i in range(3)]
-        old, _ = db.create_download_request(key, 'magnet', source_value=url)
-        db.update_download_request(old, status='failed', qb_status='failed')
-        new, _ = db.create_download_request(key, 'magnet', source_value=url)
+        old, _ = download_requests_repo.create_download_request(key, 'magnet', source_value=url)
+        download_requests_repo.update_download_request(old, status='failed', qb_status='failed')
+        new, _ = download_requests_repo.create_download_request(key, 'magnet', source_value=url)
         self.assertNotEqual(old, new)
         for entry_id, backend in zip(entries, ('qb', 'qb', 'guangya')):
-            self.assertTrue(db.claim_rss_entry(entry_id))
+            self.assertTrue(rss_repo.claim_rss_entry(entry_id))
             bind_rss_entry_download(entry_id, key, backend)
-        db.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=old)
-        self.assertEqual([assert_present(db.get_rss_entry(i))['status'] for i in entries], ['submitting'] * 3)
-        db.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=new)
-        self.assertEqual([assert_present(db.get_rss_entry(i))['status'] for i in entries], ['failed', 'failed', 'submitting'])
+        rss_repo.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=old)
+        self.assertEqual([assert_present(rss_repo.get_rss_entry(i))['status'] for i in entries], ['submitting'] * 3)
+        rss_repo.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=new)
+        self.assertEqual([assert_present(rss_repo.get_rss_entry(i))['status'] for i in entries], ['failed', 'failed', 'submitting'])
 
 
     def test_failure_feedback_covers_current_verified_content_aliases(self) -> None:
@@ -534,15 +536,15 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                        torrent_data=b'd4:infod6:lengthi10485760e4:name9:Movie.mkvee')
         keys = request_keys(item)
         self.assertEqual(len(keys), 2)
-        request, _ = db.create_download_request(keys[0], 'http', source_value=item.source_value,
+        request, _ = download_requests_repo.create_download_request(keys[0], 'http', source_value=item.source_value,
             torrent_data=item.torrent_data, alternate_request_keys=keys[1:])
         sid = self._subscription()
         entries = [self._entry(sid, str(i), item.source_value) for i in range(3)]
         for entry, key, backend in zip(entries, (keys[0], keys[1], keys[1]), ('qb', 'qb', 'guangya')):
-            self.assertTrue(db.claim_rss_entry(entry))
+            self.assertTrue(rss_repo.claim_rss_entry(entry))
             bind_rss_entry_download(entry, key, backend)
-        db.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=request)
-        self.assertEqual([assert_present(db.get_rss_entry(i))['status'] for i in entries], ['failed', 'failed', 'submitting'])
+        rss_repo.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=request)
+        self.assertEqual([assert_present(rss_repo.get_rss_entry(i))['status'] for i in entries], ['failed', 'failed', 'submitting'])
 
 
     def test_batch_and_confirmed_snapshot_do_not_count_inflight_as_submitted(self) -> None:
@@ -565,19 +567,19 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
                 engine = RSSEngine()
                 batch = engine.download_many(entries[1:3])
                 snapshot = engine.submit_snapshot(
-                    [dict(row) for row in db.get_pending_rss_snapshot()],
+                    [dict(row) for row in rss_repo.get_pending_rss_snapshot()],
                     {'url': 'http://qb.local', 'default_method': 'qb'},
-                    claim=db.claim_pending_rss_entries,
+                    claim=rss_repo.claim_pending_rss_entries,
                 )
                 self.assertEqual((batch['pending_count'], batch['success_count'], batch['existing_count'], batch['failure_count']), (2, 0, 0, 0))
                 self.assertEqual((snapshot['pending'], snapshot['submitted'], snapshot['failed']), (1, 0, 0))
                 self.assertFalse(snapshot['ok'])
-                self.assertEqual([assert_present(db.get_rss_entry(i))['status'] for i in entries], ['submitting'] * 4)
+                self.assertEqual([assert_present(rss_repo.get_rss_entry(i))['status'] for i in entries], ['submitting'] * 4)
             finally:
                 release.set()
             self.assertTrue(first.result()['ok'])
         remote.assert_called_once()
-        self.assertEqual([assert_present(db.get_rss_entry(i))['status'] for i in entries], ['downloaded'] * 4)
+        self.assertEqual([assert_present(rss_repo.get_rss_entry(i))['status'] for i in entries], ['downloaded'] * 4)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaService, LocalMediaServiceError
 from app.modules.organize import OrganizeRules
 from app.modules.scraper import MatchResult
@@ -22,8 +22,8 @@ def test_completed_task_replay_preserves_result_and_new_source(tmp_path, recreat
         source_root.mkdir(); target_root.mkdir()
         incoming = source_root / "Movie.2026.mkv"
         incoming.write_bytes(b"first-media")
-        source_id = db.create_local_media_source(name="S", qb_profile="", qb_path_prefix="", local_root=str(source_root), owner="admin")
-        db.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
+        source_id = local_media_repo.create_local_media_source(name="S", qb_profile="", qb_path_prefix="", local_root=str(source_root), owner="admin")
+        local_media_repo.upsert_local_library_target(source_id, "movie", str(target_root), owner="admin")
         service = LocalMediaService(scraper=cast(TMDBScraper, FakeScraper(MatchResult(tmdb_id="1", title="Movie", year="2026", media_type="movie", confidence=1.0))))
         rules = OrganizeRules(region_split=False, year_split=False, naming_scope="both", conflict_strategy=3, emby_refresh=False, media_probe_enabled=False)
         with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules):
@@ -33,18 +33,18 @@ def test_completed_task_replay_preserves_result_and_new_source(tmp_path, recreat
                 "admin", inspection["inspection_id"],
                 preview_digest=preview["preview_digest"],
             )
-            assert db.claim_local_media_task(task_id, owner="admin")
+            assert local_media_repo.claim_local_media_task(task_id, owner="admin")
             first = service.execute_task("admin", task_id)
             assert first["status"] == "completed"
             target = Path(first["moved"][0])
-            before = db.get_local_media_task(task_id, owner="admin")
+            before = local_media_repo.get_local_media_task(task_id, owner="admin")
             if recreate:
                 incoming.write_bytes(b"new-distinct-media")
             try:
                 service.execute_task("admin", task_id)
             except LocalMediaServiceError:
                 pass  # 显式拒绝与幂等返回均可，但必须保持已完成结果。
-            after = db.get_local_media_task(task_id, owner="admin")
+            after = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert after is not None
             assert after.status == "completed", after
             assert before is not None

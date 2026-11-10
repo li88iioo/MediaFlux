@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmissionStore,
     build_recent_download_status,
@@ -113,14 +114,14 @@ class RecentDownloadSubmissionStoreTests(unittest.TestCase):
 
 class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
     def _request(self, suffix: str, *, target: str = "qb") -> int:
-        request_id, _ = db.create_download_request(
+        request_id, _ = download_requests_repo.create_download_request(
             f"recent-status-{suffix}",
             "magnet",
             title="safe title",
             source_value="magnet:?xt=urn:btih:TOPSECRET",
             origin="agent",
         )
-        db.update_download_request(request_id, targets=target, status="submitted")
+        download_requests_repo.update_download_request(request_id, targets=target, status="submitted")
         return request_id
 
     def _record(self, request_id: int, *, target: str = "qb", partial: bool = False):
@@ -137,7 +138,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
 
     def test_qb_progress_and_sensitive_columns_are_not_exposed(self):
         request_id = self._request("progress")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="downloading",
             qb_status="downloading",
@@ -145,7 +146,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
             qb_content_path="/private/media/secret.mkv",
             error="SECRET-ERROR",
         )
-        db.add_download_log(
+        download_requests_repo.add_download_log(
             "qb",
             title="PRIVATE-TITLE",
             path="magnet:?xt=SECRET-URL",
@@ -173,7 +174,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
 
     def test_both_backends_preserve_partial_failure(self):
         request_id = self._request("partial", target="both")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -193,7 +194,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
 
     def test_mixed_backend_states_never_report_terminal_completed(self):
         request_id = self._request("mixed-active", target="both")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -206,7 +207,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.status, "in_progress")
         self.assertEqual(result.data["phase"], "downloading")
         self.assertFalse(result.data["terminal"])
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             qb_status="failed",
             gy_status="downloading",
@@ -274,7 +275,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
 
     def test_both_backends_complete_can_enter_post_processing(self):
         request_id = self._request("both-post", target="both")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -292,7 +293,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
 
     def test_post_processing_and_missing_record(self):
         request_id = self._request("post")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             status="completed",
             qb_status="completed",
@@ -313,7 +314,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
 
     def test_guangya_completed_waiting_for_organize_is_not_terminal(self):
         request_id = self._request("gy-organize", target="guangya")
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id, status="completed", gy_status="completed", organize_started=0
         )
         result = build_recent_download_status(
@@ -337,7 +338,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
             ),
         )
         with patch(
-            "app.agent.domains.downloads.recent_submissions.db.get_download_request_status_snapshot"
+            "app.repositories.download_requests.get_download_request_status_snapshot"
         ) as reader:
             result = build_recent_download_status(
                 store.get(owner="session-a")[0], position=1
@@ -360,7 +361,7 @@ class RecentDownloadStatusProjectionTests(IsolatedDatabaseTestCase):
             ),
         )
         with patch(
-            "app.agent.domains.downloads.recent_submissions.db.get_download_request_status_snapshot"
+            "app.repositories.download_requests.get_download_request_status_snapshot"
         ) as reader:
             record = store.get(owner="session-a")[0]
             result = build_recent_download_status(record, position=1)

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app import config
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaReadRejected
 from app.modules.organize import OrganizeRules
 from app.modules.organize_correction import OrganizeCorrectionService
@@ -405,8 +406,8 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.cloud.nodes["old-root"].parent_id, "year")
 
     def test_reorganize_keeps_completed_download_and_confirmation_accounting(self):
-        request_id, _ = db.create_download_request("archive-accounting", "magnet")
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request("archive-accounting", "magnet")
+        download_requests_repo.update_download_request(
             request_id, targets="guangya", status="completed", gy_status="completed", gy_isolated=1,
             gy_target_dir="source", gy_staging_parent_dir="incoming", gy_staging_name="Synthetic source",
             gy_staging_cleanup_status="completed", organize_started=1, organize_status="completed",
@@ -423,7 +424,7 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
             }, expires_at="2099-01-01 00:00:00",
         )
         db.update_organize_confirmation(token, status="completed", result_json=json.dumps({"moved": 1}))
-        get_download_request_result = db.get_download_request(request_id)
+        get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         request = dict(get_download_request_result)
         get_organize_confirmation_result = db.get_organize_confirmation(token)
@@ -433,7 +434,7 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["warnings"], [])
         self.assertFalse({"source", "leaf"}.intersection(self.cloud.info_reads))
-        get_download_request_result_2 = db.get_download_request(request_id)
+        get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(dict(get_download_request_result_2), request)
         get_organize_confirmation_result_2 = db.get_organize_confirmation(token)

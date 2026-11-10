@@ -1011,11 +1011,12 @@ class ProtectedStagingTaskTests(unittest.TestCase):
 
     def _run(self, *, gy_status="completed", safe_media=False):
         from app import database as db
+        from app.repositories import download_requests as download_requests_repo
         from app.modules import organize_tasks as tasks_module
         from app.modules.organize_service import preview_sources
 
-        request_id, _ = db.create_download_request("staging-scan-fixture", "magnet")
-        db.update_download_request(
+        request_id, _ = download_requests_repo.create_download_request("staging-scan-fixture", "magnet")
+        download_requests_repo.update_download_request(
             request_id, status="completed" if gy_status == "completed" else "downloading",
             gy_status=gy_status, gy_target_dir="stage", gy_isolated=1,
             gy_staging_name="MF-101-FixtureRelease", gy_staging_parent_dir="old-parent",
@@ -1051,7 +1052,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
                 "protected-task", run_id, [{"id": "root", "name": "NewNsfw"}],
                 harness.rules, trigger_type="telegram", client=client,
             )
-        return manager.task_status(), client, db.get_download_request(request_id), preview
+        return manager.task_status(), client, download_requests_repo.get_download_request(request_id), preview
 
     def test_preview_and_execution_share_staging_exclusions_and_keep_safe_media(self):
         for safe_media in (False, True):
@@ -1069,7 +1070,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
                 self.assertNotIn("inner", client.calls)
 
     def test_completed_moved_staging_is_explicitly_partial_without_releasing_protection(self):
-        from app import database as db
+        from app.repositories import download_requests as download_requests_repo
 
         task, client, row, _preview = self._run()
 
@@ -1084,7 +1085,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
         self.assertIn("MF-101-FixtureRelease", task["result"]["skip_reasons"][0])
         self.assertEqual(task["result"]["sources"][0]["status"], "partial")
         self.assertNotIn("stage", client.calls)
-        self.assertIn("stage", db.list_protected_guangya_staging_ids())
+        self.assertIn("stage", download_requests_repo.list_protected_guangya_staging_ids())
         assert row is not None
         self.assertEqual(row["gy_staging_parent_dir"], "old-parent")
         self.assertEqual(row["gy_staging_cleanup_status"], "retained")

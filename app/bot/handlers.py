@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from app.modules.local_media_models import LocalMediaSource
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
+from app.repositories import rss as rss_repo
 from app.agent.owner_routes import normalize_delivery_route
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
@@ -308,10 +311,10 @@ def _configured_local_organize_sources() -> list[LocalMediaSource]:
     """返回可执行移动入库的本地来源；显式整理不依赖 qB 自动接管开关。"""
     sources = []
     try:
-        for source in db.list_local_media_sources(owner="admin"):
+        for source in local_media_repo.list_local_media_sources(owner="admin"):
             if str(getattr(source, "mode", "move")) == "preview_only":
                 continue
-            if not db.list_local_library_targets(source.id, owner="admin"):
+            if not local_media_repo.list_local_library_targets(source.id, owner="admin"):
                 continue
             sources.append(source)
     except Exception as exc:
@@ -1683,7 +1686,7 @@ def _register_commands(bot, telebot):
                 "idle": "空闲",
             }.get(organize_status, organize_status)
             current = str(organize.get("current_source") or "").strip()
-            pending = db.count_download_requests_requiring_attention()
+            pending = download_requests_repo.count_download_requests_requiring_attention()
             lines = [
                 "<b>MediaFlux 运行状态</b>",
                 f"光鸭整理：{html.escape(organize_label)}",
@@ -1842,9 +1845,8 @@ def _register_commands(bot, telebot):
     @bot.message_handler(commands=["rss"])
     @require_auth
     def cmd_rss(msg):
-        from app import database as db
 
-        rows = db.list_rss_subscriptions()
+        rows = rss_repo.list_rss_subscriptions()
         if not rows:
             _reply_to_source(bot,msg, "暂无 RSS 订阅项\n\n请在控制台「RSS 订阅」页添加订阅源")
             return
@@ -1868,7 +1870,7 @@ def _register_commands(bot, telebot):
         logger.info("收到 Telegram RSS 刷新命令 chat=%s", getattr(msg.chat, "id", ""))
         parts = str(getattr(msg, "text", "") or "").split()
         if len(parts) < 2:
-            rows = db.list_rss_subscriptions()
+            rows = rss_repo.list_rss_subscriptions()
             if not rows:
                 _reply_to_source(bot,msg, "暂无 RSS 订阅\n请先在控制台「RSS 订阅」页添加订阅源")
                 return
@@ -1888,7 +1890,7 @@ def _register_commands(bot, telebot):
         except ValueError:
             _reply_to_source(bot,msg, "订阅ID 必须是数字")
             return
-        row = db.get_rss_subscription(sid)
+        row = rss_repo.get_rss_subscription(sid)
         if row is None:
             _reply_to_source(bot,msg, "未找到该 RSS 订阅，请发送 /rss 查看有效 ID")
             return
@@ -1924,7 +1926,7 @@ def _register_commands(bot, telebot):
         logger.info("收到 Telegram RSS 下载命令 chat=%s", getattr(msg.chat, "id", ""))
         parts = str(getattr(msg, "text", "") or "").split()
         if len(parts) < 2:
-            rows = db.list_rss_entries(status="pending", limit=6).items
+            rows = rss_repo.list_rss_entries(status="pending", limit=6).items
             if not rows:
                 _reply_to_source(bot,
                     msg,
@@ -1945,7 +1947,7 @@ def _register_commands(bot, telebot):
         except ValueError:
             _reply_to_source(bot,msg, "条目ID 必须是数字")
             return
-        row = db.get_rss_entry(eid)
+        row = rss_repo.get_rss_entry(eid)
         if row is None:
             _reply_to_source(bot,msg, "未找到该 RSS 条目，请发送 /rss_dl 查看待下载 ID")
             return
@@ -2006,7 +2008,7 @@ def _register_commands(bot, telebot):
         if str(request.get("status") or "") != "pending":
             return False
         chat_id, user_id = _telegram_identity(msg)
-        row = db.bind_pending_download_request_owner(
+        row = download_requests_repo.bind_pending_download_request_owner(
             int(request["id"]),
             chat_id=chat_id,
             user_id=user_id,
@@ -2205,7 +2207,7 @@ def _register_commands(bot, telebot):
             )
             return
         chat_id, user_id = _telegram_identity(call)
-        row = db.bind_pending_download_request_owner(
+        row = download_requests_repo.bind_pending_download_request_owner(
             int(parts[1]),
             chat_id=chat_id,
             user_id=user_id,
@@ -2472,7 +2474,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
         if operation == "download_request":
             raw_request_id: Any = value.get("request_id")
             request_id = int(raw_request_id)
-            row = db.bind_pending_download_request_owner(
+            row = download_requests_repo.bind_pending_download_request_owner(
                 request_id,
                 chat_id=chat_id,
                 user_id=user_id,
@@ -2491,7 +2493,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                 )
                 return
             if action["decision"] == "cancel":
-                if not db.cancel_pending_download_request(request_id):
+                if not download_requests_repo.cancel_pending_download_request(request_id):
                     _edit_write_confirmation_message(
                         bot, call.message, "下载请求已处理", "请勿重复操作。"
                     )
@@ -2510,7 +2512,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                 from app.modules.download_dispatcher import route_download_url
 
                 if route_download_url(str(row["source_value"] or "")) == "web":
-                    db.cancel_pending_download_request(
+                    download_requests_repo.cancel_pending_download_request(
                         request_id, error="普通网页链接未提交下载",
                     )
                     _edit_write_confirmation_message(
@@ -3111,7 +3113,7 @@ def _download_follow_up_text(succeeded: list[str]) -> str:
         else:
             follow_up.append("光鸭任务完成后仅通知状态；当前未配置整理目标目录。")
     if "qb" in succeeded:
-        enabled = bool(db.list_local_media_sources(owner="admin", enabled_only=True))
+        enabled = bool(local_media_repo.list_local_media_sources(owner="admin", enabled_only=True))
         if enabled:
             follow_up.append(
                 "qBittorrent 任务完成后将按本地媒体来源执行识别、移动和媒体库刷新。"
@@ -3739,7 +3741,7 @@ def _run_local_organize_stage(
     last_marker = ""
     while task_ids:
         tasks = [
-            db.get_local_media_task(task_id, owner="admin") for task_id in task_ids
+            local_media_repo.get_local_media_task(task_id, owner="admin") for task_id in task_ids
         ]
         statuses = [
             str(task.status) if task is not None else "failed" for task in tasks
@@ -3776,7 +3778,7 @@ def _run_local_organize_stage(
 
     take_result = getattr(scheduler, "take_captured_task_result", None)
     for task_id in task_ids:
-        task = db.get_local_media_task(task_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
         status = str(getattr(task, "status", "failed"))
         completed += int(status == "completed")
         requires_manual += int(status == "requires_manual")
@@ -3789,7 +3791,7 @@ def _run_local_organize_stage(
                 else {"status": "requires_manual"}
             )
         outcome = local_media_task_outcome(
-            task, db.list_local_media_task_items(task_id, owner="admin")
+            task, local_media_repo.list_local_media_task_items(task_id, owner="admin")
         )
         task_outcomes.append({"task_id": task_id, "status": status, **outcome})
         moved_items += int(outcome["archived_video_count"])
@@ -3993,7 +3995,7 @@ def _notify_local_organize_confirmations(summary: dict, chat_id: object) -> int:
         if task_id <= 0 or task_id in seen:
             continue
         seen.add(task_id)
-        task = db.get_local_media_task(task_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
         if str(getattr(task, "status", "")) != "requires_manual":
             continue
         result = task_results.get(task_id, task_results.get(str(task_id)))

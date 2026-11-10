@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from tests.support import isolated_test_database
@@ -26,7 +27,7 @@ class MetadataIndexFixesTests(unittest.TestCase):
     def test_C06_commit_queries_do_not_read_entire_source(self):
         for initial in (1000, 10000):
             with self.subTest(initial=initial), isolated_test_database(), tempfile.TemporaryDirectory() as root:
-                db.upsert_strm_index_batch("guangya-meta:source", [
+                strm_repo.upsert_strm_index_batch("guangya-meta:source", [
                     {"file_id": f"seed-{i}", "filename": f"Seed{i}.nfo", "size": 3,
                      "etag": "e", "strm_path": str(Path(root) / strm.STRM_SUBDIR / "Existing" / f"Seed{i}.nfo")}
                     for i in range(initial)])
@@ -55,7 +56,7 @@ class MetadataIndexFixesTests(unittest.TestCase):
                 def measured(real_get_conn=real_get_conn):
                     with real_get_conn() as conn:
                         yield Connection(conn)
-                with patch.object(db, "get_conn", measured), patch.object(db, "list_strm_index", wraps=db.list_strm_index) as full:
+                with patch.object(db, "get_conn", measured), patch.object(strm_repo, "list_strm_index", wraps=strm_repo.list_strm_index) as full:
                     for i in range(10):
                         item = prepared(root, fid=f"new-{i}", name=f"New{i}.nfo")
                         self.assertEqual(strm.commit_strm_metadata_job(
@@ -79,11 +80,11 @@ class MetadataIndexFixesTests(unittest.TestCase):
             target.write_bytes(b"old")
             fingerprint = strm._content_fingerprint(target)
             for source, fid in (("source", "owner"), ("source", "owner2"), ("other", "other-owner")):
-                db.upsert_strm_index(f"guangya-meta:{source}", fid, "old", 3, target.name, str(target), fingerprint)
+                strm_repo.upsert_strm_index(f"guangya-meta:{source}", fid, "old", 3, target.name, str(target), fingerprint)
             strm.commit_strm_metadata_job({"source_id": "source", "file_id": "new"}, item, root)
             self.assertEqual(target.read_bytes(), b"new")
-            self.assertEqual([r["file_id"] for r in db.list_strm_index("guangya-meta:source")], ["new"])
-            self.assertEqual([r["file_id"] for r in db.list_strm_index("guangya-meta:other")], ["other-owner"])
+            self.assertEqual([r["file_id"] for r in strm_repo.list_strm_index("guangya-meta:source")], ["new"])
+            self.assertEqual([r["file_id"] for r in strm_repo.list_strm_index("guangya-meta:other")], ["other-owner"])
 
     def test_C06_external_write_is_not_overwritten_and_index_rolls_back(self):
         for fail_db in (False, True):
@@ -91,12 +92,12 @@ class MetadataIndexFixesTests(unittest.TestCase):
                 item = prepared(root)
                 target = item["prepared"].target
                 target.write_bytes(b"old")
-                db.upsert_strm_index("guangya-meta:source", "owner", "old", 3, target.name,
+                strm_repo.upsert_strm_index("guangya-meta:source", "owner", "old", 3, target.name,
                                      str(target), strm._content_fingerprint(target))
                 if not fail_db:
                     target.write_bytes(b"external")
-                failing_write = patch.object(db, "upsert_strm_index", side_effect=OSError("db fail")) if fail_db else nullcontext()
+                failing_write = patch.object(strm_repo, "upsert_strm_index", side_effect=OSError("db fail")) if fail_db else nullcontext()
                 with failing_write, self.assertRaises((RuntimeError, OSError)):
                     strm.commit_strm_metadata_job({"source_id": "source", "file_id": "new"}, item, root)
                 self.assertEqual(target.read_bytes(), b"old" if fail_db else b"external")
-                self.assertEqual([r["file_id"] for r in db.list_strm_index("guangya-meta:source")], ["owner"])
+                self.assertEqual([r["file_id"] for r in strm_repo.list_strm_index("guangya-meta:source")], ["owner"])

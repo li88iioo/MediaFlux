@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.clients.qbittorrent import (
     QBittorrentClient,
@@ -361,7 +361,7 @@ def create_request(
     verification_owner: str = "",
 ) -> dict[str, Any]:
     keys = request_keys(item)
-    req_id, created = db.create_download_request(
+    req_id, created = download_requests_repo.create_download_request(
         keys[0], item.kind, title=item.title, display_title=item.display_title,
         source_value=item.source_value, torrent_data=item.torrent_data, content_type=item.content_type,
         chat_id=str(chat_id), user_id=str(user_id), message_id=str(message_id), origin=origin,
@@ -374,7 +374,7 @@ def create_request(
         retry_source_status=retry_source_status,
         verification_targets=verification_targets, verification_owner=verification_owner,
     )
-    row = db.get_download_request(req_id)
+    row = download_requests_repo.get_download_request(req_id)
     return {"id": req_id, "created": created, "status": row["status"] if row else ""}
 
 
@@ -416,13 +416,13 @@ def _finalize_submission_state(
     claimed_targets: tuple[str, ...] | list[str],
     updates: dict[str, Any],
 ) -> tuple[str, str]:
-    committed_status = db.finalize_download_request_submission(
+    committed_status = download_requests_repo.finalize_download_request_submission(
         request_id, claimed_targets, **updates
     )
     if committed_status is not None:
         return committed_status, ""
 
-    current = db.get_download_request(request_id)
+    current = download_requests_repo.get_download_request(request_id)
     current_status = str(current["status"] or "manual_review") if current else "manual_review"
     notice = (
         "下载后端返回结果时请求状态已被恢复或人工接管；"
@@ -886,7 +886,7 @@ def prepare_download_retry(request_id: int, target: str) -> dict[str, Any]:
         raise ValueError("request_id 必须是大于 0 的整数")
     if not isinstance(target, str) or target.strip().lower() not in SUPPORTED_TARGETS:
         raise ValueError("target 仅支持 qb、guangya 或 both")
-    return _download_retry_snapshot(db.get_download_request(request_id), target.strip().lower())[0]
+    return _download_retry_snapshot(download_requests_repo.get_download_request(request_id), target.strip().lower())[0]
 
 
 def public_download_retry_result(result: dict, *, source_request_id: int, target: str) -> dict:
@@ -920,7 +920,7 @@ def resubmit_download_request(
     """安全重试指定目标；活动请求仅补投失败目标，其余创建历史 successor。"""
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
-    source_row = db.get_download_request(source_request_id)
+    source_row = download_requests_repo.get_download_request(source_request_id)
     generation = guangya_credential_generation
     if expected_fingerprint is not None:
         try:
@@ -994,7 +994,7 @@ def resubmit_download_request(
             "created": False,
             "targets": targets,
             "source_attention_preserved": source_row[f"{peer_prefix}_status"] == "outcome_unknown" or not bool(result.get("ok")) or bool(
-                db.count_download_requests_requiring_attention(source_request_id)
+                download_requests_repo.count_download_requests_requiring_attention(source_request_id)
             ),
         }
 
@@ -1124,7 +1124,7 @@ def resubmit_download_request(
 
     if qb_task_id_hint and targets in {"qb", "both"}:
         dispatch_kwargs["qb_task_id_hint"] = qb_task_id_hint
-    successor = db.get_download_request(successor_id)
+    successor = download_requests_repo.get_download_request(successor_id)
     if successor is None:
         return {
             "ok": False,
@@ -1138,7 +1138,7 @@ def resubmit_download_request(
         successor, claimed_targets, **dispatch_kwargs,
     )
     if result.get("ok"):
-        db.mark_download_request_resubmitted(
+        download_requests_repo.mark_download_request_resubmitted(
             source_request_id,
             successor_request_id=successor_id,
             targets=targets,
@@ -1159,7 +1159,7 @@ def resubmit_download_request(
         "created": True,
         "targets": targets,
         "source_attention_preserved": not bool(result.get("ok")) or bool(
-            db.count_download_requests_requiring_attention(source_request_id)
+            download_requests_repo.count_download_requests_requiring_attention(source_request_id)
         ),
     }
 
@@ -1184,7 +1184,7 @@ def dispatch_missing_targets(
     """向已有资源请求补充尚未提交的后端，不重置已成功目标。"""
     if targets not in SUPPORTED_TARGETS:
         return {"handled": False, "ok": False, "error": "下载目标无效"}
-    row = db.get_download_request(request_id)
+    row = download_requests_repo.get_download_request(request_id)
     if not row:
         return {"handled": False, "ok": False, "error": "下载请求不存在"}
     prepared_row = None
@@ -1206,7 +1206,7 @@ def dispatch_missing_targets(
                         "content_type": "application/x-bittorrent"}
     if check_cancelled is not None:
         check_cancelled()
-    claimed = db.claim_download_request_targets(request_id, targets)
+    claimed = download_requests_repo.claim_download_request_targets(request_id, targets)
     if not claimed:
         return {"handled": False, "ok": False, "duplicate": True, "error": "该目标已提交或正在处理"}
     if prepared_row is not None and "guangya" in claimed:
@@ -1242,12 +1242,12 @@ def dispatch_request(
 ) -> dict[str, Any]:
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
-    row = db.get_download_request(request_id)
+    row = download_requests_repo.get_download_request(request_id)
     if not row:
         return {"ok": False, "error": "下载请求不存在"}
     if check_cancelled is not None:
         check_cancelled()
-    if not db.claim_download_request(request_id, targets):
+    if not download_requests_repo.claim_download_request(request_id, targets):
         return {"ok": False, "duplicate": True, "error": "该请求已提交或正在处理"}
 
     claimed = ("qb", "guangya") if targets == "both" else (targets,)
@@ -1317,7 +1317,7 @@ def _dispatch_claimed_targets(
         except asyncio.CancelledError:
             # 只由已知的发出前检查收尾；后端自身取消仍按原未知结果处理。
             for name in claimed_targets[index:]:
-                db.finalize_download_request_submission(request_id, (name,),
+                download_requests_repo.finalize_download_request_submission(request_id, (name,),
                     **{("qb_status" if name == "qb" else "gy_status"): "failed"},
                     error=f"{name}: 操作已取消，未提交下载后端")
             raise
@@ -1390,7 +1390,7 @@ def _dispatch_claimed_targets(
                 qb_task_id = str(updates.get("qb_task_id") or "").strip().lower()
                 if source == "qb" and _QB_TORRENT_ID_RE.fullmatch(qb_task_id):
                     try:
-                        db.finalize_download_request_submission(
+                        download_requests_repo.finalize_download_request_submission(
                             request_id, (source,), qb_status="manual_review", qb_task_id=qb_task_id,
                             error=updates["error"] or "qb: 下载回执持久化失败，请先核对下载器",
                         )
@@ -1404,7 +1404,7 @@ def _dispatch_claimed_targets(
             # 先写 qB 日志再释放 writer，随后用户移除才能同时取消该日志。
             # 请求与订阅受理已原子收尾；展示日志失败不能反转事实或阻断跟踪。
             try:
-                db.add_download_log(
+                download_requests_repo.add_download_log(
                     source=source,
                     title=title,
                     path=source_value if log_path is None else log_path,
@@ -1792,7 +1792,7 @@ def _submit_guangya(
         return {"ok": False, "error": "原 NSFW 下载来源已停用或移除，请重新选择目录，未提交下载"}
     if target_dir_id:
         # 在解析种子/创建隔离目录之前持久化选择，早期失败也不能丢失重试路由。
-        db.update_download_request(int(row["id"]), gy_requested_target_dir=target_dir_id,
+        download_requests_repo.update_download_request(int(row["id"]), gy_requested_target_dir=target_dir_id,
                                    gy_requested_nsfw=int(nsfw))
         target_dir_name = target_dir_name or nsfw_sources.get(target_dir_id, "")
     torrent_data = (
@@ -1828,7 +1828,7 @@ def _submit_guangya(
     def persist_staging(snapshot: dict) -> None:
         parent_name = str(snapshot.get("parent_name") or target_dir_name or "指定目标目录")
         staging_name = str(snapshot.get("name") or "")
-        if not db.bind_download_request_guangya_staging(
+        if not download_requests_repo.bind_download_request_guangya_staging(
             int(row["id"]),
             staging_id=str(snapshot.get("id") or ""),
             parent_id=str(snapshot.get("parent_id") or "0"),

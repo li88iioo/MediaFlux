@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.repositories import media_experience as repository
 from tests.support import IsolatedDatabaseTestCase
 
@@ -30,7 +32,7 @@ class TodaySummaryBatchAuditTests(IsolatedDatabaseTestCase):
                 "INSERT INTO local_media_sources(name,local_root,created_at,updated_at) VALUES('audit','/fixture',?,?)",
                 (self.stamp, self.stamp),
             ).lastrowid
-        self.sid = db.add_media_subscription(
+        self.sid = media_subscriptions_repo.add_media_subscription(
             provider="tmdb",
             external_id="909",
             tmdb_id="909",
@@ -40,7 +42,7 @@ class TodaySummaryBatchAuditTests(IsolatedDatabaseTestCase):
             download_target="guangya",
             sites=("mikan",),
         )
-        self.rss_id = db.add_rss_subscription("audit", "https://fixture.invalid/rss")
+        self.rss_id = rss_repo.add_rss_subscription("audit", "https://fixture.invalid/rss")
 
     def _seed(self, count=120):
         with db.get_conn() as conn:

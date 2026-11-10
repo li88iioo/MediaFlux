@@ -14,7 +14,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Generator, Any, Callable
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get
 from app.logger import get_logger, redact_sensitive_text
@@ -500,7 +500,7 @@ def submit_prepared_share_transfer(
             target_name=prepared["target_name"], origin=origin, tracker_chat_id=tracker_chat_id,
             client=runtime_client, store=store,
         )
-    row = db.get_download_request(result["request_id"])
+    row = download_requests_repo.get_download_request(result["request_id"])
     if row is not None:
         result["request"] = download_request_public_summary(row)
     return result
@@ -584,7 +584,7 @@ def create_share_request(
     names = [redact_sensitive_text(file["name"] or "未命名项目") for file in snapshot.files]
     title = redact_sensitive_text(f"分享转存 {len(names)} 项: {', '.join(names[:3])}")
     persisted_target_name = redact_sensitive_text(snapshot.target_name)
-    request_id, created = db.create_share_transfer_request(
+    request_id, created = download_requests_repo.create_share_transfer_request(
         key,
         title=title,
         chat_id=(tracker_chat_id or ""),
@@ -592,10 +592,10 @@ def create_share_request(
     )
     retried = False
     if not created:
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         if row is None:
             raise RuntimeError("分享转存请求状态丢失")
-        if str(row["status"] or "") == "failed" and db.claim_failed_share_transfer_request(
+        if str(row["status"] or "") == "failed" and download_requests_repo.claim_failed_share_transfer_request(
             request_id
         ):
             created = True
@@ -605,13 +605,13 @@ def create_share_request(
 
     def current_result() -> dict[str, Any]:
         # 超时恢复或人工操作已经接管，旧提交者不能再报告成功或触发后处理。
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         if row is None:
             raise RuntimeError("分享转存请求状态丢失")
         return _result_from_existing(row)
 
     def finish(**fields) -> dict[str, Any] | None:
-        if db.finish_share_transfer_request(request_id, **fields):
+        if download_requests_repo.finish_share_transfer_request(request_id, **fields):
             return None
         return current_result()
 
@@ -650,7 +650,7 @@ def create_share_request(
         staging_name = ""
         isolated = False
         if auto_follow_up:
-            existing = db.get_download_request(request_id)
+            existing = download_requests_repo.get_download_request(request_id)
             existing_staging = str(existing["gy_target_dir"] or "") if existing else ""
             if existing and int(existing["gy_isolated"] or 0) and existing_staging:
                 effective_target_id = existing_staging
@@ -674,7 +674,7 @@ def create_share_request(
                     # 先持久化不可预测的隔离目录身份，再触发云端创建。这样即使
                     # Provider 已建目录而进程在 ID 落库前退出，重试也只会认领
                     # 这个请求预先分配的目录名。
-                    db.update_download_request(
+                    download_requests_repo.update_download_request(
                         request_id, gy_staging_parent_dir=staging_parent_id,
                         gy_staging_name=staging_name,
                         gy_staging_cleanup_status="pending",
@@ -705,7 +705,7 @@ def create_share_request(
                     return preparation_failed(error)
                 effective_target_name = f"{persisted_target_name} / {staging_name}"
                 isolated = True
-            if not db.bind_download_request_guangya_staging(
+            if not download_requests_repo.bind_download_request_guangya_staging(
                 request_id, staging_id=effective_target_id,
                 parent_id=staging_parent_id, staging_name=staging_name,
                 target_name=effective_target_name,

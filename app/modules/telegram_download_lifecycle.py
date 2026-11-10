@@ -7,7 +7,9 @@ from dataclasses import replace
 from typing import Any
 
 from app import config
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.modules.agent_download_verification_notifications import (
     _RESULT_LABELS as _VERIFICATION_RESULT_LABELS,
 )
@@ -112,7 +114,7 @@ def _archive_stage(row, task) -> tuple[str, str, str]:
     local_status = _status(_value(row, "local_import_status"))
     organize_status = _status(_value(row, "organize_status"))
     if local_status == "completed" and task is not None:
-        outcome = local_media_task_outcome(task, db.list_local_media_task_items(task.id))
+        outcome = local_media_task_outcome(task, local_media_repo.list_local_media_task_items(task.id))
         kind = outcome["file_outcome"]
         archived, skipped = outcome["archived_video_count"], outcome["skipped_video_count"]
         if kind == "preview_only":
@@ -242,7 +244,7 @@ def build_download_lifecycle_event(
     reference = str(_value(row, "local_import_target"))
     suffix = reference.removeprefix("local-media-task:")
     task_id = int(suffix) if reference.startswith("local-media-task:") and len(suffix) <= 19 and suffix.isascii() and suffix.isdigit() else 0
-    task = db.get_local_media_task(task_id) if 0 < task_id < 2**63 else None
+    task = local_media_repo.get_local_media_task(task_id) if 0 < task_id < 2**63 else None
     archive_name, archive_status, archive_value = _archive_stage(row, task)
     refresh_status = local_media_refresh_status(task, stats) if task is not None else ""
     state = _overall_state(row, archive_status=archive_status, verification_status=verification_status, refresh_status=refresh_status)
@@ -359,7 +361,7 @@ def download_notification_obsolescence(thread_key: str, event: NotificationEvent
         return ""
     if not 0 < int(raw_id) < 2**63:
         return ""
-    row = db.get_download_request(int(raw_id))
+    row = download_requests_repo.get_download_request(int(raw_id))
     # 历史纯通知未必绑定请求，不凭记录缺失推断其业务已撤销。
     if row is None or _status(_value(row, "qb_status")) != "cancelled":
         return ""
@@ -384,7 +386,7 @@ def publish_download_lifecycle(
     thread_key = f"download:{request_id}"
     result = NotificationPublishResult(False, status="invalid")
     for attempt in range(3):
-        row = db.get_download_request(request_id)
+        row = download_requests_repo.get_download_request(request_id)
         if row is None:
             return NotificationPublishResult(False, status="missing_request")
         chat_id = notification_target_chat_id(_chat_id(row))
@@ -395,7 +397,7 @@ def publish_download_lifecycle(
         )
         verification_status = ""
         verification_result = ""
-        verification = db.get_agent_download_verification(request_id)
+        verification = agent_download_verification_repo.get_agent_download_verification(request_id)
         if verification is not None and verification["chat_id"] == chat_id:
             # 复用旧请求的复核不能进入另一会话的下载消息；原请求路由不变。
             # 旧通知载荷、STRM 回调和 tracker 重试都不能覆盖当前复核代际。

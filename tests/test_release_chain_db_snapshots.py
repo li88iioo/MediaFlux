@@ -23,21 +23,15 @@ def group():
     return lid
 
 
-def test_steps_and_business_snapshot_have_one_repository_owner():
-    for name in ("add_organize_operation_step", "finish_organize_operation_step", "list_organize_operation_steps",
-                 "capture_organize_business_snapshot", "restore_organize_business_snapshot", "list_latest_reversible_organize_steps"):
-        assert getattr(db, name) is getattr(organize_history, name)
-
-
 def test_v26_upgrade_preserves_legacy_steps_without_inventing_before_state():
     with isolated_test_database():
         lid = group()
-        step = db.add_organize_operation_step(lid, "old", 1, "move_rename", file_id="video", status="success")
+        step = organize_history.add_organize_operation_step(lid, "old", 1, "move_rename", file_id="video", status="success")
         with db.get_conn() as conn:
             conn.execute("ALTER TABLE organize_operation_steps DROP COLUMN state_before_json")
             conn.execute("PRAGMA user_version=26")
         db.init_db()
-        old = db.list_organize_operation_steps(lid)[0]
+        old = organize_history.list_organize_operation_steps(lid)[0]
         assert old["id"] == step and old["state_before_json"] == ""
         with db.get_conn() as conn:
             assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
@@ -67,17 +61,17 @@ def test_snapshot_persists_with_step_and_restores_all_business_fields():
     with isolated_test_database():
         lid = group()
         db.update_organize_log(lid, release_parse_json=json.dumps({"manual_position": {"season": 1, "episode": 1}}))
-        before = db.capture_organize_business_snapshot(lid)
-        db.add_organize_operation_step(lid, "change", 1, "move_rename", file_id="video", status="success", state_before=before)
-        persisted = json.loads(db.list_organize_operation_steps(lid)[0]["state_before_json"])
+        before = organize_history.capture_organize_business_snapshot(lid)
+        organize_history.add_organize_operation_step(lid, "change", 1, "move_rename", file_id="video", status="success", state_before=before)
+        persisted = json.loads(organize_history.list_organize_operation_steps(lid)[0]["state_before_json"])
         assert persisted == before
         db.update_organize_log(lid, tmdb_id="2", title="Second", year="2026", season=2, episode=3,
                               new_path="Second/E3.mkv", target_parent_id="new-season")
         item = db.list_organize_log_items(lid)[0]
         db.update_organize_log_item(item["id"], target_parent_id="new-season", target_name="Second.S02E03.mkv")
-        assert db.restore_organize_business_snapshot(lid, persisted, status="reverted", operation_type="revert",
+        assert organize_history.restore_organize_business_snapshot(lid, persisted, status="reverted", operation_type="revert",
                                                     current_parent_id="old-season", current_name="First.S01E01.mkv", error="")
-        actual = db.capture_organize_business_snapshot(lid)
+        actual = organize_history.capture_organize_business_snapshot(lid)
         assert actual == before
         get_organize_log_result = db.get_organize_log(lid)
         assert get_organize_log_result is not None
@@ -87,39 +81,39 @@ def test_snapshot_persists_with_step_and_restores_all_business_fields():
 def test_member_write_failure_rolls_back_log_identity_and_target_updates():
     with isolated_test_database():
         lid = group()
-        before = db.capture_organize_business_snapshot(lid)
+        before = organize_history.capture_organize_business_snapshot(lid)
         db.update_organize_log(lid, title="Second", tmdb_id="2")
-        current = db.capture_organize_business_snapshot(lid)
+        current = organize_history.capture_organize_business_snapshot(lid)
         with db.get_conn() as conn:
             conn.execute("CREATE TRIGGER fail_member_restore BEFORE UPDATE ON organize_log_items BEGIN SELECT RAISE(ABORT,'isolated'); END")
         with pytest.raises(sqlite3.IntegrityError):
-            db.restore_organize_business_snapshot(lid, before, status="reverted")
-        assert db.capture_organize_business_snapshot(lid) == current
+            organize_history.restore_organize_business_snapshot(lid, before, status="reverted")
+        assert organize_history.capture_organize_business_snapshot(lid) == current
 
 
 def test_snapshot_cannot_restore_changed_members_or_incomplete_identity():
     with isolated_test_database():
         lid = group()
-        before = db.capture_organize_business_snapshot(lid)
+        before = organize_history.capture_organize_business_snapshot(lid)
         incomplete = {**before, "log": {"title": "wrong"}}
         with pytest.raises(ValueError):
-            db.restore_organize_business_snapshot(lid, incomplete)
+            organize_history.restore_organize_business_snapshot(lid, incomplete)
         forged = {**before, "items": [{**before["items"][0], "file_id": "different"}]}
         with pytest.raises(ValueError):
-            db.restore_organize_business_snapshot(lid, forged)
-        assert db.capture_organize_business_snapshot(lid) == before
+            organize_history.restore_organize_business_snapshot(lid, forged)
+        assert organize_history.capture_organize_business_snapshot(lid) == before
 
 
 def test_business_step_query_does_not_truncate_at_display_limit():
     with isolated_test_database():
         lid = group()
-        before = db.capture_organize_business_snapshot(lid)
-        db.add_organize_operation_step(lid, "previous", 1, "move_rename", file_id="video", status="success")
+        before = organize_history.capture_organize_business_snapshot(lid)
+        organize_history.add_organize_operation_step(lid, "previous", 1, "move_rename", file_id="video", status="success")
         for i in range(305):
-            db.add_organize_operation_step(lid, "latest", i + 1, "move_rename", file_id=f"file-{i}", status="success",
+            organize_history.add_organize_operation_step(lid, "latest", i + 1, "move_rename", file_id=f"file-{i}", status="success",
                                           state_before=before if i == 0 else None)
-        assert len(db.list_organize_operation_steps(lid)) == 300
-        actual = db.list_latest_reversible_organize_steps(lid)
+        assert len(organize_history.list_organize_operation_steps(lid)) == 300
+        actual = organize_history.list_latest_reversible_organize_steps(lid)
         assert len(actual) == 305
         assert {row["operation_token"] for row in actual} == {"latest"}
         assert sum(bool(row["state_before_json"]) for row in actual) == 1
@@ -128,19 +122,19 @@ def test_business_step_query_does_not_truncate_at_display_limit():
 def test_probe_recovery_query_ignores_display_window_and_other_jobs():
     with isolated_test_database():
         lid = group()
-        expected = [db.add_organize_operation_step(lid, "probe:7:first", 1, "probe_rename",
+        expected = [organize_history.add_organize_operation_step(lid, "probe:7:first", 1, "probe_rename",
                     file_id="video", status="running")]
-        expected.append(db.add_organize_operation_step(lid, "probe:7:second", 1, "probe_rename",
+        expected.append(organize_history.add_organize_operation_step(lid, "probe:7:second", 1, "probe_rename",
                         file_id="video", status="interrupted"))
         with db.get_conn() as conn:
             conn.executemany(
                 "INSERT INTO organize_operation_steps(log_id,operation_token,step_index,action,status) VALUES(?,?,?,?,?)",
                 [(lid, "newer-events", i, "other", "success") for i in range(1010)],
             )
-        db.add_organize_operation_step(lid, "probe:70:first", 1, "probe_rename", status="running")
-        db.add_organize_operation_step(lid, "probe:7:third", 1, "probe_rename", status="success")
-        db.add_organize_operation_step(lid, "probe:7:fourth", 1, "move_rename", status="running")
-        assert not {r['id'] for r in db.list_organize_operation_steps(lid, limit=1000)}.intersection(expected)
-        actual = db.list_pending_organize_probe_steps(lid, 7)
+        organize_history.add_organize_operation_step(lid, "probe:70:first", 1, "probe_rename", status="running")
+        organize_history.add_organize_operation_step(lid, "probe:7:third", 1, "probe_rename", status="success")
+        organize_history.add_organize_operation_step(lid, "probe:7:fourth", 1, "move_rename", status="running")
+        assert not {r['id'] for r in organize_history.list_organize_operation_steps(lid, limit=1000)}.intersection(expected)
+        actual = organize_history.list_pending_organize_probe_steps(lid, 7)
         assert [row['id'] for row in actual] == expected[::-1]
-        assert db.list_pending_organize_probe_steps(lid + 1, 7) == []
+        assert organize_history.list_pending_organize_probe_steps(lid + 1, 7) == []

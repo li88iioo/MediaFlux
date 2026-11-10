@@ -16,6 +16,7 @@ from typing import cast
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.modules.scheduler import STRMScheduler, _merge_organize_changes
 from app.modules.strm import (
@@ -57,10 +58,10 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _rows() -> list[dict]:
-        return [dict(row) for row in db.list_strm_change_queue()]
+        return [dict(row) for row in strm_repo.list_strm_change_queue()]
 
     def test_changes_are_grouped_per_source_and_target_directory(self):
-        written = db.enqueue_strm_change_targets([
+        written = strm_repo.enqueue_strm_change_targets([
             _change(rel_dir="剧集/A/Season 01", file_id="f1"),
             _change(rel_dir="剧集/A/Season 01", file_id="f2"),
             _change(rel_dir="电影/B", file_id="f3"),
@@ -76,12 +77,12 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         })
 
     def test_repeated_enqueue_merges_idempotently(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        db.enqueue_strm_change_targets([_change(file_id="f1"), _change(file_id="f2")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1"), _change(file_id="f2")])
 
         rows = self._rows()
         self.assertEqual(len(rows), 1)
-        claimed = db.claim_strm_change_targets(owner="test")
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
         self.assertEqual(
             sorted(item["file_id"] for item in claimed[0]["changes"]), ["f1", "f2"]
         )
@@ -89,24 +90,24 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
     def test_repeated_enqueue_keeps_latest_snapshot(self):
         first = {**_change(file_id="f1"), "etag": "old", "size": 1}
         latest = {**_change(file_id="f1"), "etag": "new", "size": 2}
-        db.enqueue_strm_change_targets([first])
-        db.enqueue_strm_change_targets([latest])
+        strm_repo.enqueue_strm_change_targets([first])
+        strm_repo.enqueue_strm_change_targets([latest])
 
-        claimed = db.claim_strm_change_targets(owner="test")
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
         self.assertEqual(claimed[0]["changes"][0]["etag"], "new")
         self.assertEqual(claimed[0]["changes"][0]["size"], 2)
 
     def test_new_business_change_supersedes_only_its_ack_revalidation(self):
         retry = {**_change(), "_revalidation": True}
-        db.enqueue_strm_change_targets([
+        strm_repo.enqueue_strm_change_targets([
             retry, {**retry, "file_id": "f2"}, {**retry, "kind": "metadata"},
             {**retry, "source_id": "other"},
         ])
-        claimed = db.claim_strm_change_targets(owner="old-revalidation")
-        db.enqueue_strm_change_targets([_change(rel_dir="", action="remove")])
+        claimed = strm_repo.claim_strm_change_targets(owner="old-revalidation")
+        strm_repo.enqueue_strm_change_targets([_change(rel_dir="", action="remove")])
         # 已领取的旧重验即使失败退回，也不能恢复刚被新业务变更取代的快照。
-        self.assertEqual(db.release_strm_change_targets(claimed), 2)
-        current = db.claim_strm_change_targets(owner="newer-business")
+        self.assertEqual(strm_repo.release_strm_change_targets(claimed), 2)
+        current = strm_repo.claim_strm_change_targets(owner="newer-business")
         changes = [change for row in current for change in row["changes"]]
         video = [item for item in changes if item["source_id"] == "source"
                  and item["file_id"] == "f1" and item["kind"] == "video"]
@@ -118,7 +119,7 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         first_in_merge = threading.Event()
         release_first = threading.Event()
         errors: list[BaseException] = []
-        original_merge = db.merge_strm_changes
+        original_merge = strm_repo.merge_strm_changes
 
         def delayed_merge(existing, incoming):
             if threading.current_thread().name == "enqueue-first":
@@ -128,7 +129,7 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
 
         def enqueue(file_id: str) -> None:
             try:
-                db.enqueue_strm_change_targets([_change(file_id=file_id)])
+                strm_repo.enqueue_strm_change_targets([_change(file_id=file_id)])
             except BaseException as exc:  # pragma: no cover - asserted below
                 errors.append(exc)
 
@@ -150,7 +151,7 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(errors, [])
-        claimed = db.claim_strm_change_targets(owner="test")
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
         self.assertEqual(
             sorted(item["file_id"] for item in claimed[0]["changes"]),
             ["f1", "f2"],
@@ -158,7 +159,7 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
 
     def test_queue_overflow_is_marked_for_full_sync_instead_of_silent_drop(self):
         changes = [_change(file_id=f"f{index}") for index in range(5001)]
-        merged = db.merge_strm_changes(changes)
+        merged = strm_repo.merge_strm_changes(changes)
 
         self.assertEqual(len(merged), 5000)
         marker = merged[-1]
@@ -167,31 +168,31 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         self.assertIn("全量同步", marker["name"])
 
     def test_debounce_deadline_is_persisted_and_can_be_reset(self):
-        db.enqueue_strm_change_targets(
+        strm_repo.enqueue_strm_change_targets(
             [_change(file_id="f1")], not_before_seconds=30,
         )
-        first_delay = db.seconds_until_next_strm_change_target()
+        first_delay = strm_repo.seconds_until_next_strm_change_target()
         assert (first_delay) is not None
         self.assertGreater(first_delay, 20)
-        self.assertEqual(db.claim_strm_change_targets(owner="early"), [])
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="early"), [])
 
-        db.enqueue_strm_change_targets(
+        strm_repo.enqueue_strm_change_targets(
             [_change(file_id="f2")], not_before_seconds=8,
         )
-        reset_delay = db.seconds_until_next_strm_change_target()
+        reset_delay = strm_repo.seconds_until_next_strm_change_target()
         assert (reset_delay) is not None
         self.assertGreater(reset_delay, 3)
         self.assertLess(reset_delay, first_delay)
 
     def test_non_debounced_merge_can_preserve_existing_deadline(self):
-        db.enqueue_strm_change_targets(
+        strm_repo.enqueue_strm_change_targets(
             [_change(file_id="f1")], not_before_seconds=30,
         )
-        before = db.seconds_until_next_strm_change_target()
-        db.enqueue_strm_change_targets(
+        before = strm_repo.seconds_until_next_strm_change_target()
+        strm_repo.enqueue_strm_change_targets(
             [_change(file_id="f2")], not_before_seconds=None,
         )
-        after = db.seconds_until_next_strm_change_target()
+        after = strm_repo.seconds_until_next_strm_change_target()
 
         assert (before) is not None
         assert (after) is not None
@@ -203,25 +204,25 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
             _change(rel_dir="剧集/A/Season 1", file_id="f1"),
             _change(rel_dir="剧集/B/Season 1", file_id="f2"),
         ]
-        db.enqueue_strm_change_targets(changes, not_before_seconds=30)
+        strm_repo.enqueue_strm_change_targets(changes, not_before_seconds=30)
 
-        updated = db.reschedule_strm_change_targets(
+        updated = strm_repo.reschedule_strm_change_targets(
             changes, not_before_seconds=8,
         )
 
         self.assertEqual(updated, 2)
-        rows = [dict(row) for row in db.list_strm_change_queue()]
+        rows = [dict(row) for row in strm_repo.list_strm_change_queue()]
         self.assertEqual(len({row["next_attempt_at"] for row in rows}), 1)
-        delay = db.seconds_until_next_strm_change_target()
+        delay = strm_repo.seconds_until_next_strm_change_target()
         assert (delay) is not None
         self.assertGreater(delay, 3)
         self.assertLess(delay, 12)
 
     def test_change_during_running_becomes_dirty_without_losing_events(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        db.claim_strm_change_targets(owner="test")
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.claim_strm_change_targets(owner="test")
 
-        db.enqueue_strm_change_targets([_change(file_id="f2")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f2")])
 
         row = self._rows()[0]
         self.assertEqual(row["state"], "dirty")
@@ -231,44 +232,44 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         self.assertIn("f2", str(row["pending_changes_json"]))
 
     def test_completing_a_dirty_target_requeues_the_new_changes(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="test")
-        db.enqueue_strm_change_targets([_change(file_id="f2")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f2")])
 
-        state = db.complete_strm_change_target(
+        state = strm_repo.complete_strm_change_target(
             claimed[0]["id"],
             expected_owner=claimed[0]["lease_owner"],
             expected_lease_generation=claimed[0]["lease_generation"],
         )
 
         self.assertEqual(state, "queued")
-        replay = db.claim_strm_change_targets(owner="test")
+        replay = strm_repo.claim_strm_change_targets(owner="test")
         self.assertEqual([item["file_id"] for item in replay[0]["changes"]], ["f2"])
 
     def test_dirty_requeue_preserves_a_later_debounce_deadline(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="test")
-        db.enqueue_strm_change_targets(
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
+        strm_repo.enqueue_strm_change_targets(
             [_change(file_id="f2")], not_before_seconds=8,
         )
 
-        state = db.complete_strm_change_target(
+        state = strm_repo.complete_strm_change_target(
             claimed[0]["id"],
             expected_owner=claimed[0]["lease_owner"],
             expected_lease_generation=claimed[0]["lease_generation"],
         )
 
         self.assertEqual(state, "queued")
-        self.assertEqual(db.claim_strm_change_targets(owner="too-early"), [])
-        delay = db.seconds_until_next_strm_change_target()
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="too-early"), [])
+        delay = strm_repo.seconds_until_next_strm_change_target()
         assert (delay) is not None
         self.assertGreater(delay, 3)
 
     def test_completing_a_clean_target_marks_completed(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="test")
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
 
-        state = db.complete_strm_change_target(
+        state = strm_repo.complete_strm_change_target(
             claimed[0]["id"],
             expected_owner=claimed[0]["lease_owner"],
             expected_lease_generation=claimed[0]["lease_generation"],
@@ -276,24 +277,24 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(state, "completed")
         self.assertEqual(self._rows()[0]["version"], 1)
-        self.assertEqual(db.count_pending_strm_change_targets(), 0)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 0)
 
     def test_new_change_after_completion_reopens_the_target(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="test")
-        db.complete_strm_change_target(
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="test")
+        strm_repo.complete_strm_change_target(
             claimed[0]["id"],
             expected_owner=claimed[0]["lease_owner"],
             expected_lease_generation=claimed[0]["lease_generation"],
         )
 
-        db.enqueue_strm_change_targets([_change(file_id="f2")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f2")])
 
         self.assertEqual(self._rows()[0]["state"], "queued")
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
 
     def test_invalid_or_sourceless_changes_are_ignored(self):
-        written = db.enqueue_strm_change_targets([
+        written = strm_repo.enqueue_strm_change_targets([
             "not-a-dict",
             {"rel_dir": "剧集/A", "file_id": "f1"},
         ])
@@ -311,12 +312,12 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _row() -> dict:
-        return dict(db.list_strm_change_queue()[0])
+        return dict(strm_repo.list_strm_change_queue()[0])
 
     def test_claim_moves_pending_into_inflight_and_holds_a_lease(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
 
-        claimed = db.claim_strm_change_targets(owner="worker-a", lease_seconds=60)
+        claimed = strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=60)
 
         self.assertEqual(len(claimed), 1)
         self.assertEqual(claimed[0]["source_id"], "source")
@@ -328,41 +329,41 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual(str(row["pending_changes_json"]), "[]")
 
     def test_second_worker_cannot_claim_a_leased_target(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        db.claim_strm_change_targets(owner="worker-a", lease_seconds=600)
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=600)
 
-        self.assertEqual(db.claim_strm_change_targets(owner="worker-b"), [])
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="worker-b"), [])
 
     def test_expired_lease_is_reclaimable_after_a_crash(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        db.claim_strm_change_targets(owner="worker-a", lease_seconds=1)
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=1)
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_change_queue SET lease_until=0")
 
-        reclaimed = db.claim_strm_change_targets(owner="worker-b")
+        reclaimed = strm_repo.claim_strm_change_targets(owner="worker-b")
 
         self.assertEqual(len(reclaimed), 1)
         self.assertEqual([item["file_id"] for item in reclaimed[0]["changes"]], ["f1"])
 
     def test_next_target_delay_includes_an_unexpired_lease(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        db.claim_strm_change_targets(owner="worker-a", lease_seconds=30)
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=30)
 
-        delay = db.seconds_until_next_strm_change_target()
+        delay = strm_repo.seconds_until_next_strm_change_target()
 
         assert (delay) is not None
         self.assertGreater(delay, 20)
         self.assertLessEqual(delay, 30)
 
     def test_stale_worker_cannot_settle_a_reclaimed_target(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        first = db.claim_strm_change_targets(owner="worker-a", lease_seconds=1)[0]
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        first = strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=1)[0]
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_change_queue SET lease_until=0 WHERE id=?", (first["id"],))
-        second = db.claim_strm_change_targets(owner="worker-b", lease_seconds=60)[0]
+        second = strm_repo.claim_strm_change_targets(owner="worker-b", lease_seconds=60)[0]
 
         self.assertEqual(
-            db.complete_strm_change_target(
+            strm_repo.complete_strm_change_target(
                 first["id"],
                 expected_owner=first["lease_owner"],
                 expected_lease_generation=first["lease_generation"],
@@ -370,7 +371,7 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
             "stale",
         )
         self.assertEqual(
-            db.fail_strm_change_target(
+            strm_repo.fail_strm_change_target(
                 first["id"],
                 expected_owner=first["lease_owner"],
                 expected_lease_generation=first["lease_generation"],
@@ -378,18 +379,18 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
             ),
             "stale",
         )
-        self.assertEqual(db.release_strm_change_targets([first], reason="late"), 0)
+        self.assertEqual(strm_repo.release_strm_change_targets([first], reason="late"), 0)
         row = self._row()
         self.assertEqual(row["state"], "running")
         self.assertEqual(row["lease_owner"], "worker-b")
         self.assertEqual(row["lease_generation"], second["lease_generation"])
 
     def test_heartbeat_renews_current_lease_and_rejects_stale_generation(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="worker-a", lease_seconds=30)
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=30)
         before = float(self._row()["lease_until"])
 
-        renewed = db.renew_strm_change_target_leases(
+        renewed = strm_repo.renew_strm_change_target_leases(
             claimed, owner="worker-a", lease_seconds=120
         )
         stale = dict(claimed[0])
@@ -398,13 +399,13 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual(renewed, 1)
         self.assertGreater(float(self._row()["lease_until"]), before)
         self.assertEqual(
-            db.renew_strm_change_target_leases([stale], owner="worker-a", lease_seconds=120),
+            strm_repo.renew_strm_change_target_leases([stale], owner="worker-a", lease_seconds=120),
             0,
         )
-        self.assertEqual(db.claim_strm_change_targets(owner="worker-b"), [])
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="worker-b"), [])
 
     def test_concurrent_claimers_only_receive_target_once(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         barrier = threading.Barrier(2)
         claims: list[list[dict]] = []
         errors: list[BaseException] = []
@@ -412,7 +413,7 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         def worker(owner: str) -> None:
             try:
                 barrier.wait(timeout=2)
-                claims.append(db.claim_strm_change_targets(owner=owner, lease_seconds=60))
+                claims.append(strm_repo.claim_strm_change_targets(owner=owner, lease_seconds=60))
             except BaseException as exc:  # pragma: no cover - diagnostic safety
                 errors.append(exc)
 
@@ -430,24 +431,24 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual(self._row()["state"], "running")
 
     def test_startup_recovery_requeues_interrupted_targets(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        db.claim_strm_change_targets(owner="worker-a", lease_seconds=1)
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.claim_strm_change_targets(owner="worker-a", lease_seconds=1)
         with db.get_conn() as conn:
             conn.execute("UPDATE strm_change_queue SET lease_until=0")
 
-        recovered = db.recover_stale_strm_change_targets()
+        recovered = strm_repo.recover_stale_strm_change_targets()
 
         self.assertEqual(recovered, 1)
         row = self._row()
         self.assertEqual(row["state"], "queued")
         self.assertIn("f1", str(row["pending_changes_json"]))
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
 
     def test_failure_returns_inflight_changes_and_backs_off(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="worker-a")
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="worker-a")
 
-        state = db.fail_strm_change_target(
+        state = strm_repo.fail_strm_change_target(
             claimed[0]["id"],
             expected_owner=claimed[0]["lease_owner"],
             expected_lease_generation=claimed[0]["lease_generation"],
@@ -460,15 +461,15 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["last_error"], "provider timeout")
         self.assertIn("f1", str(row["pending_changes_json"]))
         # 退避窗口未到之前不得再次领取。
-        self.assertEqual(db.claim_strm_change_targets(owner="worker-b"), [])
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="worker-b"), [])
 
     def test_exhausted_retries_stay_failed_for_manual_recovery(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         for _attempt in range(3):
             with db.get_conn() as conn:
                 conn.execute("UPDATE strm_change_queue SET next_attempt_at='2000-01-01 00:00:00'")
-            claimed = db.claim_strm_change_targets(owner="worker-a")
-            state = db.fail_strm_change_target(
+            claimed = strm_repo.claim_strm_change_targets(owner="worker-a")
+            state = strm_repo.fail_strm_change_target(
                 claimed[0]["id"],
                 expected_owner=claimed[0]["lease_owner"],
                 expected_lease_generation=claimed[0]["lease_generation"],
@@ -481,10 +482,10 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         self.assertIn("f1", str(row["pending_changes_json"]))
 
     def test_stop_releases_claimed_targets_without_losing_changes(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
-        claimed = db.claim_strm_change_targets(owner="worker-a")
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = strm_repo.claim_strm_change_targets(owner="worker-a")
 
-        released = db.release_strm_change_targets(
+        released = strm_repo.release_strm_change_targets(
             claimed, reason="服务停止",
         )
 
@@ -495,18 +496,18 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
         self.assertIn("f1", str(row["pending_changes_json"]))
 
     def test_pending_count_tracks_active_states_only(self):
-        db.enqueue_strm_change_targets([
+        strm_repo.enqueue_strm_change_targets([
             _change(rel_dir="a", file_id="f1"),
             _change(rel_dir="b", file_id="f2"),
         ])
-        claimed = db.claim_strm_change_targets(owner="worker-a")
-        db.complete_strm_change_target(
+        claimed = strm_repo.claim_strm_change_targets(owner="worker-a")
+        strm_repo.complete_strm_change_target(
             claimed[0]["id"],
             expected_owner=claimed[0]["lease_owner"],
             expected_lease_generation=claimed[0]["lease_generation"],
         )
 
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
 
 
 class StrmChangeReplayTests(unittest.TestCase):
@@ -533,37 +534,37 @@ class StrmChangeReplayTests(unittest.TestCase):
                         latest["name"] = "A - S01E01 - Final.mkv"
                     elif change_type == "remove":
                         latest["action"] = "remove"
-                    db.enqueue_strm_change_targets([original])
-                    first = db.claim_strm_change_targets(owner="first")[0]
-                    db.enqueue_strm_change_targets([latest])
+                    strm_repo.enqueue_strm_change_targets([original])
+                    first = strm_repo.claim_strm_change_targets(owner="first")[0]
+                    strm_repo.enqueue_strm_change_targets([latest])
                     if outcome == "failure":
-                        self.assertEqual(db.fail_strm_change_target(
+                        self.assertEqual(strm_repo.fail_strm_change_target(
                             first["id"], expected_owner=first["lease_owner"],
                             expected_lease_generation=first["lease_generation"], error="timeout",
                         ), "queued")
-                        db.reschedule_strm_change_targets([latest], not_before_seconds=0)
+                        strm_repo.reschedule_strm_change_targets([latest], not_before_seconds=0)
                     elif outcome == "stop":
-                        self.assertEqual(db.release_strm_change_targets([first]), 1)
+                        self.assertEqual(strm_repo.release_strm_change_targets([first]), 1)
                     else:
                         with db.get_conn() as conn:
                             conn.execute("UPDATE strm_change_queue SET lease_until=0")
                         if outcome == "recovery":
-                            self.assertEqual(db.recover_stale_strm_change_targets(), 1)
-                    second = db.claim_strm_change_targets(owner="second")[0]
+                            self.assertEqual(strm_repo.recover_stale_strm_change_targets(), 1)
+                    second = strm_repo.claim_strm_change_targets(owner="second")[0]
                     self.assertGreater(second["lease_generation"], first["lease_generation"])
                     changes = _merge_organize_changes(second["changes"])
                     self.assertEqual(changes, [latest])
-                    before = dict(db.list_strm_change_queue()[0])
-                    self.assertEqual(db.complete_strm_change_target(
+                    before = dict(strm_repo.list_strm_change_queue()[0])
+                    self.assertEqual(strm_repo.complete_strm_change_target(
                         first["id"], expected_owner=first["lease_owner"],
                         expected_lease_generation=first["lease_generation"],
                     ), "stale")
-                    self.assertEqual(db.fail_strm_change_target(
+                    self.assertEqual(strm_repo.fail_strm_change_target(
                         first["id"], expected_owner=first["lease_owner"],
                         expected_lease_generation=first["lease_generation"], error="late",
                     ), "stale")
-                    self.assertEqual(db.release_strm_change_targets([first]), 0)
-                    self.assertEqual(dict(db.list_strm_change_queue()[0]), before)
+                    self.assertEqual(strm_repo.release_strm_change_targets([first]), 0)
+                    self.assertEqual(dict(strm_repo.list_strm_change_queue()[0]), before)
                     remote = GuangYaFile("f1", str(latest["name"]), False, 2, "new", "parent")
                     cloud = _IncrementalClient({} if change_type == "remove" else {"f1": remote})
                     stats = sync_strm_incremental(
@@ -573,13 +574,13 @@ class StrmChangeReplayTests(unittest.TestCase):
                     self.assertFalse(stats["fallback_required"], stats)
                     self.assertEqual(stats["failed"], 0)
                     if change_type == "remove":
-                        self.assertEqual(db.list_strm_index("guangya:source"), [])
+                        self.assertEqual(strm_repo.list_strm_index("guangya:source"), [])
                     else:
                         target = self.root / STRM_SUBDIR / str(latest["rel_dir"]) / Path(remote.name).with_suffix(".strm")
                         self.assertEqual(target.read_text(), build_play_url(
                             "http://play.invalid", "f1", "new", 2, remote.name,
                         ))
-                    self.assertEqual(db.complete_strm_change_target(
+                    self.assertEqual(strm_repo.complete_strm_change_target(
                         second["id"], expected_owner=second["lease_owner"],
                         expected_lease_generation=second["lease_generation"],
                     ), "completed")
@@ -596,11 +597,11 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
     def test_trigger_persists_changes_before_running(self):
         self.scheduler._persist_change_targets([_change(file_id="f1")])
 
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
 
     def test_trigger_fails_closed_when_change_persistence_fails(self):
         with patch(
-            "app.modules.scheduler.db.enqueue_strm_change_targets",
+            "app.repositories.strm.enqueue_strm_change_targets",
             side_effect=RuntimeError("db down"),
         ):
             result = self.scheduler.trigger(
@@ -613,36 +614,36 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
         self.scheduler._run_lock.release()
 
     def test_scoped_organize_run_does_not_claim_or_complete_other_sources(self):
-        db.enqueue_strm_change_targets([_change(source_id="one", file_id="a"), _change(source_id="two", file_id="b")])
+        strm_repo.enqueue_strm_change_targets([_change(source_id="one", file_id="a"), _change(source_id="two", file_id="b")])
         claimed = self.scheduler._claim_change_targets("organize", "full", source_ids={"one"})
         self.assertEqual([row["source_id"] for row in claimed], ["one"])
         with patch.object(self.scheduler, "_schedule_persisted_change_queue"):
             self.scheduler._settle_change_targets(claimed, "completed")
-        remaining = db.claim_strm_change_targets(owner="next")
+        remaining = strm_repo.claim_strm_change_targets(owner="next")
         self.assertEqual([row["source_id"] for row in remaining], ["two"])
         self.assertEqual(remaining[0]["lease_generation"], 1)
 
     def test_empty_explicit_source_filter_does_not_claim_any_work(self):
-        db.enqueue_strm_change_targets([_change()])
-        self.assertEqual(db.claim_strm_change_targets(owner="test", source_ids=[]), [])
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        strm_repo.enqueue_strm_change_targets([_change()])
+        self.assertEqual(strm_repo.claim_strm_change_targets(owner="test", source_ids=[]), [])
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
 
     def test_only_organize_runs_claim_persisted_targets(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
 
         self.assertEqual(self.scheduler._claim_change_targets("cron"), [])
         self.assertEqual(len(self.scheduler._claim_change_targets("organize")), 1)
 
     def test_successful_run_completes_claimed_targets(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
 
         self.scheduler._settle_change_targets(claimed, "completed")
 
-        self.assertEqual(db.count_pending_strm_change_targets(), 0)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 0)
 
     def test_partial_run_keeps_targets_for_retry(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
 
         with patch.object(
@@ -652,7 +653,7 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
                 claimed, "failed", error="STRM 同步部分完成，等待重试",
             )
 
-        row = dict(db.list_strm_change_queue()[0])
+        row = dict(strm_repo.list_strm_change_queue()[0])
         self.assertEqual(row["state"], "queued")
         self.assertEqual(row["attempts"], 1)
         self.assertIn("f1", str(row["pending_changes_json"]))
@@ -660,19 +661,19 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
         self.assertGreater(schedule.call_args.args[0], 50)
 
     def test_stopped_run_releases_targets(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
 
         self.scheduler._settle_change_targets(claimed, "stopped")
 
-        row = dict(db.list_strm_change_queue()[0])
+        row = dict(strm_repo.list_strm_change_queue()[0])
         self.assertEqual(row["state"], "queued")
         self.assertEqual(row["attempts"], 0)
 
     def test_dirty_target_triggers_another_organize_run(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
-        db.enqueue_strm_change_targets([_change(file_id="f2")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f2")])
 
         with patch.object(
             self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
@@ -680,10 +681,10 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
             self.scheduler._settle_change_targets(claimed, "completed")
 
         schedule.assert_called_once()
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
 
     def test_clean_completion_does_not_retrigger(self):
-        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        strm_repo.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
 
         with patch.object(
@@ -695,7 +696,7 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
 
     def test_empty_claim_still_rearms_a_future_queue_target(self):
         with patch.object(
-            db, "seconds_until_next_strm_change_target", return_value=240.0,
+            strm_repo, "seconds_until_next_strm_change_target", return_value=240.0,
         ), patch.object(
             self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
         ) as schedule:
@@ -704,27 +705,27 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
         schedule.assert_called_once_with(240.0)
 
     def test_claim_limit_is_automatically_drained_by_a_followup_run(self):
-        db.enqueue_strm_change_targets([
+        strm_repo.enqueue_strm_change_targets([
             _change(rel_dir=f"剧集/作品 {index}/Season 01", file_id=f"f{index}")
             for index in range(201)
         ])
         claimed = self.scheduler._claim_change_targets("organize")
 
         self.assertEqual(len(claimed), 200)
-        self.assertEqual(db.count_pending_strm_change_targets(), 201)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 201)
         with patch.object(
             self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
         ) as schedule:
             self.scheduler._settle_change_targets(claimed, "completed")
 
         schedule.assert_called_once()
-        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 1)
         remainder = self.scheduler._claim_change_targets("organize")
         self.assertEqual(len(remainder), 1)
         self.assertEqual(remainder[0]["rel_dir"], "剧集/作品 200/Season 01")
 
     def test_due_count_excludes_targets_still_in_backoff(self):
-        db.enqueue_strm_change_targets([
+        strm_repo.enqueue_strm_change_targets([
             _change(rel_dir="ready", file_id="f1"),
             _change(rel_dir="later", file_id="f2"),
         ])
@@ -734,8 +735,8 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
                 "WHERE rel_dir='later'"
             )
 
-        self.assertEqual(db.count_pending_strm_change_targets(), 2)
-        self.assertEqual(db.count_due_strm_change_targets(), 1)
+        self.assertEqual(strm_repo.count_pending_strm_change_targets(), 2)
+        self.assertEqual(strm_repo.count_due_strm_change_targets(), 1)
 
 
 class ChangedPathProjectionTests(IsolatedDatabaseTestCase):

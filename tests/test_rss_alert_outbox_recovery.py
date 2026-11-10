@@ -22,7 +22,7 @@ class RSSAlertOutboxRecoveryTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM telegram_notification_outbox")
             conn.execute("DELETE FROM settings_kv WHERE key LIKE 'rss.scheduler.alert_signature.%'")
         for mock in (
-            patch("app.modules.rss_scheduler.db.get_rss_subscription", return_value={"name": "测试订阅"}),
+            patch("app.repositories.rss.get_rss_subscription", return_value={"name": "测试订阅"}),
             patch.object(center, "notification_target_chat_id", return_value="test-chat"),
             patch.object(center, "allows_notification", return_value=True),
             patch.object(center._dispatch_stop, "is_set", return_value=True),

@@ -7,7 +7,7 @@ from tests.support import assert_present
 import unittest
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules.download_tracker import DownloadTracker, _GYTaskIndex
 from tests.support import isolated_test_database
 
@@ -27,8 +27,8 @@ class DownloadTrackerSnapshotConsistencyTests(unittest.TestCase):
         with isolated_test_database():
             ids = []
             for title, task_ids in (("single", "[]"), ("batch", '["same-task"]')):
-                request_id, _ = db.create_download_request(title, "magnet", title=title)
-                db.update_download_request(
+                request_id, _ = download_requests_repo.create_download_request(title, "magnet", title=title)
+                download_requests_repo.update_download_request(
                     request_id,
                     targets="guangya",
                     status="submitted",
@@ -47,9 +47,9 @@ class DownloadTrackerSnapshotConsistencyTests(unittest.TestCase):
             ):
                 for request_id in ids:
                     tracker._update_request(
-                        db.get_download_request(request_id), [], index
+                        download_requests_repo.get_download_request(request_id), [], index
                     )
             self.assertEqual(
-                [assert_present(db.get_download_request(i))["gy_status"] for i in ids],
+                [assert_present(download_requests_repo.get_download_request(i))["gy_status"] for i in ids],
                 ["downloading", "downloading"],
             )

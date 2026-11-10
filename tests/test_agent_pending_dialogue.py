@@ -11,6 +11,7 @@ from app.agent.kernel import sandbox
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
@@ -92,7 +93,7 @@ class PendingDialogueTests(unittest.IsolatedAsyncioTestCase):
                                   preview={"summary": f"创建订阅 {arguments['name']}"})
 
         def write(arguments, _snapshot, _context):
-            db.add_rss_subscription(name=arguments["name"], urls="https://example.invalid/feed")
+            rss_repo.add_rss_subscription(name=arguments["name"], urls="https://example.invalid/feed")
             return {"ok": True, "summary": f"已创建订阅 {arguments['name']}"}
 
         def read(arguments, _context):

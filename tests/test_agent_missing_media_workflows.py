@@ -6,6 +6,8 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.agent.domains.downloads.recent_submissions import (
     RecentDownloadSubmissionStore,
     parse_recent_download_verification_context,
@@ -98,14 +100,14 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             "confirmation_required",
         )
 
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "kernel-runtime-closed-loop",
             "magnet", verification_targets=[_VERIFICATION], verification_owner="session-a",
             title="The Show S02E03",
             origin="agent:session-a",
         )
         self.assertTrue(created)
-        db.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
+        download_requests_repo.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
         submission = _submission_result(request_id)
         submission.data["source_type"] = "resource_candidates"
         runtime.complete_submission(
@@ -118,7 +120,7 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
         row = self.repository.list_for_owner(owner="session-a")[0]
         self.assertEqual(row["item_state"], "verification_pending")
         self.assertEqual(row["download_request_id"], request_id)
-        job = db.get_agent_download_verification(request_id)
+        job = agent_download_verification_repo.get_agent_download_verification(request_id)
         assert job is not None
         self.assertEqual(job["owner"], "session-a")
         captured = recent.get(owner="session-a")
@@ -140,10 +142,10 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
                     "result_id": "resource-result-secret", "verification": proof,
                     "candidate_title": "The.Show.S02.Pack", "target": "qb",
                 } for proof in proofs])
-                request_id, _ = db.create_download_request("native-pack-"+mode, "magnet", origin="agent",
+                request_id, _ = download_requests_repo.create_download_request("native-pack-"+mode, "magnet", origin="agent",
                     verification_targets=proofs[:1] if mode == "missing_second" else proofs,
                     verification_owner="foreign" if mode == "foreign_owner" else owner)
-                db.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
+                download_requests_repo.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
                 result = _submission_result(request_id)
                 before = deepcopy(result.to_dict())
                 runtime.complete_submission(owner=owner, tool_name="resources.download", result=result, followups=followups)
@@ -154,7 +156,7 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
                     if attached:
                         self.assertEqual(rows[episode]["download_request_id"], request_id)
                 self.assertEqual(result.to_dict(), before)
-                request = db.get_download_request(request_id)
+                request = download_requests_repo.get_download_request(request_id)
                 assert request is not None
                 self.assertEqual(request["status"], "submitted")
 
@@ -189,18 +191,18 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
         followups = runtime.stage_candidates(owner="session-a", candidates=[{
             "result_id": "resource-result-secret", "verification": _VERIFICATION, "candidate_title": "The.Show.S02E03", "target": "qb",
         }])
-        request_id, _ = db.create_download_request("registration-error", "magnet", origin="agent")
-        db.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
+        request_id, _ = download_requests_repo.create_download_request("registration-error", "magnet", origin="agent")
+        download_requests_repo.update_download_request(request_id, targets="qb", status="submitted", qb_status="submitted")
         result = _submission_result(request_id)
         result.data["source_type"] = "resource_candidates"
         original = deepcopy(result.to_dict())
-        with patch.object(db, "get_agent_download_verification", side_effect=RuntimeError("storage unavailable")):
+        with patch.object(agent_download_verification_repo, "get_agent_download_verification", side_effect=RuntimeError("storage unavailable")):
             runtime.complete_submission(owner="session-a", tool_name="resources.download", result=result, followups=followups)
         self.assertEqual(result.to_dict(), original)
         self.assertEqual(recent.get(owner="session-a")[0].request_id, request_id)
-        self.assertIsNone(db.get_agent_download_verification(request_id))
+        self.assertIsNone(agent_download_verification_repo.get_agent_download_verification(request_id))
         self.assertNotEqual(self.repository.list_for_owner(owner="session-a")[0]["item_state"], "verification_pending")
-        request = db.get_download_request(request_id)
+        request = download_requests_repo.get_download_request(request_id)
         assert request is not None
         self.assertEqual(request["status"], "submitted")
 
@@ -259,14 +261,14 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             "revision": ref.revision,
         })
 
-        request_id, created = db.create_download_request(
+        request_id, created = download_requests_repo.create_download_request(
             "workflow-closed-loop",
             "magnet", verification_targets=[{**_VERIFICATION, "library_name": "动漫库"}], verification_owner="session-a",
             title="The Show S02E03",
             origin="agent:session-a",
         )
         self.assertTrue(created)
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_id,
             targets="qb",
             status="downloading",
@@ -314,12 +316,12 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             ref = self.repository.select_candidate(owner="session-a", verification=target, candidate_title="The.Show.S02.Pack", target="qb")
             assert ref is not None
             refs.append({"workflow_id": ref.workflow_id, "item_id": ref.item_id, "revision": ref.revision})
-        request, _ = db.create_download_request("two-episode-pack", "magnet", origin="agent", verification_targets=targets, verification_owner="session-a")
+        request, _ = download_requests_repo.create_download_request("two-episode-pack", "magnet", origin="agent", verification_targets=targets, verification_owner="session-a")
         self.assertTrue(self.repository.attach_submission(workflow_ref=refs[0], request_id=request, verification_enqueued=True))
-        job = db.claim_due_agent_download_verification()
+        job = agent_download_verification_repo.claim_due_agent_download_verification()
         assert job is not None
         results = [{**target, "result": "visible" if target["episode"] == 3 else "missing"} for target in job["targets"]]
-        self.assertTrue(db.update_agent_download_verification(
+        self.assertTrue(agent_download_verification_repo.update_agent_download_verification(
             request, status="attention", result="missing", attempts=3, next_check_at=db.now(),
             expected_lease_generation=job["lease_generation"], targets=results,
         ))

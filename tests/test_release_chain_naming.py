@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaService
 from app.modules.local_storage import LocalFilesystemAdapter
 from app.modules.organize import OrganizeRules, Organizer
@@ -44,14 +44,14 @@ class ReleaseChainNamingTests(IsolatedDatabaseTestCase):
                     (source / (video.stem + ".chs.srt")).write_bytes(
                         b"isolated subtitle"
                     )
-                    source_id = db.create_local_media_source(
+                    source_id = local_media_repo.create_local_media_source(
                         name=f"B-naming-{media_type}-{case}",
                         qb_profile="",
                         qb_path_prefix="",
                         local_root=str(source),
                         media_type=media_type,
                     )
-                    db.upsert_local_library_target(source_id, media_type, str(target))
+                    local_media_repo.upsert_local_library_target(source_id, media_type, str(target))
                     scraper = FakeScraper(
                         MatchResult(
                             tmdb_id="123",
@@ -88,7 +88,7 @@ class ReleaseChainNamingTests(IsolatedDatabaseTestCase):
                                 "admin", inspection["inspection_id"],
                                 preview_digest=preview["preview_digest"],
                             )
-                            self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+                            self.assertTrue(local_media_repo.claim_local_media_task(task_id, owner="admin"))
                             result = service.execute_task("admin", task_id)
                         self.assertEqual(result["status"], "completed")
                         self.assertFalse(video.exists())

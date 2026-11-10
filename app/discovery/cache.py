@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Generator
 
-from app import database
+from app.repositories import discovery as discovery_repo
 from app.discovery.models import redact_provider_message
 
 _TIMESTAMP = "%Y-%m-%d %H:%M:%S"
@@ -116,7 +116,7 @@ class DiscoveryCache:
         return CacheLookup("expired", None, row["last_error"] or "")
 
     def get(self, key: str) -> CacheLookup:
-        return self._lookup(database.get_discovery_cache(key))
+        return self._lookup(discovery_repo.get_discovery_cache(key))
 
     def get_detail_metadata(
         self, identities: list[tuple[str, str, str]],
@@ -137,7 +137,7 @@ class DiscoveryCache:
             identity: self.make_detail_key(*identity) for identity in normalized
         }
         try:
-            rows = database.get_discovery_cache_many(list(keys.values()))
+            rows = discovery_repo.get_discovery_cache_many(list(keys.values()))
         except Exception as exc:
             logger.warning("读取探索详情缓存失败: %s", exc)
             return {}
@@ -198,7 +198,7 @@ class DiscoveryCache:
             # 即使清理失败也限频，避免数据库异常期间每次请求都叠加清理压力。
             self._next_maintenance_at = now + _CACHE_MAINTENANCE_INTERVAL
             try:
-                database.purge_discovery_cache(now.strftime(_TIMESTAMP))
+                discovery_repo.purge_discovery_cache(now.strftime(_TIMESTAMP))
             except Exception as exc:  # pragma: no cover - 日志兜底，不影响业务写入
                 logger.warning("探索缓存清理失败: %s", exc)
         finally:
@@ -216,7 +216,7 @@ class DiscoveryCache:
         now = self._clock()
         ttl = max(1, ttl_seconds)
         stale = max(ttl, stale_seconds)
-        database.upsert_discovery_cache(
+        discovery_repo.upsert_discovery_cache(
             key,
             provider,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
@@ -234,18 +234,18 @@ class DiscoveryCache:
     ) -> None:
         """默认保留旧数据；调用方确认旧内容不可用时可改用短期错误缓存。"""
         now = self._clock()
-        row = database.get_discovery_cache(key)
+        row = discovery_repo.get_discovery_cache(key)
         if preserve_stale and row and row["payload"] and row["status"] != "error":
             try:
                 stale_until = datetime.strptime(row["stale_until"], _TIMESTAMP)
             except (TypeError, ValueError):
                 stale_until = now
             if stale_until > now:
-                database.update_discovery_cache_error(key, redact_provider_message(error))
+                discovery_repo.update_discovery_cache_error(key, redact_provider_message(error))
                 self._maybe_maintain(now)
                 return
         ttl = max(1, ttl_seconds)
-        database.upsert_discovery_cache(
+        discovery_repo.upsert_discovery_cache(
             key,
             provider,
             json.dumps({

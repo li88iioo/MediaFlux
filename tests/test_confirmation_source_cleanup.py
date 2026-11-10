@@ -7,7 +7,7 @@ from app.modules.scraper import TMDBScraper
 
 from unittest.mock import patch
 
-from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.modules import organize_confirmations as confirmations
 from app.modules.organize import Organizer, OrganizeRules
 from tests.support import IsolatedDatabaseTestCase
@@ -25,7 +25,7 @@ class ConfirmationSourceCleanupTests(IsolatedDatabaseTestCase):
         self.payload = {'source_dir_id': 'source', 'source_parent_id': 'leaf'}
         self.stats: dict[str, Any] = {'moved': 1}
         self.protected = self.enterContext(patch.object(
-            db, 'list_protected_guangya_staging_ids', return_value=[],
+            download_requests_repo, 'list_protected_guangya_staging_ids', return_value=[],
         ))
         self.enterContext(patch(
             'app.modules.organize_tasks.config.get',

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
 from app.repositories import download_staging_reconcile as queue
 from tests.support import isolated_test_database
 
@@ -68,7 +69,7 @@ class LegacyCleanupBatchLookupTests(unittest.TestCase):
         self.fixture.drain(limit=40)
         self.assertEqual(len(self.fixture.cloud.deleted), 40)
         for rid in ids:
-            get_download_request_result = db.get_download_request(rid)
+            get_download_request_result = download_requests_repo.get_download_request(rid)
             assert get_download_request_result is not None
             self.assertEqual(
                 get_download_request_result["gy_staging_cleanup_status"], "completed"

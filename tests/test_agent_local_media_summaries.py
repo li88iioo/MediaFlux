@@ -7,6 +7,7 @@ from collections import Counter
 from unittest.mock import patch
 
 from app import database as db, sdk
+from app.repositories import local_media as local_media_repo
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -26,21 +27,21 @@ class LocalMediaSummaryUnitTests(IsolatedDatabaseTestCase):
         owner: str = "admin",
         suffix: str = "one",
     ) -> int:
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name=f"PRIVATE-SOURCE-{suffix}",
             qb_profile="qb",
             qb_path_prefix=f"/private/qb/{suffix}",
             local_root=f"/private/local/{suffix}",
             owner=owner,
         )
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id,
             f"PRIVATE-HASH-{suffix}",
             f"/private/TITLE-{suffix}.mkv",
             owner=owner,
             trigger=trigger,
         )
-        db.update_local_media_task(
+        local_media_repo.update_local_media_task(
             task_id,
             owner=owner,
             status=status,

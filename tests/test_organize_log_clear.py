@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app import database as db
+from app.repositories import local_media as local_media_repo
 from app.main import create_app
 from app.modules.organize import Organizer
 from app.routes.logs_api import clear_organize_log_records
@@ -26,9 +27,9 @@ class OrganizeLogClearTests(unittest.TestCase):
                                    original_name=name + ".mkv", **kwargs)
 
     def local(self, status="failed", name="Match", owner="admin"):
-        source = db.create_local_media_source(f"local-{status}-{name}", "", "", "/downloads", owner=owner)
-        task = db.create_local_media_task(source, "", f"/downloads/{status}-{name}", owner=owner, trigger="manual")
-        db.update_local_media_task(task, owner=owner, status=status)
+        source = local_media_repo.create_local_media_source(f"local-{status}-{name}", "", "", "/downloads", owner=owner)
+        task = local_media_repo.create_local_media_task(source, "", f"/downloads/{status}-{name}", owner=owner, trigger="manual")
+        local_media_repo.update_local_media_task(task, owner=owner, status=status)
         return task
 
     def test_filters_match_listing_across_pages_and_retry_is_idempotent(self):
@@ -41,7 +42,7 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual(result["deleted"], 205)
         self.assertTrue(all(db.get_organize_log(i) is None for i in ids))
         self.assertTrue(all(db.get_organize_log(i) is not None for i in kept[:2]))
-        self.assertIsNotNone(db.get_local_media_task(kept[2], owner="admin"))
+        self.assertIsNotNone(local_media_repo.get_local_media_task(kept[2], owner="admin"))
         self.assertEqual(db.clear_organize_logs(**filters)["deleted"], 0)
 
     def test_status_mapping_and_keyword_are_shared_with_listing(self):
@@ -68,7 +69,7 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual(result["deleted"], 1)
         self.assertEqual(result["skipped_busy"], 6)
         self.assertTrue(all(db.get_organize_log(i) is not None for i in kept))
-        self.assertTrue(all(db.get_local_media_task(i, owner="admin") is not None for i in tasks))
+        self.assertTrue(all(local_media_repo.get_local_media_task(i, owner="admin") is not None for i in tasks))
         self.assertEqual(db.clear_organize_logs(status="manual")["deleted"], 0)
 
     def test_active_confirmation_protects_terminal_records_until_finished(self):
@@ -222,33 +223,33 @@ class OrganizeLogClearTests(unittest.TestCase):
             token="local-review", fingerprint="local-review", chat_id="", source_name="", directory_path="/",
             payload={"local_task_id": referenced}, expires_at="2099-01-01 00:00:00",
         )
-        result = db.delete_local_media_tasks([pending, referenced, finished, 999999])
+        result = local_media_repo.delete_local_media_tasks([pending, referenced, finished, 999999])
         self.assertEqual(result, {"requested": 4, "deleted": 1, "skipped_busy": 2, "missing": 1})
         self.assertEqual(db.clear_organize_logs(origin="local")["skipped_busy"], 2)
-        self.assertIsNotNone(db.get_local_media_task(pending))
-        self.assertIsNotNone(db.get_local_media_task(referenced))
+        self.assertIsNotNone(local_media_repo.get_local_media_task(pending))
+        self.assertIsNotNone(local_media_repo.get_local_media_task(referenced))
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET status='completed'")
-        self.assertEqual(db.delete_local_media_tasks([referenced])["deleted"], 1)
+        self.assertEqual(local_media_repo.delete_local_media_tasks([referenced])["deleted"], 1)
         # 确认已结束后仍可显式放弃人工任务；批量清空不会替用户做此决定。
         self.assertEqual(db.clear_organize_logs(origin="local")["deleted"], 0)
-        self.assertEqual(db.delete_local_media_tasks([pending])["deleted"], 1)
+        self.assertEqual(local_media_repo.delete_local_media_tasks([pending])["deleted"], 1)
 
     def test_local_repository_does_not_coerce_invalid_task_ids(self):
         task = self.local("failed", "kept")
         invalid_ids: list[Any] = [True, 1.9, "1", -1, 0]
         for value in invalid_ids:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                db.delete_local_media_tasks([value])
-        self.assertIsNotNone(db.get_local_media_task(task))
+                local_media_repo.delete_local_media_tasks([value])
+        self.assertIsNotNone(local_media_repo.get_local_media_task(task))
 
     def test_children_outside_filter_and_other_owner_survive(self):
         parent = self.cloud("failed", "parent")
         child = self.cloud("success", "child", parent_log_id=parent)
         own, other = self.local(), self.local(owner="another-user")
         self.assertEqual(db.clear_organize_logs(status="failed")["deleted"], 2)
-        self.assertIsNone(db.get_local_media_task(own, owner="admin"))
-        self.assertIsNotNone(db.get_local_media_task(other, owner="another-user"))
+        self.assertIsNone(local_media_repo.get_local_media_task(own, owner="admin"))
+        self.assertIsNotNone(local_media_repo.get_local_media_task(other, owner="another-user"))
         child_row = db.get_organize_log(child)
         assert child_row is not None
         self.assertIsNone(child_row["parent_log_id"])
@@ -307,4 +308,4 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual(result.json()['deleted'], before.json()['total'])
         self.assertEqual(client.get('/api/logs/organize/timeline', params=filters).json()['total'], 0)
         self.assertIsNotNone(db.get_organize_log(cloud_other))
-        self.assertIsNotNone(db.get_local_media_task(local_other, owner="admin"))
+        self.assertIsNotNone(local_media_repo.get_local_media_task(local_other, owner="admin"))

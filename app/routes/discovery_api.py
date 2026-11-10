@@ -283,7 +283,7 @@ def remove_watchlist(request: Request, provider: str, media_type: str, external_
 
 
 def _calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
-    from app import database
+    from app.repositories import discovery as discovery_repo
 
     def media_identity(raw):
         for provider in ("tmdb", "douban"):
@@ -296,7 +296,7 @@ def _calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
     all_cards += [card for card in snapshot.get("unscheduled", []) if card.get("category") == "animation"]
     identities = {(provider, external_id, "tv") for raw in all_cards
                   for provider, external_id in (media_identity(raw),) if provider}
-    watched = database.list_media_watchlist_keys(list(identities)) if identities else set()
+    watched = discovery_repo.list_media_watchlist_keys(list(identities)) if identities else set()
 
     def card_payload(raw):
         card = dict(raw)

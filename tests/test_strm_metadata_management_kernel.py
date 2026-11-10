@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app import config, database as db, sdk
+from app.repositories import strm as strm_repo
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import ToolCatalog
@@ -30,7 +31,7 @@ def metadata_backend(tmp_path, monkeypatch):
     with initialized_web_runtime() as paths:
         config.set_and_save({"STRM_METADATA_ENABLED": "false"})
         worker = Mock()
-        worker.status.side_effect = lambda: {**db.count_strm_metadata_jobs(),
+        worker.status.side_effect = lambda: {**strm_repo.count_strm_metadata_jobs(),
             "enabled": config.get_bool("STRM_METADATA_ENABLED", False),
             "worker_running": True, "consumer_active": True}
         monkeypatch.setattr("app.modules.strm_metadata_worker.get_strm_metadata_worker", lambda: worker)
@@ -55,7 +56,7 @@ def _states():
 
 
 def test_queue_cancel_prepares_and_rechecks_after_explicit_confirmation(metadata_backend):
-    db.enqueue_strm_metadata_jobs([_job(file_id="old")])
+    strm_repo.enqueue_strm_metadata_jobs([_job(file_id="old")])
     existing = metadata_backend.root / "movie.nfo"
     existing.write_text("existing metadata")
     async def check():
@@ -68,7 +69,7 @@ def test_queue_cancel_prepares_and_rechecks_after_explicit_confirmation(metadata
         other = await _context(store, owner="webk:v1:" + "b" * 64)
         with pytest.raises(ToolPipelineError):
             await effects.execute_confirmed(plan.plan_id, context=other)
-        db.enqueue_strm_metadata_jobs([_job(file_id="new")])
+        strm_repo.enqueue_strm_metadata_jobs([_job(file_id="new")])
         effects = _executor(SQLiteKernelStore())
         restored = await effects.get_pending_plan(owner=context.owner, session_id=context.session_id)
         assert restored is not None and restored.plan_id == plan.plan_id
@@ -85,24 +86,24 @@ def test_queue_cancel_prepares_and_rechecks_after_explicit_confirmation(metadata
 
 
 def test_changed_snapshot_fails_closed_in_confirmation_pipeline(metadata_backend):
-    db.enqueue_strm_metadata_jobs([_job()])
+    strm_repo.enqueue_strm_metadata_jobs([_job()])
     async def check():
         store = SQLiteKernelStore()
         context = await _context(store)
         effects = _executor(store)
         plan = (await effects.prepare("strm.cancel_metadata_pending", {}, context=context)).effect_plan
         assert plan is not None
-        db.enqueue_strm_metadata_jobs([_job(etag="changed")])
+        strm_repo.enqueue_strm_metadata_jobs([_job(etag="changed")])
         with pytest.raises(ToolPipelineError) as error:
             await effects.execute_confirmed(plan.plan_id, context=context)
         assert error.value.code == "confirmation_stale" and error.value.execution_started is False
-        assert db.count_strm_metadata_jobs()["queued"] == 1
+        assert strm_repo.count_strm_metadata_jobs()["queued"] == 1
     asyncio.run(check())
 
 
 def test_disable_does_not_cancel_queue_or_kill_running(metadata_backend):
     config.set_and_save({"STRM_METADATA_ENABLED": "true"})
-    db.enqueue_strm_metadata_jobs([_job(file_id="queued"), _job(file_id="running")])
+    strm_repo.enqueue_strm_metadata_jobs([_job(file_id="queued"), _job(file_id="running")])
     with db.get_conn() as conn:
         conn.execute("UPDATE strm_metadata_queue SET status='running' WHERE file_id='running'")
     async def check():
@@ -156,7 +157,7 @@ def test_policy_rejections_and_unknown_results_keep_truthful_receipts(metadata_b
                 assert "provider boundary" not in str(error.value)
             elif change in {"expiry", "config"}:
                 assert error.value.code == "confirmation_stale" and error.value.execution_started is False
-        assert db.count_strm_metadata_jobs()["total"] == 0
+        assert strm_repo.count_strm_metadata_jobs()["total"] == 0
     asyncio.run(check())
 
 
@@ -173,18 +174,18 @@ def test_empty_queue_prepare_has_no_false_used_confirmation_receipt(metadata_bac
 
 
 def test_plain_sdk_control_and_status_use_public_service(metadata_backend):
-    db.enqueue_strm_metadata_jobs([_job()])
+    strm_repo.enqueue_strm_metadata_jobs([_job()])
     with sdk.call_owner(OWNER):
         assert sdk.strm.metadata_status()["queued"] == 1
         policy = sdk.strm.set_metadata_enabled(False)
         assert policy["verified"] is True and policy["enabled"] is False
         cancelled = sdk.strm.cancel_metadata_pending()
     assert cancelled["cancelled"] == 1 and cancelled["files_deleted"] == 0
-    assert db.count_strm_metadata_jobs()["cancelled"] == 1
+    assert strm_repo.count_strm_metadata_jobs()["cancelled"] == 1
 
 
 def test_concurrent_native_confirmations_cancel_only_one_frozen_set(metadata_backend):
-    db.enqueue_strm_metadata_jobs([_job()])
+    strm_repo.enqueue_strm_metadata_jobs([_job()])
     async def check():
         store = SQLiteKernelStore()
         contexts = [await _context(store, session=name) for name in ("first", "second")]
@@ -202,4 +203,4 @@ def test_concurrent_native_confirmations_cancel_only_one_frozen_set(metadata_bac
         assert successful[0]["data"]["cancelled"] == 1 and successful[0]["status"] == "completed"
         assert rejected[0].code == "confirmation_stale" and rejected[0].execution_started is False
     asyncio.run(check())
-    assert db.count_strm_metadata_jobs()["cancelled"] == 1
+    assert strm_repo.count_strm_metadata_jobs()["cancelled"] == 1

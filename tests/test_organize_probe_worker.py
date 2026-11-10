@@ -11,6 +11,7 @@ from dataclasses import asdict
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizeRules, organize_rules_snapshot
 from app.modules.organize_probe_worker import OrganizeProbeWorker
@@ -105,29 +106,29 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
 
     def test_queue_is_persistent_and_recovers_running_job(self):
         log_id = self._create_log()
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="动漫/示例/Season 1",
             rules=asdict(OrganizeRules(target_dir_id="target")), delay_seconds=130,
         )
         self._make_due()
 
-        claimed = db.claim_due_organize_probe_jobs(owner="test", limit=1)
+        claimed = organize_probe_repo.claim_due_organize_probe_jobs(owner="test", limit=1)
         self.assertEqual([item["id"] for item in claimed], [job_id])
-        self.assertEqual(db.recover_stale_organize_probe_jobs(force=True), 1)
-        self.assertEqual(db.count_organize_probe_jobs()["retry_wait"], 1)
+        self.assertEqual(organize_probe_repo.recover_stale_organize_probe_jobs(force=True), 1)
+        self.assertEqual(organize_probe_repo.count_organize_probe_jobs()["retry_wait"], 1)
 
     def test_startup_recovery_retries_before_consuming_orphaned_jobs(self):
-        job_id = db.enqueue_organize_probe_completion(
+        job_id = organize_probe_repo.enqueue_organize_probe_completion(
             self._create_log(), source_id="target", rel_dir="动漫/示例/Season 1",
             rules=asdict(OrganizeRules(target_dir_id="target")), delay_seconds=0,
         )
         self._make_due()
         self.assertEqual(
-            [row["id"] for row in db.claim_due_organize_probe_jobs(owner="old", limit=1)],
+            [row["id"] for row in organize_probe_repo.claim_due_organize_probe_jobs(owner="old", limit=1)],
             [job_id],
         )
         worker = OrganizeProbeWorker()
-        recovered = db.recover_stale_organize_probe_jobs
+        recovered = organize_probe_repo.recover_stale_organize_probe_jobs
         wait = worker._wake_event.wait
         claimed: list[int] = []
         errors: list[threading.ExceptHookArgs] = []
@@ -143,14 +144,14 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         def consume():
             self.assertEqual(attempts, 3)
             self._make_due()
-            claimed.extend(row["id"] for row in db.claim_due_organize_probe_jobs(
+            claimed.extend(row["id"] for row in organize_probe_repo.claim_due_organize_probe_jobs(
                 owner=worker._owner, limit=1,
             ))
             worker._stop_event.set()
             return False
 
         with patch("threading.excepthook", side_effect=errors.append), patch(
-            "app.modules.organize_probe_worker.db.recover_stale_organize_probe_jobs",
+            "app.repositories.organize_probe.recover_stale_organize_probe_jobs",
             side_effect=recover,
         ) as recovery, patch.object(worker, "_process_one", side_effect=consume) as process, patch.object(
             worker._wake_event, "wait", side_effect=lambda timeout: wait(min(timeout, 0.01)),
@@ -177,7 +178,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
             raise sqlite3.OperationalError("database is locked")
 
         with patch("threading.excepthook", side_effect=errors.append), patch(
-            "app.modules.organize_probe_worker.db.recover_stale_organize_probe_jobs",
+            "app.repositories.organize_probe.recover_stale_organize_probe_jobs",
             side_effect=unavailable,
         ), patch.object(worker, "_process_one") as process:
             worker.start()
@@ -194,7 +195,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         configured = OrganizeRules(
             target_dir_id="target", nsfw_metatube_token="server-secret",
         )
-        db.enqueue_organize_probe_completion(
+        organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="电影/测试",
             rules=organize_rules_snapshot(configured), delay_seconds=130,
         )
@@ -216,7 +217,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         from app.modules.media_probe import MediaProfile
 
         log_id = self._create_log()
-        db.enqueue_organize_probe_completion(
+        organize_probe_repo.enqueue_organize_probe_completion(
             log_id,
             source_id="target",
             rel_dir="动漫/筋肉人：完美超人始祖篇 (2024) {tmdb-236000}/Season 1",
@@ -261,7 +262,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["current_name"], expected)
         items = [dict(item) for item in db.list_organize_log_items(log_id)]
         self.assertEqual(items[0]["current_name"], expected)
-        self.assertEqual(db.count_organize_probe_jobs()["completed"], 1)
+        self.assertEqual(organize_probe_repo.count_organize_probe_jobs()["completed"], 1)
         linked.assert_called_once()
         changes = linked.call_args.args[0]["strm_changes"]
         self.assertEqual({item["file_id"] for item in changes}, {"video-15", "subtitle-15"})
@@ -270,7 +271,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         from app.modules.media_probe import MediaProfile
 
         log_id = self._create_log()
-        db.enqueue_organize_probe_completion(
+        organize_probe_repo.enqueue_organize_probe_completion(
             log_id, source_id="target", rel_dir="动漫/示例/Season 1",
             rules=asdict(OrganizeRules(target_dir_id="target")), delay_seconds=130,
         )
@@ -290,7 +291,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         ):
             self.assertTrue(worker._process_one())
 
-        self.assertEqual(db.count_organize_probe_jobs()["cancelled"], 1)
+        self.assertEqual(organize_probe_repo.count_organize_probe_jobs()["cancelled"], 1)
         self.assertEqual(client.renames, [])
 
     def test_stop_does_not_discard_worker_restarted_during_join(self):

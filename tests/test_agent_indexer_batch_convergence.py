@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
 from app.indexers import downloads
 from app.indexers.downloads import download_indexer_result_public
 from app.indexers.models import ResolvedDownload
@@ -68,11 +70,11 @@ class BatchConvergenceTests(unittest.TestCase):
 
         def remote_submit(row, **kwargs):
             self.assertCountEqual(resolved_ids, [FIRST, ALIAS], "写入前必须完成整批只读解析")
-            get_download_request_result = db.get_download_request(row["id"])
+            get_download_request_result = download_requests_repo.get_download_request(row["id"])
             assert get_download_request_result is not None
             self.assertEqual(get_download_request_result["status"], "submitting")
             if verification_targets:
-                saved = db.get_agent_download_verification(row["id"])
+                saved = agent_download_verification_repo.get_agent_download_verification(row["id"])
                 self.assertIsNotNone(saved, "远端写入前必须已持久保存复核意图")
                 self.assertEqual(saved["owner"], "batch-owner")
                 persisted_before_write.extend(saved["targets"])
@@ -127,7 +129,7 @@ class BatchConvergenceTests(unittest.TestCase):
                     })
                     self.assert_merged(result, first, alias, "submitted")
                     db.init_db()
-                    saved = db.get_agent_download_verification(first["request_id"])
+                    saved = agent_download_verification_repo.get_agent_download_verification(first["request_id"])
                     assert saved is not None
                     self.assertEqual({item["episode"] for item in saved["targets"]}, {2, 3})
                     self.assertEqual(saved["owner"], "batch-owner")
@@ -161,7 +163,7 @@ class BatchConvergenceTests(unittest.TestCase):
                  "as_of": "2026-08-03", "library_name": ""}
         def remote(row, **kwargs):
             self.assertEqual(row["id"], existing["id"])
-            saved = db.get_agent_download_verification(row["id"])
+            saved = agent_download_verification_repo.get_agent_download_verification(row["id"])
             assert saved is not None
             self.assertEqual({target["episode"] for target in saved["targets"]}, {2, 3})
             return {"ok": True, "task_id": "hybrid-qb"}
@@ -179,8 +181,8 @@ class BatchConvergenceTests(unittest.TestCase):
         existing = dispatcher.create_request(item, "", "", origin="agent:nyaa")
         for phase in ("pending", "submitted"):
             with self.subTest(phase=phase):
-                db.update_download_request(existing["id"], status=phase, targets="qb", qb_status=phase)
-                with patch.object(db, "enqueue_agent_download_verification", return_value="not_eligible"), \
+                download_requests_repo.update_download_request(existing["id"], status=phase, targets="qb", qb_status=phase)
+                with patch.object(agent_download_verification_repo, "enqueue_agent_download_verification", return_value="not_eligible"), \
                      patch.object(dispatcher, "_submit_qb") as qb, patch.object(dispatcher, "_submit_guangya") as gy:
                     with self.assertRaises(downloads.IndexerValidationError):
                         downloads.submit_download_input(item, "both", origin="agent:nyaa",
@@ -200,7 +202,7 @@ class BatchConvergenceTests(unittest.TestCase):
         request_ids = []
         def remote(row, **kwargs):
             request_ids.append(row["id"])
-            saved = db.get_agent_download_verification(row["id"])
+            saved = agent_download_verification_repo.get_agent_download_verification(row["id"])
             assert saved is not None
             self.assertEqual({target["episode"] for target in saved["targets"]}, {2, 3})
             raise ProcessExit("remote accepted before local receipt")
@@ -208,7 +210,7 @@ class BatchConvergenceTests(unittest.TestCase):
             with self.assertRaises(ProcessExit):
                 self.submit(service, [FIRST, ALIAS], "qb", verification_targets=targets, verification_owner="batch-owner")
             db.init_db()
-            saved = db.get_agent_download_verification(request_ids[0])
+            saved = agent_download_verification_repo.get_agent_download_verification(request_ids[0])
             assert saved is not None
             self.assertEqual({target["episode"] for target in saved["targets"]}, {2, 3})
             replay = self.submit(service, [FIRST, ALIAS], "qb", verification_targets=targets, verification_owner="batch-owner")
@@ -241,7 +243,7 @@ class BatchConvergenceTests(unittest.TestCase):
 
     def test_duplicate_failure_uses_final_submission_not_submitting(self):
         result, first, alias = self.run_overlap({"ok": False, "error": "synthetic-private-detail"})
-        get_download_request_result_2 = db.get_download_request(first["request_id"])
+        get_download_request_result_2 = download_requests_repo.get_download_request(first["request_id"])
         assert get_download_request_result_2 is not None
         self.assertEqual(get_download_request_result_2["status"], "failed")
         self.assert_merged(result, first, alias, "failed")
@@ -277,7 +279,7 @@ class BatchConvergenceTests(unittest.TestCase):
         assert result["error"] is not None
         self.assertIn("勿直接重复提交", result["error"])
         self.assertFalse(alias["can_resubmit"])
-        original = db.get_download_request(first["request_id"])
+        original = download_requests_repo.get_download_request(first["request_id"])
         assert original is not None
         self.assertEqual(original["gy_status"], "outcome_unknown")
         async def resolve(_result_id, *, scope):
@@ -287,7 +289,7 @@ class BatchConvergenceTests(unittest.TestCase):
         remote.assert_not_called()
         self.assertEqual([item["existing_status"] for item in repeated["items"]], [original["status"]] * 2)
         self.assertEqual((repeated["status"], repeated["succeeded"]), ("conflict", 0))
-        self.assertEqual(db.get_download_request(first["request_id"]), original)
+        self.assertEqual(download_requests_repo.get_download_request(first["request_id"]), original)
         self.assertEqual(self.request_count(), 1)
 
     def test_pending_request_reuse_can_supply_final_result_without_created(self):
@@ -299,7 +301,7 @@ class BatchConvergenceTests(unittest.TestCase):
         existing = dispatcher.create_request(
             dispatcher.normalize_download_url(MAGNET), "other-chat", "", user_id="other-owner"
         )
-        self.assertTrue(db.claim_download_request(existing["id"], "guangya"))
+        self.assertTrue(download_requests_repo.claim_download_request(existing["id"], "guangya"))
 
         async def resolve(result_id, *, scope="manual"):
             return ResolvedDownload("magnet", MAGNET if result_id == ALIAS else MAGNET.replace("a" * 40, "b" * 40))
@@ -316,7 +318,7 @@ class BatchConvergenceTests(unittest.TestCase):
         self.assertEqual(result.get("merged", 0), 0)
         self.assertEqual(result["status"], "partial")
         self.assertNotIn("other-owner", str(result))
-        get_download_request_result_3 = db.get_download_request(existing["id"])
+        get_download_request_result_3 = download_requests_repo.get_download_request(existing["id"])
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3["status"], "submitting")
 
@@ -324,7 +326,7 @@ class BatchConvergenceTests(unittest.TestCase):
         existing = dispatcher.create_request(
             dispatcher.normalize_download_url(MAGNET), "", "", origin="agent:nyaa"
         )
-        self.assertTrue(db.claim_download_request(existing["id"], "guangya"))
+        self.assertTrue(download_requests_repo.claim_download_request(existing["id"], "guangya"))
 
         async def resolve(result_id, *, scope="manual"):
             return ResolvedDownload("magnet", MAGNET)
@@ -350,10 +352,10 @@ class BatchConvergenceTests(unittest.TestCase):
         self.assertEqual(items[1]["status"], "duplicate")
         before = copy.deepcopy(items)
         # 已有真实分发结果后，反馈收敛不得再查询其它 owner 或全局请求状态。
-        with patch.object(db, "get_download_request", side_effect=AssertionError("不得查询全局任务")):
+        with patch.object(download_requests_repo, "get_download_request", side_effect=AssertionError("不得查询全局任务")):
             self.assertEqual(downloads._converge_batch_duplicates(items), 0)
         self.assertEqual(items, before)
-        get_download_request_result_4 = db.get_download_request(existing["id"])
+        get_download_request_result_4 = download_requests_repo.get_download_request(existing["id"])
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["gy_status"], "submitting")
 
@@ -514,7 +516,7 @@ class BatchConvergenceTests(unittest.TestCase):
             repeated = self.submit(service, [FIRST], "qb")
         self.assertEqual(backend.call_count, 1)
         self.assertEqual(repeated["items"][0]["existing_status"], "submitted")
-        row = db.get_download_request(repeated["items"][0]["request_id"])
+        row = download_requests_repo.get_download_request(repeated["items"][0]["request_id"])
         assert row is not None
         self.assertEqual(row["qb_task_id"], "a" * 40)
 
@@ -541,7 +543,7 @@ class BatchConvergenceTests(unittest.TestCase):
                         self.submit(self.service(resolve), [FIRST], "both", check_cancelled=check_cancelled)
                 qb.assert_called_once()
                 gy.assert_not_called()
-                row = db.get_download_request(qb.call_args.args[0]["id"])
+                row = download_requests_repo.get_download_request(qb.call_args.args[0]["id"])
                 assert row is not None
                 self.assertEqual(row["qb_status"], "outcome_unknown" if unknown else "submitted")
                 self.assertEqual(row["qb_task_id"], ("c" if unknown else "d") * 40)
@@ -617,7 +619,7 @@ class BatchConvergenceTests(unittest.TestCase):
         with patch.object(dispatcher, "_submit_qb", side_effect=asyncio.CancelledError) as backend:
             with self.assertRaises(asyncio.CancelledError):
                 self.submit(self.service(resolve), [FIRST], "qb", check_cancelled=lambda: None)
-        row = db.get_download_request(backend.call_args.args[0]["id"])
+        row = download_requests_repo.get_download_request(backend.call_args.args[0]["id"])
         assert row is not None
         self.assertEqual(row["status"], "submitting")
         self.assertEqual(row["qb_status"], "submitting")

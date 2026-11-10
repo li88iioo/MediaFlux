@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 import pytest
 
 from app import database as db
+from app.repositories import strm as strm_repo
+from app.repositories import local_media as local_media_repo
 from app.clients.emby import EmbyClient
 from app.clients.guangya import GuangYaFile
 from app.clients.jellyfin import JellyfinClient
@@ -196,11 +198,11 @@ def drain_refresh(endpoint, *, owner="audit-consumer", now_epoch=None):
 def assert_strm_refresh_delivery(worker, root, targets, series, *, allow_emby):
     """验证持久交接与真实客户端的最终作品范围，仅替换外部 HTTP。"""
     targets = {str(path) for path in targets}
-    assert {(entry["path"], entry["allow_emby"]) for entry in db.list_strm_refresh_entries()} == {
+    assert {(entry["path"], entry["allow_emby"]) for entry in strm_repo.list_strm_refresh_entries()} == {
         (path, allow_emby) for path in targets
     }
     worker._flush_media_refresh(force=True)
-    assert db.count_strm_refresh_paths() == 0
+    assert strm_repo.count_strm_refresh_paths() == 0
     providers = (("jellyfin", "emby") if allow_emby else ("jellyfin",)) if targets else ()
     assert queue.media_refresh_queue_status()["paths"] == len(targets) * len(providers)
     endpoint = MediaEndpoint(root, series=series)
@@ -322,10 +324,10 @@ def test_normal_local_recognition_move_probe_and_refresh(tmp_path):
                 name = f"Audit.Series.S01E{n:02d}.{ext}"
                 contents[name] = f"{ext}-episode-{n}".encode()
                 (source / name).write_bytes(contents[name])
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             "audit", "", "", str(source), media_type="tv"
         )
-        db.upsert_local_library_target(
+        local_media_repo.upsert_local_library_target(
             source_id,
             "tv",
             str(target),
@@ -377,8 +379,8 @@ def test_normal_local_recognition_move_probe_and_refresh(tmp_path):
             assert all("1080p" in p.name for p in moved if p.suffix == ".mkv")
             assert list(source.iterdir()) == []
             assert preview_probe.call_count + probe.call_count == 2
-            assert len(db.list_local_media_operation_steps(task_id)) == 4
-            get_local_media_task_result = db.get_local_media_task(task_id)
+            assert len(local_media_repo.list_local_media_operation_steps(task_id)) == 4
+            get_local_media_task_result = local_media_repo.get_local_media_task(task_id)
             assert get_local_media_task_result is not None
             assert get_local_media_task_result.status == "completed"
             assert queue.media_refresh_queue_status()["paths"] == 1
@@ -413,11 +415,11 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
             assert result["generated"] == 4 and result["metadata_queued"] == 4, result
             assert cloud.list_calls == 1 and cloud.info_calls == 0
             # 先交接视频意图，避免同目录已有记录掩盖元数据完成后的漏交接。
-            assert {(entry["path"], entry["allow_emby"]) for entry in db.list_strm_refresh_entries()} == {
+            assert {(entry["path"], entry["allow_emby"]) for entry in strm_repo.list_strm_refresh_entries()} == {
                 (str(path), allow_emby) for path in targets
             }
             worker._flush_media_refresh(force=True)
-            assert db.count_strm_refresh_paths() == 0
+            assert strm_repo.count_strm_refresh_paths() == 0
             assert queue.media_refresh_queue_status()["paths"] == len(targets) * (2 if allow_emby else 1)
             for _ in range(4):
                 assert worker._process_one()
@@ -429,10 +431,10 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
                 )
             assert all(
                 dict(row)["status"] == "completed"
-                for row in db.list_strm_metadata_queue(status="all")
+                for row in strm_repo.list_strm_metadata_queue(status="all")
             )
-            assert len(db.list_strm_index("guangya:audit")) == 4
-            assert len(db.list_strm_index("guangya-meta:audit")) == 4
+            assert len(strm_repo.list_strm_index("guangya:audit")) == 4
+            assert len(strm_repo.list_strm_index("guangya-meta:audit")) == 4
             # 视频安装与元数据交接均走冻结策略；同目录只交接一次。
             assert_strm_refresh_delivery(
                 worker, root, targets,
@@ -442,7 +444,7 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
             assert repeated["generated"] == repeated["metadata_queued"] == 0
             assert repeated["skipped"] == repeated["metadata_skipped"] == 4
             assert worker._process_one() is False
-            assert db.count_strm_refresh_paths() == queue.media_refresh_queue_status()["paths"] == 0
+            assert strm_repo.count_strm_refresh_paths() == queue.media_refresh_queue_status()["paths"] == 0
             assert not list(root.rglob("*.part"))
 
 
@@ -461,7 +463,7 @@ def test_batch_metadata_path_migration_keeps_both_refresh_intents(tmp_path, allo
         with cloud_runtime(cloud, root, providers=("jellyfin", "emby")):
             old = None
             for directory in ("Old Series/Season 01", "New Series/Season 01"):
-                db.enqueue_strm_metadata_jobs(
+                strm_repo.enqueue_strm_metadata_jobs(
                     [
                         strm._metadata_queue_payload(
                             file,
@@ -476,10 +478,10 @@ def test_batch_metadata_path_migration_keeps_both_refresh_intents(tmp_path, allo
                 )
                 assert worker._process_one()
                 if directory.startswith("Old"):
-                    old = Path(db.list_strm_index("guangya-meta:audit")[0]["strm_path"])
+                    old = Path(strm_repo.list_strm_index("guangya-meta:audit")[0]["strm_path"])
                     assert old.is_file()
-                    db.acknowledge_strm_refresh_paths(db.list_strm_refresh_entries())
-            new = Path(db.list_strm_index("guangya-meta:audit")[0]["strm_path"])
+                    strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
+            new = Path(strm_repo.list_strm_index("guangya-meta:audit")[0]["strm_path"])
             assert old is not None
             assert not old.exists()
             assert new.read_bytes() == cloud.paths["nfo-1"].read_bytes()
@@ -497,7 +499,7 @@ def test_interrupt_metadata_ack_crash_reuses_verified_installation(tmp_path):
         root = tmp_path / "strm"
         root.mkdir()
         file = cloud.files["nfo-1"]
-        db.enqueue_strm_metadata_jobs(
+        strm_repo.enqueue_strm_metadata_jobs(
             [
                 strm._metadata_queue_payload(
                     file,
@@ -512,26 +514,26 @@ def test_interrupt_metadata_ack_crash_reuses_verified_installation(tmp_path):
         first._client = cast(GuangYaClient, cloud)
         with cloud_runtime(cloud, root):
             with patch.object(
-                db,
+                strm_repo,
                 "settle_strm_metadata_job",
                 side_effect=SystemExit("crash before ACK"),
             ):
                 with pytest.raises(SystemExit):
                     first._process_one()
-            path = Path(db.list_strm_index("guangya-meta:audit")[0]["strm_path"])
+            path = Path(strm_repo.list_strm_index("guangya-meta:audit")[0]["strm_path"])
             installed = path.stat()
             assert path.read_bytes() == cloud.paths["nfo-1"].read_bytes()
-            assert db.list_strm_metadata_queue(status="all")[0]["status"] == "running"
-            assert db.count_strm_refresh_paths() == 0
-            assert db.recover_stale_strm_metadata_jobs(force=True) == 1
+            assert strm_repo.list_strm_metadata_queue(status="all")[0]["status"] == "running"
+            assert strm_repo.count_strm_refresh_paths() == 0
+            assert strm_repo.recover_stale_strm_metadata_jobs(force=True) == 1
             restarted = metadata.STRMMetadataWorker()
             restarted._client = cast(GuangYaClient, cloud)
             restarted._last_refresh_at = metadata.time.monotonic()
             assert restarted._process_one()
             assert path.stat().st_ino == installed.st_ino
             assert path.stat().st_mtime_ns == installed.st_mtime_ns
-            assert db.list_strm_metadata_queue(status="all")[0]["status"] == "completed"
-            assert db.count_strm_refresh_paths() == 1
+            assert strm_repo.list_strm_metadata_queue(status="all")[0]["status"] == "completed"
+            assert strm_repo.count_strm_refresh_paths() == 1
             assert cloud.download_calls == 1, "已落盘且指纹确认的元数据恢复不应再次下载"
             assert restarted._process_one() is False
 
@@ -561,7 +563,7 @@ def test_interrupt_cancel_restart_finishes_only_uncommitted_files(tmp_path):
                 first.stat().st_mtime_ns,
             ) == original
             assert len(list(root.rglob("*.strm"))) == 4
-            assert len(db.list_strm_index("guangya:audit")) == 4
+            assert len(strm_repo.list_strm_index("guangya:audit")) == 4
 
 
 def test_interrupt_refresh_outbox_ack_and_media_failure_replay(tmp_path):
@@ -572,22 +574,22 @@ def test_interrupt_refresh_outbox_ack_and_media_failure_replay(tmp_path):
             p = Path(path)
             p.parent.mkdir()
             p.write_text("http://play.invalid/fixture")
-        db.enqueue_strm_refresh_paths(paths)
+        strm_repo.enqueue_strm_refresh_paths(paths)
         worker = metadata.STRMMetadataWorker()
         with patch.object(
             refresh, "_configured_provider_names", return_value=("jellyfin",)
         ):
             with patch.object(
-                db,
+                strm_repo,
                 "acknowledge_strm_refresh_paths",
                 side_effect=OSError("ACK unavailable"),
             ):
                 worker._flush_media_refresh(force=True)
-            assert db.count_strm_refresh_paths() == 3
+            assert strm_repo.count_strm_refresh_paths() == 3
             assert queue.media_refresh_queue_status()["paths"] == 3
             restarted = metadata.STRMMetadataWorker()
             restarted._flush_media_refresh(force=True)
-            assert db.count_strm_refresh_paths() == 0
+            assert strm_repo.count_strm_refresh_paths() == 0
             assert queue.media_refresh_queue_status()["paths"] == 3
         claimed = queue.claim_due_media_refreshes(owner="dead-consumer", force=True)
         assert len(claimed) == 1
@@ -617,7 +619,7 @@ def test_history_strm_index_backfill_and_old_path_recovery(tmp_path):
             "audit", video, "http://play.invalid", str(root), client=cast(GuangYaClient, cloud)
         )
         assert first["generated"] == 1
-        old = Path(db.list_strm_index("guangya:audit")[0]["strm_path"])
+        old = Path(strm_repo.list_strm_index("guangya:audit")[0]["strm_path"])
         snapshot = (old.read_bytes(), old.stat().st_ino, old.stat().st_mtime_ns)
         with db.get_conn() as conn:
             conn.execute(
@@ -626,14 +628,14 @@ def test_history_strm_index_backfill_and_old_path_recovery(tmp_path):
         restored = strm.sync_strm_incremental(
             "audit", video, "http://play.invalid", str(root), client=cast(GuangYaClient, cloud)
         )
-        row = dict(db.list_strm_index("guangya:audit")[0])
+        row = dict(strm_repo.list_strm_index("guangya:audit")[0])
         assert restored["skipped"] == 1 and restored["generated"] == 0
         assert row["content_fingerprint"].startswith("sha256:")
         assert (old.read_bytes(), old.stat().st_ino, old.stat().st_mtime_ns) == snapshot
         new = old.parent.parent / "New Season" / old.name
         new.parent.mkdir()
         new.write_bytes(old.read_bytes())
-        db.upsert_strm_index(
+        strm_repo.upsert_strm_index(
             row["source"],
             row["file_id"],
             row["etag"],
@@ -642,7 +644,7 @@ def test_history_strm_index_backfill_and_old_path_recovery(tmp_path):
             str(new),
             row["content_fingerprint"],
         )
-        assert len(db.list_strm_path_cleanup("guangya:audit")) == 1
+        assert len(strm_repo.list_strm_path_cleanup("guangya:audit")) == 1
         stats = dict(
             cleaned=0,
             metadata_cleaned=0,
@@ -655,18 +657,18 @@ def test_history_strm_index_backfill_and_old_path_recovery(tmp_path):
             str(root),
             stats,
             valid_ids={row["file_id"]},
-            on_refresh_paths=db.enqueue_strm_refresh_paths,
+            on_refresh_paths=strm_repo.enqueue_strm_refresh_paths,
         )
         assert not old.exists() and new.read_bytes() == snapshot[0]
         assert stats["cleaned"] == 1
-        assert db.list_strm_path_cleanup("guangya:audit") == []
-        assert db.count_strm_refresh_paths() == 1
+        assert strm_repo.list_strm_path_cleanup("guangya:audit") == []
+        assert strm_repo.count_strm_refresh_paths() == 1
         recover_pending_paths(
             "guangya:audit",
             str(root),
             stats,
             valid_ids={row["file_id"]},
-            on_refresh_paths=db.enqueue_strm_refresh_paths,
+            on_refresh_paths=strm_repo.enqueue_strm_refresh_paths,
         )
         assert stats["cleaned"] == 1
 

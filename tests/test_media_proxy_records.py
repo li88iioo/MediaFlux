@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import media_proxy as media_proxy_repo
 from app.main import create_app
 from app.modules import media_proxy
 from app.modules.media_proxy_safety import safe_media_name
@@ -907,7 +908,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM media_proxy_playback_records")
             conn.execute("DELETE FROM media_proxy_playback_sessions")
             conn.execute("DELETE FROM media_proxy_instances")
-        self.instance_id = db.add_media_proxy_instance(
+        self.instance_id = media_proxy_repo.add_media_proxy_instance(
             name="测试反代",
             server_type="jellyfin",
             config_source="custom",
@@ -920,7 +921,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         )
 
     def test_record_is_redacted_and_list_never_returns_urls_or_credentials(self):
-        record_id = db.record_media_proxy_playback_attempt(
+        record_id = media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             route_class="guangya_direct",
             method="GET",
@@ -936,7 +937,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             ),
         )
 
-        result = db.list_media_proxy_playback_records(instance_id=self.instance_id)
+        result = media_proxy_repo.list_media_proxy_playback_records(instance_id=self.instance_id)
 
         self.assertEqual(result["total"], 1)
         row = result["items"][0]
@@ -947,7 +948,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         self.assertNotIn("url", {key.lower() for key in row.keys()})
 
     def test_authority_only_media_url_never_leaks_credentials(self):
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             playback_session_key="authority-only",
             media_item_id="item-authority",
@@ -961,7 +962,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             source="playback_info",
         )
 
-        summary = db.list_media_proxy_playback_sessions(
+        summary = media_proxy_repo.list_media_proxy_playback_sessions(
             instance_id=self.instance_id
         )["items"][0]
         serialized = json.dumps(dict(summary), ensure_ascii=False)
@@ -970,7 +971,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             self.assertNotIn(secret, serialized)
 
     def test_encoded_media_url_is_reduced_to_safe_filename(self):
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             playback_session_key="encoded-url",
             media_item_id="item-encoded",
@@ -984,7 +985,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             source="playback_info",
         )
 
-        summary = db.list_media_proxy_playback_sessions(
+        summary = media_proxy_repo.list_media_proxy_playback_sessions(
             instance_id=self.instance_id
         )["items"][0]
         serialized = json.dumps(dict(summary), ensure_ascii=False)
@@ -995,7 +996,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             self.assertNotIn(secret, serialized)
 
     def test_opaque_uri_media_name_is_not_persisted(self):
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             playback_session_key="opaque-uri",
             media_item_id="item-opaque",
@@ -1006,7 +1007,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             source="playback_info",
         )
 
-        summary = db.list_media_proxy_playback_sessions(
+        summary = media_proxy_repo.list_media_proxy_playback_sessions(
             instance_id=self.instance_id
         )["items"][0]
         serialized = json.dumps(dict(summary), ensure_ascii=False)
@@ -1016,7 +1017,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
 
     def test_filters_pagination_and_confirmed_clear(self):
         for status, source in ((302, "guangya"), (206, "upstream"), (502, "upstream")):
-            db.record_media_proxy_playback_attempt(
+            media_proxy_repo.record_media_proxy_playback_attempt(
                 instance_id=self.instance_id,
                 route_class="stream",
                 method="GET",
@@ -1024,7 +1025,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
                 source=source,
             )
 
-        page = db.list_media_proxy_playback_records(
+        page = media_proxy_repo.list_media_proxy_playback_records(
             instance_id=self.instance_id,
             status="error",
             source="upstream",
@@ -1033,14 +1034,14 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["items"][0]["status_code"], 502)
-        legacy = db.list_media_proxy_playback_sessions(instance_id=self.instance_id)
+        legacy = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=self.instance_id)
         self.assertEqual(legacy["total"], 0)
         self.assertEqual(legacy["unlinked_total"], 3)
-        self.assertEqual(db.clear_media_proxy_playback_records(instance_id=self.instance_id), 3)
+        self.assertEqual(media_proxy_repo.clear_media_proxy_playback_records(instance_id=self.instance_id), 3)
 
     def test_session_status_filter_uses_final_outcome_after_a_retry(self):
         for status in (502, 206):
-            db.record_media_proxy_playback_attempt(
+            media_proxy_repo.record_media_proxy_playback_attempt(
                 instance_id=self.instance_id,
                 playback_session_key="recovered-session",
                 media_item_id="item-recovered",
@@ -1050,10 +1051,10 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
                 source="upstream",
             )
 
-        success = db.list_media_proxy_playback_sessions(
+        success = media_proxy_repo.list_media_proxy_playback_sessions(
             instance_id=self.instance_id, status="success"
         )
-        failure = db.list_media_proxy_playback_sessions(
+        failure = media_proxy_repo.list_media_proxy_playback_sessions(
             instance_id=self.instance_id, status="error"
         )
 
@@ -1062,7 +1063,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(failure["total"], 0)
 
     def test_same_session_is_aggregated_while_request_details_remain_available(self):
-        first_id = db.record_media_proxy_playback_attempt(
+        first_id = media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             playback_session_key="session-digest-1",
             media_item_id="item-1",
@@ -1078,7 +1079,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             upstream_latency_ms=24,
             total_latency_ms=30,
         )
-        second_id = db.record_media_proxy_playback_attempt(
+        second_id = media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             playback_session_key="session-digest-1",
             media_item_id="item-1",
@@ -1092,7 +1093,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             upstream_latency_ms=7,
             total_latency_ms=10,
         )
-        relay_id = db.record_media_proxy_playback_attempt(
+        relay_id = media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
             playback_session_key="session-digest-1",
             media_item_id="item-1",
@@ -1107,7 +1108,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             total_latency_ms=90,
         )
 
-        sessions = db.list_media_proxy_playback_sessions(instance_id=self.instance_id)
+        sessions = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=self.instance_id)
 
         self.assertEqual(sessions["total"], 1)
         summary = sessions["items"][0]
@@ -1127,7 +1128,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(summary["average_redirect_latency_ms"], 10)
         self.assertEqual(summary["relay_request_count"], 1)
         self.assertEqual(summary["average_relay_latency_ms"], 90)
-        details = db.list_media_proxy_playback_records(session_id=summary["id"])
+        details = media_proxy_repo.list_media_proxy_playback_records(session_id=summary["id"])
         self.assertEqual(details["total"], 3)
         self.assertEqual(
             {row["id"] for row in details["items"]},
@@ -1230,14 +1231,14 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         self.assertEqual((first.status_code, second.status_code), (302, 302))
         self.assertEqual(Client.calls, 1)
         self.assertEqual(Client.close_calls, 2)
-        rows = db.list_media_proxy_playback_records(instance_id=7)["items"]
+        rows = media_proxy_repo.list_media_proxy_playback_records(instance_id=7)["items"]
         self.assertEqual(len(rows), 2)
         ordered_rows = list(reversed(rows))
         self.assertEqual([row["cache_hit"] for row in ordered_rows], [0, 1])
         self.assertGreaterEqual(ordered_rows[0]["upstream_latency_ms"], 10)
         self.assertLess(ordered_rows[1]["upstream_latency_ms"], 10)
         self.assertTrue(all(row["route_class"] == "guangya_direct" for row in rows))
-        sessions = db.list_media_proxy_playback_sessions(instance_id=7)
+        sessions = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=7)
         self.assertEqual(sessions["total"], 2)
         self.assertEqual(
             [session["request_count"] for session in sessions["items"]],
@@ -1318,12 +1319,12 @@ class PlaybackRecordApiTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM media_proxy_playback_records")
             conn.execute("DELETE FROM media_proxy_playback_sessions")
             conn.execute("DELETE FROM media_proxy_instances")
-        self.instance_id = db.add_media_proxy_instance(
+        self.instance_id = media_proxy_repo.add_media_proxy_instance(
             name="API 反代", server_type="jellyfin", config_source="custom",
             upstream_url="http://127.0.0.1:8096", api_key="secret",
             listen_host="127.0.0.1", listen_port=19001, local_root="", enabled=1,
         )
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id, playback_session_key="api-session-1",
             media_item_id="api-item", media_source_id="api-source",
             route_class="guangya_direct", method="GET", status_code=302,
@@ -1374,7 +1375,7 @@ class PlaybackRecordApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(denied.status_code, 400)
         self.assertEqual(cleared.status_code, 200)
         self.assertEqual(cleared.json()["deleted"], 1)
-        self.assertEqual(db.list_media_proxy_playback_sessions(instance_id=self.instance_id)["total"], 0)
+        self.assertEqual(media_proxy_repo.list_media_proxy_playback_sessions(instance_id=self.instance_id)["total"], 0)
 
 
 if __name__ == "__main__":
@@ -1387,7 +1388,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM media_proxy_playback_records")
             conn.execute("DELETE FROM media_proxy_playback_sessions")
             conn.execute("DELETE FROM media_proxy_instances")
-        self.first = db.add_media_proxy_instance(
+        self.first = media_proxy_repo.add_media_proxy_instance(
             name="第一反代",
             server_type="jellyfin",
             config_source="custom",
@@ -1397,7 +1398,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
             listen_port=19101,
             enabled=1,
         )
-        self.second = db.add_media_proxy_instance(
+        self.second = media_proxy_repo.add_media_proxy_instance(
             name="第二反代",
             server_type="emby",
             config_source="custom",
@@ -1409,7 +1410,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
         )
 
     def test_failure_summary_aggregates_only_safe_diagnostics(self):
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.first,
             route_class="guangya_direct",
             method="GET",
@@ -1420,7 +1421,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
             total_latency_ms=10,
             media_name="PRIVATE MOVIE",
         )
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.first,
             route_class="guangya_direct",
             method="GET",
@@ -1433,7 +1434,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
             error="PRIVATE https://secret.invalid/file?token=SECRET",
             media_name="PRIVATE MOVIE",
         )
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.first,
             route_class="upstream_transcode",
             method="GET",
@@ -1445,7 +1446,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
             failure_stage="upstream",
             error="PRIVATE /private/path",
         )
-        db.record_media_proxy_playback_attempt(
+        media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.second,
             route_class="upstream_direct",
             method="GET",
@@ -1454,7 +1455,7 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
             total_latency_ms=40,
         )
 
-        summary = db.get_media_proxy_playback_failure_summary(
+        summary = media_proxy_repo.get_media_proxy_playback_failure_summary(
             hours=24, instance_id=self.first
         )
         self.assertEqual(summary["total_recorded"], 3)
@@ -1472,4 +1473,4 @@ class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
 
     def test_failure_summary_rejects_unbounded_windows(self):
         with self.assertRaises(ValueError):
-            db.get_media_proxy_playback_failure_summary(hours=48)
+            media_proxy_repo.get_media_proxy_playback_failure_summary(hours=48)

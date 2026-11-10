@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
 from app.clients.qbittorrent import TorrentTask
 import app.modules.local_media_scheduler as local_media_scheduler_module
 from app.modules.local_media_scheduler import (
@@ -29,7 +31,7 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 def _require_task(task_id: int, *, owner: str = "admin") -> LocalMediaTask:
-    task = db.get_local_media_task(task_id, owner=owner)
+    task = local_media_repo.get_local_media_task(task_id, owner=owner)
     assert task is not None
     return task
 
@@ -41,7 +43,7 @@ class FakeService:
     def __init__(self): self.calls = []
     def execute_task(self, owner, task_id, qb_client=None):
         self.calls.append((owner, task_id, qb_client))
-        db.update_local_media_task(task_id, owner=owner, status="completed", completed_at=db.now())
+        local_media_repo.update_local_media_task(task_id, owner=owner, status="completed", completed_at=db.now())
         return {"status": "completed"}
 
 
@@ -62,11 +64,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); all_root = root / "all"; fast_root = root / "fast"
             all_root.mkdir(); fast_root.mkdir(); movie = fast_root / "Movie.mkv"; movie.write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="all", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(all_root), stable_seconds=0, owner="admin",
             )
-            fast_id = db.create_local_media_source(
+            fast_id = local_media_repo.create_local_media_source(
                 name="fast", qb_profile="configured:qb", qb_path_prefix="/downloads/1",
                 local_root=str(fast_root), stable_seconds=300, owner="admin",
             )
@@ -76,7 +78,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             second = scheduler.enqueue_completed_torrent(self.torrent("/downloads/1/Movie.mkv"))
             self.assertEqual(first, second)
             assert first is not None
-            get_local_media_task_result = db.get_local_media_task(first, owner="admin")
+            get_local_media_task_result = local_media_repo.get_local_media_task(first, owner="admin")
             assert get_local_media_task_result is not None
             self.assertEqual(get_local_media_task_result.source_id, fast_id)
             self.assertEqual(scheduler.run_once(), 1)
@@ -94,7 +96,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             movie = root / "Movie.mkv"
             movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="qb-close-error",
                 qb_profile="configured:qb",
                 qb_path_prefix="/downloads",
@@ -102,7 +104,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 stable_seconds=0,
                 owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id,
                 "hash-close-error",
                 str(movie),
@@ -117,7 +119,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(scheduler.run_once(), 0)
 
             qb.close.assert_called_once_with()
-            get_local_media_task_result_2 = db.get_local_media_task(task_id, owner="admin")
+            get_local_media_task_result_2 = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert get_local_media_task_result_2 is not None
             self.assertEqual(
                 get_local_media_task_result_2.status, "failed"
@@ -136,7 +138,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             movie = root / "Movie.mkv"
             movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="qb-post-move-error",
                 qb_profile="configured:qb",
                 qb_path_prefix="/downloads",
@@ -144,7 +146,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 stable_seconds=0,
                 owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id,
                 "hash-post-move-error",
                 str(movie),
@@ -159,7 +161,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(scheduler.run_once(), 0)
 
             qb.close.assert_called_once_with()
-            get_local_media_task_result_3 = db.get_local_media_task(task_id, owner="admin")
+            get_local_media_task_result_3 = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert get_local_media_task_result_3 is not None
             self.assertEqual(
                 get_local_media_task_result_3.status,
@@ -171,12 +173,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             movie = root / "Movie.mkv"
             movie.write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="atomic-link", qb_profile="configured:qb",
                 qb_path_prefix="/downloads", local_root=str(root),
                 stable_seconds=0, owner="admin",
             )
-            request_id, _ = db.create_download_request("scheduler-atomic", "magnet")
+            request_id, _ = download_requests_repo.create_download_request("scheduler-atomic", "magnet")
             scheduler = LocalMediaScheduler(service=FakeService())
 
             task_id = scheduler.enqueue_completed_torrent(
@@ -184,7 +186,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 wake=False, request_id=request_id,
             )
 
-            request = db.get_download_request(request_id)
+            request = download_requests_repo.get_download_request(request_id)
             assert request is not None
             self.assertEqual(request["local_import_status"], "pending")
             self.assertEqual(request["local_import_target"], f"local-media-task:{task_id}")
@@ -192,7 +194,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertTrue(request["local_import_started_at"])
 
     def test_completed_torrent_matching_legacy_source_requires_container_path_migration(self):
-        db.create_local_media_source(
+        local_media_repo.create_local_media_source(
             name="legacy", qb_profile="configured:qb", qb_path_prefix=r"D:\Downloads",
             local_root=r"D:\Downloads", stable_seconds=0, owner="admin",
         )
@@ -205,10 +207,10 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 self.torrent(r"D:\Downloads\Movie.mkv", hash_value="legacy-source")
             )
 
-        self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+        self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_matching_relative_source_requires_absolute_container_path(self):
-        db.create_local_media_source(
+        local_media_repo.create_local_media_source(
             name="relative", qb_profile="configured:qb", qb_path_prefix="/downloads",
             local_root="relative-downloads", stable_seconds=0, owner="admin",
         )
@@ -221,7 +223,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 self.torrent("/downloads/Movie.mkv", hash_value="relative-source")
             )
 
-        self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+        self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_windows_and_unc_qb_prefixes_map_into_container_sources(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -232,11 +234,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             unc_root.mkdir()
             (drive_root / "Movie.mkv").write_bytes(b"movie")
             (unc_root / "Show.mkv").write_bytes(b"show")
-            drive_id = db.create_local_media_source(
+            drive_id = local_media_repo.create_local_media_source(
                 name="drive", qb_profile="configured:qb", qb_path_prefix=r"D:\Downloads",
                 local_root=str(drive_root), stable_seconds=0, owner="admin",
             )
-            unc_id = db.create_local_media_source(
+            unc_id = local_media_repo.create_local_media_source(
                 name="unc", qb_profile="configured:qb", qb_path_prefix=r"\\NAS\Media",
                 local_root=str(unc_root), stable_seconds=0, owner="admin",
             )
@@ -250,9 +252,9 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             )
 
             assert drive_task is not None
-            stored_drive = db.get_local_media_task(drive_task, owner="admin")
+            stored_drive = local_media_repo.get_local_media_task(drive_task, owner="admin")
             assert unc_task is not None
-            stored_unc = db.get_local_media_task(unc_task, owner="admin")
+            stored_unc = local_media_repo.get_local_media_task(unc_task, owner="admin")
             assert stored_drive is not None
             self.assertEqual(stored_drive.source_id, drive_id)
             self.assertEqual(Path(stored_drive.content_path), drive_root / "Movie.mkv")
@@ -266,12 +268,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             migrated_root = root / "downloads"
             migrated_root.mkdir()
             (migrated_root / "Movie.mkv").write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="legacy", qb_profile="configured:qb",
                 qb_path_prefix=r"D:\Downloads", local_root=r"D:\Downloads",
                 stable_seconds=0, owner="admin",
             )
-            migrated_id = db.create_local_media_source(
+            migrated_id = local_media_repo.create_local_media_source(
                 name="migrated", qb_profile="configured:qb",
                 qb_path_prefix=r"D:\Downloads", local_root=str(migrated_root),
                 stable_seconds=0, owner="admin",
@@ -283,7 +285,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             )
 
             assert task_id is not None
-            task = db.get_local_media_task(task_id, owner="admin")
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert task is not None
             self.assertEqual(task.source_id, migrated_id)
             self.assertEqual(Path(task.content_path), migrated_root / "Movie.mkv")
@@ -296,11 +298,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             empty_root.mkdir()
             actual_root.mkdir()
             (actual_root / "Movie.mkv").write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="empty", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(empty_root), stable_seconds=0, owner="admin",
             )
-            actual_id = db.create_local_media_source(
+            actual_id = local_media_repo.create_local_media_source(
                 name="actual", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(actual_root), stable_seconds=0, owner="admin",
             )
@@ -311,7 +313,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             )
 
             assert task_id is not None
-            task = db.get_local_media_task(task_id, owner="admin")
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert task is not None
             self.assertEqual(task.source_id, actual_id)
             self.assertEqual(Path(task.content_path), actual_root / "Movie.mkv")
@@ -323,7 +325,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 source_root = root / name
                 source_root.mkdir()
                 (source_root / "Movie.mkv").write_bytes(b"movie")
-                db.create_local_media_source(
+                local_media_repo.create_local_media_source(
                     name=name, qb_profile="configured:qb", qb_path_prefix="/downloads",
                     local_root=str(source_root), stable_seconds=0, owner="admin",
                 )
@@ -336,7 +338,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                     self.torrent("/downloads/Movie.mkv", hash_value="ambiguous-prefix")
                 )
 
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_symlink_source_is_a_visible_configuration_failure(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -349,7 +351,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 link.symlink_to(actual, target_is_directory=True)
             except (OSError, NotImplementedError):
                 self.skipTest("当前平台不支持符号链接测试")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="symlink", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(link), stable_seconds=0, owner="admin",
             )
@@ -360,7 +362,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                     self.torrent("/downloads/Movie.mkv", hash_value="symlink-source")
                 )
 
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_blank_prefix_uses_qb_task_save_path_as_implicit_mapping(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -369,7 +371,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             media_name = "[ANi] Test Show - 10.mp4"
             media = source / media_name
             media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="local", qb_profile="configured:qb", qb_path_prefix="",
                 local_root=str(source), stable_seconds=0, owner="admin",
             )
@@ -384,7 +386,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             )
 
             assert task_id is not None
-            task = db.get_local_media_task(task_id, owner="admin")
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert task is not None
             self.assertEqual(task.source_id, source_id)
             self.assertEqual(Path(task.content_path), media)
@@ -395,7 +397,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source.mkdir()
             media_name = "[ANi] Test Show - 10.mp4"
             (source / media_name).write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="local", qb_profile="configured:qb", qb_path_prefix="",
                 local_root=str(source), stable_seconds=0, owner="admin",
             )
@@ -412,7 +414,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                     )
                 )
 
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_without_enabled_local_source_remains_unclaimed(self):
         scheduler = LocalMediaScheduler(service=FakeService())
@@ -422,7 +424,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         )
 
         self.assertIsNone(task_id)
-        self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+        self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_filters_non_media_content(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -431,7 +433,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source.mkdir()
             notes = source / "readme.txt"
             notes.write_text("not media")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="local", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(source), stable_seconds=0, owner="admin",
             )
@@ -442,13 +444,13 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             )
 
             self.assertIsNone(task_id)
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_missing_path_is_retryable(self):
         with tempfile.TemporaryDirectory() as root_raw:
             source = Path(root_raw) / "downloads"
             source.mkdir()
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="local", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(source), stable_seconds=0, owner="admin",
             )
@@ -459,7 +461,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                     self.torrent("/downloads/Movie.mkv", hash_value="mount-late")
                 )
 
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_scan_limit_is_retryable(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -467,7 +469,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source.mkdir()
             movie = source / "Movie.mkv"
             movie.write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="local", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(source), stable_seconds=0, owner="admin",
             )
@@ -483,25 +485,25 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                         self.torrent("/downloads/Movie.mkv", hash_value="too-many")
                     )
 
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_legacy_windows_source_tasks_fail_with_actionable_migration_guidance(self):
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name="旧 Windows 来源", qb_profile="", qb_path_prefix=r"D:\Downloads",
             local_root=r"D:\Downloads", stable_seconds=0, owner="admin",
         )
         target_root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(target_root, ignore_errors=True))
-        db.upsert_local_library_target(
+        local_media_repo.upsert_local_library_target(
             source_id, "default", str(target_root), owner="admin",
         )
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id, "", r"D:\Downloads\Movie.mkv", owner="admin", trigger="manual",
         )
         scheduler = LocalMediaScheduler(service=FakeService())
 
         self.assertEqual(scheduler.run_once(), 0)
-        task = db.get_local_media_task(task_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert task is not None
         self.assertEqual(task.status, "failed")
         self.assertIn("Windows/UNC", task.error)
@@ -512,11 +514,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         self.assertIn("Windows/UNC", manual_result["sources"][0]["error"])
 
     def test_relative_source_tasks_fail_before_filesystem_access(self):
-        source_id = db.create_local_media_source(
+        source_id = local_media_repo.create_local_media_source(
             name="旧相对路径来源", qb_profile="", qb_path_prefix="/downloads",
             local_root="relative-downloads", stable_seconds=0, owner="admin",
         )
-        task_id = db.create_local_media_task(
+        task_id = local_media_repo.create_local_media_task(
             source_id, "", "relative-downloads/Movie.mkv",
             owner="admin", trigger="manual",
         )
@@ -525,7 +527,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         with patch("app.modules.local_media_scheduler.LocalFilesystemAdapter.scan") as scan:
             self.assertEqual(scheduler.run_once(), 0)
         scan.assert_not_called()
-        task = db.get_local_media_task(task_id, owner="admin")
+        task = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert task is not None
         self.assertEqual(task.status, "failed")
         self.assertIn("Docker 容器内绝对路径", task.error)
@@ -534,11 +536,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source = root / "source"; source.mkdir()
             movie = source / "Movie.mkv"; movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="legacy-stable", qb_profile="", qb_path_prefix="",
                 local_root=str(source), stable_seconds=300, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
             service = FakeService()
@@ -547,7 +549,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             with patch("app.modules.local_media_scheduler.LocalFilesystemAdapter.scan") as scan:
                 self.assertEqual(scheduler.run_once(), 1)
             scan.assert_not_called()
-            get_local_media_task_result_4 = db.get_local_media_task(task_id, owner="admin")
+            get_local_media_task_result_4 = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert get_local_media_task_result_4 is not None
             self.assertEqual(get_local_media_task_result_4.status, "completed")
             self.assertEqual(service.calls, [("admin", task_id, None)])
@@ -555,7 +557,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
     def test_qb_completed_task_uses_no_scheduler_prescan(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); movie = root / "Movie.mkv"; movie.write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="qb", qb_profile="configured:qb", qb_path_prefix="/downloads",
                 local_root=str(root), stable_seconds=300, owner="admin",
             )
@@ -566,7 +568,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 self.assertEqual(scheduler.run_once(), 1)
             scan.assert_not_called()
             assert task_id is not None
-            get_local_media_task_result_5 = db.get_local_media_task(task_id, owner="admin")
+            get_local_media_task_result_5 = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert get_local_media_task_result_5 is not None
             self.assertEqual(get_local_media_task_result_5.status, "completed")
 
@@ -576,15 +578,15 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source_root.mkdir()
             movie = source_root / "Movie.mkv"
             movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="local", qb_profile="", qb_path_prefix="", local_root=str(source_root),
                 stable_seconds=0, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
-            request_id, _ = db.create_download_request("notify-completed", "magnet")
-            db.link_download_request_to_local_media_task(request_id, task_id, str(movie))
+            request_id, _ = download_requests_repo.create_download_request("notify-completed", "magnet")
+            download_requests_repo.link_download_request_to_local_media_task(request_id, task_id, str(movie))
             scheduler = LocalMediaScheduler(service=FakeService())
 
             with patch(
@@ -593,8 +595,8 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             ):
                 self.assertEqual(scheduler.run_once(), 1)
 
-            task = db.get_local_media_task(task_id, owner="admin")
-            request = db.get_download_request(request_id)
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
+            request = download_requests_repo.get_download_request(request_id)
             assert task is not None
             self.assertEqual(task.status, "completed")
             assert request is not None
@@ -605,7 +607,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             @staticmethod
             def execute_task(owner, task_id, qb_client=None):
                 del qb_client
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="requires_manual", error="需要人工确认",
                 )
                 return {
@@ -618,15 +620,15 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source_root.mkdir()
             movie = source_root / "Movie.mkv"
             movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="local", qb_profile="", qb_path_prefix="", local_root=str(source_root),
                 stable_seconds=0, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
-            request_id, _ = db.create_download_request("notify-manual", "magnet")
-            db.link_download_request_to_local_media_task(request_id, task_id, str(movie))
+            request_id, _ = download_requests_repo.create_download_request("notify-manual", "magnet")
+            download_requests_repo.link_download_request_to_local_media_task(request_id, task_id, str(movie))
             scheduler = LocalMediaScheduler(service=ManualReviewService())
 
             with patch(
@@ -635,8 +637,8 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             ):
                 self.assertEqual(scheduler.run_once(), 1)
 
-            task = db.get_local_media_task(task_id, owner="admin")
-            request = db.get_download_request(request_id)
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
+            request = download_requests_repo.get_download_request(request_id)
             assert task is not None
             self.assertEqual(task.status, "requires_manual")
             assert request is not None
@@ -646,11 +648,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source = root / "source"; source.mkdir()
             movie = source / "Movie.mkv"; movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="stable", qb_profile="", qb_path_prefix="", local_root=str(source),
                 stable_seconds=300, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="manual",
             )
             scheduler = LocalMediaScheduler(service=FakeService())
@@ -659,7 +661,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 self.assertEqual(scheduler.run_once(), 1)
                 self.assertEqual(scheduler.run_once(), 0)
             scan.assert_not_called()
-            get_local_media_task_result_6 = db.get_local_media_task(task_id, owner="admin")
+            get_local_media_task_result_6 = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert get_local_media_task_result_6 is not None
             self.assertEqual(get_local_media_task_result_6.status, "completed")
 
@@ -667,29 +669,29 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source = root / "source"; source.mkdir()
             (source / "Movie.mkv").write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="preview", qb_profile="", qb_path_prefix="", local_root=str(source),
                 scan_enabled=True, stable_seconds=0, mode="preview_only", owner="admin",
             )
             scheduler = LocalMediaScheduler(service=FakeService())
             self.assertEqual(scheduler.run_once(), 0)
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_init_db_marks_interrupted_local_write_for_manual_review(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source = root / "source"; source.mkdir()
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="move", qb_profile="", qb_path_prefix="", local_root=str(source), owner="admin",
             )
-            task_id = db.create_local_media_task(source_id, "hash-interrupted", str(source), owner="admin")
-            task = db.get_local_media_task(task_id, owner="admin")
+            task_id = local_media_repo.create_local_media_task(source_id, "hash-interrupted", str(source), owner="admin")
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert task is not None
-            step_id = db.add_local_media_operation_step(task_id, task.operation_token, 0, "move", owner="admin")
-            db.update_local_media_task(task_id, owner="admin", status="moving")
-            db.update_local_media_operation_step(step_id, "running")
+            step_id = local_media_repo.add_local_media_operation_step(task_id, task.operation_token, 0, "move", owner="admin")
+            local_media_repo.update_local_media_task(task_id, owner="admin", status="moving")
+            local_media_repo.update_local_media_operation_step(step_id, "running")
             db.init_db()
-            recovered = db.get_local_media_task(task_id, owner="admin")
-            steps = db.list_local_media_operation_steps(task_id, owner="admin")
+            recovered = local_media_repo.get_local_media_task(task_id, owner="admin")
+            steps = local_media_repo.list_local_media_operation_steps(task_id, owner="admin")
             assert recovered is not None
             self.assertEqual(recovered.status, "requires_manual")
             self.assertFalse(recovered.completed_at)
@@ -701,7 +703,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "source"; source_root.mkdir()
             (source_root / "Movie.mkv").write_bytes(b"movie")
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="legacy-scan", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), enabled=False, scan_enabled=True,
                 scan_interval_minutes=10, stable_seconds=300, owner="admin",
@@ -709,21 +711,21 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             scheduler = LocalMediaScheduler(service=FakeService())
 
             self.assertEqual(scheduler.run_once(), 0)
-            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+            self.assertEqual(local_media_repo.list_local_media_tasks(owner="admin"), [])
 
     def test_preexisting_automatic_scan_task_is_stopped_with_migration_message(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); movie = root / "Movie.mkv"; movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="legacy-scan", qb_profile="", qb_path_prefix="", local_root=str(root),
                 scan_enabled=True, stable_seconds=0, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="scan",
             )
 
             self.assertEqual(LocalMediaScheduler(service=FakeService()).run_once(), 0)
-            task = db.get_local_media_task(task_id, owner="admin")
+            task = local_media_repo.get_local_media_task(task_id, owner="admin")
             assert task is not None
             self.assertEqual(task.status, "failed")
             self.assertIn("定时扫描已移除", task.error)
@@ -737,12 +739,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             target_root.mkdir()
             movie = source_root / "Existing.Movie.2026.mkv"
             movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="已有下载", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), enabled=False, scan_enabled=False,
                 stable_seconds=300, owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(target_root), owner="admin",
             )
             service = FakeService()
@@ -756,7 +758,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["scanned_sources"], 1)
                 self.assertEqual(result["candidate_count"], 1)
                 self.assertEqual(result["queued_count"], 1)
-                task = db.get_local_media_task(result["task_ids"][0], owner="admin")
+                task = local_media_repo.get_local_media_task(result["task_ids"][0], owner="admin")
                 assert task is not None
                 self.assertEqual(task.trigger, "scan")
                 self.assertTrue(task.operation_token.startswith("silent-manual-scan:"))
@@ -764,7 +766,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
 
             notify.assert_not_called()
             self.assertEqual(len(service.calls), 1)
-            get_local_media_task_result_7 = db.get_local_media_task(result["task_ids"][0], owner="admin")
+            get_local_media_task_result_7 = local_media_repo.get_local_media_task(result["task_ids"][0], owner="admin")
             assert get_local_media_task_result_7 is not None
             self.assertEqual(
                 get_local_media_task_result_7.status,
@@ -776,7 +778,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             @staticmethod
             def execute_task(owner, task_id, qb_client=None):
                 del qb_client
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="requires_manual", error="匹配置信度不足",
                 )
                 return {
@@ -800,12 +802,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             source_root.mkdir()
             target_root.mkdir()
             (source_root / "Movie.mkv").write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="已有下载", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), enabled=False, scan_enabled=False,
                 stable_seconds=0, owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(target_root), owner="admin",
             )
             scheduler = LocalMediaScheduler(service=ManualReviewService())
@@ -861,18 +863,18 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             target_root.mkdir()
             movie = source_root / "Movie.mkv"
             movie.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="已有下载", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), enabled=False, scan_enabled=False,
                 stable_seconds=0, owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(target_root), owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(movie), owner="admin", trigger="scan",
             )
-            db.update_local_media_task(
+            local_media_repo.update_local_media_task(
                 task_id, owner="admin", status="requires_manual",
                 snapshot_digest="digest-1", error="匹配置信度不足",
             )
@@ -903,12 +905,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             (media_dir / "readme.txt").write_text("ignored")
             (non_media_dir / "archive.zip").write_bytes(b"archive")
             (source_root / "notes.txt").write_text("ignored")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="本地下载", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), enabled=False, scan_enabled=False,
                 stable_seconds=0, owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(target_root), owner="admin",
             )
 
@@ -916,7 +918,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
 
             self.assertEqual(result["candidate_count"], 1)
             self.assertEqual(result["queued_count"], 1)
-            task = db.get_local_media_task(result["task_ids"][0], owner="admin")
+            task = local_media_repo.get_local_media_task(result["task_ids"][0], owner="admin")
             assert task is not None
             self.assertEqual(Path(task.content_path), media_dir / "Movie.2026.mkv")
 
@@ -929,14 +931,14 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             target_root.mkdir()
             candidate = source_root / "Movie.2026.mkv"
             candidate.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="本地下载",
                 qb_profile="",
                 qb_path_prefix="",
                 local_root=str(source_root),
                 owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id,
                 "default",
                 str(target_root),
@@ -989,12 +991,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             (wrapped_show / "Season 01").mkdir(parents=True)
             (wrapped_show / "Season 01" / "Show.C.S01E04.mkv").write_bytes(b"episode")
 
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="混合下载", qb_profile="", qb_path_prefix="",
                 local_root=str(source_root), enabled=False, scan_enabled=False,
                 stable_seconds=0, owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 source_id, "default", str(target_root), owner="admin",
             )
 
@@ -1027,14 +1029,14 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             missing_target_root.mkdir()
             (preview_root / "Preview.mkv").write_bytes(b"movie")
             (missing_target_root / "No.Target.mkv").write_bytes(b"movie")
-            preview_id = db.create_local_media_source(
+            preview_id = local_media_repo.create_local_media_source(
                 name="仅预览", qb_profile="", qb_path_prefix="",
                 local_root=str(preview_root), mode="preview_only", owner="admin",
             )
-            db.upsert_local_library_target(
+            local_media_repo.upsert_local_library_target(
                 preview_id, "default", str(root / "library"), owner="admin",
             )
-            db.create_local_media_source(
+            local_media_repo.create_local_media_source(
                 name="无目标", qb_profile="", qb_path_prefix="",
                 local_root=str(missing_target_root), owner="admin",
             )
@@ -1110,7 +1112,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                     self.commit_order.append(int(task_id))
                 try:
                     time.sleep(0.01)
-                    db.update_local_media_task(
+                    local_media_repo.update_local_media_task(
                         task_id, owner=owner, status="completed",
                         completed_at=db.now(),
                     )
@@ -1124,12 +1126,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             files = [root / "A.mkv", root / "B.mkv"]
             for media in files:
                 media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="parallel", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
             task_ids = [
-                db.create_local_media_task(
+                local_media_repo.create_local_media_task(
                     source_id, "", str(media), owner="admin", trigger="manual",
                 )
                 for media in files
@@ -1184,7 +1186,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             @staticmethod
             def execute_task(owner, task_id, qb_client=None):
                 del qb_client
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="completed",
                     completed_at=db.now(),
                 )
@@ -1194,11 +1196,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             child = root / "Movie.mkv"
             child.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="overlap", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
-            parent_task = db.create_local_media_task(
+            parent_task = local_media_repo.create_local_media_task(
                 source_id, "", str(root), owner="admin", trigger="manual",
             )
             # Public admission rejects overlapping paths. Insert one legacy row
@@ -1227,7 +1229,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 "app.modules.local_media_scheduler.notify_local_media_task",
             ):
                 self.assertEqual(scheduler.run_once(), 1)
-                get_local_media_task_result_8 = db.get_local_media_task(child_task, owner="admin")
+                get_local_media_task_result_8 = local_media_repo.get_local_media_task(child_task, owner="admin")
                 assert get_local_media_task_result_8 is not None
                 self.assertEqual(
                     get_local_media_task_result_8.status,
@@ -1267,11 +1269,11 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             media = root / "Fallback.mkv"
             media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="fallback", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(media), owner="admin", trigger="manual",
             )
             service = FallbackService()
@@ -1288,7 +1290,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(service.prepared, [task_id])
         self.assertEqual(service.calls[0][1], task_id)
         self.assertEqual(service.closed_workers, 1)
-        get_local_media_task_result_9 = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result_9 = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result_9 is not None
         self.assertEqual(
             get_local_media_task_result_9.status,
@@ -1325,12 +1327,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             media = root / "Qb.Movie.mkv"
             media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="qb-planning", qb_profile="configured:qb",
                 qb_path_prefix="/downloads", local_root=str(root),
                 stable_seconds=0, owner="admin",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "hash-planning", str(media), owner="admin",
                 trigger="qb_completed",
             )
@@ -1354,7 +1356,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         self.assertTrue(qb_created.is_set())
         self.assertIs(service.calls[0][2], qb_client)
         qb_client.close.assert_called_once_with()
-        get_local_media_task_result_10 = db.get_local_media_task(task_id, owner="admin")
+        get_local_media_task_result_10 = local_media_repo.get_local_media_task(task_id, owner="admin")
         assert get_local_media_task_result_10 is not None
         self.assertEqual(
             get_local_media_task_result_10.status,
@@ -1396,7 +1398,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             @staticmethod
             def execute_task(owner, task_id, qb_client=None):
                 del qb_client
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="requires_manual",
                     error="人工确认", completed_at=None,
                 )
@@ -1414,12 +1416,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             files = [root / f"Review-{index}.mkv" for index in range(3)]
             for media in files:
                 media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="reviews", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
             task_ids = [
-                db.create_local_media_task(
+                local_media_repo.create_local_media_task(
                     source_id, "", str(media), owner="admin", trigger="manual",
                 )
                 for media in files
@@ -1474,12 +1476,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             root = Path(root_raw)
             media = root / "FJIN-140.mp4"
             media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="nsfw", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
                 media_type="nsfw",
             )
-            task_id = db.create_local_media_task(
+            task_id = local_media_repo.create_local_media_task(
                 source_id, "", str(media), owner="admin", trigger="manual",
             )
             service = SerialNsfwService()
@@ -1536,7 +1538,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             @staticmethod
             def execute_task(owner, task_id, qb_client=None):
                 del qb_client
-                db.update_local_media_task(
+                local_media_repo.update_local_media_task(
                     task_id, owner=owner, status="completed",
                     completed_at=db.now(),
                 )
@@ -1552,12 +1554,12 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             files = [root / "One.mkv", root / "Two.mkv"]
             for media in files:
                 media.write_bytes(b"movie")
-            source_id = db.create_local_media_source(
+            source_id = local_media_repo.create_local_media_source(
                 name="shutdown-parallel", qb_profile="", qb_path_prefix="",
                 local_root=str(root), stable_seconds=0, owner="admin",
             )
             task_ids = [
-                db.create_local_media_task(
+                local_media_repo.create_local_media_task(
                     source_id, "", str(media), owner="admin", trigger="manual",
                 )
                 for media in files

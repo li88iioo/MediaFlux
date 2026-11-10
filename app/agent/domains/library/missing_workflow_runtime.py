@@ -21,7 +21,7 @@ from app.repositories.agent_download_verification import (
     workflow_ref_from_context,
 )
 from app.agent.models import ToolResult
-from app import database as db
+from app.repositories import agent_download_verification as agent_download_verification_repo
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ class MissingMediaWorkflowRuntime:
             attached = False
             try:
                 request_id = raw.get("request_id")
-                job = db.get_agent_download_verification(request_id) if type(request_id) is int and request_id > 0 else None
+                job = agent_download_verification_repo.get_agent_download_verification(request_id) if type(request_id) is int and request_id > 0 else None
                 proof = verification_from_followup_context(context)
                 workflow_ref = workflow_ref_from_context(context)
                 keys = ("tmdb_id", "season", "episode", "library_name")

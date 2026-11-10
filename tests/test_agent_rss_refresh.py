@@ -8,6 +8,7 @@ from app.modules import rss_delivery
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import rss as rss_repo
 from app.database import media_owner_digest
 from app.agent.errors import AgentToolError
 from app.modules.rss_subscriptions import RSSSubscriptionError
@@ -29,7 +30,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM rss_items")
             conn.execute("DELETE FROM agent_action_history")
         reset_agent_service_for_tests()
-        self.sid = db.add_rss_subscription(
+        self.sid = rss_repo.add_rss_subscription(
             "Private RSS",
             "https://secret.example/rss?passkey=RSS_SECRET",
             exclude_keywords="PRIVATE_FILTER",
@@ -143,7 +144,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
 
 
     def test_bulk_refresh_is_strict_local_preview_and_aggregates_partial_results(self):
-        second_id = db.add_rss_subscription(
+        second_id = rss_repo.add_rss_subscription(
             "Mikan", "https://second.secret.invalid/rss?token=SECOND_SECRET"
         )
         arguments = {"subscription_ids": [self.sid, second_id]}
@@ -284,7 +285,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         prepared = service.prepare(
             "rss.refresh", {"subscription_ids": [self.sid]}, owner="owner"
         )
-        db.update_rss_subscription(self.sid, {"urls": "https://changed.invalid/rss"})
+        rss_repo.update_rss_subscription(self.sid, {"urls": "https://changed.invalid/rss"})
         with (
             patch.object(RSSEngine, "refresh") as refresh,
             self.assertRaises(AgentToolError) as stale,

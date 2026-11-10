@@ -9,6 +9,11 @@ from pathlib import Path
 from unittest import mock
 
 from app import database as db
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import rss as rss_repo
+from app.repositories import media_proxy as media_proxy_repo
+from app.repositories import agent_download_verification as agent_download_verification_repo
+from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app import database_migrations
 from app import runtime_paths as runtime_paths_module
 from app.modules.backup import BackupError, restore_backup, verify_backup
@@ -21,7 +26,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
     def test_v37_and_unversioned_verification_jobs_migrate_targets_without_losing_receipts(self):
         for version in (37, 0):
             with self.subTest(version=version):
-                request_id, _ = db.create_download_request(f"verification-v{version}", "magnet", origin="agent")
+                request_id, _ = download_requests_repo.create_download_request(f"verification-v{version}", "magnet", origin="agent")
                 with db.get_conn() as conn:
                     conn.execute("DELETE FROM agent_download_verification_notification_outbox")
                     conn.execute("DROP TABLE agent_download_verifications")
@@ -54,7 +59,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         {"title": "The Show", "season": 2, "episode": 3, "result": "missing"},
                     ])
                 db.init_db()
-                verification = db.get_agent_download_verification(request_id)
+                verification = agent_download_verification_repo.get_agent_download_verification(request_id)
                 assert verification is not None
                 self.assertEqual(len(verification["targets"]), 1)
 
@@ -151,7 +156,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
             db.configure_database(path, test_mode=True)
             try:
                 db.init_db()
-                row = db.get_agent_library_patrol()
+                row = agent_library_patrol_repo.get_agent_library_patrol()
                 assert row is not None
                 self.assertEqual(row["cycle_cursor_tmdb_id"], "12345")
                 self.assertEqual(row["cycle_accumulator_json"], '{"kept":"progress"}')
@@ -159,7 +164,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
                 assert run is not None
                 self.assertEqual(run["task_name"], "agent_library_patrol")
                 self.assertEqual(run["result"], row["cycle_accumulator_json"])
-                claimed = db.claim_due_agent_library_patrol(current_time=db.now())
+                claimed = agent_library_patrol_repo.claim_due_agent_library_patrol(current_time=db.now())
                 assert claimed is not None
                 self.assertEqual(claimed["cycle_run_id"], run["id"])
             finally:
@@ -567,27 +572,27 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
     ) -> None:
         infohash = "a" * 40
         uncertain_hash = "b" * 40
-        qb_sub = db.add_rss_subscription(
+        qb_sub = rss_repo.add_rss_subscription(
             name="Legacy qB", urls="https://example.com/qb.xml", download_method="qb"
         )
-        gy_sub = db.add_rss_subscription(
+        gy_sub = rss_repo.add_rss_subscription(
             name="Legacy GuangYa",
             urls="https://example.com/gy.xml",
             download_method="guangya",
         )
-        qb_entry = db.add_rss_entry_with_media(
+        qb_entry = rss_repo.add_rss_entry_with_media(
             qb_sub,
             "Legacy qB item",
             "legacy-qb",
             payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{infohash}"}),
         )["id"]
-        gy_entry = db.add_rss_entry_with_media(
+        gy_entry = rss_repo.add_rss_entry_with_media(
             gy_sub,
             "Legacy GuangYa item",
             "legacy-gy",
             payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{infohash}"}),
         )["id"]
-        uncertain_entry = db.add_rss_entry_with_media(
+        uncertain_entry = rss_repo.add_rss_entry_with_media(
             qb_sub,
             "Legacy uncertain item",
             "legacy-uncertain",
@@ -660,7 +665,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
         self.assertEqual(request["organize_status"], "skipped")
         active_ids = {
             int(row["id"])
-            for row in db.list_active_download_requests(include_local_import=True)
+            for row in download_requests_repo.list_active_download_requests(include_local_import=True)
         }
         self.assertNotIn(int(request["id"]), active_ids)
         assert (uncertain) is not None
@@ -679,7 +684,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
             "qb_into_gy": "d" * 40,
             "uncertain_qb": "e" * 40,
         }
-        subscription_id = db.add_rss_subscription(
+        subscription_id = rss_repo.add_rss_subscription(
             name="Legacy mixed backends",
             urls="https://example.com/legacy.xml",
             download_method="both",
@@ -687,7 +692,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
         entry_ids: dict[str, int] = {}
         request_ids: dict[str, int] = {}
         for label, infohash in hashes.items():
-            entry_id = db.add_rss_entry_with_media(
+            entry_id = rss_repo.add_rss_entry_with_media(
                 subscription_id,
                 label,
                 f"legacy-{label}",
@@ -705,7 +710,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
             canonical_key = hashlib.sha256(
                 f"btih:{infohash}".encode("utf-8")
             ).hexdigest()
-            request_id, created = db.create_download_request(
+            request_id, created = download_requests_repo.create_download_request(
                 canonical_key,
                 "magnet",
                 title=label,
@@ -715,7 +720,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
             self.assertTrue(created)
             request_ids[label] = request_id
 
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_ids["gy_into_qb"],
             targets="qb",
             status="completed",
@@ -723,7 +728,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
             local_import_status="completed",
             completed_at="2026-08-02 00:00:00",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_ids["qb_into_gy"],
             targets="guangya",
             status="completed",
@@ -732,7 +737,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
             organize_status="completed",
             completed_at="2026-08-02 00:00:00",
         )
-        db.update_download_request(
+        download_requests_repo.update_download_request(
             request_ids["uncertain_qb"],
             targets="qb",
             status="completed",
@@ -2129,7 +2134,7 @@ with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), \
                     media_name = conn.execute(
                         "SELECT media_name FROM media_proxy_playback_sessions WHERE id=1"
                     ).fetchone()["media_name"]
-                sessions = db.list_media_proxy_playback_sessions(instance_id=7)
+                sessions = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=7)
                 self.assertIn("media_name", columns)
                 self.assertEqual(media_name, "")
                 self.assertEqual(sessions["total"], 1)
