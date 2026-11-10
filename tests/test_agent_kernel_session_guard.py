@@ -32,6 +32,10 @@ from tests.test_agent_ux_backend import (
 )
 
 
+# 线程/事件同步只为防挂死兜底；正常立即返回，高负载下 5 秒会误报。
+SYNC_TIMEOUT = 30
+
+
 @pytest.fixture
 def isolated_chain():
     yield from inspect.unwrap(chain.isolated_chain)()
@@ -84,7 +88,7 @@ def test_confirmed_write_blocks_cross_worker_mutation_until_receipt_persisted(is
 
         def remote_write(*args, **kwargs):
             remote_entered.set()
-            assert remote_release.wait(5)
+            assert remote_release.wait(SYNC_TIMEOUT)
             return {"ok": True, "task_id": "fake-gy"}
 
         async def commit(lease, *, conversation=None, updates=()):
@@ -102,9 +106,9 @@ def test_confirmed_write_blocks_cross_worker_mutation_until_receipt_persisted(is
             task = asyncio.create_task(confirmation(writer, plan))
             try:
                 if phase == "remote":
-                    assert await asyncio.to_thread(remote_entered.wait, 5)
+                    assert await asyncio.to_thread(remote_entered.wait, SYNC_TIMEOUT)
                 else:
-                    await asyncio.wait_for(receipt_entered.wait(), 5)
+                    await asyncio.wait_for(receipt_entered.wait(), SYNC_TIMEOUT)
                 if operation == "query":
                     events = await _events(other.run(QueryEnvelope(
                         owner=OWNER, session_id=SESSION, message="另一 worker 的新问题",
@@ -150,7 +154,7 @@ def test_lifecycle_wins_before_confirmation_never_enters_external_write(isolated
         with patch.object(lifecycle, "_invalidate", side_effect=delayed_invalidation):
             task = asyncio.create_task(mutate(operation, lifecycle, other_store))
             try:
-                await asyncio.wait_for(entered.wait(), 5)
+                await asyncio.wait_for(entered.wait(), SYNC_TIMEOUT)
                 events = await confirmation(writer, plan)
                 assert any(e.payload.get("code") == "effect_in_progress" for e in events), events
                 assert isolated_chain[0].call_count == 0
@@ -194,13 +198,13 @@ def test_independent_owner_session_can_confirm_while_first_scope_is_writing(isol
         def remote_write(row, **kwargs):
             if int(row["id"]) == 1:
                 entered.set()
-                assert release.wait(5)
+                assert release.wait(SYNC_TIMEOUT)
             return {"ok": True, "task_id": "fake-gy"}
 
         isolated_chain[0].side_effect = remote_write
         task = asyncio.create_task(confirmation(writer, plan))
         try:
-            assert await asyncio.to_thread(entered.wait, 5)
+            assert await asyncio.to_thread(entered.wait, SYNC_TIMEOUT)
             # 第二张卡预检时已选择另一资源；确认阶段不能改变冻结的磁力身份。
             assert_completed(await confirmation(other, plan2, owner=other_owner, session_id=other_session))
             await lifecycle_for(other, other_pipeline, other_store).reset(owner=other_owner, session_id=other_session)
@@ -266,18 +270,18 @@ def test_process_exit_releases_scope_and_restart_never_reexecutes_claimed_plan(i
         process.start()
         child.close()
         try:
-            assert await asyncio.to_thread(parent.poll, 10), "子进程未进入确认执行"
+            assert await asyncio.to_thread(parent.poll, SYNC_TIMEOUT), "子进程未进入确认执行"
             stage, request_id = parent.recv()
             assert stage == "writing"
             with pytest.raises(SessionBusyError):
                 await store.reset_session(owner=OWNER, session_id=SESSION)
             if exit_kind == "normal":
                 parent.send("finish")
-                assert await asyncio.to_thread(parent.poll, 10)
+                assert await asyncio.to_thread(parent.poll, SYNC_TIMEOUT)
                 assert parent.recv() == ("finished", True)
             else:
                 process.kill()
-            await asyncio.to_thread(process.join, 10)
+            await asyncio.to_thread(process.join, SYNC_TIMEOUT)
             assert not process.is_alive()
             assert (process.exitcode == 0) is (exit_kind == "normal")
             restarted, re_pipeline, re_store = persistent_runtime()
@@ -312,13 +316,13 @@ def test_cancelled_state_transaction_keeps_guard_until_worker_commits(isolated_c
 
         def delayed_write(conn, state):
             entered.set()
-            assert release.wait(5)
+            assert release.wait(SYNC_TIMEOUT)
             return real_write(conn, state)
 
         with patch.object(store, "_write_state", side_effect=delayed_write):
             transaction = asyncio.create_task(store.commit(old, updates=(StateUpdate("summary", "旧读先提交"),)))
             try:
-                assert await asyncio.to_thread(entered.wait, 5)
+                assert await asyncio.to_thread(entered.wait, SYNC_TIMEOUT)
                 transaction.cancel()
                 events = await confirmation(writer, plan)
                 assert any(e.payload.get("code") == "effect_in_progress" for e in events)
@@ -344,7 +348,7 @@ def test_disconnected_confirmation_keeps_cross_worker_guard_until_receipt(isolat
 
         def remote_write(*args, **kwargs):
             entered.set()
-            assert release.wait(5)
+            assert release.wait(SYNC_TIMEOUT)
             return {"ok": True, "task_id": "fake-gy"}
 
         async def commit(lease, *, conversation=None, updates=()):
@@ -358,13 +362,13 @@ def test_disconnected_confirmation_keeps_cross_worker_guard_until_receipt(isolat
             stream = writer.confirm(owner=OWNER, session_id=SESSION, plan_id=plan)
             assert (await anext(stream)).type is AgentEventType.TURN_STARTED
             try:
-                assert await asyncio.to_thread(entered.wait, 5)
+                assert await asyncio.to_thread(entered.wait, SYNC_TIMEOUT)
                 await stream.aclose()
                 with pytest.raises(SessionBusyError):
                     await lifecycle_for(other, op, other_store).reset(owner=OWNER, session_id=SESSION)
             finally:
                 release.set()
-                await asyncio.wait_for(saved.wait(), 5)
+                await asyncio.wait_for(saved.wait(), SYNC_TIMEOUT)
             # 等待 detached producer 的收尾，避免测试关闭事件循环代替生产者完成。
             pending = tuple(writer._detached_tasks)
             if pending:
@@ -421,7 +425,7 @@ def test_cancelled_producer_drains_external_thread_and_persists_receipt(isolated
 
         def remote_write(*args, **kwargs):
             entered.set()
-            assert release.wait(5)
+            assert release.wait(SYNC_TIMEOUT)
             return {"ok": True, "task_id": "fake-gy"}
 
         isolated_chain[0].side_effect = remote_write
@@ -430,7 +434,7 @@ def test_cancelled_producer_drains_external_thread_and_persists_receipt(isolated
             queue, plan_id=plan,
         ).run())
         try:
-            assert await asyncio.to_thread(entered.wait, 5)
+            assert await asyncio.to_thread(entered.wait, SYNC_TIMEOUT)
             task.cancel()
             delivered = asyncio.Event()
             asyncio.get_running_loop().call_soon(delivered.set)
@@ -501,7 +505,7 @@ def test_worker_owned_cancellation_never_spins_or_leaks_scope(mode):
     process.start()
     child.close()
     try:
-        process.join(10)
+        process.join(SYNC_TIMEOUT)
         assert not process.is_alive(), "工作项自身取消导致忙等或持锁未收束"
         assert process.exitcode == 0
         assert parent.poll(1)
@@ -541,7 +545,7 @@ def test_cancellation_during_confirmed_finalization_keeps_receipt_and_terminal_f
                 matched = matched and (receipt if phase == "receipt" else not receipt)
             if matched and not entered.is_set():
                 entered.set()
-                assert release.wait(5)
+                assert release.wait(SYNC_TIMEOUT)
             return original(*args, **kwargs)
 
         def attach_reference(*, plan, value, elapsed_ms):
@@ -552,7 +556,7 @@ def test_cancellation_during_confirmed_finalization_keeps_receipt_and_terminal_f
             task = asyncio.create_task(AgentTurn(writer, QueryEnvelope(owner=OWNER, session_id=SESSION,
                 message="继续已确认任务", request_id="finalization-cancel", channel="api").to_agent_input(), queue, plan_id=plan).run())
             try:
-                assert await asyncio.to_thread(entered.wait, 5)
+                assert await asyncio.to_thread(entered.wait, SYNC_TIMEOUT)
                 assert isolated_chain[0].call_count == 1
                 task.cancel()
                 delivered = asyncio.Event()
@@ -564,7 +568,7 @@ def test_cancellation_during_confirmed_finalization_keeps_receipt_and_terminal_f
                     await other_store.commit(old, conversation=[])
             finally:
                 release.set()
-                await asyncio.wait_for(task, 5)
+                await asyncio.wait_for(task, SYNC_TIMEOUT)
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())

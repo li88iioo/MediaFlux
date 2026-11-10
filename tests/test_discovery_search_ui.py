@@ -1255,8 +1255,15 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 self.assertEqual(page.locator('#discovery-grid').evaluate('e=>e.childElementCount'), 0)
                 self.assertAlmostEqual(page.evaluate("document.querySelector('.discovery-rail').scrollLeft"), rail_offset, delta=1)
                 cdp = page.context.new_cdp_session(page)
-                cdp.send('HeapProfiler.collectGarbage')
-                self.assertTrue(page.evaluate("window.__oldCard.deref()===undefined"))
+                # 单次 GC 不保证回收 WeakRef 目标；真泄漏时多轮后仍存活。
+                released = False
+                for _ in range(10):
+                    cdp.send('HeapProfiler.collectGarbage')
+                    released = page.evaluate("window.__oldCard.deref()===undefined")
+                    if released:
+                        break
+                    page.wait_for_timeout(50)
+                self.assertTrue(released)
                 cdp.detach()
                 page.evaluate("document.querySelector('#discovery-tab-tmdb-movie').click()")
                 page.wait_for_function("document.querySelectorAll('#discovery-grid .discovery-card').length===40")
