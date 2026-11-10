@@ -313,16 +313,8 @@ def get_agent_kernel_runtime() -> AgentKernelRuntime:
         return runtime
 
 
-def get_agent_kernel() -> AgentSession:
-    return get_agent_kernel_runtime().session
-
-
 def invalidate_agent_kernel_runtime() -> None:
     """使下一次入口调用按最新模型与上下文配置重建 Kernel。"""
     global _runtime
     with _lock:
         _runtime = None
-
-
-def reset_agent_kernel_for_tests() -> None:
-    invalidate_agent_kernel_runtime()

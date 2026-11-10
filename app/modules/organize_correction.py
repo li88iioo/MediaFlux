@@ -9,7 +9,6 @@ import hashlib
 import json
 import re
 import time
-import uuid
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -2130,8 +2129,3 @@ class OrganizeCorrectionService:
         if warnings or directory_warnings:
             db.update_organize_log(log_id, error="；".join(result["warnings"]))
         return result
-
-
-
-def new_operation_token() -> str:
-    return uuid.uuid4().hex

@@ -251,14 +251,6 @@ def get_media_subscription(subscription_id: int, *, include_deleted: bool = Fals
         ).fetchone()
 
 
-def get_media_subscription_by_identity(tmdb_id: str, media_type: str) -> sqlite3.Row | None:
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM media_subscriptions WHERE tmdb_id=? AND media_type=? AND deleted_at IS NULL",
-            (tmdb_id, media_type),
-        ).fetchone()
-
-
 def list_media_subscriptions(
     *, status: str = "", enabled: bool | None = None, limit: int = 200, offset: int = 0,
     before: tuple[str, int] | None = None,

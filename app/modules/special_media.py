@@ -280,11 +280,6 @@ def has_fractional_episode_position(value: str) -> bool:
     return fractional_episode_position(value) is not None
 
 
-def strip_special_directories(value: str) -> str:
-    """移除路径中的特别篇容器，保留所属作品上下文。"""
-    return "/".join(part for part in split_path(value) if not is_special_directory_name(part))
-
-
 def special_parent_context(value: str, fallback: str = "") -> str:
     """返回特别篇容器所属作品侧的上下文，不采用容器后的素材分类目录。"""
     parts = split_path(value)

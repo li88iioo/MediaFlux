@@ -4,11 +4,8 @@ from __future__ import annotations
 import codecs
 import json
 import re
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import timezone
-from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -230,32 +227,6 @@ def is_protocol_fallback_error(
             return False
         text = error.strip()
     return text.removesuffix(".") in _PROTOCOL_FALLBACK_MESSAGES
-
-
-def provider_retry_delay(
-    retry_after: object,
-    *,
-    retry_index: int,
-    max_seconds: float = 2.0,
-) -> float:
-    """解析 Retry-After，并把指数退避严格限制在总预算可控范围。"""
-    limit = max(0.0, float(max_seconds))
-    raw = str(retry_after or "").strip()
-    delay: float | None = None
-    if raw:
-        try:
-            delay = float(raw)
-        except ValueError:
-            try:
-                parsed = parsedate_to_datetime(raw)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                delay = parsed.timestamp() - time.time()
-            except (TypeError, ValueError, OverflowError):
-                delay = None
-    if delay is None:
-        delay = 0.2 * (2 ** max(0, retry_index))
-    return min(limit, max(0.0, delay))
 
 
 def strip_reasoning_markup(value: object) -> str:

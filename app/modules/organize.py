@@ -4426,30 +4426,6 @@ class Organizer:
         return "\n\n".join(sections)
 
     @staticmethod
-    def _notification_footer(stats: dict) -> str:
-        lines: list[str] = []
-        confirmations = [
-            str(item).strip() for item in (stats.get("confirmations") or [])
-            if str(item).strip()
-        ]
-        skip_reasons = [
-            str(item).strip() for item in (stats.get("skip_reasons") or [])
-            if str(item).strip()
-        ]
-        if confirmations:
-            lines.append("待确认：" + "；".join(confirmations[:3]))
-        if skip_reasons:
-            lines.append("跳过原因：" + "；".join(skip_reasons[:3]))
-        cleanup_reasons = [
-            str(item).strip()
-            for item in (stats.get("empty_dir_cleanup_reasons") or [])
-            if str(item).strip()
-        ]
-        if cleanup_reasons:
-            lines.append("目录清理：" + "；".join(cleanup_reasons[:3]))
-        return "\n".join(lines)
-
-    @staticmethod
     def _confirmation_summary(match: MatchResult) -> str:
         reason = (match.error or "TMDB 匹配结果需人工确认").strip()
         if match.tmdb_id and match.title:
@@ -7505,17 +7481,6 @@ class Organizer:
                 "scan_failures": scan_failures,
             }
         return report["cleaned"]
-
-    def _clean_empty_dirs(
-        self,
-        scanned_dirs: list[tuple],
-        *,
-        protected_source_ids: set[str] | None = None,
-    ) -> int:
-        """自底向上删除本次扫描到的空子目录，不处理受保护来源根。"""
-        return self._clean_empty_dirs_report(
-            scanned_dirs, protected_source_ids=protected_source_ids
-        )["cleaned"]
 
     def _clean_empty_dirs_report(
         self,

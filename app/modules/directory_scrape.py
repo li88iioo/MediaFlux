@@ -2000,28 +2000,6 @@ class DirectoryScrapeService:
             "homepage": "",
         }
 
-    @staticmethod
-    def _position_overrides(
-        inspection: DirectoryInspection,
-    ) -> dict[str | tuple[str, str], tuple[int | None, int | None]]:
-        counts: dict[str, int] = {}
-        for item in inspection.videos:
-            counts[item.name] = counts.get(item.name, 0) + 1
-        result: dict[str | tuple[str, str], tuple[int | None, int | None]] = {}
-        for item in inspection.videos:
-            if item.season is None and item.episode is None:
-                continue
-            position = (item.season, item.episode)
-            relative_parent = (item.relative_dir or "").replace("\\", "/").strip("/")
-            full_parent = "/".join(
-                value for value in (inspection.directory_name, relative_parent) if value
-            )
-            result[(relative_parent, item.name)] = position
-            result[(full_parent, item.name)] = position
-            if counts.get(item.name) == 1:
-                result[item.name] = position
-        return result
-
     @classmethod
     def _mapped_position_overrides(
         cls,

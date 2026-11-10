@@ -35,10 +35,6 @@ def automatic_match_policy(value: object | None = None) -> AutomaticMatchPolicy:
     return AUTOMATIC_MATCH_POLICIES[normalize_automatic_match_preset(raw)]
 
 
-def automatic_match_threshold(value: object | None = None) -> float:
-    return automatic_match_policy(value).threshold
-
-
 def automatic_match_confirmation_message(value: object | None = None) -> str:
     policy = automatic_match_policy(value)
     percentage = round(policy.threshold * 100)

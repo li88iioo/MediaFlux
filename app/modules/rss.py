@@ -442,11 +442,6 @@ class MikanParser:
         return entries
 
     @staticmethod
-    def _extract_torrent(entry) -> str:
-        """从 feed 条目提取种子链接：优先 enclosure，回退 link。"""
-        return MikanParser._extract_download(entry)[0]
-
-    @staticmethod
     def _extract_download(entry) -> tuple[str, str]:
         from app.modules.offline import _is_http_torrent_url
 

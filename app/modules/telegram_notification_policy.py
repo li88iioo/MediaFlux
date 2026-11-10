@@ -65,10 +65,3 @@ def allows_notification(
     except ValueError:
         normalized = NotificationImportance.RESULT
     return _LEVEL_RANK[notification_level()] >= _IMPORTANCE_RANK[normalized]
-
-
-def notification_policy_snapshot() -> dict[str, object]:
-    return {
-        "enabled": notifications_enabled(),
-        "level": notification_level(),
-    }

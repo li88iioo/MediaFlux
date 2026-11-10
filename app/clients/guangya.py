@@ -2981,17 +2981,6 @@ class GuangYaClient:
 
         return export_manifest(self, source_dir_id, source_name=source_name)
 
-    def import_gcid_json(self, gcid_data: dict, target_dir_id: str = "0") -> dict:
-        """校验 GCID 清单并报告导入能力，不伪造云端写入。"""
-        from app.modules.gcid_manifest import validate_manifest
-
-        result = validate_manifest(gcid_data)
-        return {
-            **result,
-            "target_dir_id": (target_dir_id or "0"),
-            "executed": False,
-        }
-
     # ===== 离线下载 =====
     def add_offline_task(self, url: str, target_dir_id: str = "0",
                          task_type: str = "magnet") -> dict:

@@ -632,15 +632,6 @@ def purge_notifications(*, retention_days: int = 30, limit: int = 1000) -> int:
         return (cur.rowcount or 0)
 
 
-def pending_notification_count() -> int:
-    with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS total FROM telegram_notification_outbox "
-            "WHERE status IN ('pending','retry_wait','sending')"
-        ).fetchone()
-        return int(row["total"] or 0)
-
-
 def _recover_after_restart(conn, timestamp: str) -> None:
     """恢复可确定更新的消息；发送结果未知的新消息不得自动重放。"""
     conn.execute(

@@ -3586,21 +3586,6 @@ def update_organize_confirmation(token: str, **fields) -> None:
         )
 
 
-def release_organize_confirmation(
-    token: str, error: str = "", *, include_running: bool = False
-) -> None:
-    """释放未完成认领，允许同一安全快照稍后再次点击。"""
-    statuses = ("queued", "running") if include_running else ("queued",)
-    placeholders = ",".join("?" for _ in statuses)
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE organize_confirmations SET status='pending',selected_index=NULL,"
-            f"queued_at=NULL,task_id='',error=?,completed_at=NULL,updated_at=? "
-            f"WHERE token=? AND status IN ({placeholders})",
-            ((error or ""), now(), (token or ""), *statuses),
-        )
-
-
 def complete_organize_confirmation_with_delivery(
     token: str,
     *,
