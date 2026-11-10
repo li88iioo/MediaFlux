@@ -38,7 +38,14 @@ from app.modules.media_identity import (
 )
 from app.private_files import protect_sqlite_files
 from app.runtime_paths import get_runtime_paths
+from app import database_migrations
+from app.database_schema import _SCHEMA
 from app.repositories import recognition
+from app.repositories import telegram_notifications
+from app.repositories import download_requests as download_requests_repo
+from app.repositories import local_media as local_media_repo
+from app.repositories import organize_history as organize_history_repo
+from app.repositories import strm as strm_repo
 
 logger = get_logger(__name__)
 
@@ -174,9 +181,6 @@ def configure_database(path: Path, *, test_mode: bool = False) -> Path:
     return configured_path
 
 
-from app.database_schema import _SCHEMA  # noqa: E402
-
-
 def _protect_database_files(path: Path | None = None) -> None:
     """尽力收紧数据库文件权限，不让权限修复掩盖数据库业务异常。"""
     try:
@@ -249,9 +253,6 @@ def _connect() -> sqlite3.Connection:
 
 def _test_mode_enabled() -> bool:
     return _configured_test_mode or os.getenv("MEDIAFLUX_TEST_MODE", "").strip() == "1"
-
-
-from app import database_migrations
 
 
 def _run_schema_savepoint(
@@ -1395,8 +1396,6 @@ def list_organize_log_items(log_id: int) -> list[sqlite3.Row]:
             "WHEN 'video' THEN 0 ELSE 1 END,id",
             (log_id,),
         ).fetchall()
-
-
 
 
 def claim_organize_log_operation(
@@ -4152,10 +4151,3 @@ def claim_agent_action_lease(lease_key: str, *, ttl_seconds: int = 90) -> str | 
             (normalized, token, current + ttl, now()),
         )
         return token if cur.rowcount == 1 else None
-
-
-from app.repositories import telegram_notifications  # noqa: E402
-from app.repositories import download_requests as download_requests_repo  # noqa: E402
-from app.repositories import local_media as local_media_repo  # noqa: E402
-from app.repositories import organize_history as organize_history_repo  # noqa: E402
-from app.repositories import strm as strm_repo  # noqa: E402
