@@ -165,6 +165,20 @@ class OrganizeResultSchemaTests(unittest.TestCase):
                 self.assertEqual(result["data"]["task"]["stats"], {"moved": 1, "failed": 1})
                 self.assertEqual(missing["status"], "unknown")
 
+    def test_correction_followup_warnings_cannot_claim_complete_ingestion(self):
+        from app.modules.organize_results import project_organize_status
+
+        result = project_organize_status({"status": "completed", "result": {
+            "success": True, "log_id": 42, "item_count": 1,
+            "warnings": ["云端操作已完成，STRM/Jellyfin 后处理未受理：token=private-secret"],
+        }}, overview={})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["task"]["status"], "partial")
+        self.assertEqual(result["data"]["task"]["warning_count"], 1)
+        self.assertIn("后处理", result["error"])
+        self.assertIn("不要重复移动或改名", str(result["suggestions"]))
+        self.assertNotIn("private-secret", str(result))
+
     def test_protected_download_prevents_a_success_notification(self):
         from app.modules.organize import Organizer
         from app.modules.telegram_organize_lifecycle import build_organize_lifecycle_event

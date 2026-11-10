@@ -129,6 +129,8 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "activity.unfollow": "活动跟踪停用",
     "activity.inspect_undo": "可逆操作核对",
     "activity.undo": "可逆操作回退",
+    "activity.organize_detail": "整理日志详情",
+    "activity.reorganize": "纠正识别并整理入库",
     # 历史审计仍需可读标签，不注册为执行入口。
     "action.undo.inspect": "可逆操作核对",
     "action.undo.execute": "可逆操作回退",

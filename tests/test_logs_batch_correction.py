@@ -356,6 +356,85 @@ def _preview(service: OrganizeCorrectionService, entries: list[dict[str, Any]], 
     return service.preview_batch(entries, CANDIDATE if candidate is None else candidate)
 
 
+@pytest.mark.parametrize("stale", [False, True, "file_changed"])
+def test_agent_reorganize_frozen_log_position_without_prerename(
+    isolated_db, harness: _Harness, archive_rules, monkeypatch, stale,
+):
+    """真实纠偏预览/文件执行：旧发布集号直接纠正；确认后改动不能被覆盖。"""
+    import asyncio
+    from types import SimpleNamespace
+    from app import sdk
+    from app.agent.kernel.persistence import SQLiteKernelStore
+    from app.agent.errors import ToolPipelineError
+    from app.modules import organize_correction, organize_tasks
+    from tests.test_agent_sdk_effects import context_for, executor
+
+    log_id = _add_log(harness.cloud, "Series - 19.mkv", old_tmdb_id="4242",
+                      original_path="/动漫/MF-557-Series - 19")
+    db.update_organize_log(log_id, status="failed", error="文件集号超出范围")
+    callbacks = []
+    def start(operation, reference, callback, **kwargs):
+        callbacks.append(callback)
+        return {"ok": True, "task_id": "log-correction-task"}
+
+    monkeypatch.setattr(organize_correction, "OrganizeCorrectionService", harness.service)
+    monkeypatch.setattr(organize_tasks, "get_organize_manager", lambda: SimpleNamespace(start_operation=start))
+    archive_rules.link_strm = False
+    monkeypatch.setattr(OrganizeCorrectionService, "_notify_reorganize_result", lambda *a, **kw: [])
+    monkeypatch.setattr(OrganizeCorrectionService, "_finalize_reorganized_source", lambda *a, **kw: [])
+
+    async def run():
+        store = SQLiteKernelStore()
+        context = await context_for(store)
+        effects = executor(store)
+        with sdk.call_owner(context.owner):
+            detail = sdk.activity.organize_detail(log_id)
+        assert detail["allowed_actions"]["reorganize"]
+        arguments = {
+            "log_id": log_id, "tmdb_id": "4242", "media_type": "tv", "season": 2, "episode": 6,
+        }
+        if stale == "file_changed":
+            harness.cloud.rename("file-1", "changed.mkv")
+            writes = list(harness.cloud.write_calls)
+            with pytest.raises(ToolPipelineError, match="文件名已变化") as error:
+                await effects.prepare("activity.reorganize", arguments, context=context)
+            assert error.value.code == "precondition_failed"
+            assert not callbacks and harness.cloud.write_calls == writes
+            return
+        proposal = await effects.prepare("activity.reorganize", arguments, context=context)
+        plan = proposal.effect_plan
+        assert plan is not None
+        assert plan.preview["data"]["season"] == 2
+        assert plan.preview["data"]["episode"] == 6
+        assert "S02E06" in plan.preview["data"]["file_name"]
+        assert not harness.cloud.write_calls and not callbacks
+        if stale:
+            db.update_organize_log(log_id, status="skipped")
+            with pytest.raises(ToolPipelineError, match="版本已变化"):
+                await effects.execute_confirmed(plan.plan_id, context=context)
+            assert not callbacks and not harness.cloud.write_calls
+            return
+        completed = await effects.execute_confirmed(plan.plan_id, context=context)
+        result = completed.outcome.public_content
+        assert result["status"] == "accepted"
+        assert result["data"]["log_id"] == log_id and len(callbacks) == 1
+        assert not harness.cloud.write_calls
+        assert callbacks[0]()["success"]
+        row = db.get_organize_log(log_id)
+        assert row is not None
+        assert row["status"] == "success" and (row["season"], row["episode"]) == (2, 6)
+        assert row["confirmation_actor"] == "agent"
+        assert harness.scraper.confirmed == []
+        with db.get_conn() as conn:
+            assert conn.execute("SELECT count(*) FROM manual_episode_confirmations WHERE log_id=?", (log_id,)).fetchone()[0] == 0
+        assert "S02E06" in row["current_name"]
+        assert row["original_name"] == "Series - 19.mkv"
+        with pytest.raises(ToolPipelineError):
+            await effects.execute_confirmed(plan.plan_id, context=context)
+        assert len(callbacks) == 1
+    asyncio.run(run())
+
+
 def test_preview_uses_explicit_candidate_keeps_episode_positions_and_does_not_write(
     isolated_db, harness: _Harness,
 ):

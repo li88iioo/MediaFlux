@@ -2014,6 +2014,35 @@ class Activity:
 
         return timeline_snapshot(kind, identifier)
 
+    @staticmethod
+    @sdk_method('read')
+    def organize_detail(log_id: int) -> dict:
+        """读取单条光鸭整理日志的媒体身份、成员 file_id、版本及 allowed_actions。
+
+        log_id 来自 organize_logs。纠正季集后入库使用 reorganize，无需先改文件或父目录名称。
+        """
+        from app.modules.organize_correction import OrganizeCorrectionService
+
+        service = OrganizeCorrectionService()
+        try:
+            return service.detail(log_id)
+        finally:
+            service.close()
+
+    @staticmethod
+    @sdk_method('write')
+    def reorganize(log_id: int, tmdb_id: str, media_type: str, season: int | None = None,
+                   episode: int | None = None, provider: str = "tmdb", external_id: str = "") -> dict:
+        """按日志纠正身份/季集并整理入库，使用与 Web 日志相同的预览、执行和收尾。
+
+        例：activity.reorganize(log_id, tmdb_id="276288", media_type="tv", season=2, episode=6)。
+        季集取用户明确指定值或核实后的资料；工作区生成一次完整变更确认，随后移动、改名、
+        更新原日志和待确认状态，并按配置联动 STRM。accepted 只表示受理，宿主跟踪本次任务；
+        activity.timeline("organize", log_id) 可核对该条日志的归档状态和操作记录。
+        AI 选择保留 agent 来源，不自动沉淀为人工识别知识。
+        """
+        raise ValueError("日志重新整理须通过工作区 EffectExecutor 确认执行")
+
 
     @staticmethod
     @sdk_method('read')

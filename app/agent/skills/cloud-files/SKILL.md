@@ -30,10 +30,11 @@
 
 下载请求先按 media-research 技能的 `activity.timeline("download", request_id)` 核对已有整理/STRM 阶段，避免重复发起。用户要求继续整理入库时按实际链路处理：
 
-1. 已配置来源用 `cloud.preview_organize(source_ids=...)` 读取计划、目标与 `data.sources[].id`，确认范围后 `cloud.organize(source_ids=...)`，用确认执行回执 `data.run_id` 调 `cloud.organize_status(run_id)`。省略来源是全部配置来源；max_files 仅限制预览，执行仍处理所选来源全部文件，不把样本当执行上限。
-2. 针对单个真实文件/目录的识别纠正，先 `cloud.inspect_media(file_id)`、必要时 `cloud.search_media` 核实身份，再 `cloud.scrape` 传真实媒体身份及必要季集；其回执 `data.operation_ref` 用 `cloud.operation` 跟踪。此编号与批量整理的 run_id 不可混用；简单 change 移动/改名不等于完成识别。
-3. 整理已配置 STRM 联动时先核对原任务。需补同步时，从 `strm.status()["data"]["sources"]` 取真实 STRM 来源 id，用 `strm.run(source_ids=[...])`，再以回执 `data.run_id` 查 `strm.status(run_id)` 的 `data.task`；不要把整理来源 ID 当 STRM 来源 ID。partial/failed 时用 `strm.failures` 按 data.next_offset 核对明细，需要重试时 `strm.retry_failures(ids)` 只传选中的 open 记录 id；unknown 不以最近运行替代或重投。
-4. 同步结束仍要验收媒体库：`library.libraries(server=...)` 确定真实库；需扫描时 `library.refresh(server, library_id)`，accepted 仅表示排队。剧集用 `library.audit(query, tmdb_id=..., season=..., library_name=..., refresh=True)` 对照目标集；电影用 `library.presence` 核对身份存在性，其返回来源范围不能替代指定库归属验收。按真实范围报告可见性，possible/indeterminate、来源失败和不完整库存保留未知；索引可见不证明可播放。
+1. 对待确认、失败或跳过的日志，先 `activity.organize_logs` 定位原条目、`activity.organize_detail(log_id)` 核实媒体与文件，再用 `activity.reorganize(log_id, tmdb_id=..., media_type="tv", season=2, episode=6)` 一次纠正并入库；季集使用用户明确指定值，或经资料核实后在预览中展示的值。这会更新原日志和待确认状态，并联动已配置的 STRM；不需要先改文件名或父目录名。用户已要求整理时，在这份完整预览上确认，不把改名完成当作整理完成。
+2. 已配置来源用 `cloud.preview_organize(source_ids=...)` 读取计划、目标与 `data.sources[].id`，确认范围后 `cloud.organize(source_ids=...)`，用确认执行回执 `data.run_id` 调 `cloud.organize_status(run_id)`。省略来源是全部配置来源；max_files 仅限制预览，执行仍处理所选来源全部文件，不把样本当执行上限。
+3. 针对单个真实文件/目录的识别纠正，先 `cloud.inspect_media(file_id)`、必要时 `cloud.search_media` 核实身份，再 `cloud.scrape` 传真实媒体身份及必要季集；其回执 `data.operation_ref` 用 `cloud.operation` 跟踪。此编号与批量整理的 run_id 不可混用；简单 change 移动/改名不等于完成识别。
+4. 整理已配置 STRM 联动时先核对原任务。需补同步时，从 `strm.status()["data"]["sources"]` 取真实 STRM 来源 id，用 `strm.run(source_ids=[...])`，再以回执 `data.run_id` 查 `strm.status(run_id)` 的 `data.task`；不要把整理来源 ID 当 STRM 来源 ID。partial/failed 时用 `strm.failures` 按 data.next_offset 核对明细，需要重试时 `strm.retry_failures(ids)` 只传选中的 open 记录 id；unknown 不以最近运行替代或重投。
+5. 同步结束仍要验收媒体库：`library.libraries(server=...)` 确定真实库；需扫描时 `library.refresh(server, library_id)`，accepted 仅表示排队。剧集用 `library.audit(query, tmdb_id=..., season=..., library_name=..., refresh=True)` 对照目标集；电影用 `library.presence` 核对身份存在性，其返回来源范围不能替代指定库归属验收。按真实范围报告可见性，possible/indeterminate、来源失败和不完整库存保留未知；索引可见不证明可播放。
 
 ## 检查最近可撤销的操作
 

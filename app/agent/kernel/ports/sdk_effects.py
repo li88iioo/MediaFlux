@@ -600,6 +600,98 @@ def activity_undo_tool() -> KernelToolSpec:
     )
 
 
+def activity_reorganize_tool() -> KernelToolSpec:
+    """日志纠偏复用 Web 的冻结预览与单条执行器，不先改名或扫描整个来源。"""
+    from app import sdk
+    from app.modules.organize_correction import OrganizeCorrectionService
+    from app.modules.directory_scrape_errors import DirectoryScrapePublicError, public_error_message
+
+    def prepare(arguments, context):
+        service = None
+        try:
+            with confirmation_runtime(context) as prefix:
+                values = sdk.prepare_sdk_method("activity.reorganize", arguments, owner=context.owner)
+                context.cancellation.raise_if_cancelled()
+                service = OrganizeCorrectionService()
+                frozen = service.preview_reorganize(**values)
+                if not service.detail(values["log_id"])["allowed_actions"]["reorganize"]:
+                    raise ValueError("当前日志不允许重新整理")
+                data = deepcopy(frozen)
+                data["resources"] = [{"title": f"{item['from_name']} → {frozen['target_path']}/{item['to_name']}",
+                                      "count": 1} for item in frozen["items"]]
+                data["count"] = len(frozen["items"])
+                preview = ToolResult(True, "confirmation_required", f"纠正日志 #{values['log_id']} 并整理入库", data=data)
+                return PreparedEffect(arguments=values, preview=preview.to_dict(),
+                    snapshot_fingerprint=prefix + _fingerprint(frozen),
+                    metadata={"risk": "danger", "reorganize_preview": frozen,
+                        "confirmation": build_confirmation_contract(tool_name="activity.reorganize",
+                            risk=RiskLevel.DANGER, preview=preview)})
+        except (ValueError, LookupError, DirectoryScrapePublicError) as exc:
+            message = public_error_message(exc) if isinstance(exc, DirectoryScrapePublicError) else str(exc)
+            raise ToolPipelineError(message, code="precondition_failed") from exc
+        finally:
+            if service is not None:
+                service.close()
+
+    def submit(arguments, expected_snapshot, context):
+        service = None
+        submitted = False
+        try:
+            with confirmation_runtime(context) as prefix:
+                active = context.active_effect_plan
+                if (active is None or active.owner != context.owner or active.session_id != context.session_id
+                        or active.tool_name != "activity.reorganize" or dict(active.arguments) != arguments):
+                    raise ToolPipelineError("缺少原确认执行范围", code="confirmation_invalid")
+                frozen = active.metadata.get("reorganize_preview")
+                if not isinstance(frozen, dict) or prefix + _fingerprint(frozen) != expected_snapshot:
+                    raise ToolPipelineError("整理预览已变化，请重新预检", code="confirmation_stale")
+                context.cancellation.raise_if_cancelled()
+                service = OrganizeCorrectionService()
+                submitted = True
+                accepted = service.submit_reorganize(frozen, "agent-" + active.plan_id, confirmation_actor="agent")
+                if not accepted.get("ok"):
+                    return ToolResult(False, "busy", "整理队列未接收请求", error=accepted.get("error", ""))
+                result = ToolResult(True, "accepted", "单条纠正整理已受理，尚未完成",
+                    data={"log_id": frozen["log_id"], "task_id": accepted["task_id"]})
+                result.effect_metadata["completion"] = {"kind": "guangya_organize_task",
+                    "task_id": accepted["task_id"], "operation": "reorganize"}
+                return result
+        except (ValueError, LookupError, DirectoryScrapePublicError, ToolPipelineError, AgentRuntimeDisabled, RuntimeFenceError) as exc:
+            error = ToolPipelineError(str(exc), code=getattr(exc, "code", "precondition_failed"))
+            error.mark_execution_started(False)
+            raise error from exc
+        except Exception as exc:
+            error = ToolPipelineError("整理提交结果待核对，请查看原日志，勿重复提交", code="outcome_unknown")
+            error.mark_execution_started(submitted)
+            raise error from exc
+        finally:
+            if service is not None:
+                service.close()
+
+    async def execute(arguments, expected_snapshot, context):
+        result = await asyncio.to_thread(submit, arguments, expected_snapshot, context)
+        if context.wait_for_completion:
+            return await effect_completion.wait_for_effect_completion(result, tool="activity.reorganize",
+                context=ToolContext(owner=context.owner, session_id=context.session_id,
+                                    cancelled=lambda: context.cancellation.cancelled),
+                report_progress=context.report_progress, scope=context.completion_scope)
+        tracker = effect_completion.observers._completion_tracker(result)
+        if result.ok and tracker is not None:
+            await effect_completion._register_effect_wait(result, tracker, "activity.reorganize", context.completion_scope)
+        return result
+
+    return KernelToolSpec(name="activity.reorganize", domain="activity", effect=ToolEffect.DANGER,
+        description=activity.reorganize.__doc__ or "", metadata={"risk": "danger"},
+        input_schema={"type": "object", "required": ["log_id", "tmdb_id", "media_type"], "additionalProperties": False,
+            "properties": {"log_id": {"type": "integer", "minimum": 1}, "tmdb_id": {"type": "string"},
+                "media_type": {"type": "string", "enum": ["movie", "tv"]},
+                "season": {"type": ["integer", "null"], "minimum": 0, "maximum": 999},
+                "episode": {"type": ["integer", "null"], "minimum": 1, "maximum": 9999},
+                "provider": {"type": "string", "enum": ["tmdb", "metatube", "clean_title"]},
+                "external_id": {"type": "string"}}},
+        prepare=prepare, execute_confirmed=execute)
+
+
 def activity_follow_tools() -> tuple[KernelToolSpec, KernelToolSpec]:
     """按持久活动身份关注/停用；业务条件提交复用同一规则仓储。"""
     def prepare(arguments, context, *, operation):

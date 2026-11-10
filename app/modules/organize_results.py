@@ -207,7 +207,8 @@ def project_organize_status(
     resumed_ids = result.get("resumed_download_ids", []) if isinstance(result, dict) else []
     resumed_count = len({value for value in resumed_ids if type(value) is int and value > 0}) if isinstance(resumed_ids, list) else 0
     protected_count = len(_dict_list(result.get("protected_staging_dirs"))) if isinstance(result, dict) else 0
-    if (handoff_error or protected_count) and task_status == "completed":
+    warning_count = len(_text_list(result.get("warnings"))) if isinstance(result, dict) else 0
+    if (handoff_error or protected_count or warning_count) and task_status == "completed":
         task_status = "partial"
     schedule_raw = (
         overview.get("schedule") if isinstance(overview.get("schedule"), dict) else {}
@@ -271,6 +272,10 @@ def project_organize_status(
 
     # 只公开有明确统计依据的故障阶段，不转发 Provider 原始异常或私有路径。
     problems = []
+    if warning_count:
+        summary += f"；后处理有 {warning_count} 项警告"
+        problems.append("文件变更已结算，后处理仍需核对；不能据此认定 STRM 和媒体库已完成")
+        suggestions.append("请核对原整理日志及服务日志中的后处理警告；不要重复移动或改名。")
     if protected_count:
         summary += f"；受保护下载目录 {protected_count} 个未扫描"
         if task_status in {"partial", "failed", "manual_review"}:
@@ -306,6 +311,8 @@ def project_organize_status(
     if protected_count:
         task_data["protected_staging_count"] = protected_count
         task_data["scan_complete"] = False
+    if warning_count:
+        task_data["warning_count"] = warning_count
     if resumed_count:
         task_data["resumed_download_count"] = resumed_count
         summary += f"；本轮已恢复 {resumed_count} 个下载整理任务，尚不代表入库完成"

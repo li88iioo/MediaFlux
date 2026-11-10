@@ -116,7 +116,7 @@ def build_tool_catalog() -> ToolCatalog:
     from .ports.sdk_effects import automation_tools, subscription_tools
     for tool in (*automation_tools(), *subscription_tools()):
         catalog.register(tool)
-    from .ports.sdk_effects import media_refresh_tools, activity_undo_tool, activity_follow_tools, share_transfer_tool, directory_scrape_tool, qb_control_tools, cloud_change_tool, cloud_recycle_tools, cloud_share_tools, download_retry_tool, download_submit_tool, preferences_tools, resource_download_tool, watchlist_tools
+    from .ports.sdk_effects import media_refresh_tools, activity_reorganize_tool, activity_undo_tool, activity_follow_tools, share_transfer_tool, directory_scrape_tool, qb_control_tools, cloud_change_tool, cloud_recycle_tools, cloud_share_tools, download_retry_tool, download_submit_tool, preferences_tools, resource_download_tool, watchlist_tools
     from .ports.sdk_effects import rss_configuration_tools, rss_delivery_tools
     for tool in (*rss_configuration_tools(), *rss_delivery_tools()):
         catalog.register(tool)
@@ -137,6 +137,7 @@ def build_tool_catalog() -> ToolCatalog:
     for tool in media_user_tools():
         catalog.register(tool)
     catalog.register(activity_undo_tool())
+    catalog.register(activity_reorganize_tool())
     for tool in activity_follow_tools():
         catalog.register(tool)
     catalog.register(resource_download_tool())

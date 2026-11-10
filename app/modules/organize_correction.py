@@ -700,6 +700,35 @@ class OrganizeCorrectionService:
         )
         return self._execute_reorganize(log_id, operation_token, expected_version, preview)
 
+    def submit_reorganize(self, preview: dict, operation_token: str, *, confirmation_actor: str) -> dict:
+        """提交已冻结的单条纠偏预览；与 Web 共用执行、回滚、确认收尾及 STRM 联动。"""
+        from copy import deepcopy
+        from app.modules.organize_tasks import get_organize_manager
+
+        if confirmation_actor not in {"human", "agent"}:
+            raise ValueError("识别确认来源无效")
+        frozen = deepcopy(preview)
+        log_id, version = frozen["log_id"], frozen["version"]
+        current = self.detail(log_id)
+        if current["version"] != version or not current["allowed_actions"]["reorganize"]:
+            raise ValueError("日志状态或版本已变化，请重新预览")
+        if not self.client.logged_in:
+            raise ValueError("光鸭未登录，无法重新整理")
+
+        def operation():
+            service = OrganizeCorrectionService()
+            try:
+                return service._execute_reorganize(
+                    log_id, operation_token, version, frozen, confirmation_actor=confirmation_actor,
+                )
+            finally:
+                service.close()
+
+        return get_organize_manager().start_operation(
+            "重新整理", f"日志 {log_id}", operation,
+            dedupe_key=f"reorganize:{log_id}:{operation_token}",
+        )
+
     def _verify_item(self, item: CorrectionItem) -> GuangYaFile:
         remote = self.client.file_info(item.file_id)
         if not remote:
@@ -1454,9 +1483,10 @@ class OrganizeCorrectionService:
         match: dict | None = None,
         transitions: list[AppliedTransition],
         parent_path: str = "",
+        confirmation_actor: str = "human",
     ) -> list[str]:
         warnings: list[str] = []
-        if match and str(match.get("provider") or "tmdb").strip().lower() == "tmdb":
+        if confirmation_actor != "agent" and match and str(match.get("provider") or "tmdb").strip().lower() == "tmdb":
             try:
                 self.scraper.confirm(
                     self._video(items).original_name,
@@ -1661,7 +1691,7 @@ class OrganizeCorrectionService:
         return warnings
 
     def _execute_reorganize(self, log_id: int, operation_token: str,
-                            expected_version: int, preview: dict) -> dict:
+                            expected_version: int, preview: dict, *, confirmation_actor: str = "human") -> dict:
         items = self._load_items(log_id)
         self._verify_items(items)
         current_rules = self._rules_for_log(self.detail(log_id))
@@ -1727,7 +1757,7 @@ class OrganizeCorrectionService:
                     db.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
             if not db.update_organize_log(
-                log_id, status="success", operation_type="reorganize", confirmation_actor="human",
+                log_id, status="success", operation_type="reorganize", confirmation_actor=confirmation_actor,
                 current_parent_id=target_id, current_name=preview["file_name"], target_parent_id=target_id,
                 new_path=preview["target_path"] + "/" + preview["file_name"], tmdb_id=match["tmdb_id"],
                 provider=str(match.get("provider") or ""), external_id=str(match.get("external_id") or ""),
@@ -1754,7 +1784,7 @@ class OrganizeCorrectionService:
             raise
         post_warnings = self._run_post_actions(
             items=items, rules=rules, match=match, transitions=completed,
-            parent_path=parent_path,
+            parent_path=parent_path, confirmation_actor=confirmation_actor,
         )
         empty_dirs_cleaned, directory_warnings = self._cleanup_empty_directories(
             log_id=log_id, directories=cleanup_directories,

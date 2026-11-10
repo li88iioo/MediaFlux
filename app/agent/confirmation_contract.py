@@ -70,6 +70,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "保存或停用周期观察；任务异常、阶段结束或到期时通知一次。不启动、重试或取消原任务。",
         "reversibility": "可以停用跟踪；已进入统一通知队列的消息不能由本操作撤回。",
     },
+    "activity.reorganize": {
+        "action": "纠正识别并整理入库",
+        "object": "指定整理日志中的视频及伴随文件",
+        "impact": "按预览的媒体身份和季集移动、改名，更新原整理日志与待确认状态，并联动已配置的 STRM。",
+        "reversibility": "保留逐项操作记录；回退需重新核验当前文件和目标目录，已发出的通知不能撤回。",
+    },
     "activity.undo": {
         "action": "可逆操作回退",
         "object": "本次凭证绑定的媒体偏好或光鸭最近可逆文件操作",
