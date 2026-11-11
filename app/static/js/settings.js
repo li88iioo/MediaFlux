@@ -232,9 +232,6 @@
             config[key]=['1','true','yes','on','y'].includes(String(config[key]).trim().toLowerCase())?'1':'0';
         });
         fillConfigFields(form,config);
-        // 其余字段的默认值由 /api/config 按后端唯一默认值表回填。
-        const configDefaults={TG_NOTIFICATION_ENABLED:'1',TG_NOTIFICATION_LEVEL:'standard',AI_RECOGNITION_ENABLED:'0',AI_RECOGNITION_CONFIDENCE_THRESHOLD:'0.8',AI_RECOGNITION_REQUESTS_PER_MINUTE:'6',AI_RECOGNITION_DAILY_REQUEST_LIMIT:'100',AI_RECOGNITION_MAX_CONCURRENCY:'2',AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS:'60',ORGANIZE_TAVILY_HINTS_ENABLED:'0',ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT:'20'};
-        Object.entries(configDefaults).forEach(([key,value])=>{if(config[key])return;const field=form.querySelector(`[data-key="${key}"]`);if(!field)return;if(field.type==='checkbox')field.checked=value==='1';else field.value=value;});
         loadIndexerSiteSelection(config);
         setConfigReady();
         syncTelemetryWidgets();

@@ -61,10 +61,10 @@ _states_lock = threading.RLock()
 
 def governance_config() -> AIRecognitionGovernanceConfig:
     return AIRecognitionGovernanceConfig(
-        requests_per_minute=config.get_int_clamped("AI_RECOGNITION_REQUESTS_PER_MINUTE", 6, 1, 30),
-        daily_request_limit=config.get_int_clamped("AI_RECOGNITION_DAILY_REQUEST_LIMIT", 100, 1, 100_000),
-        max_concurrency=config.get_int_clamped("AI_RECOGNITION_MAX_CONCURRENCY", 2, 1, 8),
-        circuit_breaker_seconds=config.get_int_clamped("AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS", 60, 10, 600),
+        requests_per_minute=config.get_int_setting("AI_RECOGNITION_REQUESTS_PER_MINUTE"),
+        daily_request_limit=config.get_int_setting("AI_RECOGNITION_DAILY_REQUEST_LIMIT"),
+        max_concurrency=config.get_int_setting("AI_RECOGNITION_MAX_CONCURRENCY"),
+        circuit_breaker_seconds=config.get_int_setting("AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS"),
     )
 
 

@@ -31,6 +31,8 @@ _LEVEL_RANK = {
     "standard": 1,
     "detailed": 2,
 }
+NOTIFICATION_LEVELS = tuple(_LEVEL_RANK)
+DEFAULT_NOTIFICATION_LEVEL = "standard"
 _IMPORTANCE_RANK = {
     NotificationImportance.ACTION: 0,
     NotificationImportance.ERROR: 0,
@@ -40,12 +42,12 @@ _IMPORTANCE_RANK = {
 
 
 def notification_level() -> str:
-    value = (config.get("TG_NOTIFICATION_LEVEL", "standard") or "standard").strip().lower()
-    return value if value in _LEVEL_RANK else "standard"
+    value = (config.get("TG_NOTIFICATION_LEVEL", DEFAULT_NOTIFICATION_LEVEL) or DEFAULT_NOTIFICATION_LEVEL).strip().lower()
+    return value if value in _LEVEL_RANK else DEFAULT_NOTIFICATION_LEVEL
 
 
 def notifications_enabled() -> bool:
-    return config.get_bool("TG_NOTIFICATION_ENABLED", True)
+    return config.get_bool("TG_NOTIFICATION_ENABLED")
 
 
 def allows_notification(

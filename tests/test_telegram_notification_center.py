@@ -1719,8 +1719,11 @@ class TelegramNotificationSettingsTests(unittest.TestCase):
         self.assertEqual(template.count('data-key="TG_NOTIFICATION_LEVEL"'), 1)
         for value in ("essential", "standard", "detailed"):
             self.assertIn(f'<option value="{value}"', template)
-        self.assertIn("TG_NOTIFICATION_ENABLED:'1'", script)
-        self.assertIn("TG_NOTIFICATION_LEVEL:'standard'", script)
+        from app.routes.api import _UI_DEFAULTS
+
+        # 未配置时由 /api/config 回填后端默认值，前端不再自带副本。
+        self.assertEqual((_UI_DEFAULTS["TG_NOTIFICATION_ENABLED"], _UI_DEFAULTS["TG_NOTIFICATION_LEVEL"]), ("1", "standard"))
+        self.assertNotIn("configDefaults", script)
 
     def test_config_api_normalizes_switch_and_rejects_unknown_level(self) -> None:
         with patch(

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
-from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_WEB_PORT
+from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_WEB_PORT, INT_SETTING_BOUNDS
 from app.env_file import read_env_bytes as _read_env_bytes
 from app.runtime_paths import get_runtime_paths
 
@@ -177,6 +177,11 @@ def get_int(key: str, default: int = 0) -> int:
 def get_int_clamped(key: str, default: int, minimum: int, maximum: int) -> int:
     """读取整数配置；无效值回退默认值，越界截断到允许范围。"""
     return max(minimum, min(get_int(key, default), maximum))
+
+
+def get_int_setting(key: str) -> int:
+    """按 INT_SETTING_BOUNDS 读取已登记的整数设置。"""
+    return get_int_clamped(key, *INT_SETTING_BOUNDS[key])
 
 
 def get_bool(key: str, default: bool | None = None) -> bool:

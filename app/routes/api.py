@@ -16,6 +16,8 @@ from app.clients.douban_authenticated import (
     normalize_dbcl2,
 )
 from app.defaults import (
+    AI_RECOGNITION_CONFIDENCE_BOUNDS,
+    INT_SETTING_BOUNDS,
     DEFAULT_BOOL_CONFIG_VALUES,
     DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT,
     DEFAULT_AGENT_EPISODE_RESEARCH_ENABLED,
@@ -34,6 +36,7 @@ from app.indexers.config import (
 )
 from app.logger import get_logger
 from app.modules.policy_config import POLICY_BY_KEY, policy_int
+from app.modules.telegram_notification_policy import DEFAULT_NOTIFICATION_LEVEL, NOTIFICATION_LEVELS
 from app.modules.feature_config import (
     AGENT_EPISODE_RESEARCH_KEYS,
     AI_RECOGNITION_KEYS,
@@ -267,9 +270,11 @@ def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
             "TG_NOTIFICATION_ENABLED", data["TG_NOTIFICATION_ENABLED"]
         )
     if "TG_NOTIFICATION_LEVEL" in data:
-        level = str(data["TG_NOTIFICATION_LEVEL"] or "standard").strip().lower()
-        if level not in {"essential", "standard", "detailed"}:
-            raise ValueError("TG_NOTIFICATION_LEVEL 必须是 essential、standard 或 detailed")
+        level = str(data["TG_NOTIFICATION_LEVEL"] or DEFAULT_NOTIFICATION_LEVEL).strip().lower()
+        if level not in NOTIFICATION_LEVELS:
+            raise ValueError(
+                f"TG_NOTIFICATION_LEVEL 必须是 {'、'.join(NOTIFICATION_LEVELS[:-1])} 或 {NOTIFICATION_LEVELS[-1]}"
+            )
         updates["TG_NOTIFICATION_LEVEL"] = level
     if "TG_AGENT_ENABLED" in data:
         updates["TG_AGENT_ENABLED"] = normalize_boolean(
@@ -583,31 +588,30 @@ def _validate_ai_recognition_updates(data: dict[str, Any]) -> dict[str, str]:
         )
 
     if "AI_RECOGNITION_CONFIDENCE_THRESHOLD" in data:
+        _, low, high = AI_RECOGNITION_CONFIDENCE_BOUNDS
         try:
             confidence = float(
                 str(data["AI_RECOGNITION_CONFIDENCE_THRESHOLD"]).strip()
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "AI_RECOGNITION_CONFIDENCE_THRESHOLD 必须是 0.5 到 0.99 的数字"
+                f"AI_RECOGNITION_CONFIDENCE_THRESHOLD 必须是 {low} 到 {high} 的数字"
             ) from exc
-        if not 0.5 <= confidence <= 0.99:
+        if not low <= confidence <= high:
             raise ValueError(
-                "AI_RECOGNITION_CONFIDENCE_THRESHOLD 必须在 0.5 到 0.99 之间"
+                f"AI_RECOGNITION_CONFIDENCE_THRESHOLD 必须在 {low} 到 {high} 之间"
             )
         normalized["AI_RECOGNITION_CONFIDENCE_THRESHOLD"] = (
             f"{confidence:.2f}".rstrip("0").rstrip(".")
         )
 
-    limits = {
-        "AI_RECOGNITION_REQUESTS_PER_MINUTE": (1, 30),
-        "AI_RECOGNITION_DAILY_REQUEST_LIMIT": (1, 100_000),
-        "AI_RECOGNITION_MAX_CONCURRENCY": (1, 8),
-        "AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS": (10, 600),
-    }
-    for key, (minimum, maximum) in limits.items():
+    for key in (
+        "AI_RECOGNITION_REQUESTS_PER_MINUTE", "AI_RECOGNITION_DAILY_REQUEST_LIMIT",
+        "AI_RECOGNITION_MAX_CONCURRENCY", "AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS",
+    ):
         if key not in data:
             continue
+        _, minimum, maximum = INT_SETTING_BOUNDS[key]
         try:
             value = int(str(data[key]).strip())
         except (TypeError, ValueError) as exc:
@@ -634,9 +638,10 @@ def _validate_organize_tavily_updates(data: dict[str, Any]) -> dict[str, str]:
             raise ValueError(
                 "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT 必须是整数"
             ) from exc
-        if not 1 <= daily_limit <= 100_000:
+        _, low, high = INT_SETTING_BOUNDS["ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT"]
+        if not low <= daily_limit <= high:
             raise ValueError(
-                "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT 必须在 1 到 100000 之间"
+                f"ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT 必须在 {low} 到 {high} 之间"
             )
         normalized["ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT"] = str(daily_limit)
     return normalized
@@ -975,6 +980,9 @@ def _ui_defaults() -> dict[str, str]:
     defaults.update({key: "1" if default else "0" for key, _, default in FEATURES.values()})
     defaults.update({key: str(policy.default) for key, policy in POLICY_BY_KEY.items()})
     defaults.update(_AGENT_SETTINGS_DEFAULTS)
+    defaults.update({key: str(bounds[0]) for key, bounds in INT_SETTING_BOUNDS.items()})
+    defaults["AI_RECOGNITION_CONFIDENCE_THRESHOLD"] = str(AI_RECOGNITION_CONFIDENCE_BOUNDS[0])
+    defaults["TG_NOTIFICATION_LEVEL"] = DEFAULT_NOTIFICATION_LEVEL
     return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
 
 

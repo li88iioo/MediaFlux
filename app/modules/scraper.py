@@ -39,6 +39,7 @@ from app.clients.openai_compatible import (
 )
 from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.config import get, get_bool
+from app.defaults import AI_RECOGNITION_CONFIDENCE_BOUNDS
 from app.discovery.models import (
     ProviderRateLimited,
     ProviderTimeout,
@@ -6454,11 +6455,12 @@ class TMDBScraper:
 
     @staticmethod
     def _ai_confidence_threshold() -> float:
+        default, minimum, maximum = AI_RECOGNITION_CONFIDENCE_BOUNDS
         try:
-            value = float(get("AI_RECOGNITION_CONFIDENCE_THRESHOLD", "0.8") or 0.8)
+            value = float(get("AI_RECOGNITION_CONFIDENCE_THRESHOLD", str(default)) or default)
         except (TypeError, ValueError):
-            value = 0.8
-        return max(0.5, min(value, 0.99))
+            value = default
+        return max(minimum, min(value, maximum))
 
     @staticmethod
     def _ai_timeout_seconds() -> int:
@@ -6760,7 +6762,7 @@ class TMDBScraper:
         media_type_hint: str = "",
     ) -> RecognitionResult:
         """未知发布组仅在 AI 高置信 + 去前缀后 TMDB 严格命中时即时采用。"""
-        if not get_bool("AI_RECOGNITION_ENABLED", False):
+        if not get_bool("AI_RECOGNITION_ENABLED"):
             return deterministic
         if deterministic.status not in {"no_result", "low_confidence"}:
             return deterministic
@@ -7298,7 +7300,7 @@ class TMDBScraper:
         *,
         source_anchors: list[str] | None = None,
     ) -> RecognitionResult:
-        if not get_bool("AI_RECOGNITION_ENABLED", False):
+        if not get_bool("AI_RECOGNITION_ENABLED"):
             deterministic.ai_diagnostic = {
                 "attempted": False,
                 "reason": "disabled",

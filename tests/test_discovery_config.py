@@ -174,6 +174,9 @@ class DiscoveryConfigTests(unittest.TestCase):
         self.assertEqual(response["DISCOVERY_CACHE_TTL_SECONDS"], "21600")
         self.assertEqual(response["DISCOVERY_DOUBAN_ENABLED"], "1")
         self.assertEqual(response["AGENT_ENABLED"], "0")
+        self.assertEqual(response["AI_RECOGNITION_REQUESTS_PER_MINUTE"], "6")
+        self.assertEqual(response["AI_RECOGNITION_CONFIDENCE_THRESHOLD"], "0.8")
+        self.assertEqual(response["TG_NOTIFICATION_LEVEL"], "standard")
         with patch("app.routes.api.config.all_items", return_value={"DISCOVERY_CACHE_TTL_SECONDS": "900"}):
             self.assertEqual(get_config(self.request)["DISCOVERY_CACHE_TTL_SECONDS"], "900")
 

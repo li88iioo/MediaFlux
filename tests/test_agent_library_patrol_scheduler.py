@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.defaults import DEFAULT_BOOL_CONFIG_VALUES
 from app.repositories import agent_library_patrol as agent_library_patrol_repo
 from app.modules.library_patrol import patrol_status
 from app.modules.episode_audit import EpisodeAuditResult
@@ -484,12 +485,13 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         max_series: int = 50,
     ):
 
-        def get_bool(key: str, default: bool = False) -> bool:
+        def get_bool(key: str, default: bool | None = None) -> bool:
             if key == "AGENT_LIBRARY_PATROL_ENABLED":
                 return enabled
             if key == "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED":
                 return notify
-            return default
+            # 与 config.get_bool 一致：未传默认值时使用登记的权威默认值。
+            return DEFAULT_BOOL_CONFIG_VALUES.get(key, False) if default is None else default
 
         def get_int(key: str, default: int = 0) -> int:
             values = {
@@ -839,12 +841,12 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         notification_enabled = True
         original_claim = agent_library_patrol_repo.claim_due_agent_library_patrol_notification
 
-        def get_bool(key: str, default: bool = False) -> bool:
+        def get_bool(key: str, default: bool | None = None) -> bool:
             if key == "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED":
                 return notification_enabled
             if key == "AGENT_LIBRARY_PATROL_ENABLED":
                 return True
-            return default
+            return DEFAULT_BOOL_CONFIG_VALUES.get(key, False) if default is None else default
 
         def claim_then_disable(**kwargs):
             nonlocal notification_enabled

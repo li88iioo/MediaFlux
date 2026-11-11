@@ -241,7 +241,7 @@ def search_recognition_titles(
     client_factory: Callable[..., Any] | None = None,
 ) -> RecognitionWebHintResult:
     """取得标题线索；默认关闭，且同查询一次最多消耗 1 个独立额度。"""
-    if not get_bool("ORGANIZE_TAVILY_HINTS_ENABLED", False):
+    if not get_bool("ORGANIZE_TAVILY_HINTS_ENABLED"):
         return RecognitionWebHintResult(status="disabled")
     normalized_title = _normalize_title(title)
     if not normalized_title:
@@ -272,7 +272,7 @@ def search_recognition_titles(
         result = RecognitionWebHintResult(status="unavailable")
         awaitable: object | None = None
         try:
-            daily_limit = config.get_int_clamped("ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT", 20, 1, 100_000)
+            daily_limit = config.get_int_setting("ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT")
             if not reserve_daily(daily_limit):
                 result = RecognitionWebHintResult(status="budget_exhausted")
             else:

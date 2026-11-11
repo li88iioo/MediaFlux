@@ -71,7 +71,7 @@ def _load_settings_api(config) -> dict[str, Any]:
     functions = {"_is_config_mask", "_ui_defaults", VALIDATOR, "get_config", "save_config"}
     nodes: list[ast.stmt] = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib", "app.modules.feature_config", "app.modules.policy_config"}:
+        if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib", "app.modules.feature_config", "app.modules.policy_config", "app.modules.telegram_notification_policy"}:
             nodes.append(node)
         elif isinstance(node, ast.Assign) and all(
             isinstance(target, ast.Name) and target.id.startswith("_") for target in node.targets
