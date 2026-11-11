@@ -180,6 +180,18 @@ class DiscoveryConfigTests(unittest.TestCase):
         with patch("app.routes.api.config.all_items", return_value={"DISCOVERY_CACHE_TTL_SECONDS": "900"}):
             self.assertEqual(get_config(self.request)["DISCOVERY_CACHE_TTL_SECONDS"], "900")
 
+    def test_explicit_empty_values_follow_runtime_semantics(self):
+        """旧前端会把显式空值显示为默认值；运行时对非布尔字段的空值同样取默认值。"""
+        stored = {"TG_NOTIFICATION_LEVEL": "", "AI_RECOGNITION_REQUESTS_PER_MINUTE": "",
+                  "LOGIN_WALLPAPER_MODE": "", "TG_NOTIFICATION_ENABLED": ""}
+        with patch("app.routes.api.config.all_items", return_value=stored):
+            response = get_config(self.request)
+        self.assertEqual(response["TG_NOTIFICATION_LEVEL"], "standard")
+        self.assertEqual(response["AI_RECOGNITION_REQUESTS_PER_MINUTE"], "6")
+        self.assertEqual(response["LOGIN_WALLPAPER_MODE"], "default")
+        # get_bool("") 即为关闭，页面不能显示成默认开启。
+        self.assertEqual(response["TG_NOTIFICATION_ENABLED"], "")
+
     def test_retired_indexer_settings_are_hidden_and_no_longer_writable(self):
         retired = {"INDEXER_1LOU_GOOGLE_ENABLED": "1", "INDEXER_1LOU_MIN_INTERVAL_SECONDS": "5"}
         with patch("app.routes.api.config.all_items", return_value={**retired, "INDEXER_ENABLED_SITES": "nyaa,1lou"}):

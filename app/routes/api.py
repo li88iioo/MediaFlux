@@ -1008,10 +1008,12 @@ def get_config(request: Request):
         managed_field_set.add("INDEXER_ENABLED_SITES")
     managed_fields = sorted(managed_field_set)
     managed_field_set = set(managed_fields)
-    # 未配置的页面字段以后端权威默认值展示；新授权（成人复核、季集研究等）
+    # 页面字段按运行时语义展示：缺失或空值取后端权威默认值；布尔开关（*_ENABLED）
+    # 的显式空值在 get_bool 中即为关闭，保持原样。新授权（成人复核、季集研究等）
     # 独立默认关闭，不继承旧开关。
     for key, default in _UI_DEFAULTS.items():
-        items.setdefault(key, default)
+        if key not in items or (items[key] == "" and not key.endswith("_ENABLED")):
+            items[key] = default
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
     retention_key = "DOWNLOAD_TORRENT_RETENTION_DAYS"
