@@ -2127,7 +2127,8 @@ def _can_continue_operation(client, item, outcome, source_snapshot, created_targ
         return True
     except GuangYaFSChangeStale:
         outcome["reason"] = "precondition_failed"
-    except Exception:
+    except Exception as exc:
+        logger.warning("光鸭变更写后核验失败，待复核 type=%s", type(exc).__name__)
         outcome["reason"] = "verification_pending"
     return False
 

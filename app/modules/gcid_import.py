@@ -13,6 +13,9 @@ from typing import Any, Callable, Mapping, Protocol
 from app import database as db
 from app import notifier
 from app.modules.gcid_manifest import GCIDManifest, GCIDManifestFile, normalize_manifest_v2
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class PreviewBindingError(ValueError):
@@ -453,7 +456,8 @@ def _execute_items(
                 size=int(row["size"] or 0),
                 gcid=row["gcid"],
             ))
-        except Exception:
+        except Exception as exc:
+            logger.warning("GCID 导入单项失败 type=%s", type(exc).__name__)
             outcome = GCIDImportItemResult(False)
         if outcome.success:
             _update_item(

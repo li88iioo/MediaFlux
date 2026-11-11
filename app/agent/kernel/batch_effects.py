@@ -26,6 +26,9 @@ from .tool_calls import PreparedEffect
 from .invocation import invoke
 from app.agent.schema import validate_json_schema
 from .tool_calls import PipelineResult, ToolCallContext
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _fingerprint(value: dict) -> str:
@@ -217,7 +220,8 @@ def batch_tool(executor) -> KernelToolSpec:
                 executor._notify_effect("failed", plan=child, code=exc.code, elapsed_ms=int((time.monotonic() - started) * 1000))
                 value = {"ok": False, "status": exc.code if exc.code in {"outcome_unknown", "result_unknown"} else "failed",
                          "summary": str(exc), "error": exc.code}
-            except Exception:
+            except Exception as exc:
+                logger.warning("批量写操作子项执行异常，结果未核验 type=%s", type(exc).__name__)
                 executor._notify_effect("interrupted", plan=child)
                 value = {"ok": False, "status": "outcome_unknown", "summary": "该项执行结果未核验，已停止后续操作；请先检查实际状态"}
             else:

@@ -42,7 +42,8 @@ def index_diagnostics(request: Request):
         return api_response(
             db.list_strm_index_diagnostics(config.get("STRM_ROOT", ""))
         )
-    except Exception:
+    except Exception as exc:
+        logger.error("STRM 索引诊断失败 type=%s", type(exc).__name__)
         return api_error("STRM 索引诊断失败", 500)
 
 
@@ -66,7 +67,8 @@ def cleanup_index_diagnostics(request: Request, data: dict = Body(...)):
         diagnostics = db.list_strm_index_diagnostics(config.get("STRM_ROOT", ""))
     except ValueError:
         return api_error("请求包含非确认测试索引，未执行清理", 409)
-    except Exception:
+    except Exception as exc:
+        logger.error("STRM 测试索引清理失败 type=%s", type(exc).__name__)
         return api_error("STRM 测试索引清理失败", 500)
     return api_response({"deleted": deleted, "diagnostics": diagnostics})
 

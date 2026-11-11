@@ -110,7 +110,8 @@ def execute_qb_control(snapshot: dict[str, Any], *,
                     accepted = method("|".join(hashes))
             except QBControlSafetyUnavailable:
                 raise  # remove 的本地取消意图未能落盘，尚未向 qB 发出写请求。
-            except Exception:
+            except Exception as exc:
+                logger.warning("qBittorrent 写请求结果未知 type=%s", type(exc).__name__)
                 accepted = None
             if not accepted:
                 return {**receipt, "ok": False, "status": "outcome_unknown", "accepted": None,
@@ -118,7 +119,8 @@ def execute_qb_control(snapshot: dict[str, Any], *,
                         "tracking_stopped": operation == "delete"}
             try:
                 after = _selected_tasks(client, hashes)
-            except Exception:
+            except Exception as exc:
+                logger.warning("qBittorrent 写后状态读取失败 type=%s", type(exc).__name__)
                 return {**receipt, "ok": False, "status": "outcome_unknown", "accepted": True,
                         "summary": f"qBittorrent 已接受{action}请求，但状态读取失败；请核对实时任务，勿重复提交"}
             if operation == "delete":

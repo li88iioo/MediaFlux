@@ -2893,7 +2893,8 @@ class GuangYaClient:
                                verified=bool(created["share_url"]))
         except GuangYaWriteRejected:
             raise
-        except Exception:
+        except Exception as exc:
+            logger.warning("光鸭分享操作结果未知 type=%s", type(exc).__name__)
             return {**receipt, "ok": False, "status": "outcome_unknown",
                     "error": "光鸭分享操作结果未知，请先查询分享列表，勿重复提交"}
         if revoke:

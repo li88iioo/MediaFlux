@@ -36,6 +36,9 @@ from app.indexers.service import search_payload
 from app.modules.download_dispatcher import public_dispatch_summary
 from app.web import api_error, api_response, require_api_login
 from app.repositories.download_requests import DOWNLOAD_TARGETS
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _require_enabled() -> None:
@@ -272,7 +275,8 @@ async def download(request: Request, data: Any = Body(default=None)):
         return api_response({"error": "资源下载数据无效", "code": "invalid_download"}, 400)
     except _DownloadRequestCreationError:
         return api_response({"error": "下载请求创建失败", "code": "request_failed"}, 500)
-    except Exception:
+    except Exception as exc:
+        logger.error("资源站下载处理失败 type=%s", type(exc).__name__)
         return api_response({"error": "下载处理失败", "code": "download_failed"}, 500)
 
     status = 200 if item["ok"] else (409 if item["duplicate"] else 502)

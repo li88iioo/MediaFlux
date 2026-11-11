@@ -2040,7 +2040,8 @@ class LocalMediaService:
                         qb_client.delete_torrents(task.qb_hash, delete_files=False)
                         qb_task_retired = True
                         cleanup_allowed = True
-                except Exception:
+                except Exception as exc:
+                    logger.warning("qB 任务收尾失败，保留待清理 type=%s", type(exc).__name__)
                     qb_cleanup_pending = True
                     warnings.append(
                         "qB 任务移除失败：媒体已安全入库，任务保持暂停；"
