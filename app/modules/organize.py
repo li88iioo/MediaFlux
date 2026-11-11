@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, overload
 from app import database as db
 from app.repositories import media_probe as media_probe_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
-from app.config import get, get_bool, get_int
+from app.config import get, get_int
 from app.database import add_organize_log, add_organize_log_items
 from app.repositories.media_probe import get_media_probe_cache
 from app.logger import get_logger, log_throttled, redact_sensitive_text
@@ -2676,9 +2676,7 @@ class Organizer:
         ``max_files`` 是整源级预览截断语义（负数立即停止、正数拒绝写入），
         与逐组枚举不兼容；冻结成员由枚举和扫描共同约束，不关闭组级流水线。
         """
-        if context.dry_run or not context.group_pipeline or context.max_files:
-            return False
-        return get_bool("ORGANIZE_GROUP_PIPELINE", True)
+        return not (context.dry_run or not context.group_pipeline or context.max_files)
 
     def _reset_task_caches(self) -> None:
         """任务级缓存必须逐任务重置，禁止跨任务继承过期快照。"""
