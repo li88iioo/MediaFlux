@@ -279,6 +279,19 @@ def _validate_destination(destination: Path) -> None:
         raise SupportBundleError("支持包输出路径不能是链接或特殊文件")
 
 
+def _write_archive_stream(temporary, files: dict[str, bytes]) -> os.stat_result:
+    """收紧权限后写入并落盘归档，返回写入前的文件身份供调用方复核。"""
+    if not protect_private_stream(temporary):
+        raise SupportBundleError("无法收紧支持包临时文件权限")
+    temporary_metadata = os.fstat(temporary.fileno())
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            archive.writestr(name, payload)
+    temporary.flush()
+    os.fsync(temporary.fileno())
+    return temporary_metadata
+
+
 def _write_private_archive_posix(destination: Path, files: dict[str, bytes]) -> None:
     directory_fd = -1
     temporary_name: str = ""
@@ -305,16 +318,7 @@ def _write_private_archive_posix(destination: Path, files: dict[str, bytes]) -> 
             raise SupportBundleError("无法创建唯一的支持包临时文件")
 
         with os.fdopen(descriptor, "w+b") as temporary:
-            if not protect_private_stream(temporary):
-                raise SupportBundleError("无法收紧支持包临时文件权限")
-            temporary_metadata = os.fstat(temporary.fileno())
-            with zipfile.ZipFile(
-                temporary, "w", compression=zipfile.ZIP_DEFLATED
-            ) as archive:
-                for name, payload in files.items():
-                    archive.writestr(name, payload)
-            temporary.flush()
-            os.fsync(temporary.fileno())
+            temporary_metadata = _write_archive_stream(temporary, files)
             if not _same_identity(temporary_metadata, os.fstat(temporary.fileno())):
                 raise SupportBundleError("支持包临时文件在写入期间发生变化")
 
@@ -375,16 +379,7 @@ def _write_private_archive_path(destination: Path, files: dict[str, bytes]) -> N
             delete=False,
         ) as temporary:
             temporary_name = temporary.name
-            if not protect_private_stream(temporary):
-                raise SupportBundleError("无法收紧支持包临时文件权限")
-            temporary_metadata = os.fstat(temporary.fileno())
-            with zipfile.ZipFile(
-                temporary, "w", compression=zipfile.ZIP_DEFLATED
-            ) as archive:
-                for name, payload in files.items():
-                    archive.writestr(name, payload)
-            temporary.flush()
-            os.fsync(temporary.fileno())
+            temporary_metadata = _write_archive_stream(temporary, files)
 
         temporary_path = Path(temporary_name)
         closed_metadata = temporary_path.lstat()

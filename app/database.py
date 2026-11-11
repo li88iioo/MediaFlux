@@ -2985,6 +2985,22 @@ def bind_organize_confirmation_message(
         )
 
 
+def _pending_confirmation_row(conn: sqlite3.Connection, token: str, chat_id: str) -> sqlite3.Row:
+    """读取仍待处理且属于该会话的确认单；不存在、越权与已处理统一拒绝。"""
+    row = conn.execute(
+        "SELECT * FROM organize_confirmations WHERE token=?",
+        ((token or ""),),
+    ).fetchone()
+    if row is None:
+        raise ValueError("确认操作不存在或已失效")
+    expected_chat = str(row["chat_id"] or "")
+    if expected_chat and expected_chat != (chat_id or ""):
+        raise ValueError("确认操作不存在或已失效")
+    if str(row["status"] or "") != "pending":
+        raise ValueError("该确认操作已处理")
+    return row
+
+
 def claim_organize_confirmation(
     token: str, *, chat_id: str, selected_index: int, actor: str = "human",
     event_json: str = "", message_id: int | None = None,
@@ -2999,17 +3015,7 @@ def claim_organize_confirmation(
         # 入队顺序必须反映按钮实际点击顺序。全局 now() 只精确到秒，
         # 连续点击会退化成记录创建顺序，因此仅为队列时间保留微秒。
         queued_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        row = conn.execute(
-            "SELECT * FROM organize_confirmations WHERE token=?",
-            ((token or ""),),
-        ).fetchone()
-        if row is None:
-            raise ValueError("确认操作不存在或已失效")
-        expected_chat = str(row["chat_id"] or "")
-        if expected_chat and expected_chat != (chat_id or ""):
-            raise ValueError("确认操作不存在或已失效")
-        if str(row["status"] or "") != "pending":
-            raise ValueError("该确认操作已处理")
+        row = _pending_confirmation_row(conn, token, chat_id)
         expired = str(row["expires_at"] or "") <= timestamp
         if expired:
             conn.execute(
@@ -3084,17 +3090,7 @@ def cancel_organize_confirmation(
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT * FROM organize_confirmations WHERE token=?",
-            ((token or ""),),
-        ).fetchone()
-        if row is None:
-            raise ValueError("确认操作不存在或已失效")
-        expected_chat = str(row["chat_id"] or "")
-        if expected_chat and expected_chat != (chat_id or ""):
-            raise ValueError("确认操作不存在或已失效")
-        if str(row["status"] or "") != "pending":
-            raise ValueError("该确认操作已处理")
+        row = _pending_confirmation_row(conn, token, chat_id)
         if str(row["expires_at"] or "") <= timestamp:
             conn.execute(
                 "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
@@ -3147,7 +3143,7 @@ def cancel_organize_confirmation(
                     conn,
                     token=token,
                     event_json=event_json,
-                    chat_id=expected_chat or (chat_id or ""),
+                    chat_id=str(row["chat_id"] or "") or (chat_id or ""),
                     message_id=message_id,
                     timestamp=timestamp,
                 )
