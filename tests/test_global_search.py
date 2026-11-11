@@ -8,7 +8,7 @@ from unittest.mock import patch
 from app.clients.base import MediaItem
 from app.discovery.models import MediaCard
 from app.discovery.models import normalize_search_query
-from app.modules.global_search import _local_section, build_global_search
+from app.modules.global_search import _local_section, _rss_section, build_global_search
 
 
 class GlobalSearchTests(unittest.TestCase):
@@ -17,6 +17,16 @@ class GlobalSearchTests(unittest.TestCase):
         for value in ("", "x" * 121, "bad\nquery"):
             with self.assertRaisesRegex(ValueError, "1 到 120"):
                 normalize_search_query(value)
+
+    def test_rss_null_columns_never_match_as_the_text_none(self):
+        """历史库的 NULL 字段曾被转成 "None" 参与匹配，挤掉真正命中的订阅。"""
+        legacy = {"id": 1, "name": "Legacy", "urls": None, "parser": None, "exclude_keywords": None,
+                  "enabled": None, "action": None, "download_method": None}
+        wanted = {"id": 2, "name": "One Piece", "urls": "https://example.invalid/rss", "parser": "mikan",
+                  "exclude_keywords": "", "enabled": 1, "action": "subscribe", "download_method": ""}
+        with patch("app.repositories.rss.list_rss_subscriptions", return_value=[legacy, wanted]):
+            section = _rss_section("one")
+        self.assertEqual([item["title"] for item in section["items"]], ["One Piece"])
 
     @patch("app.modules.global_search.search_media_servers")
     def test_local_media_prefers_one_real_series_over_episode_hits(self, media_search):
