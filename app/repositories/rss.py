@@ -1105,39 +1105,44 @@ def get_rss_manual_review_summary(sub_id: int) -> dict[str, int]:
     }
 
 
+# RSS 条目健康判定的唯一定义；Web 诊断与 Agent 订阅摘要共用，避免两边口径漂移。
+_DEFAULT_STALE_SUBMITTING_MINUTES = 15
+_DEFAULT_PENDING_BACKLOG_HOURS = 24
+_PENDING_VALID = "e.status='pending' AND COALESCE(e.processed,0)=0"
+_PENDING_BACKLOG = (
+    f"{_PENDING_VALID} AND (COALESCE(NULLIF(e.created_at,''),'')='' "
+    "OR datetime(e.created_at) IS NULL OR datetime(e.created_at)<=datetime(?,?))"
+)
+_SUBMITTING_VALID = "e.status='submitting' AND COALESCE(e.processed,0)=0"
+_SUBMITTING_TIMESTAMP = "COALESCE(NULLIF(e.submitted_at,''),NULLIF(e.created_at,''),'')"
+_STALE_SUBMITTING = (
+    f"{_SUBMITTING_VALID} AND ({_SUBMITTING_TIMESTAMP}='' "
+    f"OR datetime({_SUBMITTING_TIMESTAMP}) IS NULL "
+    f"OR datetime({_SUBMITTING_TIMESTAMP})<=datetime(?,?))"
+)
+_VALID_ENTRY = (
+    "((e.status IN ('pending','submitting','failed') AND COALESCE(e.processed,0)=0) "
+    "OR (e.status IN ('downloaded','skipped') AND COALESCE(e.processed,0)=1))"
+)
+_INVALID_ENTRY = f"COALESCE(({_VALID_ENTRY}),0)=0"
+
+
 def get_rss_diagnostic_summary(
     current_time: str | None = None,
     *,
-    stale_submitting_minutes: int = 15,
-    pending_backlog_hours: int = 24,
+    stale_submitting_minutes: int = _DEFAULT_STALE_SUBMITTING_MINUTES,
+    pending_backlog_hours: int = _DEFAULT_PENDING_BACKLOG_HOURS,
     attention_limit: int = 20,
     attention_offset: int = 0,
 ) -> dict:
     """返回 RSS Agent 所需的安全聚合；不读取或返回源 URL、标题、GUID、payload 或路径。"""
     snapshot = current_time or db.now()
-    stale_minutes = max(1, min(24 * 60, (stale_submitting_minutes or 15)))
-    backlog_hours = max(1, min(24 * 365, (pending_backlog_hours or 24)))
+    stale_minutes = max(1, min(24 * 60, (stale_submitting_minutes or _DEFAULT_STALE_SUBMITTING_MINUTES)))
+    backlog_hours = max(1, min(24 * 365, (pending_backlog_hours or _DEFAULT_PENDING_BACKLOG_HOURS)))
     limit = max(1, min(100, (attention_limit or 20)))
     stale_modifier = f"-{stale_minutes} minutes"
     backlog_modifier = f"-{backlog_hours} hours"
 
-    pending_valid = "e.status='pending' AND COALESCE(e.processed,0)=0"
-    pending_backlog = (
-        f"{pending_valid} AND (COALESCE(NULLIF(e.created_at,''),'')='' "
-        "OR datetime(e.created_at) IS NULL OR datetime(e.created_at)<=datetime(?,?))"
-    )
-    submitting_valid = "e.status='submitting' AND COALESCE(e.processed,0)=0"
-    submitting_timestamp = "COALESCE(NULLIF(e.submitted_at,''),NULLIF(e.created_at,''),'')"
-    stale_submitting = (
-        f"{submitting_valid} AND ({submitting_timestamp}='' "
-        f"OR datetime({submitting_timestamp}) IS NULL "
-        f"OR datetime({submitting_timestamp})<=datetime(?,?))"
-    )
-    valid_entry = (
-        "((e.status IN ('pending','submitting','failed') AND COALESCE(e.processed,0)=0) "
-        "OR (e.status IN ('downloaded','skipped') AND COALESCE(e.processed,0)=1))"
-    )
-    invalid_entry = f"COALESCE(({valid_entry}),0)=0"
 
     with db.get_conn() as conn:
         subscription_row = conn.execute(
@@ -1162,10 +1167,10 @@ def get_rss_diagnostic_summary(
         entry_row = conn.execute(
             "SELECT "
             "COUNT(*) AS total,"
-            f"SUM(CASE WHEN {pending_valid} THEN 1 ELSE 0 END) AS pending,"
-            f"SUM(CASE WHEN {pending_backlog} THEN 1 ELSE 0 END) AS pending_backlog,"
-            f"SUM(CASE WHEN {submitting_valid} THEN 1 ELSE 0 END) AS submitting,"
-            f"SUM(CASE WHEN {stale_submitting} THEN 1 ELSE 0 END) AS stale_submitting,"
+            f"SUM(CASE WHEN {_PENDING_VALID} THEN 1 ELSE 0 END) AS pending,"
+            f"SUM(CASE WHEN {_PENDING_BACKLOG} THEN 1 ELSE 0 END) AS pending_backlog,"
+            f"SUM(CASE WHEN {_SUBMITTING_VALID} THEN 1 ELSE 0 END) AS submitting,"
+            f"SUM(CASE WHEN {_STALE_SUBMITTING} THEN 1 ELSE 0 END) AS stale_submitting,"
             "SUM(CASE WHEN e.status='failed' AND COALESCE(e.processed,0)=0 THEN 1 ELSE 0 END) AS failed,"
             "SUM(CASE WHEN e.status='downloaded' AND COALESCE(e.processed,0)=1 THEN 1 ELSE 0 END) AS downloaded,"
             "SUM(CASE WHEN e.status='downloaded' AND COALESCE(e.processed,0)=1 "
@@ -1173,7 +1178,7 @@ def get_rss_diagnostic_summary(
             "AND datetime(e.processed_at) IS NOT NULL "
             "AND datetime(e.processed_at)>=datetime(?,'-24 hours') THEN 1 ELSE 0 END) AS downloaded_last_24h,"
             "SUM(CASE WHEN e.status='skipped' AND COALESCE(e.processed,0)=1 THEN 1 ELSE 0 END) AS skipped,"
-            f"SUM(CASE WHEN {invalid_entry} THEN 1 ELSE 0 END) AS unknown_or_inconsistent "
+            f"SUM(CASE WHEN {_INVALID_ENTRY} THEN 1 ELSE 0 END) AS unknown_or_inconsistent "
             "FROM rss_entries e",
             (snapshot, backlog_modifier, snapshot, stale_modifier, snapshot),
         ).fetchone()
@@ -1198,10 +1203,10 @@ def get_rss_diagnostic_summary(
                         AND TRIM(COALESCE(i.refresh_cron,''))<>'' THEN 1 ELSE 0 END AS cron_not_active,
                     CASE WHEN i.enabled=1 AND COALESCE(i.last_refreshed_at,'')<>''
                         AND datetime(i.last_refreshed_at) IS NULL THEN 1 ELSE 0 END AS invalid_last_refreshed_at,
-                    SUM(CASE WHEN {pending_backlog} THEN 1 ELSE 0 END) AS pending_backlog,
-                    SUM(CASE WHEN {stale_submitting} THEN 1 ELSE 0 END) AS stale_submitting,
+                    SUM(CASE WHEN {_PENDING_BACKLOG} THEN 1 ELSE 0 END) AS pending_backlog,
+                    SUM(CASE WHEN {_STALE_SUBMITTING} THEN 1 ELSE 0 END) AS stale_submitting,
                     SUM(CASE WHEN e.status='failed' AND COALESCE(e.processed,0)=0 THEN 1 ELSE 0 END) AS failed_entries,
-                    SUM(CASE WHEN e.id IS NOT NULL AND {invalid_entry} THEN 1 ELSE 0 END) AS unknown_or_inconsistent
+                    SUM(CASE WHEN e.id IS NOT NULL AND {_INVALID_ENTRY} THEN 1 ELSE 0 END) AS unknown_or_inconsistent
                 FROM rss_items i
                 LEFT JOIN rss_entries e ON e.rss_item_id=i.id
                 GROUP BY i.id
@@ -1305,25 +1310,8 @@ def _query_rss_subscription_safe_summaries(
     after_id: int | None = None,
 ) -> list[sqlite3.Row]:
     """聚合 Agent 公开订阅；名称可展示，但不读取 URL、过滤词、正文或路径。"""
-    stale_modifier = "-15 minutes"
-    backlog_modifier = "-24 hours"
-    pending_valid = "e.status='pending' AND COALESCE(e.processed,0)=0"
-    pending_backlog = (
-        f"{pending_valid} AND (COALESCE(NULLIF(e.created_at,''),'')='' "
-        "OR datetime(e.created_at) IS NULL OR datetime(e.created_at)<=datetime(?,?))"
-    )
-    submitting_valid = "e.status='submitting' AND COALESCE(e.processed,0)=0"
-    submitting_timestamp = "COALESCE(NULLIF(e.submitted_at,''),NULLIF(e.created_at,''),'')"
-    stale_submitting = (
-        f"{submitting_valid} AND ({submitting_timestamp}='' "
-        f"OR datetime({submitting_timestamp}) IS NULL "
-        f"OR datetime({submitting_timestamp})<=datetime(?,?))"
-    )
-    valid_entry = (
-        "((e.status IN ('pending','submitting','failed') AND COALESCE(e.processed,0)=0) "
-        "OR (e.status IN ('downloaded','skipped') AND COALESCE(e.processed,0)=1))"
-    )
-    invalid_entry = f"COALESCE(({valid_entry}),0)=0"
+    stale_modifier = f"-{_DEFAULT_STALE_SUBMITTING_MINUTES} minutes"
+    backlog_modifier = f"-{_DEFAULT_PENDING_BACKLOG_HOURS} hours"
     bounded_limit = max(1, min(100, (limit or 100)))
     selected_where = "WHERE id=?" if subscription_id is not None else "WHERE id>?" if after_id is not None else ""
     selected_params: list[object] = (
@@ -1367,10 +1355,10 @@ def _query_rss_subscription_safe_summaries(
                 CASE WHEN i.enabled=1 AND COALESCE(i.last_refreshed_at,'')<>''
                     AND datetime(i.last_refreshed_at) IS NULL THEN 1 ELSE 0 END AS invalid_last_refreshed_at,
                 COUNT(e.id) AS entry_total,
-                SUM(CASE WHEN {pending_valid} THEN 1 ELSE 0 END) AS pending,
-                SUM(CASE WHEN {pending_backlog} THEN 1 ELSE 0 END) AS pending_backlog,
-                SUM(CASE WHEN {submitting_valid} THEN 1 ELSE 0 END) AS submitting,
-                SUM(CASE WHEN {stale_submitting} THEN 1 ELSE 0 END) AS stale_submitting,
+                SUM(CASE WHEN {_PENDING_VALID} THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN {_PENDING_BACKLOG} THEN 1 ELSE 0 END) AS pending_backlog,
+                SUM(CASE WHEN {_SUBMITTING_VALID} THEN 1 ELSE 0 END) AS submitting,
+                SUM(CASE WHEN {_STALE_SUBMITTING} THEN 1 ELSE 0 END) AS stale_submitting,
                 SUM(CASE WHEN e.status='failed' AND COALESCE(e.processed,0)=0 THEN 1 ELSE 0 END) AS failed,
                 SUM(CASE WHEN e.status='downloaded' AND COALESCE(e.processed,0)=1 THEN 1 ELSE 0 END) AS downloaded,
                 SUM(CASE WHEN e.status='downloaded' AND COALESCE(e.processed,0)=1
@@ -1378,7 +1366,7 @@ def _query_rss_subscription_safe_summaries(
                     AND datetime(e.processed_at) IS NOT NULL
                     AND datetime(e.processed_at)>=datetime(?,'-24 hours') THEN 1 ELSE 0 END) AS downloaded_last_24h,
                 SUM(CASE WHEN e.status='skipped' AND COALESCE(e.processed,0)=1 THEN 1 ELSE 0 END) AS skipped,
-                SUM(CASE WHEN e.id IS NOT NULL AND {invalid_entry} THEN 1 ELSE 0 END) AS unknown_or_inconsistent
+                SUM(CASE WHEN e.id IS NOT NULL AND {_INVALID_ENTRY} THEN 1 ELSE 0 END) AS unknown_or_inconsistent
             FROM selected_items i
             LEFT JOIN rss_entries e ON e.rss_item_id=i.id
             GROUP BY i.id
