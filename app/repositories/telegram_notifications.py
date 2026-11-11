@@ -1,4 +1,4 @@
-"""统一 Telegram 主动通知仓储；schema 仅由 database.init_db 初始化和迁移。"""
+"""统一 Telegram 主动通知仓储；schema 仅由 db.init_db 初始化和迁移。"""
 from __future__ import annotations
 
 import json
@@ -50,9 +50,8 @@ def upsert_notification(
     payload = (event_json or "").strip()
     if not key or not payload:
         return None
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         # 源回执与目标线程必须在同一写事务内校验/更新；只在移交前读取
         # 租约会留下终态已发布、旧接纳随后覆写的窗口。
@@ -233,10 +232,9 @@ def invalidate_pending_download_notifications_conn(
 def claim_due_notifications(
     *, limit: int = 20, event_key: str = "",
 ) -> list[dict[str, Any]]:
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     claimed: list[dict[str, Any]] = []
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         stale_before = _future_stamp(-_LEASE_SECONDS, base_stamp=stamp)
         # 首次发送没有远端 message_id，租约过期只代表本地失去结果，不能
@@ -299,9 +297,8 @@ def complete_notification(
     claimed_revision: int,
     message_id: int = 0,
 ) -> bool:
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT revision FROM telegram_notification_outbox WHERE id=? "
@@ -343,9 +340,8 @@ def retry_notification(
     message_id: int = 0,
 ) -> str:
     """统一失败收敛：已知消息可幂等编辑，未知首次发送隔离，旧租约不写入。"""
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT attempts,revision,message_id FROM telegram_notification_outbox WHERE id=? "
@@ -400,9 +396,8 @@ def fail_notification(
     clear_message_id: bool = False,
 ) -> bool:
     """记录明确拒绝；迟到 worker 不得把更新后的 revision 一并判死。"""
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT revision FROM telegram_notification_outbox WHERE id=? "
@@ -452,9 +447,8 @@ def suppress_notification(
     claimed_revision: int,
     reason: str = "NotificationPolicyDisabled",
 ) -> bool:
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT revision FROM telegram_notification_outbox WHERE id=? "
@@ -608,11 +602,10 @@ def recover_notifications() -> int:
 
 def purge_notifications(*, retention_days: int = 30, limit: int = 1000) -> int:
     """清理旧终态；尚有待投递分段的回复保留前缀回执，避免清理破坏顺序证据。"""
-    database = db
     normal_cutoff = _future_stamp(-max(1, retention_days) * 86400)
     diagnostic_cutoff = _future_stamp(-max(90, retention_days) * 86400)
     group_length = _CONTINUATION_GROUP_LENGTH
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         cur = conn.execute(
             "DELETE FROM telegram_notification_outbox WHERE id IN ("
             "SELECT candidate.id FROM telegram_notification_outbox AS candidate WHERE "

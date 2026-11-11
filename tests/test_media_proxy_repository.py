@@ -44,7 +44,7 @@ class MediaProxyRepositoryTests(unittest.TestCase):
                 instance["trusted_proxy_cidrs_json"],
                 '["192.168.88.110/32"]',
             )
-            repository.add_media_proxy_binding(
+            repository.create_media_proxy_binding(
                 instance_id=instance_id,
                 media_item_id="item-1",
                 media_source_id="source-1",

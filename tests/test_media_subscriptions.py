@@ -649,8 +649,16 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
 
     def test_soft_delete_hides_subscription_but_preserves_audit_rows(self) -> None:
         subscription_id = self._seed_subscription()
-        run_id = media_subscriptions_repo.add_media_subscription_run(subscription_id, "manual")
-        media_subscriptions_repo.finish_media_subscription_run(run_id, status="satisfied", summary="已满足")
+        run_id = media_subscriptions_repo.claim_media_subscription_check_run(subscription_id, "manual")
+        assert run_id is not None
+        seeded = media_subscriptions_repo.get_media_subscription(subscription_id)
+        assert seeded is not None
+        self.assertTrue(media_subscriptions_repo.finalize_media_subscription_check(
+            subscription_id, run_id, status="satisfied", run_status="satisfied", summary="已满足",
+            payload={"status": "satisfied"}, interval_minutes=60, expected_count=1, local_count=1,
+            missing_count=0, missing_json="[]", result_json='{"status":"satisfied"}',
+            subscription_revision=int(seeded["revision"]),
+        ))
 
         self.assertTrue(media_subscriptions_repo.delete_media_subscription(subscription_id))
         self.assertIsNone(media_subscriptions_repo.get_media_subscription(subscription_id))

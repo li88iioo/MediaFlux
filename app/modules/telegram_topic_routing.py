@@ -253,11 +253,7 @@ def _set_topic_naming_status(
                 (status, db.now(), key, only_if),
             )
             return cursor.rowcount == 1
-        conn.execute(
-            "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-            (key, status, db.now()),
-        )
+        db.kv_set_conn(conn, key, status)
     return True
 
 

@@ -1074,7 +1074,7 @@ class StrmRetryConcurrencyStateTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(claimed), 1)
         file = GuangYaFile("video", "Movie.mkv", False, 1, "e", "source-lock")
 
-        self.assertTrue(db.resolve_strm_failure(failure_id, expected_status="retrying"))
+        self.assertTrue(strm_repo.resolve_strm_failure_with_refresh(failure_id, None, expected_status="retrying"))
         updated = db.update_strm_failure_retry(
             failure_id, source_id="source-lock", source_name="锁来源", file=file,
             rel_dir="", target_rel_path="光鸭云盘/Movie.mkv.strm",

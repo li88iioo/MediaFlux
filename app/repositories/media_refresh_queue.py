@@ -49,11 +49,7 @@ def _write_state(conn, state: dict[str, Any]) -> None:
         sort_keys=True,
         separators=(",", ":"),
     )
-    conn.execute(
-        "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-        (_QUEUE_KEY, payload, db.now()),
-    )
+    db.kv_set_conn(conn, _QUEUE_KEY, payload)
 
 
 def _normalized_provider(value: object) -> str:

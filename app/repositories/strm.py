@@ -116,7 +116,6 @@ def upsert_strm_index(
     refresh_policy: StrmRefreshPolicy | None = None,
 ) -> str:
     """提交索引、冲突清理及本轮刷新意图；纯索引维护不传刷新策略。"""
-    database = db
     conflicts = [
         item
         for item in dict.fromkeys(
@@ -124,13 +123,13 @@ def upsert_strm_index(
         )
         if item != file_id
     ]
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         previous = conn.execute(
             "SELECT strm_path FROM strm_index WHERE source=? AND file_id=?",
             (source, file_id),
         ).fetchone()
         conn.execute(
-            _RECORD_DISPLACED_PATH, (database.now(), source, file_id, strm_path)
+            _RECORD_DISPLACED_PATH, (db.now(), source, file_id, strm_path)
         )
         conn.execute(
             _UPSERT_STRM_INDEX,
@@ -142,10 +141,10 @@ def upsert_strm_index(
                 filename,
                 strm_path,
                 (content_fingerprint or ""),
-                database.now(),
+                db.now(),
             ),
         )
-        _delete_conflicting_indexes(conn, source, conflicts, database.now())
+        _delete_conflicting_indexes(conn, source, conflicts, db.now())
         if refresh_policy is not None:
             refresh_policy.record(conn, [strm_path])
         return str(previous["strm_path"] or "") if previous else ""
@@ -168,8 +167,7 @@ def upsert_strm_index_batch(
     """
     if not items:
         return
-    database = db
-    now_str = database.now()
+    now_str = db.now()
     records = []
     all_conflicts: list[str] = []
     for item in items:
@@ -191,7 +189,7 @@ def upsert_strm_index_batch(
         if conflicts:
             all_conflicts.extend(conflicts)
 
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         if len({record[1] for record in records}) == len(records):
             # 常见的唯一 ID 批次保持 executemany；不同 ID 之间没有读写依赖。
             conn.executemany(
@@ -258,8 +256,7 @@ def enqueue_strm_path_cleanup(items: list[dict[str, str]]) -> int:
     """历史副本使用与索引迁移相同的持久清理凭据；调用方提交后才能删文件。"""
     if not items:
         return 0
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     records = []
     for item in items:
         values = tuple((item.get(key) or "") for key in (
@@ -268,7 +265,7 @@ def enqueue_strm_path_cleanup(items: list[dict[str, str]]) -> int:
         if not all(values):
             raise ValueError("STRM 清理凭据缺少来源、文件、路径或指纹")
         records.append((*values, stamp))
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         before = conn.total_changes
         conn.executemany(
             "INSERT OR IGNORE INTO strm_path_cleanup("
@@ -458,10 +455,9 @@ def enqueue_strm_metadata_jobs(
     result = {"created": 0, "updated": 0, "dirty": 0, "deduped": 0}
     if not normalized:
         return result
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     safe_max_attempts = max(1, (max_attempts or DEFAULT_STRM_METADATA_MAX_ATTEMPTS))
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         for item in normalized:
             source_id = str(item.get("source_id") or "").strip()
             file_id = str(item.get("file_id") or "").strip()
@@ -535,12 +531,11 @@ def claim_due_strm_metadata_jobs(
     limit: int = 1,
 ) -> list[dict[str, Any]]:
     """原子领取到期元数据任务；lease_generation 隔离迟到 worker。"""
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     now_epoch = time.time()
     deadline = now_epoch + max(1, (lease_seconds or 1))
     claimed: list[dict[str, Any]] = []
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT * FROM strm_metadata_queue WHERE provider=? AND ("
@@ -608,9 +603,8 @@ def settle_strm_metadata_job(
     cancel_reason: str = "",
 ) -> str:
     """按租约交接成功或取消；快照已变化时只重新排队最新版本。"""
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         # 把快照判定和终态更新放在同一写事务内，避免扫描线程在两条 SQL
         # 之间写入 dirty/revision 后又被迟到的 completed 覆盖。
         conn.execute("BEGIN IMMEDIATE")
@@ -643,7 +637,7 @@ def settle_strm_metadata_job(
             return "stale"
         if status == "completed":
             StrmRefreshPolicy(**json.loads(row["refresh_policy_json"])).record(conn, refresh_paths)
-            database._resolve_strm_failure_for_item_conn(
+            db._resolve_strm_failure_for_item_conn(
                 conn, str(row["source_id"]), str(row["file_id"]), "metadata", timestamp=stamp,
             )
         return status
@@ -688,11 +682,10 @@ def enqueue_strm_refresh_paths(
     paths: Iterable[object] | None, *, allow_emby: bool = True, request_owners: Iterable[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """持久登记变化，返回本次写入的事件快照；交接只允许确认该快照。"""
-    database = db
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         return _enqueue_strm_refresh_paths(
-            conn, paths, stamp=database.now(), allow_emby=allow_emby,
+            conn, paths, stamp=db.now(), allow_emby=allow_emby,
             request_owners=request_owners,
         )
 
@@ -702,9 +695,8 @@ def resolve_strm_failure_with_refresh(
     expected_status: str = "retrying", metadata_job: dict[str, Any] | None = None,
 ) -> bool:
     """失败恢复、同快照后台队列 ACK 与刷新意图同事务；不重新排队已安装文件。"""
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE strm_failures SET status='resolved',updated_at=?,resolved_at=? "
             "WHERE id=? AND status=?",
@@ -826,9 +818,8 @@ def fail_or_retry_strm_metadata_job(
     lease/revision 判定，旧快照不能污染新任务。凭据等全局条件变化可用
     consume_attempt=False 交回租约，不消耗文件下载次数。
     """
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         # 与 complete 使用相同的原子判定，失败回写也不能吞掉更新后的快照。
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -876,8 +867,7 @@ def recover_stale_strm_metadata_jobs(
     *, provider: str = "guangya", force: bool = False, owner: str = "",
 ) -> int:
     """恢复上次进程或过期租约遗留的 running 元数据任务。"""
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     where = "provider=? AND status='running'"
     params: list[object] = [(provider or "guangya")]
     if force and owner:
@@ -886,7 +876,7 @@ def recover_stale_strm_metadata_jobs(
     elif not force:
         where += " AND lease_until<=?"
         params.append(time.time())
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE strm_metadata_queue SET status='retry_wait',dirty=0,next_attempt_at=?,"
             "lease_owner='',lease_until=0,lease_generation=lease_generation+1,"
@@ -907,9 +897,8 @@ _CANCEL_METADATA_JOB = (
 def cancel_strm_metadata_job(
     source_id: str, file_id: str, *, provider: str = "guangya", reason: str = "",
 ) -> bool:
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         cur = conn.execute(
             _CANCEL_METADATA_JOB,
             (
@@ -925,10 +914,9 @@ def cancel_stale_strm_metadata_jobs(
     reason: str = "完整扫描确认远端元数据已失效",
 ) -> int:
     valid = {str(item) for item in (valid_file_ids or []) if str(item)}
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     cancelled = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         rows = conn.execute(
             "SELECT id,file_id FROM strm_metadata_queue WHERE provider=? AND source_id=? "
             "AND status<>'cancelled'",
@@ -952,10 +940,9 @@ def cancel_retired_strm_metadata_jobs(
 ) -> int:
     """取消已不在配置来源集中的元数据任务，防止退役清理后被后台复活。"""
     active = {str(item) for item in (active_source_ids or []) if str(item)}
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     cancelled = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         rows = conn.execute(
             "SELECT id,source_id FROM strm_metadata_queue WHERE provider=? "
             "AND status<>'cancelled'",
@@ -1153,8 +1140,7 @@ def enqueue_strm_change_targets(
     grouped = group_changes_by_target(changes)
     if not grouped and not download_request_ids:
         return (0, []) if with_owners else 0
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     if not_before_seconds is None:
         next_attempt_at = None
     else:
@@ -1164,7 +1150,7 @@ def enqueue_strm_change_targets(
             delay = 0.0
         next_attempt_at = _future_stamp(delay)
     written = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         # SQLite 的默认延迟事务不会在上面的 SELECT 前取得写锁；并发入队若
         # 同时读到旧快照，后提交者会覆盖另一批变化。把读取、合并和写入
         # 放进同一立即写事务，保持“不丢事件”的队列契约。
@@ -1269,11 +1255,10 @@ def reschedule_strm_change_targets(
     grouped = group_changes_by_target(changes)
     if not grouped:
         return 0
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     next_attempt_at = _future_stamp(not_before_seconds)
     updated = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         for source_id, rel_dir in grouped:
             cur = conn.execute(
                 "UPDATE strm_change_queue SET next_attempt_at=?,updated_at=? "
@@ -1294,8 +1279,7 @@ def claim_strm_change_targets(
     source_ids: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     """原子领取到期目标；租约代次隔离过期 worker 的迟到结算。"""
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     now_epoch = time.time()
     deadline = now_epoch + max(1, (lease_seconds or 1))
     safe_owner = (owner or "").strip()
@@ -1306,7 +1290,7 @@ def claim_strm_change_targets(
         return []
     source_filter = " AND source_id IN (" + ",".join("?" for _ in selected) + ")" if selected else ""
     claimed: list[dict[str, Any]] = []
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT * FROM strm_change_queue WHERE provider=? AND ("
@@ -1380,9 +1364,8 @@ def complete_strm_change_target(
     target_id: int, *, expected_owner: str, expected_lease_generation: int,
 ) -> str:
     """完成一轮同步；只允许当前租约持有者结算，dirty 目标自动重排。"""
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT state,pending_changes_json,next_attempt_at FROM strm_change_queue "
@@ -1425,9 +1408,8 @@ def fail_strm_change_target(
     max_attempts: int = 5,
 ) -> str:
     """当前租约失败后有界退避；迟到 worker 不得覆盖后来者状态。"""
-    database = db
-    stamp = database.now()
-    with database.get_conn() as conn:
+    stamp = db.now()
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT attempts,pending_changes_json,inflight_changes_json "
@@ -1461,10 +1443,9 @@ def release_strm_change_targets(claimed: Iterable[object] | None, *, reason: str
     rows = [dict(item) for item in (claimed or []) if isinstance(item, dict)]
     if not rows:
         return 0
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     released = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         for item in rows:
             target_id = int(item.get("id") or 0)
@@ -1495,11 +1476,10 @@ def release_strm_change_targets(claimed: Iterable[object] | None, *, reason: str
 
 def recover_stale_strm_change_targets(*, provider: str = DEFAULT_STRM_PROVIDER) -> int:
     """恢复租约过期目标，并推进代次使迟到 worker 的结算永久失效。"""
-    database = db
-    stamp = database.now()
+    stamp = db.now()
     now_epoch = time.time()
     recovered = 0
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             "SELECT id,lease_generation,pending_changes_json,inflight_changes_json "
@@ -1636,13 +1616,12 @@ def cancel_strm_metadata_backlog(expected: dict[str, Any]) -> int:
         or expected["count"] <= 0
     ):
         raise ValueError("元数据队列预览无效，请重新预览")
-    database = db
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         current = _metadata_backlog_snapshot(conn, expected["cutoff_id"])
         if current != expected:
             raise ValueError("元数据队列已变化，请重新预览；未取消任何任务")
-        stamp = database.now()
+        stamp = db.now()
         changed = conn.execute(
             "UPDATE strm_metadata_queue SET status='cancelled',dirty=0,revision=revision+1,"
             "lease_owner='',lease_until=0,completed_at=?,updated_at=?,"

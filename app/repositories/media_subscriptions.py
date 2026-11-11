@@ -702,41 +702,6 @@ def recover_stale_media_subscription_checks(*, stale_minutes: int = 30) -> int:
         return (cur.rowcount or 0)
 
 
-def add_media_subscription_run(subscription_id: int, trigger_type: str = "manual") -> int:
-    with get_conn() as conn:
-        subscription = conn.execute(
-            "SELECT revision FROM media_subscriptions WHERE id=? AND deleted_at IS NULL",
-            (subscription_id,),
-        ).fetchone()
-        if subscription is None:
-            raise ValueError("媒体订阅不存在")
-        cur = conn.execute(
-            "INSERT INTO media_subscription_runs("
-            "subscription_id,trigger_type,subscription_revision,status,started_at"
-            ") VALUES(?,?,?,'running',?)",
-            (
-                subscription_id,
-                trigger_type,
-                int(subscription["revision"] or 1),
-                now(),
-            ),
-        )
-        assert cur.lastrowid is not None
-        return cur.lastrowid
-
-
-def finish_media_subscription_run(
-    run_id: int, *, status: str, summary: str = "", payload: Any = None, error: str = ""
-) -> bool:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE media_subscription_runs SET status=?,summary=?,payload_json=?,error=?,finished_at=? "
-            "WHERE id=? AND status='running'",
-            (status, summary, _json(payload, {}), error, now(), run_id),
-        )
-        return cur.rowcount == 1
-
-
 def _enqueue_run_notification(
     conn: Any,
     *,

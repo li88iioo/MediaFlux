@@ -1784,26 +1784,30 @@ def finalize_download_request_submission(
         )
 
 
+def link_local_media_task_conn(
+    conn: sqlite3.Connection, request_id: int, task_id: int, content_path: str, *, timestamp: str,
+) -> bool:
+    """在调用方事务内把未终结的下载请求关联到本地媒体任务。"""
+    cur = conn.execute(
+        "UPDATE download_requests SET local_import_status='pending',local_import_target=?,"
+        "qb_content_path=?,local_import_error='',local_import_started_at="
+        "COALESCE(NULLIF(local_import_started_at,''),?),"
+        "local_import_completed_at=NULL,updated_at=? "
+        "WHERE id=? AND COALESCE(local_import_status,'') IN ('','pending')",
+        (f"local-media-task:{task_id}", (content_path or ""), timestamp, timestamp, request_id),
+    )
+    return cur.rowcount == 1
+
+
 def link_download_request_to_local_media_task(
     request_id: int, task_id: int, content_path: str
 ) -> bool:
     """仅把尚未进入终态的下载请求关联到本地媒体任务。"""
     with db.get_conn() as conn:
-        timestamp = db.now()
-        cur = conn.execute(
-            "UPDATE download_requests SET local_import_status='pending',local_import_target=?,"
-            "qb_content_path=?,local_import_error='',local_import_started_at="
-            "COALESCE(NULLIF(local_import_started_at,''),?),"
-            "local_import_completed_at=NULL,updated_at=? "
-            "WHERE id=? AND COALESCE(local_import_status,'') IN ('','pending')",
-            (
-                f"local-media-task:{task_id}", (content_path or ""),
-                timestamp, timestamp, request_id,
-            ),
-        )
-        if cur.rowcount == 1:
+        linked = link_local_media_task_conn(conn, request_id, task_id, content_path, timestamp=db.now())
+        if linked:
             local_media_repo.reconcile_local_media_downloads(conn, task_id=task_id)
-        return cur.rowcount == 1
+        return linked
 
 
 def mark_download_request_local_media_skipped(request_id: int, content_path: str, error: str) -> bool:

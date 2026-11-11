@@ -731,13 +731,18 @@ def kv_get(key: str, default: str = "") -> str:
         return row["value"] if row else default
 
 
+def kv_set_conn(conn: sqlite3.Connection, key: str, value: str, *, timestamp: str | None = None) -> None:
+    """在调用方事务内写入 settings_kv；所有 KV 写入共用这一条 upsert。"""
+    conn.execute(
+        "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        (key, value, timestamp or now()),
+    )
+
+
 def kv_set(key: str, value: str) -> None:
     with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO settings_kv(key, value, updated_at) VALUES(?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, value, now()),
-        )
+        kv_set_conn(conn, key, value)
 
 
 def add_organize_delete_audit(
@@ -1955,11 +1960,7 @@ def _write_strm_source_snapshot(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    conn.execute(
-        "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-        (_STRM_SOURCE_SNAPSHOT_KEY, payload, now()),
-    )
+    kv_set_conn(conn, _STRM_SOURCE_SNAPSHOT_KEY, payload)
 
 
 def _read_strm_source_snapshot(
@@ -1999,13 +2000,7 @@ def _apply_strm_source_reconciliation(
         )
     timestamp = now()
     for source_id, (source_name, strm_root) in retired_sources.items():
-        conn.execute(
-            "INSERT INTO strm_retired_sources(source_id,source_name,strm_root,queued_at,"
-            "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
-            "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
-            "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
-            (source_id, source_name, strm_root, timestamp, timestamp),
-        )
+        _queue_strm_retired_source(conn, source_id, source_name, strm_root, timestamp)
 
 
 @contextmanager
@@ -2070,24 +2065,24 @@ def reconcile_configured_strm_sources(
         return list(retired)
 
 
+def _queue_strm_retired_source(
+    conn: sqlite3.Connection, source_id: str, source_name: str, strm_root: str, timestamp: str,
+) -> None:
+    """登记或刷新待退役的 STRM 来源；对账与手动入队共用。"""
+    conn.execute(
+        "INSERT INTO strm_retired_sources(source_id,source_name,strm_root,queued_at,"
+        "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
+        "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
+        "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
+        (source_id, source_name, strm_root, timestamp, timestamp),
+    )
+
+
 def enqueue_strm_retired_source(
     source_id: str, source_name: str, strm_root: str
 ) -> None:
-    timestamp = now()
     with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO strm_retired_sources(source_id,source_name,strm_root,queued_at,"
-            "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
-            "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
-            "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
-            (
-                source_id,
-                (source_name or ""),
-                (strm_root or ""),
-                timestamp,
-                timestamp,
-            ),
-        )
+        _queue_strm_retired_source(conn, source_id, source_name or "", strm_root or "", now())
 
 
 def cancel_strm_retired_sources(source_ids: list[str]) -> int:
@@ -2356,17 +2351,6 @@ def get_strm_failure_triage_summary() -> dict[str, Any]:
             0, int(row["active_retried"] or 0)
         )
     return summary
-
-
-def resolve_strm_failure(failure_id: int, *, expected_status: str = "retrying") -> bool:
-    timestamp = now()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE strm_failures SET status='resolved',updated_at=?,resolved_at=? "
-            "WHERE id=? AND status=?",
-            (timestamp, timestamp, failure_id, expected_status),
-        )
-        return cur.rowcount == 1
 
 
 def _resolve_strm_failure_for_item_conn(

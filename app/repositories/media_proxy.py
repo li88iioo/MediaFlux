@@ -113,39 +113,6 @@ def delete_media_proxy_instance(instance_id: int) -> bool:
         return cur.rowcount > 0
 
 
-def add_media_proxy_binding(
-    *,
-    instance_id: int,
-    media_item_id: str,
-    media_source_id: str,
-    source_type: str,
-    guangya_file_id: str = "",
-    local_relative_path: str = "",
-    enabled: int = 1,
-) -> int:
-    timestamp = db.now()
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO media_proxy_bindings("
-            "instance_id,media_item_id,media_source_id,source_type,guangya_file_id,"
-            "local_relative_path,enabled,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                instance_id,
-                media_item_id,
-                media_source_id,
-                source_type,
-                guangya_file_id,
-                local_relative_path,
-                1 if enabled else 0,
-                timestamp,
-                timestamp,
-            ),
-        )
-        assert cur.lastrowid is not None
-        return cur.lastrowid
-
-
 def create_media_proxy_binding(
     *,
     instance_id: int,

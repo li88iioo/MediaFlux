@@ -568,13 +568,13 @@ class MediaProxyTests(InitializedWebTestCase):
                 self.assertEqual(
                     get_media_proxy_instance_result["name"], "Test Jellyfin"
                 )
-                binding_id = media_proxy_repo.add_media_proxy_binding(
+                binding_id = int(media_proxy_repo.create_media_proxy_binding(
                     instance_id=instance_id,
                     media_item_id="item-1",
                     media_source_id="source-1",
                     source_type="local",
                     local_relative_path="Movies/video.mkv",
-                )
+                )["id"])
                 binding = media_proxy_repo.get_media_proxy_binding(instance_id, "item-1", "source-1")
                 assert binding is not None
                 self.assertEqual(int(binding["id"]), binding_id)

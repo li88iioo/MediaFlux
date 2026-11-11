@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from app import database as db
 from app.repositories import organize_history as organize_history_repo
+from app.repositories import download_requests as download_requests_repo
 
 _LOCAL_MEDIA_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed"})
 
@@ -160,6 +161,48 @@ def _bind_qb_hash_to_active_local_media_task(
     return task_id
 
 
+def _insert_source(
+    conn: sqlite3.Connection, *, owner: str, name: str, qb_profile: str, qb_path_prefix: str,
+    local_root: str, enabled: bool | int, media_type: str, mode: str, timestamp: str,
+) -> int:
+    """写入一条已校验的本地媒体来源；单建与整包保存共用。"""
+    cur = conn.execute(
+        "INSERT INTO local_media_sources(owner,name,qb_profile,qb_path_prefix,local_root,"
+        "smb_user,smb_pass,"
+        "enabled,stable_seconds,scan_enabled,scan_interval_minutes,media_type,mode,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (owner, name, qb_profile, qb_path_prefix, local_root, "", "",
+         1 if enabled else 0, 0, 0, 10, media_type, mode, timestamp, timestamp),
+    )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def _insert_waiting_task(
+    conn: sqlite3.Connection, *, owner: str, source_id: int, qb_hash: str | None, content_path: str,
+    trigger: str, token: str, timestamp: str,
+) -> int:
+    """登记一条等待稳定的本地媒体任务；自动入队与 qB 完成关联共用。"""
+    cur = conn.execute(
+        "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
+        "operation_token,created_at,updated_at) VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
+        (owner, source_id, qb_hash, content_path, trigger, token, timestamp, timestamp),
+    )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def _insert_target(conn: sqlite3.Connection, *, source_id: int, owner: str, item: dict, timestamp: str) -> None:
+    """写入一条已校验的媒体库目标；整包保存与批量替换共用。"""
+    conn.execute(
+        "INSERT INTO local_library_targets(source_id,owner,category,path,provider,"
+        "library_id,library_name,server_path,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (source_id, owner, item["category"], item["path"], item["provider"],
+         item["library_id"], item["library_name"], item["server_path"], timestamp, timestamp),
+    )
+
+
 def create_local_media_source(
     name: str,
     qb_profile: str,
@@ -189,31 +232,11 @@ def create_local_media_source(
         raise ValueError("本地媒体来源类型必须是 auto、movie、tv 或 nsfw")
     timestamp = db.now()
     with db.get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO local_media_sources(owner,name,qb_profile,qb_path_prefix,local_root,"
-            "smb_user,smb_pass,"
-            "enabled,stable_seconds,scan_enabled,scan_interval_minutes,media_type,mode,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                safe_owner,
-                safe_name,
-                (qb_profile or ""),
-                (qb_path_prefix or ""),
-                safe_root,
-                "",
-                "",
-                1 if enabled else 0,
-                0,
-                0,
-                10,
-                safe_media_type,
-                safe_mode,
-                timestamp,
-                timestamp,
-            ),
+        return _insert_source(
+            conn, owner=safe_owner, name=safe_name, qb_profile=(qb_profile or ""),
+            qb_path_prefix=(qb_path_prefix or ""), local_root=safe_root, enabled=enabled,
+            media_type=safe_media_type, mode=safe_mode, timestamp=timestamp,
         )
-        assert cur.lastrowid is not None
-        return cur.lastrowid
 
 
 class LocalMediaSourceChanged(ValueError):
@@ -321,31 +344,11 @@ def save_local_media_source_bundle(
         conn.execute("BEGIN IMMEDIATE")
         _check_source_snapshot(conn, source_id, safe_owner, expected_snapshot, cancelled)
         if source_id is None:
-            cur = conn.execute(
-                "INSERT INTO local_media_sources(owner,name,qb_profile,qb_path_prefix,local_root,"
-                "smb_user,smb_pass,"
-                "enabled,stable_seconds,scan_enabled,scan_interval_minutes,media_type,mode,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    safe_owner,
-                    safe_name,
-                    (qb_profile or "").strip(),
-                    (qb_path_prefix or "").strip(),
-                    safe_root,
-                    "",
-                    "",
-                    1 if enabled else 0,
-                    0,
-                    0,
-                    10,
-                    safe_media_type,
-                    safe_mode,
-                    timestamp,
-                    timestamp,
-                ),
+            saved_id = _insert_source(
+                conn, owner=safe_owner, name=safe_name, qb_profile=(qb_profile or "").strip(),
+                qb_path_prefix=(qb_path_prefix or "").strip(), local_root=safe_root, enabled=enabled,
+                media_type=safe_media_type, mode=safe_mode, timestamp=timestamp,
             )
-            assert cur.lastrowid is not None
-            saved_id = cur.lastrowid
         else:
             saved_id = source_id
             current = conn.execute(
@@ -420,22 +423,7 @@ def save_local_media_source_bundle(
                 (saved_id, safe_owner),
             )
             for item in normalized_targets:
-                conn.execute(
-                    "INSERT INTO local_library_targets(source_id,owner,category,path,provider,library_id,library_name,server_path,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        saved_id,
-                        safe_owner,
-                        item["category"],
-                        item["path"],
-                        item["provider"],
-                        item["library_id"],
-                        item["library_name"],
-                        item["server_path"],
-                        timestamp,
-                        timestamp,
-                    ),
-                )
+                _insert_target(conn, source_id=saved_id, owner=safe_owner, item=item, timestamp=timestamp)
         return saved_id
 
 
@@ -622,23 +610,7 @@ def replace_local_library_targets(
             raise LookupError("本地媒体来源不存在")
         conn.execute("DELETE FROM local_library_targets WHERE owner=?", (safe_owner,))
         for item in normalized:
-            conn.execute(
-                "INSERT INTO local_library_targets(source_id,owner,category,path,provider,"
-                "library_id,library_name,server_path,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    int(item["source_id"]),
-                    safe_owner,
-                    item["category"],
-                    item["path"],
-                    item["provider"],
-                    item["library_id"],
-                    item["library_name"],
-                    item["server_path"],
-                    timestamp,
-                    timestamp,
-                ),
-            )
+            _insert_target(conn, source_id=int(item["source_id"]), owner=safe_owner, item=item, timestamp=timestamp)
 
 
 def create_local_media_task(
@@ -731,22 +703,10 @@ def create_local_media_task(
             _normalize_local_media_task_path(conn, active, safe_path)
             return int(active["id"])
 
-        cur = conn.execute(
-            "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
-            "operation_token,created_at,updated_at) VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
-            (
-                safe_owner,
-                source_id,
-                normalized_hash,
-                safe_path,
-                safe_trigger,
-                token,
-                timestamp,
-                timestamp,
-            ),
+        return _insert_waiting_task(
+            conn, owner=safe_owner, source_id=source_id, qb_hash=normalized_hash,
+            content_path=safe_path, trigger=safe_trigger, token=token, timestamp=timestamp,
         )
-        assert cur.lastrowid is not None
-        return cur.lastrowid
 
 
 def create_and_link_qb_local_media_task(
@@ -816,23 +776,10 @@ def create_and_link_qb_local_media_task(
                     conn, active, normalized_hash, safe_path
                 )
             else:
-                cur = conn.execute(
-                    "INSERT INTO local_media_tasks("
-                    "owner,source_id,qb_hash,content_path,trigger,status,operation_token,created_at,updated_at"
-                    ") VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
-                    (
-                        safe_owner,
-                        source_id,
-                        normalized_hash,
-                        safe_path,
-                        "qb_completed",
-                        uuid.uuid4().hex,
-                        timestamp,
-                        timestamp,
-                    ),
+                task_id = _insert_waiting_task(
+                    conn, owner=safe_owner, source_id=source_id, qb_hash=normalized_hash,
+                    content_path=safe_path, trigger="qb_completed", token=uuid.uuid4().hex, timestamp=timestamp,
                 )
-                assert cur.lastrowid is not None
-                task_id = cur.lastrowid
         else:
             task_id = int(hash_task["id"])
             existing_target = f"local-media-task:{task_id}"
@@ -886,15 +833,9 @@ def create_and_link_qb_local_media_task(
         current_target = str(request_row["local_import_target"] or "")
         if current_target and current_target != target:
             raise ValueError("下载请求已绑定其他本地整理任务")
-        cur = conn.execute(
-            "UPDATE download_requests SET local_import_status='pending',local_import_target=?,"
-            "qb_content_path=?,local_import_error='',local_import_started_at="
-            "COALESCE(NULLIF(local_import_started_at,''),?),"
-            "local_import_completed_at=NULL,updated_at=? "
-            "WHERE id=? AND COALESCE(local_import_status,'') IN ('','pending')",
-            (target, safe_path, timestamp, timestamp, request_id),
-        )
-        if cur.rowcount != 1:
+        if not download_requests_repo.link_local_media_task_conn(
+            conn, request_id, task_id, safe_path, timestamp=timestamp,
+        ):
             raise ValueError("下载请求的本地入库状态已变化")
         reconcile_local_media_downloads(conn, task_id=task_id)
         return task_id, restarted

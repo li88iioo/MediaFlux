@@ -365,11 +365,7 @@ def discover_legacy_confirmation_cleanup(*, limit: int = _MAX_BATCH) -> int:
                 before = conn.total_changes
                 enqueue_confirmation_cleanup(conn, token=token, timestamp=timestamp)
                 created += int(conn.total_changes > before)
-        conn.execute(
-            'INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) '
-            'ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at',
-            (LEGACY_CURSOR_KEY, str(rows[-1]['id'] if rows else 0), timestamp),
-        )
+        db.kv_set_conn(conn, LEGACY_CURSOR_KEY, str(rows[-1]['id'] if rows else 0), timestamp=timestamp)
     return created
 
 

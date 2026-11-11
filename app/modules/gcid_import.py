@@ -296,14 +296,9 @@ def _read_retry_replays(conn) -> OrderedDict[tuple[int, str], None]:
 def _write_retry_replays(conn, replays: OrderedDict[tuple[int, str], None]) -> None:
     while len(replays) > _RETRY_REPLAY_LIMIT:
         replays.popitem(last=False)
-    conn.execute(
-        "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-        (
-            _RETRY_REPLAY_KEY,
-            json.dumps(list(replays), ensure_ascii=False, separators=(",", ":")),
-            db.now(),
-        ),
+    db.kv_set_conn(
+        conn, _RETRY_REPLAY_KEY,
+        json.dumps(list(replays), ensure_ascii=False, separators=(",", ":")),
     )
 
 

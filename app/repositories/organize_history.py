@@ -311,8 +311,7 @@ def restore_organize_business_snapshot(log_id: int, snapshot: dict, **log_fields
     state = _validated_snapshot(snapshot)
     if set(log_fields) - _FINISH_FIELDS:
         raise ValueError("不允许用收尾字段覆盖业务前像")
-    database = db
-    with database.get_conn() as conn:
+    with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if conn.execute("SELECT id FROM organize_log WHERE id=?", (log_id,)).fetchone() is None:
             raise LookupError("整理日志不存在")
@@ -323,7 +322,7 @@ def restore_organize_business_snapshot(log_id: int, snapshot: dict, **log_fields
         expected = {(item["id"], item["file_id"]) for item in state["items"]}
         if actual != expected:
             raise ValueError("媒体组成员已变化，业务前像不能安全应用")
-        timestamp = database.now()
+        timestamp = db.now()
         values = {**state["log"], **log_fields}
         assignments = ','.join(f'{key}=?' for key in values)
         conn.execute(
