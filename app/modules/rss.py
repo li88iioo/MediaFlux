@@ -46,6 +46,35 @@ from app.sensitive_data import redact_sensitive_text
 
 logger = get_logger(__name__)
 
+RSS_FAILURE_LABELS = {
+    "": "",
+    "unknown_failure": "未分类失败",
+    "submission_outcome_unknown": "提交结果待确认",
+    "qb_outcome_unknown": "qBittorrent 提交结果待确认",
+    "guangya_outcome_unknown": "光鸭提交结果待确认",
+    "download_failed": "下载失败",
+    "invalid_payload": "条目数据无效",
+    "torrent_fetch_timeout": "种子文件下载超时",
+    "torrent_fetch_failed": "种子文件下载失败",
+    "torrent_http_error": "种子下载服务返回 HTTP 错误",
+    "torrent_invalid": "种子文件无效",
+    "torrent_identity_mismatch": "种子内容与条目资源标识不一致",
+    "missing_torrent_url": "条目缺少种子下载地址",
+    "qb_rejected": "qBittorrent 拒绝提交",
+    "qb_dedupe_busy": "qBittorrent 同一资源正在处理",
+    "qb_server_error": "qBittorrent 服务异常",
+    "qb_auth_failed": "qBittorrent 认证失败",
+    "qb_rate_limited": "qBittorrent 请求受限",
+    "qb_unavailable": "qBittorrent 暂不可用",
+    "qb_submit_failed": "qBittorrent 提交失败",
+    "guangya_submit_failed": "光鸭提交失败",
+    "guangya_manifest_unavailable": "光鸭暂未取得文件清单",
+    "guangya_unavailable": "光鸭解析服务暂不可用",
+    "guangya_rate_limited": "光鸭请求受限",
+    "guangya_auth_failed": "光鸭认证失败",
+    "guangya_credentials_changed": "光鸭登录凭据已变化，请重新预检",
+}
+
 RSS_REFRESH_BUSY_ERROR = "订阅正在刷新，请稍后重试"
 RSS_REFRESH_CONFLICT_ERROR = "订阅配置已变化，请重新确认"
 _RSS_REFRESH_GATE_LOCK = threading.Lock()
@@ -1443,6 +1472,7 @@ class RSSEngine:
             "existing": result["existing_count"],
             "unverified": result["unverified_count"],
             "failed": result["failure_count"],
+            "failure_details": result["failed"],
             "outcome_unknown_count": outcome_unknown_count,
             "review_required": bool(result.get("review_required"))
             or outcome_unknown_count > 0,

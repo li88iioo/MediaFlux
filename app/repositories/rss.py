@@ -1085,23 +1085,33 @@ def update_rss_entries_processed_snapshot(
         return updated
 
 
-def get_rss_manual_review_summary(sub_id: int) -> dict[str, int]:
-    """汇总订阅仍未处理的终态失败，供调度告警跨轮次重试与恢复。"""
+def get_rss_failure_summary(sub_id: int, *, entry_ids: Sequence[int] | None = None) -> dict:
+    """汇总所选提交失败；不选条目时汇总尚未处理的终态失败。"""
+    selection = (
+        f"COALESCE(e.failure_retryable,0)=0 OR COALESCE(e.retry_count,0)>={_RSS_MAX_RETRIES}"
+        if entry_ids is None else f"e.id IN ({','.join('?' for _ in entry_ids) or 'NULL'})"
+    )
+    scope = (
+        "FROM rss_entries e WHERE e.rss_item_id=? AND e.status='failed' "
+        f"AND COALESCE(e.processed,0)=0 AND ({selection})"
+    )
+    params = (sub_id, *(entry_ids or ()))
     with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT "
-            "SUM(CASE WHEN failure_code IN "
-            "('qb_outcome_unknown','guangya_outcome_unknown','submission_outcome_unknown') "
-            "THEN 1 ELSE 0 END) AS outcome_unknown_count, "
-            "COUNT(*) AS failed_count "
-            "FROM rss_entries WHERE rss_item_id=? AND status='failed' "
-            "AND COALESCE(processed,0)=0 AND (COALESCE(failure_retryable,0)=0 "
-            f"OR COALESCE(retry_count,0)>={_RSS_MAX_RETRIES})",
-            (sub_id,),
-        ).fetchone()
+        groups = [dict(row) for row in conn.execute(
+            "SELECT COALESCE(e.failure_code,'') AS code, COUNT(*) AS count "
+            + scope + " GROUP BY code ORDER BY code", params,
+        )]
+        entries = [dict(row) for row in conn.execute(
+            "SELECT e.id,e.title,e.failure_code " + scope + " ORDER BY e.id DESC LIMIT 3",
+            params,
+        )]
     return {
-        "outcome_unknown_count": int(row["outcome_unknown_count"] or 0) if row else 0,
-        "failed_count": int(row["failed_count"] or 0) if row else 0,
+        "outcome_unknown_count": sum(group["count"] for group in groups if group["code"] in {
+            "qb_outcome_unknown", "guangya_outcome_unknown", "submission_outcome_unknown",
+        }),
+        "failed_count": sum(group["count"] for group in groups),
+        "reasons": groups,
+        "entries": entries,
     }
 
 

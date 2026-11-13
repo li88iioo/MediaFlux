@@ -8,7 +8,8 @@ from unittest.mock import patch
 from app import database as db
 from app.modules import telegram_notification_center as center
 from app.modules.rss_scheduler import RSSScheduler
-from app.notifier import NotificationEvent
+from app.notifier import NotificationEvent, render_event
+from app.repositories import rss as rss_repo
 from app.repositories.telegram_notifications import (
     claim_due_notifications,
     complete_notification,
@@ -159,3 +160,114 @@ class RSSAlertOutboxRecoveryTests(IsolatedDatabaseTestCase):
         scheduler._clear_issue(1)
         self._notify(RSSScheduler())
         self.assertEqual(len(self._outbox()), 1)
+
+    def test_failure_details_reach_outbox_with_grouped_reasons_and_bounded_safe_examples(self):
+        sid = rss_repo.add_rss_subscription("蜜柑", "https://example.invalid/rss")
+        codes = ["torrent_invalid", "guangya_auth_failed", "guangya_outcome_unknown",
+                 "guangya_auth_failed", "guangya_auth_failed"]
+        failures = []
+        for number, code in enumerate(codes):
+            eid = int(rss_repo.add_rss_entry_with_media(
+                sid, f"<剧集{number}> token=title-secret " + "长标题" * 100, str(number),
+            )["id"])
+            rss_repo.record_rss_entry_failure(eid, code, False)
+            failures.append({"id": eid, "error": (
+                "提交结果待核对，请先检查下载器状态，勿直接重复提交"
+                if code == "guangya_outcome_unknown" else "光鸭认证失败（HTTP 401），token=error-secret"
+            )})
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine:
+            engine.return_value.auto_download.return_value = {
+                "failed": 5, "outcome_unknown_count": 1, "failure_details": failures,
+            }
+            RSSScheduler()._execute(sid, "download")
+
+        rows = self._outbox()
+        self.assertEqual(len(rows), 1)
+        event = center.deserialize_notification_event(rows[0]["event_json"])
+        fields = list(event.fields)
+        self.assertIn(("失败", "4"), fields)
+        self.assertIn(("待核对", "1"), fields)
+        reasons = [value for key, value in fields if key == "原因"]
+        self.assertCountEqual(reasons, ["光鸭认证失败 · 3 条", "光鸭提交结果待确认 · 1 条", "种子文件无效 · 1 条"])
+        self.assertEqual(sum(str(line).startswith("• #") for line in event.lines), 3)
+        rendered = render_event(event)
+        self.assertIn("HTTP 401", rendered)
+        self.assertIn("另有 2 条未展开", rendered)
+        self.assertIn("&lt;剧集4&gt;", rendered)
+        self.assertIn("勿直接重投", rendered)
+        self.assertNotIn("title-secret", rows[0]["event_json"])
+        self.assertNotIn("error-secret", rows[0]["event_json"])
+        self.assertLess(len(rendered), 2500)
+
+    def test_same_count_new_reason_alerts_but_title_changes_and_restart_do_not(self):
+        sid = rss_repo.add_rss_subscription("蜜柑", "https://example.invalid/rss")
+        eid = int(rss_repo.add_rss_entry_with_media(sid, "剧集 E20", "episode")["id"])
+        rss_repo.record_rss_entry_failure(eid, "guangya_auth_failed", False)
+        scheduler = RSSScheduler()
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine:
+            engine.return_value.auto_download.return_value = {
+                "failed": 1, "failure_details": [{"id": eid, "error": "光鸭认证失败（HTTP 401）"}],
+            }
+            engine.return_value.refresh.return_value = {"total": 0, "new": 0}
+            scheduler._execute(sid, "download")
+            self._ack_all()
+            # 同类问题仅换了名称，不应在空轮次或重启后重新通知。
+            with db.get_conn() as conn:
+                conn.execute("UPDATE rss_entries SET title='剧集新标题' WHERE id=?", (eid,))
+            scheduler._execute(sid, "subscribe")
+            RSSScheduler()._execute(sid, "subscribe")
+            self.assertEqual(len(self._outbox()), 1)
+            # 仍为一条，但改成另一种失败时必须通知。
+            rss_repo.record_rss_entry_failure(eid, "torrent_invalid", False)
+            RSSScheduler()._execute(sid, "subscribe")
+            rows = self._outbox()
+            self.assertEqual(len(rows), 2)
+            self.assertNotEqual(rows[0]["event_key"], rows[1]["event_key"])
+            self.assertIn("种子文件无效", rows[1]["event_json"])
+            self.assertEqual(rows[1]["status"], "pending")
+
+    def test_current_retryable_failures_are_reported_without_unrelated_entries(self):
+        sid = rss_repo.add_rss_subscription("蜜柑", "https://example.invalid/rss")
+        other = rss_repo.add_rss_subscription("其他订阅", "https://example.invalid/other")
+        ids = []
+        for subscription, title, retryable in (
+            (sid, "本轮超时", True), (sid, "历史可重试失败", True),
+            (sid, "已处理", False), (other, "别的订阅", False),
+        ):
+            eid = int(rss_repo.add_rss_entry_with_media(subscription, title, title)["id"])
+            rss_repo.record_rss_entry_failure(eid, "torrent_fetch_timeout", retryable)
+            ids.append(eid)
+        rss_repo.update_rss_entries_processed([ids[2]], True)
+        summary = rss_repo.get_rss_failure_summary(sid, entry_ids=[ids[0], ids[2], ids[3]])
+        self.assertEqual(summary["failed_count"], 1)
+        self.assertEqual(summary["reasons"], [{"code": "torrent_fetch_timeout", "count": 1}])
+        self.assertEqual([item["id"] for item in summary["entries"]], [ids[0]])
+        self.assertEqual(rss_repo.get_rss_failure_summary(sid)["failed_count"], 0)
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine:
+            engine.return_value.auto_download.return_value = {
+                "failed": 1, "failure_details": [{"id": ids[0], "error": "种子文件下载超时"}],
+            }
+            RSSScheduler()._execute(sid, "download")
+        self.assertIn("种子文件下载超时", self._outbox()[0]["event_json"])
+        self.assertNotIn("历史可重试失败", self._outbox()[0]["event_json"])
+
+    def test_current_unknown_without_details_does_not_mix_historical_failure_counts(self):
+        sid = rss_repo.add_rss_subscription("蜜柑", "https://example.invalid/rss")
+        old_id = int(rss_repo.add_rss_entry_with_media(sid, "历史失败", "old")["id"])
+        rss_repo.record_rss_entry_failure(old_id, "guangya_auth_failed", False)
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine:
+            engine.return_value.auto_download.return_value = {
+                "failed": 1, "outcome_unknown_count": 1, "failure_details": [],
+            }
+            scheduler = RSSScheduler()
+            scheduler._execute(sid, "download")
+            event = center.deserialize_notification_event(self._outbox()[0]["event_json"])
+            self.assertIn(("失败", "0"), event.fields)
+            self.assertIn(("待核对", "1"), event.fields)
+            self.assertNotIn("光鸭认证失败", render_event(event))
+            self.assertIn("未取得条目详情", render_event(event))
+            # 无新投递时再报告历史未处理失败，不能把两个集合用 max() 混算。
+            engine.return_value.refresh.return_value = {"total": 0, "new": 0}
+            scheduler._execute(sid, "subscribe")
+            self.assertEqual(len(self._outbox()), 2)
+            self.assertIn("光鸭认证失败", self._outbox()[1]["event_json"])

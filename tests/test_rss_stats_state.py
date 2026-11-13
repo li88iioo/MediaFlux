@@ -290,18 +290,18 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                 rss_repo.record_rss_entry_failure(eid, "qb_unavailable", True)
                 with db.get_conn() as conn:
                     conn.execute("UPDATE rss_entries SET retry_count=? WHERE id=?", (retry_count, eid))
-                summary = rss_repo.get_rss_manual_review_summary(sid)
-                self.assertEqual(summary, {
-                    "outcome_unknown_count": 0, "failed_count": int(retry_count >= 5),
-                })
+                summary = rss_repo.get_rss_failure_summary(sid)
+                self.assertEqual(summary["outcome_unknown_count"], 0)
+                self.assertEqual(summary["failed_count"], int(retry_count >= 5))
+                self.assertEqual(summary["reasons"], [{"code": "qb_unavailable", "count": 1}] if retry_count >= 5 else [])
                 retry_ids = {row["id"] for row in rss_repo.get_retryable_failed_rss_snapshot(default_method="qb")}
                 self.assertEqual(eid in retry_ids, retry_count < 5)
                 # 显式跳过/重开仍可用；自动重试上限不应封死人工恢复入口。
                 self.assertEqual(rss_repo.update_rss_entries_processed([eid], True), 1)
-                self.assertEqual(rss_repo.get_rss_manual_review_summary(sid)["failed_count"], 0)
+                self.assertEqual(rss_repo.get_rss_failure_summary(sid)["failed_count"], 0)
                 self.assertEqual(rss_repo.update_rss_entries_processed([eid], False), 1)
                 self.assertTrue(rss_repo.claim_rss_entry(eid))
-                self.assertEqual(rss_repo.get_rss_manual_review_summary(sid)["failed_count"], 0)
+                self.assertEqual(rss_repo.get_rss_failure_summary(sid)["failed_count"], 0)
 
     def test_rss_stats_counts_global_active_and_pending_entries(self) -> None:
         self._seed()

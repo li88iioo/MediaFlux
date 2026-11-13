@@ -192,6 +192,48 @@ class OfflineResolutionFailureTests(unittest.TestCase):
                 self.assertEqual(client.torrent_resolve_calls, [])
                 self.assert_no_writes(client)
 
+    def test_rss_auth_error_survives_auto_download_and_notification_outbox(self):
+        from app import database as db
+        from app.modules import rss, rss_scheduler, telegram_notification_center as center
+        from app.notifier import render_event
+        from app.repositories import rss as rss_repo
+        from tests.support import isolated_test_database
+
+        client = self.client(self.http_error(401))
+        client.close = Mock()
+        torrent = b"d4:infod6:lengthi10485760e4:name9:Movie.mkvee"
+        with isolated_test_database():
+            sid = rss_repo.add_rss_subscription(
+                "蜜柑", "https://example.invalid/rss", action="download", download_method="guangya",
+            )
+            eid = rss_repo.add_rss_entry_with_media(
+                sid, "测试剧集 E20", "auth-episode",
+                payload=json.dumps({"torrent_url": "https://example.invalid/episode.torrent"}),
+            )["id"]
+            with (
+                patch.object(rss.RSSEngine, "refresh", return_value={"total": 1, "new": 0}),
+                patch.object(rss, "_fetch_rss_payload", return_value=(torrent, {})),
+                patch.object(offline, "GuangYaClient", return_value=client),
+                patch.object(center, "notification_target_chat_id", return_value="test-chat"),
+                patch.object(center, "allows_notification", return_value=True),
+                patch.object(center._dispatch_stop, "is_set", return_value=True),
+            ):
+                rss_scheduler.RSSScheduler()._execute(sid, "download")
+
+            row = rss_repo.get_rss_entry(int(eid))
+            assert row is not None
+            self.assertEqual(row["failure_code"], "guangya_auth_failed")
+            with db.get_conn() as conn:
+                rows = conn.execute("SELECT event_json FROM telegram_notification_outbox").fetchall()
+            self.assertEqual(len(rows), 1)
+            rendered = render_event(center.deserialize_notification_event(rows[0]["event_json"]))
+            self.assertIn("光鸭认证失败 · 1 条", rendered)
+            self.assertIn("测试剧集 E20", rendered)
+            self.assertIn("HTTP 401", rendered)
+            self.assertNotIn("fixture-secret", rendered)
+            self.assertNotIn("upstream-body", rendered)
+            self.assert_no_writes(client)
+
     def test_valid_torrent_uses_only_verified_remote_indexes(self):
         client = self.client(payload=RESOLVE_SUBFILES_FIXTURE)
         result = offline.submit_offline(self.url, client=cast(GuangYaClient, client), torrent_data=b"fixture")

@@ -11,7 +11,8 @@ from typing import Any
 from app import database as db
 from app.repositories import rss as rss_repo
 from app.logger import get_logger, log_throttled
-from app.modules.rss import RSSEngine, rss_subscription_refresh_revision
+from app.modules.rss import RSS_FAILURE_LABELS, RSSEngine, rss_subscription_refresh_revision
+from app.sensitive_data import redact_sensitive_text
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 
 logger = get_logger(__name__)
@@ -62,8 +63,11 @@ class RSSScheduler:
             json.dumps(alert, ensure_ascii=False, separators=(",", ":")),
         )
 
-    def _notify_issue(self, sub_id: int, code: str, fields: list[tuple[str, object]]) -> None:
-        signature = (code, *(str(value) for _label, value in fields))
+    def _notify_issue(
+        self, sub_id: int, code: str, fields: list[tuple[str, object]], *,
+        lines: tuple[str, ...] = (), reason_codes: tuple[str, ...] = (),
+    ) -> None:
+        signature = (code, *(str(value) for _label, value in fields), *reason_codes)
         with self._lock:
             if self._alert_signatures.get(sub_id) == signature:
                 return
@@ -91,7 +95,7 @@ class RSSScheduler:
                 type(exc).__name__,
             )
             return
-        name = str(subscription["name"] or f"订阅 #{sub_id}") if subscription else f"订阅 #{sub_id}"
+        name = redact_sensitive_text(subscription["name"] or f"订阅 #{sub_id}") if subscription else f"订阅 #{sub_id}"
         try:
             from app.modules.telegram_notification_center import (
                 publish_notification_event,
@@ -110,7 +114,8 @@ class RSSScheduler:
                         NOTIFICATION_SECTION_BREAK,
                         *tuple(fields),
                     ),
-                    footer="相同问题只提醒一次；恢复后再次发生会重新提醒。",
+                    lines=lines,
+                    footer="相同问题只提醒一次；原因变化或恢复后再次发生会重新提醒。",
                     layout="relaxed",
                 ),
                 topic=NotificationTopic.RSS,
@@ -275,61 +280,54 @@ class RSSScheduler:
                     str(result.get("error_code") or "error"),
                     [("状态", "刷新失败，请检查订阅源")],
                 )
-            elif int(result.get("outcome_unknown_count") or 0) > 0:
-                logger.warning(
-                    "RSS 周期下载结果待核对 sub#%s outcome_unknown=%s failed=%s",
-                    sub_id,
-                    int(result.get("outcome_unknown_count") or 0),
-                    int(result.get("failed") or 0),
-                )
-                self._notify_issue(
-                    sub_id,
-                    "outcome_unknown",
-                    [
-                        ("状态", "提交结果待人工核对，请勿重复提交"),
-                        ("待核对", int(result.get("outcome_unknown_count") or 0)),
-                        ("失败", int(result.get("failed") or 0)),
-                    ],
-                )
-            elif int(result.get("failed") or 0) > 0:
-                logger.warning(
-                    "RSS 周期下载部分失败 sub#%s failed=%s",
-                    sub_id,
-                    int(result.get("failed") or 0),
-                )
-                self._notify_issue(
-                    sub_id,
-                    "partial_failure",
-                    [("状态", "周期下载部分失败"), ("失败", int(result.get("failed") or 0))],
-                )
-            elif bool(result.get("partial")) or bool(
-                (result.get("refresh") or {}).get("partial")
+            elif not (result.get("failed") or result.get("outcome_unknown_count")) and (
+                result.get("partial") or (result.get("refresh") or {}).get("partial")
             ):
                 logger.warning("RSS 周期刷新部分完成 sub#%s", sub_id)
-                self._notify_issue(
-                    sub_id,
-                    "partial_refresh",
-                    [("状态", "部分订阅源刷新失败")],
-                )
+                self._notify_issue(sub_id, "partial_refresh", [("状态", "部分订阅源刷新失败")])
             else:
-                unresolved = rss_repo.get_rss_manual_review_summary(sub_id)
-                outcome_unknown = (unresolved.get("outcome_unknown_count") or 0)
-                failed = (unresolved.get("failed_count") or 0)
-                if outcome_unknown:
-                    self._notify_issue(
-                        sub_id,
-                        "outcome_unknown",
-                        [
-                            ("状态", "提交结果待人工核对，请勿重复提交"),
-                            ("待核对", outcome_unknown),
-                            ("失败", failed),
-                        ],
+                failures = {item["id"]: item for item in result.get("failure_details") or []}
+                failed = int(result.get("failed") or 0)
+                unknown = int(result.get("outcome_unknown_count") or 0)
+                summary = rss_repo.get_rss_failure_summary(
+                    sub_id, entry_ids=tuple(failures) if failed or unknown else None,
+                )
+                # 本轮有失败时只说明本轮，空轮次则继续提醒尚未处理的终态失败。
+                # 并发冲突等没有持久失败记录时仍保留实际回执，不能宣布成功。
+                if not (failed or unknown):
+                    failed, unknown = summary["failed_count"], summary["outcome_unknown_count"]
+                if failed or unknown:
+                    logger.warning(
+                        "RSS 周期下载%s sub#%s outcome_unknown=%s failed=%s",
+                        "结果待核对" if unknown else "部分失败", sub_id, unknown, failed,
                     )
-                elif failed:
+                    fields: list[tuple[str, object]] = [
+                        ("状态", "提交结果待人工核对，请勿重复提交" if unknown else "周期下载部分失败"),
+                    ]
+                    if unknown:
+                        fields.append(("待核对", unknown))
+                    # failed 包含未知结果，展示时分开，避免将待核对误称为确定失败。
+                    fields.append(("失败", str(max(0, failed - unknown))))
+                    fields.extend(("原因", f"{RSS_FAILURE_LABELS.get(group['code']) or '未分类失败'} · {group['count']} 条")
+                                  for group in summary["reasons"])
+                    if failed > summary["failed_count"]:
+                        fields.append(("原因", f"未取得条目详情，请查看下载中心 · {failed - summary['failed_count']} 条"))
+                    lines = []
+                    for entry in summary["entries"]:
+                        title = " ".join(redact_sensitive_text(entry["title"]).split())[:160]
+                        detail = failures.get(entry["id"], {}).get("error")
+                        reason = " ".join(redact_sensitive_text(detail).split())[:200] if detail else (
+                            RSS_FAILURE_LABELS.get(entry["failure_code"]) or "未分类失败"
+                        )
+                        lines.append(f"• #{entry['id']} {title}：{reason}")
+                    remaining = failed - len(lines)
+                    if remaining > 0:
+                        lines.append(f"另有 {remaining} 条未展开。")
+                    lines.append("请在下载中心查看详情并处理；待核对条目请先确认下载器任务，勿直接重投。" if unknown
+                                 else "请在下载中心查看失败详情，处理原因后再重试。")
                     self._notify_issue(
-                        sub_id,
-                        "partial_failure",
-                        [("状态", "周期下载部分失败"), ("失败", failed)],
+                        sub_id, "outcome_unknown" if unknown else "partial_failure", fields, lines=tuple(lines),
+                        reason_codes=tuple(group["code"] for group in summary["reasons"]),
                     )
                 else:
                     self._clear_issue(sub_id)

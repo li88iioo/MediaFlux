@@ -13,6 +13,7 @@ from app.repositories import rss as rss_repo
 from app.logger import get_logger
 from app.modules.rss import (
     RSSEngine,
+    RSS_FAILURE_LABELS,
     rss_entry_delivery,
     rss_subscription_refresh_revision,
 )
@@ -21,25 +22,6 @@ from app.modules.web_secret import signed_context_fingerprint
 from app.sensitive_data import redact_sensitive_text
 
 logger = get_logger(__name__)
-_SAFE_FAILURE_LABELS = {
-    "": "",
-    "unknown_failure": "未分类失败",
-    "submission_outcome_unknown": "提交结果待确认",
-    "qb_outcome_unknown": "qBittorrent 提交结果待确认",
-    "guangya_outcome_unknown": "光鸭提交结果待确认",
-    "download_failed": "下载失败",
-    "invalid_payload": "条目数据无效",
-    "qb_auth_failed": "qBittorrent 认证失败",
-    "qb_rate_limited": "qBittorrent 请求受限",
-    "qb_unavailable": "qBittorrent 暂不可用",
-    "qb_submit_failed": "qBittorrent 提交失败",
-    "guangya_submit_failed": "光鸭提交失败",
-    "guangya_manifest_unavailable": "光鸭暂未取得文件清单",
-    "guangya_unavailable": "光鸭解析服务暂不可用",
-    "guangya_rate_limited": "光鸭请求受限",
-    "guangya_auth_failed": "光鸭认证失败",
-    "guangya_credentials_changed": "光鸭登录凭据已变化，请重新预检",
-}
 
 
 def _ids(value):
@@ -139,7 +121,7 @@ def entries(
             "episode": row["media_episode"],
             "skip_reason": redact_sensitive_text(str(row["skip_reason"] or "")),
             "failure_code": str(row["failure_code"] or ""),
-            "failure_label": _SAFE_FAILURE_LABELS.get(
+            "failure_label": RSS_FAILURE_LABELS.get(
                 str(row["failure_code"] or ""), "未分类失败"
             ),
             "failure_retryable": bool(row["failure_retryable"]),

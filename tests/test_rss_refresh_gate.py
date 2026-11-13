@@ -737,6 +737,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             "failed": 1,
             "outcome_unknown_count": 1,
             "review_required": True,
+            "failure_details": [{"id": int(entry_id), "error": "提交结果待核对"}],
         }
         healthy = {"total": 0, "new": 0, "skipped": 0}
         scheduler = RSSScheduler()
@@ -777,7 +778,9 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
             "app.modules.telegram_notification_center.publish_notification_event", return_value=True,
         ) as publisher:
-            engine.return_value.auto_download.return_value = {"failed": 1}
+            engine.return_value.auto_download.return_value = {
+                "failed": 1, "failure_details": [{"id": eid, "error": "qBittorrent 暂不可用"}],
+            }
             engine.return_value.refresh.return_value = {"total": 0, "new": 0}
             scheduler._execute(sid, "download")
             before = db.kv_get(scheduler._alert_key(sid), "")
