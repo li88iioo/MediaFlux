@@ -11,20 +11,30 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+from app.agent import rate_limit as rates
 from app.agent.kernel import sandbox
+from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.effects import EffectExecutor
+from app.agent.kernel.persistence import SQLiteKernelStore
+from app.agent.kernel.ports.mediaflux_policy import MediaFluxToolRateLimiter
 from app.agent.kernel.references import InMemoryReferenceStore
 from app.agent.kernel.state import InMemorySessionStateStore
+from tests.support import isolated_test_database
 from tests.test_agent_code_sandbox import make_context
 
 
 @asynccontextmanager
-async def _bridge(root, effects):
+async def _bridge(root, effects, *, context=None):
+    root.mkdir(parents=True, exist_ok=True)
     (root / "run").mkdir()
     (root / "output").mkdir()
     progress = AsyncMock()
-    context = replace(await make_context(InMemorySessionStateStore()), report_progress=progress)
-    effects.reference_store = InMemoryReferenceStore()
+    context = replace(context or await make_context(InMemorySessionStateStore()), report_progress=progress)
+    if isinstance(effects, SimpleNamespace):
+        effects.admit_call = AsyncMock()
+        effects.reference_store = InMemoryReferenceStore()
     rpc = sandbox._SDKRequests(context, root, cast(EffectExecutor, effects))
     rpc.uid = os.getuid()
     try:
@@ -62,6 +72,134 @@ def _publish(rpc, number, method="resources.download", arguments=None):
     return name
 
 
+@pytest.fixture
+def sqlite_admission():
+    with (
+        isolated_test_database("sdk-ipc-admission.db"),
+        patch.dict(rates._TOOL_RATE_LIMITS, {"library.episodes": 4}),
+        patch.object(rates, "agent_rate_limiter", rates.AgentRateLimiter(shared=True, wall_clock=lambda: 120.0)),
+    ):
+        yield
+
+
+@asynccontextmanager
+async def _sqlite_bridge(root, *, owner="quota-owner", session="quota-session"):
+    store = SQLiteKernelStore(secret_provider=lambda: "ipc-admission-test-secret")
+    effects = EffectExecutor(
+        catalog=ToolCatalog(), state_store=store, reference_store=store,
+        rate_limiter=MediaFluxToolRateLimiter(),
+    )
+    context = await make_context(store, owner=owner, session=session)
+    async with _bridge(root, effects, context=context) as (rpc, _):
+        yield rpc, effects
+
+
+def test_exhausted_sqlite_read_quota_blocks_provider_and_keeps_other_owner_independent(tmp_path, sqlite_admission):
+    async def run():
+        invoked = []
+
+        def read(query: str):
+            invoked.append(query)
+            return {"query": query}
+
+        for _ in range(4):
+            assert rates.consume_agent_tool("quota-owner", "library.episodes").allowed
+        decision = rates.consume_agent_tool("quota-owner", "library.episodes")
+        assert not decision.allowed
+        expected = {key: getattr(decision, key) for key in (
+            "limit", "cost", "remaining", "retry_after_seconds", "retry_at_epoch", "reason",
+        )}
+        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+            async with _sqlite_bridge(tmp_path / "exhausted") as (rpc, _):
+                name = _publish(rpc, 1, "library.episodes", {"query": "blocked"})
+                await rpc.dispatch(name)
+                reply = json.loads((rpc.root / "run/mf-responses" / name).read_text())
+                assert invoked == []
+                assert reply["error"]["code"] == "rate_limited"
+                assert reply["error"]["execution_started"] is False
+                assert reply["error"]["rate_limit"] == expected
+            async with _sqlite_bridge(tmp_path / "other-owner", owner="other-owner") as (rpc, _):
+                name = _publish(rpc, 1, "library.episodes", {"query": "independent"})
+                await rpc.dispatch(name)
+                assert json.loads((rpc.root / "run/mf-responses" / name).read_text())["result"] == {"query": "independent"}
+                assert invoked == ["independent"]
+
+    asyncio.run(run())
+
+
+def test_concurrent_sqlite_read_admission_shares_four_permits_across_bridges(tmp_path, sqlite_admission):
+    async def run():
+        invoked = []
+
+        def read(query: str):
+            invoked.append(query)
+            return {"query": query}
+
+        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+            async with (
+                _sqlite_bridge(tmp_path / "first", session="first") as (first, _),
+                _sqlite_bridge(tmp_path / "second", session="second") as (second, _),
+            ):
+                requests = [
+                    (rpc, _publish(rpc, index, "library.episodes", {"query": str(index)}))
+                    for index, rpc in enumerate((first, second) * 3)
+                ]
+                await asyncio.gather(*(rpc.dispatch(name) for rpc, name in requests))
+                replies = [json.loads((rpc.root / "run/mf-responses" / name).read_text()) for rpc, name in requests]
+                assert len(invoked) == 4 and len(set(invoked)) == 4
+                assert sum("result" in reply for reply in replies) == 4
+                rejected = [reply["error"] for reply in replies if "error" in reply]
+                assert len(rejected) == 2
+                assert all(error["code"] == "rate_limited" and error["execution_started"] is False for error in rejected)
+                assert all(error["rate_limit"]["remaining"] == 0 for error in rejected)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("ending", ("cancel", "revoked"))
+def test_read_admission_rechecks_cancellation_and_lease_after_await(tmp_path, sqlite_admission, ending):
+    async def run():
+        invoked = []
+
+        def read(query: str):
+            invoked.append(query)
+            return {"query": query}
+
+        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+            async with _sqlite_bridge(tmp_path) as (rpc, effects):
+                entered, release = asyncio.Event(), asyncio.Event()
+                acquire = effects.rate_limiter.acquire
+
+                async def delayed_acquire(**kwargs):
+                    await acquire(**kwargs)
+                    entered.set()
+                    await release.wait()
+
+                with patch.object(effects.rate_limiter, "acquire", new=delayed_acquire):
+                    name = _publish(rpc, 1, "library.episodes", {"query": "blocked"})
+                    dispatch = asyncio.create_task(rpc.dispatch(name))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 2)
+                        if ending == "cancel":
+                            rpc.context.cancellation.cancel()
+                        else:
+                            await effects.state_store.begin_turn(
+                                owner=rpc.context.owner, session_id=rpc.context.session_id, request_id="replacement",
+                            )
+                    finally:
+                        release.set()
+                        await asyncio.gather(dispatch, return_exceptions=True)
+                assert invoked == []
+                if ending == "cancel":
+                    assert dispatch.cancelled()
+                    assert not (rpc.root / "run/mf-responses" / name).exists()
+                else:
+                    reply = json.loads((rpc.root / "run/mf-responses" / name).read_text())
+                    assert "error" in reply and "result" not in reply
+
+    asyncio.run(run())
+
+
 def test_approval_request_is_not_dispatched_again_after_task_completion(tmp_path):
     async def run():
         effects = SimpleNamespace(
@@ -87,6 +225,7 @@ def test_approval_request_is_not_dispatched_again_after_task_completion(tmp_path
                         }
                     ]
                     effects.prepare.assert_awaited_once()
+                    effects.admit_call.assert_not_awaited()
                     activities = [call.args[0]["activity"] for call in progress.await_args_list]
                     assert [item["status"] for item in activities] == ["running", "approval_required"]
                     assert len({item["id"] for item in activities}) == 1
@@ -222,6 +361,7 @@ def test_unknown_write_is_not_replayed_when_response_disappears(tmp_path):
                         }
                     ]
                     effects.prepare.assert_awaited_once()
+                    effects.admit_call.assert_not_awaited()
                     assert not response.exists()
                     response.write_bytes(reply)
 

@@ -596,7 +596,7 @@ class EffectExecutor:
     async def _prepare_effect(self, tool, raw_arguments, normalized, context, started, *,
                               prepare_only=False, confirmation_deadline=None) -> PipelineResult:
         resolved = await self._authorize(tool, normalized, context)
-        await self._admit(tool, resolved, context)
+        await self.admit_call(tool.name, resolved, context, effect=tool.effect, cost=tool.cost)
         completed = context.confirmed_effect
         plan = completed.effect_plan if completed else None
         if (
@@ -1025,7 +1025,8 @@ class EffectExecutor:
                 raise ToolPipelineError("确认计划风险类型不匹配", code="confirmation_invalid")
             context = replace(context, active_effect_plan=plan)
             resolved_arguments = await self._authorize(tool, dict(plan.arguments), context, confirmation=True)
-            await self._admit(tool, resolved_arguments, context, confirmation=True)
+            await self.admit_call(tool.name, resolved_arguments, context,
+                                  effect=tool.effect, cost=tool.cost, confirmation=True)
             if context.scoped_trust:
                 await self.scoped_trust.consume(plan, context=context)
         except ToolPipelineError as exc:
@@ -1111,24 +1112,25 @@ class EffectExecutor:
         return resolved
 
 
-    async def _admit(
-        self, tool: KernelToolSpec, arguments: dict[str, Any], context: ToolCallContext, *, confirmation: bool = False,
+    async def admit_call(
+        self, name: str, arguments: dict[str, Any], context: ToolCallContext, *,
+        effect: ToolEffect, cost: float = 1.0, confirmation: bool = False,
     ) -> None:
         """实际调用前领取一次额度，并在等待后复核取消与回合有效性。"""
         try:
             await self.rate_limiter.acquire(
-                owner=context.owner, tool_name=f"confirm:{tool.name}" if confirmation else tool.name,
-                cost=max(1.0, tool.cost) if confirmation else tool.cost, arguments=arguments,
+                owner=context.owner, tool_name=f"confirm:{name}" if confirmation else name,
+                cost=max(1.0, cost) if confirmation else cost, arguments=arguments,
             )
         except ToolRateLimitError as exc:
-            if not confirmation and tool.effect is ToolEffect.READ and not tool.name.startswith("agent."):
-                raise _ReadPermitRejected(exc, tool.name) from exc
+            if not confirmation and effect is ToolEffect.READ and not name.startswith("agent."):
+                raise _ReadPermitRejected(exc, name) from exc
             raise
         context.cancellation.raise_if_cancelled()
         # A preview cannot reenter a held confirmation, even with an old lease.
         # Reject busy before stale so the confirmed receipt can finish settling.
         scope = (session_scope_guard(context.owner, context.session_id)
-                 if not confirmation and tool.effect is not ToolEffect.READ else nullcontext())
+                 if not confirmation and effect is not ToolEffect.READ else nullcontext())
         with scope:
             if context.lease.continuation_id:
                 # Same-connection fence check linearizes handler start after acquire.

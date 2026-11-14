@@ -63,7 +63,7 @@ class ToolPipeline(EffectExecutor):
             return await self._prepare_effect(tool, raw_arguments, normalized, context, started)
         async with (_read_publication_lock if _read_publication_lock is not None else nullcontext()):
             resolved = await self._authorize(tool, normalized, context)
-            await self._admit(tool, resolved, context)
+            await self.admit_call(tool.name, resolved, context, effect=tool.effect, cost=tool.cost)
         return await self._execute_read(tool, normalized, resolved, context, started,
             returned_read=_returned_read, admitted=_read_admitted, publication_lock=_read_publication_lock)
 

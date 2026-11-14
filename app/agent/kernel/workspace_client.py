@@ -18,12 +18,14 @@ from typing import Any, get_args, get_origin
 class Error(RuntimeError):
     """业务失败；code与execution_started说明原因和本次调用是否已开始写入。"""
 
-    def __init__(self, message, *, code="error", execution_started=None):
+    def __init__(self, message, *, code="error", execution_started=None, rate_limit=None):
         state = ("；本次调用未开始写入" if execution_started is False else
                  "；本次调用已开始写入，须核验原操作结果" if execution_started is True else "")
-        super().__init__(f"{code}: {message}{state}")
+        retry = f"；请等待 {rate_limit['retry_after_seconds']} 秒后重试" if rate_limit and rate_limit.get("retry_after_seconds") else ""
+        super().__init__(f"{code}: {message}{state}{retry}")
         self.code = code
         self.execution_started = execution_started
+        self.rate_limit = rate_limit
 
 
 def _request(method, arguments):

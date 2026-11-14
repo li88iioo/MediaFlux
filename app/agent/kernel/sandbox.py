@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from app.agent.errors import ToolPipelineError
+from app.agent.errors import ToolPipelineError, ToolRateLimitError, _ReadPermitRejected
 from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.modules.process_lock import CrossProcessLock
 from app.runtime_paths import get_runtime_paths
@@ -283,6 +283,7 @@ class _SDKRequests:
                 raise TypeError("arguments 必须是对象")
             bound = inspect.signature(function).bind(**arguments)
             bound.apply_defaults()
+            normalized = {key: value for key, value in bound.arguments.items() if value is not Ellipsis}
             self.context.cancellation.raise_if_cancelled()
             current_task = self.context.current_task
             if not method.startswith("session.") and method not in {"skills.save", "skills.restore"} and self.context.task_budget is not None:
@@ -299,9 +300,7 @@ class _SDKRequests:
                 async with self.effect_lock:
                     if self.proposal is not None:
                         raise ToolPipelineError("已有操作等待确认；本次调用未执行", code="approval_pending")
-                    prepared = await self.effects.prepare(method,
-                        {key: value for key, value in bound.arguments.items() if value is not Ellipsis},
-                        context=self.context)
+                    prepared = await self.effects.prepare(method, normalized, context=self.context)
                     if prepared.effect_plan is not None and prepared.tool.metadata.get("confirmation_required") is False:
                         # 免确认写仍复用冻结、一次领取和持久回执；不终止脚本或生成用户卡片。
                         try:
@@ -318,13 +317,15 @@ class _SDKRequests:
                         return
                     result = dict(prepared.outcome.public_content)
             else:
+                if effect == "read":
+                    await self.effects.admit_call(method, normalized, self.context, effect=ToolEffect.READ)
                 operation_id = await self.presentation.begin(method)
                 snapshot = await self.presentation.snapshot() if method == "resources.present" and bound.arguments.get("result_ids") else None
                 def invoke():
                     # 技能保存/恢复是内部写入，也不能当作只读观察归档。
                     if effect != "local_write":
                         observation.update(method=method,
-                                           arguments={key: value for key, value in bound.arguments.items() if value is not Ellipsis},
+                                           arguments=normalized,
                                            called_at=datetime.now(timezone.utc).isoformat())
                     try:
                         return function(**bound.arguments)
@@ -381,6 +382,11 @@ class _SDKRequests:
             call = {"method": str(method), "ok": False, "status": code}
             self.calls.append(call)
             error: dict[str, Any] = {"code": code, "message": message}
+            if isinstance(exc, ToolRateLimitError):
+                error["rate_limit"] = dict(exc.rate_limit)
+            if isinstance(exc, _ReadPermitRejected):
+                error["execution_started"] = False
+                call["execution_started"] = False
             execution_started = getattr(exc, "execution_started", None)
             if isinstance(execution_started, bool):
                 error["execution_started"] = execution_started

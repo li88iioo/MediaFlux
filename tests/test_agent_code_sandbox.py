@@ -212,6 +212,50 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(result.outcome.full_model_content or result.outcome.model_content)
         return payload["data"]
 
+    async def test_sdk_rate_limit_error_survives_real_workspace_client(self):
+        from unittest.mock import Mock
+        from app.agent import rate_limit as rates
+        from app.agent.kernel.ports.mediaflux_policy import MediaFluxToolRateLimiter
+
+        self.enterContext(isolated_test_database("workspace-rate-admission.db"))
+        self.enterContext(patch.dict(rates._TOOL_RATE_LIMITS, {"library.episodes": 4}))
+        self.enterContext(patch.object(
+            rates, "agent_rate_limiter", rates.AgentRateLimiter(shared=True, wall_clock=lambda: 120.0),
+        ))
+        self.pipeline.rate_limiter = MediaFluxToolRateLimiter()
+        for _ in range(4):
+            self.assertTrue(rates.consume_agent_tool(self.context.owner, "library.episodes").allowed)
+        decision = rates.consume_agent_tool(self.context.owner, "library.episodes")
+        self.assertFalse(decision.allowed)
+        expected = {key: getattr(decision, key) for key in (
+            "limit", "cost", "remaining", "retry_after_seconds", "retry_at_epoch", "reason",
+        )}
+        provider = Mock()
+
+        def read(query):
+            provider(query)
+            return {"items": []}
+
+        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+            result = await self.execute(
+                'import json\n'
+                'try:\n'
+                '    mf.library.episodes("blocked")\n'
+                'except mf.Error as error:\n'
+                '    print(json.dumps({"code": error.code, "rate_limit": error.rate_limit, '
+                '"execution_started": error.execution_started, "message": str(error)}))\n'
+            )
+        self.assertEqual(result["exit_code"], 0, result["stderr"])
+        error = json.loads(result["stdout"].strip())
+        self.assertEqual(error["code"], "rate_limited")
+        self.assertIs(error["execution_started"], False)
+        self.assertEqual(error["rate_limit"], expected)
+        delay = decision.retry_after_seconds
+        assert delay is not None
+        self.assertGreater(delay, 0)
+        self.assertIn(f"{delay:g}", error["message"])
+        provider.assert_not_called()
+
     async def test_python_has_sdk_binding_but_keeps_process_state_isolated(self):
         with patch.dict(sandbox.METHODS, {"library.episodes": lambda series_id: {"id": series_id}}):
             first = await self.execute('print(mf.library.episodes("first")["id"])\n'
