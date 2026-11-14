@@ -492,30 +492,93 @@ class AgentUXBrowserTests(unittest.TestCase):
                     page.wait_for_function("() => !document.querySelector('#agentNewReplies').hidden")
                     self.assertEqual(page.locator('#agentNewReplies').inner_text().strip(), '回到底部')
 
-    def test_history_filter_rename_and_pin_keep_existing_conversation(self):
+    def test_history_rename_and_pin_keep_existing_conversation(self):
         page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': [
             {'session_id': SESSION_A, 'title': '旧排障记录', 'updated_at': 10, 'pinned': False},
             {'session_id': SESSION_B, 'title': '最近选片', 'updated_at': 20, 'pinned': False},
         ]}})
         page.locator('#agentPrompt').fill('正在编辑的草稿')
         harness.open_sessions(page)
-        page.locator('#agentSessionSearch').fill('排障')
-        self.assertEqual(page.locator('.agent-session-item:visible').count(), 1)
         page.locator(f'[data-session-rename="{SESSION_A}"]').click()
         editor = page.locator('.agent-session-editor')
         editor.locator('input').fill('我的排障手册')
         editor.locator('button[type=submit]').click()
         page.wait_for_selector('.agent-session-editor', state='detached')
-        self.assertEqual(page.locator('.agent-session-open:visible strong').inner_text(), '我的排障手册')
-        page.locator('#agentSessionSearch').fill('')
+        self.assertEqual(page.locator(f'[data-session-open="{SESSION_A}"] strong').inner_text(), '我的排障手册')
         page.locator(f'[data-session-pin="{SESSION_A}"]').click()
         page.wait_for_function("id => document.querySelector('.agent-session-item').dataset.sessionId === id", arg=SESSION_A)
         self.assertEqual(page.locator(f'[data-session-pin="{SESSION_A}"]').get_attribute('aria-pressed'), 'true')
         self.assertEqual(page.locator('#agentPrompt').input_value(), '正在编辑的草稿')
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
-        page.locator('#agentSessionSearch').fill('不存在的名字')
-        self.assertIn('没有匹配', page.locator('.agent-session-empty').inner_text())
-        self.snapshot(page, 'history-filter')
+        self.snapshot(page, 'history-rename-pin')
+
+    def test_message_search_shows_highlighted_snippets_and_opens_the_hit(self):
+        key = 'e' * 32
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+            {'session_id': SESSION_A, 'title': '主要', 'updated_at': 10},
+            {'session_id': SESSION_B, 'title': '选片', 'updated_at': 20}]},
+            'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '主要聊天内容'}]},
+                               SESSION_B: {'messages': [{'role': 'assistant', 'content': '要我推送到 qB 吗？'}]}},
+            'channels': [{'key': key, 'title': 'TG 追更', 'updated_at': 30}],
+            'channelDetails': {key: {'read_only': True, 'messages': [{'role': 'assistant', 'content': 'TG：已推送到 qB'}]}},
+            'searchResults': {'qB': [
+                {'kind': 'side', 'session_id': SESSION_B, 'title': '选片', 'updated_at': 20, 'before': '要我推送到 ', 'match': 'qB', 'after': ' 吗？'},
+                {'kind': 'channel', 'key': key, 'title': 'TG 追更', 'updated_at': 30, 'before': 'TG：已推送到 ', 'match': 'qB', 'after': ''}]}})
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('主要聊天内容')")
+        harness.open_sessions(page)
+        page.locator('#agentSessionSearch').fill('qB')
+        results = page.locator('.agent-search-result')
+        results.first.wait_for()
+        self.assertEqual(results.count(), 2)
+        self.assertTrue(page.locator('#agentRailBrowse').is_hidden())
+        self.assertEqual(results.first.locator('mark').inner_text(), 'qB')
+        self.assertIn('选片', results.first.locator('small').inner_text())
+        results.first.click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('要我推送到 qB')")
+        results.nth(1).click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('TG：已推送到 qB')")
+        self.assertTrue(page.locator('#agentComposer').is_hidden())
+        page.locator('#agentSessionSearch').fill('没有结果')
+        page.locator('.agent-search-empty').wait_for()
+        self.assertIn('没有找到', page.locator('.agent-search-empty').inner_text())
+        page.locator('#agentSessionSearch').fill('')
+        page.locator('#agentRailBrowse').wait_for(state='visible')
+        self.assertTrue(page.locator('#agentSearchResults').is_hidden())
+
+    def test_channel_and_side_groups_collapse_and_remember_it(self):
+        config = {'sessions': {'draft_scope': SCOPE, 'sessions': [{'session_id': SESSION_B, 'title': '选片', 'updated_at': 20}]},
+                  'channels': [{'key': 'f' * 32, 'title': 'TG 追更', 'updated_at': 30}]}
+        page = self.page(config)
+        harness.open_sessions(page)
+        page.locator('[data-channel-open]').wait_for()
+        page.locator('[data-group-toggle="channels"]').click()
+        self.assertEqual(page.locator('[data-group-toggle="channels"]').get_attribute('aria-expanded'), 'false')
+        self.assertTrue(page.locator('#agentChannelList').is_hidden())
+        page.locator('[data-group-toggle="side"]').click()
+        self.assertTrue(page.locator('#agentSessionList').is_hidden())
+        self.reload_ui(page, config)
+        harness.open_sessions(page)
+        self.assertTrue(page.locator('#agentChannelList').is_hidden())
+        self.assertTrue(page.locator('#agentSessionList').is_hidden())
+        page.locator('[data-group-toggle="channels"]').click()
+        self.assertTrue(page.locator('#agentChannelList').is_visible())
+
+    def test_deleting_the_open_channel_returns_to_the_main_chat(self):
+        key = 'a1' * 16
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+            {'session_id': SESSION_A, 'title': '主要', 'updated_at': 10}]},
+            'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '主要聊天内容'}]}},
+            'channels': [{'key': key, 'title': 'TG 追更', 'updated_at': 30}],
+            'channelDetails': {key: {'read_only': True, 'messages': [{'role': 'assistant', 'content': 'TG 历史'}]}}})
+        harness.open_sessions(page)
+        page.locator(f'[data-channel-open="{key}"]').click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('TG 历史')")
+        page.locator(f'[data-channel-delete="{key}"]').click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('主要聊天内容')")
+        page.locator('#agentChannels').wait_for(state='hidden')
+        self.assertTrue(page.locator('#agentComposer').is_visible())
+        self.assertTrue(any(call['method'] == 'DELETE' and call['url'] == f'/api/agent/channels/{key}'
+                            for call in page.evaluate('window.__kernelCalls')))
 
     def test_history_update_failure_keeps_editor_and_reports_error(self):
         page = self.page({'patchStatus': 409, 'sessions': {'sessions': [{'session_id': SESSION_A, 'title': '原会话'}]}})

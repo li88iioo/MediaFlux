@@ -530,6 +530,79 @@ async def get_channel(request: Request, key: str):
         return _error(exc)
 
 
+@router.delete("/channels/{key}")
+async def delete_channel(request: Request, key: str):
+    """删除一条 Telegram 渠道会话的历史；Telegram 下次发消息时会从新会话开始。"""
+    require_api_login(request)
+    try:
+        runtime = await run_in_threadpool(get_agent_kernel_runtime)
+        for owner, session_id, _summary in await _telegram_channels(runtime):
+            if hmac.compare_digest(_channel_key(owner, session_id), key):
+                deleted = await runtime.lifecycle.delete(owner=owner, session_id=session_id)
+                return api_response({"deleted": deleted, "key": key})
+        return api_error("渠道会话不存在", 404)
+    except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
+        return _error(exc)
+
+
+_SEARCH_LIMIT = 50
+
+
+def _collapse_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def _search_snippet(content: str, start: int, length: int) -> dict[str, str]:
+    left, right = max(0, start - 24), min(len(content), start + length + 48)
+    clean = _collapse_spaces
+    return {
+        "before": ("…" if left else "") + clean(content[left:start]),
+        "match": content[start:start + length],
+        "after": clean(content[start + length:right]) + ("…" if right < len(content) else ""),
+    }
+
+
+@router.get("/search")
+async def search_messages(request: Request, q: str = ""):
+    """在主要聊天、旁聊和 Telegram 渠道的公开消息里全文搜索；只读，不加载模型。"""
+    require_api_login(request)
+    query = q.strip()
+    if not 1 <= len(query) <= 80:
+        return api_error("搜索词需为 1–80 个字符", 400)
+    try:
+        runtime = await run_in_threadpool(get_agent_kernel_runtime)
+        owner = _owner()
+        sessions = await runtime.store.list_sessions(owner=owner)
+        main_session_id = await run_in_threadpool(web_main_session_id, owner, sessions)
+        scopes = [(owner, str(item["session_id"]), item,
+                   {"kind": "main" if str(item["session_id"]) == main_session_id else "side",
+                    "session_id": str(item["session_id"])}) for item in sessions]
+        scopes += [(tg_owner, session_id, item, {"kind": "channel", "key": _channel_key(tg_owner, session_id)})
+                   for tg_owner, session_id, item in await _telegram_channels(runtime)]
+        scopes.sort(key=lambda scope: float(scope[2].get("updated_at") or 0), reverse=True)
+        needle = query.casefold()
+        results: list[dict[str, Any]] = []
+        for scope_owner, session_id, summary, target in scopes:
+            state = await runtime.store.load(owner=scope_owner, session_id=session_id)
+            for message in reversed(public_conversation_messages(state.conversation)):
+                content = str(message.get("content") or "")
+                start = content.casefold().find(needle)
+                if start < 0:
+                    continue
+                results.append({**target, "title": str(summary.get("title") or "新对话"),
+                                "role": message.get("role"), "updated_at": summary.get("updated_at"),
+                                **_search_snippet(content, start, len(query))})
+                if len(results) >= _SEARCH_LIMIT:
+                    break
+            if len(results) >= _SEARCH_LIMIT:
+                break
+        response = api_response({"query": query, "results": results, "truncated": len(results) >= _SEARCH_LIMIT})
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+    except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
+        return _error(exc)
+
+
 @router.get("/sessions/{session_id}")
 async def get_session(request: Request, session_id: str):
     require_api_login(request)

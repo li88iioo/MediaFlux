@@ -17,6 +17,9 @@
     const channelSection = document.getElementById('agentChannels');
     const channelList = document.getElementById('agentChannelList');
     const channelNotice = document.getElementById('agentChannelNotice');
+    const searchResults = document.getElementById('agentSearchResults');
+    const railBrowse = document.getElementById('agentRailBrowse');
+    const GROUP_KEY = 'mediaflux.agent.sidebar.groups.v1';
     const replyText = document.getElementById('agentReplyText');
     const historyButton = document.getElementById('toggleAgentRail');
     const historyRail = document.getElementById('agentHistoryRail');
@@ -2622,7 +2625,6 @@
             .map((item) => ({...item, pinned: item.pinned === true}));
         if (!sessionList) return;
         syncMainChatButton();
-        const query = String(sessionSearch?.value || '').trim().normalize('NFKC').toLocaleLowerCase();
         // 主要聊天固定在列表上方，旁聊列表只列其余会话。
         const sorted = sessionItems.filter(item => item.session_id !== mainSessionId).sort((a, b) => Number(b.pinned) - Number(a.pinned) ||
             (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0));
@@ -2665,8 +2667,7 @@
             pin.title = item.pinned ? '取消置顶' : '置顶';
             row.querySelector('[data-session-rename]').setAttribute('aria-label', `重命名会话 ${title}`);
             row.querySelector('[data-session-delete]').setAttribute('aria-label', `删除会话 ${title}`);
-            row.hidden = Boolean(query && !title.normalize('NFKC').toLocaleLowerCase().includes(query));
-            if (!row.hidden) shown += 1;
+            shown += 1;
             sessionList.append(row);
         }
         let empty = sessionList.querySelector('.agent-session-empty');
@@ -2677,7 +2678,7 @@
                 sessionList.append(empty);
                 renderIcons(empty);
             }
-            empty.querySelector('span').textContent = query ? '没有匹配的旁聊，试试其他标题' : '尚无旁聊';
+            empty.querySelector('span').textContent = '尚无旁聊';
         } else empty?.remove();
         if (sessionCount) sessionCount.textContent = `${shown} 条`;
         sessionList.scrollTop = scrollTop;
@@ -3076,6 +3077,77 @@
         loadSession(mainSessionId);
     }
 
+    function readGroupState() {
+        try { return JSON.parse(localStorage.getItem(GROUP_KEY) || '{}') || {}; } catch (_) { return {}; }
+    }
+
+    function applyGroupState() {
+        const collapsed = readGroupState();
+        document.querySelectorAll('[data-group-toggle]').forEach(button => {
+            const closed = collapsed[button.dataset.groupToggle] === true;
+            button.setAttribute('aria-expanded', String(!closed));
+            const list = document.getElementById(button.getAttribute('aria-controls') || '');
+            if (list) list.hidden = closed;
+        });
+    }
+
+    function toggleGroup(name) {
+        const collapsed = readGroupState();
+        collapsed[name] = collapsed[name] !== true;
+        try { localStorage.setItem(GROUP_KEY, JSON.stringify(collapsed)); } catch (_) { /* 仅本浏览器记忆折叠状态 */ }
+        applyGroupState();
+    }
+
+    let searchGeneration = 0;
+
+    async function runSearch() {
+        const query = String(sessionSearch?.value || '').trim();
+        const generation = ++searchGeneration;
+        if (!searchResults || !railBrowse) return;
+        if (!query) {
+            searchResults.hidden = true;
+            searchResults.replaceChildren();
+            railBrowse.hidden = false;
+            return;
+        }
+        railBrowse.hidden = true;
+        searchResults.hidden = false;
+        searchResults.setAttribute('aria-busy', 'true');
+        try {
+            const payload = await fetchJSON(`/api/agent/search?q=${encodeURIComponent(query.slice(0, 80))}`);
+            if (generation !== searchGeneration) return;
+            const results = Array.isArray(payload?.results) ? payload.results : [];
+            searchResults.replaceChildren(...results.map(item => {
+                const button = element('button', 'agent-search-result');
+                button.type = 'button';
+                if (item.kind === 'channel') button.dataset.searchChannel = String(item.key || '');
+                else button.dataset.searchSession = String(item.session_id || '');
+                const snippet = element('p', '');
+                snippet.append(document.createTextNode(String(item.before || '')),
+                    element('mark', '', String(item.match || '')), document.createTextNode(String(item.after || '')));
+                const place = item.kind === 'main' ? '主要聊天' : item.kind === 'channel' ? `Telegram · ${item.title || ''}` : String(item.title || '旁聊');
+                button.append(snippet, element('small', '', [sessionTime(item.updated_at), place].filter(Boolean).join(' · ')));
+                return button;
+            }));
+            if (!results.length) searchResults.append(element('p', 'agent-search-empty', `没有找到包含“${query}”的消息`));
+        } catch (error) {
+            if (generation !== searchGeneration) return;
+            searchResults.replaceChildren(element('p', 'agent-search-empty', error?.message || '搜索暂不可用'));
+        } finally {
+            if (generation === searchGeneration) searchResults.setAttribute('aria-busy', 'false');
+        }
+    }
+
+    async function deleteChannel(key) {
+        try {
+            await fetchJSON(`/api/agent/channels/${encodeURIComponent(key)}`, {method: 'DELETE'});
+            if (viewingChannel === key) openMainChat();
+            await refreshChannels();
+        } catch (error) {
+            announce(sessionStatus, error?.message || '渠道会话删除失败');
+        }
+    }
+
     function renderChannelList(items) {
         if (!channelList || !channelSection) return;
         channelList.replaceChildren(...items.map(item => {
@@ -3085,10 +3157,19 @@
             open.classList.toggle('is-active', item.key === viewingChannel);
             open.setAttribute('aria-current', item.key === viewingChannel ? 'page' : 'false');
             const label = element('span', '');
-            label.append(element('strong', '', String(item.title || 'Telegram')),
+            const title = String(item.title || 'Telegram');
+            label.append(element('strong', '', title),
                 element('small', '', `Telegram${sessionTime(item.updated_at) ? ` · ${sessionTime(item.updated_at)}` : ''}`));
             open.append(icon('send'), label);
-            return open;
+            const remove = element('button', 'agent-channel-delete');
+            remove.type = 'button';
+            remove.dataset.channelDelete = item.key;
+            remove.title = '删除';
+            remove.setAttribute('aria-label', `删除渠道会话 ${title}`);
+            remove.append(icon('trash-2'));
+            const row = element('div', 'agent-channel-item');
+            row.append(open, remove);
+            return row;
         }));
         channelSection.hidden = !items.length;
         renderIcons(channelList);
@@ -3611,7 +3692,9 @@
     });
     channelList?.addEventListener('click', (event) => {
         const open = event.target.closest('[data-channel-open]');
+        const remove = event.target.closest('[data-channel-delete]');
         if (open) openChannel(open.dataset.channelOpen || '');
+        if (remove) deleteChannel(remove.dataset.channelDelete || '');
     });
     document.getElementById('agentReplyCancel')?.addEventListener('click', () => { setReply(''); promptInput?.focus(); });
     // 常驻会话栏没有“打开”动作；回到页面时刷新列表，及时发现新旁聊或登录主体变化。
@@ -3626,7 +3709,21 @@
     historyRail?.addEventListener('click', (event) => {
         if (event.target === historyRail || event.target.closest('[data-agent-history-close]')) closeHistoryRail();
     });
-    sessionSearch?.addEventListener('input', () => renderSessionList(sessionItems));
+    let searchTimer = 0;
+    sessionSearch?.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(runSearch, 250);
+    });
+    searchResults?.addEventListener('click', (event) => {
+        const result = event.target.closest('[data-search-session], [data-search-channel]');
+        if (!result) return;
+        if (result.dataset.searchChannel) openChannel(result.dataset.searchChannel);
+        else loadSession(result.dataset.searchSession || '');
+    });
+    document.querySelectorAll('[data-group-toggle]').forEach(button => {
+        button.addEventListener('click', () => toggleGroup(button.dataset.groupToggle));
+    });
+    applyGroupState();
     sessionList?.addEventListener('click', (event) => {
         const open = event.target.closest('[data-session-open]');
         const remove = event.target.closest('[data-session-delete]');

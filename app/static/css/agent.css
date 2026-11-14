@@ -2046,3 +2046,26 @@ body.agent-page-body::after { display: none; }
     .agent-download-target, .agent-download-submit, .agent-download-cancel { height: 44px; font-size: 16px; }
     .agent-attach { flex-basis: 44px; width: 44px; height: 44px; margin-bottom: 0; }
 }
+
+/* 渠道/旁聊折叠、消息全文搜索结果、渠道删除。 */
+.agent-group-toggle { flex: 1 1 auto; display: inline-flex; align-items: center; gap: 4px; min-height: 32px; padding: 0; color: inherit; background: transparent; border: 0; font: inherit; text-align: left; cursor: pointer; }
+.agent-group-toggle .agent-session-group-title { flex: 0 0 auto; }
+.agent-group-toggle svg { width: 14px; height: 14px; transition: transform .15s ease; }
+.agent-group-toggle[aria-expanded="false"] svg { transform: rotate(-90deg); }
+.agent-group-toggle:hover { color: var(--text-primary); }
+.agent-session-list[hidden], .agent-channel-list[hidden], .agent-rail-browse[hidden], .agent-search-results[hidden] { display: none; }
+.agent-rail-browse { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.agent-channel-item { display: grid; grid-template-columns: minmax(0, 1fr) 36px; align-items: center; }
+.agent-channel-delete { width: 36px; height: 36px; display: inline-grid; place-items: center; padding: 0; color: var(--text-muted); background: transparent; border: 0; border-radius: 8px; cursor: pointer; opacity: 0; }
+.agent-channel-item:hover .agent-channel-delete, .agent-channel-delete:focus-visible { opacity: 1; }
+.agent-channel-delete:hover { color: var(--danger); }
+.agent-channel-delete svg { width: 14px; height: 14px; }
+@media (hover: none) { .agent-channel-delete { opacity: .7; } }
+.agent-search-results { flex: 1; min-height: 0; margin-top: 10px; overflow-y: auto; overscroll-behavior: contain; }
+.agent-search-result { display: block; width: 100%; padding: 8px 10px; color: var(--text-secondary); background: transparent; border: 0; border-bottom: 1px solid var(--agent-line); border-radius: 0; font: inherit; text-align: left; cursor: pointer; }
+.agent-search-result:hover { background: var(--bg-input); }
+.agent-search-result p { margin: 0; font-size: 12px; line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.agent-search-result mark { color: var(--text-primary); background: transparent; font-weight: 700; }
+.agent-search-result small { display: block; margin-top: 2px; color: var(--text-muted); font-size: 10px; }
+.agent-search-empty { margin: 24px 0; color: var(--text-muted); font-size: 12px; text-align: center; }
+@media (prefers-reduced-motion: reduce) { .agent-group-toggle svg { transition: none; } }

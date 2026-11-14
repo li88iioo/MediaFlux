@@ -1233,3 +1233,43 @@ def test_telegram_channel_is_listed_and_readable_without_exposing_identity(api, 
     assert owner_routes.telegram_channel_owners() == ["tg:v1:12345\x1f111", "tg:v1:12345\x1f222"]
     values["TG_CHAT_ID"] = "not-a-chat"
     assert owner_routes.telegram_channel_owners() == []
+
+
+async def _seed_conversation(store, *, owner, session_id, conversation):
+    lease, _ = await store.begin_turn(owner=owner, session_id=session_id, request_id="seed")
+    await store.commit(lease, conversation=conversation)
+
+
+def test_message_search_spans_main_side_and_channel_and_channel_delete(api, monkeypatch):
+    tg_owner = "tg:v1:12345\x1f12345"
+    monkeypatch.setattr(agent_api, "telegram_channel_owners", lambda: [tg_owner])
+    assert api.client.get("/api/agent/search?q=诛仙").status_code == 401
+    _login(api)
+    owner = _web_owner(api)
+    asyncio.run(_seed_conversation(api.store, owner=owner, session_id="session_search_main_01", conversation=[
+        {"role": "user", "content": "诛仙下一集出了吗"},
+        {"role": "assistant", "content": "出了：S4E15，4K HBR 1.42 GiB。\n要我推送到 qB 吗？"}]))
+    time.sleep(1.1)
+    asyncio.run(_seed_conversation(api.store, owner=owner, session_id="session_search_side_01", conversation=[
+        {"role": "user", "content": "媒体库排障"}]))
+    asyncio.run(_seed_conversation(api.store, owner=tg_owner, session_id="tg_" + "d" * 32, conversation=[
+        {"role": "assistant", "content": "TG：诛仙 S4E15 已推送到 qB"}]))
+    api.client.get("/api/agent/sessions")  # 分配主要聊天：最近一次会话
+    payload = api.client.get("/api/agent/search", params={"q": "qb"}).json()
+    kinds = sorted(item["kind"] for item in payload["results"])
+    assert kinds == ["channel", "side"] or kinds == ["channel", "main"]
+    hit = next(item for item in payload["results"] if item.get("session_id") == "session_search_main_01")
+    assert hit["match"] == "qB" and hit["before"].endswith("要我推送到 ") and hit["after"] == " 吗？"
+    channel = next(item for item in payload["results"] if item["kind"] == "channel")
+    assert "12345" not in str(channel) and len(channel["key"]) == 32
+    assert api.client.get("/api/agent/search", params={"q": "不存在的词"}).json()["results"] == []
+    for bad in ("", "  ", "x" * 81):
+        assert api.client.get("/api/agent/search", params={"q": bad}).status_code == 400
+
+    delete = AsyncMock(return_value=True)
+    api.runtime.lifecycle = SimpleNamespace(delete=delete)
+    assert api.client.delete(f"/api/agent/channels/{channel['key']}").status_code == 403
+    response = api.client.delete(f"/api/agent/channels/{channel['key']}", headers=CSRF)
+    assert response.status_code == 200 and response.json()["deleted"] is True
+    delete.assert_awaited_once_with(owner=tg_owner, session_id="tg_" + "d" * 32)
+    assert api.client.delete("/api/agent/channels/" + "0" * 32, headers=CSRF).status_code == 404

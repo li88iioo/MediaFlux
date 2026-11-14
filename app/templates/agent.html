@@ -65,20 +65,23 @@
             <section class="agent-rail-section agent-session-panel">
                 <h2 class="sr-only" id="agent-session-heading" tabindex="-1">会话</h2>
                 <div class="agent-session-heading">
-                    <label class="agent-session-search"><i data-lucide="search"></i><span class="sr-only">筛选会话标题</span><input id="agentSessionSearch" type="search" maxlength="80" placeholder="搜索" autocomplete="off"></label>
+                    <label class="agent-session-search"><i data-lucide="search"></i><span class="sr-only">搜索聊天消息</span><input id="agentSessionSearch" type="search" maxlength="80" placeholder="搜索消息" autocomplete="off"></label>
                     <button type="button" class="agent-history-close" data-agent-history-close aria-label="关闭会话栏" title="关闭会话栏"><i data-lucide="x"></i></button>
                 </div>
-                <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><i data-lucide="message-circle"></i><span>主要聊天</span></button>
-                <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden>
-                    <div class="agent-session-group"><span class="agent-session-group-title">渠道</span></div>
-                    <div class="agent-channel-list" id="agentChannelList"></div>
-                </section>
-                <div class="agent-session-group">
-                    <span class="agent-session-group-title">旁聊</span>
-                    <span class="agent-session-count" id="agentSessionCount">0 条</span>
-                    <button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊" title="新建旁聊"><i data-lucide="plus"></i></button>
+                <div class="agent-search-results" id="agentSearchResults" aria-live="polite" hidden></div>
+                <div class="agent-rail-browse" id="agentRailBrowse">
+                    <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><i data-lucide="message-circle"></i><span>主要聊天</span></button>
+                    <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden>
+                        <div class="agent-session-group"><button type="button" class="agent-group-toggle" data-group-toggle="channels" aria-expanded="true" aria-controls="agentChannelList"><span class="agent-session-group-title">渠道</span><i data-lucide="chevron-down"></i></button></div>
+                        <div class="agent-channel-list" id="agentChannelList"></div>
+                    </section>
+                    <div class="agent-session-group">
+                        <button type="button" class="agent-group-toggle" data-group-toggle="side" aria-expanded="true" aria-controls="agentSessionList"><span class="agent-session-group-title">旁聊</span><i data-lucide="chevron-down"></i></button>
+                        <span class="agent-session-count" id="agentSessionCount">0 条</span>
+                        <button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊" title="新建旁聊"><i data-lucide="plus"></i></button>
+                    </div>
+                    <div class="agent-session-list" id="agentSessionList" aria-live="polite" aria-busy="true"><div class="agent-session-empty"><i data-lucide="message-circle-dashed"></i><span>尚无旁聊</span></div></div>
                 </div>
-                <div class="agent-session-list" id="agentSessionList" aria-live="polite" aria-busy="true"><div class="agent-session-empty"><i data-lucide="message-circle-dashed"></i><span>尚无旁聊</span></div></div>
                 <p class="agent-history-feedback" id="agentSessionStatus" role="status" aria-live="polite"></p>
                 <a class="agent-session-settings" href="{{ url_for('pages.settings') }}#agent"><i data-lucide="sliders-horizontal"></i><span>Agent 设置</span></a>
             </section>

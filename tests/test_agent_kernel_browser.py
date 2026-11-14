@@ -91,10 +91,13 @@ HTML = """
               <label class="agent-session-search"><input id="agentSessionSearch" type="search" maxlength="80" placeholder="搜索"></label>
               <button type="button" class="agent-history-close" data-agent-history-close>关闭</button>
             </div>
-            <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><span>主要聊天</span></button>
-            <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden><div class="agent-session-group"><span class="agent-session-group-title">渠道</span></div><div class="agent-channel-list" id="agentChannelList"></div></section>
-            <div class="agent-session-group"><span class="agent-session-group-title">旁聊</span><span class="agent-session-count" id="agentSessionCount">0 条</span><button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊">新建旁聊</button></div>
-            <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
+            <div class="agent-search-results" id="agentSearchResults" aria-live="polite" hidden></div>
+            <div class="agent-rail-browse" id="agentRailBrowse">
+              <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><span>主要聊天</span></button>
+              <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden><div class="agent-session-group"><button type="button" class="agent-group-toggle" data-group-toggle="channels" aria-expanded="true" aria-controls="agentChannelList"><span class="agent-session-group-title">渠道</span></button></div><div class="agent-channel-list" id="agentChannelList"></div></section>
+              <div class="agent-session-group"><button type="button" class="agent-group-toggle" data-group-toggle="side" aria-expanded="true" aria-controls="agentSessionList"><span class="agent-session-group-title">旁聊</span></button><span class="agent-session-count" id="agentSessionCount">0 条</span><button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊">新建旁聊</button></div>
+              <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
+            </div>
             <p class="agent-history-feedback" id="agentSessionStatus" role="status"></p>
             <a class="agent-session-settings" href="#settings">Agent 设置</a>
           </section>
@@ -216,6 +219,15 @@ MOCK_FETCH = r"""
     if (path === '/api/downloads/direct/submit') {
       window.__directForms = (window.__directForms || []).concat([[...options.body.entries()].map(([key, value]) => [key, typeof value === 'string' ? value : value.name])]);
       return jsonResponse(window.__kernelConfig.directSubmit || {request_id: 1, summary: '下载请求 #1 已提交'});
+    }
+    if (path === '/api/agent/search') {
+      const query = new URL(url, location.href).searchParams.get('q') || '';
+      return jsonResponse({query, results: (window.__kernelConfig.searchResults || {})[query] || []});
+    }
+    if (path.startsWith('/api/agent/channels/') && options.method === 'DELETE') {
+      const key = decodeURIComponent(path.split('/').pop());
+      window.__kernelConfig.channels = (window.__kernelConfig.channels || []).filter(item => item.key !== key);
+      return jsonResponse({deleted: true, key});
     }
     if (path === '/api/agent/channels') return jsonResponse({channels: window.__kernelConfig.channels || []});
     if (path.startsWith('/api/agent/channels/')) {
