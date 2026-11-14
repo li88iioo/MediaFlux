@@ -217,8 +217,10 @@ def _batch_event(
     else:
         metadata["detail_token"] = ""
         title = "⚠️ 整理待确认批次"
-        reviewing = [item for item in items if item.get("status") == "pending" and item.get("review_status")]
-        review_count = sum(item["review_status"] in {"waiting", "pending", "running"} for item in reviewing)
+        # 分母是整批进入过复核的组；已确认或已处理的组算完成，不能移出分母让进度倒退。
+        reviewing = [item for item in items if item.get("review_status")]
+        review_count = sum(item.get("status") == "pending" and item["review_status"] in {"waiting", "pending", "running"}
+                           for item in reviewing)
         fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text), ("分页", f"{page}/{pages}"))
         if any(downstream_counts.values()):
             fields += (("后续处理", " · ".join(f"{label} {downstream_counts[key]}" for key, label in (

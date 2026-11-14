@@ -170,8 +170,10 @@ def _choices(entries: list[dict], chat_id: str | None) -> list[tuple]:
 
 
 def _digest(choices: list[tuple]) -> str:
-    # 通知位置、模型建议和运行状态不属于文件变更范围；其更新不使已确认操作失去幂等性。
+    # 建议槽（Agent 建议或人工选择）是本次确认的依据，必须冻结到认领前；
+    # 认领不改写建议槽，通知位置与运行状态仍不入摘要，已入队项重复提交保持幂等。
     frozen = [{"token": row["token"], "index": index,
+               "suggestion": row["review_result_json"] or "",
                "episode_research_receipt": confirmations.episode_research_receipt_from_row(row),
                "payload": {key: payload.get(key) for key in (
                    "kind", "source_dir_id", "source_parent_id", "files", "companions", "candidates", "rules",

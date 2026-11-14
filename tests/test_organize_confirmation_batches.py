@@ -386,6 +386,22 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         with self.assertRaisesRegex(ValueError, "预览已变化"):
             batches.submit_choices(entries, preview["digest"])
 
+    def test_selection_saved_after_preview_invalidates_that_preview(self):
+        self.create("one", review=True)
+        organize_confirmations_repo.update_organize_confirmation(
+            "one", review_status="approved",
+            review_result_json=json.dumps({"candidate_index": 0, "summary": "Agent 建议"}),
+        )
+        entries = [{"confirmation_id": "one", "candidate_index": 0}]
+        preview = batches.preview_choices(entries)
+        batches.save_selection("one", 1)
+        with self.assertRaisesRegex(ValueError, "预览已变化"):
+            batches.submit_choices(entries, preview["digest"])
+        row = self.row("one")
+        self.assertEqual(row["status"], "pending")
+        self.assertIsNone(row["selected_index"])
+        self.assertEqual(json.loads(row["review_result_json"])["candidate_index"], 1)
+
     def test_review_change_between_preview_check_and_claim_cannot_change_write_scope(self):
         self.create("one", review=True)
         entries = [{"confirmation_id": "one", "candidate_index": 0}]

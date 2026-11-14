@@ -243,6 +243,36 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertTrue(str(dict(self._snapshot().event.fields)["Agent 复核"]).startswith("已完成 1/2 组"))
         self.assertEqual(self._confirmation(manual)["review_status"], "")
 
+    def test_review_progress_keeps_confirmed_groups_in_the_total(self):
+        done, running = self._create(2)
+        self._review(done)
+        self._review(running, status="running")
+        batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+        self.assertTrue(str(dict(self._snapshot().event.fields)["Agent 复核"]).startswith("已完成 1/2 组"))
+        self.assertIn("已接纳 1 组", self._callback(self._action("确认全部已核验建议")))
+        self.assertEqual(self._confirmation(done)["status"], "queued")
+        self.assertTrue(str(dict(self._snapshot().event.fields)["Agent 复核"]).startswith("已完成 1/2 组"))
+
+    def test_web_reselection_during_tap_never_queues_the_old_suggestion(self):
+        token, _other = self._create(2)
+        self._review(token)
+        batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+        approval = self._action("确认全部已核验建议")
+        original = service.submit_choices
+
+        def web_saves_first(entries, digest, **kwargs):
+            service.save_selection(token, 1)
+            return original(entries, digest, **kwargs)
+
+        with patch.object(service, "submit_choices", side_effect=web_saves_first):
+            with self.assertRaisesRegex(ValueError, "预览已变化"):
+                self._callback(approval)
+        row = self._confirmation(token)
+        self.assertEqual(row["status"], "pending")
+        self.assertIsNone(row["selected_index"])
+        self.assertEqual(json.loads(row["review_result_json"])["candidate_index"], 1)
+        self.dispatch.assert_not_called()
+
     def test_readonly_review_button_preserves_approved_choice_and_never_executes(self):
         first, second = self._create()
         self._review(first, index=1)
