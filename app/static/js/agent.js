@@ -329,6 +329,12 @@
 
     function setConsoleEmpty(empty) {
         consoleNode?.classList.toggle('is-empty', Boolean(empty));
+        if (viewingChannel && channelNotice) {
+            announce(channelNotice.querySelector('strong'), empty ? '暂无可显示的消息' : '只能查看');
+            announce(channelNotice.querySelector('small'), empty
+                ? '此会话仅供查看，请在 Telegram 中继续对话。'
+                : '消息已从 Telegram 同步，请在 Telegram 中继续这个对话。');
+        }
         placeTaskSnapshot();
         if (!initialRestore) {
             try { localStorage.setItem(LAYOUT_KEY, JSON.stringify({session_id: sessionId, mode: empty ? 'empty' : 'conversation'})); } catch (_) { /* 可选布局提示。 */ }

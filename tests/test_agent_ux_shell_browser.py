@@ -94,6 +94,71 @@ class AgentShellBrowserCase(InitializedWebTestCase):
 
 
 class AgentUXShellBrowserTests(AgentShellBrowserCase):
+    def test_empty_telegram_notice_stays_compact_when_switching_conversations(self):
+        for viewport in ({'width': 1920, 'height': 1080}, {'width': 390, 'height': 844}, {'width': 320, 'height': 568}):
+            with self.subTest(viewport=viewport):
+                page, unexpected, errors = self.make_shell(viewport, history=False)
+                page.evaluate("""() => {
+                    const cfg = window.__kernelConfig;
+                    cfg.sessions.main_session_id = 'session_shell_0000000001';
+                    cfg.sessionDetails = {session_shell_0000000001: {
+                        messages: [{role: 'assistant', content: 'Web 会话回复'}],
+                    }};
+                    cfg.channels = [
+                        {key: 'c'.repeat(32), title: '新对话'},
+                        {key: 'd'.repeat(32), title: '有消息的话题'},
+                    ];
+                    cfg.channelDetails = {
+                        ['c'.repeat(32)]: {read_only: true, messages: []},
+                        ['d'.repeat(32)]: {read_only: true, messages: [{role: 'assistant', content: 'Telegram 会话回复'}]},
+                    };
+                }""")
+                browser_support.open_sessions(page)
+                page.locator(f'[data-channel-open="{"c" * 32}"]').click()
+                browser_support.wait_rail_settled(page)
+                page.locator('.agent-console.is-channel.is-empty').wait_for()
+                notice = page.locator('#agentChannelNotice')
+                bounds = notice.bounding_box()
+                console = page.locator('.agent-console').bounding_box()
+                assert bounds is not None and console is not None
+                self.assertLess(bounds['height'], 130)
+                self.assertLessEqual(abs(bounds['y'] + bounds['height'] / 2 - console['y'] - console['height'] / 2), 1)
+                self.assertLessEqual(bounds['width'], min(700, viewport['width'] - 40))
+                self.assertEqual(notice.locator('strong').inner_text(), '暂无可显示的消息')
+                self.assertNotIn('已从 Telegram 同步', notice.inner_text())
+                self.assertTrue(page.locator('#agentComposer').is_hidden())
+                self.assertTrue(page.locator('.agent-empty-intro').is_hidden())
+                self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), viewport['width'])
+                if output := os.getenv('MEDIAFLUX_UI_SCREENSHOTS'):
+                    page.screenshot(path=str(Path(output) / f'telegram-empty-{viewport["width"]}.png'))
+
+                browser_support.open_sessions(page)
+                self.assertEqual(page.locator('#agentChannels').get_attribute('aria-label'), 'Telegram')
+                self.assertEqual(page.locator('#agentChannels .agent-session-group-title').inner_text(), 'Telegram')
+                page.locator(f'[data-channel-open="{"d" * 32}"]').click()
+                browser_support.wait_rail_settled(page)
+                page.get_by_text('Telegram 会话回复', exact=True).wait_for()
+                self.assertEqual(notice.locator('strong').inner_text(), '只能查看')
+                self.assertIn('已从 Telegram 同步', notice.inner_text())
+                self.assertTrue(page.locator('#agentComposer').is_hidden())
+                bounds = notice.bounding_box()
+                assert bounds is not None
+                self.assertLess(bounds['height'], 130)
+                self.assertGreater(bounds['y'], console['y'] + console['height'] / 2)
+
+                browser_support.open_sessions(page)
+                page.locator(f'[data-channel-open="{"c" * 32}"]').click()
+                page.locator('.agent-console.is-channel.is-empty').wait_for()
+                self.assertEqual(notice.locator('strong').inner_text(), '暂无可显示的消息')
+                browser_support.open_sessions(page)
+                page.locator('#agentMainChat').click()
+                browser_support.wait_rail_settled(page)
+                page.get_by_text('Web 会话回复', exact=True).wait_for()
+                self.assertTrue(notice.is_hidden())
+                self.assertTrue(page.locator('#agentComposer').is_visible())
+                self.assertEqual(unexpected, [])
+                self.assertEqual(errors, [])
+
     def test_real_shell_keeps_composer_centered_and_auxiliary_content_separate(self):
         for viewport in ({'width': 1280, 'height': 800}, {'width': 390, 'height': 844}, {'width': 320, 'height': 360}):
             for history in (False, True):

@@ -94,7 +94,7 @@ HTML = """
             <div class="agent-search-results" id="agentSearchResults" aria-live="polite" hidden></div>
             <div class="agent-rail-browse" id="agentRailBrowse">
               <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><span>主要聊天</span><small class="agent-session-time"></small></button>
-              <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden><div class="agent-session-group"><button type="button" class="agent-group-toggle" data-group-toggle="channels" aria-expanded="true" aria-controls="agentChannelList"><span class="agent-session-group-title">渠道</span></button></div><div class="agent-channel-list" id="agentChannelList"></div></section>
+              <section class="agent-channels" id="agentChannels" aria-label="Telegram" hidden><div class="agent-session-group"><button type="button" class="agent-group-toggle" data-group-toggle="channels" aria-expanded="true" aria-controls="agentChannelList"><span class="agent-session-group-title">Telegram</span></button></div><div class="agent-channel-list" id="agentChannelList"></div></section>
               <div class="agent-session-group"><button type="button" class="agent-group-toggle" data-group-toggle="side" aria-expanded="true" aria-controls="agentSessionList"><span class="agent-session-group-title">旁聊</span></button><button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊">新建旁聊</button></div>
               <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
             </div>
