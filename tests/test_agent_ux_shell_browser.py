@@ -120,7 +120,7 @@ class AgentUXShellBrowserTests(AgentShellBrowserCase):
                     self.assertTrue(page.locator('#agentMainChat').is_visible())
                     if drawer:
                         self.assertTrue(page.locator('#agent-session-heading').evaluate('(node) => document.activeElement === node'))
-                    self.assertEqual(page.locator('#agentSessionCount').inner_text(), f'{1 if history else 0} 条')
+                    self.assertEqual(page.locator('.agent-session-item').count(), 1 if history else 0)
                     self.assertEqual(unexpected, [])
                     self.assertEqual(errors, [])
 

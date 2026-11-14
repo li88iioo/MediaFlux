@@ -405,7 +405,7 @@ class AgentRestoreBrowserTests(shell_support.AgentShellBrowserCase):
         other_scope = 'c' * 64
         page.evaluate("scope => {window.__kernelConfig.sessions={draft_scope:scope,sessions:[]};window.__kernelConfig.sessionDetails={};}", other_scope)
         browser_support.open_sessions(page)
-        page.wait_for_function("document.querySelector('#agentSessionCount').textContent === '0 条'")
+        page.wait_for_function("document.querySelectorAll('#agentSessionList .agent-session-item').length === 0")
         new_id = page.evaluate(f"localStorage.getItem('{SESSION_KEY}')")
         self.assertNotEqual(new_id, SESSION)
         self.assertEqual(page.evaluate(f"JSON.parse(localStorage.getItem('{LAYOUT_KEY}'))"), {'session_id': new_id, 'mode': 'empty'})

@@ -153,8 +153,9 @@ console.log('page loader: complete, failure, invalid cursor, malformed response 
         self.assertIn("appearance: none", css)
         self.assertIn("-webkit-appearance: none", css)
         self.assertIn(".lm-task-select-all[hidden]", css)
-        self.assertIn(".lm-task-select-all input:focus-visible", css)
-        self.assertIn("box-shadow: 0 0 0 3px var(--accent-soft)", css)
+        # 原生勾选框仍可键盘操作；焦点统一走全局中性描边，不叠绿色阴影。
+        self.assertNotIn(".lm-task-select-all input:focus-visible", css)
+        self.assertNotIn("box-shadow: 0 0 0 3px var(--accent-soft)", css)
         self.assertIn(".lm-task-table th:nth-child(1) { width: 96px; }", css)
         self.assertRegex(
             css,

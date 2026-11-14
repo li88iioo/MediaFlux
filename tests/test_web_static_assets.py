@@ -55,3 +55,29 @@ class StaticAssetUrlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FocusStylePolicyTests(unittest.TestCase):
+    """全站焦点样式：点击不画绿色高亮框；键盘焦点只由 main.css/core-layout.css 的中性描边提供。"""
+
+    ROOT = Path(__file__).resolve().parents[1] / "app" / "static" / "css"
+
+    def test_no_stylesheet_paints_green_focus_rings(self):
+        import re
+
+        rule = re.compile(r"([^{}]*:focus[^{}]*)\{([^{}]*)\}")
+        green = re.compile(r"(outline|box-shadow|border(-[a-z]+)?)\s*:[^;]*(var\(--(accent|mf-brand|discovery-amber|dashboard-accent)|#65f0c2)", re.I)
+        offenders = []
+        for path in sorted(self.ROOT.rglob("*.css")):
+            for selector, body in rule.findall(path.read_text()):
+                parts = [part for part in re.split(r",(?![^()]*\))", selector) if part.strip()]
+                if parts and all(":focus" in part for part in parts) and green.search(body):
+                    offenders.append(f"{path.name}: {selector.strip()[:80]}")
+        self.assertEqual(offenders, [])
+
+    def test_global_policy_hides_pointer_focus_and_keeps_keyboard_ring(self):
+        for name in ("main.css", "core-layout.css"):
+            source = (self.ROOT / name).read_text()
+            with self.subTest(stylesheet=name):
+                self.assertIn(":focus:not(:focus-visible) { outline: none; }", source)
+                self.assertIn(":focus-visible { outline: 2px solid color-mix(in srgb, currentColor 40%, transparent);", source)

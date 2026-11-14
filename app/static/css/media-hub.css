@@ -1050,7 +1050,7 @@
     outline:0;
 }
 .media-hub-page .media-hub-filter-search input:focus-visible,
-.media-hub-page .media-recent-select select:focus-visible { background:var(--dashboard-paper); box-shadow:0 0 0 2px var(--dashboard-accent-soft); }
+.media-hub-page .media-recent-select select:focus-visible { background:var(--dashboard-paper); }
 .media-hub-page .media-hub-filter-search input { padding:0 12px 0 37px; font-size:10.5px; }
 .media-hub-page .media-recent-select {
     min-width:0;
@@ -1565,7 +1565,6 @@
 .media-hub-page .media-hub-filter-search input:focus-visible,
 .media-hub-page .media-recent-select select:focus-visible {
     background: var(--dashboard-paper);
-    box-shadow: inset 0 0 0 1px var(--dashboard-accent);
 }
 .media-hub-page .media-hub-filter-search > svg {
     left: 13px;

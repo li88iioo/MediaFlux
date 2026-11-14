@@ -230,7 +230,6 @@
 }
 
 .ml-library-mapping-row:focus-within {
-    border-color: var(--accent-border);
     background: var(--bg-card);
 }
 
@@ -304,17 +303,11 @@
     background: color-mix(in srgb, currentColor 9%, var(--bg-card));
 }
 
-.ml-source-toggle:focus-visible {
-    outline: 2px solid var(--accent-border);
-    outline-offset: 2px;
-}
-
 .ml-source-toggle svg {
     width: 15px;
     height: 15px;
     flex: 0 0 auto;
 }
-
 
 .ml-directory-control {
     display: grid;
@@ -593,7 +586,6 @@
             "managed";
         gap: 11px;
     }
-
 
     .ml-source-control {
         width: 108px;

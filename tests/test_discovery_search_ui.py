@@ -89,7 +89,8 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             re.compile(r"\.discovery-filter-control \.form-select\s*\{[^}]*border:\s*0[^}]*background:\s*transparent", re.S),
         )
         self.assertIn(".discovery-filter-control.is-active", self.styles)
-        self.assertIn(".discovery-page .discovery-filter-control:focus-within", self.styles)
+        # 点击聚焦不再给筛选模块加绿色描边或内阴影。
+        self.assertNotIn(".discovery-page .discovery-filter-control:focus-within", self.styles)
         self.assertIn(".discovery-page .discovery-filter-control .form-select:focus-visible", self.styles)
         self.assertRegex(
             self.styles,
@@ -652,14 +653,8 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             self.script,
             re.compile(r"if \(status !== 'disabled' && siteId\)[\s\S]*?createFilterButton\(", re.S),
         )
-        self.assertRegex(
-            self.styles,
-            re.compile(
-                r"\.discovery-resource-sites:focus-visible\s*,\s*"
-                r"\.discovery-resource-site-status\.is-error:focus-visible\s*\{[^}]*outline:",
-                re.S,
-            ),
-        )
+        # 键盘焦点由全局中性描边提供，站点状态不再自带琥珀色焦点框。
+        self.assertNotRegex(self.styles, re.compile(r"\.discovery-resource-site-status[^{]*:focus-visible\s*\{[^}]*outline:", re.S))
 
     def test_failure_detail_and_single_site_retry_use_stable_detail_strip(self):
         for contract in (
@@ -820,24 +815,17 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             ),
         )
 
-    def test_discovery_text_controls_use_one_focus_ring_without_double_outline(self):
+    def test_discovery_controls_do_not_add_colored_focus_rings(self):
         self.assertRegex(
             self.styles,
-            re.compile(
-                r"\.discovery-page\s+:is\(input\.form-input,\s*select\.form-select\):focus-visible\s*\{"
-                r"[^}]*outline:\s*none;[^}]*border-color:\s*transparent;"
-                r"[^}]*box-shadow:\s*0\s+0\s+0\s+2px\s+var\(--accent\)",
-                re.S,
-            ),
+            re.compile(r"\.discovery-page\s+:is\(input\.form-input,\s*select\.form-select\):focus-visible\s*\{[^}]*outline:\s*none;", re.S),
         )
         self.assertNotRegex(
             self.styles,
-            re.compile(r"\.discovery-page\s+input:focus-visible[^}]*outline:", re.S),
+            re.compile(r"\.discovery-page[^{}]*:focus[^{}]*\{[^}]*box-shadow:[^;]*var\(--accent", re.S),
         )
-        self.assertRegex(
-            self.styles,
-            re.compile(r"\.discovery-page\s+button:focus-visible\s*\{[^}]*outline:", re.S),
-        )
+        # 控件的绿色双框已删除，键盘焦点统一画中性描边。
+        self.assertIn(":focus-visible { outline: 2px solid color-mix(in srgb, currentColor 40%, transparent);", self.styles)
 
     def test_css_reserves_control_height_and_contains_mobile_resource_rows(self):
         for selector in (
@@ -1566,6 +1554,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                     active: document.activeElement === select,
                     wrapperShadow: style.boxShadow,
                     wrapperBorders: [style.borderTopColor, style.borderRightColor, style.borderBottomColor, style.borderLeftColor],
+                    wrapperOutline: style.outlineStyle,
                     selectOutline: selectStyle.outlineStyle,
                     selectShadow: selectStyle.boxShadow,
                 };
@@ -1580,9 +1569,9 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.keyboard.press("Escape")
         clicked = focus_metrics(focused=True)
         self.assertTrue(clicked["focusWithin"])
-        self.assertIn("1px inset", clicked["wrapperShadow"])
+        self.assertEqual(clicked["wrapperShadow"], "none")
         self.assertEqual(len(set(clicked["wrapperBorders"])), 1)
-        self.assertNotEqual(clicked["wrapperBorders"][0], initial["wrapperBorders"][0])
+        self.assertEqual(clicked["wrapperBorders"], initial["wrapperBorders"])
         self.assertEqual(clicked["selectOutline"], "none")
         self.assertEqual(clicked["selectShadow"], "none")
         self.assertEqual(clicked["rect"], initial["rect"])
@@ -1594,7 +1583,9 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertTrue(keyboard["focusWithin"])
         self.assertTrue(keyboard["active"])
         self.assertTrue(keyboard["focusVisible"])
-        self.assertIn("1px inset", keyboard["wrapperShadow"])
+        self.assertEqual(keyboard["wrapperOutline"], "solid")
+        self.assertEqual(keyboard["wrapperShadow"], "none")
+        self.assertEqual(keyboard["wrapperBorders"], initial["wrapperBorders"])
         self.assertEqual(len(set(keyboard["wrapperBorders"])), 1)
         self.assertEqual(keyboard["selectOutline"], "none")
         self.assertEqual(keyboard["selectShadow"], "none")

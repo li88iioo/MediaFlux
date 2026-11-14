@@ -5286,7 +5286,8 @@ class SecurityTests(InitializedWebTestCase):
             ".settings-tab.active { color: var(--accent); background: var(--accent-soft); }",
             settings_css,
         )
-        self.assertIn(".settings-tab:focus-visible", settings_css)
+        self.assertNotIn(".settings-tab:focus-visible", settings_css)
+        self.assertIn(":focus-visible { outline: 2px solid color-mix(in srgb, currentColor 40%, transparent);", main_css)
         self.assertIn("@media (max-width: 900px)", settings_css)
         self.assertIn("height: 38px; padding: 0 14px; gap: 6px;", settings_css)
         self.assertNotIn("repeat(7,minmax(0,1fr))", main_css)
@@ -5780,7 +5781,8 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn(
             ".app-message-modal.is-success .app-message-copy .server-kicker", stylesheet
         )
-        self.assertIn(".app-confirm-actions button:focus-visible", stylesheet)
+        self.assertNotIn(".app-confirm-actions button:focus-visible", stylesheet)
+        self.assertIn(":focus-visible { outline: 2px solid color-mix(in srgb, currentColor 40%, transparent);", stylesheet)
         self.assertIn("confirmModal.classList.toggle('is-danger', danger)", script)
         self.assertIn("confirmSubmit.classList.toggle('btn-danger', danger)", script)
         self.assertIn("messageModal.classList.add(`is-${type}`)", script)

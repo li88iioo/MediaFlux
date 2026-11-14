@@ -226,22 +226,21 @@ class AgentUXBrowserTests(unittest.TestCase):
                 self.snapshot(page, f'feedback-empty-with-history-{viewport["width"]}-{viewport["height"]}')
                 drawer = page.locator('#toggleAgentRail').is_visible()
                 harness.open_sessions(page)
-                self.assertEqual(page.locator('#agentSessionCount').inner_text(), '1 条')
+                self.assertEqual(page.locator('.agent-session-item').count(), 1)
                 self.assertEqual(page.locator('#agent-session-heading').inner_text(), '会话')
                 self.assertEqual(page.locator('.agent-history-drawer .agent-kicker').count(), 0)
                 if drawer:
                     self.assertTrue(page.locator('#agent-session-heading').evaluate('(node) => document.activeElement === node'))
-                count = page.locator('#agentSessionCount').evaluate("node => {const style = getComputedStyle(node); return {border: style.borderTopWidth, background: style.backgroundColor, font: style.fontFamily};}")
-                self.assertEqual(count['border'], '0px')
-                self.assertEqual(count['background'], 'rgba(0, 0, 0, 0)')
-                self.assertNotIn('mono', count['font'].lower())
+                self.assertEqual(page.locator('#agentSessionCount').count(), 0)
                 page.locator('#agentSessionSearch').focus()
                 self.assertEqual(page.locator('#agentSessionSearch').evaluate('(node) => getComputedStyle(node).outlineStyle'), 'none')
                 search_style = page.locator('.agent-session-search').evaluate("node => {const style = getComputedStyle(node); return {radius: style.borderRadius, shadow: style.boxShadow};}")
                 self.assertEqual(search_style['radius'], '12px')
-                self.assertNotEqual(search_style['shadow'], 'none')
+                # 点击聚焦不再显示绿色高亮框。
+                self.assertEqual(search_style['shadow'], 'none')
                 self.snapshot(page, f'feedback-history-search-{viewport["width"]}-{viewport["height"]}')
-                page.locator('[data-session-rename]').click()
+                page.locator('[data-session-more]').first.click()
+                page.locator('[data-session-rename]').first.click()
                 editor = page.locator('.agent-session-editor input')
                 style = editor.evaluate("node => {const style = getComputedStyle(node); return {outline: style.outlineStyle, radius: style.borderRadius, border: style.borderTopWidth};}")
                 self.assertEqual(style, {'outline': 'none', 'radius': '10px', 'border': '1px'})
@@ -307,7 +306,7 @@ class AgentUXBrowserTests(unittest.TestCase):
             {'session_id': SESSION_B, 'title': '其他会话', 'updated_at': 10},
         ]}})
         harness.open_sessions(page)
-        page.locator(f'[data-session-rename="{SESSION_A}"]').click()
+        harness.row_action(page, 'session', 'rename', SESSION_A)
         editor = page.locator('.agent-session-editor input')
         editor.fill('还没有保存的新名称')
         page.locator('#agentSessionSearch').fill('准备')
@@ -343,7 +342,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         harness.wait_rail_settled(page)
         self.assertEqual(page.locator('#agentPrompt').input_value(), 'A 的草稿')
         harness.open_sessions(page)
-        page.locator(f'[data-session-delete="{SESSION_A}"]').click()
+        harness.row_action(page, 'session', 'delete', SESSION_A)
         harness.wait_rail_settled(page)
         # 删除当前会话后切离该会话；宽屏会话栏不关闭，需等切换完成。
         page.wait_for_function("id => localStorage.getItem('mediaflux.agent.kernel.session.v1') !== id", arg=SESSION_A)
@@ -528,13 +527,13 @@ class AgentUXBrowserTests(unittest.TestCase):
         ]}})
         page.locator('#agentPrompt').fill('正在编辑的草稿')
         harness.open_sessions(page)
-        page.locator(f'[data-session-rename="{SESSION_A}"]').click()
+        harness.row_action(page, 'session', 'rename', SESSION_A)
         editor = page.locator('.agent-session-editor')
         editor.locator('input').fill('我的排障手册')
         editor.locator('button[type=submit]').click()
         page.wait_for_selector('.agent-session-editor', state='detached')
         self.assertEqual(page.locator(f'[data-session-open="{SESSION_A}"] strong').inner_text(), '我的排障手册')
-        page.locator(f'[data-session-pin="{SESSION_A}"]').click()
+        harness.row_action(page, 'session', 'pin', SESSION_A)
         page.wait_for_function("id => document.querySelector('.agent-session-item').dataset.sessionId === id", arg=SESSION_A)
         self.assertEqual(page.locator(f'[data-session-pin="{SESSION_A}"]').get_attribute('aria-pressed'), 'true')
         self.assertEqual(page.locator('#agentPrompt').input_value(), '正在编辑的草稿')
@@ -602,17 +601,134 @@ class AgentUXBrowserTests(unittest.TestCase):
         harness.open_sessions(page)
         page.locator(f'[data-channel-open="{key}"]').click()
         page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('TG 历史')")
-        page.locator(f'[data-channel-delete="{key}"]').click()
+        harness.row_action(page, 'channel', 'delete', key)
         page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('主要聊天内容')")
         page.locator('#agentChannels').wait_for(state='hidden')
         self.assertTrue(page.locator('#agentComposer').is_visible())
         self.assertTrue(any(call['method'] == 'DELETE' and call['url'] == f'/api/agent/channels/{key}'
                             for call in page.evaluate('window.__kernelCalls')))
 
+    def test_row_menu_stays_visible_at_list_end_and_supports_keyboard(self):
+        sessions = [{'session_id': f'session_menu_{index:016d}', 'title': f'旁聊 {index}',
+                     'updated_at': 1_700_000_000 + index} for index in range(40)]
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': sessions}},
+                                 viewport={'width': width, 'height': 600})
+                harness.open_sessions(page)
+                trigger = page.locator('[data-session-more]').last
+                trigger.scroll_into_view_if_needed()
+                trigger.focus()
+                page.keyboard.press('Enter')
+                menu = page.locator('.agent-row-menu:visible')
+                self.assertEqual(menu.count(), 1)
+                self.assertEqual(trigger.get_attribute('aria-expanded'), 'true')
+                box = menu.bounding_box()
+                assert box is not None
+                self.assertGreaterEqual(box['y'], 0)
+                self.assertLessEqual(box['y'] + box['height'], 600)
+                self.assertLessEqual(box['x'] + box['width'], width)
+                self.snapshot(page, f'session-menu-{width}')
+                self.assertEqual(menu.get_by_role('menuitem').all_text_contents(), ['置顶', '重命名', '删除'])
+                self.assertTrue(menu.get_by_role('menuitem').nth(0).evaluate('node => document.activeElement === node'))
+                page.keyboard.press('ArrowDown')
+                self.assertTrue(menu.get_by_role('menuitem').nth(1).evaluate('node => document.activeElement === node'))
+                page.keyboard.press('End')
+                self.assertTrue(menu.get_by_role('menuitem').nth(2).evaluate('node => document.activeElement === node'))
+                page.keyboard.press('Escape')
+                self.assertEqual(page.locator('.agent-row-menu:visible').count(), 0)
+                self.assertTrue(trigger.evaluate('node => document.activeElement === node'))
+                self.assertTrue(page.locator('#agentHistoryRail').is_visible())
+                page.keyboard.press('Enter')
+                page.locator('#agentSessionSearch').click()
+                self.assertEqual(page.locator('.agent-row-menu:visible').count(), 0)
+                self.assertEqual(trigger.get_attribute('aria-expanded'), 'false')
+                trigger.click()
+                self.assertEqual(menu.get_by_role('menuitem').first.evaluate('node => getComputedStyle(node).outlineStyle'), 'none')
+
+    def test_focusing_composer_does_not_add_a_green_glow(self):
+        page = self.page()
+        composer = page.locator('#agentComposer')
+        page.evaluate("async () => { await Promise.all(document.getAnimations().filter(a => a.effect?.getTiming().iterations !== Infinity).map(a => a.finished.catch(() => {}))); }")
+        before = composer.evaluate('node => { const s = getComputedStyle(node); return [s.borderColor, s.boxShadow]; }')
+        page.locator('#agentPrompt').click()
+        page.evaluate("async () => { await Promise.all(document.getAnimations().filter(a => a.effect?.getTiming().iterations !== Infinity).map(a => a.finished.catch(() => {}))); }")
+        after = composer.evaluate('node => { const s = getComputedStyle(node); return [s.borderColor, s.boxShadow]; }')
+        self.assertEqual(before, after)
+        self.assertEqual(page.locator('#agentPrompt').evaluate('node => getComputedStyle(node).outlineStyle'), 'none')
+
+    def test_sidebar_row_displays_relative_time_and_menu_closes_after_rename(self):
+        now = time.time()
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+            {'session_id': SESSION_A, 'title': '主要聊天', 'updated_at': now - 120},
+            {'session_id': SESSION_B, 'title': '旧旁聊', 'updated_at': now - 3600},
+        ]}})
+        self.assertEqual(page.locator('#agentMainChat .agent-session-time').inner_text(), '2分')
+        row = page.locator(f'[data-session-id="{SESSION_B}"]')
+        self.assertEqual(row.locator('.agent-session-time').text_content(), '1时')
+        row.hover()
+        page.wait_for_function("() => getComputedStyle(document.querySelector('.agent-row-more')).opacity === '1'")
+        self.assertNotIn('条消息', row.inner_text())
+        harness.row_action(page, 'session', 'rename', SESSION_B)
+        row.locator('input').fill('新名称')
+        page.keyboard.press('Enter')
+        page.wait_for_function("() => !document.querySelector('.agent-session-editor')")
+        self.assertEqual(row.locator('.agent-session-open strong').inner_text(), '新名称')
+        self.assertTrue(row.locator('.agent-row-more').evaluate('node => node === document.activeElement'))
+        self.assertEqual(row.locator('.agent-row-more').get_attribute('aria-expanded'), 'false')
+
+    def test_menu_hover_uses_accent_and_selected_single_row_has_no_frame(self):
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': [
+            {'session_id': SESSION_A, 'title': '只有这一条', 'updated_at': time.time()}]},
+            'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '已保存的回复'}]}}},
+            stored_session=SESSION_A)
+        page.wait_for_selector('.agent-narrative')
+        row = page.locator(f'[data-session-id="{SESSION_A}"]')
+        self.assertTrue(row.evaluate('node => node.classList.contains("is-active")'))
+        borders = row.evaluate("node => {const s = getComputedStyle(node); return [s.borderTopWidth, s.borderRightWidth, s.borderBottomWidth, s.borderLeftWidth];}")
+        self.assertEqual(borders, ['0px'] * 4)
+        self.assertEqual(page.locator('#agentSessionCount').count(), 0)
+        page.locator(f'[data-session-more="{SESSION_A}"]').click()
+        for selector, token, background in (
+            ('[data-session-pin]', '--accent', 'var(--accent-soft)'),
+            ('[data-session-delete]', '--danger', 'color-mix(in srgb, var(--danger) 10%, transparent)'),
+        ):
+            button = row.locator(selector)
+            button.hover()
+            colors = button.evaluate("""(node, values) => {
+                const probe = document.createElement('span');
+                probe.style.color = `var(${values[0]})`;
+                probe.style.backgroundColor = values[1];
+                node.append(probe);
+                const expected = getComputedStyle(probe);
+                const actual = getComputedStyle(node);
+                const result = [actual.color, actual.backgroundColor, expected.color, expected.backgroundColor];
+                probe.remove(); return result;
+            }""", [token, background])
+            self.assertEqual(colors[:2], colors[2:])
+
+    def test_dashboard_global_search_has_no_green_focus_frame_in_either_theme(self):
+        # 看板有独立的 dashboard-accent 别名，不能只测试 Agent 页的普通 accent。
+        page = self.browser.new_page(viewport={'width': 1280, 'height': 800})
+        self.addCleanup(page.close)
+        page.set_content('<html><head></head><body class="dashboard-page"><form class="dashboard-global-search"><input id="dashboardSearchInput" type="search" placeholder="搜索媒体、订阅、任务或日志"></form></body></html>')
+        for path in ('main.css', 'dashboard-workbench.css'):
+            page.add_style_tag(path=str(harness.ROOT / 'app/static/css' / path))
+        for theme in ('light', 'dark'):
+            with self.subTest(theme=theme):
+                page.evaluate("theme => { document.documentElement.dataset.theme = theme; document.activeElement.blur(); }", theme)
+                search = page.locator('#dashboardSearchInput')
+                before = search.bounding_box()
+                search.click()
+                page.wait_for_function("() => { const s = getComputedStyle(document.querySelector('#dashboardSearchInput')); return s.outlineStyle === 'none' && s.boxShadow === 'none'; }")
+                self.assertEqual(search.bounding_box(), before)
+                search.fill('电影')
+                self.assertEqual(search.input_value(), '电影')
+
     def test_history_update_failure_keeps_editor_and_reports_error(self):
         page = self.page({'patchStatus': 409, 'sessions': {'sessions': [{'session_id': SESSION_A, 'title': '原会话'}]}})
         harness.open_sessions(page)
-        page.locator('[data-session-rename]').click()
+        harness.row_action(page, 'session', 'rename', SESSION_A)
         page.locator('.agent-session-editor input').fill('新名称')
         page.keyboard.press('Enter')
         page.wait_for_function("() => document.querySelector('#agentSessionStatus').textContent.includes('更新失败')")
@@ -1180,7 +1296,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'page')
         self.assertEqual(page.locator(f'[data-session-open="{SESSION_A}"]').count(), 0)
         self.assertEqual(page.locator(f'[data-session-delete="{SESSION_A}"]').count(), 0)
-        self.assertEqual(page.locator('#agentSessionCount').inner_text(), '1 条')
+        self.assertEqual(page.locator('.agent-session-item').count(), 1)
         page.locator(f'[data-session-open="{SESSION_B}"]').click()
         page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('旁聊内容')")
         self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'false')

@@ -24,7 +24,6 @@
     const historyButton = document.getElementById('toggleAgentRail');
     const historyRail = document.getElementById('agentHistoryRail');
     const sessionList = document.getElementById('agentSessionList');
-    const sessionCount = document.getElementById('agentSessionCount');
     const sessionStatus = document.getElementById('agentSessionStatus');
     const responseStatus = document.getElementById('agentResponseStatus');
     const nextActions = document.getElementById('agentStartActions');
@@ -2676,6 +2675,80 @@
         return new Intl.DateTimeFormat('zh-CN', {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'}).format(date);
     }
 
+    // 会话栏的相对时间：一小时内“N分”，一天内“N时”，更早显示日期。
+    function relativeTime(value) {
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds) || seconds <= 0) return '';
+        const elapsed = Math.max(0, Date.now() / 1000 - seconds);
+        if (elapsed < 60) return '刚刚';
+        if (elapsed < 3600) return `${Math.floor(elapsed / 60)}分`;
+        if (elapsed < 86400) return `${Math.floor(elapsed / 3600)}时`;
+        const date = new Date(seconds * 1000);
+        return new Intl.DateTimeFormat('zh-CN', {
+            ...(date.getFullYear() === new Date().getFullYear() ? {} : {year: 'numeric'}), month: 'numeric', day: 'numeric',
+        }).format(date);
+    }
+
+    // 每行一个“…”按钮与就地弹出的操作菜单；按钮上的 data-*-<动作> 沿用原有点击处理。
+    function rowMenu(id, actions, scope) {
+        const more = element('button', 'agent-row-more');
+        more.type = 'button';
+        more.dataset[`${scope}More`] = id;
+        more.setAttribute('aria-haspopup', 'menu');
+        more.setAttribute('aria-expanded', 'false');
+        more.append(icon('ellipsis'));
+        const menu = element('div', 'agent-row-menu');
+        menu.setAttribute('role', 'menu');
+        menu.setAttribute('popover', 'manual');
+        menu.hidden = true;
+        for (const [name, mark, label] of actions) {
+            const button = element('button', `agent-row-menu-item${name === 'delete' ? ' is-danger' : ''}`);
+            button.type = 'button';
+            button.setAttribute('role', 'menuitem');
+            button.dataset[`${scope}${name[0].toUpperCase()}${name.slice(1)}`] = id;
+            button.append(icon(mark), element('span', '', label));
+            menu.append(button);
+        }
+        return {more, menu};
+    }
+
+    function closeRowMenus(except = null) {
+        document.querySelectorAll('.agent-row-menu:not([hidden])').forEach(menu => {
+            if (menu === except) return;
+            if (menu.matches(':popover-open')) menu.hidePopover();
+            menu.hidden = true;
+            menu.parentElement?.querySelector('.agent-row-more')?.setAttribute('aria-expanded', 'false');
+            menu.parentElement?.classList.remove('is-menu-open');
+        });
+    }
+
+    function toggleRowMenu(button) {
+        const menu = button.parentElement?.querySelector('.agent-row-menu');
+        if (!menu) return;
+        const open = menu.hidden;
+        closeRowMenus(open ? menu : null);
+        if (!open) return;
+        menu.hidden = false;
+        // 页面上层浮窗不会被会话列表或手机抽屉的滚动容器裁切。
+        if (typeof menu.showPopover === 'function') menu.showPopover();
+        button.setAttribute('aria-expanded', 'true');
+        button.parentElement.classList.add('is-menu-open');
+        positionRowMenu(menu);
+        menu.querySelector('button')?.focus({preventScroll: true});
+    }
+
+    function positionRowMenu(menu) {
+        const button = menu.parentElement?.querySelector('.agent-row-more');
+        if (!button) return;
+        const anchor = button.getBoundingClientRect();
+        const box = menu.getBoundingClientRect();
+        const left = Math.max(8, Math.min(anchor.right - box.width, window.innerWidth - box.width - 8));
+        const top = anchor.bottom + box.height + 8 <= window.innerHeight
+            ? anchor.bottom + 4 : Math.max(8, anchor.top - box.height - 4);
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
+    }
+
     function renderSessionList(items) {
         sessionItems = (Array.isArray(items) ? items : []).filter((item) => SESSION_RE.test(String(item?.session_id || ''))).slice(0, 100)
             .map((item) => ({...item, pinned: item.pinned === true}));
@@ -2688,7 +2761,6 @@
         const ids = new Set(sorted.map(item => item.session_id));
         const scrollTop = sessionList.scrollTop;
         const focused = sessionList.contains(document.activeElement) ? document.activeElement : null;
-        let shown = 0;
         for (const [id, row] of existing) if (!ids.has(id)) row.remove();
         for (const item of sorted) {
             let row = existing.get(item.session_id);
@@ -2698,36 +2770,26 @@
                 const open = element('button', 'agent-session-open');
                 open.type = 'button';
                 open.dataset.sessionOpen = item.session_id;
-                open.append(element('strong', ''), element('small', ''));
-                const controls = element('div', 'agent-session-controls');
-                for (const [name, mark, label] of [['pin', 'pin', '置顶'], ['rename', 'pencil', '重命名'], ['delete', 'trash-2', '删除']]) {
-                    const button = element('button', `agent-session-${name}`);
-                    button.type = 'button';
-                    button.dataset[`session${name[0].toUpperCase()}${name.slice(1)}`] = item.session_id;
-                    button.title = label;
-                    button.append(icon(mark));
-                    controls.append(button);
-                }
-                row.append(open, controls);
+                open.append(element('strong', ''), element('small', 'agent-session-time'));
+                const {more, menu} = rowMenu(item.session_id, [['pin', 'pin', '置顶'], ['rename', 'pencil', '重命名'], ['delete', 'trash-2', '删除']], 'session');
+                row.append(open, more, menu);
                 renderIcons(row);
             }
             const title = String(item.title || '新对话');
             const open = row.querySelector('.agent-session-open');
             open.querySelector('strong').textContent = title;
-            open.querySelector('small').textContent = `${item.pinned ? '置顶 · ' : ''}${item.message_count || 0} 条消息${sessionTime(item.updated_at) ? ` · ${sessionTime(item.updated_at)}` : ''}`;
+            open.querySelector('small').textContent = relativeTime(item.updated_at);
             open.title = title;
             row.classList.toggle('is-active', item.session_id === sessionId && !viewingChannel);
+            row.classList.toggle('is-pinned', item.pinned);
+            row.querySelector('[data-session-more]').setAttribute('aria-label', `更多操作：${title}`);
             const pin = row.querySelector('[data-session-pin]');
             pin.setAttribute('aria-pressed', String(item.pinned));
-            pin.setAttribute('aria-label', `${item.pinned ? '取消置顶' : '置顶'}会话 ${title}`);
-            pin.title = item.pinned ? '取消置顶' : '置顶';
-            row.querySelector('[data-session-rename]').setAttribute('aria-label', `重命名会话 ${title}`);
-            row.querySelector('[data-session-delete]').setAttribute('aria-label', `删除会话 ${title}`);
-            shown += 1;
+            pin.querySelector('span').textContent = item.pinned ? '取消置顶' : '置顶';
             sessionList.append(row);
         }
         let empty = sessionList.querySelector('.agent-session-empty');
-        if (!shown) {
+        if (!sorted.length) {
             if (!empty) {
                 empty = element('div', 'agent-session-empty');
                 empty.append(icon('message-circle-dashed'), element('span', ''));
@@ -2736,7 +2798,6 @@
             }
             empty.querySelector('span').textContent = '尚无旁聊';
         } else empty?.remove();
-        if (sessionCount) sessionCount.textContent = `${shown} 条`;
         sessionList.scrollTop = scrollTop;
         if (focused?.isConnected && !focused.closest('[hidden]') && document.activeElement !== focused) focused.focus({preventScroll: true});
     }
@@ -2760,7 +2821,7 @@
             const restoreFocus = form.contains(document.activeElement) || document.activeElement === document.body;
             form.remove();
             row.classList.remove('is-editing');
-            if (restoreFocus && historyRail?.open) row.querySelector('[data-session-rename]')?.focus({preventScroll: true});
+            if (restoreFocus && historyRail?.open) row.querySelector('.agent-row-more')?.focus({preventScroll: true});
         };
         cancel.addEventListener('click', close);
         input.addEventListener('keydown', event => {
@@ -2807,7 +2868,8 @@
             // disabled 会使键盘焦点落到 body；失败后恢复，但不抢走用户主动移到别处的焦点。
             if (focused?.isConnected && historyRail?.open &&
                 (document.activeElement === document.body || document.activeElement === focused)) {
-                focused.focus({preventScroll: true});
+                const target = focused.closest('[hidden]') ? row?.querySelector('.agent-row-more') : focused;
+                target?.focus({preventScroll: true});
                 if (selection && typeof focused.setSelectionRange === 'function') focused.setSelectionRange(...selection);
             }
         }
@@ -3117,6 +3179,9 @@
     function syncMainChatButton() {
         if (!mainChatButton) return;
         mainChatButton.disabled = !mainSessionId;
+        const main = sessionItems.find(item => item.session_id === mainSessionId);
+        const time = mainChatButton.querySelector('.agent-session-time');
+        if (time) time.textContent = relativeTime(main?.updated_at);
         const active = Boolean(mainSessionId) && sessionId === mainSessionId && !viewingChannel;
         mainChatButton.classList.toggle('is-active', active);
         mainChatButton.setAttribute('aria-current', active ? 'page' : 'false');
@@ -3215,17 +3280,13 @@
             open.setAttribute('aria-current', item.key === viewingChannel ? 'page' : 'false');
             const label = element('span', '');
             const title = String(item.title || 'Telegram');
-            label.append(element('strong', '', title),
-                element('small', '', `Telegram${sessionTime(item.updated_at) ? ` · ${sessionTime(item.updated_at)}` : ''}`));
+            label.append(element('strong', '', title), element('small', 'agent-session-time', relativeTime(item.updated_at)));
             open.append(icon('send'), label);
-            const remove = element('button', 'agent-channel-delete');
-            remove.type = 'button';
-            remove.dataset.channelDelete = item.key;
-            remove.title = '删除';
-            remove.setAttribute('aria-label', `删除渠道会话 ${title}`);
-            remove.append(icon('trash-2'));
+            open.title = title;
+            const {more, menu} = rowMenu(item.key, [['delete', 'trash-2', '删除']], 'channel');
+            more.setAttribute('aria-label', `更多操作：${title}`);
             const row = element('div', 'agent-channel-item');
-            row.append(open, remove);
+            row.append(open, more, menu);
             return row;
         }));
         channelSection.hidden = !items.length;
@@ -3783,6 +3844,40 @@
         button.addEventListener('click', () => toggleGroup(button.dataset.groupToggle));
     });
     applyGroupState();
+    document.addEventListener('click', (event) => {
+        const more = event.target.closest('.agent-row-more');
+        if (more) {
+            toggleRowMenu(more);
+            return;
+        }
+        if (event.target.closest('.agent-row-menu-item') || !event.target.closest('.agent-row-menu')) closeRowMenus();
+    }, true);
+    document.addEventListener('keydown', (event) => {
+        const menu = document.querySelector('.agent-row-menu:not([hidden])');
+        if (!menu) return;
+        if (event.key === 'Escape' || event.key === 'Tab') {
+            const trigger = menu.parentElement?.querySelector('.agent-row-more');
+            closeRowMenus();
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            trigger?.focus({preventScroll: true});
+            return;
+        }
+        if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const choices = [...menu.querySelectorAll('button:not(:disabled)')];
+        const current = choices.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? choices.length - 1
+            : (current + (event.key === 'ArrowDown' ? 1 : -1) + choices.length) % choices.length;
+        choices[next]?.focus({preventScroll: true});
+    }, true);
+    window.addEventListener('resize', () => closeRowMenus(), {passive: true});
+    historyRail?.addEventListener('scroll', (event) => {
+        const menu = document.querySelector('.agent-row-menu:not([hidden])');
+        if (menu && !event.target.closest('.agent-row-menu')) positionRowMenu(menu);
+    }, {capture: true, passive: true});
     sessionList?.addEventListener('click', (event) => {
         const open = event.target.closest('[data-session-open]');
         const remove = event.target.closest('[data-session-delete]');

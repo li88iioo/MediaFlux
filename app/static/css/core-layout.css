@@ -160,11 +160,6 @@ body {
 body::before,
 body::after { display: none !important; }
 
-:focus-visible {
-    outline: 2px solid var(--mf-brand);
-    outline-offset: 2px;
-}
-
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid transparent; border-radius: 999px; background-clip: padding-box; }
@@ -495,9 +490,7 @@ textarea.form-input {
 .form-input:hover, .form-select:hover { border-color: var(--mf-border-strong); }
 .form-input:focus, .form-select:focus {
     outline: none;
-    border-color: var(--mf-brand);
     background: var(--mf-surface);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--mf-brand) 12%, transparent);
 }
 
 /* Custom switch / checkbox */
@@ -1183,12 +1176,9 @@ tr:hover td { background: var(--row-hover); }
 
 .login-form .form-input:focus {
     background: rgba(0, 0, 0, 0.4) !important;
-    border-color: var(--mf-brand) !important;
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--mf-brand) 18%, transparent) !important;
 }
 :root[data-theme="light"] .login-form .form-input:focus {
     background: var(--mf-surface-raised) !important;
-    border-color: var(--mf-brand) !important;
 }
 
 .login-form .btn-primary {
@@ -1309,7 +1299,6 @@ tr:hover td { background: var(--row-hover); }
 }
 .login-page--wallpaper .form-input:focus {
     background: rgba(0, 0, 0, 0.5) !important;
-    border-color: var(--mf-brand) !important;
 }
 .login-page--wallpaper .form-input::placeholder {
     color: rgba(255, 255, 255, 0.52) !important; /* 调高灰白度，使其不点击时也能看清 */
@@ -1346,7 +1335,6 @@ tr:hover td { background: var(--row-hover); }
 }
 :root[data-theme="light"] .login-page--wallpaper .form-input:focus {
     background: var(--mf-surface-raised) !important;
-    border-color: var(--mf-brand) !important;
 }
 :root[data-theme="light"] .login-page--wallpaper .form-input::placeholder {
     color: color-mix(in srgb, var(--mf-text-secondary) 72%, transparent) !important;
@@ -1396,3 +1384,9 @@ tr:hover td { background: var(--row-hover); }
     width: min(460px, calc(100% - 40px)) !important;
     padding: 44px 38px 36px !important;
 }
+
+/* 焦点策略：鼠标点击与触摸不显示高亮框；键盘导航只显示细的中性描边；文本输入框以光标表示焦点。
+   登录页只加载 core-layout.css，其余页面加载 main.css，两处保持一致。 */
+:focus:not(:focus-visible) { outline: none; }
+:focus-visible { outline: 2px solid color-mix(in srgb, currentColor 40%, transparent); outline-offset: 2px; }
+:is(textarea, [contenteditable="true"], input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"])):focus-visible { outline: none; }

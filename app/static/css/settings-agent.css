@@ -136,7 +136,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 .settings-tab span { color: inherit; font-size: 13px; font-weight: 600; }
 .settings-tab:hover { color: var(--text-primary); background: var(--bg-card-hover); }
 .settings-tab.active { color: var(--accent); background: var(--accent-soft); }
-.settings-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 .settings-panel-split {
     --settings-split-label: 200px;
     --settings-split-control: 100%;
@@ -842,7 +842,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 .metadata-nsfw-clean-review .toggle { width: 44px; height: 44px; }
 .metadata-nsfw-clean-review .toggle-slider { inset: 11px 2px; }
 .metadata-nsfw-clean-review input:disabled + .toggle-slider { opacity: .55; cursor: not-allowed; }
-.metadata-nsfw-clean-review input:focus-visible + .toggle-slider { outline: 2px solid var(--accent); outline-offset: 3px; }
+
 .metadata-card-body > :last-child { border-bottom: 0; }
 .metadata-tavily-meta-grid {
     display: grid;
@@ -998,7 +998,6 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     transition: border-color .15s ease, background .15s ease;
 }
 .metadata-gauge-card:focus-within {
-    border-color: var(--accent);
     background: var(--bg-card);
 }
 .gauge-head {
@@ -1109,9 +1108,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     box-shadow: 0 1px 2px rgba(15, 23, 42, .035);
     transform: none;
 }
-.settings-page #settings-panel-discovery .discovery-card:focus-within {
-    border-color: var(--discovery-amber);
-}
+
 .discovery-card-head {
     min-height: 74px;
     display: flex;
@@ -1272,9 +1269,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 }
 .discovery-card-body .form-input:focus,
 .discovery-card-body .form-select:focus {
-    border-color: var(--accent);
     background: var(--bg-card);
-    box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .settings-page .indexer-site-box .discovery-card-body { padding-top: 8px; }
 .discovery-site-group {
@@ -1820,8 +1815,6 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 .agent-field .form-input:focus,
 .agent-field .form-select:focus {
     background: var(--input-focus);
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .agent-input-unit { position: relative; display: block; }
 .agent-input-unit .form-input { padding-right: 68px; }

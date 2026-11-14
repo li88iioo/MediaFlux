@@ -90,8 +90,6 @@
 .dashboard-page .dashboard-global-search input::placeholder { color: var(--dashboard-faint); }
 .dashboard-page .dashboard-global-search input:focus {
     background: var(--dashboard-paper);
-    border-color: color-mix(in srgb, var(--accent) 52%, transparent);
-    box-shadow: 0 0 0 4px var(--dashboard-accent-soft);
 }
 .dashboard-page .dashboard-global-search input:disabled { opacity: .55; cursor: not-allowed; }
 .dashboard-page .dashboard-global-search kbd {
@@ -151,10 +149,7 @@
     background: var(--dashboard-paper-2);
     box-shadow: none;
 }
-.dashboard-page a.dashboard-quick-status-item:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--dashboard-accent) 58%, transparent);
-    outline-offset: 1px;
-}
+
 .dashboard-page a.dashboard-quick-status-item:hover::before,
 .dashboard-page a.dashboard-quick-status-item:hover + .dashboard-quick-status-item::before { opacity: 0; }
 .dashboard-page .dashboard-quick-status-icon {
@@ -627,16 +622,7 @@
 /* Stable shell and semantic dashboard accents. */
 .dashboard-page { --dashboard-topbar-h: 72px; }
 .dashboard-page .content { animation: none; }
-.dashboard-page a:focus-visible,
-.dashboard-page button:focus-visible,
-.dashboard-page input:focus-visible,
-.dashboard-page select:focus-visible,
-.dashboard-page textarea:focus-visible,
-.dashboard-page [tabindex]:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--dashboard-accent) 72%, white);
-    outline-offset: 2px;
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--dashboard-accent) 12%, transparent);
-}
+
 .dashboard-page .dashboard-row-action { opacity: .8; }
 
 /* Topbar controls inherit the compact, squared MediaFlux control language. */
@@ -660,10 +646,7 @@
     border-radius: var(--dashboard-control-radius);
     font-size: 12px;
 }
-.dashboard-page .dashboard-global-search input:focus {
-    border-color: var(--dashboard-accent);
-    box-shadow: 0 0 0 2px var(--dashboard-accent-soft);
-}
+
 .dashboard-page .dashboard-global-search kbd {
     right: 8px;
     padding: 3px 6px;

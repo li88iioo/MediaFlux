@@ -431,11 +431,7 @@ html[data-local-media-initial-tab="manual"] .lm-tab-panel[data-tab-panel="manual
 }
 .lm-task-select-cell input:focus,
 .lm-task-select-all input:focus { outline: 0; }
-.lm-task-select-cell input:focus-visible,
-.lm-task-select-all input:focus-visible {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-soft);
-}
+
 .lm-task-select-cell input:disabled { cursor: not-allowed; opacity: .42; }
 .lm-task-select-all {
     min-height: 20px;
@@ -587,7 +583,7 @@ html[data-local-media-initial-tab="manual"] .lm-tab-panel[data-tab-panel="manual
     border: 1px solid var(--border);
     border-radius: var(--radius-sm, 7px);
 }
-.lm-item-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+
 .lm-item-search svg { width: 14px; height: 14px; justify-self: center; }
 .lm-item-search input {
     width: 100%; height: 34px; min-width: 0; padding: 0 10px 0 0;
@@ -696,7 +692,7 @@ html[data-local-media-initial-tab="manual"] .lm-tab-panel[data-tab-panel="manual
     cursor: default;
 }
 .lm-media-row.is-directory { cursor: pointer; }
-.lm-media-row.is-directory:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
 .lm-media-row:hover,
 .lm-media-row:focus-within,
 .lm-media-row.is-context { background: var(--control-tint); }
@@ -1360,7 +1356,6 @@ body.lm-scrape-open { overflow: hidden; }
 .lm-input-unit .form-input { padding-right: 54px; }
 .lm-input-unit > span { position: absolute; top: 50%; right: 12px; color: var(--text-muted); font-size: 9px; transform: translateY(-50%); pointer-events: none; }
 
-
 .lm-dialog-actions {
     flex: 0 0 auto;
     display: flex;
@@ -1569,7 +1564,6 @@ body.lm-scrape-open { overflow: hidden; }
     place-items: center;
 }
 .lm-picker-btn svg { width: 15px; height: 15px; }
-
 
 /* 本地来源配置之上的二级目录选择器，关闭后回到原配置上下文。 */
 body.local-media-page .settings-dir-modal { z-index: 321; }
@@ -2073,10 +2067,7 @@ body.local-media-page .settings-dir-modal { z-index: 321; }
         background: var(--control-tint);
         border-color: var(--border-soft);
     }
-    .lm-scrape-mobile-tabs button:focus-visible {
-        outline: 2px solid var(--accent-border);
-        outline-offset: -2px;
-    }
+
     .lm-scrape-workspace {
         min-height: 0;
         grid-template-columns: 1fr;

@@ -860,7 +860,7 @@ class FreeCalendarBrowserTests(unittest.TestCase):
         platform.focus()
         focus = platform.evaluate('(el)=>({outline:getComputedStyle(el).outlineStyle, shadow:getComputedStyle(el).boxShadow})')
         self.assertEqual(focus['outline'], 'none')
-        self.assertNotEqual(focus['shadow'], 'none')
+        self.assertEqual(focus['shadow'], 'none')
         self.assertEqual(platform.bounding_box(), before)
         page.evaluate('new WebSocket("wss://blocked.invalid/fixture")'); page.wait_for_timeout(20)
         self.assertEqual(network.websockets,['wss://blocked.invalid/fixture'])

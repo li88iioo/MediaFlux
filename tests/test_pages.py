@@ -201,7 +201,7 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertIn("transform: none;", css)
         self.assertIn("background: var(--bg-elevated);", css)
         self.assertIn("box-shadow: 0 1px 2px rgba(15, 23, 42, .035);", css)
-        self.assertIn(".settings-page #settings-panel-discovery .discovery-card:focus-within {", css)
+        self.assertNotIn(".settings-page #settings-panel-discovery .discovery-card:focus-within {", css)
 
 
 if __name__ == "__main__":

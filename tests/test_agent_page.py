@@ -129,7 +129,7 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn('id="agentHistoryRail"', response.text)
         self.assertNotIn("/settings#agent", response.text)
         self.assertIn('id="agentSessionList"', response.text)
-        self.assertIn('id="agentSessionCount"', response.text)
+        self.assertNotIn('id="agentSessionCount"', response.text)
         self.assertRegex(
             response.text,
             re.compile(r'<a href="/agent" class="nav-item active"[^>]*>'),
@@ -437,7 +437,8 @@ class AgentPageTests(InitializedWebTestCase):
             ),
         )
         self.assertIn("overflow-wrap: anywhere", source)
-        self.assertIn(".agent-page button:focus-visible", source)
+        # 焦点样式由全局策略统一提供，Agent 页不再自带绿色焦点框。
+        self.assertNotRegex(source, r":focus[^{]*\{[^}]*var\(--accent")
         self.assertRegex(
             source,
             re.compile(r"\.agent-session-list\s*\{[^}]*height:\s*230px", re.DOTALL),
@@ -445,7 +446,7 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertRegex(
             source,
             re.compile(
-                r"\.agent-session-item\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 44px",
+                r"\.agent-session-item,\s*\.agent-channel-item\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 32px",
                 re.DOTALL,
             ),
         )
