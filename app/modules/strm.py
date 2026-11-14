@@ -2980,13 +2980,17 @@ def parse_strm_sources(
     return sources, ""
 
 
-def plan_strm_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
+def plan_strm_sources(
+    sources: list[dict[str, str]], *, prefixes: dict[str, str] | None = None,
+    occupied_prefixes: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """保留来源已分配的目录；只为新来源分配独立且不冲突的目录。"""
+    prefixes = prefixes or {}
     name_counts: dict[str, int] = {}
     for source in sources:
         name = source["name"]
         name_counts[name] = name_counts.get(name, 0) + 1
 
-    multiple = len(sources) > 1
     planned = []
     for source in sources:
         source_id = source["id"]
@@ -2995,39 +2999,44 @@ def plan_strm_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
         planned.append({
             "id": source_id,
             "name": name,
-            "rel_prefix": prefix if multiple else "",
+            "rel_prefix": prefixes.get(source_id, prefix),
             "source_key": f"guangya:{source_id}",
             "metadata_source_key": f"guangya-meta:{source_id}",
         })
 
-    if multiple:
-        # 预留所有旧路径，避免冲突 loser 占用尚未分配来源的原路径。
-        reserved = {safe_path_component(row["rel_prefix"]) for row in planned}
-        seen = set()
-        for row in sorted(
-            planned,
-            key=lambda item: (name_counts[item["name"]] == 1, item["id"]),
-        ):
-            component = safe_path_component(row["rel_prefix"])
-            if component in seen:
-                legacy_prefix = row["rel_prefix"]
-                candidate = f"{legacy_prefix} [source {row['id']}]"
-                suffix = 1
+    # 已有本地分类和退役来源均保留目录，新增来源不能抢占。
+    seen = {
+        safe_path_component(value)
+        for value in [*prefixes.values(), *(occupied_prefixes or ())] if value
+    }
+    reserved = seen.copy()
+    reserved.update(safe_path_component(row["rel_prefix"]) for row in planned if row["rel_prefix"])
+    for row in sorted(
+        planned, key=lambda item: (name_counts[item["name"]] == 1, item["id"]),
+    ):
+        if row["id"] in prefixes:
+            continue
+        component = safe_path_component(row["rel_prefix"])
+        if component in seen:
+            candidate = f"{row['rel_prefix']} [source {row['id']}]"
+            suffix = 1
+            component = safe_path_component(candidate)
+            while component in reserved:
+                suffix += 1
+                candidate = f"{row['rel_prefix']} [source {row['id']} #{suffix}]"
                 component = safe_path_component(candidate)
-                while component in reserved:
-                    suffix += 1
-                    candidate = f"{legacy_prefix} [source {row['id']} #{suffix}]"
-                    component = safe_path_component(candidate)
-                row["rel_prefix"] = candidate
-                reserved.add(component)
-            seen.add(component)
+            row["rel_prefix"] = candidate
+            reserved.add(component)
+        seen.add(component)
 
     return planned
 
 
 def configured_strm_source_plans() -> tuple[list[dict[str, str]], str]:
     sources, error = parse_strm_sources(get("GY_STRM_SOURCE_DIRS", ""))
-    return (plan_strm_sources(sources), "") if not error else ([], error)
+    if error:
+        return [], error
+    return plan_strm_sources(sources, prefixes=db.get_strm_source_prefixes(sources)), ""
 
 
 def _scope_path(value: object) -> str:

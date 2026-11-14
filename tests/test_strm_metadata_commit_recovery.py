@@ -78,7 +78,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
 
     def retry_manually(self):
         return strm.retry_all_strm_failures("source", "metadata", "test", client=cast(GuangYaClient, self.client), runtime_config={
-            "sources": strm.plan_strm_sources([{"id": "source", "name": "整理"}]),
+            "sources": strm.plan_strm_sources([{"id": "source", "name": "整理"}], prefixes={"source": ""}),
             "strm_root": str(self.root), "base_url": "http://play.invalid", "media_server_refresh": True,
         })
 

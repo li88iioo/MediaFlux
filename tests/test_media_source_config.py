@@ -242,6 +242,40 @@ class MediaConfigSaveTests(unittest.TestCase):
         self.assertEqual(config.read_env_snapshot(config.ENV_FILE)[1], initial)
         self.assertEqual(db.list_strm_retired_sources(), [])
 
+    def test_source_save_freezes_legacy_paths_before_publishing_new_config(self):
+        from app import config, database as db
+        from app.modules.strm import configured_strm_source_plans
+        from app.routes.media_libraries_api import _strm_summary
+
+        self.initialize_publisher()
+        self.enterContext(patch.dict(os.environ))
+        self.enterContext(patch.object(config, "_cache", None))
+        old = [{"id": "11", "name": "整理"}, {"id": "22", "name": "NSFW"}]
+        config.set_and_save({"GY_STRM_SOURCE_DIRS": json.dumps(old), "STRM_ROOT": "/data/strm"})
+        with patch.object(self.api, "require_api_login"), patch(
+            "app.modules.scheduler.get_scheduler", return_value=MagicMock(),
+        ):
+            result = self.api.save_config(
+                cast(Request, self.request), {"GY_STRM_SOURCE_DIRS": json.dumps(old[:1])},
+            )
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(configured_strm_source_plans()[0][0]["rel_prefix"], "整理")
+        self.assertEqual(_strm_summary()["sources"][0]["local_path"], "/data/strm/光鸭云盘/整理")
+        self.assertEqual([r["source_id"] for r in db.list_strm_retired_sources()], ["22"])
+        before = db.get_strm_source_prefixes(old[:1])
+        with patch.object(self.api, "require_api_login"), patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation", side_effect=RuntimeError("abort"),
+        ):
+            failed = self.api.save_config(
+                cast(Request, self.request),
+                {"GY_STRM_SOURCE_DIRS": json.dumps([*old[:1], {"id": "33", "name": "Other"}])},
+            )
+        assert isinstance(failed, JSONResponse)
+        self.assertEqual(failed.status_code, 500)
+        self.assertEqual(db.get_strm_source_prefixes(old[:1]), before)
+        db.reconcile_configured_strm_sources(old[:1], "/data/strm")
+        self.assertEqual(configured_strm_source_plans()[0][0]["rel_prefix"], "整理")
+
     def test_strm_source_publication_cannot_overtake_running_cleanup(self):
         from app import config, database as db
         from app.modules.process_lock import CrossProcessLock

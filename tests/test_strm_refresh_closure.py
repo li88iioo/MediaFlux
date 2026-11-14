@@ -44,7 +44,7 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
          flat=False, retire=False, configured_text=None, queue_only=False):
     """经真实 scheduler 注入策略；不直接为安装器伪造刷新行为。"""
     scheduler = STRMScheduler()
-    sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}])
+    sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""})
     values = {
         "STRM_ROOT": str(root), "GY_STRM_BASE_URL": "http://play.invalid",
         "GY_STRM_SOURCE_DIRS": configured_text if configured_text is not None else json.dumps(

@@ -13,7 +13,7 @@ from app.repositories import local_media as local_media_repo
 from app.main import create_app
 from app.routes import media_libraries_api
 from app.modules.media_server_profiles import MediaServerProfile
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 
 class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
@@ -174,6 +174,8 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(payload["strm"], strm)
 
     def test_strm_summary_lists_existing_category_directories(self):
+        # 历史单来源平铺目录，不借用应用启动后已发布的其它来源快照。
+        self.enterContext(isolated_test_database())
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             output = root / media_libraries_api.STRM_SUBDIR

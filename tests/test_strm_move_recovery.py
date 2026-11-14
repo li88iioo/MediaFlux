@@ -227,7 +227,7 @@ class StrmFirstInstallRecoveryTests(unittest.TestCase):
             [int(failures[0]["id"])], "test",
             client=cast(GuangYaClient, MoveCloud("New")),
             runtime_config={
-                "sources": strm.plan_strm_sources([{"id": "source", "name": "Source"}]),
+                "sources": strm.plan_strm_sources([{"id": "source", "name": "Source"}], prefixes={"source": ""}),
                 "strm_root": str(self.root), "base_url": BASE_URL,
                 "media_server_refresh": True, "allow_emby": False,
             },

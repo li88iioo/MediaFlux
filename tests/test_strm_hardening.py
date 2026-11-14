@@ -4,6 +4,7 @@ from typing import cast
 from app.clients.guangya import GuangYaClient
 
 import hashlib
+import json
 import tempfile
 import threading
 import time
@@ -17,7 +18,7 @@ from app import database as db
 from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import strm as strm_module
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 from app.modules.strm import (
     STRM_SUBDIR,
@@ -163,8 +164,112 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(error, "")
         self.assertEqual(duplicate_ids, [{"id": "same-source", "name": "Original"}])
         self.assertEqual(
-            strm_module.plan_strm_sources(duplicate_ids)[0]["rel_prefix"], ""
+            strm_module.plan_strm_sources(duplicate_ids)[0]["rel_prefix"], "Original"
         )
+
+    def test_removing_source_keeps_existing_video_and_metadata_paths(self):
+        self.enterContext(isolated_test_database())
+        sources = [{"id": "stable", "name": "整理"}, {"id": "retired", "name": "NSFW"}]
+        client = _TreeClient({
+            "stable": [GuangYaFile("show", "动漫", True, parent_id="stable")],
+            "show": [
+                GuangYaFile("video", "Movie.mkv", False, 100, "v1", "show"),
+                GuangYaFile("meta", "Movie.nfo", False, 4, "m1", "show"),
+            ],
+        })
+        with tempfile.TemporaryDirectory() as root:
+            # 旧版快照没有目录分配；升级必须固化多来源原路径。
+            db.kv_set(db._STRM_SOURCE_SNAPSHOT_KEY, json.dumps({
+                "version": 1, "strm_root": root, "sources": sources,
+            }))
+            db.reconcile_configured_strm_sources(sources, root)
+            with patch("app.modules.strm.requests.get", return_value=_Response(b"data")):
+                first = sync_strm(
+                    "stable", "http://example", root, client=cast(GuangYaClient, client),
+                    rel_prefix=db.get_strm_source_prefixes(sources)["stable"],
+                    metadata_exts={"nfo"},
+                )
+                self.assertEqual(first["generated"], 1)
+                self.assertEqual(_drain_metadata_jobs(client, root, {"nfo"}), 1)
+            media_dir = Path(root) / STRM_SUBDIR / "整理" / "动漫"
+            paths = [media_dir / "Movie.strm", media_dir / "Movie.nfo"]
+            original = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+            with db.reconcile_strm_retired_sources_transaction(
+                ["stable"], [("retired", "NSFW", root)], configured_sources=sources[:1],
+                configured_strm_root=root, previous_sources=sources,
+            ):
+                pass
+            # 再次启动不能把唯一来源改成平铺布局；页面、重试和同步读取同一映射。
+            db.reconcile_configured_strm_sources(sources[:1], root)
+            with patch("app.modules.strm.get", return_value=json.dumps(sources[:1])):
+                planned, error = strm_module.configured_strm_source_plans()
+            self.assertEqual(error, "")
+            self.assertEqual(planned[0]["rel_prefix"], "整理")
+            again = sync_strm(
+                "stable", "http://example", root, client=cast(GuangYaClient, client),
+                rel_prefix=planned[0]["rel_prefix"], metadata_exts={"nfo"},
+            )
+            retired = strm_module.clean_retired_strm_sources({"stable"})
+            self.assertEqual(again["generated"], 0, again)
+            self.assertEqual(again["cleaned"], 0, again)
+            self.assertEqual(again["metadata_queued"], 0, again)
+            self.assertEqual(retired["blocked"], 0)
+            self.assertEqual([(p.read_bytes(), p.stat().st_mtime_ns) for p in paths], original)
+
+    def test_source_add_rename_readd_preserves_assigned_directories(self):
+        self.enterContext(isolated_test_database())
+        old = [{"id": "old", "name": "整理"}]
+        db.reconcile_configured_strm_sources(old, "/data/strm")
+        self.assertEqual(db.get_strm_source_prefixes(old), {"old": ""})
+        added = [*old, {"id": "new", "name": "NSFW"}]
+        with db.reconcile_strm_retired_sources_transaction(
+            ["old", "new"], [], configured_sources=added, previous_sources=old,
+        ):
+            pass
+        assigned = db.get_strm_source_prefixes(added)
+        self.assertEqual(assigned, {"old": "", "new": "NSFW"})
+        renamed = [{"id": "old", "name": "别名"}, {"id": "new", "name": "新别名"}]
+        db.reconcile_configured_strm_sources(renamed, "/data/strm")
+        self.assertEqual(db.get_strm_source_prefixes(renamed), assigned)
+        db.reconcile_configured_strm_sources(old, "/data/strm")
+        replacement = [*old, {"id": "another", "name": "NSFW"}]
+        db.reconcile_configured_strm_sources(replacement, "/data/strm")
+        reserved = db.get_strm_source_prefixes(replacement)
+        self.assertEqual(reserved["new"], "NSFW")
+        self.assertNotEqual(reserved["another"], "NSFW")
+        db.reconcile_configured_strm_sources(added, "/data/strm")
+        self.assertEqual(db.get_strm_source_prefixes(added)["new"], "NSFW")
+
+    def test_new_source_avoids_existing_flat_source_category(self):
+        self.enterContext(isolated_test_database())
+        sources = [{"id": "old", "name": "整理"}, {"id": "new", "name": "NSFW"}]
+        client = _TreeClient({
+            "old": [GuangYaFile("category", "NSFW", True, parent_id="old")],
+            "category": [GuangYaFile("old-video", "Movie.mkv", False, 100, "a", "category")],
+            "new": [GuangYaFile("new-video", "Movie.mkv", False, 100, "b", "new")],
+        })
+        with tempfile.TemporaryDirectory() as root:
+            db.reconcile_configured_strm_sources(sources[:1], root)
+            sync_strm("old", "http://example", root, client=cast(GuangYaClient, client))
+            original = Path(root) / STRM_SUBDIR / "NSFW" / "Movie.strm"
+            payload = original.read_bytes()
+            with db.reconcile_strm_retired_sources_transaction(
+                ["old", "new"], [], configured_sources=sources,
+                configured_strm_root=root, previous_sources=sources[:1],
+            ):
+                pass
+            prefixes = db.get_strm_source_prefixes(sources)
+            self.assertEqual(prefixes["old"], "")
+            self.assertNotEqual(prefixes["new"], "NSFW")
+            result = sync_strm(
+                "new", "http://example", root, client=cast(GuangYaClient, client),
+                rel_prefix=prefixes["new"],
+            )
+            self.assertEqual(result["generated"], 1, result)
+            self.assertEqual(result["failed"], 0, result)
+            self.assertEqual(original.read_bytes(), payload)
+            db.reconcile_configured_strm_sources(sources, root)
+            self.assertEqual(db.get_strm_source_prefixes(sources), prefixes)
 
     def test_same_name_sources_with_equal_id_suffixes_get_stable_unique_prefixes(self):
         sources = [

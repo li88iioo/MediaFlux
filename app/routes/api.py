@@ -1464,6 +1464,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
                     sorted(new_ids), retired_sources,
                     configured_sources=new_strm_sources or [],
                     configured_strm_root=persisted_updates.get("STRM_ROOT", old_strm_root) or "",
+                    previous_sources=old_strm_sources,
                 )
                 publication = config.runtime_config_publication(persisted_updates)
             config_persisted = False

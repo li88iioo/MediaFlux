@@ -22,7 +22,7 @@ def seed(root, count=3):
         db.record_strm_failure(source_id="s", source_name="S", file_id=file.file_id,
             parent_id="s", filename=file.name,
             rel_dir="", target_rel_path=f"{file.name}.strm", action="generate", error="disk failed")
-    runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}]),
+    runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""}),
                "strm_root": str(root), "base_url": "http://play.invalid"}
     return _TreeClient({"s": files}), runtime
 
@@ -115,7 +115,7 @@ def test_metadata_retry_only_visits_related_index_rows(tmp_path, count):
             target = strm._metadata_target(file, "", str(tmp_path))
             strm_repo.upsert_strm_index("guangya-meta:s", file.file_id, file.etag, file.size, file.name, str(target))
         client = _TreeClient({"s": files})
-        runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}]),
+        runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""}),
                    "strm_root": str(tmp_path), "base_url": "http://play.invalid"}
         visits = []
         original = strm._install_metadata_candidate
@@ -207,7 +207,7 @@ def test_metadata_retry_download_stop_releases_instead_of_failing(tmp_path):
         file = GuangYaFile("m", "Movie.nfo", False, 8, "e", "s")
         db.record_strm_failure(source_id="s", source_name="S", file_id="m", parent_id="s", filename=file.name,
             action="metadata", rel_dir="", target_rel_path=file.name, error="old failure")
-        runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}]),
+        runtime: dict[str, Any] = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""}),
                    "strm_root": str(tmp_path), "base_url": "http://play.invalid"}
         stop = threading.Event()
 
@@ -239,7 +239,7 @@ def test_metadata_manual_move_honors_refresh_policy_for_old_and_new_paths(tmp_pa
         db.record_strm_failure(source_id="s", source_name="S", file_id="m", parent_id="s",
                                filename=file.name, action="metadata", rel_dir="",
                                target_rel_path=f"{strm.STRM_SUBDIR}/{file.name}", error="previous failure")
-        runtime = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}]),
+        runtime = {"sources": strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""}),
                    "strm_root": str(tmp_path), "base_url": "http://play.invalid",
                    "media_server_refresh": enabled, "allow_emby": False}
         with patch("app.modules.strm.requests.get", return_value=_Response()):

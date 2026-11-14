@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Request
 
-from app import config
+from app import config, database as db
 from app.repositories import local_media as local_media_repo
 from app.clients.base import close_media_server_client
 from app.logger import get_logger
@@ -211,7 +211,9 @@ def _strm_summary() -> dict[str, Any]:
         config.get("GY_STRM_SOURCE_DIRS", ""),
         require_nonempty=False,
     )
-    plans = plan_strm_sources(sources) if not error else []
+    plans = plan_strm_sources(
+        sources, prefixes=db.get_strm_source_prefixes(sources),
+    ) if not error else []
     output_root = str(Path(root) / STRM_SUBDIR) if root else ""
     source_payload = []
     for item in plans:
