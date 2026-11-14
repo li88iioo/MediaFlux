@@ -1,6 +1,7 @@
 """统一媒体库控制中心 API 与页面路由测试。"""
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -174,14 +175,14 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(payload["strm"], strm)
 
     def test_strm_summary_lists_existing_category_directories(self):
-        # 历史单来源平铺目录，不借用应用启动后已发布的其它来源快照。
+        # 单来源也按选中目录名隔离，不借用应用启动后已发布的其它来源快照。
         self.enterContext(isolated_test_database())
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             output = root / media_libraries_api.STRM_SUBDIR
-            (output / "动漫").mkdir(parents=True)
-            (output / "电影").mkdir()
-            (output / ".cache").mkdir()
+            (output / "整理" / "动漫").mkdir(parents=True)
+            (output / "整理" / "电影").mkdir()
+            (output / "整理" / ".cache").mkdir()
 
             def config_value(key: str, default: str = "") -> str:
                 values = {
@@ -194,13 +195,28 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                 payload = media_libraries_api._strm_summary()
 
         self.assertEqual(payload["output_root"], str(output))
-        self.assertEqual(payload["sources"][0]["local_path"], str(output))
+        self.assertEqual(payload["sources"][0]["local_path"], str(output / "整理"))
         names = [item["name"] for item in payload["directories"]]
-        self.assertEqual(names, ["全部 STRM", "动漫", "电影"])
+        self.assertEqual(names, ["全部 STRM", "整理", "整理 / 动漫", "整理 / 电影"])
         self.assertNotIn(".cache", names)
-        anime = next(item for item in payload["directories"] if item["name"] == "动漫")
-        self.assertEqual(anime["local_path"], str(output / "动漫"))
+        anime = next(item for item in payload["directories"] if item["name"] == "整理 / 动漫")
+        self.assertEqual(anime["local_path"], str(output / "整理" / "动漫"))
         self.assertEqual(anime["kind"], "category")
+
+    def test_strm_summary_uses_selected_directory_name_for_old_empty_prefix(self):
+        self.enterContext(isolated_test_database())
+        from app import database as db
+
+        db.kv_set(db._STRM_SOURCE_SNAPSHOT_KEY, json.dumps({
+            "version": 1, "sources": [{"id": "1", "name": "整理"}],
+            "strm_root": "/data/strm", "local_prefixes": {"1": ""},
+        }))
+        with patch("app.routes.media_libraries_api.config.get", side_effect=lambda key, default="": {
+            "STRM_ROOT": "/data/strm", "GY_STRM_SOURCE_DIRS": '[{"id":"1","name":"整理"}]',
+        }.get(key, default)):
+            payload = media_libraries_api._strm_summary()
+        self.assertEqual(payload["source_error"], "")
+        self.assertEqual(payload["sources"][0]["local_path"], "/data/strm/光鸭云盘/整理")
 
     def test_strm_directory_browser_supports_nested_sources_and_blocks_escape(self):
         self.login()

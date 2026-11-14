@@ -145,7 +145,7 @@ def test_metadata_selection_reuses_public_download_install_and_ledger(backend):
     with patch.object(service.requests, "get", return_value=_Response(b"metadata")):
         result = sdk.strm.retry_failures([identifier])
     assert result["status"] == "completed" and result["data"]["resolved"] == 1
-    assert (backend.root / service.STRM_SUBDIR / "Show.nfo").read_bytes() == b"metadata"
+    assert (backend.root / service.STRM_SUBDIR / "测试来源" / "Show.nfo").read_bytes() == b"metadata"
     assert db.list_strm_failures(status="resolved")[0]["id"] == identifier
 
 
@@ -191,7 +191,7 @@ def test_cold_sqlite_confirmation_executes_only_selected_ids_once(backend):
         assert (data["requested"], data["matched"], data["resolved"]) == (1, 1, 1)
         assert db.list_strm_failures(status="resolved")[0]["id"] == selected
         assert untouched in [row["id"] for row in db.list_strm_failures()]
-        assert (backend.root / service.STRM_SUBDIR / "Video-0.strm").is_file()
+        assert (backend.root / service.STRM_SUBDIR / "测试来源" / "Video-0.strm").is_file()
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)
         assert backend.client.list_calls == ["source"]

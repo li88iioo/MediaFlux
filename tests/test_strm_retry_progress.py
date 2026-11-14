@@ -205,6 +205,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                     root,
                     client=cast(GuangYaClient, client),
                     source_name="待重试源",
+                    rel_prefix="待重试源",
                 )
             failures = db.list_strm_failures(status="open", limit=20)
             selected_id = next(row["id"] for row in failures if row["file_id"] == "video-1")
@@ -235,7 +236,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
             self.assertEqual([row["file_id"] for row in open_rows], ["video-2"])
             resolved = db.list_strm_failures(status="resolved", limit=20)
             self.assertEqual([row["file_id"] for row in resolved], ["video-1"])
-            self.assertTrue((Path(root) / strm_module.STRM_SUBDIR / "One.strm").is_file())
+            self.assertTrue((Path(root) / strm_module.STRM_SUBDIR / "待重试源" / "One.strm").is_file())
 
     def test_retry_re_resolves_file_moved_to_a_new_configured_source(self):
         old_source = "source-old"
@@ -281,6 +282,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
             target = (
                 Path(root)
                 / strm_module.STRM_SUBDIR
+                / "新来源"
                 / "新目录"
                 / "Renamed.strm"
             )
@@ -1156,8 +1158,8 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
     def _failure(source: str, file_id: str, filename: str, action: str = "metadata") -> int:
         return db.record_strm_failure(
             source_id=source, source_name="元数据源", file_id=file_id,
-            parent_id=source, filename=filename, action=action, rel_dir="",
-            target_rel_path=f"光鸭云盘/{filename}", error="initial failure",
+            parent_id=source, filename=filename, action=action, rel_dir="元数据源",
+            target_rel_path=f"光鸭云盘/元数据源/{filename}", error="initial failure",
         )
 
     @staticmethod
@@ -1180,7 +1182,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
         failure_id = self._failure(source, file.file_id, file.name)
 
         with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / strm_module.STRM_SUBDIR / "poster.jpg"
+            target = Path(root) / strm_module.STRM_SUBDIR / "元数据源" / "poster.jpg"
             target.parent.mkdir(parents=True)
             target.write_bytes(b"old-data")
             strm_repo.upsert_strm_index(source_key, file.file_id, "old", 8, file.name, str(target))
@@ -1216,7 +1218,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
         failure_id = self._failure(source, file.file_id, "old.jpg")
 
         with tempfile.TemporaryDirectory() as root:
-            old_path = Path(root) / strm_module.STRM_SUBDIR / "old.jpg"
+            old_path = Path(root) / strm_module.STRM_SUBDIR / "元数据源" / "old.jpg"
             old_path.parent.mkdir(parents=True)
             old_path.write_bytes(b"old")
             strm_repo.upsert_strm_index(
@@ -1229,7 +1231,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
                 result = strm_module.retry_strm_failures(
                     [failure_id], "manual", client=cast(GuangYaClient, client)
                 )
-            new_path = Path(root) / strm_module.STRM_SUBDIR / "new.jpg"
+            new_path = Path(root) / strm_module.STRM_SUBDIR / "元数据源" / "new.jpg"
             row = strm_repo.list_strm_index(source_key)[0]
             self.assertFalse(old_path.exists())
             self.assertEqual(new_path.read_bytes(), b"new-data")
@@ -1246,7 +1248,7 @@ class StrmMetadataRetryTransactionAndMissingTests(IsolatedDatabaseTestCase):
         failure_id = self._failure(source, fresh.file_id, fresh.name)
 
         with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / strm_module.STRM_SUBDIR / "poster.jpg"
+            target = Path(root) / strm_module.STRM_SUBDIR / "元数据源" / "poster.jpg"
             target.parent.mkdir(parents=True)
             target.write_bytes(b"conflict")
             strm_repo.upsert_strm_index(

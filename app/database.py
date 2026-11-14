@@ -1957,7 +1957,7 @@ def _write_strm_source_snapshot(
     from app.modules.strm import STRM_SUBDIR, plan_strm_sources
 
     previous = _read_strm_source_snapshot(conn)
-    prefixes = previous[2] if previous is not None else _legacy_strm_source_prefixes(
+    prefixes = previous[2] if previous is not None else _strm_source_prefixes(
         sources if previous_sources is None else previous_sources
     )
     occupied: set[str] = set()
@@ -2005,35 +2005,35 @@ def _read_strm_source_snapshot(
         sources = _normalize_strm_source_snapshot(raw_sources)
         prefixes = payload.get("local_prefixes")
         if prefixes is None:
-            prefixes = _legacy_strm_source_prefixes(sources)
+            prefixes = {}
         elif not isinstance(prefixes, dict) or any(
             not isinstance(key, str) or not isinstance(value, str)
             for key, value in prefixes.items()
         ) or not sources.keys() <= prefixes.keys():
             raise RuntimeError("STRM 来源路径快照不完整，已停止重新分配目录")
-        return sources, str(payload.get("strm_root") or ""), prefixes
+        return sources, str(payload.get("strm_root") or ""), _strm_source_prefixes(sources, prefixes)
     except (TypeError, ValueError):
         logger.warning("STRM 来源快照损坏，已按当前配置重建")
         return None
 
 
-def _legacy_strm_source_prefixes(sources: dict[str, str]) -> dict[str, str]:
-    """旧快照首次升级时固化旧布局，之后不再按来源数量改变路径。"""
+def _strm_source_prefixes(sources: dict[str, str], prefixes: dict[str, str] | None = None) -> dict[str, str]:
+    """统一来源目录分配；只纠正空前缀，保留已有非空路径及退役来源预留。"""
     from app.modules.strm import plan_strm_sources
 
-    if len(sources) == 1:
-        return {source_id: "" for source_id in sources}
+    prefixes = {key: value for key, value in (prefixes or {}).items() if value}
     return {
-        row["id"]: row["rel_prefix"] for row in plan_strm_sources([
+        **prefixes,
+        **{row["id"]: row["rel_prefix"] for row in plan_strm_sources([
             {"id": source_id, "name": name} for source_id, name in sources.items()
-        ])
+        ], prefixes=prefixes)},
     }
 
 
 def get_strm_source_prefixes(configured_sources: Iterable[object]) -> dict[str, str]:
     with get_conn() as conn:
         snapshot = _read_strm_source_snapshot(conn)
-    return snapshot[2] if snapshot is not None else _legacy_strm_source_prefixes(
+    return snapshot[2] if snapshot is not None else _strm_source_prefixes(
         _normalize_strm_source_snapshot(configured_sources)
     )
 
