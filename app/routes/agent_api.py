@@ -28,7 +28,9 @@ from app.agent.kernel.state_types import SelectionInvalidError, SessionBusyError
 from app.agent.kernel.task_state import task_projection
 from app.agent.kernel.turn_display import active_turn_view, last_turn_view
 from app.agent.kernel.ux_display import next_actions_view, session_display_patch
-from app.agent.owner_routes import SESSION_ID_RE, current_web_main_session_id, web_kernel_owner, web_main_session_id
+from app.agent.owner_routes import (
+    SESSION_ID_RE, current_web_main_session_id, telegram_channel_owners, web_kernel_owner, web_main_session_id,
+)
 from app.agent.public_view import public_active_turn_events, public_activities, public_conversation_messages
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.transports import (
@@ -472,6 +474,58 @@ async def patch_session(request: Request, session_id: str, data: Annotated[Any, 
         if summary is None:
             return api_error("会话不存在", 404)
         return api_response({"session": summary})
+    except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
+        return _error(exc)
+
+
+def _channel_key(owner: str, session_id: str) -> str:
+    """渠道会话的不透明键：不向页面暴露 Telegram chat/user 标识。"""
+    return hmac.new(get_web_secret().encode(), f"channel:v1\0{owner}\0{session_id}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+async def _telegram_channels(runtime) -> list[tuple[str, str, dict[str, Any]]]:
+    channels = []
+    for owner in await run_in_threadpool(telegram_channel_owners):
+        for summary in await runtime.store.list_sessions(owner=owner):
+            channels.append((owner, str(summary["session_id"]), summary))
+    return channels
+
+
+@router.get("/channels")
+async def list_channels(request: Request):
+    """只读渠道：列出 Telegram 白名单身份下的会话，供 Web 查看。"""
+    require_api_login(request)
+    try:
+        runtime = await run_in_threadpool(get_agent_kernel_runtime)
+        channels = [{
+            "key": _channel_key(owner, session_id), "channel": "telegram",
+            "title": str(summary.get("title") or "Telegram"),
+            "updated_at": summary.get("updated_at"), "message_count": summary.get("message_count", 0),
+        } for owner, session_id, summary in await _telegram_channels(runtime)]
+        channels.sort(key=lambda item: float(item["updated_at"] or 0), reverse=True)
+        response = api_response({"channels": channels})
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+    except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
+        return _error(exc)
+
+
+@router.get("/channels/{key}")
+async def get_channel(request: Request, key: str):
+    require_api_login(request)
+    try:
+        runtime = await run_in_threadpool(get_agent_kernel_runtime)
+        for owner, session_id, summary in await _telegram_channels(runtime):
+            if hmac.compare_digest(_channel_key(owner, session_id), key):
+                state = await runtime.store.load(owner=owner, session_id=session_id)
+                response = api_response({
+                    "key": key, "channel": "telegram", "read_only": True,
+                    "title": str(summary.get("title") or "Telegram"),
+                    "messages": public_conversation_messages(state.conversation),
+                })
+                response.headers["Cache-Control"] = "private, no-store"
+                return response
+        return api_error("渠道会话不存在", 404)
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
         return _error(exc)
 

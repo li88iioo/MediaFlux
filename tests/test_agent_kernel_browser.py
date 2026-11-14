@@ -79,6 +79,7 @@ HTML = """
               <button type="button" class="agent-send agent-stop" id="agentStopSession" aria-label="停止任务" aria-busy="false" hidden disabled>停止</button>
             </span>
           </form>
+          <div class="agent-channel-notice" id="agentChannelNotice" role="status" hidden><div><strong>只能查看</strong><small>消息已从 Telegram 同步，请在 Telegram 中继续这个对话。</small></div></div>
           <section class="agent-start-panel"><p class="agent-start-status" id="agentStartActionsStatus" role="status">正在读取本地待办…</p><div class="agent-start-actions" id="agentStartActions" aria-busy="true"></div></section>
         </section>
         <dialog class="agent-rail agent-history-drawer" id="agentHistoryRail">
@@ -89,6 +90,7 @@ HTML = """
               <button type="button" class="agent-history-close" data-agent-history-close>关闭</button>
             </div>
             <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><span>主要聊天</span></button>
+            <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden><div class="agent-session-group"><span class="agent-session-group-title">渠道</span></div><div class="agent-channel-list" id="agentChannelList"></div></section>
             <div class="agent-session-group"><span class="agent-session-group-title">旁聊</span><span class="agent-session-count" id="agentSessionCount">0 条</span><button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊">新建旁聊</button></div>
             <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
             <p class="agent-history-feedback" id="agentSessionStatus" role="status"></p>
@@ -204,6 +206,11 @@ MOCK_FETCH = r"""
     if (path === '/api/agent/next-actions') {
       if (window.__kernelConfig.nextActionsDelayMs) await new Promise(resolve => setTimeout(resolve, window.__kernelConfig.nextActionsDelayMs));
       return jsonResponse(window.__kernelConfig.nextActions || {actions: [], snapshot_status: 'idle'}, window.__kernelConfig.nextActionsStatus || 200);
+    }
+    if (path === '/api/agent/channels') return jsonResponse({channels: window.__kernelConfig.channels || []});
+    if (path.startsWith('/api/agent/channels/')) {
+      const detail = (window.__kernelConfig.channelDetails || {})[decodeURIComponent(path.split('/').pop())];
+      return detail ? jsonResponse(detail) : jsonResponse({error: '渠道会话不存在'}, 404);
     }
     if (path === '/api/agent/sessions') return jsonResponse(sessionList());
     if (path.startsWith('/api/agent/sessions/') && options.method === 'PATCH') {

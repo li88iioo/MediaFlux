@@ -49,6 +49,10 @@
                     <button type="button" class="agent-send agent-stop" id="agentStopSession" aria-label="停止任务" aria-describedby="agentSessionStopHelp" aria-busy="false" title="停止任务" hidden disabled><i data-lucide="square"></i></button>
                 </span>
             </form>
+            <div class="agent-channel-notice" id="agentChannelNotice" role="status" hidden>
+                <i data-lucide="send"></i>
+                <div><strong>只能查看</strong><small>消息已从 Telegram 同步，请在 Telegram 中继续这个对话。</small></div>
+            </div>
             <section class="agent-start-panel" aria-label="可以从这里开始">
                 <p class="agent-start-status" id="agentStartActionsStatus" role="status">正在读取本地待办…</p>
                 <div class="agent-start-actions" id="agentStartActions" aria-busy="true"></div>
@@ -63,6 +67,10 @@
                     <button type="button" class="agent-history-close" data-agent-history-close aria-label="关闭会话栏" title="关闭会话栏"><i data-lucide="x"></i></button>
                 </div>
                 <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><i data-lucide="message-circle"></i><span>主要聊天</span></button>
+                <section class="agent-channels" id="agentChannels" aria-label="渠道" hidden>
+                    <div class="agent-session-group"><span class="agent-session-group-title">渠道</span></div>
+                    <div class="agent-channel-list" id="agentChannelList"></div>
+                </section>
                 <div class="agent-session-group">
                     <span class="agent-session-group-title">旁聊</span>
                     <span class="agent-session-count" id="agentSessionCount">0 条</span>

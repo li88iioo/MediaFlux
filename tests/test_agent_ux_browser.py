@@ -384,6 +384,41 @@ class AgentUXBrowserTests(unittest.TestCase):
         second = json.loads(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query')[1].body"))
         self.assertNotIn('reply_to', second)
 
+    def test_telegram_channel_is_read_only_and_returning_restores_main_chat(self):
+        key = 'c' * 32
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+            {'session_id': SESSION_A, 'title': '主要', 'updated_at': 10}]},
+            'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '主要聊天里的回复。'}]}},
+            'channels': [{'key': key, 'channel': 'telegram', 'title': '诛仙追更', 'updated_at': 20}],
+            'channelDetails': {key: {'key': key, 'read_only': True, 'messages': [
+                {'role': 'user', 'content': '诛仙下一集出了吗'},
+                {'role': 'assistant', 'content': 'TG 里的回复：S4E15 已出。'}]}}})
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('主要聊天里的回复')")
+        channel = page.locator(f'[data-channel-open="{key}"]')
+        channel.wait_for()
+        self.assertTrue(page.locator('#agentChannels').is_visible())
+        channel.click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('TG 里的回复')")
+        self.assertTrue(page.locator('#agentComposer').is_hidden())
+        self.assertTrue(page.locator('#agentChannelNotice').is_visible())
+        self.assertIn('Telegram', page.locator('#agentChannelNotice').inner_text())
+        self.assertEqual(channel.get_attribute('aria-current'), 'page')
+        self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'false')
+        self.assertTrue(page.locator('.agent-message-assistant [data-reply-message]').first.is_hidden())
+        self.assertNotIn('主要聊天里的回复', page.locator('#agentTranscript').inner_text())
+        page.locator('#agentMainChat').click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('主要聊天里的回复')")
+        self.assertTrue(page.locator('#agentComposer').is_visible())
+        self.assertTrue(page.locator('#agentChannelNotice').is_hidden())
+        self.assertEqual(channel.get_attribute('aria-current'), 'false')
+        self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'page')
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.method === 'POST').length"), 0)
+
+    def test_channel_section_stays_hidden_without_telegram_sessions(self):
+        page = self.page()
+        page.wait_for_function("() => window.__kernelCalls.some(call => call.url === '/api/agent/channels')")
+        self.assertTrue(page.locator('#agentChannels').is_hidden())
+
     def test_completion_and_error_do_not_pull_reader_to_bottom(self):
         for outcome in ('turn.completed', 'turn.failed'):
             with self.subTest(outcome=outcome):

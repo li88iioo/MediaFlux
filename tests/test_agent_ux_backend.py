@@ -1204,3 +1204,32 @@ def test_main_chat_adopts_latest_session_stays_fixed_and_cannot_be_deleted(api):
     response = api.client.delete(f"/api/agent/sessions/{latest}", headers=CSRF)
     assert response.status_code == 409 and "主要聊天" in response.text
     assert latest in {item["session_id"] for item in api.client.get("/api/agent/sessions").json()["sessions"]}
+
+
+def test_telegram_channel_is_listed_and_readable_without_exposing_identity(api, monkeypatch):
+    from app.agent import owner_routes
+
+    tg_owner = "tg:v1:12345\x1f12345"
+    tg_session = "tg_" + "c" * 32
+    monkeypatch.setattr(agent_api, "telegram_channel_owners", lambda: [tg_owner])
+    assert api.client.get("/api/agent/channels").status_code == 401
+    _login(api)
+    asyncio.run(_seed(api.store, owner=tg_owner, session_id=tg_session))
+    asyncio.run(_seed(api.store, owner=_web_owner(api), session_id="session_web_only_000001"))
+    channels = api.client.get("/api/agent/channels").json()["channels"]
+    assert len(channels) == 1 and channels[0]["channel"] == "telegram"
+    key = channels[0]["key"]
+    assert "12345" not in str(channels) and tg_session not in str(channels)
+    detail = api.client.get(f"/api/agent/channels/{key}").json()
+    assert detail["read_only"] is True
+    assert detail["messages"] == [{"role": "user", "content": "原始标题"}]
+    assert api.client.get("/api/agent/channels/" + "0" * 32).status_code == 404
+    monkeypatch.setattr(agent_api, "telegram_channel_owners", lambda: [])
+    assert api.client.get("/api/agent/channels").json()["channels"] == []
+    assert api.client.get(f"/api/agent/channels/{key}").status_code == 404
+
+    values = {"TG_CHAT_ID": "12345", "TG_AGENT_ALLOWED_USER_IDS": "222, 111 abc"}
+    monkeypatch.setattr(owner_routes.config, "get", lambda key, default="": values.get(key, default))
+    assert owner_routes.telegram_channel_owners() == ["tg:v1:12345\x1f111", "tg:v1:12345\x1f222"]
+    values["TG_CHAT_ID"] = "not-a-chat"
+    assert owner_routes.telegram_channel_owners() == []

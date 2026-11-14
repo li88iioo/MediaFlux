@@ -2007,3 +2007,20 @@ body.agent-page-body::after { display: none; }
 .agent-reply-cancel:hover { color: var(--accent); background: var(--accent-soft); }
 .agent-reply-cancel svg { width: 14px; height: 14px; }
 @media (prefers-reduced-motion: reduce) { .agent-message-reply { transition: none; } }
+
+/* 渠道：Telegram 会话只读查看，输入框换成提示。 */
+.agent-channel-list { display: grid; gap: 2px; margin-top: 4px; }
+.agent-channel-open { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 6px 12px; color: var(--text-primary); background: transparent; border: 1px solid transparent; border-radius: 12px; font: inherit; text-align: left; cursor: pointer; }
+.agent-channel-open svg { flex: 0 0 16px; width: 16px; height: 16px; color: var(--accent); }
+.agent-channel-open span { min-width: 0; }
+.agent-channel-open strong, .agent-channel-open small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-channel-open strong { font-size: 12px; font-weight: 600; }
+.agent-channel-open small { margin-top: 2px; color: var(--text-muted); font-size: 10px; }
+.agent-channel-open:hover, .agent-channel-open.is-active { background: var(--bg-input); border-color: var(--agent-line); }
+.agent-channel-notice { width: min(calc(100% - 20px), var(--agent-reading-width, 980px)); display: flex; align-items: center; gap: 12px; margin: 0 auto 28px; padding: 12px 16px; color: var(--text-secondary); background: var(--bg-card); border: 1px solid var(--agent-glass-border); border-radius: 24px; flex-shrink: 0; }
+.agent-channel-notice[hidden] { display: none; }
+.agent-channel-notice svg { flex: 0 0 20px; width: 20px; height: 20px; color: var(--accent); }
+.agent-channel-notice strong { display: block; color: var(--text-primary); font-size: 13px; }
+.agent-channel-notice small { display: block; margin-top: 2px; font-size: 12px; }
+.agent-console.is-channel .agent-message-reply, .agent-console.is-channel .agent-start-panel, .agent-console.is-channel .agent-empty-intro { display: none; }
+.agent-composer[hidden] { display: none !important; }

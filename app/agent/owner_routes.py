@@ -87,6 +87,14 @@ def configured_telegram_user_ids() -> set[str]:
     }
 
 
+def telegram_channel_owners() -> list[str]:
+    """Web 只读渠道可见的 Telegram Kernel 身份：与 TG 输入授权同一白名单。"""
+    chat = (config.get("TG_CHAT_ID", "") or "").strip()
+    if not _TELEGRAM_CHAT_RE.fullmatch(chat):
+        return []
+    return [f"tg:v1:{chat}\x1f{user}" for user in sorted(configured_telegram_user_ids())]
+
+
 def telegram_owner_route_access(
     value: object,
     *,

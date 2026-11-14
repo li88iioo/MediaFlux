@@ -14,6 +14,9 @@
     const newSessionButton = document.getElementById('agentNewSession');
     const mainChatButton = document.getElementById('agentMainChat');
     const replyBar = document.getElementById('agentReplyBar');
+    const channelSection = document.getElementById('agentChannels');
+    const channelList = document.getElementById('agentChannelList');
+    const channelNotice = document.getElementById('agentChannelNotice');
     const replyText = document.getElementById('agentReplyText');
     const historyButton = document.getElementById('toggleAgentRail');
     const historyRail = document.getElementById('agentHistoryRail');
@@ -72,6 +75,8 @@
     const sessionEdits = new Set();
     let mainSessionId = '';
     let replyDraft = '';
+    let viewingChannel = '';
+    let channelGeneration = 0;
     // 宽屏常驻会话栏；窄屏收为抽屉。
     const railDocked = window.matchMedia?.('(min-width: 901px)') || null;
     let activeRequest = null;
@@ -2575,7 +2580,7 @@
             open.querySelector('strong').textContent = title;
             open.querySelector('small').textContent = `${item.pinned ? '置顶 · ' : ''}${item.message_count || 0} 条消息${sessionTime(item.updated_at) ? ` · ${sessionTime(item.updated_at)}` : ''}`;
             open.title = title;
-            row.classList.toggle('is-active', item.session_id === sessionId);
+            row.classList.toggle('is-active', item.session_id === sessionId && !viewingChannel);
             const pin = row.querySelector('[data-session-pin]');
             pin.setAttribute('aria-pressed', String(item.pinned));
             pin.setAttribute('aria-label', `${item.pinned ? '取消置顶' : '置顶'}会话 ${title}`);
@@ -2727,6 +2732,7 @@
             configureDraftScope(payload.draft_scope);
             if (SESSION_RE.test(String(payload.main_session_id || ''))) mainSessionId = payload.main_session_id;
             renderSessionList(payload.sessions || []);
+            refreshChannels();
             // 常驻会话栏的静默刷新不留可见提示，只在用户主动打开时播报。
             if (!quiet) announce(sessionStatus, '会话列表已更新');
             return payload;
@@ -2866,6 +2872,10 @@
 
     async function loadSession(targetId, {closeHistory = true, startup = false, signal = null, preserveScroll = false} = {}) {
         if (!SESSION_RE.test(targetId)) return false;
+        if (viewingChannel) {
+            ++channelGeneration;
+            setChannelMode('');
+        }
         if (!startup) stopInitialRestore();
         const switching = targetId !== sessionId;
         const previousSessionId = sessionId;
@@ -2971,7 +2981,7 @@
     function syncMainChatButton() {
         if (!mainChatButton) return;
         mainChatButton.disabled = !mainSessionId;
-        const active = Boolean(mainSessionId) && sessionId === mainSessionId;
+        const active = Boolean(mainSessionId) && sessionId === mainSessionId && !viewingChannel;
         mainChatButton.classList.toggle('is-active', active);
         mainChatButton.setAttribute('aria-current', active ? 'page' : 'false');
     }
@@ -2981,15 +2991,89 @@
             startNewSession();
             return;
         }
-        if (mainSessionId === sessionId) {
+        if (mainSessionId === sessionId && !viewingChannel) {
             closeHistoryRail();
             return;
         }
         loadSession(mainSessionId);
     }
 
+    function renderChannelList(items) {
+        if (!channelList || !channelSection) return;
+        channelList.replaceChildren(...items.map(item => {
+            const open = element('button', 'agent-channel-open');
+            open.type = 'button';
+            open.dataset.channelOpen = item.key;
+            open.classList.toggle('is-active', item.key === viewingChannel);
+            open.setAttribute('aria-current', item.key === viewingChannel ? 'page' : 'false');
+            const label = element('span', '');
+            label.append(element('strong', '', String(item.title || 'Telegram')),
+                element('small', '', `Telegram${sessionTime(item.updated_at) ? ` · ${sessionTime(item.updated_at)}` : ''}`));
+            open.append(icon('send'), label);
+            return open;
+        }));
+        channelSection.hidden = !items.length;
+        renderIcons(channelList);
+    }
+
+    async function refreshChannels() {
+        try {
+            const payload = await fetchJSON('/api/agent/channels');
+            renderChannelList(Array.isArray(payload?.channels) ? payload.channels : []);
+        } catch (_) {
+            renderChannelList([]);
+        }
+    }
+
+    function setChannelMode(key) {
+        viewingChannel = key;
+        consoleNode?.classList.toggle('is-channel', Boolean(key));
+        if (composer) composer.hidden = Boolean(key);
+        if (channelNotice) channelNotice.hidden = !key;
+        channelList?.querySelectorAll('[data-channel-open]').forEach(button => {
+            const active = button.dataset.channelOpen === key;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-current', active ? 'page' : 'false');
+        });
+        sessionList?.querySelectorAll('.agent-session-item').forEach(row => row.classList.toggle('is-active', !key && row.dataset.sessionId === sessionId));
+        syncMainChatButton();
+    }
+
+    async function openChannel(key) {
+        if (!key) return;
+        // 只读查看渠道会话：先像切换会话一样放下当前会话的请求与草稿，返回时由 loadSession 重新恢复。
+        stopInitialRestore();
+        saveDraft();
+        setReply('');
+        ++sessionLoadGeneration;
+        invalidateActiveRequest();
+        setBusy(false);
+        clearTaskSnapshot();
+        expireCandidateCards();
+        const generation = ++channelGeneration;
+        try {
+            const payload = await fetchJSON(`/api/agent/channels/${encodeURIComponent(key)}`);
+            if (generation !== channelGeneration) return;
+            setChannelMode(key);
+            transcript?.replaceChildren();
+            for (const message of payload?.messages || []) {
+                if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, replyTo: String(message.reply_to || '')});
+                else if (message.role === 'assistant') finalizeAnswer(createAssistantTurn({recovered: true}), String(message.content || ''));
+            }
+            setConsoleEmpty(!transcript?.childElementCount);
+            scrollToBottom(true);
+            closeHistoryRail();
+        } catch (error) {
+            announce(sessionStatus, error?.message || '渠道会话加载失败');
+        }
+    }
+
     function startNewSession() {
         setReply('');
+        if (viewingChannel) {
+            ++channelGeneration;
+            setChannelMode('');
+        }
         clearTaskSnapshot();
         stopInitialRestore();
         saveDraft();
@@ -3433,6 +3517,10 @@
     document.getElementById('agentRestoreRetry')?.addEventListener('click', restoreInitialSession);
     document.getElementById('agentRestoreNew')?.addEventListener('click', startNewSession);
     mainChatButton?.addEventListener('click', openMainChat);
+    channelList?.addEventListener('click', (event) => {
+        const open = event.target.closest('[data-channel-open]');
+        if (open) openChannel(open.dataset.channelOpen || '');
+    });
     document.getElementById('agentReplyCancel')?.addEventListener('click', () => { setReply(''); promptInput?.focus(); });
     // 常驻会话栏没有“打开”动作；回到页面时刷新列表，及时发现新旁聊或登录主体变化。
     window.addEventListener('focus', () => { if (railDocked?.matches && !startupController) refreshSessions({quiet: true}); });
