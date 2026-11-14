@@ -328,7 +328,7 @@ class AgentKernelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable_path = _chromium_executable(cls.playwright)
         launch_options: dict = {
             "headless": True,
@@ -337,6 +337,7 @@ class AgentKernelBrowserTests(unittest.TestCase):
         if executable_path is not None:
             launch_options["executable_path"] = executable_path
         cls.browser = cls.playwright.chromium.launch(**launch_options)
+        cls.addClassCleanup(cls.browser.close)
         cls.source = SCRIPT.read_text(encoding="utf-8")
         cls.styles = "\n".join(
             (
@@ -344,11 +345,6 @@ class AgentKernelBrowserTests(unittest.TestCase):
                 AGENT_STYLES.read_text(encoding="utf-8"),
             )
         )
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.browser.close()
-        cls.playwright.stop()
 
     def make_page(
         self: _KernelPageHarness,

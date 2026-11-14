@@ -106,10 +106,6 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         browser_tests.AgentKernelBrowserTests.setUpClass.__func__(cls)
 
-    @classmethod
-    def tearDownClass(cls):
-        browser_tests.AgentKernelBrowserTests.tearDownClass.__func__(cls)
-
     make_page = browser_tests.AgentKernelBrowserTests.make_page
 
     def confirm(self, events, *, malformed_tail="", http_error=None):

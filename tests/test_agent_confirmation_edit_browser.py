@@ -51,10 +51,6 @@ class ConfirmationEditBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         support.AgentKernelBrowserTests.setUpClass.__func__(cls)
 
-    @classmethod
-    def tearDownClass(cls):
-        support.AgentKernelBrowserTests.tearDownClass.__func__(cls)
-
     make_page = support.AgentKernelBrowserTests.make_page
 
     def page(self, *, width=390, extra=None, action=None):

@@ -43,13 +43,6 @@ class AgentShellBrowserCase(InitializedWebTestCase):
         browser_support.AgentKernelBrowserTests.setUpClass.__func__(cls)
         cls.static_root = Path(os.getenv('MEDIAFLUX_BROWSER_STATIC_ROOT') or browser_support.ROOT / 'app/static').resolve()
 
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            browser_support.AgentKernelBrowserTests.tearDownClass.__func__(cls)
-        finally:
-            super().tearDownClass()
-
     def make_shell(self, viewport, *, history):
         context = self.browser.new_context(viewport=viewport)
         self.addCleanup(context.close)

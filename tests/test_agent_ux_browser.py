@@ -100,10 +100,6 @@ class AgentUXBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         harness.AgentKernelBrowserTests.setUpClass.__func__(cls)
 
-    @classmethod
-    def tearDownClass(cls):
-        harness.AgentKernelBrowserTests.tearDownClass.__func__(cls)
-
     make_page = harness.AgentKernelBrowserTests.make_page
 
     def page(self, config: dict | None = None, **kwargs):

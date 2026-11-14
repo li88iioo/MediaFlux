@@ -79,6 +79,36 @@ def initialize_web_paths(paths, username, password, inspect_page=None):
 
 
 class AgentShellFixtureLifecycleTests(unittest.TestCase):
+    def test_failed_browser_launch_releases_playwright_event_loop(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+        from tests.test_agent_kernel_browser import sync_playwright
+
+        if sync_playwright is None:
+            self.skipTest("系统环境未安装 Playwright")
+        program = '''
+import asyncio
+import unittest
+from unittest.mock import patch
+from playwright.sync_api import BrowserType
+from tests.test_agent_confirmation_edit_browser import ConfirmationEditBrowserTests
+
+case = ConfirmationEditBrowserTests("test_confirmation_execution_collapses_both_same_session_forms")
+result = unittest.TestResult()
+with patch.object(BrowserType, "launch", side_effect=RuntimeError("browser launch failed")) as launch:
+    unittest.TestSuite([case]).run(result)
+    launch.assert_called_once()
+assert len(result.errors) == 1 and "browser launch failed" in result.errors[0][1], result.errors
+assert not result.failures and not result.skipped
+assert asyncio.run(asyncio.sleep(0, result="ready")) == "ready"
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_failed_page_fixture_cannot_restore_stale_runtime_after_traceback_gc(self):
         import gc
         import weakref
