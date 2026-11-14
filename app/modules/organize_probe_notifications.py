@@ -180,7 +180,11 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
         if not chat or not ref["topic_enabled"]:
             continue
         try:
-            previous = get_notification_thread_snapshot(ref["thread_key"], topic=ref["topic"], chat_id=chat)
+            thread_key = ref["thread_key"]
+            if ref["topic"] == "confirmation":
+                from app.modules.organize_confirmations import confirmation_thread_key
+                thread_key = confirmation_thread_key(ref["token"])
+            previous = get_notification_thread_snapshot(thread_key, topic=ref["topic"], chat_id=chat)
             if previous is None:
                 missing_chats.add(chat)
                 continue
@@ -197,7 +201,7 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
                 ref["topic"] == "organize" and previous.event.lifecycle.get("parent")
                 and not _event_downstream_failed(previous.event)
             )
-            if not failed and not can_project_parent and (previous.event.state == "partial" or str(previous.event.title).startswith(("⚠️", "⏳"))):
+            if not failed and not can_project_parent and previous.event.state != "confirmation_batch" and (previous.event.state == "partial" or str(previous.event.title).startswith(("⚠️", "⏳"))):
                 handled = True
                 continue
             safe_error = "后台规格补全后的 STRM 同步异常，请在 Web 运行记录中查看。" if scoped_failed else ""

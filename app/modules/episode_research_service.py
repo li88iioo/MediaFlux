@@ -47,10 +47,11 @@ def _reader_with_deadline(case: dict, factory, deadline_at: float):
     return reader
 
 
-def episode_research_enabled() -> bool:
+def episode_research_enabled(*, explicit_approval: bool = False) -> bool:
+    """显式批准仅免除主动复核开关；复杂研究及 Agent/LLM 依赖仍须启用。"""
     return bool(
         config.get_bool("AGENT_EPISODE_RESEARCH_ENABLED", False)
-        and config.get_bool("AGENT_RECOGNITION_REVIEW_ENABLED", False)
+        and (explicit_approval is True or config.get_bool("AGENT_RECOGNITION_REVIEW_ENABLED", False))
         and config.get_bool("AGENT_ENABLED", False)
         and config.get_bool("AGENT_LLM_ENABLED", False)
         and (config.get("AGENT_LLM_API_URL", "") or "").strip()
@@ -93,25 +94,29 @@ def _validate_receipt_shape(receipt: object) -> None:
         raise EpisodeResearchError("invalid_research_receipt")
 
 
-def _check_scope(payload: dict) -> None:
+def _check_scope(payload: dict, *, explicit_approval: bool = False) -> None:
     if str(payload.get("kind") or "guangya").lower() != "guangya":
         raise EpisodeResearchError("unsupported_research_scope", "当前季集研究只用于光鸭冻结待确认案例")
-    if not episode_research_enabled():
+    if not episode_research_enabled(explicit_approval=explicit_approval):
         raise EpisodeResearchError("episode_research_disabled", "复杂季集研究或主动复核已关闭")
 
 
 def revalidate_episode_research_receipt(
     payload: dict, receipt: dict, *, expected_candidate_index: int | None = None,
-    reader_factory=None, deadline_at: float | None = None,
+    explicit_approval: bool = False, reader_factory=None, deadline_at: float | None = None,
 ) -> dict:
-    """receipt不是授权：重新核验缓存、原始文件、所选身份和当前TMDB证据。"""
+    """重新核验缓存、原始文件、所选身份和当前TMDB证据；receipt 本身不授写权。
+
+    explicit_approval 仅由已批准的宿主执行链传入，允许主动复核关闭后重验原映射，
+    不绕过复杂研究开关、其它运行依赖或任何证据与时限校验。
+    """
     from app.repositories.episode_research import (
         get_episode_research_cache,
         invalidate_episode_research_cache,
     )
     deadline_at = time.monotonic() + _TOTAL_TIMEOUT_SECONDS if deadline_at is None else deadline_at
     _remaining(deadline_at)
-    _check_scope(payload)
+    _check_scope(payload, explicit_approval=explicit_approval)
     _validate_receipt_shape(receipt)
     case = normalize_case(payload)
     if case["case_key"] != receipt["cache_key"]:
@@ -134,7 +139,7 @@ def revalidate_episode_research_receipt(
         if proposal_receipt(current) != receipt:
             invalidate_episode_research_cache(case["case_key"])
             raise EpisodeResearchError("research_evidence_changed", "季集顺序或目标元数据已变化，需重新研究")
-        _check_scope(payload)
+        _check_scope(payload, explicit_approval=explicit_approval)
         _remaining(deadline_at)
         return current
     finally:

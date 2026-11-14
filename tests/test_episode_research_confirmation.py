@@ -109,8 +109,9 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
     def execute(self):
         row = db.claim_queued_organize_confirmation("episode-case")
         assert (row) is not None
+        payload = confirmations._decode_row(row)
         with patch.object(confirmations, "TMDBScraper", return_value=self.scraper()):
-            return confirmations._execute_guangya_confirmation("episode-case", self.payload, self.payload["candidates"][0],
+            return confirmations._execute_guangya_confirmation("episode-case", payload, payload["candidates"][0],
                                                                selected_index=0, chat_id="owner-chat", actor="agent")
 
     def test_verified_research_runs_existing_frozen_executor_not_old_numbering_rule(self):
@@ -129,6 +130,29 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
         assert row is not None
         self.assertEqual((row["status"], row["confirmation_actor"]), ("completed", "agent"))
         self.assertIn("episode_research_receipt", json.loads(row["review_result_json"]))
+
+    def test_explicit_approval_executes_frozen_mapping_with_proactive_review_off_without_human_learning(self):
+        self.payload["review_only"] = True
+        self.assertEqual(self.create(self.decision()), "approved")
+        self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+        with self.assertRaises(EpisodeResearchError):
+            confirmations.start_confirmation("episode-case", 0, chat_id="owner-chat", actor="agent", dispatch=False)
+        queued = confirmations.start_confirmation("episode-case", 0, chat_id="owner-chat", actor="agent",
+            explicit_approval=True, dispatch=False)
+        self.assertEqual(queued["status"], "queued")
+        with patch.object(confirmations, "_record_confirmation_learning") as learning:
+            result = self.execute()
+            learning.assert_not_called()
+        self.assertEqual(result["stats"]["moved"], 4)
+        for number, item in enumerate(self.payload["files"], 1):
+            current = self.cloud.infos[item["file_id"]]
+            self.assertIn(f"S00E{number:02d}", current.name)
+            self.assertEqual(self.cloud.infos[current.parent_id].name, "Specials")
+        row = db.get_organize_confirmation("episode-case")
+        assert row is not None
+        self.assertEqual((row["status"], row["confirmation_actor"]), ("completed", "agent"))
+        self.assertIs(json.loads(row["payload_json"])["_explicit_approval"], True)
+        self.assertEqual(self.cloud.deleted, [])
 
     def test_switch_off_before_queue_or_before_write_cannot_move_files(self):
         decision = self.decision()

@@ -62,11 +62,17 @@ class EpisodeResearchWriteSafetyTests(IsolatedDatabaseTestCase):
                 self.assertEqual(case.cloud.infos[item["file_id"]].name, item["name"])
 
     def test_source_change_during_receipt_revalidation_blocks_all_media_writes(self):
-        for kind in ("video", "companion"):
-            with self.subTest(kind=kind), self._build() as case:
+        for explicit, kind in ((False, "video"), (False, "companion"), (True, "video"), (True, "companion")):
+            with self.subTest(explicit_approval=explicit, kind=kind), self._build() as case:
                 subtitle = self._add_subtitle(case)
                 file_id = case.payload["files"][0]["file_id"] if kind == "video" else subtitle.file_id
+                if explicit:
+                    case.payload["review_only"] = True
                 self.assertEqual(case.create(case.decision()), "approved")
+                if explicit:
+                    case.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+                    confirmations.start_confirmation("episode-case", 0, chat_id="owner-chat", actor="agent",
+                        explicit_approval=True, dispatch=False)
                 original = service.revalidate_episode_research_receipt
                 reached = []
 
@@ -352,9 +358,16 @@ class EpisodeResearchWriteSafetyTests(IsolatedDatabaseTestCase):
             self.assertEqual(get_organize_confirmation_result_3["status"], "failed")
 
     def test_switch_or_effective_rules_change_after_revalidation_blocks_write(self):
-        for fault in ("disabled", "rules_changed"):
-            with self.subTest(fault=fault), self._build() as case:
+        for explicit, fault in ((False, "disabled"), (False, "rules_changed"),
+                                (True, "disabled"), (True, "rules_changed"), (True, "agent_disabled")):
+            with self.subTest(explicit_approval=explicit, fault=fault), self._build() as case:
+                if explicit:
+                    case.payload["review_only"] = True
                 self.assertEqual(case.create(case.decision()), "approved")
+                if explicit:
+                    case.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+                    confirmations.start_confirmation("episode-case", 0, chat_id="owner-chat", actor="agent",
+                        explicit_approval=True, dispatch=False)
                 original = service.revalidate_episode_research_receipt
                 reached = []
 
@@ -364,6 +377,8 @@ class EpisodeResearchWriteSafetyTests(IsolatedDatabaseTestCase):
                     proposal = original(*args, **kwargs)
                     if fault == "disabled":
                         case.values["AGENT_EPISODE_RESEARCH_ENABLED"] = "0"
+                    elif fault == "agent_disabled":
+                        case.values["AGENT_ENABLED"] = "0"
                     else:
                         case.enterContext(patch.object(
                             type(case.rules), "from_config",
@@ -387,36 +402,43 @@ class EpisodeResearchWriteSafetyTests(IsolatedDatabaseTestCase):
                 self._assert_all_frozen_files_stay_in_source(case)
 
     def test_switch_off_mid_batch_stops_new_writes_and_exposes_partial_failure(self):
-        with self._build() as case:
-            self.assertEqual(case.create(case.decision()), "approved")
-            original_move = case.cloud.move
-            first_id = case.payload["files"][0]["file_id"]
+        for explicit in (False, True):
+            with self.subTest(explicit_approval=explicit), self._build() as case:
+                if explicit:
+                    case.payload["review_only"] = True
+                self.assertEqual(case.create(case.decision()), "approved")
+                if explicit:
+                    case.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+                    confirmations.start_confirmation("episode-case", 0, chat_id="owner-chat", actor="agent",
+                        explicit_approval=True, dispatch=False)
+                original_move = case.cloud.move
+                first_id = case.payload["files"][0]["file_id"]
 
-            def move_then_disable(file_ids, parent_id):
-                result = original_move(file_ids, parent_id)
-                case.values["AGENT_EPISODE_RESEARCH_ENABLED"] = "0"
-                return result
+                def move_then_disable(file_ids, parent_id):
+                    result = original_move(file_ids, parent_id)
+                    case.values["AGENT_EPISODE_RESEARCH_ENABLED"] = "0"
+                    return result
 
-            with (
-                patch.object(case.cloud, "move", side_effect=move_then_disable) as move,
-                patch.object(case.cloud, "rename", wraps=case.cloud.rename) as rename,
-                patch.object(case.cloud, "delete", wraps=case.cloud.delete) as delete,
-            ):
-                result = case.execute()
-                self.assertEqual([call.args[0] for call in move.call_args_list], [[first_id]])
-                self.assertTrue(all(call.args[0] == first_id for call in rename.call_args_list))
-                delete.assert_not_called()
-            self.assertEqual(result["stats"]["moved"], 1)
-            self.assertGreater(result["stats"].get("failed", 0), 0)
-            for item in case.payload["files"][1:]:
-                self.assertEqual(case.cloud.infos[item["file_id"]].parent_id, "source")
-            row = db.get_organize_confirmation("episode-case")
-            # completed 表示这次 job 已结束，并不要求把旧部分失败语义改为 failed。
-            assert row is not None
-            self.assertIn(row["status"], {"completed", "failed"})
-            recorded = json.loads(row["result_json"])
-            self.assertEqual(recorded["moved"], 1)
-            self.assertGreater(recorded.get("failed", 0), 0)
+                with (
+                    patch.object(case.cloud, "move", side_effect=move_then_disable) as move,
+                    patch.object(case.cloud, "rename", wraps=case.cloud.rename) as rename,
+                    patch.object(case.cloud, "delete", wraps=case.cloud.delete) as delete,
+                ):
+                    result = case.execute()
+                    self.assertEqual([call.args[0] for call in move.call_args_list], [[first_id]])
+                    self.assertTrue(all(call.args[0] == first_id for call in rename.call_args_list))
+                    delete.assert_not_called()
+                self.assertEqual(result["stats"]["moved"], 1)
+                self.assertGreater(result["stats"].get("failed", 0), 0)
+                for item in case.payload["files"][1:]:
+                    self.assertEqual(case.cloud.infos[item["file_id"]].parent_id, "source")
+                row = db.get_organize_confirmation("episode-case")
+                # completed 表示这次 job 已结束，并不要求把旧部分失败语义改为 failed。
+                assert row is not None
+                self.assertIn(row["status"], {"completed", "failed"})
+                recorded = json.loads(row["result_json"])
+                self.assertEqual(recorded["moved"], 1)
+                self.assertGreater(recorded.get("failed", 0), 0)
 
     def test_existing_guard_without_target_context_hook_remains_compatible(self):
         with self._build() as case:

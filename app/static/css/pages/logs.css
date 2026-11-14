@@ -1,0 +1,101 @@
+/* 待确认媒体组审阅：沿用全站颜色、控件、圆角和弹窗 tokens。 */
+.confirmation-review-launch { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 14px; font-size: 12px; }
+.confirmation-review-launch .jump-btn { flex-shrink: 0; min-height: 40px; white-space: nowrap; }
+.confirmation-review-dialog { width: min(1200px, calc(100vw - 40px)); height: min(900px, calc(100vh - 40px)); height: min(900px, calc(100dvh - 40px)); display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; border-radius: var(--modal-radius); box-shadow: var(--shadow); }
+.confirmation-review-dialog [hidden] { display: none !important; }
+.confirmation-review-dialog .organize-detail-head p { white-space: normal; }
+.confirmation-review-dialog button { flex-shrink: 0; }
+.confirmation-review-dialog .jump-btn, .confirmation-review-dialog .btn { min-height: 40px; height: 40px; white-space: nowrap; }
+.confirmation-review-dialog .jump-btn:hover, .confirmation-review-dialog .btn:hover { transform: none; }
+.confirmation-review-dialog :is(button, input, select):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.confirmation-review-dialog input[type="checkbox"], .confirmation-review-dialog input[type="radio"] { width: 18px; height: 18px; flex: 0 0 18px; accent-color: var(--accent); }
+.confirmation-review-filters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.5fr) auto; align-items: end; gap: 10px; padding: 14px 22px; border-bottom: 1px solid var(--border-soft); }
+.confirmation-review-filters label { min-width: 0; display: grid; gap: 6px; color: var(--text-secondary); font-size: 12px; }
+.confirmation-review-filters .form-input { min-width: 0; width: 100%; height: 40px; }
+.confirmation-review-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 22px 0; }
+.confirmation-review-scope { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
+.confirmation-review-scope .form-select { width: 150px; min-height: 40px; }
+.confirmation-review-tools { display: flex; gap: 8px; }
+.confirmation-review-metrics { flex-shrink: 0; height: 36px; padding: 8px 22px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.confirmation-review-workspace { display: grid; grid-template-columns: minmax(300px, .85fr) minmax(0, 1.15fr); flex: 1; min-height: 0; border-top: 1px solid var(--border-soft); }
+.confirmation-review-queue { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--border); }
+.confirmation-review-page-select { display: flex; align-items: center; gap: 10px; flex-shrink: 0; min-height: 48px; padding: 8px 18px; background: var(--bg-input); color: var(--text-secondary); font-size: 12px; }
+#confirmationReviewSelectionCount { margin-left: auto; font-variant-numeric: tabular-nums; }
+.confirmation-review-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; }
+.confirmation-review-row { display: flex; align-items: center; gap: 8px; min-height: 104px; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); border-left: 3px solid transparent; }
+.confirmation-review-row.is-active { background: var(--accent-soft); border-left-color: var(--accent); }
+.confirmation-review-check { display: grid; place-items: center; flex: 0 0 44px; min-height: 44px; }
+.confirmation-review-open { display: grid; gap: 5px; width: 100%; min-width: 0; padding: 6px 0; color: var(--text-primary); background: transparent; border: 0; text-align: left; cursor: pointer; }
+.confirmation-review-open strong { font-size: 13px; line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.confirmation-review-open small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
+.confirmation-review-row-status { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-height: 20px; font-size: 11px; color: var(--text-secondary); }
+.confirmation-review-row-status .status-pill { padding: 2px 7px; }
+.confirmation-review-pagination { display: flex; align-items: center; gap: 8px; flex-shrink: 0; min-height: 60px; padding: 8px 14px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-secondary); }
+.confirmation-review-pagination span { flex: 1; font-variant-numeric: tabular-nums; }
+.confirmation-review-inspector { min-width: 0; min-height: 0; padding: 18px 22px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none; }
+.confirmation-review-empty { padding: 30px 18px; color: var(--text-secondary); font-size: 13px; line-height: 1.8; }
+.confirmation-review-inspector h3 { margin-bottom: 8px; font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
+.confirmation-review-context { display: grid; gap: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.confirmation-review-context code { font-size: 11px; }
+.confirmation-review-files { margin: 14px 0; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: var(--radius); font-size: 12px; color: var(--text-secondary); }
+.confirmation-review-files summary { cursor: pointer; min-height: 24px; }
+.confirmation-review-files ul { max-height: 160px; overflow-y: auto; list-style: none; }
+.confirmation-review-files li { padding: 5px 0; overflow-wrap: anywhere; }
+.confirmation-review-suggestion { min-height: 64px; margin-bottom: 14px; padding: 12px; color: var(--text-secondary); background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.confirmation-review-suggestion strong { display: block; color: var(--accent); font-weight: 650; }
+.confirmation-review-downstream { margin-bottom: 14px; color: var(--text-secondary); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.confirmation-review-candidates { display: grid; gap: 8px; border: 0; min-width: 0; }
+.confirmation-review-candidates legend { margin-bottom: 10px; font-size: 12px; color: var(--text-secondary); }
+.confirmation-review-candidate { display: flex; align-items: center; gap: 12px; min-height: 72px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; }
+.confirmation-review-candidate.is-selected { background: var(--accent-soft); border-color: var(--accent); }
+.confirmation-review-candidate span { display: grid; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.confirmation-review-candidate strong { color: var(--text-primary); font-size: 13px; line-height: 1.5; }
+.confirmation-review-candidate small { color: var(--text-secondary); font-size: 11px; }
+.confirmation-review-savebar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.confirmation-review-savebar .jump-btn { flex: 1; }
+.confirmation-review-preview { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); }
+.confirmation-review-preview p { color: var(--text-secondary); font-size: 12px; line-height: 1.7; }
+.confirmation-review-preview article { display: grid; gap: 6px; margin-top: 10px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 12px; overflow-wrap: anywhere; }
+.confirmation-review-preview article strong { color: var(--accent); }
+.confirmation-review-footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-shrink: 0; min-height: 96px; padding: 12px 22px; border-top: 1px solid var(--border); background: var(--bg-card); }
+.confirmation-review-footer > div:first-child { flex: 1; min-width: 0; }
+.confirmation-review-footer p { min-height: 18px; color: var(--text-secondary); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+#confirmationReviewState { min-height: 36px; }
+#confirmationReviewState.is-error { color: var(--danger); }
+.confirmation-review-actions { display: flex; gap: 8px; }
+.confirmation-review-actions .btn { width: 150px; }
+#confirmationReviewAgent { width: 132px; }
+#confirmationReviewPrepare { width: 104px; }
+@media (max-width: 960px) {
+    .confirmation-review-filters { grid-template-columns: repeat(2, minmax(0, 1fr)) auto; }
+    .confirmation-review-filters label:nth-child(3) { grid-column: 1; }
+    .confirmation-review-filters button { grid-column: 3; grid-row: 2; }
+    .confirmation-review-footer { align-items: stretch; flex-direction: column; gap: 6px; }
+    .confirmation-review-actions { justify-content: flex-end; }
+}
+@media (max-width: 640px) {
+    .confirmation-review-launch { align-items: stretch; flex-direction: column; }
+    .confirmation-review-modal { padding: 0; }
+    .confirmation-review-dialog { width: 100%; height: 100vh; height: 100dvh; max-height: 100%; border: 0; border-radius: 0; }
+    .confirmation-review-dialog .organize-detail-head { padding: 12px 16px; min-height: 76px; }
+    .confirmation-review-dialog .icon-action { min-width: 44px; min-height: 44px; }
+    .confirmation-review-dialog .jump-btn, .confirmation-review-dialog .btn { min-height: 44px; height: 44px; }
+    .confirmation-review-dialog .form-input, .confirmation-review-dialog .form-select { font-size: 16px; min-height: 44px; }
+    .confirmation-review-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 10px 16px; gap: 8px; }
+    .confirmation-review-filters button { grid-column: 1 / -1; grid-row: auto; }
+    .confirmation-review-toolbar { flex-wrap: wrap; padding: 8px 16px 0; gap: 8px; }
+    .confirmation-review-scope, .confirmation-review-scope .form-select { flex: 1; }
+    .confirmation-review-tools { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px; }
+    .confirmation-review-tools .jump-btn { padding-inline: 8px; font-size: 11px; }
+    .confirmation-review-metrics { padding-inline: 16px; }
+    .confirmation-review-workspace { display: flex; flex-direction: column; overflow-y: auto; overscroll-behavior: contain; }
+    .confirmation-review-queue { flex: 0 0 310px; min-height: 310px; border-right: 0; border-bottom: 1px solid var(--border); }
+    .confirmation-review-inspector { flex-shrink: 0; min-height: 280px; overflow: visible; padding: 16px; }
+    .confirmation-review-footer { padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0px)); }
+    .confirmation-review-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .confirmation-review-actions .btn { grid-column: 1 / -1; }
+    #confirmationReviewAgent, #confirmationReviewPrepare, .confirmation-review-actions .btn { width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .confirmation-review-modal, .confirmation-review-dialog, .confirmation-review-dialog button { animation: none; transition: none; }
+}

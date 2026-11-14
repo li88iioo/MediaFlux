@@ -693,6 +693,73 @@ def activity_reorganize_tool() -> KernelToolSpec:
         prepare=prepare, execute_confirmed=execute)
 
 
+def activity_confirm_organize_tool() -> KernelToolSpec:
+    """逐项候选复用公共批量服务，整份冻结预览沿原确认执行边界校验。"""
+    from app import sdk
+
+    def prepare(arguments, context):
+        from app.modules.organize_confirmation_batches import preview_choices
+
+        try:
+            with confirmation_runtime(context) as prefix:
+                values = sdk.prepare_sdk_method("activity.confirm_organize", arguments, owner=context.owner)
+                context.cancellation.raise_if_cancelled()
+                frozen = deepcopy(preview_choices(values["entries"]))
+                data = deepcopy(frozen)
+                data["count"] = len(frozen["entries"])
+                data["resources"] = [{"title": f"{item['identity']} → {item['candidate']['title']}（候选 {item['candidate']['index']}）",
+                                      "count": 1} for item in frozen["items"]]
+                preview = ToolResult(True, "confirmation_required", f"确认 {data['count']} 组媒体的逐项候选并排队整理", data=data)
+                return PreparedEffect(arguments={"entries": deepcopy(frozen["entries"])}, preview=preview.to_dict(),
+                    snapshot_fingerprint=prefix + _fingerprint(frozen),
+                    metadata={"risk": "danger", "organize_confirmations_preview": frozen,
+                        "confirmation": build_confirmation_contract(tool_name="activity.confirm_organize",
+                            risk=RiskLevel.DANGER, preview=preview)})
+        except (ValueError, LookupError, TypeError, AgentRuntimeDisabled, RuntimeFenceError) as exc:
+            raise ToolPipelineError(str(exc), code=getattr(exc, "code", "precondition_failed")) from exc
+
+    def execute(arguments, expected_snapshot, context):
+        from app.modules.organize_confirmation_batches import submit_choices
+
+        submitted = False
+        try:
+            with confirmation_runtime(context) as prefix:
+                active = context.active_effect_plan
+                if (active is None or active.owner != context.owner or active.session_id != context.session_id
+                        or active.tool_name != "activity.confirm_organize" or dict(active.arguments) != arguments):
+                    raise ToolPipelineError("缺少原确认执行范围", code="confirmation_invalid")
+                frozen = active.metadata.get("organize_confirmations_preview")
+                if (not isinstance(frozen, dict) or prefix + _fingerprint(frozen) != expected_snapshot
+                        or frozen.get("entries") != arguments["entries"]):
+                    raise ToolPipelineError("整理候选预览已变化，请重新预检", code="confirmation_stale")
+                context.cancellation.raise_if_cancelled()
+                submitted = True
+                accepted = submit_choices(frozen["entries"], frozen["digest"], actor="agent")
+                requested = accepted["accepted"]
+                failed = accepted["failed"]
+                return ToolResult(bool(requested), "accepted" if requested else "failed",
+                    f"已受理 {requested} 组、未受理 {failed} 组；整理尚未完成，请按 tokens 查询队列进度" if requested
+                    else f"整理队列未受理请求，{failed} 组失败",
+                    data={**accepted, "tokens": [entry["token"] for entry in frozen["entries"]]})
+        except (ValueError, LookupError, TypeError, ToolPipelineError, AgentRuntimeDisabled, RuntimeFenceError) as exc:
+            error = ToolPipelineError(str(exc), code=getattr(exc, "code", "precondition_failed"))
+            error.mark_execution_started(False)
+            raise error from exc
+        except Exception as exc:
+            error = ToolPipelineError("整理提交结果待核对，请按 tokens 查询队列，勿重复提交", code="outcome_unknown")
+            error.mark_execution_started(submitted)
+            raise error from exc
+
+    return KernelToolSpec(name="activity.confirm_organize", domain="activity", effect=ToolEffect.DANGER,
+        description=activity.confirm_organize.__doc__ or "", metadata={"risk": "danger"},
+        input_schema={"type": "object", "required": ["entries"], "additionalProperties": False,
+            "properties": {"entries": {"type": "array", "minItems": 1, "maxItems": 1000,
+                "items": {"type": "object", "required": ["token", "candidate_index"], "additionalProperties": False,
+                    "properties": {"token": {"type": "string", "minLength": 1},
+                        "candidate_index": {"type": "integer", "minimum": 0}}}}}},
+        prepare=prepare, execute_confirmed=execute)
+
+
 def activity_follow_tools() -> tuple[KernelToolSpec, KernelToolSpec]:
     """按持久活动身份关注/停用；业务条件提交复用同一规则仓储。"""
     def prepare(arguments, context, *, operation):

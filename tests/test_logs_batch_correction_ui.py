@@ -190,7 +190,7 @@ window.fetch=async(input,options={})=>{
 
 
 @unittest.skipIf(sync_playwright is None or Environment is None, "未安装 Playwright/Jinja2")
-class LogsBatchCorrectionBrowserTests(unittest.TestCase):
+class LogsBrowserCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
@@ -238,6 +238,23 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         self.page.goto("http://mediaflux.test/logs", wait_until="domcontentloaded")
         self.page.wait_for_function("() => window.__apiCalls?.some(call => call.path === '/api/logs/organize/timeline')")
 
+    def tearDown(self):
+        self.page.close()
+        self.assertEqual(self.errors, [])
+
+    def _serve_local_page(self, route):
+        path = urlsplit(route.request.url).path
+        if path == "/logs":
+            route.fulfill(status=200, content_type="text/html; charset=utf-8", body=self.html)
+        elif path == "/static/js/logs.js":
+            route.fulfill(status=200, content_type="text/javascript; charset=utf-8", body=(ROOT / "app/static/js/logs.js").read_text(encoding="utf-8"))
+        elif path == "/static/css/main.css":
+            route.fulfill(status=200, content_type="text/css; charset=utf-8", body=(ROOT / "app/static/css/main.css").read_text(encoding="utf-8"))
+        else:
+            route.abort()
+
+
+class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
     def enable_batch_delete_fixture(self, task_status='completed', task_result=None, *, rows=None):
         if rows is None:
             rows = [{**row, "status": "skipped", "error": "未识别，跳过整理"} for row in ROWS]
@@ -280,10 +297,6 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         self.page.wait_for_function("() => window.__apiCalls.some(call => call.path === '/api/logs/organize/batch' && call.method === 'POST')")
         self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.includes('批次完成')")
         return self.page.locator('#organizeBatchState')
-
-    def tearDown(self):
-        self.page.close()
-        self.assertEqual(self.errors, [])
 
     def test_recycled_status_is_consistent_in_filter_list_and_detail(self):
         self.page.evaluate("""async () => {
@@ -359,17 +372,6 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator('#organizeList').inner_html(), before)
         self.assertTrue(self.page.locator('.organize-row-select').first.is_checked())
         self.assertFalse(self.page.locator('#clearOrganizeLogsBtn').is_disabled())
-
-    def _serve_local_page(self, route):
-        path = urlsplit(route.request.url).path
-        if path == "/logs":
-            route.fulfill(status=200, content_type="text/html; charset=utf-8", body=self.html)
-        elif path == "/static/js/logs.js":
-            route.fulfill(status=200, content_type="text/javascript; charset=utf-8", body=(ROOT / "app/static/js/logs.js").read_text(encoding="utf-8"))
-        elif path == "/static/css/main.css":
-            route.fulfill(status=200, content_type="text/css; charset=utf-8", body=(ROOT / "app/static/css/main.css").read_text(encoding="utf-8"))
-        else:
-            route.abort()
 
     def select_two_and_open(self):
         self.page.locator(".organize-row-select").nth(0).check()

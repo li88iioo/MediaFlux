@@ -182,6 +182,45 @@ mf.cloud.scrape(file_id, media_type=candidate["media_type"],
 
 需要纠正剧集时附加核实的 `season` / `episode`。刮削回执的 `data.operation_ref` 用 `cloud.operation` 跟踪；最终再核验第 11 节的入库阶段。AI 推断不自动保存为人工学习规则。
 
+### 大批待确认组逐项选择
+
+当前批量确认仅支持光鸭整理。已有批次可按 `batch_id` 查询，也可按 `task_id/source/reason/q` 筛选；SDK 的 `page_size` 可取 1–1000：
+
+```python
+page = mf.activity.organize_confirmations(batch_id=batch_id)
+with open("/work/organize-confirmations.json", "w") as stream:
+    json.dump(page, stream, ensure_ascii=False)
+print({"total": page["total"], "pages": page["pages"], "counts": page["counts"],
+       "selection_truncated": page["selection_truncated"], "items": page["items"]})
+```
+
+`items` 只是本页；按 `page=2,3,...` 读取其余页面。`tokens` 包含当前筛选全部匹配项，最多 1000；`selection_truncated=True` 时缩小筛选范围，不能声称已选全部。需要只读模型建议且 `review_enabled=True` 时：
+
+```python
+print(mf.activity.review_organize_confirmations(page["tokens"]))
+```
+
+这只把复核持久排队，不确认或整理文件。后续用原 `tokens` 读取 `review_status/suggestion`，结合各条文件与候选核对。每条选择来自该条 `candidates[].index`；下面 `token_a/token_b` 和候选序号均来自已核对记录：
+
+```python
+entries = [{"token": token_a, "candidate_index": index_a},
+           {"token": token_b, "candidate_index": index_b}]
+with open("/work/organize-choices.json", "w") as stream:
+    json.dump(entries, stream, ensure_ascii=False)
+mf.activity.confirm_organize(entries)
+```
+
+这一次调用冻结全部选择、文件和来源规则，生成一张确认卡；每组可以选不同候选。确认后逐项进入原队列，`data.accepted/failed/items` 是受理结果。另开命令按原 tokens 查进度；大于一页继续分页：
+
+```python
+with open("/work/organize-choices.json") as stream:
+    entries = json.load(stream)
+progress = mf.activity.organize_confirmations(tokens=[entry["token"] for entry in entries], status="all")
+print(progress)
+```
+
+`queued/running` 尚未完成，逐条核对终态及 `error`；复核建议、入队数均不证明入库。执行来源保留为 Agent，不自动学习为人工偏好。
+
 ## 07 配置来源整理、停止与定时
 
 “看看配置的整理来源和目标”，只读预览：

@@ -4111,14 +4111,21 @@ class Organizer:
         organize_rollup: dict | None = None,
         download_request_ids: list[int] | None = None,
     ) -> bool:
-        """发送独立候选卡；失败时保留已持久化任务并给出 Web 回退。"""
+        """单组保留候选卡，多组先冻结全部候选再发送一条批次摘要。"""
         if not groups:
             return True
         from app.modules.organize_confirmations import (
             confirmation_event,
+            create_confirmation_actions,
             publish_confirmation_event,
         )
 
+        batch_id = ""
+        batch_tokens: list[str] = []
+        if len(groups) >= 2:
+            from uuid import uuid4
+
+            batch_id = uuid4().hex
         confirmation_failures = 0
         for index, group in enumerate(groups, start=1):
             group_source = str(group.get("source_name") or source_name)
@@ -4135,6 +4142,16 @@ class Organizer:
                     confirmation_group["organize_rollup"] = dict(organize_rollup)
                 if download_request_ids:
                     confirmation_group["download_request_ids"] = list(download_request_ids)
+                if batch_id:
+                    confirmation_group["_confirmation_batch"] = batch_id
+                    actions = create_confirmation_actions(
+                        confirmation_group, rules, source_name=group_source,
+                        chat_id=chat_id, review_ready=False,
+                    )
+                    if not actions:
+                        raise ValueError("确认组没有可用操作")
+                    batch_tokens.append(actions[0].callback_data.split(":", 2)[1])
+                    continue
                 event = confirmation_event(
                     f"⚠️ 待确认媒体 {index}/{len(groups)}",
                     {
@@ -4157,6 +4174,31 @@ class Organizer:
                 )
             if not delivered:
                 confirmation_failures += 1
+        if batch_tokens:
+            from app.modules.telegram_confirmation_batch import publish_batch_summary
+
+            try:
+                delivered = publish_batch_summary(
+                    batch_id, chat_id=chat_id, deliver_now=True,
+                )
+                if delivered:
+                    from app.modules.organize_confirmations import _recognition_review_is_enabled
+
+                    if _recognition_review_is_enabled():
+                        from app.modules.organize_confirmation_batches import MAX_SELECTION, request_reviews
+                        from app.notifier import notification_target_chat_id
+
+                        if len(batch_tokens) <= MAX_SELECTION:
+                            request_reviews(
+                                batch_tokens, chat_id=notification_target_chat_id(chat_id),
+                            )
+                else:
+                    confirmation_failures += 1
+            except Exception as exc:
+                confirmation_failures += 1
+                logger.warning(
+                    "整理确认批次摘要发布失败 type=%s", type(exc).__name__,
+                )
         if confirmation_failures:
             logger.warning(
                 "整理待确认卡未被通知中心接纳 count=%s；候选仍保留在 Web 待确认队列",

@@ -10,7 +10,8 @@ import asyncio
 import re
 import secrets
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import date
 from pathlib import PurePath
 from typing import Any
 
@@ -33,6 +34,13 @@ from app.agent.kernel.provider_model import (
 )
 from app.agent.kernel.session import SessionLimits
 from app.logger import get_logger
+from app.modules.nsfw import (
+    MetaTubeClient,
+    MetaTubeError,
+    clean_nsfw_release_text,
+    extract_nsfw_identifier,
+    normalize_code,
+)
 from app.modules.nsfw_clean_review import (
     inspect_nsfw_clean_candidate,
     nsfw_clean_review_enabled,
@@ -51,10 +59,10 @@ _SYSTEM_PROMPT = """
 
 必须遵守：
 1. 先调用 recognition.inspect_case；不得凭文件名印象直接决定。
-2. 对可能选择的候选调用 recognition.inspect_candidate。TMDB候选核对真实详情；clean_title仅核对服务器清洗证据，不代表外部元数据匹配。
+2. 对可能选择的候选调用 recognition.inspect_candidate。TMDB候选核对真实详情；MetaTube必须读取所有冻结冲突候选的真实详情，比较provider:external_id、精确番号、年份/日期、演员、厂牌等；clean_title仅核对服务器清洗证据，不代表外部元数据匹配。
 3. 剧集必须再按案例中出现的每个季调用 recognition.inspect_season，并核对每个集号真实存在。
 4. 只能从冻结候选中选择；不得新建候选、修改季集号、猜测缺失集号或绕过规则。
-5. TMDB必须有标题/别名、年份、类型及季集的一致证据；clean_title必须有已授权的光鸭成人来源、同一明确番号、无歧义分段以及保留身份的清洗变换才approve。不得把score=1当成外部查证，不能补造演员/剧情/年份；否则abstain。
+5. TMDB必须有标题/别名、年份、类型及季集的一致证据；MetaTube必须核对源文件和详情的同一精确番号、冻结身份及年份，且有源文件年份/日期/演员等证据唯一排除冲突候选。同番号不同年份不能直接视为等价，不能默认选择候选0；证据不足、详情缺失或冲突未消解必须abstain。clean_title必须有已授权的光鸭成人来源、同一明确番号、无歧义分段以及保留身份的清洗变换才approve。不得把score=1当成外部查证，不能补造演员/剧情/年份；否则abstain。
 6. 最后必须且只能调用一次 recognition.propose_review_decision。该工具只记录建议，不执行写操作。
 7. 不输出思维过程；工具接受决定后只用一句短句结束。
 """.strip()
@@ -73,6 +81,8 @@ class RecognitionReviewDecision:
     failure_code: str = ""
     entry_mode: str = ""
     episode_research_receipt: dict[str, Any] | None = None
+    # 仅保留 MetaTube 的结构化详情，不收模型解释或上游原始载荷。
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def approved(self) -> bool:
@@ -81,13 +91,14 @@ class RecognitionReviewDecision:
     def audit_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("status", None)
-        # 模型自由文本只在本次短生命周期内使用；审计只保存结构化结果，
-        # 避免把解释、文件名或潜在思维过程带入长期数据库。
+        # 默认审计不收模型自由文本；公共摘要由调用方单独脱敏、截断后保存。
         payload.pop("summary", None)
         if not self.entry_mode:
             payload.pop("entry_mode", None)
         if self.episode_research_receipt is None:
             payload.pop("episode_research_receipt", None)
+        if not self.evidence:
+            payload.pop("evidence", None)
         return payload
 
 
@@ -122,12 +133,13 @@ def _candidate_summary(candidate: dict[str, Any], index: int) -> dict[str, Any]:
         score = max(0.0, min(float(candidate.get("score", 0.0) or 0.0), 1.0))
     except (TypeError, ValueError, OverflowError):
         score = 0.0
-    return {
+    result: dict[str, Any] = {
         "index": index,
         "title": str(candidate.get("title") or "").strip()[:300],
         "year": str(candidate.get("year") or "").strip()[:8],
         "media_type": str(candidate.get("media_type") or "").strip().lower(),
         "provider": _candidate_provider(candidate),
+        "external_id": str(candidate.get("external_id") or "").strip()[:300],
         "tmdb_id": str(candidate.get("tmdb_id") or "").strip()[:32],
         "score": round(score, 4),
         "support": max(0, int(candidate.get("support") or 0)),
@@ -136,6 +148,146 @@ def _candidate_summary(candidate: dict[str, Any], index: int) -> dict[str, Any]:
             if str(item).isdigit()
         ],
     }
+    if _candidate_provider(candidate) == "metatube":
+        result["evidence"] = _metatube_projection(candidate.get("metadata"))
+    return result
+
+
+def _metatube_projection(metadata: object) -> dict[str, Any]:
+    """只投影可比对字段；不外发原始响应、图片 URL 或服务配置。"""
+    raw = metadata if isinstance(metadata, dict) else {}
+
+    def text(key: str, limit: int = 300) -> str:
+        value = raw.get(key)
+        return value.strip()[:limit] if isinstance(value, str) else ""
+
+    release_date = ""
+    try:
+        release_date = date.fromisoformat(text("release_date")[:10]).isoformat()
+    except ValueError:
+        pass
+    provider, item_id = text("provider"), text("id")
+    result: dict[str, Any] = {
+        "source_provider": provider,
+        "external_id": f"{provider}:{item_id}" if provider and item_id else "",
+        # number 必须由上游明确返回，不能采用客户端以 id 补号的回退。
+        "number": normalize_code(text("number")),
+        "title": text("title"),
+        "release_date": release_date,
+        "year": release_date[:4],
+    }
+    for key in ("actors", "genres"):
+        values = raw.get(key) or []
+        values = values if isinstance(values, (list, tuple)) else [values]
+        result[key] = [value.strip()[:100] for value in values[:20]
+                       if isinstance(value, str) and value.strip()]
+        if key == "actors":
+            result["actors_truncated"] = len(values) > 20
+    for key in ("maker", "label", "director", "series"):
+        result[key] = text(key)
+    return result
+
+
+def _metatube_source_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    rules = payload.get("rules")
+    strip_domains = str(rules.get("nsfw_strip_domains") or "") if isinstance(rules, dict) else ""
+    names = [_safe_leaf(payload.get("directory"))]
+    names.extend(_safe_leaf(item.get("name")) for item in payload.get("files") or []
+                 if isinstance(item, dict))
+    codes: list[set[str]] = []
+    texts: list[str] = []
+    for name in names:
+        remaining = clean_nsfw_release_text(name, strip_domains)
+        found: set[str] = set()
+        for _ in range(12):
+            identifier = extract_nsfw_identifier(remaining)
+            if identifier is None:
+                break
+            found.add(normalize_code(identifier.code))
+            if not identifier.matched_text or identifier.matched_text not in remaining:
+                found.add("ambiguous")
+                break
+            remaining = remaining.replace(identifier.matched_text, " ", 1)
+        else:
+            found.add("ambiguous")
+        codes.append(found)
+        # 移除番号后再提取年份，避免把 T38-1999 等番号的一部分当作年份。
+        texts.append(remaining)
+    numbers = set().union(*codes)
+    consistent = len(numbers) == 1 and len(codes) > 1 and all(
+        item == numbers or (not item and codes[0] == numbers) for item in codes[1:]
+    )
+    text = "\n".join(texts)
+    dates: set[str] = set()
+    for value in re.findall(r"(?<!\d)(?:19|20)\d{2}-\d{2}-\d{2}(?!\d)", text):
+        try:
+            dates.add(date.fromisoformat(value).isoformat())
+        except ValueError:
+            pass
+    return {
+        "number": next(iter(numbers)) if consistent else "",
+        "years": sorted(set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", text))),
+        "dates": sorted(dates),
+        "text": text,
+    }
+
+
+def _metatube_approval_failure(
+    candidates: list[dict[str, Any]], index: int,
+    details: dict[int, dict[str, Any]], source: dict[str, Any],
+) -> str:
+    """模型只能建议；冻结身份、精确番号和冲突消歧由服务器再次校验。"""
+    if not source["number"]:
+        return "metatube_source_number_ambiguous"
+    if len(source["years"]) > 1 or len(source["dates"]) > 1:
+        return "metatube_source_date_ambiguous"
+    for position, candidate in enumerate(candidates):
+        if _candidate_provider(candidate) != "metatube":
+            return "metatube_candidate_scope_conflict"
+        provider, separator, item_id = str(candidate.get("external_id") or "").strip().partition(":")
+        if (not separator or not provider or not item_id
+                or str(candidate.get("media_type") or "").strip().lower() != "movie"):
+            return "provider_not_revalidated"
+        detail = details.get(position) or {}
+        if not detail.get("found"):
+            return "metatube_details_unavailable"
+        if detail["external_id"] != f"{provider}:{item_id}":
+            return "metatube_identity_mismatch"
+        if not detail["number"]:
+            return "metatube_number_unverified"
+        frozen = _metatube_projection(candidate.get("metadata"))
+        identifier = extract_nsfw_identifier(str(candidate.get("title") or ""))
+        frozen_number = frozen["number"] or (identifier.code if identifier else "")
+        frozen_year = str(candidate.get("year") or "").strip()
+        if ((frozen_number and normalize_code(frozen_number) != detail["number"])
+                or (frozen_year and frozen_year != detail["year"])
+                or (frozen["release_date"] and frozen["release_date"] != detail["release_date"])
+                or (frozen["external_id"] and frozen["external_id"] != detail["external_id"])):
+            return "metatube_snapshot_mismatch"
+
+    source_actors = {
+        actor.casefold() for detail in details.values() for actor in detail.get("actors", [])
+        if len(actor) >= 2 and re.search(
+            r"(?<!\w)" + re.escape(actor) + r"(?!\w)", source["text"], re.IGNORECASE
+        )
+    }
+    eligible = []
+    for position, detail in details.items():
+        if (detail["number"] == source["number"]
+                and (not source["years"] or not detail["year"] or source["years"] == [detail["year"]])
+                and (not source["dates"] or not detail["release_date"] or source["dates"] == [detail["release_date"]])
+                and (not detail["actors"] or detail["actors_truncated"]
+                     or source_actors.issubset({actor.casefold() for actor in detail["actors"]}))):
+            eligible.append(position)
+    if eligible != [index]:
+        return "metatube_conflict_unresolved"
+    selected = details[index]
+    if (not selected["title"] or not (selected["year"] or source_actors)
+            or (source["years"] and source["years"] != [selected["year"]])
+            or (source["dates"] and source["dates"] != [selected["release_date"]])
+            or not source_actors.issubset({actor.casefold() for actor in selected["actors"]})):
+        return "metatube_evidence_insufficient"
+    return ""
 
 
 def _detail_projection(detail: dict[str, Any], *, media_type: str) -> dict[str, Any]:
@@ -230,8 +382,11 @@ def _model_visible_payload_is_safe(
                 candidate.get("title"),
                 candidate.get("year"),
                 candidate.get("provider"),
+                candidate.get("external_id"),
             )
         )
+        if _candidate_provider(candidate) == "metatube":
+            values.append(_metatube_projection(candidate.get("metadata")))
     return not any(
         contains_sensitive_credential(value)
         for value in values
@@ -248,10 +403,15 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             reason_code="case_file_limit_exceeded",
             summary=f"冻结案例包含 {len(files)} 个文件，超过自动复核上限 {_MAX_FILES}",
         )
-    candidates = [
-        dict(item) for item in list(payload.get("candidates") or [])[:_MAX_CANDIDATES]
-        if isinstance(item, dict)
-    ]
+    frozen_candidates = list(payload.get("candidates") or [])
+    if len(frozen_candidates) > _MAX_CANDIDATES or any(
+        not isinstance(item, dict) for item in frozen_candidates
+    ):
+        return RecognitionReviewDecision(
+            status="abstained", reason_code="invalid_frozen_candidates",
+            summary="冻结候选范围无效，已保留人工确认",
+        )
+    candidates = [dict(item) for item in frozen_candidates]
     if not candidates:
         return RecognitionReviewDecision(
             status="abstained",
@@ -286,6 +446,10 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
     inspected_details: dict[int, dict[str, Any]] = {}
     inspected_seasons: dict[tuple[int, int], set[int]] = {}
     parsed_positions: list[tuple[int | None, int | None]] = []
+    metatube_client: MetaTubeClient | None = None
+    metatube_source = _metatube_source_evidence(payload) if any(
+        _candidate_provider(item) == "metatube" for item in candidates
+    ) else {}
 
     def case_files() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -346,6 +510,9 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
                     _candidate_summary(item, index)
                     for index, item in enumerate(candidates)
                 ],
+                "metatube_source": {
+                    key: value for key, value in metatube_source.items() if key != "text"
+                },
                 "constraints": {
                     "candidate_is_frozen": True,
                     "may_change_position": False,
@@ -355,6 +522,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
         }
 
     def inspect_candidate(arguments: dict[str, Any], _context) -> dict[str, Any]:
+        nonlocal metatube_client
         if proposed:
             raise ToolPipelineError(
                 "复核决定提交后不能继续读取证据", code="decision_already_proposed"
@@ -372,12 +540,61 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             evidence = inspect_nsfw_clean_candidate(payload, candidate)
             inspected_candidates[index] = bool(evidence["ok"])
             return evidence
+        if provider == "metatube":
+            source_provider, separator, item_id = str(
+                candidate.get("external_id") or ""
+            ).strip().partition(":")
+            if media_type != "movie" or not separator or not source_provider or not item_id:
+                return {"ok": False, "status": "unsupported_candidate",
+                        "summary": "MetaTube 冻结身份不完整，保留人工确认"}
+            if index not in inspected_details:
+                projected: dict[str, Any] = {"found": False}
+                try:
+                    if metatube_client is None:
+                        endpoint = (
+                            config.get("GY_ORGANIZE_NSFW_METATUBE_ENDPOINT", "") or ""
+                        ).strip()
+                        rules = payload.get("rules")
+                        frozen_endpoint = (
+                            str(rules.get("nsfw_metatube_endpoint") or "").strip()
+                            if isinstance(rules, dict) else ""
+                        )
+                        if frozen_endpoint and frozen_endpoint.rstrip("/") != endpoint.rstrip("/"):
+                            raise MetaTubeError("MetaTube 配置已变化")
+                        metatube_client = MetaTubeClient(
+                            endpoint,
+                            config.get("GY_ORGANIZE_NSFW_METATUBE_TOKEN", "") or "",
+                            timeout=config.get_int("GY_ORGANIZE_NSFW_TIMEOUT_SECONDS", 8),
+                        )
+                    detail = metatube_client.get_movie(source_provider, item_id)
+                    evidence = _metatube_projection(detail.raw)
+                    if not contains_sensitive_credential(evidence):
+                        projected = {"found": True, **evidence}
+                except (MetaTubeError, ValueError):
+                    # 不把上游异常文本、服务地址或认证字段送给模型。
+                    pass
+                inspected_details[index] = projected
+            projected = inspected_details[index]
+            inspected_candidates[index] = bool(
+                projected["found"]
+                and projected.get("external_id") == f"{source_provider}:{item_id}"
+                and projected.get("number")
+            )
+            return {
+                "ok": inspected_candidates[index],
+                "status": "success" if inspected_candidates[index] else "not_found",
+                "summary": (
+                    "已读取 MetaTube 冻结候选详情；仍需核对源文件并排除冲突"
+                    if inspected_candidates[index] else "MetaTube 详情不足或身份不符，保留人工确认"
+                ),
+                "data": {"candidate_index": index, **projected},
+            }
         if provider != "tmdb" or media_type not in {"movie", "tv"} or not tmdb_id:
             inspected_candidates[index] = False
             return {
                 "ok": False,
                 "status": "unsupported_candidate",
-                "summary": "该候选不属于已支持的 TMDB 核验或光鸭清洗范围",
+                "summary": "该候选不属于已支持的 TMDB、MetaTube 核验或光鸭清洗范围",
                 "data": {"candidate_index": index, "provider": provider},
             }
         assert scraper is not None
@@ -499,7 +716,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
         KernelToolSpec(
             name="recognition.inspect_candidate",
             domain="recognition",
-            description="核验冻结候选：TMDB读取实时详情；已授权的光鸭clean_title读取服务器重算的番号/清洗前后/分段证据，不获取或编造完整元数据。",
+            description="核验冻结候选：TMDB读取实时详情；MetaTube仅按冻结provider:external_id读取番号、日期、演员和厂牌等结构化详情，所有冲突候选均须读取；已授权的光鸭clean_title仅核对服务器清洗证据。",
             input_schema=index_schema,
             effect=ToolEffect.READ,
             examples=("核对候选 0", "读取候选详情"),
@@ -574,9 +791,28 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
     finally:
         if scraper is not None:
             scraper.close()
+        if metatube_client is not None:
+            metatube_client.close()
 
     elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
     model_name = (settings.model or "")[:200]
+    review_evidence = [
+        {
+            "candidate_index": position,
+            "frozen_identity_matches": detail["external_id"] == str(
+                candidates[position].get("external_id") or ""
+            ).strip(),
+            "source_number_matches": bool(
+                metatube_source.get("number") == detail["number"] and detail["number"]
+            ),
+            **{key: detail[key] for key in (
+                "source_provider", "external_id", "number", "year", "release_date",
+                "actors", "actors_truncated", "maker", "label", "director", "series",
+            )},
+        }
+        for position, detail in sorted(inspected_details.items())
+        if _candidate_provider(candidates[position]) == "metatube" and detail.get("found")
+    ]
     if not proposed:
         return RecognitionReviewDecision(
             status="failed",
@@ -586,6 +822,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             tool_calls=tool_calls,
             duration_ms=elapsed_ms,
             failure_code=failure_code or "missing_decision",
+            evidence=review_evidence,
         )
     if proposed["decision"] != "approve":
         return RecognitionReviewDecision(
@@ -597,6 +834,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             model=model_name,
             tool_calls=tool_calls,
             duration_ms=elapsed_ms,
+            evidence=review_evidence,
         )
 
     index = int(proposed["candidate_index"])
@@ -616,6 +854,10 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             evidence = inspect_nsfw_clean_candidate(payload, candidate)
             if not evidence["ok"]:
                 guard_failure = evidence["reason_code"]
+    elif _candidate_provider(candidate) == "metatube":
+        guard_failure = _metatube_approval_failure(
+            candidates, index, inspected_details, metatube_source
+        )
     elif _candidate_provider(candidate) != "tmdb":
         guard_failure = "provider_not_revalidated"
     elif not inspected_candidates.get(index, False):
@@ -658,6 +900,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             model=model_name,
             tool_calls=tool_calls,
             duration_ms=elapsed_ms,
+            evidence=review_evidence,
         )
     return RecognitionReviewDecision(
         status="approved",
@@ -669,6 +912,7 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
         model=model_name,
         tool_calls=tool_calls,
         duration_ms=elapsed_ms,
+        evidence=review_evidence,
     )
 
 

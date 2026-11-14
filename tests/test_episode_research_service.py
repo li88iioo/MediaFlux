@@ -4,6 +4,7 @@ import asyncio
 import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, cast
 from unittest.mock import patch
 
 from app import config
@@ -70,36 +71,120 @@ class EpisodeResearchServiceTests(IsolatedDatabaseTestCase):
         self.assertTrue(all("/tv/100/season/0" in client.requests for client in self.clients))
         self.assertEqual(first["receipt"], second["receipt"])
 
-    def test_cache_tampering_scope_changes_or_expiry_never_authorize_mapping(self):
+    def test_explicit_approval_revalidates_when_only_proactive_review_is_disabled(self):
         result = self.research()
-        for change in ("receipt", "source", "candidate", "expiry"):
-            with self.subTest(change=change):
-                payload, receipt = copy.deepcopy(self.payload), copy.deepcopy(result["receipt"])
-                if change == "receipt": receipt["group_fingerprint"] = "0"*64
-                if change == "source": payload["files"][0]["name"] = "Other.Show.S01E11.mkv"
-                if change == "candidate": receipt["candidate_index"] = 1
-                if change == "expiry": invalidate_episode_research_cache(receipt["cache_key"])
-                before = len(self.clients)
-                with self.assertRaises(EpisodeResearchError):
-                    service.revalidate_episode_research_receipt(payload, receipt, expected_candidate_index=0, reader_factory=self.reader)
+        self.assertEqual(result["status"], "verified")
+        self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+        self.assertFalse(service.episode_research_enabled())
+        before = len(self.clients)
+        with self.assertRaises(EpisodeResearchError) as raised:
+            service.revalidate_episode_research_receipt(self.payload, result["receipt"], reader_factory=self.reader)
+        self.assertEqual(raised.exception.code, "episode_research_disabled")
+        self.assertEqual(len(self.clients), before)
+        current = service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+            expected_candidate_index=0, explicit_approval=True, reader_factory=self.reader)
+        self.assertEqual(current["mappings"], result["proposal"]["mappings"])
+        self.assertEqual(len(self.clients), before + 1)
+        self.assertIn("/tv/100/season/0", self.clients[-1].requests)
+        self.assertEqual(self.research()["reason_code"], "episode_research_disabled")
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(len(self.clients), before + 1)
+
+    def test_explicit_approval_keeps_complex_research_and_runtime_guards(self):
+        result = self.research()
+        self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+        before = len(self.clients)
+        for key, value in (("AGENT_EPISODE_RESEARCH_ENABLED", "0"), ("AGENT_ENABLED", "0"),
+                           ("AGENT_LLM_ENABLED", "0"), ("AGENT_LLM_API_URL", ""), ("AGENT_LLM_MODEL", "")):
+            with self.subTest(key=key), patch.dict(self.values, {key: value}):
+                self.assertFalse(service.episode_research_enabled(explicit_approval=True))
+                with self.assertRaises(EpisodeResearchError) as raised:
+                    service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+                        explicit_approval=True, reader_factory=self.reader)
+                self.assertEqual(raised.exception.code, "episode_research_disabled")
                 self.assertEqual(len(self.clients), before)
 
-    def test_changed_stable_episode_id_blocks_old_receipt(self):
+    def test_only_boolean_explicit_approval_can_replace_proactive_review(self):
         result = self.research()
-        self.modify_client = lambda client: client.data["/tv/100/season/0"]["episodes"][0].update(id=9999)
-        with self.assertRaises(EpisodeResearchError):
-            service.revalidate_episode_research_receipt(self.payload, result["receipt"], reader_factory=self.reader)
+        self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
+        before = len(self.clients)
+        for value in (False, None, 1, "true"):
+            with self.subTest(value=value), self.assertRaises(EpisodeResearchError) as raised:
+                service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+                    explicit_approval=cast(Any, value), reader_factory=self.reader)
+            self.assertEqual(raised.exception.code, "episode_research_disabled")
+        self.assertEqual(len(self.clients), before)
+
+    def test_cache_tampering_scope_changes_or_expiry_never_authorize_mapping(self):
+        for explicit in (False, True):
+            self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "1"
+            result = self.research()
+            self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0" if explicit else "1"
+            for change in ("receipt", "source", "candidate", "scope", "expiry"):
+                with self.subTest(explicit_approval=explicit, change=change):
+                    payload, receipt = copy.deepcopy(self.payload), copy.deepcopy(result["receipt"])
+                    if change == "receipt": receipt["group_fingerprint"] = "0"*64
+                    if change == "source": payload["files"][0]["name"] = "Other.Show.S01E11.mkv"
+                    if change == "candidate": receipt["candidate_index"] = 1
+                    if change == "scope": payload["kind"] = "local_media"
+                    if change == "expiry": invalidate_episode_research_cache(receipt["cache_key"])
+                    before = len(self.clients)
+                    with self.assertRaises(EpisodeResearchError):
+                        service.revalidate_episode_research_receipt(payload, receipt, expected_candidate_index=0,
+                            explicit_approval=explicit, reader_factory=self.reader)
+                    self.assertEqual(len(self.clients), before)
+
+    def test_changed_stable_episode_id_blocks_old_receipt(self):
+        for explicit in (False, True):
+            with self.subTest(explicit_approval=explicit):
+                self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "1"
+                self.modify_client = None
+                result = self.research()
+                self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0" if explicit else "1"
+                self.modify_client = lambda client: client.data["/tv/100/season/0"]["episodes"][0].update(id=9999)
+                with self.assertRaises(EpisodeResearchError):
+                    service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+                        explicit_approval=explicit, reader_factory=self.reader)
 
     def test_reordered_group_requires_new_research_instead_of_silent_cache_rewrite(self):
-        result = self.research()
         def change(client):
             group = client.data[f"/tv/episode_group/{GROUP_ID}"]["groups"][0]["episodes"]
             group[-4]["episode_number"], group[-1]["episode_number"] = 4, 1
             group[-4]["id"], group[-1]["id"] = 1014, 1011
-        self.modify_client = change
-        with self.assertRaises(EpisodeResearchError) as raised:
-            service.revalidate_episode_research_receipt(self.payload, result["receipt"], reader_factory=self.reader)
-        self.assertEqual(raised.exception.code, "research_evidence_changed")
+        for explicit in (False, True):
+            with self.subTest(explicit_approval=explicit):
+                self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "1"
+                self.modify_client = None
+                result = self.research()
+                self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0" if explicit else "1"
+                self.modify_client = change
+                with self.assertRaises(EpisodeResearchError) as raised:
+                    service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+                        explicit_approval=explicit, reader_factory=self.reader)
+                self.assertEqual(raised.exception.code, "research_evidence_changed")
+
+    def test_explicit_approval_rechecks_runtime_guards_after_metadata_validation(self):
+        result = self.research()
+        original = EpisodeEvidenceReader.validate
+        for key in ("AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_EPISODE_RESEARCH_ENABLED", "AGENT_ENABLED"):
+            with self.subTest(key=key), patch.dict(self.values):
+                def validate_then_disable(reader, index, group_id, *, key=key):
+                    current = original(reader, index, group_id)
+                    self.values[key] = "0"
+                    return current
+                before = len(self.clients)
+                with patch.object(EpisodeEvidenceReader, "validate", new=validate_then_disable):
+                    if key == "AGENT_RECOGNITION_REVIEW_ENABLED":
+                        current = service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+                            explicit_approval=True, reader_factory=self.reader)
+                        self.assertEqual(current["mappings"], result["proposal"]["mappings"])
+                    else:
+                        with self.assertRaises(EpisodeResearchError) as raised:
+                            service.revalidate_episode_research_receipt(self.payload, result["receipt"],
+                                explicit_approval=True, reader_factory=self.reader)
+                        self.assertEqual(raised.exception.code, "episode_research_disabled")
+                self.assertEqual(len(self.clients), before + 1)
+                self.assertIn("/tv/100/season/0", self.clients[-1].requests)
 
     def test_disabled_and_local_media_paths_do_not_call_model_or_tmdb(self):
         for kind, enabled in (("guangya", "0"), ("local_media", "1")):

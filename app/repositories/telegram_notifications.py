@@ -55,13 +55,28 @@ def upsert_notification(
         conn.execute("BEGIN IMMEDIATE")
         # 源回执与目标线程必须在同一写事务内校验/更新；只在移交前读取
         # 租约会留下终态已发布、旧接纳随后覆写的窗口。
-        if expected_confirmation_delivery is not None and conn.execute(
-            "SELECT 1 FROM organize_confirmation_delivery_outbox "
-            "WHERE id=? AND lease_generation=? AND status='sending' "
-            "AND ?='confirmation:'||confirmation_token",
-            (*expected_confirmation_delivery, thread_key),
-        ).fetchone() is None:
-            return None
+        if expected_confirmation_delivery is not None:
+            delivery = conn.execute(
+                "SELECT d.confirmation_token,d.chat_id,c.chat_id AS confirmation_chat_id,c.payload_json "
+                "FROM organize_confirmation_delivery_outbox d "
+                "LEFT JOIN organize_confirmations c ON c.token=d.confirmation_token "
+                "WHERE d.id=? AND d.lease_generation=? AND d.status='sending'",
+                expected_confirmation_delivery,
+            ).fetchone()
+            if delivery is None:
+                return None
+            if thread_key != f"confirmation:{delivery['confirmation_token']}":
+                try:
+                    confirmation_payload = json.loads(delivery["payload_json"] or "{}")
+                except (TypeError, ValueError):
+                    return None
+                batch_id = confirmation_payload.get("_confirmation_batch") if isinstance(confirmation_payload, dict) else None
+                if (not isinstance(batch_id, str) or not 16 <= len(batch_id) <= 32
+                        or any(char not in "0123456789abcdef" for char in batch_id)
+                        or thread_key != f"confirmation-batch:{batch_id}"
+                        or topic != "confirmation" or not chat_id
+                        or delivery["chat_id"] != chat_id or delivery["confirmation_chat_id"] != chat_id):
+                    return None
         row = conn.execute(
             "SELECT id,status,revision,delivered_revision,message_id,event_json,"
             "thread_key,topic,importance,chat_id FROM "

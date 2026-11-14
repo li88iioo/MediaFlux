@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}日志记录 - MediaFlux{% endblock %}
 {% block page_title %}日志记录{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ static_url('css/pages/logs.css') }}">{% endblock %}
 {% block content %}
 <div class="logs-summary" id="summary">
     <div class="stat-card organize">
@@ -72,6 +73,10 @@
             <button type="button" class="jump-btn danger" id="clearOrganizeLogsBtn" title="按当前来源、状态和关键词清理匹配的光鸭与本地整理记录"><i data-lucide="eraser"></i>清理记录</button>
         </div>
     </div>
+    <div class="confirmation-review-launch">
+        <span class="text-muted">光鸭待确认媒体组：逐项选择不同作品，统一确认。</span>
+        <button type="button" class="jump-btn" id="organizeConfirmationReviewBtn"><i data-lucide="list-checks"></i>批量审阅光鸭待确认</button>
+    </div>
     <div class="logs-batchbar">
         <div class="logs-batch-meta">
             <span class="organize-batch-count" id="organizeBatchCount">当前页已选 0 条</span>
@@ -117,6 +122,65 @@
     </div>
     <pre class="runtime-log-view" id="runtimeLogView" aria-live="polite"></pre>
 </section>
+
+<div class="app-modal confirmation-review-modal" id="confirmationReviewModal" hidden>
+    <div class="card confirmation-review-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmationReviewTitle" aria-describedby="confirmationReviewHelp">
+        <header class="organize-detail-head">
+            <div class="organize-detail-heading">
+                <h2 id="confirmationReviewTitle">批量审阅光鸭待确认</h2>
+                <p id="confirmationReviewHelp">光鸭候选队列 · 每组各自选择作品；Agent 仅只读复核，最终确认后才后台整理。</p>
+            </div>
+            <button type="button" class="icon-action" data-modal-close aria-label="关闭批量审阅"><i data-lucide="x"></i></button>
+        </header>
+        <form class="confirmation-review-filters" id="confirmationReviewFilters">
+            <label>任务<input class="form-input" id="confirmationReviewTask" name="task_id" placeholder="全部任务"></label>
+            <label>来源（精确名称）<input class="form-input" id="confirmationReviewSource" name="source" placeholder="全部光鸭来源"></label>
+            <label>原因（包含）<input class="form-input" id="confirmationReviewReason" name="reason" placeholder="全部原因"></label>
+            <label>关键词<input type="search" class="form-input" id="confirmationReviewQuery" name="q" placeholder="搜索作品或目录"></label>
+            <button type="submit" class="jump-btn">筛选队列</button>
+        </form>
+        <div class="confirmation-review-toolbar">
+            <label class="confirmation-review-scope">查看<select class="form-select" id="confirmationReviewScope" aria-label="审阅范围"><option value="pending">待确认队列</option><option value="selected">跨页已选</option><option value="batch">当前批次状态</option></select></label>
+            <div class="confirmation-review-tools">
+                <button type="button" class="jump-btn" id="confirmationReviewSelectMatching" disabled>全选匹配（最多 1000 组）</button>
+                <button type="button" class="jump-btn" id="confirmationReviewClear" disabled>清空选择</button>
+                <button type="button" class="jump-btn" id="confirmationReviewRefresh" aria-label="刷新审阅状态"><i data-lucide="refresh-cw"></i>刷新</button>
+            </div>
+        </div>
+        <div class="confirmation-review-metrics" id="confirmationReviewCounts">正在读取服务器状态…</div>
+        <div class="confirmation-review-workspace">
+            <section class="confirmation-review-queue" aria-label="待确认媒体组">
+                <label class="confirmation-review-page-select"><input type="checkbox" id="confirmationReviewSelectPage" aria-label="选择本页待确认媒体组" disabled>选择本页<span id="confirmationReviewSelectionCount">已选 0 / 1000 组</span></label>
+                <div class="confirmation-review-list" id="confirmationReviewList" aria-busy="false"><p class="confirmation-review-empty">正在读取待确认媒体组…</p></div>
+                <nav class="confirmation-review-pagination" aria-label="待确认媒体组分页">
+                    <span id="confirmationReviewPageInfo">第 1 页</span>
+                    <button type="button" class="jump-btn" id="confirmationReviewPrev" aria-label="上一页媒体组" disabled>上一页</button>
+                    <button type="button" class="jump-btn" id="confirmationReviewNext" aria-label="下一页媒体组" disabled>下一页</button>
+                </nav>
+            </section>
+            <section class="confirmation-review-inspector" aria-label="连续审阅候选">
+                <div id="confirmationReviewDetail"><p class="confirmation-review-empty">从左侧打开一个媒体组，查看文件与候选作品。</p></div>
+                <section class="confirmation-review-preview" id="confirmationReviewPreview" aria-labelledby="confirmationReviewPreviewTitle" hidden>
+                    <h3 id="confirmationReviewPreviewTitle">光鸭媒体目录预览</h3>
+                    <p id="confirmationReviewPreviewSummary"></p>
+                    <p id="confirmationReviewPreviewNote"></p>
+                    <div id="confirmationReviewPreviewItems"></div>
+                </section>
+            </section>
+        </div>
+        <footer class="confirmation-review-footer">
+            <div>
+                <p id="confirmationReviewReady">仅确认已有建议或已保存人工选择的待确认项，其余保留待确认。</p>
+                <p id="confirmationReviewState" role="status" aria-live="polite" aria-atomic="true"></p>
+            </div>
+            <div class="confirmation-review-actions">
+                <button type="button" class="jump-btn" id="confirmationReviewAgent" disabled>Agent 只读复核</button>
+                <button type="button" class="jump-btn" id="confirmationReviewPrepare" disabled>预览所选</button>
+                <button type="button" class="btn btn-primary" id="confirmationReviewSubmit" disabled>确认并后台整理</button>
+            </div>
+        </footer>
+    </div>
+</div>
 
 <div class="app-modal organize-detail-modal" id="organizeDetailModal" hidden>
     <div class="card organize-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="organizeDetailTitle">

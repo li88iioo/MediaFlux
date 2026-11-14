@@ -1,7 +1,7 @@
 """SDK 写入共用确认账本；测试真实预检/持久化，下载后端用替身。"""
 from __future__ import annotations
 
-from app.agent.kernel.ports.sdk_effects import cloud_organize_tools
+from app.agent.kernel.ports.sdk_effects import activity_confirm_organize_tool, cloud_organize_tools
 
 import asyncio
 import json
@@ -87,6 +87,7 @@ async def context_for(store, owner="sdk-owner", session="sdk-session"):
 
 def executor(store, *, authorization=None):
     catalog = ToolCatalog([*subscription_tools(), notification_test_tool(), policy_config_tool(), *cloud_organize_tools(), feature_config_tool(), *local_task_tools(), *automation_tools(), indexer_configuration_tool(), *library_audit_job_tools(), recognition_rule_tool(), *rss_configuration_tools(), *rss_delivery_tools(), *local_source_tools(), *media_path_mapping_tools(), *playback_tools(), *recognition_knowledge_tools(), *media_user_tools(), library_patrol_tool(), media_mapping_tool(), release_format_save_tool(), *media_refresh_tools(), activity_undo_tool(), activity_reorganize_tool(), *activity_follow_tools(), *schedule_policy_tools(), strm_run_tool(), *strm_failure_tools(), share_transfer_tool(), *strm_metadata_tools(), directory_scrape_tool(), resource_download_tool(), download_submit_tool(), download_retry_tool(), cloud_change_tool(), *qb_control_tools(), *cloud_recycle_tools(), *cloud_share_tools(), *watchlist_tools(), *preferences_tools()])
+    catalog.register(activity_confirm_organize_tool())
     return EffectExecutor(catalog=catalog, state_store=store, reference_store=store,
                           effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()), authorization=authorization)
 

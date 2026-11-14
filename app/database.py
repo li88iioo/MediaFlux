@@ -2802,6 +2802,123 @@ def get_organize_confirmation(token: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def query_organize_confirmations(
+    *, batch_id: str = "", task_id: str = "", source: str = "", reason: str = "",
+    keyword: str = "", status: str = "pending", tokens: list[str] | None = None,
+    chat_id: str | None = None, page: int = 1, page_size: int = 20, selection_limit: int = 1000,
+) -> dict:
+    """Web、TG 和 SDK 使用同一持久候选集合；筛选值始终为绑定参数。"""
+    clauses = ["json_valid(payload_json)", "COALESCE(json_extract(payload_json,'$.kind'),'guangya')='guangya'"]
+    values: list[object] = []
+    timestamp = now()
+    for column, value in (("organize_task_id", task_id), ("source_name", source),
+                          ("json_extract(payload_json,'$._confirmation_batch')", batch_id)):
+        if value:
+            clauses.append(f"{column}=?")
+            values.append(value)
+    if chat_id is not None:
+        clauses.append("chat_id=?")
+        values.append(chat_id)
+    if status == "expired":
+        clauses.append("(status='expired' OR (status='pending' AND expires_at<=?))")
+        values.append(timestamp)
+    elif status != "all":
+        clauses.append("status=?")
+        values.append(status)
+        if status == "pending":
+            clauses.append("expires_at>?")
+            values.append(timestamp)
+    for expression, text in (("COALESCE(json_extract(payload_json,'$.reason'),'')", reason),
+                             ("directory_path || ' ' || source_name || ' ' || "
+                              "COALESCE(json_extract(payload_json,'$.identity'),'')", keyword)):
+        if text:
+            clauses.append(f"instr(lower({expression}),lower(?))>0")
+            values.append(text)
+    if tokens is not None:
+        if not tokens:
+            return {"rows": [], "tokens": [], "total": 0, "counts": {}}
+        clauses.append("token IN (" + ",".join("?" for _ in tokens) + ")")
+        values.extend(tokens)
+    elif not batch_id:
+        clauses.append("NOT EXISTS (SELECT 1 FROM organize_confirmations newer "
+                       "WHERE newer.fingerprint=organize_confirmations.fingerprint "
+                       "AND newer.id>organize_confirmations.id)")
+    where = " FROM organize_confirmations WHERE " + " AND ".join(clauses)
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        counts = dict(conn.execute(
+            "SELECT CASE WHEN status='pending' AND expires_at<=? THEN 'expired' ELSE status END AS state,"
+            "COUNT(*)" + where + " GROUP BY state", [timestamp, *values],
+        ).fetchall())
+        total = sum(counts.values())
+        rows = conn.execute(
+            "SELECT *" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*values, page_size, min((page - 1) * page_size, total)],
+        ).fetchall()
+        selected = conn.execute(
+            "SELECT token" + where + " ORDER BY id DESC LIMIT ?", [*values, selection_limit],
+        ).fetchall()
+    return {"rows": rows, "tokens": [row["token"] for row in selected], "total": total, "counts": counts}
+
+
+def request_organize_confirmation_reviews(tokens: list[str], *, chat_id: str | None = None) -> dict:
+    """只读复核显式请求；切换模式与自动写入竞争同一数据库事务。"""
+    counts = {"requested": 0, "unchanged": 0, "unavailable": 0}
+    timestamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for token in tokens:
+            row = conn.execute("SELECT * FROM organize_confirmations WHERE token=?", (token,)).fetchone()
+            if (row is None or (chat_id is not None and row["chat_id"] != chat_id)
+                    or row["status"] != "pending" or row["expires_at"] <= timestamp):
+                counts["unavailable"] += 1
+                continue
+            payload = json.loads(row["payload_json"])
+            if not payload.get("candidates"):
+                counts["unavailable"] += 1
+                continue
+            payload["review_only"] = True
+            active = row["review_status"] in {"pending", "running", "approved"}
+            conn.execute(
+                "UPDATE organize_confirmations SET payload_json=?,review_status=?,"
+                "review_attempts=?,updated_at=? WHERE token=?",
+                (json.dumps(payload, ensure_ascii=False), row["review_status"] if active else "pending",
+                 row["review_attempts"] if active else 0, timestamp, token),
+            )
+            counts["unchanged" if active else "requested"] += 1
+    return counts
+
+
+def save_organize_confirmation_selection(token: str, candidate_index: int, *, chat_id: str | None = None) -> None:
+    """保存人工审阅草稿，不认领、不执行；迟到的模型结果不得覆盖人工选择。"""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM organize_confirmations WHERE token=?", (token,)).fetchone()
+        if row is None or (chat_id is not None and row["chat_id"] != chat_id):
+            raise ValueError("确认操作不存在或已失效")
+        if row["status"] != "pending" or row["expires_at"] <= now():
+            raise ValueError("该确认已处理或过期，请刷新列表")
+        payload = json.loads(row["payload_json"])
+        if type(candidate_index) is not int or not 0 <= candidate_index < len(payload.get("candidates") or []):
+            raise ValueError("候选参数无效")
+        retry_index = payload.get("_retry_selected_index")
+        if retry_index is not None and retry_index != candidate_index:
+            raise ValueError("该重试确认已绑定其他候选")
+        payload["review_only"] = True
+        try:
+            previous_review = json.loads(row["review_result_json"] or "{}")
+        except ValueError:
+            previous_review = {}
+        evidence = previous_review.get("evidence", []) if isinstance(previous_review, dict) else []
+        conn.execute(
+            "UPDATE organize_confirmations SET payload_json=?,review_status='approved',"
+            "review_result_json=?,review_completed_at=?,updated_at=? WHERE token=?",
+            (json.dumps(payload, ensure_ascii=False), json.dumps({"candidate_index": candidate_index,
+             "source": "human", "summary": "人工选择，尚未执行", "reason_code": "human_selected", "evidence": evidence}, ensure_ascii=False),
+             now(), now(), token),
+        )
+
+
 def activate_organize_confirmation_review(token: str) -> bool:
     """人工候选卡已可靠入队后，才允许后台 Agent 领取复核。"""
     timestamp = now()
@@ -3036,7 +3153,8 @@ def _pending_confirmation_row(conn: sqlite3.Connection, token: str, chat_id: str
 
 def claim_organize_confirmation(
     token: str, *, chat_id: str, selected_index: int, actor: str = "human",
-    event_json: str = "", message_id: int | None = None,
+    event_json: str = "", message_id: int | None = None, explicit_approval: bool = False,
+    expected_snapshot: tuple[str, str] | None = None,
 ) -> sqlite3.Row:
     """原子保存确认选择与接纳回执；过期、越权和重放统一拒绝。"""
     normalized_actor = (actor or "human").strip().lower()
@@ -3049,6 +3167,8 @@ def claim_organize_confirmation(
         # 连续点击会退化成记录创建顺序，因此仅为队列时间保留微秒。
         queued_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         row = _pending_confirmation_row(conn, token, chat_id)
+        if expected_snapshot is not None and (row["payload_json"], row["review_result_json"]) != expected_snapshot:
+            raise ValueError("确认材料已变化，请重新预览")
         expired = str(row["expires_at"] or "") <= timestamp
         if expired:
             conn.execute(
@@ -3071,6 +3191,7 @@ def claim_organize_confirmation(
         else:
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='queued',selected_index=?,"
+                "payload_json=CASE WHEN ? THEN json_set(payload_json,'$._explicit_approval',json('true')) ELSE payload_json END,"
                 "queued_at=?,confirmation_actor=?,task_id=?,error='',"
                 "review_status=CASE "
                 "WHEN ?='agent' THEN 'approved' "
@@ -3081,13 +3202,14 @@ def claim_organize_confirmation(
                 "WHEN ?='human' AND review_status IN ('waiting','pending','running') THEN ? "
                 "ELSE review_completed_at END,updated_at=? "
                 "WHERE id=? AND status='pending' "
-                "AND (?<>'agent' OR review_status='running')",
+                "AND (?<>'agent' OR ? OR (review_status='running' "
+                "AND COALESCE(json_extract(payload_json,'$.review_only'),0)=0))",
                 (
-                    selected_index, queued_at, normalized_actor, f"queue-{int(row['id']):06d}",
+                    selected_index, explicit_approval, queued_at, normalized_actor, f"queue-{int(row['id']):06d}",
                     normalized_actor, normalized_actor,
                     normalized_actor, timestamp,
                     normalized_actor, timestamp,
-                    timestamp, int(row["id"]), normalized_actor,
+                    timestamp, int(row["id"]), normalized_actor, explicit_approval,
                 ),
             )
             if cursor.rowcount != 1:

@@ -2153,6 +2153,14 @@ def _register_commands(bot, telebot):
         _handle_organize_confirmation_callback(bot, call)
 
     @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("orgb:")
+    )
+    def choose_organize_batch(call):
+        if _reject_unauthorized_group_write(bot, call):
+            return
+        _handle_organize_batch_callback(bot, call)
+
+    @bot.callback_query_handler(
         func=lambda call: str(getattr(call, "data", "")).startswith("mrs:")
     )
     def choose_media_resource(call):
@@ -2774,6 +2782,24 @@ def _dispatch_resource_download(
             )
         except Exception as reply_exc:
             logger.info("Telegram 失败提示未送达 type=%s", type(reply_exc).__name__)
+
+
+def _handle_organize_batch_callback(bot, call) -> None:
+    from app.modules.telegram_confirmation_batch import handle_batch_callback
+
+    chat_id, _user_id = _telegram_identity(call)
+    try:
+        text = handle_batch_callback(
+            str(call.data or ""), chat_id=chat_id, message_id=call.message.message_id,
+        )
+    except (TypeError, ValueError) as exc:
+        bot.answer_callback_query(call.id, str(exc or "批次确认参数无效"), show_alert=True)
+        return
+    except Exception as exc:
+        logger.warning("Telegram 整理批次处理失败 type=%s", type(exc).__name__)
+        bot.answer_callback_query(call.id, "批次处理失败，请稍后刷新重试", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, text)
 
 
 def _handle_organize_confirmation_callback(bot, call) -> None:

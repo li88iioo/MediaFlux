@@ -22,6 +22,7 @@ from app.repositories import local_media as local_media_repo
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get
 from app.logger import get_logger
+from app.sensitive_data import redact_sensitive_text
 from app.modules.directory_scrape import FixedMatchScraper
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.nsfw import (
@@ -210,6 +211,7 @@ def _fingerprint(payload: dict) -> str:
         if key not in {
             "organize_task_id", "organize_rollup", "download_request_ids", "_telegram_message_id",
             _RETRY_SELECTED_INDEX_KEY, _NOTIFICATION_SUPPRESSED_KEY, "_organize_log_upper_bound",
+            "_confirmation_batch", "review_only", "_explicit_approval",
         }
     }
     encoded = json.dumps(
@@ -323,7 +325,10 @@ def _episode_research_for_execution(token: str, payload: dict, selected_index: i
             or row["selected_index"] != selected_index or str(row["fingerprint"] or "") != _fingerprint(payload)):
         raise DirectoryScrapeConflictError("季集研究执行所有权或文件快照已变化")
     from app.modules.episode_research_service import revalidate_episode_research_receipt
-    return revalidate_episode_research_receipt(payload, receipt, expected_candidate_index=selected_index)
+    return revalidate_episode_research_receipt(
+        payload, receipt, expected_candidate_index=selected_index,
+        explicit_approval=payload.get("_explicit_approval") is True,
+    )
 
 
 class _AgentEpisodeWriteBoundary:
@@ -358,7 +363,7 @@ class _AgentEpisodeWriteBoundary:
 
     def _assert_authorized(self, plan) -> None:
         from app.modules.episode_research_service import episode_research_enabled
-        if not episode_research_enabled():
+        if not episode_research_enabled(explicit_approval=self.payload.get("_explicit_approval") is True):
             raise DirectoryScrapeConflictError("复杂季集研究已关闭，未授权后续文件变更")
         source = str(self.payload.get("source_dir_id") or "")
         rules = OrganizeRules.from_config().for_source(source)
@@ -444,7 +449,7 @@ def _persist_confirmation_actions(
             + timedelta(hours=_CONFIRMATION_TTL_HOURS)
         ),
         organize_task_id=str(persisted_payload.get("organize_task_id") or ""),
-        review_requested=_recognition_review_is_enabled(),
+        review_requested=bool(candidates) and _recognition_review_is_enabled(),
         review_ready=review_ready,
     )
     if review_ready:
@@ -503,6 +508,13 @@ def confirmation_token_from_event(event: NotificationEvent) -> str:
     return ""
 
 
+def confirmation_thread_key(token: str) -> str:
+    """候选拥有独立执行身份，同批候选共享通知线程。"""
+    row = db.get_organize_confirmation(token)
+    batch_id = str(_decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    return f"confirmation-batch:{batch_id}" if batch_id else f"confirmation:{token}"
+
+
 def publish_confirmation_event(
     event: NotificationEvent,
     *,
@@ -525,6 +537,15 @@ def publish_confirmation_event(
     resolved_token = (token or confirmation_token_from_event(event)).strip()
     if not resolved_token:
         return False
+    row = db.get_organize_confirmation(resolved_token)
+    batch_id = str(_decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    if batch_id:
+        from app.modules.telegram_confirmation_batch import publish_batch_summary
+        return publish_batch_summary(
+            batch_id, chat_id=chat_id, message_id=message_id, deliver_now=False,
+            expected_confirmation_delivery=expected_confirmation_delivery,
+            expected_revision=expected_revision,
+        )
     importance = (
         NotificationImportance.ERROR if error else
         NotificationImportance.RESULT if terminal else
@@ -587,6 +608,20 @@ def update_confirmation_lifecycle_downstream(
     from app.modules.telegram_notification_center import get_notification_thread_event
     from app.modules.telegram_notification_policy import NotificationTopic
 
+    row = db.get_organize_confirmation(token)
+    batch_id = str(_decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    if batch_id:
+        from app.modules.telegram_confirmation_batch import publish_batch_summary
+        downstream = {"strm": strm_status, "media_refresh": media_refresh,
+                      "partial": partial, "error": redact_sensitive_text(error)}
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_confirmations SET result_json=json_set("
+                "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
+                "'$._downstream',json(?)),updated_at=? WHERE token=?",
+                (json.dumps(downstream, ensure_ascii=False), db.now(), token),
+            )
+        return publish_batch_summary(batch_id, chat_id=chat_id)
     thread_key = f"confirmation:{(token or '').strip()}"
     previous = get_notification_thread_event(
         thread_key, topic=NotificationTopic.CONFIRMATION, chat_id=chat_id,
@@ -667,6 +702,9 @@ def create_confirmation_actions(
     organize_rollup = group.get("organize_rollup")
     if organize_task_id:
         payload["organize_task_id"] = organize_task_id
+    if group.get("_confirmation_batch"):
+        payload["_confirmation_batch"] = str(group["_confirmation_batch"])
+        payload["review_only"] = True
     if isinstance(organize_rollup, dict):
         payload["organize_rollup"] = dict(organize_rollup)
     if "download_request_ids" in group:
@@ -806,21 +844,22 @@ def schedule_guangya_recognition_reviews(
     source_name: str = "",
     chat_id: str = "",
 ) -> int:
-    """在通知关闭时也持久化 Agent 复核；人工日志仍保持原有待确认状态。"""
-    if not _recognition_review_is_enabled():
-        return 0
+    """通知关闭仍保留同一候选队列，Web 人工审阅不依赖 Agent 开关。"""
     groups, _actionable_count = Organizer._validated_task_confirmation_groups(stats)
+    batch_id = secrets.token_hex(8) if len(groups) > 1 else ""
+    review_enabled = _recognition_review_is_enabled()
     scheduled = 0
     for group in groups:
-        if not list(group.get("candidates") or []):
-            continue
+        group = {**group, "organize_task_id": str(stats.get("task_id") or "")}
+        if batch_id:
+            group["_confirmation_batch"] = batch_id
         try:
             actions = create_confirmation_actions(
                 group,
                 rules,
                 source_name=source_name,
                 chat_id=chat_id,
-                review_ready=True,
+                review_ready=review_enabled,
                 notification_suppressed=True,
             )
         except Exception as exc:  # noqa: BLE001 - 单组失败不能阻断整理终态
@@ -1541,6 +1580,17 @@ def _process_recognition_review_row(row) -> str:
 
     decision = review_confirmation_payload(payload)
     audit = decision.audit_payload()
+    current = db.get_organize_confirmation(token)
+    if current is not None and _decode_row(current).get("review_only"):
+        # 批量审阅只保存建议，批准与候选入队由用户的同一份预览决定。
+        saved = db.complete_organize_confirmation_review(
+            token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
+        )
+        batch_id = str(payload.get("_confirmation_batch") or "")
+        if saved and batch_id and _confirmation_delivery_enabled(payload):
+            from app.modules.telegram_confirmation_batch import publish_batch_summary
+            publish_batch_summary(batch_id, chat_id=str(row["chat_id"] or ""))
+        return decision.status if saved else "ownership_lost"
     if not decision.approved:
         db.complete_organize_confirmation_review(
             token, status=decision.status, result=audit
@@ -1578,6 +1628,12 @@ def _process_recognition_review_row(row) -> str:
         )
     except ValueError as exc:
         current = db.get_organize_confirmation(token)
+        if (current is not None and current["status"] == "pending"
+                and _decode_row(current).get("review_only")):
+            db.complete_organize_confirmation_review(
+                token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
+            )
+            return decision.status
         if (
             current is not None
             and str(current["review_status"] or "") == "running"
@@ -1773,6 +1829,9 @@ def start_confirmation(
     *,
     chat_id: str,
     actor: str = "human",
+    explicit_approval: bool = False,
+    dispatch: bool = True,
+    expected_snapshot: tuple[str, str] | None = None,
 ) -> dict:
     """持久化确认选择；人工与 Agent 竞争同一个一次性 pending 所有权。"""
     normalized_actor = (actor or "human").strip().lower()
@@ -1784,6 +1843,8 @@ def start_confirmation(
     expected_chat = str(preview["chat_id"] or "")
     if expected_chat and expected_chat != (chat_id or ""):
         raise ValueError("确认操作不存在或已失效")
+    if expected_snapshot is not None and (preview["payload_json"], preview["review_result_json"]) != expected_snapshot:
+        raise ValueError("确认材料已变化，请重新预览")
     _raise_if_confirmation_expired(preview)
 
     payload = _decode_row(preview)
@@ -1800,7 +1861,7 @@ def start_confirmation(
             raise ValueError("该重试确认已绑定其他候选")
     candidate = dict(candidates[selected_index])
     status = str(preview["status"] or "pending")
-    if normalized_actor == "agent" and _clean_review_candidate(candidate) and status == "pending":
+    if normalized_actor == "agent" and not explicit_approval and _clean_review_candidate(candidate) and status == "pending":
         _validate_agent_clean_authorization(payload, candidate)
     if normalized_actor == "agent" and status == "pending":
         receipt = _episode_research_receipt_from_row(preview)
@@ -1808,7 +1869,10 @@ def start_confirmation(
             from app.modules.episode_research_service import (
                 revalidate_episode_research_receipt,
             )
-            revalidate_episode_research_receipt(payload, receipt, expected_candidate_index=selected_index)
+            revalidate_episode_research_receipt(
+                payload, receipt, expected_candidate_index=selected_index,
+                explicit_approval=explicit_approval,
+            )
 
     if status in {"queued", "running", "completed"}:
         if (
@@ -1830,6 +1894,8 @@ def start_confirmation(
             chat_id=chat_id,
             selected_index=selected_index,
             actor=normalized_actor,
+            explicit_approval=explicit_approval,
+            expected_snapshot=expected_snapshot,
             event_json=(
                 serialize_notification_event(_confirmation_selected_event(preview, payload, candidate))
                 if _confirmation_delivery_enabled(payload) else ""
@@ -1873,9 +1939,10 @@ def start_confirmation(
             raise ValueError("确认操作已过期，请重新执行整理")
         raise
     # 原子入队时已经绑定 queue_id；此后不得清空 error，worker 可能已经失败。
-    _dispatch_due_confirmation_delivery(token)
-    _dispatch_next_queued_confirmation()
-    wake_confirmation_dispatcher()
+    if dispatch:
+        _dispatch_due_confirmation_delivery(token)
+        _dispatch_next_queued_confirmation()
+        wake_confirmation_dispatcher()
     current = db.get_organize_confirmation(token) or row
     return _confirmation_result(current, payload, candidate)
 
@@ -2632,7 +2699,7 @@ def _execute_guangya_confirmation(
     delivery_enabled = _confirmation_delivery_enabled(payload)
     clean_boundary = (
         _AgentCleanWriteBoundary(payload, candidate)
-        if actor == "agent" and _clean_review_candidate(candidate) else None
+        if actor == "agent" and not payload.get("_explicit_approval") and _clean_review_candidate(candidate) else None
     )
     episode_boundary = None
     write_boundary = clean_boundary

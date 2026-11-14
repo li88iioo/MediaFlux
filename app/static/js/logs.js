@@ -1184,3 +1184,359 @@ if (initialTab === 'runtime') {
     loadOverview();
     loadOrganize();
 }
+
+// 媒体组待确认队列独立于日志页的 50 条纠正/回收操作。
+(() => {
+    const endpoint='/api/logs/organize/confirmations';
+    const storageKey='mediaflux.logs.confirmation-review';
+    const limit=1000, pageSize=20;
+    const el=name=>document.getElementById('confirmationReview'+name);
+    const state={selected:new Set(),batch:[],cache:new Map(),drafts:new Map(),items:[],tokens:[],
+        page:1,pages:0,total:0,active:'',filters:{},counts:{},truncated:false,reviewEnabled:false,
+        serial:0,previewSerial:0,preview:null,busy:false,loading:false,synced:false,timer:null};
+    const statuses={pending:'待确认',queued:'已入队',running:'整理中',completed:'已完成',failed:'失败',expired:'已过期',cancelled:'已取消'};
+    const reviewStatuses={waiting:'等待发起只读复核',pending:'复核排队中',queued:'复核排队中',running:'只读复核中',approved:'复核已有建议',abstained:'复核弃权',completed:'复核完成',failed:'复核失败',unavailable:'复核不可用'};
+    const textValue=value=>typeof value==='object'&&value!==null?String(value.title||value.name||value.path||JSON.stringify(value)):String(value??'');
+    const evidenceLabels={number:'番号',release_date:'发行日期',actors:'演员',maker:'制作商',label:'厂牌',series:'系列'};
+    const evidenceValue=value=>Array.isArray(value)?value.map(textValue).join('、'):textValue(value);
+    const sameEntries=(left,right)=>Array.isArray(left)&&left.length===right.length&&new Set(left.map(entry=>entry.token)).size===right.length&&
+        right.every(entry=>left.some(other=>other.token===entry.token&&other.candidate_index===entry.candidate_index));
+    const title=item=>textValue(item.identity)||textValue(item.directory)||'未命名媒体组';
+    const visible=()=>!el('Modal').hidden;
+    const cleanTokens=tokens=>[...new Set((Array.isArray(tokens)?tokens:[]).filter(token=>typeof token==='string'&&token).slice(0,limit))];
+    const say=(message,error=false)=>{el('State').textContent=message;el('State').classList.toggle('is-error',error);};
+    function persist(){
+        try{sessionStorage.setItem(storageKey,JSON.stringify({selected:[...state.selected],batch:state.batch}));}catch{/* 隐私模式仍可完成本次审阅。 */}
+    }
+    function invalidatePreview(){
+        state.previewSerial++;
+        state.preview=null;
+        el('Preview').hidden=true;
+        el('Submit').disabled=true;
+    }
+    function serverIndex(item){
+        const index=item?.suggestion?.candidate_index??item?.selected_index;
+        return Number.isInteger(index)&&item.candidates?.some(candidate=>candidate.index===index)?index:null;
+    }
+    function entryFor(item){
+        const index=serverIndex(item);
+        if(item?.status!=='pending'||index===null)return null;
+        if(state.drafts.has(item.token)&&state.drafts.get(item.token)!==index)return null;
+        return {token:item.token,candidate_index:index};
+    }
+    const entriesForSelection=()=>[...state.selected].map(token=>entryFor(state.cache.get(token))).filter(Boolean);
+    function merge(items){
+        for(const item of items){
+            const previous=state.cache.get(item.token);
+            state.cache.set(item.token,item);
+            if(state.preview&&state.preview.entries.some(entry=>entry.token===item.token)&&
+                JSON.stringify(entryFor(previous))!==JSON.stringify(entryFor(item)))invalidatePreview();
+        }
+        state.items=state.items.map(item=>state.cache.get(item.token)||item);
+    }
+    async function request(path='',body){
+        const response=await api(endpoint+path,body===undefined?{}:{method:'POST',body:JSON.stringify(body)});
+        const data=await response.json();
+        if(!response.ok)throw new Error(data.error||data.detail||'请求失败，请刷新后重试');
+        return data;
+    }
+    // 冻结 token 查询不继承当前筛选；按服务端分页回读，不能用缓存授权执行。
+    async function snapshot(tokens){
+        const items=[];
+        for(let offset=0;offset<tokens.length;offset+=100){
+            const query={tokens:tokens.slice(offset,offset+100),status:'all',page_size:100};
+            let page=1,pages=1;
+            do{
+                const data=await request('/query',{...query,page});
+                items.push(...(data.items||[]));
+                pages=Number(data.pages)||0;
+                page++;
+            }while(page<=pages);
+        }
+        return items;
+    }
+    function schedule(){
+        clearTimeout(state.timer);
+        if(visible())state.timer=setTimeout(()=>load(state.page,true),4000);
+    }
+    function controls(){
+        const count=state.selected.size;
+        const locked=state.busy||!state.synced;
+        el('SelectionCount').textContent=`已选 ${count} / ${limit} 组`;
+        el('Clear').disabled=state.busy||!count;
+        el('SelectMatching').disabled=locked||state.loading||!state.tokens.length||el('Scope').value!=='pending';
+        el('Agent').disabled=locked||!count||!state.reviewEnabled;
+        el('Agent').title=state.reviewEnabled?'仅生成候选建议，不执行媒体整理':'当前未启用 Agent 复核，可手动选择候选';
+        el('Prepare').disabled=locked||!count;
+        el('Submit').disabled=locked||!state.preview;
+        el('Refresh').disabled=state.busy||state.loading;
+        el('Refresh').setAttribute('aria-busy',String(state.loading));
+        el('Prev').disabled=state.busy||state.loading||state.page<=1;
+        el('Next').disabled=state.busy||state.loading||state.page>=state.pages;
+        el('Scope').disabled=state.busy;
+        el('Filters').querySelectorAll('input,button').forEach(input=>{input.disabled=state.busy;});
+        const selectable=state.items.filter(item=>item.status==='pending');
+        const checked=selectable.filter(item=>state.selected.has(item.token)).length;
+        const selectPage=el('SelectPage');
+        selectPage.disabled=locked||state.loading||!selectable.length;
+        selectPage.checked=selectable.length>0&&checked===selectable.length;
+        selectPage.indeterminate=checked>0&&checked<selectable.length;
+        el('List').querySelectorAll('input[type="checkbox"]').forEach(input=>{
+            const item=state.cache.get(input.dataset.token);
+            input.checked=state.selected.has(input.dataset.token);
+            input.disabled=state.busy||item?.status!=='pending'||(!input.checked&&count>=limit);
+        });
+        el('List').querySelectorAll('button').forEach(button=>{button.disabled=state.busy;});
+        el('Detail').querySelectorAll('input,button').forEach(input=>{
+            const item=state.cache.get(state.active);
+            input.disabled=state.busy||(input.dataset.reviewAction!=='next'&&item?.status!=='pending');
+            if(input.dataset.reviewAction==='save')input.disabled||=!state.drafts.has(state.active);
+        });
+        const ready=entriesForSelection().length;
+        el('Ready').textContent=`已选 ${count} 组 · 已读取且可确认 ${ready} 组；未保存选择、无建议及非待确认项不提交。`;
+    }
+    function renderList(){
+        const list=el('List');
+        if(!state.items.length){
+            list.innerHTML='<p class="confirmation-review-empty">'+(el('Scope').value==='pending'?'没有匹配的待确认媒体组，可调整筛选后刷新。':'此范围暂无媒体组，可返回待确认队列选择。')+'</p>';
+            return;
+        }
+        list.querySelector('.confirmation-review-empty')?.remove();
+        const existing=new Map([...list.children].map(row=>[row.dataset.token,row]));
+        let cursor=list.firstElementChild;
+        for(const item of state.items){
+            let row=existing.get(item.token);
+            if(!row){
+                row=document.createElement('article');row.className='confirmation-review-row';row.dataset.token=item.token;
+                row.innerHTML='<label class="confirmation-review-check"><input type="checkbox"></label><button type="button" class="confirmation-review-open"><strong></strong><small></small><span class="confirmation-review-row-status"></span></button>';
+            }
+            const checkbox=row.querySelector('input');checkbox.dataset.token=item.token;
+            checkbox.setAttribute('aria-label','选择待确认媒体组 '+title(item));
+            const button=row.querySelector('button');button.dataset.token=item.token;
+            button.setAttribute('aria-label','审阅 '+title(item));button.setAttribute('aria-current',String(state.active===item.token));
+            row.classList.toggle('is-active',state.active===item.token);
+            button.querySelector('strong').textContent=title(item);
+            const context=[item.source,item.reason].filter(Boolean).join(' · ');
+            button.querySelector('small').textContent=context;button.querySelector('small').title=context;
+            const index=serverIndex(item);
+            const statusClass=item.status==='completed'?'done':['failed','expired'].includes(item.status)?'failed':item.status==='pending'?'paused':'running';
+            const statusMarkup=`<span class="status-pill ${statusClass}">${_esc(statuses[item.status]||item.status)}</span><span>${_esc(reviewStatuses[item.review_status]||(index!==null?(item.suggestion?.source==='human'?'已保存人工选择':'已有候选建议'):'等待选择'))}</span>`;
+            const statusNode=button.querySelector('.confirmation-review-row-status');
+            if(statusNode.innerHTML!==statusMarkup)statusNode.innerHTML=statusMarkup;
+            if(row!==cursor)list.insertBefore(row,cursor);
+            cursor=row.nextElementSibling;existing.delete(item.token);
+        }
+        existing.forEach(row=>row.remove());
+    }
+    function renderDetail(){
+        const item=state.cache.get(state.active), detail=el('Detail');
+        if(!item){detail.innerHTML='<p class="confirmation-review-empty">选择一个媒体组，查看文件与候选作品。</p>';delete detail.dataset.signature;return;}
+        const draft=state.drafts.has(item.token)?state.drafts.get(item.token):serverIndex(item);
+        const signature=JSON.stringify([item,draft]);
+        if(detail.dataset.signature===signature)return;
+        detail.dataset.signature=signature;
+        const suggestion=item.suggestion;
+        const files=Array.isArray(item.files)?item.files:[];
+        const candidates=Array.isArray(item.candidates)?item.candidates:[];
+        const confidence=Number(suggestion?.confidence);
+        const suggestionTitle=suggestion?.source==='human'?'已保存人工选择':suggestion?'Agent 候选建议（只读）':'尚无候选建议';
+        detail.innerHTML=`<h3>${_esc(title(item))}</h3>
+            <div class="confirmation-review-context"><span>${_esc(statuses[item.status]||item.status)} · ${_esc(item.source||'未知来源')} · 任务 ${_esc(item.task_id||'—')}</span><code>${_esc(textValue(item.directory))}</code><span>待确认原因：${_esc(item.reason||'未提供')}</span>${item.expires_at?`<span>有效期至 ${_esc(item.expires_at)}</span>`:''}${item.error?`<span class="is-error">${_esc(item.error)}</span>`:''}</div>
+            <details class="confirmation-review-files"><summary>查看 ${files.length} 个文件及季集信息</summary><ul>${files.map(file=>`<li>${_esc(file.name||textValue(file))}${file.season!=null?` · 第 ${_esc(file.season)} 季`:''}${file.episode!=null?`第 ${_esc(file.episode)} 集`:''}</li>`).join('')}</ul></details>
+            <div class="confirmation-review-suggestion"><strong>${_esc(suggestionTitle)}</strong>${_esc(suggestion?.summary||item.review_summary||reviewStatuses[item.review_status]||'手动选择候选，或对已选媒体组发起 Agent 只读复核。')}${suggestion?.reason_code?`<br>依据：${_esc(suggestion.reason_code)}`:''}${suggestion?.confidence!=null&&Number.isFinite(confidence)?` · 置信度 ${Math.round(confidence*100)}%`:''}</div>
+            ${item.downstream&&Object.keys(item.downstream).length?`<div class="confirmation-review-downstream"><strong>STRM / 媒体库后续</strong>${Object.entries(item.downstream).filter(([,value])=>value!==''&&value!==null).map(([key,value])=>`<p>${_esc(({strm:'STRM',media_refresh:'媒体库刷新',media_library:'媒体库',library:'媒体库',partial:'部分完成',status:'状态',error:'错误',message:'说明'})[key]||key)}：${_esc(typeof value==='boolean'?(value?'是':'否'):evidenceValue(value))}</p>`).join('')}</div>`:''}
+            <fieldset class="confirmation-review-candidates"><legend>候选作品 · 不会默认选择第一项</legend>${candidates.map(candidate=>`<label class="confirmation-review-candidate${draft===candidate.index?' is-selected':''}"><input type="radio" name="confirmation-review-candidate" value="${_attr(candidate.index)}" aria-label="选择候选 ${_attr(candidate.title)} (${_attr(candidate.year||'年份未知')})"${draft===candidate.index?' checked':''}><span><strong>${_esc(candidate.title||'未命名候选')} ${_esc(candidate.year||'')}</strong><small>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')} · ${_esc(candidate.media_type||'')}</small>${Object.entries(candidate.evidence||{}).filter(([,value])=>value!=null&&evidenceValue(value)).map(([key,value])=>`<small>${_esc(evidenceLabels[key]||key)}：${_esc(evidenceValue(value))}</small>`).join('')}</span></label>`).join('')||'<p class="confirmation-review-empty">没有可选候选，请保留待确认。</p>'}</fieldset>
+            <div class="confirmation-review-savebar"><button type="button" class="jump-btn" data-review-action="save">保存并下一条</button><button type="button" class="jump-btn" data-review-action="next">下一条 / 暂留待确认</button></div>`;
+    }
+    function render(){
+        renderList();renderDetail();controls();
+        el('PageInfo').textContent=`共 ${state.total} 组 · ${state.page} / ${Math.max(1,state.pages)} 页`;
+        el('Counts').textContent=Object.entries(state.counts).map(([key,count])=>`${statuses[key]||key} ${count}`).join(' · ')+(state.truncated?' · 匹配超过 1000 组，本次最多选择前 1000 组':'');
+    }
+    async function load(page=state.page,quiet=false){
+        if(!visible()||state.busy||(quiet&&state.loading)){schedule();return;}
+        const serial=++state.serial;
+        if(page!==state.page)state.active='';
+        state.page=page;state.loading=true;controls();el('List').setAttribute('aria-busy','true');
+        const scope=el('Scope').value;
+        const frozen=scope==='batch'?state.batch:[...state.selected];
+        const params=new URLSearchParams({status:scope==='pending'?'pending':'all',page:String(page),page_size:String(pageSize)});
+        if(scope==='pending')Object.entries(state.filters).forEach(([key,value])=>{if(value)params.set(key,value);});
+        try{
+            const data=scope==='pending'?await request('?'+params):frozen.length?
+                await request('/query',{tokens:frozen,status:'all',page,page_size:pageSize}):{items:[],total:0,pages:0,tokens:[],counts:{}};
+            if(serial!==state.serial||!visible())return;
+            // pending 队列中的项入队后会消失，详情仍回读其真实运行状态。
+            const active=state.active;
+            let activeItems=[];
+            if(active&&!(data.items||[]).some(item=>item.token===active))activeItems=await snapshot([active]);
+            if(serial!==state.serial||!visible())return;
+            merge([...(data.items||[]),...activeItems]);
+            state.items=data.items||[];state.tokens=cleanTokens(data.tokens);state.total=Number(data.total)||0;
+            state.pages=Number(data.pages)||0;state.page=Number(data.page)||page;state.counts=data.counts||{};
+            state.truncated=Boolean(data.selection_truncated);state.reviewEnabled=Boolean(data.review_enabled);
+            state.synced=true;
+            if(!state.active||!state.cache.get(state.active))state.active=state.items[0]?.token||'';
+            render();
+            if(!quiet)say(state.truncated?'匹配超过 1000 组，本次上限 1000 组；可细化筛选继续审阅。':'已同步服务器状态。');
+        }catch(error){if(serial===state.serial)say(`刷新失败：${error.message}。已保留列表与选择，请重试。`,true);}
+        finally{if(serial===state.serial){state.loading=false;el('List').setAttribute('aria-busy','false');controls();schedule();}}
+    }
+    function selectionChanged(){
+        invalidatePreview();persist();render();
+        if(el('Scope').value==='selected')load(1);
+    }
+    async function act(work){
+        if(state.busy||!state.synced)return;
+        state.busy=true;state.loading=false;++state.serial;clearTimeout(state.timer);controls();
+        try{await work();}catch(error){say(error.message||'操作失败，请刷新后重试',true);}
+        finally{state.busy=false;el('List').setAttribute('aria-busy','false');if(visible()){render();if(!state.synced)load();else schedule();}}
+    }
+    async function next(){
+        const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.token);
+        const index=order.indexOf(state.active), token=order[index+1];
+        if(token){
+            merge(await snapshot([token]));state.active=token;render();
+            if(el('Scope').value==='selected'||(!state.items.some(item=>item.token===token)&&state.selected.has(token))){
+                el('Scope').value='selected';
+                state.page=Math.floor((index+1)/pageSize)+1;
+                // 外层 act 解锁后再加载新页。
+                setTimeout(()=>load(state.page),0);
+            }
+        }else if(state.page<state.pages){state.active='';setTimeout(()=>load(state.page+1),0);}
+        else say('已到本次列表末尾；未选择的媒体组继续保留待确认。');
+    }
+    const modal=createAppModal(el('Modal'),{onRequestClose:({close})=>{
+        ++state.serial;state.loading=false;clearTimeout(state.timer);invalidatePreview();persist();close();
+    }});
+    function open(restored=false){
+        invalidatePreview();state.synced=false;
+        if(restored)el('Scope').value=state.batch.length?'batch':'selected';
+        else if(!state.selected.size&&!state.batch.length){
+            const params=new URLSearchParams(location.search);
+            el('Task').value=params.get('task_id')||'';
+            el('Source').value=params.get('source')||'';
+            el('Reason').value=params.get('reason')||'';
+            el('Query').value=document.getElementById('orgKeyword').value.trim();
+            state.filters={task_id:el('Task').value,source:el('Source').value,reason:el('Reason').value,q:el('Query').value};
+        }
+        modal.open(document.getElementById('organizeConfirmationReviewBtn'));load();
+    }
+    document.getElementById('organizeConfirmationReviewBtn').addEventListener('click',()=>open());
+    el('Filters').addEventListener('submit',event=>{
+        event.preventDefault();if(state.busy)return;
+        state.filters=Object.fromEntries(new FormData(event.currentTarget).entries());
+        Object.keys(state.filters).forEach(key=>state.filters[key]=state.filters[key].trim());
+        state.active='';el('Scope').value='pending';invalidatePreview();load(1);
+    });
+    el('Scope').addEventListener('change',()=>{state.active='';invalidatePreview();load(1);});
+    el('Refresh').addEventListener('click',()=>load());
+    el('Prev').addEventListener('click',()=>load(state.page-1));
+    el('Next').addEventListener('click',()=>load(state.page+1));
+    el('List').addEventListener('change',event=>{
+        const input=event.target;if(!input.matches('input[type="checkbox"]')||state.busy)return;
+        if(input.checked){if(state.selected.size<limit)state.selected.add(input.dataset.token);}
+        else state.selected.delete(input.dataset.token);
+        selectionChanged();
+    });
+    el('List').addEventListener('click',event=>{
+        const button=event.target.closest('button[data-token]');if(!button||state.busy)return;
+        state.active=button.dataset.token;render();
+        if(matchMedia('(max-width: 640px)').matches)el('Detail').scrollIntoView({block:'start'});
+    });
+    el('SelectPage').addEventListener('change',event=>{
+        for(const item of state.items.filter(item=>item.status==='pending')){
+            if(event.target.checked){if(state.selected.size<limit)state.selected.add(item.token);}
+            else state.selected.delete(item.token);
+        }
+        selectionChanged();
+    });
+    el('SelectMatching').addEventListener('click',()=>{
+        const combined=[...new Set([...state.selected,...state.tokens])];
+        state.selected=new Set(combined.slice(0,limit));selectionChanged();
+        say(state.truncated||combined.length>limit?'已选 1000 组，达到本次上限；其余匹配请细化筛选或下批处理。':`已选择 ${state.selected.size} 个媒体组，包含全部当前匹配，可跨页审阅。`);
+    });
+    el('Clear').addEventListener('click',()=>{state.selected.clear();selectionChanged();say('已清空选择，服务器上的人工选择和批次继续保留。');});
+    el('Detail').addEventListener('change',event=>{
+        if(!event.target.matches('input[type="radio"]'))return;
+        const item=state.cache.get(state.active);
+        if(item?.status!=='pending'||state.busy)return;
+        state.drafts.set(state.active,Number(event.target.value));invalidatePreview();
+        event.target.closest('fieldset').querySelectorAll('label').forEach(label=>label.classList.toggle('is-selected',label.querySelector('input').checked));
+        // 记录当前 DOM 的新签名，后台刷新无需重建用户正在操作的候选。
+        el('Detail').dataset.signature=JSON.stringify([item,state.drafts.get(state.active)]);
+        controls();say('候选尚未保存，请点击“保存并下一条”；预览不会使用未保存的选择。');
+    });
+    el('Detail').addEventListener('click',event=>{
+        const action=event.target.closest('button')?.dataset.reviewAction;if(!action)return;
+        act(async()=>{
+            if(action==='next'){await next();return;}
+            const token=state.active,index=state.drafts.get(token);
+            if(!Number.isInteger(index))return;
+            invalidatePreview();
+            await request('/selection',{token,candidate_index:index});
+            const items=await snapshot([token]);merge(items);
+            const saved=items.find(item=>item.token===token);
+            if(saved?.suggestion?.source!=='human'||serverIndex(saved)!==index)throw new Error('选择已提交，尚未从服务器读回人工选择，请刷新核实');
+            state.drafts.delete(token);say('人工选择已保存，尚未执行整理。');await next();
+        });
+    });
+    el('Agent').addEventListener('click',()=>act(async()=>{
+        invalidatePreview();
+        const tokens=[...state.selected],items=await snapshot(tokens);merge(items);
+        const eligible=items.filter(item=>item.status==='pending'&&item.suggestion?.source!=='human'&&!['pending','queued','running'].includes(item.review_status)).map(item=>item.token);
+        if(!eligible.length){say('没有需要复核的待确认项；人工选择、已排队及已完成项已保留。');return;}
+        const data=await request('/review',{tokens:eligible});
+        merge(await snapshot(eligible));
+        say(`已请求 ${data.requested??eligible.length} 组只读复核${data.unchanged?`，${data.unchanged} 组保持原状态`:''}；建议会自动刷新，未执行整理。`);
+    }));
+    el('Prepare').addEventListener('click',()=>act(async()=>{
+        invalidatePreview();const serial=state.previewSerial;
+        const tokens=[...state.selected],items=await snapshot(tokens);
+        // 缺失或过期 token 不沿用旧缓存中的建议。
+        tokens.forEach(token=>state.cache.delete(token));merge(items);
+        if(serial!==state.previewSerial||!visible())return;
+        const entries=entriesForSelection();
+        if(!entries.length){say('没有可确认项：请先获得候选建议或保存人工选择；其余继续待确认。',true);return;}
+        const data=await request('/preview',{entries});
+        if(serial!==state.previewSerial||!visible())return;
+        if(!data.digest||!sameEntries(data.entries,entries))throw new Error('预览与当前选择不一致，请重新预览');
+        if(!Array.isArray(data.items)||data.items.length!==entries.length||new Set(data.items.map(item=>item.token)).size!==entries.length||data.items.some(item=>item.error||!entries.some(entry=>entry.token===item.token)))throw new Error('部分媒体组无法预览，请刷新后检查');
+        state.preview={entries,digest:data.digest};
+        const skipped=tokens.length-entries.length;
+        el('PreviewSummary').textContent=`本次确认 ${entries.length} 组，各自使用下列候选；${skipped} 组不提交，其中仍待确认的项继续保留。`;
+        el('PreviewNote').textContent=data.note||'仅预览媒体目录；完整分类层级与文件名以后台整理规则为准。';
+        el('PreviewItems').innerHTML=data.items.map(item=>{
+            const candidate=item.candidate||{};
+            const position=(season,episode)=>`S${season==null?'?':String(season).padStart(2,'0')}E${episode==null?'?':String(episode).padStart(2,'0')}`;
+            const mappings=(item.episode_mappings||[]).map(mapping=>`<p class="confirmation-review-episode-map">${_esc(item.files?.[mapping.file_index]?.name||`文件 ${mapping.file_index+1}`)}：${_esc(position(mapping.source_season,mapping.source_episode))} → ${_esc(position(mapping.target_season,mapping.target_episode))}</p>`).join('');
+            return `<article><span>${_esc(title(item))}</span><strong>${_esc(candidate.title||textValue(candidate))} ${_esc(candidate.year||'')}</strong><span>${_esc(candidate.provider||'')} · ${_esc(candidate.external_id||candidate.tmdb_id||'')}</span><p>源目录：${_esc(textValue(item.directory))}</p><p>媒体目录：${_esc(textValue(item.target)||'暂无法确定，后台整理时计算')}</p><p>文件：${_esc((item.files||[]).map(file=>file.name||textValue(file)).join('、')||'未提供文件明细')}</p>${mappings}</article>`;
+        }).join('');
+        el('Preview').hidden=false;el('Preview').scrollIntoView({block:'nearest'});
+        say(`预览已就绪：${entries.length} 组可确认，${skipped} 组不提交。请核对各自作品与目录。`);
+    }));
+    el('Submit').addEventListener('click',()=>act(async()=>{
+        const preview=state.preview;if(!preview)return;
+        // 点击确认后仍核实服务器状态；刷新恢复绝不自动重放此 POST。
+        const items=await snapshot(preview.entries.map(entry=>entry.token));
+        const current=new Map(items.map(item=>[item.token,item]));merge(items);
+        if(preview!==state.preview||preview.entries.some(entry=>JSON.stringify(entryFor(current.get(entry.token)))!==JSON.stringify(entry))){
+            invalidatePreview();say('服务器状态或候选已变化，请重新预览；已完成项不会重复提交。',true);return;
+        }
+        invalidatePreview();state.batch=preview.entries.map(entry=>entry.token);persist();
+        let data;
+        try{data=await request('/submit',preview);}
+        catch(error){el('Scope').value='batch';state.active='';say(`提交状态待核实：${error.message}。请刷新当前批次，系统不会自动重试。`,true);return;}
+        merge((data.items||[]).map(receipt=>({...state.cache.get(receipt.token),...receipt})));
+        el('Scope').value='batch';state.active='';state.page=1;
+        say(`后台已接收 ${data.accepted??0} 组${data.failed?`，${data.failed} 组未入队`:''}；运行状态会自动刷新。`,Boolean(data.failed));
+        // 保留回执供网络刷新失败时核对；最终以服务器查询状态恢复。
+        state.items=state.batch.map(token=>state.cache.get(token)).filter(Boolean);render();
+        setTimeout(()=>load(1,true),0);
+    }));
+    try{
+        const stored=JSON.parse(sessionStorage.getItem(storageKey)||'{}');
+        state.selected=new Set(cleanTokens(stored.selected));state.batch=cleanTokens(stored.batch);
+    }catch{/* 无效会话数据不提供执行授权。 */}
+    if(state.selected.size||state.batch.length)open(true);
+})();

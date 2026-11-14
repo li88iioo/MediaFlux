@@ -138,6 +138,8 @@ def build_tool_catalog() -> ToolCatalog:
         catalog.register(tool)
     catalog.register(activity_undo_tool())
     catalog.register(activity_reorganize_tool())
+    from .ports.sdk_effects import activity_confirm_organize_tool
+    catalog.register(activity_confirm_organize_tool())
     for tool in activity_follow_tools():
         catalog.register(tool)
     catalog.register(resource_download_tool())
