@@ -40,6 +40,7 @@ from app.modules.download_dispatcher import (
     request_keys,
     request_source_alias_key,
     resubmit_download_request,
+    parse_torrent_manifest,
     route_download_url,
     torrent_download_input,
 )
@@ -771,28 +772,39 @@ def submit_download_input(
     }
 
 
-def preview_download_url(url: str, target: str) -> tuple[dict, dict]:
-    """直接链接的只读预检；共享协议路由、身份与后端就绪事实，不创建请求。"""
+def direct_url_input(url: str) -> DownloadInput:
     if not isinstance(url, str) or not url.strip() or len(url) > 8192:
         raise ValueError("请提供有效的下载链接（不超过8192字符）")
-    if target not in DOWNLOAD_TARGETS:
-        raise ValueError("下载目标无效")
     routed = route_download_url(url)
     if routed == "guangya_share":
         raise ValueError("光鸭分享链接需要先解析分享内容，再执行转存")
     if routed == "web":
         raise ValueError("这是普通网页链接，不会创建离线下载任务")
-    item = normalize_download_url(url)
+    return normalize_download_url(url)
+
+
+def direct_download_details(item: DownloadInput) -> dict:
+    """直接提交前展示的标题与种子清单摘要；不返回 tracker 或下载地址。"""
+    from app.repositories.download_requests import safe_download_text
+
+    details: dict[str, Any] = {"kind": item.kind, "title": safe_download_text(item.title)}
+    if item.torrent_data:
+        manifest = parse_torrent_manifest(item.torrent_data)
+        details.update(file_count=len(manifest.files), total_size=sum(file.length for file in manifest.files))
+    return details
+
+
+def preview_direct_download(item: DownloadInput, target: str) -> tuple[dict, dict]:
+    """直接链接或种子的只读预检；共享协议身份与后端就绪事实，不创建请求。"""
+    if target not in DOWNLOAD_TARGETS:
+        raise ValueError("下载目标无效")
     readiness = download_target_readiness(target)
     unavailable = [name for name, ready in readiness.items() if not ready]
     if unavailable:
         labels = {"qb": "qBittorrent", "guangya": "光鸭"}
         raise ValueError("、".join(labels[name] for name in unavailable) + " 尚未配置或登录")
-    from app.repositories.download_requests import safe_download_text
-
     preview = {
-        "source_type": "direct_url", "kind": item.kind,
-        "title": safe_download_text(item.title), "target": target, "backends": readiness,
+        "source_type": "direct_url", **direct_download_details(item), "target": target, "backends": readiness,
         "effects": ["创建幂等下载请求", "提交到所选下载后端", "保留后续整理与 STRM 跟踪"],
     }
     snapshot: dict[str, Any] = {"identity": request_key(item), "target": target, "backends": readiness}
@@ -801,16 +813,16 @@ def preview_download_url(url: str, target: str) -> tuple[dict, dict]:
     return preview, snapshot
 
 
-def submit_download_url(url: str, target: str, *, origin: str,
-                        expected_snapshot: dict | None = None,
-                        check_cancelled: Callable[[], None] | None = None) -> dict:
-    """直接链接只准入首次提交；已有活跃请求不会隐式补投失败后端。"""
-    preview, snapshot = preview_download_url(url, target)
+def submit_direct_download(item: DownloadInput, target: str, *, origin: str,
+                           expected_snapshot: dict | None = None,
+                           check_cancelled: Callable[[], None] | None = None) -> dict:
+    """直接链接或种子只准入首次提交；已有活跃请求不会隐式补投失败后端。"""
+    preview, snapshot = preview_direct_download(item, target)
     if expected_snapshot is not None and snapshot != expected_snapshot:
         raise DownloadSnapshotChanged()
     if check_cancelled is not None:
         check_cancelled()
-    created = create_request(normalize_download_url(url), "", "", origin=origin)
+    created = create_request(item, "", "", origin=origin)
     request_id = int(created["id"])
     try:
         credentials = ({"guangya_credential_generation": snapshot["guangya_credential_generation"]}
@@ -829,6 +841,17 @@ def submit_download_url(url: str, target: str, *, origin: str,
             "target": target, "kind": preview["kind"], "source_type": "direct_url",
             "title": preview["title"],
             "summary": f"下载请求 #{request_id} {message}"}
+
+
+def preview_download_url(url: str, target: str) -> tuple[dict, dict]:
+    return preview_direct_download(direct_url_input(url), target)
+
+
+def submit_download_url(url: str, target: str, *, origin: str,
+                        expected_snapshot: dict | None = None,
+                        check_cancelled: Callable[[], None] | None = None) -> dict:
+    return submit_direct_download(direct_url_input(url), target, origin=origin,
+                                  expected_snapshot=expected_snapshot, check_cancelled=check_cancelled)
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,11 @@ from app.modules.qb_control import QBControlConflict
 from tests.support import InitializedWebTestCase, isolated_test_database
 
 
-class DownloadBatchActionApiTests(InitializedWebTestCase):
+class LoggedInDownloadsApiCase(InitializedWebTestCase):
+    """下载 API 测试共用的登录会话与 CSRF 头；本类不含测试方法。"""
+
+    client: TestClient
+
     def setUp(self) -> None:
         from tests.support import initialized_web_runtime
         self.enterContext(initialized_web_runtime())
@@ -46,6 +50,9 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 302)
         page = self.client.get("/downloads")
         return {"X-CSRF-Token": self._csrf_token(page)}
+
+
+class DownloadBatchActionApiTests(LoggedInDownloadsApiCase):
 
     def test_qb_connection_test_uses_current_draft_without_saving(self):
         headers = self._headers()
@@ -305,3 +312,68 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertIn("qB 任务移除未确认", response.json()["error"])
         self.assertNotIn("success", response.json())
+
+
+def _torrent_bytes(name: bytes = "测试.S01E01.mkv".encode()) -> bytes:
+    from tests.test_torrent_manifest import _torrent
+
+    return _torrent({b"length": 4_096, b"name": name, b"piece length": 16_384, b"pieces": b"0" * 20})
+
+
+class DirectDownloadApiTests(LoggedInDownloadsApiCase):
+    @staticmethod
+    def _request_count() -> int:
+        from app import database as db
+
+        with db.get_conn() as conn:
+            return conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0]
+
+    def test_preview_reads_torrent_or_link_without_creating_requests(self):
+        headers = self._headers()
+        response = self.client.post("/api/downloads/direct/preview", headers=headers,
+                                    files={"file": ("测试.torrent", _torrent_bytes(), "application/x-bittorrent")})
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual((payload["kind"], payload["title"], payload["file_count"], payload["total_size"]),
+                         ("torrent", "测试.S01E01.mkv", 1, 4_096))
+        self.assertEqual(set(payload["backends"]), {"qb", "guangya"})
+        self.assertNotIn("tracker", response.text)
+        magnet = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Show&tr=" + "x" * 1500
+        response = self.client.post("/api/downloads/direct/preview", headers=headers, data={"url": magnet})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["kind"], "magnet")
+        self.assertEqual(self._request_count(), 0)
+
+    def test_invalid_inputs_are_rejected_before_any_request(self):
+        headers = self._headers()
+        magnet = "magnet:?xt=urn:btih:" + "a" * 40
+        cases: tuple[tuple[dict[str, str] | None, dict[str, tuple[str, bytes, str]] | None], ...] = (
+            (None, {"file": ("a.txt", b"hello", "text/plain")}),
+            (None, {"file": ("bad.torrent", b"not bencode", "application/x-bittorrent")}),
+            (None, {"file": ("huge.torrent", b"0" * (4 * 1024 * 1024 + 1), "application/x-bittorrent")}),
+            ({"url": "https://example.com/page"}, None),
+            ({"url": magnet}, {"file": ("x.torrent", _torrent_bytes(), "application/x-bittorrent")}),
+        )
+        for data, files in cases:
+            with self.subTest(data=data, files=files and list(files["file"][:1])):
+                response = self.client.post("/api/downloads/direct/preview", headers=headers, data=data, files=files)
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.client.post("/api/downloads/direct/preview",
+                                          data={"url": "magnet:?xt=urn:btih:" + "a" * 40}).status_code, 403)
+        self.assertEqual(self._request_count(), 0)
+
+    def test_submit_uses_the_shared_direct_download_service(self):
+        headers = self._headers()
+        result = {"request_id": 7, "status": "submitted", "summary": "下载请求 #7 已提交"}
+        with patch("app.indexers.downloads.submit_direct_download", return_value=result) as submit:
+            response = self.client.post("/api/downloads/direct/submit", headers=headers, data={"target": "qb"},
+                                        files={"file": ("测试.torrent", _torrent_bytes(), "application/x-bittorrent")})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["request_id"], 7)
+        item, target = submit.call_args.args
+        self.assertEqual((item.kind, item.title, target, submit.call_args.kwargs["origin"]), ("torrent", "测试.S01E01.mkv", "qb", "web"))
+        with patch("app.indexers.downloads.submit_direct_download", side_effect=ValueError("下载目标无效")):
+            response = self.client.post("/api/downloads/direct/submit", headers=headers,
+                                        data={"target": "nope", "url": "magnet:?xt=urn:btih:" + "b" * 40})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("下载目标无效", response.text)

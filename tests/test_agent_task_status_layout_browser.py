@@ -28,14 +28,17 @@ class TaskStatusLayoutBrowserTests(AgentShellBrowserCase):
                 button = page.locator("#agentRestoreNew").bounding_box()
                 assert button is not None
                 self.assertLessEqual(button["y"] + button["height"], notice["y"] + notice["height"] + 0.5)
-                # 空输入框不显示任何操作按钮；窄屏会话入口在顶栏且保持 44px 触控尺寸。
-                self.assertEqual(page.locator("#agentComposer :is(a, button):visible").count(), 0)
+                # 空输入框只显示 + 添加种子；窄屏会话入口在顶栏，二者都保持 44px 触控尺寸。
+                controls = page.locator("#agentComposer :is(a, button):visible")
+                self.assertEqual(controls.count(), 1)
+                self.assertEqual(controls.first.get_attribute("id"), "agentAttach")
                 self.assertTrue(page.locator("#agentSend").is_hidden())
                 self.assertFalse(page.locator("#agentStopSession").is_visible())
-                toggle = page.locator("#toggleAgentRail").bounding_box()
-                assert toggle is not None
-                self.assertGreaterEqual(toggle["width"], 44)
-                self.assertGreaterEqual(toggle["height"], 44)
+                for selector in ("#agentAttach", "#toggleAgentRail"):
+                    box = page.locator(selector).bounding_box()
+                    assert box is not None
+                    self.assertGreaterEqual(box["width"], 44)
+                    self.assertGreaterEqual(box["height"], 44)
                 page.locator("#agentPrompt").click(position={"x": 20, "y": 8})
                 self.assertEqual(page.evaluate("document.activeElement.id"), "agentPrompt")
                 self.assertEqual(page.locator(".agent-console").evaluate("n=>n.scrollLeft"), 0)

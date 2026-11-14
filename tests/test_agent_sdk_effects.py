@@ -588,7 +588,7 @@ def test_native_download_cancel_during_shared_preflight_never_writes(retry_backe
                      if method == "downloads.submit" else {"request_id": retry_backend.request_id, "target": "qb"})
         plan = (await effects.prepare(method, arguments, context=context)).effect_plan
         assert plan is not None
-        target, name = ((downloads, "preview_download_url") if method == "downloads.submit"
+        target, name = ((downloads, "preview_direct_download") if method == "downloads.submit"
                         else (download_dispatcher, "_download_retry_snapshot"))
         original = getattr(target, name)
         calls = 0

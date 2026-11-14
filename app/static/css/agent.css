@@ -2024,3 +2024,25 @@ body.agent-page-body::after { display: none; }
 .agent-channel-notice small { display: block; margin-top: 2px; font-size: 12px; }
 .agent-console.is-channel .agent-message-reply, .agent-console.is-channel .agent-start-panel, .agent-console.is-channel .agent-empty-intro { display: none; }
 .agent-composer[hidden] { display: none !important; }
+
+/* + 添加种子：输入框左侧；下载卡片由用户选目标后提交，不经过模型。 */
+.agent-attach { flex: 0 0 36px; width: 36px; height: 36px; margin-bottom: 4px; display: inline-grid; place-items: center; padding: 0; color: var(--text-secondary); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
+.agent-attach:hover { color: var(--accent); background: var(--accent-soft); }
+.agent-attach:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 2px; }
+.agent-attach svg { width: 18px; height: 18px; }
+.agent-console.is-empty .agent-composer { padding-left: 7px; }
+.agent-download-card { display: grid; gap: 6px; max-width: 560px; padding: 14px 16px; background: var(--bg-card); border: 1px solid var(--agent-line); border-radius: 16px; }
+.agent-download-title { color: var(--text-primary); font-size: 14px; font-weight: 650; overflow-wrap: anywhere; }
+.agent-download-meta { margin: 0; color: var(--text-secondary); font-size: 12px; }
+.agent-download-card.is-error .agent-download-meta { color: var(--danger); }
+.agent-download-card.is-done .agent-download-meta { color: var(--accent); }
+.agent-download-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.agent-download-target { height: 38px; padding: 0 10px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border-strong); border-radius: 9px; font: inherit; font-size: 13px; }
+.agent-download-submit, .agent-download-cancel { height: 38px; padding: 0 14px; border-radius: 9px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.agent-download-submit { color: #ffffff; background: var(--accent); border: 1px solid var(--accent); }
+.agent-download-submit:disabled { opacity: .55; cursor: default; }
+.agent-download-cancel { color: var(--text-secondary); background: transparent; border: 1px solid var(--agent-line); }
+@media (max-width: 680px) {
+    .agent-download-target, .agent-download-submit, .agent-download-cancel { height: 44px; font-size: 16px; }
+    .agent-attach { flex-basis: 44px; width: 44px; height: 44px; margin-bottom: 0; }
+}

@@ -5,7 +5,7 @@ import logging
 import re
 import time
 
-from fastapi import APIRouter, Body, Query, Request
+from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile
 
 from app import config
 from app.repositories import download_requests as download_requests_repo
@@ -665,3 +665,51 @@ def qb_action(action: str, request: Request, data: dict | None = Body(default=No
         return api_error("连接失败，请检查地址、认证信息和网络", 502)
     finally:
         close_qbittorrent_client(client)
+
+
+_MAX_TORRENT_BYTES = 4 * 1024 * 1024
+
+
+def _direct_item(url: str, upload: UploadFile | None):
+    """Web 直接提交只接受一个 .torrent 种子或一条下载链接，复用 TG 与 Agent 的同一套解析。"""
+    from app.indexers.downloads import direct_url_input
+    from app.modules.download_dispatcher import torrent_download_input
+
+    if upload is not None and url.strip():
+        raise ValueError("一次只能提交一个种子或一条链接")
+    if upload is None:
+        return direct_url_input(url)
+    name = upload.filename or "upload.torrent"
+    if not name.lower().endswith(".torrent"):
+        raise ValueError("仅支持 .torrent 种子文件")
+    data = upload.file.read(_MAX_TORRENT_BYTES + 1)
+    if not data or len(data) > _MAX_TORRENT_BYTES:
+        raise ValueError("种子文件为空或超过 4 MB")
+    return torrent_download_input(name, data)
+
+
+@router.post("/direct/preview")
+def preview_direct_download(request: Request, url: str = Form(""), file: UploadFile | None = File(None)):
+    """只读解析种子或链接，返回标题、文件摘要与各下载后端就绪状态；不创建请求。"""
+    require_api_login(request)
+    from app.indexers.downloads import direct_download_details, download_target_readiness
+
+    try:
+        details = direct_download_details(_direct_item(url, file))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    return api_response({**details, "backends": download_target_readiness("both")})
+
+
+@router.post("/direct/submit")
+def submit_direct_download(request: Request, target: str = Form(""), url: str = Form(""),
+                           file: UploadFile | None = File(None)):
+    """创建幂等下载请求并提交到所选后端；与 Agent 的 downloads.submit 共用同一服务。"""
+    require_api_login(request)
+    from app.indexers import downloads
+
+    try:
+        result = downloads.submit_direct_download(_direct_item(url, file), target, origin="web")
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    return api_response(result)

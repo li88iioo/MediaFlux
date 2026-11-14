@@ -419,6 +419,51 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.wait_for_function("() => window.__kernelCalls.some(call => call.url === '/api/agent/channels')")
         self.assertTrue(page.locator('#agentChannels').is_hidden())
 
+    def test_attached_torrent_becomes_a_download_card_without_calling_the_model(self):
+        page = self.page({'directPreview': {'kind': 'torrent', 'title': '诛仙.S04E15.2160p', 'file_count': 2,
+                                            'total_size': 1_524_000_000, 'backends': {'qb': True, 'guangya': False}},
+                          'directSubmit': {'request_id': 9, 'summary': '下载请求 #9 已提交'}})
+        self.assertTrue(page.locator('#agentAttach').is_visible())
+        page.locator('#agentAttachFile').set_input_files(files=[{
+            'name': 'zhuxian.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'd4:infod4:name1:aee'}])
+        card = page.locator('.agent-download-card')
+        card.locator('.agent-download-submit').wait_for()
+        self.assertIn('诛仙.S04E15.2160p', card.inner_text())
+        self.assertIn('2 个文件', card.inner_text())
+        self.assertEqual(page.locator('.agent-download-target').input_value(), 'qb')
+        self.assertTrue(page.locator('.agent-download-target option[value="guangya"]').is_disabled())
+        self.assertTrue(page.locator('.agent-download-target option[value="both"]').is_disabled())
+        card.locator('.agent-download-submit').click()
+        card.locator('.agent-download-meta', has_text='下载请求 #9 已提交').wait_for()
+        forms = page.evaluate('window.__directForms')
+        self.assertEqual(forms[0], [['file', 'zhuxian.torrent']])
+        self.assertEqual(forms[1], [['file', 'zhuxian.torrent'], ['target', 'qb']])
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
+        self.assertEqual(card.locator('.agent-download-submit').count(), 0)
+
+    def test_pasting_a_long_magnet_creates_a_card_instead_of_hitting_the_prompt_limit(self):
+        magnet = 'magnet:?xt=urn:btih:' + 'a' * 40 + '&dn=Show&tr=' + 'udp%3A%2F%2Ftracker.example%3A1337' * 40
+        page = self.page({'directPreview': {'kind': 'magnet', 'title': 'Show', 'backends': {'qb': True, 'guangya': True}}})
+        page.locator('#agentPrompt').focus()
+        page.evaluate("""text => {
+            const data = new DataTransfer(); data.setData('text', text);
+            document.querySelector('#agentPrompt').dispatchEvent(new ClipboardEvent('paste', {clipboardData: data, bubbles: true, cancelable: true}));
+        }""", magnet)
+        page.locator('.agent-download-card .agent-download-submit').wait_for()
+        self.assertEqual(page.locator('#agentPrompt').input_value(), '')
+        self.assertEqual(page.evaluate('window.__directForms[0]'), [['url', magnet]])
+        self.assertIn('磁力链接', page.locator('.agent-download-card').inner_text())
+        page.locator('.agent-download-cancel').click()
+        self.assertEqual(page.locator('.agent-download-card').count(), 0)
+
+    def test_unparseable_attachment_reports_error_and_offers_no_submit(self):
+        page = self.page()
+        page.locator('#agentAttachFile').set_input_files(files=[{
+            'name': 'broken.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'broken'}])
+        page.locator('.agent-download-card.is-error').wait_for()
+        self.assertIn('无法解析', page.locator('.agent-download-card').inner_text())
+        self.assertEqual(page.locator('.agent-download-submit').count(), 0)
+
     def test_completion_and_error_do_not_pull_reader_to_bottom(self):
         for outcome in ('turn.completed', 'turn.failed'):
             with self.subTest(outcome=outcome):

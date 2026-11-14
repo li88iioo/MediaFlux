@@ -71,6 +71,8 @@ HTML = """
           <button type="button" class="agent-new-replies" id="agentNewReplies" hidden><span>回到底部</span></button>
           <form class="agent-composer" id="agentComposer">
             <div class="agent-reply-bar" id="agentReplyBar" hidden><div class="agent-reply-bar-text"><small>正在回复</small><p id="agentReplyText"></p></div><button type="button" class="agent-reply-cancel" id="agentReplyCancel" aria-label="取消回复">取消</button></div>
+            <button type="button" class="agent-attach" id="agentAttach" aria-label="添加种子文件">+</button>
+            <input type="file" id="agentAttachFile" accept=".torrent,application/x-bittorrent" hidden>
             <div class="agent-composer-input-wrap">
               <textarea id="agentPrompt" rows="1" maxlength="1000" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea>
             </div>
@@ -206,6 +208,14 @@ MOCK_FETCH = r"""
     if (path === '/api/agent/next-actions') {
       if (window.__kernelConfig.nextActionsDelayMs) await new Promise(resolve => setTimeout(resolve, window.__kernelConfig.nextActionsDelayMs));
       return jsonResponse(window.__kernelConfig.nextActions || {actions: [], snapshot_status: 'idle'}, window.__kernelConfig.nextActionsStatus || 200);
+    }
+    if (path === '/api/downloads/direct/preview') {
+      window.__directForms = (window.__directForms || []).concat([[...options.body.entries()].map(([key, value]) => [key, typeof value === 'string' ? value : value.name])]);
+      return window.__kernelConfig.directPreview ? jsonResponse(window.__kernelConfig.directPreview) : jsonResponse({error: '无法解析'}, 400);
+    }
+    if (path === '/api/downloads/direct/submit') {
+      window.__directForms = (window.__directForms || []).concat([[...options.body.entries()].map(([key, value]) => [key, typeof value === 'string' ? value : value.name])]);
+      return jsonResponse(window.__kernelConfig.directSubmit || {request_id: 1, summary: '下载请求 #1 已提交'});
     }
     if (path === '/api/agent/channels') return jsonResponse({channels: window.__kernelConfig.channels || []});
     if (path.startsWith('/api/agent/channels/')) {

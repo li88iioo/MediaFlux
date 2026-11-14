@@ -381,7 +381,7 @@
     function appendMessage(role, {recovered = false, scroll = true} = {}) {
         const item = element('article', `agent-message agent-message-${role}`);
         if (recovered) item.classList.add('is-recovered');
-        item.setAttribute('aria-label', role === 'user' ? '你的消息' : '助手回复');
+        item.setAttribute('aria-label', role === 'user' ? '你的消息' : role === 'download' ? '下载提交' : '助手回复');
         const body = element('div', 'agent-message-body');
         item.append(body);
         if (role === 'assistant') {
@@ -407,6 +407,84 @@
         if (replyTo) view.body.append(element('blockquote', 'agent-message-quote', clipText(replyTo, 140)));
         view.body.append(element('p', '', text));
         return view;
+    }
+
+    const MAGNET_RE = /^magnet:\?\S*xt=urn:bt[im]h:/i;
+    const DOWNLOAD_TARGET_LABELS = {qb: 'qBittorrent', guangya: '光鸭', both: '两者'};
+
+    function formatBytes(value) {
+        let size = Number(value) || 0;
+        const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+        let unit = 0;
+        while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+        return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
+    }
+
+    function directDownloadForm(source, target = '') {
+        const form = new FormData();
+        if (source.file) form.append('file', source.file, source.file.name);
+        else form.append('url', source.url);
+        if (target) form.append('target', target);
+        return form;
+    }
+
+    // + 上传种子或粘贴磁力链接：不经过模型，和 Telegram 发种子一样直接建下载请求，由用户选目标后提交。
+    async function createDownloadCard(source) {
+        const view = appendMessage('download');
+        const card = element('section', 'agent-download-card');
+        const heading = element('strong', 'agent-download-title', source.file ? source.file.name : '磁力链接');
+        const meta = element('p', 'agent-download-meta', '正在解析…');
+        card.append(heading, meta);
+        view.body.append(card);
+        let preview;
+        try {
+            preview = await fetchJSON('/api/downloads/direct/preview', {method: 'POST', body: directDownloadForm(source)});
+        } catch (error) {
+            meta.textContent = error?.message || '无法解析，请确认种子或链接完整';
+            card.classList.add('is-error');
+            return;
+        }
+        heading.textContent = String(preview.title || heading.textContent);
+        meta.textContent = preview.kind === 'torrent'
+            ? `种子 · ${preview.file_count || 0} 个文件 · ${formatBytes(preview.total_size)}`
+            : '磁力链接';
+        const backends = preview.backends || {};
+        const select = element('select', 'agent-download-target');
+        select.setAttribute('aria-label', '下载目标');
+        for (const target of ['qb', 'guangya', 'both']) {
+            const ready = target === 'both' ? backends.qb && backends.guangya : backends[target];
+            const option = element('option', '', `${DOWNLOAD_TARGET_LABELS[target]}${ready ? '' : '（未就绪）'}`);
+            option.value = target;
+            option.disabled = !ready;
+            select.append(option);
+        }
+        const firstReady = [...select.options].find(option => !option.disabled);
+        if (firstReady) select.value = firstReady.value;
+        const submit = element('button', 'agent-download-submit', '提交下载');
+        submit.type = 'button';
+        submit.disabled = !firstReady;
+        const cancel = element('button', 'agent-download-cancel', '取消');
+        cancel.type = 'button';
+        const actions = element('div', 'agent-download-actions');
+        actions.append(select, submit, cancel);
+        card.append(actions);
+        cancel.addEventListener('click', () => view.item.remove());
+        submit.addEventListener('click', async () => {
+            submit.disabled = cancel.disabled = select.disabled = true;
+            submit.textContent = '正在提交…';
+            try {
+                const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, select.value)});
+                meta.textContent = String(result.summary || `下载请求 #${result.request_id} 已受理`);
+                actions.remove();
+                card.classList.add('is-done');
+            } catch (error) {
+                meta.textContent = error?.message || '提交失败，请稍后在下载页核对';
+                submit.disabled = cancel.disabled = select.disabled = false;
+                submit.textContent = '重试提交';
+                card.classList.add('is-error');
+            }
+        });
+        scrollToBottom(true);
     }
 
     const REPLY_LIMIT = 2000;
@@ -3517,6 +3595,20 @@
     document.getElementById('agentRestoreRetry')?.addEventListener('click', restoreInitialSession);
     document.getElementById('agentRestoreNew')?.addEventListener('click', startNewSession);
     mainChatButton?.addEventListener('click', openMainChat);
+    const attachFile = document.getElementById('agentAttachFile');
+    document.getElementById('agentAttach')?.addEventListener('click', () => attachFile?.click());
+    attachFile?.addEventListener('change', () => {
+        const file = attachFile.files?.[0];
+        attachFile.value = '';
+        if (file) createDownloadCard({file});
+    });
+    promptInput?.addEventListener('paste', (event) => {
+        const text = String(event.clipboardData?.getData('text') || '').trim();
+        if (!MAGNET_RE.test(text) || /\s/.test(text)) return;
+        // 带 tracker 的磁力链接常超过输入框 1000 字上限，直接转为下载卡片。
+        event.preventDefault();
+        createDownloadCard({url: text});
+    });
     channelList?.addEventListener('click', (event) => {
         const open = event.target.closest('[data-channel-open]');
         if (open) openChannel(open.dataset.channelOpen || '');
