@@ -1,6 +1,7 @@
 """RSS 订阅、条目状态机与诊断的数据访问。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from contextlib import nullcontext
@@ -298,6 +299,7 @@ def add_rss_entry_with_media(
     season: int | None = None,
     episode: int | None = None,
     skip_reason: str = "",
+    reassess_library_skip: bool = False,
     connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """按 guid 与可信 media_key 去重；传入连接时加入调用方的写事务。"""
@@ -307,52 +309,63 @@ def add_rss_entry_with_media(
             return add_rss_entry_with_media(
                 sub_id, title, guid, pub_date=pub_date, payload=payload,
                 media_key=media_key, tmdb_id=tmdb_id, season=season,
-                episode=episode, skip_reason=skip_reason, connection=conn,
+                episode=episode, skip_reason=skip_reason, reassess_library_skip=reassess_library_skip, connection=conn,
             )
     timestamp = db.now()
     normalized_key = (media_key or "").strip()
     normalized_reason = (skip_reason or "").strip()[:160]
     duplicate_guid = connection.execute(
-        "SELECT e.id,e.status,m.media_key,m.skip_reason FROM rss_entries e "
+        "SELECT e.id,e.payload,e.processed_at,"
+        "(e.status='skipped' AND e.processed=1 AND e.title=? AND m.tmdb_id=? AND m.tmdb_id!='' "
+        "AND (m.skip_reason=? OR (m.skip_reason='媒体库已存在该剧集' AND ?)) AND e.download_request_id IS NULL "
+        "AND e.download_request_key='' AND e.download_backend='' AND COALESCE(e.submitted_at,'')='' "
+        "AND e.failure_code='' AND e.failure_retryable=0 AND e.retry_count=0 AND COALESCE(e.failed_at,'')='') AS unconsumed "
+        "FROM rss_entries e "
         "LEFT JOIN rss_entry_media m ON m.rss_entry_id=e.id "
-        "WHERE e.rss_item_id=? AND e.guid=? LIMIT 1", (sub_id, guid),
+        "WHERE e.rss_item_id=? AND e.guid=? LIMIT 1", (title, tmdb_id, _RSS_MEDIA_DUPLICATE_REASON, reassess_library_skip, sub_id, guid),
     ).fetchone()
     if duplicate_guid is not None:
-        # 自动语义跳过是可重评估的发现结果；人工跳过与库内跳过不重开。
-        if (duplicate_guid["status"] == "skipped"
-                and duplicate_guid["skip_reason"] == _RSS_MEDIA_DUPLICATE_REASON
-                and normalized_key and duplicate_guid["media_key"] == normalized_key
-                and not normalized_reason
-                and _rss_media_blocker(connection, normalized_key, exclude_id=duplicate_guid["id"]) is None):
-            connection.execute(
-                "UPDATE rss_entries SET status='pending',processed=0,processed_at=NULL WHERE id=?",
-                (duplicate_guid["id"],),
-            )
-            connection.execute(
-                "UPDATE rss_entry_media SET skip_reason='',updated_at=? WHERE rss_entry_id=?",
-                (timestamp, duplicate_guid["id"]),
-            )
-        return {"id": None, "status": "duplicate_guid", "skip_reason": ""}
-    if normalized_key and not normalized_reason and _rss_media_blocker(connection, normalized_key):
+        # 只重评未消费、来源未变的自动发现结果；不改写用户选择或下载回执。
+        try:
+            sources = [
+                (value.get("link", ""), value.get("torrent_url", "")) if isinstance(value, dict) else ("", "")
+                for value in (json.loads(duplicate_guid["payload"] or "{}"), json.loads(payload or "{}"))
+            ]
+        except (TypeError, ValueError):
+            sources = [("", ""), ("", "")]
+        if not (duplicate_guid["unconsumed"] and any(sources[0]) and sources[0] == sources[1]):
+            return {"id": None, "status": "duplicate_guid", "skip_reason": ""}
+    entry_id = duplicate_guid["id"] if duplicate_guid is not None else 0
+    if normalized_key and not normalized_reason and _rss_media_blocker(connection, normalized_key, exclude_id=entry_id):
         normalized_reason = _RSS_MEDIA_DUPLICATE_REASON
-    status = "skipped" if normalized_reason else "pending"
-    processed = 1 if normalized_reason else 0
-    processed_at = timestamp if normalized_reason else None
-    cur = connection.execute(
-        "INSERT INTO rss_entries(rss_item_id,title,status,processed,processed_at,pub_date,guid,"
-        "payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (sub_id, title, status, processed, processed_at, pub_date, guid, payload, timestamp),
-    )
-    assert cur.lastrowid is not None
-    entry_id = cur.lastrowid
+    status, processed = ("skipped", 1) if normalized_reason else ("pending", 0)
+    processed_at = (duplicate_guid["processed_at"] or timestamp) if duplicate_guid is not None and processed else timestamp if processed else None
+    if duplicate_guid is not None:
+        connection.execute(
+            "UPDATE rss_entries SET status=?,processed=?,processed_at=?,payload=? WHERE id=?",
+            (status, processed, processed_at, payload, entry_id),
+        )
+    else:
+        entry_id = connection.execute(
+            "INSERT INTO rss_entries(rss_item_id,title,status,processed,processed_at,pub_date,guid,"
+            "payload,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (sub_id, title, status, processed, processed_at, pub_date, guid, payload, timestamp),
+        ).lastrowid
+        assert entry_id is not None
     if normalized_key or tmdb_id or season is not None or episode is not None or normalized_reason:
         connection.execute(
             "INSERT INTO rss_entry_media(rss_entry_id,media_key,tmdb_id,season,episode,"
-            "skip_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            "skip_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(rss_entry_id) DO UPDATE SET media_key=excluded.media_key,tmdb_id=excluded.tmdb_id,"
+            "season=excluded.season,episode=excluded.episode,skip_reason=excluded.skip_reason,updated_at=excluded.updated_at "
+            "WHERE (media_key,tmdb_id,season,episode,skip_reason) IS NOT "
+            "(excluded.media_key,excluded.tmdb_id,excluded.season,excluded.episode,excluded.skip_reason)",
             (entry_id, normalized_key, (tmdb_id or ""), season, episode,
              normalized_reason, timestamp, timestamp),
         )
-    return {"id": entry_id, "status": status, "skip_reason": normalized_reason}
+    return {"id": None, "status": "duplicate_guid", "skip_reason": ""} if duplicate_guid is not None else {
+        "id": entry_id, "status": status, "skip_reason": normalized_reason,
+    }
 
 
 def _rss_entry_filters(sub_id: int | None = None, status: str | None = None,

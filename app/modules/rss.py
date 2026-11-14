@@ -511,26 +511,19 @@ class MikanParser:
         try:
             from guessit import guessit
             info = guessit(title)
-            episode = ""
-            episode_value = info.get("episode")
-            if isinstance(episode_value, (list, tuple)):
-                episode_value = episode_value[-1] if episode_value else None
-            season_value = info.get("season", 1)
-            if isinstance(season_value, (list, tuple)):
-                season_value = season_value[-1] if season_value else 1
-            if episode_value is not None:
-                episode = f"S{int(season_value or 1):02d}E{int(episode_value):02d}"
-            else:
-                absolute_episode = info.get("absolute_episode")
-                if isinstance(absolute_episode, (list, tuple)):
-                    absolute_episode = absolute_episode[-1] if absolute_episode else None
-                if absolute_episode is not None:
-                    episode = f"E{int(absolute_episode):02d}"
+            labels = []
+            for prefix, value in (("S", info.get("season")), ("E", info.get("episode", info.get("absolute_episode")))):
+                if value is None:
+                    continue
+                numbers = [int(number) for number in value] if isinstance(value, (list, tuple)) else [int(value)]
+                parts = [f"{prefix}{number:02d}" for number in numbers]
+                contiguous = len(numbers) > 1 and numbers == list(range(numbers[0], numbers[-1] + 1))
+                labels.append(f"{parts[0]}-{parts[-1]}" if contiguous else ",".join(parts))
             series_title = info.get("title", "")
             if isinstance(series_title, (list, tuple)):
                 series_title = series_title[-1] if series_title else ""
             return {
-                "episode": episode,
+                "episode": "".join(labels),
                 "release_group": str(info.get("release_group", "") or ""),
                 "resolution": str(info.get("screen_size", "") or ""),
                 "series_title": str(series_title or "").strip(),
@@ -621,6 +614,7 @@ class RSSEngine:
         ready = unavailable = truncated = 0
         for source in sources:
             status = str(source.get("status") or "")
+            truncated += bool(source.get("truncated"))
             if status == "ready":
                 ready += 1
                 positions.update(
@@ -628,8 +622,6 @@ class RSSEngine:
                     for item in source.get("episodes") or []
                     if isinstance(item, (list, tuple)) and len(item) == 2
                 )
-                if source.get("truncated"):
-                    truncated += 1
             elif status == "unavailable":
                 unavailable += 1
         return positions, {
@@ -697,24 +689,12 @@ class RSSEngine:
                     "failed_sources": failed_sources,
                 }
 
-            structured_entries = [
-                entry for entry in parsed_entries
-                if parse_episode_label(entry.episode, default_season=default_season) is not None
-            ]
-            structured_series_keys = [
-                self._series_identity_key(entry.series_title) for entry in structured_entries
-            ]
-            series_keys = {key for key in structured_series_keys if key}
-            unresolved_series_count = sum(not key for key in structured_series_keys)
-            structure_binding_allowed = bool(
-                media_tmdb_id
-                and structured_entries
-                and len(series_keys) == 1
-                and unresolved_series_count == 0
-            )
-            binding_allowed = structure_binding_allowed
+            series = [self._series_identity_key(entry.series_title) for entry in parsed_entries if entry.episode]
+            series_keys = set(series) - {""}
+            unresolved_series_count = series.count("")
+            binding_allowed = bool(media_tmdb_id and len(series_keys) == 1 and not unresolved_series_count)
             binding_bypass_reason = ""
-            if structure_binding_allowed:
+            if binding_allowed:
                 bound_title_keys, titles_verified = self._bound_tv_title_keys(media_tmdb_id)
                 if not titles_verified:
                     binding_allowed = False
@@ -788,10 +768,15 @@ class RSSEngine:
                             "series_title": entry.series_title,
                         }, ensure_ascii=False),
                         media_key=media_key,
-                        tmdb_id=media_tmdb_id if position is not None else "",
+                        tmdb_id=media_tmdb_id if binding_allowed and entry.episode else "",
                         season=position[0] if position is not None else None,
                         episode=position[1] if position is not None else None,
                         skip_reason=automatic_skip_reason,
+                        reassess_library_skip=bool(binding_allowed and entry.episode and (
+                            position is None or not skip_existing or (
+                                library_check["sources"] and not library_check["unavailable"] and not library_check["truncated"]
+                            )
+                        )),
                         connection=conn,
                     )
                     if inserted.get("id") is not None:

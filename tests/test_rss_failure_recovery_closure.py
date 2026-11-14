@@ -41,6 +41,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         )
         eid = int(rss_repo.add_rss_entry_with_media(
             sid, "Episode", f"guid-{self.sequence}", media_key=media_key,
+            tmdb_id=media_key.split(":")[1] if media_key else "",
             payload=json.dumps({"torrent_url": source}),
         )["id"])
         return sid, eid, dispatcher.DownloadInput("magnet", "Episode", source)
@@ -947,7 +948,10 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         self.assertEqual(get_rss_entry_result_15["status"], "skipped")
         self.fail_request(rid)
         def refresh():
-            return rss_repo.add_rss_entry_with_media(sid, "Episode", f"guid-{self.sequence}", media_key=key, payload=json.dumps({"torrent_url": item.source_value}))
+            return rss_repo.add_rss_entry_with_media(
+                sid, "Episode", f"guid-{self.sequence}", media_key=key, tmdb_id="42",
+                payload=json.dumps({"torrent_url": item.source_value}),
+            )
         self.assertIsNone(refresh()["id"])
         get_rss_entry_result_16 = rss_repo.get_rss_entry(second)
         assert get_rss_entry_result_16 is not None
@@ -1013,6 +1017,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                     refreshed = rss_repo.add_rss_entry_with_media(
                         sid, "Episode", alternate_entry["guid"],
                         media_key=key, payload=json.dumps({"torrent_url": item.source_value}),
+                        tmdb_id=key.split(":")[1],
                     )
                     self.assertIsNone(refreshed["id"])
                     self.assertEqual(assert_present(rss_repo.get_rss_entry(alternate))["status"], "pending")

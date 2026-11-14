@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from xml.sax.saxutils import escape
 
 from app import database as db
 from app.repositories import rss as rss_repo
@@ -13,7 +15,7 @@ from app.modules.rss_subscription_config import (
     normalize_rss_subscription_create,
 )
 from app.services import inspect_series_episode_inventory_by_tmdb
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, assert_present
 
 
 class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
@@ -23,6 +25,203 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM rss_entries")
             conn.execute("DELETE FROM rss_media_bindings")
             conn.execute("DELETE FROM rss_items")
+
+    def refresh_feed(self, sid, title, *, positions=(), inventory=None, verified=True):
+        source = "magnet:?xt=urn:btih:" + "a" * 40
+        feed = (
+            '<rss version="2.0"><channel><title>Bound</title><item><title>'
+            + escape(title) + '</title><guid>discovery</guid><link>'
+            + source + '</link></item></channel></rss>'
+        ).encode()
+        engine = RSSEngine()
+        with (
+            patch("app.modules.rss._fetch_rss_payload", return_value=(feed, {})),
+            patch.object(engine, "_bound_tv_title_keys", return_value=({"bound"}, verified)),
+            patch.object(engine, "_existing_library_episodes", return_value=(set(positions), inventory or {
+                "sources": 1, "ready": 1, "unavailable": 0, "truncated": 0,
+            })),
+        ):
+            result = engine.refresh(sid)
+        row = next(row for row in rss_repo.list_rss_entries(sub_id=sid).items if row["guid"] == "discovery")
+        return result, row
+
+    def historical_skip(self, sid, title, *, reason="媒体库已存在该剧集", episode=1):
+        source = "magnet:?xt=urn:btih:" + "a" * 40
+        return int(rss_repo.add_rss_entry_with_media(
+            sid, title, "discovery", payload=json.dumps({
+                "link": source, "torrent_url": source, "episode": f"S01E{episode:02d}",
+                "series_title": "Bound", "content_type": "", "release_group": "", "resolution": "1080p",
+            }, ensure_ascii=False),
+            media_key=build_media_key("105556", "tv", 1, episode), tmdb_id="105556",
+            season=1, episode=episode, skip_reason=reason,
+        )["id"])
+
+    def test_real_feed_preserves_default_specials_and_complete_episode_sets(self):
+        cases = (
+            ("Bound - 01 [1080p]", "E01", (2, 1)),
+            ("Bound S00E01 1080p", "S00E01", (0, 1)),
+            ("Bound S01E01-E02 1080p", "S01E01-E02", None),
+            ("Bound S01E01E03 1080p", "S01E01,E03", None),
+            ("Bound S01-S02 1080p", "S01-S02", None),
+            ("Bound 01-03 1080p", "E01-E03", None),
+        )
+        for title, label, position in cases:
+            with self.subTest(title=title):
+                sid = rss_repo.add_rss_subscription(
+                    "Bound", "https://example.invalid/rss", media_tmdb_id="105556",
+                    media_default_season=2, skip_existing_episodes=1,
+                )
+                result, row = self.refresh_feed(sid, title, positions={(1, 1), (1, 2)})
+                self.assertEqual(row["status"], "pending")
+                self.assertEqual(json.loads(row["payload"])["episode"], label)
+                self.assertFalse(result.get("media_binding_bypassed"))
+                self.assertEqual(row["media_key"], build_media_key("105556", "tv", *position) if position else "")
+                with db.get_conn() as conn:
+                    media = conn.execute("SELECT * FROM rss_entry_media WHERE rss_entry_id=?", (row["id"],)).fetchone()
+                self.assertEqual(media["tmdb_id"], "105556")
+                self.assertEqual((media["season"], media["episode"]), position or (None, None))
+
+    def test_same_guid_refresh_reassesses_unconsumed_automatic_skips_and_is_idempotent(self):
+        for title, old_episode, position in (
+            ("Bound - 01 [1080p]", 1, (2, 1)),
+            ("Bound S00E01 1080p", 1, (0, 1)),
+            ("Bound S01E01-E02 1080p", 2, None),
+        ):
+            for reason in ("媒体库已存在该剧集", "相同 TMDB 剧集已在 RSS 队列或下载记录中"):
+                with self.subTest(title=title, reason=reason):
+                    sid = rss_repo.add_rss_subscription(
+                        "Bound", "https://example.invalid/rss", media_tmdb_id="105556",
+                        media_default_season=2, skip_existing_episodes=1,
+                    )
+                    eid = self.historical_skip(sid, title, reason=reason, episode=old_episode)
+                    before = dict(assert_present(rss_repo.get_rss_entry(eid)))
+                    result, row = self.refresh_feed(sid, title, positions={(1, 1), (1, 2)})
+                    self.assertEqual(result["new"], 0)
+                    self.assertEqual((row["id"], row["status"], row["processed"]), (eid, "pending", 0))
+                    self.assertEqual(row["created_at"], before["created_at"])
+                    self.assertEqual(row["media_key"], build_media_key("105556", "tv", *position) if position else "")
+                    self.assertEqual(row["skip_reason"], "")
+                    self.assertNotEqual(json.loads(row["payload"])["episode"], f"S01E{old_episode:02d}")
+                    _, again = self.refresh_feed(sid, title, positions={(1, 1), (1, 2)})
+                    self.assertEqual(dict(again), dict(row))
+
+    def test_current_inventory_and_new_media_key_blocker_still_skip_corrected_identity(self):
+        for blocker in (False, True):
+            with self.subTest(blocker=blocker):
+                sid = rss_repo.add_rss_subscription(
+                    "Bound", "https://example.invalid/rss", media_tmdb_id="105556",
+                    media_default_season=2, skip_existing_episodes=1,
+                )
+                eid = self.historical_skip(sid, "Bound - 01 [1080p]")
+                if blocker:
+                    owner = rss_repo.add_rss_entry_with_media(
+                        sid, "owner", "owner", media_key=build_media_key("105556", "tv", 2, 1),
+                    )["id"]
+                    self.assertTrue(rss_repo.claim_rss_entry(owner))
+                _, row = self.refresh_feed(sid, "Bound - 01 [1080p]", positions=() if blocker else {(2, 1)})
+                self.assertEqual((row["id"], row["status"], row["processed"]), (eid, "skipped", 1))
+                self.assertEqual(row["media_key"], build_media_key("105556", "tv", 2, 1))
+                self.assertEqual(row["skip_reason"], "相同 TMDB 剧集已在 RSS 队列或下载记录中" if blocker else "媒体库已存在该剧集")
+
+    def test_untrusted_or_unavailable_refresh_does_not_reopen_old_library_skip(self):
+        for verified, inventory in (
+            (False, None),
+            (True, {"sources": 1, "ready": 0, "unavailable": 1, "truncated": 0}),
+            (True, {"sources": 1, "ready": 1, "unavailable": 0, "truncated": 1}),
+        ):
+            with self.subTest(verified=verified, inventory=inventory):
+                sid = rss_repo.add_rss_subscription(
+                    "Bound", "https://example.invalid/rss", media_tmdb_id="105556",
+                    media_default_season=2, skip_existing_episodes=1,
+                )
+                self.historical_skip(sid, "Bound - 01 [1080p]")
+                before = dict(rss_repo.list_rss_entries(sub_id=sid).items[0])
+                _, row = self.refresh_feed(sid, "Bound - 01 [1080p]", verified=verified, inventory=inventory)
+                self.assertEqual(dict(row), before)
+
+    def test_same_key_semantic_skip_reopens_through_trusted_discovery_only(self):
+        sid = rss_repo.add_rss_subscription(
+            "Bound", "https://example.invalid/rss", media_tmdb_id="105556",
+        )
+        eid = self.historical_skip(sid, "Bound S01E01 1080p", reason="相同 TMDB 剧集已在 RSS 队列或下载记录中")
+        _, row = self.refresh_feed(sid, "Bound S01E01 1080p")
+        self.assertEqual((row["id"], row["status"]), (eid, "pending"))
+        self.assertEqual(rss_repo.update_rss_entries_processed([eid], True), 1)
+        _, row = self.refresh_feed(sid, "Bound S01E01 1080p")
+        self.assertEqual((row["status"], row["skip_reason"]), ("skipped", ""))
+
+    def test_semantic_skip_reopens_when_blocker_is_gone_despite_incomplete_inventory(self):
+        for inventory in (
+            {"sources": 1, "ready": 0, "unavailable": 1, "truncated": 0},
+            {"sources": 1, "ready": 1, "unavailable": 0, "truncated": 1},
+        ):
+            with self.subTest(inventory=inventory):
+                sid = rss_repo.add_rss_subscription(
+                    "Bound", "https://example.invalid/rss", media_tmdb_id="105556", skip_existing_episodes=1,
+                )
+                eid = self.historical_skip(sid, "Bound S01E01 1080p", reason="相同 TMDB 剧集已在 RSS 队列或下载记录中")
+                _, row = self.refresh_feed(sid, "Bound S01E01 1080p", inventory=inventory)
+                self.assertEqual((row["id"], row["status"], row["media_key"]), (eid, "pending", "tmdb:105556:tv:S01E001"))
+
+    def test_range_reopens_past_wrong_single_episode_blocker_without_changing_owner(self):
+        sid = rss_repo.add_rss_subscription(
+            "Bound", "https://example.invalid/rss", media_tmdb_id="105556", skip_existing_episodes=1,
+        )
+        owner = rss_repo.add_rss_entry_with_media(
+            sid, "Bound S01E02", "owner", media_key=build_media_key("105556", "tv", 1, 2),
+        )["id"]
+        self.assertTrue(rss_repo.claim_rss_entry(owner))
+        owner_before = dict(assert_present(rss_repo.get_rss_entry(owner)))
+        eid = self.historical_skip(sid, "Bound S01E01-E02 1080p", episode=2,
+                                   reason="相同 TMDB 剧集已在 RSS 队列或下载记录中")
+        _, row = self.refresh_feed(sid, "Bound S01E01-E02 1080p", positions={(1, 2)})
+        self.assertEqual((row["id"], row["status"], row["media_key"]), (eid, "pending", ""))
+        self.assertEqual(dict(assert_present(rss_repo.get_rss_entry(owner))), owner_before)
+
+    def test_ranges_participate_in_mixed_series_binding_check(self):
+        sid = rss_repo.add_rss_subscription(
+            "Mixed", "https://example.invalid/rss", media_tmdb_id="105556", skip_existing_episodes=1,
+        )
+        engine = RSSEngine()
+        engine.parser.parse = Mock(return_value=[
+            RSSEntry(title="Bound S01E01", guid="one", episode="S01E01", series_title="Bound"),
+            RSSEntry(title="Other S01E01-E02", guid="pack", episode="S01E01-E02", series_title="Other"),
+        ])
+        with patch.object(engine, "_bound_tv_title_keys") as titles:
+            result = engine.refresh(sid)
+        titles.assert_not_called()
+        self.assertTrue(result["mixed_feed_bypassed"])
+        self.assertEqual(result["detected_series_count"], 2)
+        self.assertTrue(all(not row["media_key"] for row in rss_repo.list_rss_entries(sub_id=sid).items))
+
+    def test_refresh_preserves_manual_keyword_consumed_and_changed_source_rows(self):
+        scenarios = (
+            ("manual", "UPDATE rss_entry_media SET skip_reason='' WHERE rss_entry_id=?"),
+            ("keyword", "UPDATE rss_entry_media SET skip_reason='命中当前订阅排除关键词' WHERE rss_entry_id=?"),
+            ("request", "UPDATE rss_entries SET download_request_key='btih:old',download_backend='qb' WHERE id=?"),
+            ("submitted", "UPDATE rss_entries SET submitted_at='2026-01-01 00:00:00' WHERE id=?"),
+            ("failure", "UPDATE rss_entries SET failure_code='qb_outcome_unknown' WHERE id=?"),
+            ("retry", "UPDATE rss_entries SET retry_count=1 WHERE id=?"),
+            ("failed_at", "UPDATE rss_entries SET failed_at='2026-01-01 00:00:00' WHERE id=?"),
+            ("tmdb", "UPDATE rss_entry_media SET tmdb_id='42' WHERE rss_entry_id=?"),
+            ("title", "UPDATE rss_entries SET title='Other - 01 [1080p]' WHERE id=?"),
+            ("payload", "UPDATE rss_entries SET payload='{}' WHERE id=?"),
+            ("source", "UPDATE rss_entries SET payload='{\"torrent_url\":\"magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}' WHERE id=?"),
+            ("downloaded", "UPDATE rss_entries SET status='downloaded' WHERE id=?"),
+            ("submitting", "UPDATE rss_entries SET status='submitting',processed=0 WHERE id=?"),
+        )
+        for scenario, sql in scenarios:
+            with self.subTest(scenario=scenario):
+                sid = rss_repo.add_rss_subscription(
+                    "Bound", "https://example.invalid/rss", media_tmdb_id="105556",
+                    media_default_season=2, skip_existing_episodes=1,
+                )
+                eid = self.historical_skip(sid, "Bound - 01 [1080p]")
+                with db.get_conn() as conn:
+                    conn.execute(sql, (eid,))
+                before = dict(rss_repo.list_rss_entries(sub_id=sid).items[0])
+                _, row = self.refresh_feed(sid, "Bound - 01 [1080p]")
+                self.assertEqual(dict(row), before)
 
     def test_media_identity_only_accepts_structured_episode_labels(self) -> None:
         self.assertEqual(parse_episode_label("S02E03", default_season=1), (2, 3))
@@ -364,6 +563,17 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(rows[0]["episodes"], [(1, 1), (1, 2)])
         client.find_series_candidates_by_tmdb.assert_called_once_with("105556", limit=20)
         self.assertFalse(hasattr(client, "search_series_candidates"))
+
+        # 未找到剧集也可能是截断结果，不能用来重开历史库内跳过记录。
+        client.find_series_candidates_by_tmdb.return_value = SeriesSearchResult(
+            candidates=[], total=0, truncated=True,
+        )
+        with patch("app.services._configured_media_sources", return_value=[
+            ("jellyfin", "Jellyfin", "http://jellyfin", client),
+        ]):
+            positions, check = RSSEngine._existing_library_episodes("105556")
+        self.assertEqual(positions, set())
+        self.assertEqual(check, {"sources": 1, "ready": 0, "unavailable": 0, "truncated": 1})
 
     def test_shared_binding_validation_requires_tmdb_for_library_filter(self) -> None:
         base = {"name": "Anime", "urls": "https://example.invalid/rss"}

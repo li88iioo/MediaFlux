@@ -162,7 +162,14 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
         key = "tmdb:105556:tv:S01E001"
         blocker = rss_repo.add_rss_entry_with_media(sid, "blocker", "blocker", media_key=key)["id"]
         self.assertTrue(rss_repo.claim_rss_entry(blocker))
-        reopened = rss_repo.add_rss_entry_with_media(sid, "semantic duplicate", "guid-1", media_key=key)
+        entry = self.entries[0]
+        entry.torrent_url = "magnet:?xt=urn:btih:" + "a" * 40
+        payload = json.dumps({name: getattr(entry, name) for name in (
+            "link", "torrent_url", "content_type", "episode", "release_group", "resolution", "series_title",
+        )}, ensure_ascii=False)
+        reopened = rss_repo.add_rss_entry_with_media(
+            sid, entry.title, entry.guid, media_key=key, tmdb_id="105556", season=1, episode=1, payload=payload,
+        )
         self.assertEqual(reopened["status"], "skipped")
         rss_repo.record_rss_entry_failure(blocker, "torrent_invalid", False)
         self.engine.parser.parse = Mock(return_value=[
