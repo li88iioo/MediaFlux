@@ -390,6 +390,37 @@ class AgentUXBrowserTests(unittest.TestCase):
         second = json.loads(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query')[1].body"))
         self.assertNotIn('reply_to', second)
 
+    def test_failed_reply_restores_its_reference_without_overwriting_another_draft(self):
+        page = self.page({
+            'queryEvents': [harness._event(1, 'turn.started'),
+                            harness._event(2, 'turn.failed', {'message': '模型暂不可用', 'code': 'model_error'})],
+            'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+                {'session_id': SESSION_A, 'title': '资源'}]},
+            'sessionDetails': {SESSION_A: {'messages': [
+                {'role': 'assistant', 'content': '资源 A：1080p'},
+                {'role': 'assistant', 'content': '资源 B：2160p'}]}},
+        })
+        page.locator('.agent-message-assistant [data-reply-message]').first.click()
+        page.locator('#agentPrompt').fill('解释这个')
+        page.locator('#agentSend').click()
+        retry = page.locator('.agent-retry-draft')
+        retry.wait_for()
+        # 已另选了引用时，失败消息的恢复按钮不能替换新草稿。
+        page.locator('.agent-message-assistant [data-reply-message]').nth(1).click()
+        retry.click()
+        self.assertEqual(page.locator('#agentPrompt').input_value(), '')
+        self.assertIn('资源 B', page.locator('#agentReplyText').inner_text())
+        page.locator('#agentReplyCancel').click()
+        retry.click()
+        self.assertEqual(page.locator('#agentPrompt').input_value(), '解释这个')
+        self.assertTrue(page.locator('#agentReplyBar').is_visible())
+        self.assertIn('资源 A', page.locator('#agentReplyText').inner_text())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 1)
+        page.locator('#agentSend').click()
+        page.wait_for_function("() => window.__kernelCalls.filter(call => call.url === '/api/agent/query').length === 2")
+        bodies = page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').map(call => JSON.parse(call.body))")
+        self.assertEqual(bodies[0]['reply_to'], bodies[1]['reply_to'])
+
     def test_time_separators_follow_gaps_between_user_messages(self):
         base = 1_794_600_000
         page = self.page({'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
@@ -446,6 +477,89 @@ class AgentUXBrowserTests(unittest.TestCase):
         page = self.page()
         page.wait_for_function("() => window.__kernelCalls.some(call => call.url === '/api/agent/channels')")
         self.assertTrue(page.locator('#agentChannels').is_hidden())
+
+    def test_delayed_channel_cannot_replace_a_newer_web_navigation(self):
+        key = 'c' * 32
+        for destination in ('agentNewSession', 'agentMainChat'):
+            with self.subTest(destination=destination):
+                page = self.page({
+                    'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+                        {'session_id': SESSION_A, 'title': '主要', 'updated_at': 10}]},
+                    'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '主要聊天里的回复'}]}},
+                    'channels': [{'key': key, 'title': 'TG 追更', 'updated_at': 20}],
+                })
+                page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('主要聊天里的回复')")
+                page.evaluate("""key => {
+                    const original = window.fetch;
+                    window.fetch = (url, options) => String(url) === `/api/agent/channels/${key}`
+                        ? new Promise(resolve => { window.releaseChannel = () => resolve(new Response(JSON.stringify({
+                            read_only: true, messages: [{role: 'assistant', content: '迟到的 TG 回复'}]
+                        }), {headers: {'Content-Type': 'application/json'}})); }) : original(url, options);
+                }""", key)
+                page.locator(f'[data-channel-open="{key}"]').click()
+                page.wait_for_function("() => typeof window.releaseChannel === 'function'")
+                page.locator(f'#{destination}').click()
+                page.evaluate('async () => { window.releaseChannel(); await new Promise(requestAnimationFrame); }')
+                self.assertTrue(page.locator('#agentComposer').is_visible())
+                self.assertTrue(page.locator('#agentChannelNotice').is_hidden())
+                self.assertNotIn('迟到的 TG 回复', page.locator('#agentTranscript').inner_text())
+                if destination == 'agentMainChat':
+                    self.assertIn('主要聊天里的回复', page.locator('#agentTranscript').inner_text())
+                else:
+                    self.assertEqual(page.locator('.agent-message').count(), 0)
+
+    def test_failed_return_from_channel_keeps_the_visible_history_read_only(self):
+        key = 'd' * 32
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+                {'session_id': SESSION_A, 'title': '主要', 'updated_at': 10}]},
+            'channels': [{'key': key, 'title': 'TG 追更', 'updated_at': 20}],
+            'channelDetails': {key: {'read_only': True, 'messages': [{'role': 'assistant', 'content': 'TG 历史'}]}},
+        })
+        page.locator(f'[data-channel-open="{key}"]').click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('TG 历史')")
+        page.evaluate("""session => {
+            const original = window.fetch;
+            window.fetch = (url, options) => String(url) === `/api/agent/sessions/${session}`
+                ? Promise.resolve(new Response(JSON.stringify({error: '会话暂不可用'}), {
+                    status: 503, headers: {'Content-Type': 'application/json'}
+                })) : original(url, options);
+        }""", SESSION_A)
+        page.locator('#agentMainChat').click()
+        page.wait_for_function("() => document.querySelector('#agentSessionStatus').textContent.includes('会话暂不可用')")
+        self.assertIn('TG 历史', page.locator('#agentTranscript').inner_text())
+        self.assertTrue(page.locator('#agentComposer').is_hidden())
+        self.assertTrue(page.locator('#agentChannelNotice').is_visible())
+        self.assertEqual(page.locator(f'[data-channel-open="{key}"]').get_attribute('aria-current'), 'page')
+
+    def test_reopening_main_chat_preserves_the_pending_receipt_observer(self):
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+                {'session_id': SESSION_A, 'title': '后台回执'}]},
+            'sessionDetails': {SESSION_A: session_snapshot(
+                SESSION_A, messages=[{'role': 'assistant', 'content': '等待后台结果'}],
+                last_turn={'request_id': 'receipt-request', 'turn_id': 'receipt-turn', 'status': 'completed'},
+                pending_effect_count=1)},
+        })
+        page.get_by_text('等待后台结果', exact=True).wait_for()
+        page.evaluate("""id => {
+            const original = window.fetch;
+            window.__manualReloads = 0;
+            window.fetch = (url, options) => {
+                if (String(url) === `/api/agent/sessions/${id}` && !options?.headers?.['X-Agent-Request-Id']) {
+                    window.__manualReloads += 1;
+                    return Promise.resolve(new Response(JSON.stringify({error: '会话暂不可用'}), {status: 503}));
+                }
+                return original(url, options);
+            };
+        }""", SESSION_A)
+        page.locator('#agentMainChat').click()
+        self.assertEqual(page.evaluate('window.__manualReloads'), 0)
+        page.evaluate("""id => { window.__kernelConfig.sessionDetails[id] = {
+            messages: [{role: 'assistant', content: '后台结果已到达'}], pending_effect_count: 0,
+        }; }""", SESSION_A)
+        page.get_by_text('后台结果已到达', exact=True).wait_for(timeout=5000)
+        self.assertTrue(page.locator('#agentPrompt').is_enabled())
 
     def test_attached_torrent_becomes_a_download_card_without_calling_the_model(self):
         page = self.page({'directPreview': {'kind': 'torrent', 'title': '诛仙.S04E15.2160p', 'file_count': 2,

@@ -78,7 +78,6 @@
     let mainSessionId = '';
     let replyDraft = '';
     let viewingChannel = '';
-    let channelGeneration = 0;
     // 宽屏常驻会话栏；窄屏收为抽屉。
     const railDocked = window.matchMedia?.('(min-width: 901px)') || null;
     let activeRequest = null;
@@ -289,16 +288,18 @@
         return accountChanged;
     }
 
-    function fillDraft(text) {
+    function fillDraft(text, replyTo) {
         const value = clipText(String(text || '').trim(), 1000);
         if (!promptInput || !value) return;
-        if (promptInput.value.trim() && promptInput.value.trim() !== value) {
+        if ((promptInput.value.trim() && promptInput.value.trim() !== value)
+            || (replyTo !== undefined && replyDraft && replyDraft !== replyTo)) {
             announce(responseStatus, '输入框已有草稿，请先发送或清空后再选择。');
             window.showToast?.('已保留输入框中的草稿，请先发送或清空后再选择', 'warning');
             promptInput.focus();
             return;
         }
         promptInput.value = value;
+        if (replyTo !== undefined) setReply(replyTo);
         saveDraft();
         resizePrompt();
         promptInput.focus();
@@ -1260,6 +1261,7 @@
             const retry = element('button', 'agent-retry-draft', '放回输入框修改');
             retry.type = 'button';
             retry.dataset.agentDraft = turn.requestMessage;
+            retry.dataset.agentReplyTo = turn.requestReplyTo || '';
             actions.append(retry);
             turn.card.append(actions);
         }
@@ -2419,6 +2421,7 @@
         if (replyTo) setReply('');
         const turn = createAssistantTurn();
         turn.requestMessage = message;
+        turn.requestReplyTo = replyTo;
         turn.boundSelection = Boolean(actionKey);
         if (!actionKey) {
             promptInput.value = '';
@@ -3025,7 +3028,9 @@
                 active.kind = active.kind || 'query';
                 const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
                 turn.boundSelection = false;
-                turn.requestMessage = [...(payload.messages || [])].reverse().find(message => message.role === 'user')?.content || '';
+                const userMessage = [...(payload.messages || [])].reverse().find(message => message.role === 'user');
+                turn.requestMessage = userMessage?.content || '';
+                turn.requestReplyTo = userMessage?.reply_to || '';
                 active.turn = turn;
                 prepareActiveStatus(active, activeProgressText(payload.active_turn, active));
             }
@@ -3040,6 +3045,7 @@
                 const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
                 turn.boundSelection = active?.kind === 'candidate_preview';
                 turn.requestMessage = active?.turn?.requestMessage || '';
+                turn.requestReplyTo = active?.turn?.requestReplyTo || '';
                 turn.confirmationRequested = active?.kind === 'confirm';
                 const failureMessage = terminalTurn.status === 'failed' && message === '本轮未能完成'
                     ? '当前会话摘要未提供具体失败原因。可查看日志定位；涉及文件变更时，请先核对结果。'
@@ -3070,10 +3076,6 @@
 
     async function loadSession(targetId, {closeHistory = true, startup = false, signal = null, preserveScroll = false} = {}) {
         if (!SESSION_RE.test(targetId)) return false;
-        if (viewingChannel) {
-            ++channelGeneration;
-            setChannelMode('');
-        }
         if (!startup) stopInitialRestore();
         const switching = targetId !== sessionId;
         const previousSessionId = sessionId;
@@ -3097,6 +3099,7 @@
             if (generation !== sessionLoadGeneration || (active && !isCurrentActiveRequest(active))) return false;
             if (configureDraftScope(payload.draft_scope) || generation !== sessionLoadGeneration
                 || (active && !isCurrentActiveRequest(active))) return false;
+            if (viewingChannel) setChannelMode('');
             if (!(Number(payload.pending_effect_count) > 0)) receiptObservationWindows.delete(targetId);
             if (active) {
                 renderTaskSnapshot(payload.task);
@@ -3192,7 +3195,7 @@
             startNewSession();
             return;
         }
-        if (mainSessionId === sessionId && !viewingChannel) {
+        if (mainSessionId === sessionId && !viewingChannel && activeRequest) {
             closeHistoryRail();
             return;
         }
@@ -3322,15 +3325,14 @@
         stopInitialRestore();
         saveDraft();
         setReply('');
-        ++sessionLoadGeneration;
+        const generation = ++sessionLoadGeneration;
         invalidateActiveRequest();
         setBusy(false);
         clearTaskSnapshot();
         expireCandidateCards();
-        const generation = ++channelGeneration;
         try {
             const payload = await fetchJSON(`/api/agent/channels/${encodeURIComponent(key)}`);
-            if (generation !== channelGeneration) return;
+            if (generation !== sessionLoadGeneration) return;
             setChannelMode(key);
             transcript?.replaceChildren();
             lastUserAt = 0;
@@ -3342,16 +3344,13 @@
             scrollToBottom(true);
             closeHistoryRail();
         } catch (error) {
-            announce(sessionStatus, error?.message || '渠道会话加载失败');
+            if (generation === sessionLoadGeneration) announce(sessionStatus, error?.message || '渠道会话加载失败');
         }
     }
 
     function startNewSession() {
         setReply('');
-        if (viewingChannel) {
-            ++channelGeneration;
-            setChannelMode('');
-        }
+        if (viewingChannel) setChannelMode('');
         clearTaskSnapshot();
         stopInitialRestore();
         saveDraft();
@@ -3914,7 +3913,7 @@
         const action = event.target.closest('[data-agent-action-key]');
         if (action && !action.disabled) sendQuery(action.dataset.agentActionTitle, action.dataset.agentActionKey);
         const draft = event.target.closest('[data-agent-draft]');
-        if (draft) fillDraft(draft.dataset.agentDraft);
+        if (draft) fillDraft(draft.dataset.agentDraft, draft.dataset.agentReplyTo);
     });
     window.visualViewport?.addEventListener('resize', syncViewportHeight, {passive: true});
     window.addEventListener('resize', syncViewportHeight, {passive: true});
