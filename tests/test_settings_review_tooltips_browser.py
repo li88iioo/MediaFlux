@@ -221,7 +221,14 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
                 self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
 
                 before = site_toggle.locator('..').bounding_box()
-                site_toggle.locator('..').click()
+                # 验证真实键盘焦点；不把合并后的公共CSS规则锁定为特定选择器文本。
+                page.keyboard.press('Tab')
+                site_toggle.focus()
+                self.assertTrue(site_toggle.evaluate('input => input.matches(":focus-visible")'))
+                chip = site_toggle.locator('..').locator('[data-indexer-site-chip]')
+                expect(chip).not_to_have_css('outline-style', 'none')
+                self.assertGreater(float(chip.evaluate('el => getComputedStyle(el).outlineWidth').removesuffix('px')), 0)
+                site_toggle.press('Space')
                 remaining = ['nyaa', 'mikan', 'tpb']
                 self.assertEqual(self.selected(page), remaining)
                 after = site_toggle.locator('..').bounding_box()

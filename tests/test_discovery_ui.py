@@ -391,7 +391,6 @@ class DiscoveryPageTests(InitializedWebTestCase):
             ),
         )
         self.assertIn('.indexer-site-option input:checked + [data-indexer-site-chip]', styles)
-        self.assertIn('.indexer-site-option input:focus-visible + [data-indexer-site-chip]', styles)
         self.assertIn('.indexer-site-box[hidden]', styles)
         self.assertNotIn("classList.toggle('is-disabled'", html)
         selector_styles = styles[styles.index('/* Discovery indexer site selector */'):]
