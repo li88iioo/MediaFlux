@@ -9,7 +9,10 @@ from unittest.mock import patch
 
 from app.repositories import download_requests as download_requests_repo
 from app.modules import organize_confirmations as confirmations
-from app.modules.organize import Organizer, OrganizeRules
+from app.modules.organize import (
+    OrganizeContext, OrganizePlan, OrganizePlanningResult, Organizer, OrganizeRules,
+)
+from app.modules.organize_scan import OrganizeScanResult
 from tests.support import IsolatedDatabaseTestCase
 from tests.test_download_staging_cleanup_lifecycle import _CloudTree
 
@@ -73,6 +76,91 @@ class ConfirmationSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.cloud.reads, [])
         self.assertEqual(self.cloud.deleted, [])
         self.protected.assert_not_called()
+
+    def test_recycled_confirmation_cleans_exact_chain_with_cleanup_disabled(self):
+        self.rules.clean_empty = False
+        self.stats = {'moved': 0, 'skipped': 1, 'duplicate_recycled': 1,
+                      'duplicate_cleanup_parent_ids': ['leaf']}
+        self.cloud.add_dir('unrelated', 'source')
+        self.clean()
+        self.assertEqual(self.cloud.deleted, ['leaf', 'stage'])
+        self.assertIn('source', self.cloud.nodes)
+        self.assertNotIn('unrelated', self.cloud.reads)
+        self.assertEqual(self.stats['empty_dirs_cleaned'], 2)
+        event = confirmations._confirmation_result_event(self.payload, {}, self.stats)
+        result_label = str(dict(event.fields)['执行结果'])
+        self.assertIn('同版本已回收 1', result_label)
+        self.assertIn('跳过 0', result_label)
+        self.assertIn('整理完成', str(event.title))
+
+    def test_recycled_confirmation_does_not_delete_temporary_source_root(self):
+        self.rules.clean_empty = False
+        self.payload['source_dir_id'] = 'leaf'
+        self.stats = {'duplicate_recycled': 1, 'duplicate_cleanup_parent_ids': ['leaf']}
+        self.clean()
+        self.assertEqual(self.cloud.deleted, [])
+
+    def test_recycled_confirmation_needs_its_exact_parent_and_no_failure(self):
+        self.rules.clean_empty = False
+        for extra in ({'duplicate_cleanup_parent_ids': ['other']}, {'duplicate_cleanup_failed': 1}):
+            with self.subTest(extra=extra):
+                self.stats = {'duplicate_recycled': 1, 'duplicate_cleanup_parent_ids': ['leaf'], **extra}
+                self.clean()
+                self.assertEqual(self.cloud.deleted, [])
+                self.assertEqual(self.cloud.reads, [])
+
+    def execute_recycled_stage(self, **extra):
+        plan = OrganizePlan('video', 'video.mkv', 'leaf', original_parent_id='leaf', action='recycled')
+        stats = Organizer._initial_stats()
+        stats.update({'skipped': 1, 'duplicate_recycled': 1,
+                      'duplicate_cleanup_parent_ids': ['leaf'], **extra})
+        scan = OrganizeScanResult(
+            scanned_videos=[], scanned_dirs=[(id_, 1, 'v1', 100) for id_ in self.cloud.nodes],
+            companion_files={}, video_files_by_path={}, protected_sources=set(), source_root_name='Source',
+        )
+        with patch('app.modules.organize.execute_organize_plans'):
+            self.organizer._run_execution_stage(
+                scan, OrganizePlanningResult(plans=[plan], subtitle_plans_by_video={}),
+                OrganizeContext(source_dir_id='source', dry_run=False, post_actions=False), self.rules, stats,
+            )
+        return stats
+
+    def test_organizer_recycles_only_exact_ancestors_with_cleanup_disabled(self):
+        self.rules.clean_empty = False
+        self.cloud.add_dir('unrelated', 'source')
+        stats = self.execute_recycled_stage()
+        self.assertEqual(self.cloud.deleted, ['leaf', 'stage'])
+        self.assertEqual(stats['empty_dirs_cleaned'], 2)
+        self.assertNotIn('unrelated', self.cloud.reads)
+        self.assertNotIn('source', self.cloud.reads)
+
+    def test_organizer_does_not_treat_recycled_plan_as_remaining_media(self):
+        stats = self.execute_recycled_stage()
+        self.assertEqual(self.cloud.deleted, ['leaf', 'stage'])
+        self.assertEqual(stats['empty_dirs_cleaned'], 2)
+        self.assertNotIn('source', self.cloud.deleted)
+
+    def test_organizer_recycled_cleanup_preserves_nonempty_and_out_of_scope_tree(self):
+        self.rules.clean_empty = False
+        self.cloud.add_file('unselected.srt', 'leaf')
+        self.execute_recycled_stage()
+        self.assertEqual(self.cloud.deleted, [])
+        self.cloud.nodes['stage'].parent_id = '0'
+        stats = self.execute_recycled_stage()
+        self.assertEqual(self.cloud.deleted, [])
+        self.assertEqual(stats['empty_dir_cleanup_failed'], 1)
+
+    def test_organizer_recycle_failure_blocks_cleanup_and_read_error_is_redacted(self):
+        self.rules.clean_empty = False
+        stats = self.execute_recycled_stage(duplicate_cleanup_failed=1)
+        self.assertEqual(self.cloud.reads, [])
+        self.assertEqual(stats['empty_dir_cleanup_skipped'], 1)
+        with patch.object(self.cloud, 'file_info', side_effect=RuntimeError('api_key=private-token')):
+            stats = self.execute_recycled_stage()
+        self.assertEqual(self.cloud.deleted, [])
+        self.assertEqual(stats['duplicate_recycled'], 1)
+        self.assertEqual(stats['empty_dir_cleanup_failed'], 1)
+        self.assertNotIn('private-token', str(stats))
 
     def test_no_move_or_incomplete_execution_does_not_cleanup(self):
         for extra in ({'moved': 0}, {'failed': 1}, {'need_confirm': 1}, {'stopped': 1},

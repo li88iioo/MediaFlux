@@ -118,6 +118,92 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result['status'], 'running')
 
+    def test_persisted_recycle_fact_cleans_owned_tree_despite_disabled_policy_once(self):
+        stats = {'moved': 0, 'skipped': 1, 'duplicate_recycled': 1,
+                 'duplicate_cleanup_parent_ids': ['leaf'], 'download_staging_policy': 'retained'}
+        organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(stats))
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='done'", (
+                json.dumps({**self.payload, 'rules': {'clean_empty': False}}),
+            ))
+        self.cloud.add_dir('leaf', 'stage')
+        self.rules.clean_empty = False
+        self.assertIsNotNone(self.enqueue())
+        self.assertEqual(json.loads(self.job()['result_json'])['duplicate_recycled'], 1)
+        self.drain()
+        self.drain()
+        row = download_requests_repo.get_download_request(self.request_id)
+        assert row is not None
+        self.assertEqual((row['organize_status'], row['gy_staging_cleanup_status']), ('completed', 'completed'))
+        self.assertEqual(row['gy_staging_cleanup_error'], '')
+        self.assertEqual(self.cloud.deleted, ['leaf', 'stage'])
+        self.assertEqual(self.job()['status'], 'completed')
+
+    def test_recycle_failure_or_noninteger_fact_never_enqueues_cleanup(self):
+        for stats in ({'moved': 0, 'duplicate_recycled': 1, 'duplicate_cleanup_failed': 1},
+                      {'moved': 0, 'duplicate_recycled': True}):
+            with self.subTest(stats=stats):
+                organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(stats))
+                self.assertIsNone(self.enqueue())
+        self.assertEqual(self.cloud.deleted, [])
+
+    def test_recycle_fact_lazily_opens_client_when_ordinary_cleanup_is_disabled(self):
+        organize_confirmations_repo.update_organize_confirmation(
+            'done', result_json=json.dumps({'moved': 0, 'duplicate_recycled': 1}),
+        )
+        self.enqueue()
+        self.rules.clean_empty = False
+        self.assertTrue(self.writer_lock.acquire(blocking=False))
+        try:
+            with patch.object(worker, 'GuangYaClient', return_value=self.cloud) as client_factory, \
+                    patch.object(worker, 'close_guangya_client'), \
+                    patch('app.modules.organize_tasks.config.get', side_effect=lambda key, default='': default):
+                worker.reconcile_with_client(rules=self.rules, writer_lock=self.writer_lock)
+                client_factory.assert_called_once_with()
+        finally:
+            self.writer_lock.release()
+        self.assertEqual(self.cloud.deleted, ['stage'])
+
+    def test_changed_recycle_fact_blocks_existing_intent_even_if_move_succeeded(self):
+        organize_confirmations_repo.update_organize_confirmation(
+            'done', result_json=json.dumps({'moved': 0, 'duplicate_recycled': 1}),
+        )
+        self.enqueue()
+        organize_confirmations_repo.update_organize_confirmation('done', result_json='{"moved":1}')
+        self.drain()
+        self.assertEqual(self.job()['status'], 'blocked')
+        self.assertEqual(self.cloud.deleted, [])
+
+    def test_exact_deleted_receipt_settles_old_manual_log_without_reclaim_or_rewrite(self):
+        old_log = db.add_organize_log('guangya', '/', '', 'video', 'manual', '',
+                                     source_dir_id='stage', legacy_incomplete=False)
+        db.add_organize_log_items(old_log, [{'file_id': 'video', 'role': 'video', 'status': 'manual'}])
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_log SET updated_at='2000-01-01 00:00:00' WHERE id=?", (old_log,))
+        self.confirm('recycled', status='running')
+        receipt = db.add_organize_log(
+            'guangya', '/', '', 'video', 'deleted', '', source_dir_id='stage',
+            operation_token='recognition-confirm:recycled', legacy_incomplete=False,
+        )
+        with db.get_conn() as conn:
+            before = dict(conn.execute('SELECT * FROM organize_log WHERE id=?', (receipt,)).fetchone())
+        stats = {'moved': 0, 'skipped': 1, 'duplicate_recycled': 1,
+                 'duplicate_cleanup_parent_ids': ['stage']}
+        with patch.object(db, 'claim_organize_log_operation', side_effect=AssertionError('must not reclaim deleted log')):
+            organize_confirmations_repo.complete_organize_confirmation_with_delivery(
+                'recycled', result_json=json.dumps(stats), event_json='{}', chat_id='',
+                message_id=None, enqueue_delivery=False,
+            )
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute('SELECT status FROM organize_log WHERE id=?', (old_log,)).fetchone()['status'], 'confirmed')
+            self.assertEqual(conn.execute('SELECT status FROM organize_log_items WHERE log_id=?', (old_log,)).fetchone()['status'], 'confirmed')
+            self.assertEqual(dict(conn.execute('SELECT * FROM organize_log WHERE id=?', (receipt,)).fetchone()), before)
+        self.assertEqual(self.job('recycled')['status'], 'pending')
+        self.rules.clean_empty = False
+        self.drain(confirmation_token='recycled')
+        self.assertEqual(self.cloud.deleted, ['stage'])
+        self.assertEqual(self.job('recycled')['status'], 'completed')
+
     def test_read_error_persists_backoff_then_new_worker_recovers_once(self):
         self.enqueue()
         with patch.object(self.cloud, 'list_dir', side_effect=OSError('offline')):

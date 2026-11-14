@@ -46,7 +46,7 @@ class OrganizeResultSchemaTests(unittest.TestCase):
     def test_result_exposes_counters_groups_and_strm_without_log_parsing(self):
         result = build_organize_result(
             {
-                "total": 10, "moved": 8, "failed": 1,
+                "total": 10, "moved": 8, "failed": 1, "duplicate_recycled": 1,
                 "group_results": [{"group_path": "作品 A", "status": "completed"}],
                 "strm": {"ok": True},
                 "strm_changes": [{"rel_dir": "剧集/A", "name": "E01.mkv"}],
@@ -60,6 +60,7 @@ class OrganizeResultSchemaTests(unittest.TestCase):
 
         self.assertEqual(result["schema_version"], ORGANIZE_RESULT_SCHEMA_VERSION)
         self.assertEqual(result["counters"]["moved"], 8)
+        self.assertEqual(read_organize_result(result)["counters"]["duplicate_recycled"], 1)
         self.assertEqual(result["groups"][0]["group_path"], "作品 A")
         self.assertEqual(result["strm"], {"ok": True})
         self.assertEqual(result["media_refresh"], {"Jellyfin": True})

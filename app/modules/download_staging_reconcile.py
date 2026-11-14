@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from contextlib import ExitStack
 from dataclasses import replace
 
@@ -55,7 +56,12 @@ def reconcile_with_client(client=None, *, rules: OrganizeRules | None = None, li
                         '仍有同源媒体等待确认，稍后复核' if reason == 'waiting' else reason
                     ))
                     continue
-                if row['gy_staging_cleanup_status'] in ('completed', 'skipped'):
+                stats = json.loads(job['result_json'])
+                recycled = stats.get('duplicate_recycled', 0)
+                duplicate_cleanup = type(recycled) is int and recycled > 0
+                if row['gy_staging_cleanup_status'] == 'completed' or (
+                    row['gy_staging_cleanup_status'] == 'skipped' and not duplicate_cleanup
+                ):
                     finish_cleanup_intent(
                         job, status='completed' if row['gy_staging_cleanup_status'] == 'completed' else 'retained',
                         error=str(row.get('gy_staging_cleanup_error') or ''),
@@ -67,7 +73,7 @@ def reconcile_with_client(client=None, *, rules: OrganizeRules | None = None, li
                 current_rules = rules or OrganizeRules.from_config().for_source(str(row['gy_target_dir']))
                 if row.pop('_cleanup_disabled', False):
                     current_rules = replace(current_rules, clean_empty=False)
-                if current_rules.clean_empty and client is None:
+                if (current_rules.clean_empty or duplicate_cleanup) and client is None:
                     client = GuangYaClient()
                     clients.callback(close_guangya_client, client)
                 # 所有永久来源/目标保护、版本、空树、请求 CAS、删除审计继续复用原实现。
@@ -76,6 +82,7 @@ def reconcile_with_client(client=None, *, rules: OrganizeRules | None = None, li
                     [{'id': str(row['gy_target_dir']), 'name': str(row['gy_staging_name'])}],
                     rules=current_rules,
                     expected_identities={int(row['id']): {**row, '_confirmation_id': int(job['confirmation_id'])}},
+                    source_stats={str(row['gy_target_dir']): stats},
                 )
                 merge_cleanup_report(aggregate, report)
                 latest = download_requests_repo.get_download_request(int(row['id']))

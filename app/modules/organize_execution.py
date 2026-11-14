@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import replace
 from inspect import getattr_static
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -11,7 +12,7 @@ from app import database as db
 from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.logger import get_logger
-from app.modules.directory_scrape_errors import safe_organize_failure
+from app.modules.directory_scrape_errors import DirectoryScrapeConflictError, safe_organize_failure
 from app.modules.guangya_compensation import restore_guangya_file
 from app.modules.organize_delete_audit import (
     DeleteCandidate,
@@ -95,6 +96,50 @@ def execute_organize_plans(
         )
 
     subtitle_plans_by_video = subtitle_plans_by_video or {}
+    duplicate_candidates: list[tuple[OrganizePlan, int, list[GuangYaFile]]] = []
+
+    def shared_companion_ids(plan: OrganizePlan, candidates: list[GuangYaFile], entries: list[GuangYaFile]) -> set[str]:
+        from app.modules.organize import VIDEO_EXTS
+
+        video_exts = VIDEO_EXTS | organizer.video_exts(rules)
+        present = {item.file_id for item in entries}
+        remaining = [item for item in candidates if item.file_id in present]
+        return {
+            item.file_id
+            for other in entries
+            if not other.is_dir and other.file_id != plan.file_id
+            and other.name.rsplit(".", 1)[-1].lower() in video_exts
+            for item in organizer._companions_for_plan(
+                replace(plan, file_id=other.file_id, original_name=other.name), remaining,
+            )
+        }
+
+    def duplicate_candidate(plan: OrganizePlan) -> bool:
+        return (
+            plan.conflict_decision in {"skip", "batch_superseded"}
+            and plan.match is not None and not plan.match.need_confirm
+            and bool(plan.target_path)
+        )
+
+    def skipped_companions(plan: OrganizePlan) -> list[GuangYaFile]:
+        candidates = companion_files.get(plan.original_path, [])
+        if not duplicate_candidate(plan):
+            return organizer._companions_for_plan(plan, candidates)
+        # 自动回收只带走独占伴随文件。字幕归属沿用整理规划，不凭相同
+        # basename 删除另一个版本仍可能需要的字幕/图片/NFO。
+        companions = list({item.file_id: item for item in (
+            *organizer._companions_for_plan(
+                plan, [item for item in candidates if media_role(item.name) != "subtitle"],
+            ),
+            *(item.file for item in subtitle_plans_by_video.get(plan.file_id, [])),
+        )}.values())
+        if not companions:
+            return []
+        # 小文件、样片或未选中的视频不在 plans 内，但仍拥有其伴随文件。
+        entries = organizer.client.list_dir(plan.original_parent_id)
+        shared = shared_companion_ids(plan, companions, entries)
+        present = {item.file_id for item in entries}
+        return [item for item in companions if item.file_id in present and item.file_id not in shared]
     moved_companions: set[str] = set()
     directory_stats: dict[str, dict[str, Any]] = {}
     runtime = task_runtime or OrganizeTaskRuntime()
@@ -178,10 +223,8 @@ def execute_organize_plans(
         parsed = organizer._parse_media_fields(plan.original_name)
         position_season, position_episode = resolved_plan_position(plan, parsed)
         target_name = plan.new_name or plan.original_name
-        companions = organizer._companions_for_plan(
-            plan, companion_files.get(plan.original_path, [])
-        )
-        write_plan_audit(
+        companions = skipped_companions(plan)
+        log_id = write_plan_audit(
             plan, match, plan.target_path + "/" + target_name, "skipped",
             {
                 "current_parent_id": plan.original_parent_id,
@@ -212,6 +255,8 @@ def execute_organize_plans(
                 "status": "skipped", "error": reason,
             } for item in companions]],
         )
+        if duplicate_candidate(plan):
+            duplicate_candidates.append((plan, log_id, companions))
 
     active_group_key = ""
     completed_group_keys: set[str] = set()
@@ -286,11 +331,9 @@ def execute_organize_plans(
             audit_status = "manual" if match.need_confirm else "skipped"
             parsed = organizer._parse_media_fields(p.original_name)
             position_season, position_episode = resolved_plan_position(p, parsed)
-            companions = organizer._companions_for_plan(
-                p, companion_files.get(p.original_path, [])
-            )
+            companions = skipped_companions(p)
             try:
-                write_plan_audit(
+                log_id = write_plan_audit(
                     p, match, "", audit_status,
                     {
                         "current_parent_id": p.original_parent_id,
@@ -316,6 +359,8 @@ def execute_organize_plans(
                         "status": audit_status, "error": p.note or match.error,
                     } for item in companions]],
                 )
+                if duplicate_candidate(p):
+                    duplicate_candidates.append((p, log_id, companions))
             except Exception:
                 logger.exception("写入跳过整理审计失败 file=%s", p.original_name)
                 raise
@@ -826,12 +871,95 @@ def execute_organize_plans(
                 db.update_organize_delete_audit(
                     delete_audit_id, organize_log_id=failed_log_id
                 )
+    # 预演库存可能含本批尚未成功的虚拟赢家；归档全部结束后才核验真实
+    # 保留方，再复用整理日志的回收事务。失败/取消时不回收剩余来源。
+    if duplicate_candidates and stats.get("scan_complete") is not False and not any(
+        stats.get(key) for key in ("failed", "stopped", "scan_errors", "scan_limited", "protected_staging_dirs")
+    ):
+        from app.modules.organize_correction import OrganizeCorrectionService
+        from app.modules.organize_scan import validate_source_snapshot
+
+        correction = OrganizeCorrectionService(client=organizer.client, scraper=organizer.scraper)
+        try:
+            for plan, log_id, companions in duplicate_candidates:
+                if cancel_event is not None and cancel_event.is_set():
+                    stats["stopped"] = 1
+                    break
+                try:
+                    target_id = organizer._find_existing_dir_chain(rules.target_dir_id, plan.target_path) or ""
+                    if not target_id or target_id == plan.original_parent_id:
+                        raise DirectoryScrapeConflictError("保留版本归档位置未核实，来源文件已保留")
+                    target_files = organizer.client.list_dir(target_id)
+                    snapshot = runtime.get_inventory(target_id)
+                    evidence = snapshot.evidence_names if snapshot is not None else {}
+                    retained, decision, _ = organizer._resolve_variant_conflict(
+                        plan, target_files, rules, evidence,
+                    )
+                    if (retained is None or decision != "skip" or retained.file_id == plan.file_id
+                            or retained.is_dir or retained.size <= 0 or not retained.etag):
+                        raise DirectoryScrapeConflictError("未核实有效的同版本归档文件，来源文件已保留")
+                    retained = replace(retained)
+
+                    def verify_retained() -> None:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise DirectoryScrapeConflictError("整理已取消，停止自动回收")
+                        live_files = organizer.client.list_dir(target_id)
+                        validate_source_snapshot(
+                            retained, next((item for item in live_files if item.file_id == retained.file_id), None),
+                            role="保留的归档版本",
+                        )
+                        organizer._verify_remote_snapshot(retained, role="保留的归档版本")
+                        if companions and shared_companion_ids(
+                            plan, companions, organizer.client.list_dir(plan.original_parent_id),
+                        ):
+                            raise DirectoryScrapeConflictError("伴随文件被其他来源视频共用，停止自动回收")
+                        kept, live_decision, _ = organizer._resolve_variant_conflict(
+                            plan, live_files, rules, evidence,
+                        )
+                        if kept is None or kept.file_id != retained.file_id or live_decision != "skip":
+                            raise DirectoryScrapeConflictError("归档版本或冲突判定已变化，停止自动回收")
+                        guard = getattr(organizer, "_before_plan_write", None)
+                        if guard is not None:
+                            guard(plan, "conflict", target_files=live_files)
+
+                    verify_retained()
+                    detail = correction.detail(log_id)
+                    result = correction.delete_group(
+                        log_id, str(detail.get("operation_token") or f"duplicate:{uuid.uuid4().hex}"),
+                        int(detail["version"]), "",
+                        retained=retained, before_delete=verify_retained,
+                    )
+                    for warning in result.get("warnings", []):
+                        organizer._append_reason(stats, "warnings", warning)
+                        organizer._append_reason(stats, "skip_reasons", warning)
+                    plan.action = "recycled"
+                    plan.note = plan.conflict_note = "同版本保留现有版本，新文件及其专属伴随文件已移入光鸭回收站"
+                    stats["duplicate_recycled"] = int(stats.get("duplicate_recycled", 0)) + 1
+                    current = directory_stats[plan.original_path or "/"]
+                    current["duplicate_recycled"] = int(current.get("duplicate_recycled", 0)) + 1
+                    parents = stats.setdefault("duplicate_cleanup_parent_ids", [])
+                    if plan.original_parent_id not in parents:
+                        parents.append(plan.original_parent_id)
+                except Exception as exc:
+                    message = safe_organize_failure(exc)
+                    stats["failed"] += 1
+                    stats["duplicate_cleanup_failed"] = int(stats.get("duplicate_cleanup_failed", 0)) + 1
+                    directory_stats[plan.original_path or "/"]["failed"] += 1
+                    organizer._append_reason(stats, "skip_reasons", f"同版本自动回收未完成：{message}")
+                    # 回收内核已结算 partial_failed/failed 时不得覆盖真实结果。
+                    row = db.get_organize_log(log_id)
+                    if row is not None and row["status"] == "skipped":
+                        db.update_organize_log(log_id, status="failed", error=f"同版本自动回收未完成：{message}")
+                    logger.warning("同版本自动回收未完成 file=%s error=%s", plan.original_name, message)
+                    break
+        finally:
+            correction.close()
     if active_group_key and active_group_key not in completed_group_keys:
         completed_group_keys.add(active_group_key)
     for group_key, row in source_group_rows.items():
         totals = {
             "moved": 0, "metadata_moved": 0, "skipped": 0,
-            "need_confirm": 0, "failed": 0,
+            "need_confirm": 0, "failed": 0, "duplicate_recycled": 0,
         }
         for path in source_group_paths.get(group_key, set()):
             current = directory_stats.get(path, {})

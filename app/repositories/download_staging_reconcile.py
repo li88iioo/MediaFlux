@@ -30,7 +30,11 @@ def _object(encoded) -> dict:
 def _success(encoded) -> bool:
     stats = _object(encoded)
     moved = stats.get('moved')
-    return type(moved) is int and moved > 0 and not _unsafe_confirmation_stats(encoded)
+    recycled = stats.get('duplicate_recycled')
+    return (
+        ((type(moved) is int and moved > 0) or (type(recycled) is int and recycled > 0))
+        and not _unsafe_confirmation_stats(encoded)
+    )
 
 
 def _eligible(row: dict) -> bool:
@@ -63,11 +67,14 @@ def enqueue_confirmation_cleanup(conn, *, token: str, timestamp: str) -> int | N
     if len(owners) != 1 or not _eligible(owners[0]):
         return None
     row = owners[0]
-    if row.get('gy_staging_cleanup_status') in ('completed', 'skipped'):
+    stats = _object(confirmation['result_json'])
+    recycled = stats.get('duplicate_recycled', 0)
+    if row.get('gy_staging_cleanup_status') == 'completed' or (
+        row.get('gy_staging_cleanup_status') == 'skipped' and not (type(recycled) is int and recycled > 0)
+    ):
         return None
     identity = staging_identity_snapshot(row)
     # 执行时收窄过的授权不可被后台当前配置放大（含 Agent clean_title）。
-    stats = _object(confirmation['result_json'])
     if 'download_staging_identity' in stats:
         before = stats['download_staging_identity']
         if not isinstance(before, dict) or not same_staging_identity(row, before):
@@ -277,6 +284,11 @@ def validate_cleanup_intent(job: dict) -> tuple[dict | None, str]:
         if (confirmation is None or confirmation['status'] != 'completed'
                 or not _success(job['result_json']) or not _success(confirmation['result_json'])):
             return None, '确认已变化、失败或成功证据不足，停止自动收尾'
+        recycled = _object(job['result_json']).get('duplicate_recycled', 0)
+        if type(recycled) is int and recycled > 0:
+            current_recycled = _object(confirmation['result_json']).get('duplicate_recycled', 0)
+            if type(current_recycled) is not int or current_recycled != recycled:
+                return None, '确认的文件回收成功事实已变化，停止自动收尾'
         owners = requests_for_download_confirmation(_object(confirmation['payload_json']), conn=conn)
         expected = _object(job['identity_json'])
         if (len(owners) != 1 or int(owners[0]['id']) != int(job['request_id'])

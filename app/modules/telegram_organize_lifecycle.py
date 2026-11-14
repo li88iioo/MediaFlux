@@ -123,6 +123,7 @@ def _counts(stats: Mapping[str, Any]) -> dict[str, int]:
         "confirm": "need_confirm",
         "skipped": "skipped",
         "failed": "failed",
+        "duplicate_recycled": "duplicate_recycled",
     }
     counts = {
         label: safe_int(stats.get(source), 0, minimum=0)
@@ -138,6 +139,7 @@ def _counts(stats: Mapping[str, Any]) -> dict[str, int]:
                 for item in directories.values()
                 if isinstance(item, Mapping)
             )
+    counts["skipped"] = max(0, counts["skipped"] - counts["duplicate_recycled"])
     return counts
 
 
@@ -156,6 +158,7 @@ def _summary_label(counts: Mapping[str, int], *, expired: int = 0) -> str:
         ("metadata", "元数据"),
         ("confirm", "待确认"),
         ("skipped", "跳过"),
+        ("duplicate_recycled", "同版本已回收"),
         ("failed", "失败"),
     )
     for key, label in labels:
@@ -439,7 +442,7 @@ def update_organize_lifecycle_confirmations(
 
     base = {
         key: safe_int(baseline.get(key), 0, minimum=0)
-        for key in ("total", "moved", "metadata", "confirm", "skipped", "failed")
+        for key in ("total", "moved", "metadata", "confirm", "skipped", "failed", "duplicate_recycled")
     }
     resolved_files = min(
         base["confirm"],
@@ -454,8 +457,12 @@ def update_organize_lifecycle_confirmations(
             outcomes.get("metadata"), 0, minimum=0,
         ),
         "confirm": max(0, base["confirm"] - resolved_files),
-        "skipped": base["skipped"] + safe_int(
-            outcomes.get("skipped"), 0, minimum=0,
+        "skipped": base["skipped"] + max(
+            0, safe_int(outcomes.get("skipped"), 0, minimum=0)
+            - safe_int(outcomes.get("duplicate_recycled"), 0, minimum=0),
+        ),
+        "duplicate_recycled": base["duplicate_recycled"] + safe_int(
+            outcomes.get("duplicate_recycled"), 0, minimum=0,
         ),
         "failed": base["failed"] + safe_int(
             outcomes.get("failed"), 0, minimum=0,
@@ -471,10 +478,13 @@ def update_organize_lifecycle_confirmations(
     for key, label in (
         ("moved", "入库"),
         ("skipped", "跳过"),
+        ("duplicate_recycled", "同版本已回收"),
         ("failed", "失败"),
         ("expired", "过期"),
     ):
         value = safe_int(outcomes.get(key), 0, minimum=0)
+        if key == "skipped":
+            value = max(0, value - safe_int(outcomes.get("duplicate_recycled"), 0, minimum=0))
         if value:
             confirmation_parts.append(f"{label} {value} 个视频")
     if counts["confirm"]:

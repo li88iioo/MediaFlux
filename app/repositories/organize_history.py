@@ -21,6 +21,19 @@ _BUSINESS_LOG_FIELDS = (
 _FINISH_FIELDS = {"status", "operation_type", "current_parent_id", "current_name", "error"}
 
 
+def has_unresolved_delete_audits(file_ids: list[str]) -> bool:
+    """精确文件 ID 的未知回收结果阻止自动重放；重启后的 interrupted 同样未知。"""
+    ids = tuple(dict.fromkeys(file_ids))
+    if not ids:
+        return False
+    placeholders = ",".join("?" for _ in ids)
+    with db.get_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM organize_delete_audit WHERE status IN ('pending','failed','interrupted') "
+            f"AND file_id IN ({placeholders}) LIMIT 1", ids,
+        ).fetchone() is not None
+
+
 def active_organize_confirmation_refs(conn: sqlite3.Connection) -> tuple[set[str], set[str], set[str]]:
     """在调用方事务内读取仍可执行的确认引用，供日志两入口和页面共用。"""
     files, tasks, tokens = set(), set(), set()
@@ -108,7 +121,7 @@ def settle_completed_confirmation_logs(conn: sqlite3.Connection, *, token: str =
                 continue
             status = "skipped"
             reason = f"确认处理已结束；本组入库 {stats['moved']} 个、跳过 {stats['skipped']} 个"
-        elif receipt["status"] not in {"success", "skipped", "failed"}:
+        elif receipt["status"] not in {"success", "skipped", "failed", "deleted"}:
             continue
         stamp = row["completed_at"] or row["updated_at"]
         conn.execute(

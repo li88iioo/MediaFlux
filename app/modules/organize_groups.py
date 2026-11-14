@@ -122,6 +122,7 @@ class OrganizeGroupResult:
     error: str = ""
     elapsed_seconds: float = 0.0
     stats: dict[str, Any] = field(default_factory=dict)
+    duplicate_recycled: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """仅输出可安全 JSON 序列化的字段；原始 stats 由调用方按需保留。"""
@@ -136,6 +137,7 @@ class OrganizeGroupResult:
             "replaced": self.replaced,
             "metadata_moved": self.metadata_moved,
             "skipped": self.skipped,
+            "duplicate_recycled": self.duplicate_recycled,
             "need_confirm": self.need_confirm,
             "failed": self.failed,
             "failures": list(self.failures),
@@ -159,6 +161,7 @@ class OrganizeGroupResult:
             "moved": self.moved,
             "metadata_moved": self.metadata_moved,
             "skipped": self.skipped,
+            "duplicate_recycled": self.duplicate_recycled,
             "need_confirm": self.need_confirm,
             "failed": self.failed,
         }
@@ -524,6 +527,9 @@ def merge_group_stats(aggregate: dict, group_stats: dict) -> dict:
             bucket = aggregate.setdefault(key, [])
             if not isinstance(bucket, list):
                 continue
+            if key == "duplicate_cleanup_parent_ids":
+                bucket.extend(parent for parent in value if parent not in bucket)
+                continue
             if limit is None:
                 bucket.extend(value)
                 continue
@@ -607,6 +613,7 @@ def build_group_result(
             "empty_dir_cleanup_failed",
             "empty_dir_cleanup_unsupported",
             "empty_dir_cleanup_skipped",
+            "duplicate_cleanup_failed",
         )
         if key in stats
     }
@@ -622,6 +629,7 @@ def build_group_result(
         replaced=int(stats.get("replaced", 0) or 0),
         metadata_moved=int(stats.get("metadata_moved", 0) or 0),
         skipped=int(stats.get("skipped", 0) or 0),
+        duplicate_recycled=int(stats.get("duplicate_recycled", 0) or 0),
         need_confirm=int(stats.get("need_confirm", 0) or 0),
         failed=int(stats.get("failed", 0) or 0),
         failures=[str(item) for item in (stats.get("skip_reasons") or [])][:10],
@@ -647,6 +655,7 @@ def resolve_group_status(stats: dict, *, error: str = "") -> str:
         or (stats or {}).get("scan_errors")
         or (stats or {}).get("protected_staging_dirs")
         or int((stats or {}).get("replacement_cleanup_failed", 0) or 0)
+        or int((stats or {}).get("duplicate_cleanup_failed", 0) or 0)
         or int((stats or {}).get("audit_failures", 0) or 0)
         or int((stats or {}).get("empty_dir_cleanup_failed", 0) or 0)
     )

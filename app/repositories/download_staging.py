@@ -69,7 +69,8 @@ def _unsafe_confirmation_stats(encoded: str | None) -> bool:
             or stats.get('scan_complete') is False
             or any(stats.get(key) for key in (
                 'failed', 'need_confirm', 'stopped', 'scan_errors', 'scan_limited', 'audit_failures',
-                'replacement_cleanup_failed', 'empty_dir_cleanup_failed', 'source_dir_cleanup_failed',
+                'replacement_cleanup_failed', 'duplicate_cleanup_failed',
+                'empty_dir_cleanup_failed', 'source_dir_cleanup_failed',
             ))
         )
     except (TypeError, ValueError):

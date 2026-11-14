@@ -422,6 +422,13 @@ class GroupStatsMergeTests(unittest.TestCase):
         self.assertEqual(aggregate["failed"], 1)
         self.assertFalse(aggregate["scan_complete"])
 
+    def test_duplicate_facts_sum_and_parent_ids_remain_unique_across_groups(self):
+        aggregate: dict = {}
+        merge_group_stats(aggregate, {'duplicate_recycled': 1, 'duplicate_cleanup_parent_ids': ['a', 'a']})
+        merge_group_stats(aggregate, {'duplicate_recycled': 2, 'duplicate_cleanup_parent_ids': ['a', 'b']})
+        self.assertEqual(aggregate['duplicate_recycled'], 3)
+        self.assertEqual(aggregate['duplicate_cleanup_parent_ids'], ['a', 'b'])
+
     def test_flag_style_counters_use_max_not_sum(self):
         aggregate: dict = {}
 

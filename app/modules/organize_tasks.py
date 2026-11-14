@@ -163,6 +163,11 @@ def _merge_source_stats(aggregate: dict[str, Any], stats: dict[str, Any]) -> Non
             aggregate.setdefault(key, []).extend(
                 item for item in values if isinstance(item, dict)
             )
+    parents = aggregate.setdefault("duplicate_cleanup_parent_ids", [])
+    parents.extend(
+        parent for parent in stats.get("duplicate_cleanup_parent_ids") or []
+        if parent not in parents
+    )
     for key in (
         "confirmations",
         "skip_reasons",
@@ -187,7 +192,7 @@ def _operation_result_status(result: object) -> str:
     if organize_strm_error(stats):
         return "partial"
     for key in (
-        "failed", "replacement_cleanup_failed", "empty_dir_cleanup_failed",
+        "failed", "replacement_cleanup_failed", "duplicate_cleanup_failed", "empty_dir_cleanup_failed",
         "source_dir_cleanup_failed", "audit_failures",
         "verification_failed", "stopped", "scan_errors",
     ):
@@ -245,6 +250,7 @@ _SOURCE_ROOT_CLEANUP_UNSAFE_STATS = (
     "protected_staging_dirs",
     "stopped",
     "replacement_cleanup_failed",
+    "duplicate_cleanup_failed",
     "audit_failures",
 )
 
@@ -2111,6 +2117,7 @@ class OrganizeTaskManager:
                 or aggregate.get("scan_errors")
                 or aggregate.get("protected_staging_dirs")
                 or int(aggregate.get("replacement_cleanup_failed", 0) or 0)
+                or int(aggregate.get("duplicate_cleanup_failed", 0) or 0)
                 or int(aggregate.get("empty_dir_cleanup_failed", 0) or 0)
                 or int(aggregate.get("source_dir_cleanup_failed", 0) or 0)
                 or int(aggregate.get("audit_failures", 0) or 0)
@@ -2181,7 +2188,10 @@ class OrganizeTaskManager:
                 if aggregate.get('resumed_download_ids'):
                     message += f"；已恢复 {len(aggregate['resumed_download_ids'])} 个下载整理任务，等待后台落稳核验"
             if status == "completed":
-                cleanup = self._cleanup_download_staging(organizer.client, download_request_ids or [], sources, rules=rules)
+                cleanup = self._cleanup_download_staging(
+                    organizer.client, download_request_ids or [], sources, rules=rules,
+                    source_stats={item["id"]: item["stats"] for item in source_results},
+                )
                 if isinstance(cleanup, dict):
                     aggregate["empty_dirs_cleaned"] = int(aggregate.get("empty_dirs_cleaned") or 0) + int(cleanup.get("cleaned") or 0)
                     for reason in cleanup.get("reasons", []):
@@ -2377,6 +2387,7 @@ class OrganizeTaskManager:
         *, rules: OrganizeRules | None = None,
         expected_identities: dict[int, dict] | None = None,
         allow_running: bool = True,
+        source_stats: dict[str, dict] | None = None,
     ) -> dict:
         current_rules = rules or OrganizeRules.from_config()
         protected, error = _protected_organize_root_ids(current_rules)
@@ -2393,11 +2404,21 @@ class OrganizeTaskManager:
             raise ValueError(config_error)
         protected.update(item["id"] for item in configured)
         protected.update({"0", (current_rules.target_dir_id or "0")})
-        return cleanup_download_staging(
-            client, request_ids, source_ids={item["id"] for item in sources},
-            protected_ids=protected, enabled=current_rules.clean_empty, allow_running=allow_running,
-            expected_identities=expected_identities,
-        )
+        combined = cleanup_report()
+        for source_id in dict.fromkeys(item["id"] for item in sources):
+            stats = (source_stats or {}).get(source_id, {})
+            if any(stats.get(key) for key in _SOURCE_ROOT_CLEANUP_UNSAFE_STATS):
+                combined["protected"] += 1
+                combined["reasons"].append("来源整理存在失败或扫描异常，已保留下载隔离目录")
+                continue
+            recycled = stats.get("duplicate_recycled")
+            report = cleanup_download_staging(
+                client, request_ids, source_ids={source_id}, protected_ids=protected,
+                enabled=current_rules.clean_empty or (type(recycled) is int and recycled > 0),
+                allow_running=allow_running, expected_identities=expected_identities,
+            )
+            merge_cleanup_report(combined, report)
+        return combined
 
 
 _manager = OrganizeTaskManager()

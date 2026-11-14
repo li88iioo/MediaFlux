@@ -10,7 +10,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from app import database as db
 from app.repositories import organize_confirmations as organize_confirmations_repo
@@ -60,6 +60,9 @@ from app.modules.scraper import (
 )
 from app.modules.strm import cleanup_deleted_cloud_files, configured_strm_source_plans, safe_path_component
 
+if TYPE_CHECKING:
+    from app.modules.directory_scrape import FixedMatchScraper, PreviewSnapshotGuangYaClient
+
 logger = get_logger(__name__)
 
 BUSY_STATUSES = {"reorganizing", "returning", "reverting", "deleting"}
@@ -67,6 +70,7 @@ REORGANIZE_STATUSES = {"success", "failed", "skipped", "manual", "reverted", "in
 RETURN_STATUSES = {"success", "failed", "reverted", "interrupted"}
 REVERT_STATUSES = {"success"}
 DELETE_STATUSES = {"success", "failed", "skipped", "reverted", "interrupted"}
+_DUPLICATE_DELETE_REASON = "同版本保留已归档版本，自动回收来源新文件"
 
 
 @dataclass
@@ -93,13 +97,17 @@ class AppliedTransition:
 
 
 class OrganizeCorrectionService:
-    def __init__(self, client: GuangYaClient | None = None,
-                 scraper: TMDBScraper | None = None):
+    def __init__(self, client: GuangYaClient | PreviewSnapshotGuangYaClient | None = None,
+                 scraper: TMDBScraper | FixedMatchScraper | None = None):
+        from app.modules.directory_scrape import FixedMatchScraper
+
         self._owns_client = client is None
         self._owns_scraper = scraper is None
         self.client = client if client is not None else GuangYaClient()
-        self.scraper = scraper if scraper is not None else TMDBScraper()
-        self.organizer = Organizer(client=self.client, scraper=self.scraper)
+        self.scraper = scraper.delegate if isinstance(scraper, FixedMatchScraper) else (
+            scraper if scraper is not None else TMDBScraper()
+        )
+        self.organizer = Organizer(client=self.client, scraper=scraper if scraper is not None else self.scraper)
         self._closed = False
 
     def close(self) -> None:
@@ -2104,33 +2112,50 @@ class OrganizeCorrectionService:
         return cleaned, warnings
 
     def _prepare_delete_group(
-        self, log_id: int, confirm_text: str,
+        self, log_id: int, confirm_text: str, *, retained: GuangYaFile | None = None,
     ) -> list[CorrectionItem]:
         detail = self.detail(log_id)
-        if confirm_text != "DELETE":
+        if retained is None and confirm_text != "DELETE":
             raise ValueError("请输入 DELETE 确认移入光鸭回收站")
         if not detail["allowed_actions"]["delete"]:
             raise ValueError(detail.get("safety_notice") or "当前状态不能删除")
         items = self._load_items(log_id)
         ordered = sorted(items, key=lambda item: item.role == "video")
         try:
+            if retained is not None and any(item.file_id == retained.file_id for item in ordered):
+                raise DirectoryScrapeConflictError("保留归档文件不能同时作为回收来源")
+            if retained is not None and organize_history_repo.has_unresolved_delete_audits(
+                [item.file_id for item in ordered],
+            ):
+                raise DirectoryScrapeConflictError("来源文件存在结果未知的回收审计，已停止自动重复回收，请先核对云盘")
             self._preflight_delete_items(ordered)
         except Exception as exc:
             for item in ordered:
                 record_blocked_delete(
-                    trigger="manual", reason=str(exc),
+                    trigger="duplicate_cleanup" if retained is not None else "manual",
+                    reason=f"{_DUPLICATE_DELETE_REASON}；{exc}" if retained is not None else str(exc),
                     candidate=DeleteCandidate(
                         item.file_id, item.current_name, item.current_parent_id,
                         item.size, item.etag,
                     ),
+                    replacement=DeleteCandidate(
+                        retained.file_id, retained.name, retained.parent_id,
+                        retained.size, retained.etag,
+                    ) if retained is not None else None,
                     organize_log_id=log_id,
                 )
+            if retained is not None:
+                failure = DirectoryScrapeConflictError(str(exc))
+                setattr(failure, "provider_write_not_started", True)
+                raise failure from exc
             raise
         return ordered
 
     def _execute_claimed_delete(
         self, log_id: int, operation_token: str,
         ordered: list[CorrectionItem], *, deleted_in_batch: set[str] | None = None,
+        retained: GuangYaFile | None = None,
+        before_delete: Callable[[], None] | None = None,
     ) -> dict:
         deleted: set[str] = set()
         batch_deleted = deleted_in_batch if deleted_in_batch is not None else set()
@@ -2144,14 +2169,36 @@ class OrganizeCorrectionService:
                 )
                 try:
                     if item.file_id not in batch_deleted:
+                        def delete_current(current=item):
+                            try:
+                                if before_delete is not None:
+                                    before_delete()
+                                self._preflight_delete_items([current])
+                            except Exception as exc:
+                                setattr(exc, "provider_write_not_started", True)
+                                raise
+                            result = self.client.delete([current.file_id])
+                            if result is False:
+                                raise RuntimeError("云盘未确认文件回收结果")
+                            return result
+
                         execute_recycle_bin_delete(
-                            self.client, trigger="manual",
-                            reason="用户在整理日志中输入 DELETE 显式确认",
+                            self.client,
+                            trigger="duplicate_cleanup" if retained is not None else "manual",
+                            reason=(
+                                _DUPLICATE_DELETE_REASON if retained is not None
+                                else "用户在整理日志中输入 DELETE 显式确认"
+                            ),
                             candidate=DeleteCandidate(
                                 item.file_id, item.current_name, item.current_parent_id,
                                 item.size, item.etag,
                             ),
+                            replacement=DeleteCandidate(
+                                retained.file_id, retained.name, retained.parent_id,
+                                retained.size, retained.etag,
+                            ) if retained is not None else None,
                             organize_log_id=log_id,
+                            delete_operation=delete_current if before_delete is not None else None,
                         )
                         deleted.add(item.file_id)
                         batch_deleted.add(item.file_id)
@@ -2176,9 +2223,16 @@ class OrganizeCorrectionService:
             db.update_organize_log(
                 log_id, status="partial_failed" if deleted else "failed", error=message,
             )
-            raise RuntimeError(message) from error
+            provider_not_called = bool(getattr(error, "provider_write_not_started", False))
+            failure = DirectoryScrapeConflictError(message) if retained is not None and provider_not_called else RuntimeError(message)
+            if provider_not_called:
+                setattr(failure, "provider_write_not_started", True)
+            raise failure from error
+        message = "；".join(warnings)
+        if retained is not None:
+            message = "；".join([f"{_DUPLICATE_DELETE_REASON}（已回收）", *warnings])
         db.update_organize_log(
-            log_id, status="deleted", operation_type="delete", error="；".join(warnings)
+            log_id, status="deleted", operation_type="delete", error=message,
         )
         return {
             "success": True, "log_id": log_id, "deleted": len(deleted),
@@ -2186,16 +2240,29 @@ class OrganizeCorrectionService:
         }
 
     def delete_group(self, log_id: int, operation_token: str,
-                     expected_version: int, confirm_text: str) -> dict:
-        ordered = self._prepare_delete_group(log_id, confirm_text)
-        directories, protected, staging_requests, warnings = self._capture_delete_cleanup(
-            {item.current_parent_id for item in ordered}, OrganizeRules.from_config(),
+                     expected_version: int, confirm_text: str, *,
+                     retained: GuangYaFile | None = None,
+                     before_delete: Callable[[], None] | None = None) -> dict:
+        """共用回收内核；自动回收由调用方 guard 授权，目录交原整理生命周期收尾。"""
+        if retained is not None and before_delete is None:
+            raise ValueError("自动回收必须提供删除前归档保留校验")
+        ordered = self._prepare_delete_group(log_id, confirm_text, retained=retained)
+        directories, protected, staging_requests, warnings = (
+            self._capture_delete_cleanup(
+                {item.current_parent_id for item in ordered}, OrganizeRules.from_config(),
+            )
+            if retained is None else ([], set(), {}, [])
         )
         if not db.claim_organize_log_operation(
             log_id, operation_token, "deleting", tuple(DELETE_STATUSES), expected_version,
         ):
             raise RuntimeError("日志状态或版本已变化，请刷新后重试")
-        result = self._execute_claimed_delete(log_id, operation_token, ordered)
+        result = self._execute_claimed_delete(
+            log_id, operation_token, ordered, retained=retained, before_delete=before_delete,
+        )
+        if retained is not None:
+            result["empty_dirs_cleaned"] = 0
+            return result
         cleaned, directory_warnings = self._finish_delete_cleanup(
             log_id=log_id, directories=directories, protected=protected,
             directory_log_ids={item.current_parent_id: log_id for item in ordered},

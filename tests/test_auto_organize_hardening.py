@@ -1499,7 +1499,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(manager.task_status()["status"], "completed")
         self.assertTrue(organizer.organize.call_args.kwargs["automatic"])
 
-    def test_stopped_download_organize_is_marked_for_attention(self):
+    def test_stopped_organize_remains_in_history_without_requesting_redownload(self):
         request_id, _created = download_requests_repo.create_download_request(
             "stopped-organize", "magnet", title="Stopped", initial_targets="guangya",
             source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
@@ -1546,7 +1546,11 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         attention_ids = {
             int(item["id"]) for item in download_requests_repo.list_download_requests_requiring_attention()
         }
-        self.assertIn(request_id, attention_ids)
+        self.assertNotIn(request_id, attention_ids)
+        history = download_requests_repo.list_download_request_summaries(scope="recent")
+        summary = next(item for item in history["items"] if item["request_number"] == request_id)
+        self.assertTrue(any(item["key"] == "organize" for item in summary["postprocess_issues"]))
+        self.assertIn("勿直接重复执行", summary["error"])
 
     def test_conflict_preview_uses_initialized_shared_listing_cache(self):
         organizer = Organizer(client=Mock(), scraper=Mock())

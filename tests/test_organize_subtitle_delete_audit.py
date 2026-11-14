@@ -26,6 +26,7 @@ from app.modules.organize_execution import execute_organize_plans
 from app.modules.organize_runtime import OrganizeTaskRuntime
 from app.modules.organize_postprocess import replacement_delete_block_reason
 from app.modules.organize_correction import OrganizeCorrectionService
+from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.scraper import MatchResult
 from app.modules.organize_delete_audit import (
     DeleteCandidate,
@@ -33,7 +34,7 @@ from app.modules.organize_delete_audit import (
     record_blocked_delete,
 )
 from tests.test_organize_multiversion import _VariantScraper, _VariantTreeClient
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 
 def cloud_file(file_id: str, name: str, *, size: int = 100, etag: str = "") -> GuangYaFile:
@@ -200,22 +201,47 @@ class SubtitleRecycleAuditUiTests(unittest.TestCase):
 
 
 class ManualRecycleBinDeleteTests(IsolatedDatabaseTestCase):
-    def _log(self):
+    def _log(self, *, status="success", parent="target"):
         log_id = db.add_organize_log(
-            "guangya", "source", "target/Movie.mkv", "video", "success", "1",
+            "guangya", "source", "target/Movie.mkv", "video", status, "1",
             original_parent_id="source", original_name="Movie.mkv",
-            current_parent_id="target", current_name="Movie.mkv",
+            current_parent_id=parent, current_name="Movie.mkv",
             legacy_incomplete=False,
         )
         db.add_organize_log_items(log_id, [
             {"file_id": "video", "role": "video", "original_parent_id": "source",
-             "original_name": "Movie.mkv", "current_parent_id": "target",
-             "current_name": "Movie.mkv", "size": 100, "etag": "gcid-video"},
+             "original_name": "Movie.mkv", "current_parent_id": parent,
+             "current_name": "Movie.mkv", "size": 100, "etag": "gcid-video", "status": status},
             {"file_id": "sub", "role": "subtitle", "original_parent_id": "source",
-             "original_name": "Movie.en.srt", "current_parent_id": "target",
-             "current_name": "Movie.en.srt", "size": 2, "etag": "gcid-sub"},
+             "original_name": "Movie.en.srt", "current_parent_id": parent,
+             "current_name": "Movie.en.srt", "size": 2, "etag": "gcid-sub", "status": status},
         ])
         return log_id
+
+    def _duplicate_delete_fixture(self, *, scraper=None):
+        self.enterContext(isolated_test_database())
+        log_id = self._log(status="skipped", parent="source")
+        retained = replace(cloud_file("retained", "Archived.Movie.mkv", size=200, etag="gcid-kept"), parent_id="archive")
+        remote = {item.file_id: item for item in (
+            cloud_file("video", "Movie.mkv", size=100, etag="gcid-video"),
+            cloud_file("sub", "Movie.en.srt", size=2, etag="gcid-sub"), retained,
+        )}
+        client = unittest.mock.Mock(spec=GuangYaClient)
+        client.file_info.side_effect = lambda file_id: replace(remote[file_id]) if file_id in remote else None
+        client.list_dir.side_effect = lambda parent_id: [
+            replace(item) for item in remote.values() if item.parent_id == parent_id
+        ]
+
+        def delete(ids):
+            for file_id in ids:
+                remote.pop(file_id)
+            return True
+
+        client.delete.side_effect = delete
+        self.enterContext(patch.object(OrganizeRules, "from_config", return_value=OrganizeRules(link_strm=False)))
+        service = OrganizeCorrectionService(client=client, scraper=scraper if scraper is not None else unittest.mock.Mock(spec=TMDBScraper))
+        self.addCleanup(service.close)
+        return log_id, service, client, remote, replace(retained)
 
     def test_manual_delete_preflights_whole_group_and_audits_each_provider_call(self):
         log_id = self._log()
@@ -243,7 +269,186 @@ class ManualRecycleBinDeleteTests(IsolatedDatabaseTestCase):
         self.assertIn("无法核验父目录 target", "；".join(result["warnings"]))
         self.assertEqual(result["deleted"], 2)
         self.assertEqual({row["status"] for row in db.list_organize_delete_audits(log_id)}, {"success"})
+        self.assertEqual({row["trigger"] for row in db.list_organize_delete_audits(log_id)}, {"manual"})
+        self.assertTrue(all(row["reason"] == "用户在整理日志中输入 DELETE 显式确认"
+                            and not row["replacement_file_id"] for row in db.list_organize_delete_audits(log_id)))
         self.assertEqual(len(service.detail(log_id)["delete_audits"]), 2)
+
+    def test_automatic_delete_audits_retained_file_and_leaves_directory_cleanup_to_organizer(self):
+        log_id, service, client, remote, retained = self._duplicate_delete_fixture()
+        guard = unittest.mock.Mock()
+
+        def verify_retained():
+            self.assertEqual(service.detail(log_id)["status"], "deleting")
+            self.assertEqual(sum(row["status"] == "pending" for row in db.list_organize_delete_audits(log_id)), 1)
+            self.assertIn(retained.file_id, remote)
+
+        guard.side_effect = verify_retained
+        with patch.object(service, "_capture_delete_cleanup") as capture, patch.object(service, "_finish_delete_cleanup") as finish:
+            result = service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=guard)
+        capture.assert_not_called()
+        finish.assert_not_called()
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"], result["warnings"]), (2, 0, []))
+        self.assertEqual(guard.call_count, 2)
+        self.assertEqual(client.delete.call_args_list, [unittest.mock.call(["sub"]), unittest.mock.call(["video"])])
+        self.assertEqual(set(remote), {"retained"})
+        detail = service.detail(log_id)
+        self.assertEqual(detail["status"], "deleted")
+        self.assertIn("已回收", detail["error"])
+        self.assertEqual({item["status"] for item in detail["items"]}, {"deleted"})
+        for audit in detail["delete_audits"]:
+            self.assertEqual((audit["trigger"], audit["status"], audit["parent_id"]), ("duplicate_cleanup", "success", "source"))
+            self.assertEqual(audit["reason"], "同版本保留已归档版本，自动回收来源新文件")
+            self.assertEqual((audit["replacement_file_id"], audit["replacement_name"], audit["replacement_size"], audit["replacement_gcid"]),
+                             (retained.file_id, retained.name, retained.size, retained.etag))
+
+    def test_automatic_delete_requires_guard_before_claiming_log(self):
+        log_id, service, client, _remote, retained = self._duplicate_delete_fixture()
+        with self.assertRaisesRegex(ValueError, "必须提供"):
+            service.delete_group(log_id, "auto-token", 1, "", retained=retained)
+        client.delete.assert_not_called()
+        self.assertEqual(service.detail(log_id)["status"], "skipped")
+        self.assertEqual(db.list_organize_delete_audits(log_id), [])
+
+    def test_automatic_delete_reuses_fixed_scraper_delegate_without_closing_injected_dependencies(self):
+        from app.modules.directory_scrape import FixedMatchScraper
+
+        delegate = unittest.mock.Mock(spec=TMDBScraper)
+        fixed = FixedMatchScraper(delegate, MatchResult(tmdb_id="1", title="Movie", media_type="movie"))
+        log_id, service, client, _remote, retained = self._duplicate_delete_fixture(scraper=fixed)
+        self.assertIs(service.organizer.scraper, fixed)
+        self.assertIs(service.scraper, delegate)
+        result = service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=lambda: None)
+        self.assertEqual(result["deleted"], 2)
+        service.close()
+        delegate.close.assert_not_called()
+        client.close.assert_not_called()
+
+    def test_manual_delete_keeps_explicit_confirmation_behavior_with_old_unknown_audit(self):
+        log_id, service, client, _remote, _retained = self._duplicate_delete_fixture()
+        old_audit = db.add_organize_delete_audit(trigger="manual", file_id="video", reason="历史未知回收", status="failed")
+        result = service.delete_group(log_id, "manual-token", 1, "DELETE")
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(client.delete.call_count, 2)
+        old_row = db.get_organize_delete_audit(old_audit)
+        assert old_row is not None
+        self.assertEqual(old_row["status"], "failed")
+        self.assertEqual({audit["trigger"] for audit in db.list_organize_delete_audits(log_id)}, {"manual"})
+
+    def test_automatic_delete_guard_rejection_is_blocked_with_public_reason(self):
+        log_id, service, client, remote, retained = self._duplicate_delete_fixture()
+        guard = unittest.mock.Mock(side_effect=DirectoryScrapeConflictError("归档保留文件已变化"))
+        with self.assertRaisesRegex(DirectoryScrapeConflictError, "归档保留文件已变化") as caught:
+            service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=guard)
+        self.assertTrue(getattr(caught.exception, "provider_write_not_started", False))
+        client.delete.assert_not_called()
+        self.assertEqual(set(remote), {"video", "sub", "retained"})
+        detail = service.detail(log_id)
+        self.assertEqual(detail["status"], "failed")
+        self.assertEqual([(audit["trigger"], audit["status"]) for audit in detail["delete_audits"]], [("duplicate_cleanup", "blocked")])
+        self.assertIn("归档保留文件已变化", detail["error"])
+
+    def test_automatic_delete_preflight_failure_uses_automatic_audit_before_claim(self):
+        for field, value in (("size", 101), ("etag", "changed")):
+            with self.subTest(field=field):
+                log_id, service, client, remote, retained = self._duplicate_delete_fixture()
+                setattr(remote["video"], field, value)
+                guard = unittest.mock.Mock()
+                with self.assertRaises(DirectoryScrapeConflictError):
+                    service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=guard)
+                client.delete.assert_not_called()
+                guard.assert_not_called()
+                detail = service.detail(log_id)
+                self.assertEqual(detail["status"], "skipped")
+                self.assertEqual(len(detail["delete_audits"]), 2)
+                self.assertTrue(all(audit["trigger"] == "duplicate_cleanup" and audit["status"] == "blocked"
+                                    and audit["replacement_file_id"] == retained.file_id for audit in detail["delete_audits"]))
+
+    def test_automatic_delete_reverifies_source_after_guard_even_when_size_or_etag_disappear(self):
+        for field, value in (("size", 0), ("etag", "")):
+            with self.subTest(field=field):
+                log_id, service, client, remote, retained = self._duplicate_delete_fixture()
+                with self.assertRaises(DirectoryScrapeConflictError) as caught:
+                    service.delete_group(log_id, "auto-token", 1, "", retained=retained,
+                                         before_delete=lambda: setattr(remote["sub"], field, value))
+                self.assertTrue(getattr(caught.exception, "provider_write_not_started", False))
+                client.delete.assert_not_called()
+                self.assertEqual(db.list_organize_delete_audits(log_id)[0]["status"], "blocked")
+
+    def test_automatic_delete_retained_loss_between_members_preserves_partial_result(self):
+        log_id, service, client, remote, retained = self._duplicate_delete_fixture()
+        original_delete = client.delete.side_effect
+
+        def delete_and_lose_retained(ids):
+            result = original_delete(ids)
+            remote.pop(retained.file_id)
+            return result
+
+        def guard():
+            if retained.file_id not in remote:
+                raise DirectoryScrapeConflictError("归档保留文件已不存在")
+
+        client.delete.side_effect = delete_and_lose_retained
+        with self.assertRaisesRegex(DirectoryScrapeConflictError, "归档保留文件已不存在"):
+            service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=guard)
+        client.delete.assert_called_once_with(["sub"])
+        self.assertEqual(set(remote), {"video"})
+        detail = service.detail(log_id)
+        self.assertEqual(detail["status"], "partial_failed")
+        self.assertEqual({item["file_id"]: item["status"] for item in detail["items"]}, {"video": "skipped", "sub": "deleted"})
+        self.assertEqual({audit["file_id"]: audit["status"] for audit in detail["delete_audits"]}, {"video": "blocked", "sub": "success"})
+
+    def test_automatic_delete_provider_failure_is_not_replayed_for_still_live_source(self):
+        log_id, service, client, remote, retained = self._duplicate_delete_fixture()
+        original_delete = client.delete.side_effect
+
+        def lose_response(ids):
+            if ids == ["video"]:
+                raise TimeoutError("回收结果未确认")
+            return original_delete(ids)
+
+        client.delete.side_effect = lose_response
+        with self.assertRaisesRegex(RuntimeError, "回收结果未确认"):
+            service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=lambda: None)
+        detail = service.detail(log_id)
+        self.assertEqual(detail["status"], "partial_failed")
+        self.assertEqual({audit["file_id"]: audit["status"] for audit in detail["delete_audits"]}, {"video": "failed", "sub": "success"})
+        retry_log = self._log(status="skipped", parent="source")
+        with self.assertRaisesRegex(DirectoryScrapeConflictError, "结果未知的回收审计"):
+            service.delete_group(retry_log, "retry-token", 1, "", retained=retained, before_delete=lambda: None)
+        self.assertEqual(client.delete.call_count, 2)
+        self.assertIn("video", remote)
+        self.assertIn("retained", remote)
+        self.assertEqual(service.detail(retry_log)["status"], "skipped")
+
+    def test_automatic_delete_blocks_pending_failed_and_interrupted_audits_before_provider(self):
+        for status in ("pending", "failed", "interrupted"):
+            with self.subTest(status=status):
+                log_id, service, client, _remote, retained = self._duplicate_delete_fixture()
+                audit_id = db.add_organize_delete_audit(trigger="manual", file_id="video", reason="历史未知删除", status=status)
+                guard = unittest.mock.Mock()
+                with self.assertRaisesRegex(DirectoryScrapeConflictError, "结果未知的回收审计"):
+                    service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=guard)
+                client.delete.assert_not_called()
+                guard.assert_not_called()
+                self.assertEqual(service.detail(log_id)["status"], "skipped")
+                db.update_organize_delete_audit(audit_id, status="blocked")
+
+    def test_automatic_delete_unknown_audit_matches_exact_source_id_only(self):
+        log_id, service, client, _remote, retained = self._duplicate_delete_fixture()
+        db.add_organize_delete_audit(trigger="manual", file_id="another-copy", size=100, gcid="gcid-video", reason="其他对象未知删除", status="pending")
+        result = service.delete_group(log_id, "auto-token", 1, "", retained=retained, before_delete=lambda: None)
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(client.delete.call_count, 2)
+
+    def test_automatic_delete_keeps_version_claim_and_never_deletes_retained_id(self):
+        log_id, service, client, _remote, retained = self._duplicate_delete_fixture()
+        with self.assertRaisesRegex(RuntimeError, "日志状态或版本已变化"):
+            service.delete_group(log_id, "auto-token", 999, "", retained=retained, before_delete=lambda: None)
+        client.delete.assert_not_called()
+        with self.assertRaisesRegex(DirectoryScrapeConflictError, "保留归档文件不能"):
+            service.delete_group(log_id, "auto-token", 1, "", retained=replace(retained, file_id="video"), before_delete=lambda: None)
+        client.delete.assert_not_called()
 
     def test_batch_delete_preflights_and_claims_every_log_before_any_provider_call(self):
         def add_tv_log(index, file_id, parent_id, gcid):

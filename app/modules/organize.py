@@ -1450,6 +1450,8 @@ class Organizer:
             "moved": 0, "renamed": 0, "rename_failed": 0,
             "metadata_moved": 0, "stopped": 0, "skipped": 0,
             "conflict": 0, "failed": 0,
+            "duplicate_recycled": 0, "duplicate_cleanup_failed": 0,
+            "duplicate_cleanup_parent_ids": [],
             "subtitle_moved": 0, "subtitle_skipped": 0,
             "subtitle_reasons": [], "scan_errors": [], "protected_staging_dirs": [],
             "scan_complete": True, "scan_limited": 0,
@@ -2481,7 +2483,7 @@ class Organizer:
             return None
         candidate_id = next(iter(candidates))
         if not any(
-            plan.action != "move"
+            plan.action not in {"move", "recycled"}
             and (plan.original_parent_id or "").strip() == candidate_id
             for plan in plans
         ):
@@ -2496,6 +2498,31 @@ class Organizer:
             "unavailable": 0,
             "reasons": ["目录仍含未移动媒体，已跳过空目录复核"],
         }
+
+    def _duplicate_cleanup_dirs(
+        self, parent_ids: list[str], source_dir_id: str,
+    ) -> list[tuple[str, int, str, int]]:
+        """先核实已回收视频的整条原父链；仅返回来源根以内的精确祖先。"""
+        directories: dict[str, tuple[str, int, str, int]] = {}
+        for parent_id in dict.fromkeys(parent_ids):
+            current = parent_id
+            chain: list[GuangYaFile] = []
+            seen: set[str] = set()
+            while current != source_dir_id:
+                if not current or current == "0" or current in seen or len(seen) >= 64:
+                    raise RuntimeError("已回收视频的原父链不在扫描来源内，已保留空目录")
+                seen.add(current)
+                info = self.client.file_info(current)
+                if info is None or info.is_dir is not True or info.file_id != current:
+                    raise RuntimeError("已回收视频的原父目录无法核验，已保留空目录")
+                chain.append(info)
+                current = str(info.parent_id or "").strip()
+            for index, info in enumerate(chain):
+                directories[info.file_id] = (
+                    info.file_id, len(chain) - index,
+                    info.etag or "", max(0, info.updated_at or 0),
+                )
+        return list(directories.values())
 
     def _run_execution_stage(
         self, scan_result: OrganizeScanResult, planning_result: OrganizePlanningResult,
@@ -2539,19 +2566,39 @@ class Organizer:
             or stats.get("scan_errors")
             or stats.get("protected_staging_dirs")
             or stats.get("replacement_cleanup_failed")
+            or stats.get("duplicate_cleanup_failed")
             or stats.get("audit_failures")
         )
         cleanup_started = time.monotonic()
-        if rules.clean_empty and cleanup_safe:
+        duplicate_cleanup = bool(
+            stats.get("duplicate_recycled") and stats.get("duplicate_cleanup_parent_ids")
+        )
+        cleanup_requested = rules.clean_empty or duplicate_cleanup
+        if cleanup_requested and cleanup_safe:
             if on_stage is not None:
                 on_stage(GROUP_STAGE_CLEANUP)
-            cleanup_report = self._known_nonempty_cleanup_report(
-                scanned_dirs, protected_sources, plans,
-            ) or self._clean_empty_dirs_report(
-                scanned_dirs,
-                protected_source_ids=protected_sources,
-                cancel_check=context.cancelled,
-            )
+            # 明确回收独立于普通清空开关；关闭时只清理这些原父链，来源根仍保护。
+            cleanup_dirs = list(scanned_dirs) if rules.clean_empty else []
+            cleanup_protected = protected_sources | {source_dir_id}
+            cleanup_report: dict[str, Any]
+            try:
+                if duplicate_cleanup:
+                    cleanup_dirs.extend(self._duplicate_cleanup_dirs(
+                        stats["duplicate_cleanup_parent_ids"], source_dir_id,
+                    ))
+                cleanup_report = self._known_nonempty_cleanup_report(
+                    cleanup_dirs, cleanup_protected, plans,
+                ) or self._clean_empty_dirs_report(
+                    cleanup_dirs,
+                    protected_source_ids=cleanup_protected,
+                    cancel_check=context.cancelled,
+                )
+            except Exception as exc:
+                # 文件回收已确认；目录只读失败不能丢掉成功事实或重跑文件删除。
+                cleanup_report = {
+                    "cleaned": 0, "delete_failures": 1,
+                    "reasons": [f"回收后源目录收尾失败，已保留：{redact_sensitive_text(safe_organize_failure(exc))[:300]}"],
+                }
             stats["empty_dirs_cleaned"] = int(cleanup_report.get("cleaned", 0) or 0)
             for report_key, stats_key in (
                 ("candidates", "empty_dir_cleanup_candidates"),
@@ -2575,7 +2622,7 @@ class Organizer:
                 self._append_reason(
                     stats, "empty_dir_cleanup_reasons", reason, limit=6
                 )
-        elif rules.clean_empty and not cleanup_safe:
+        elif cleanup_requested and not cleanup_safe:
             stats["empty_dir_cleanup_skipped"] = 1
             if context.cancelled():
                 stats["stopped"] = 1
@@ -6889,7 +6936,7 @@ class Organizer:
                 incoming_evidence=f"{plan.original_name} {plan.new_name}",
             ):
                 return existing, "replace", "同版本仍按冲突策略处理：新文件胜出并替换现有版本"
-            return existing, "skip", "同版本仍按冲突策略处理：保留现有版本并跳过新文件"
+            return existing, "skip", "同版本仍按冲突策略处理：保留现有版本"
         if coexist_count:
             return None, "coexist", "不同版本允许共存；同版本仍按冲突策略处理"
         return None, "new", "未发现同媒体版本，可直接归档；同版本仍按冲突策略处理"
@@ -7194,6 +7241,11 @@ class Organizer:
             return result
 
         self._preview_conflicts_with_inventory(plans, rules, load_inventory)
+        for plan in plans:
+            if plan.action == "skip" and plan.conflict_decision in {"skip", "batch_superseded"}:
+                note = "正式执行核实保留版本后，自动回收来源新文件及其专属伴随文件"
+                plan.note = f"{plan.note}；{note}" if plan.note else note
+                plan.conflict_note = f"{plan.conflict_note}；{note}" if plan.conflict_note else note
 
     def _verify_remote_snapshot(self, expected: GuangYaFile, *, role: str) -> GuangYaFile:
         """在第一次写操作前复核远端对象，拒绝使用过期扫描快照。"""

@@ -17,7 +17,7 @@ from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules.organize_execution import execute_organize_plans
 from app.modules.organize_tasks import OrganizeTaskManager
 from app.modules.scraper import MatchResult
-from tests.support import isolated_test_database
+from tests.support import assert_present, isolated_test_database
 from tests.test_download_staging_cleanup_lifecycle import _CloudTree
 
 
@@ -106,14 +106,14 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             for i in range(count)
         ]
 
-    def execute(self, sources, requests, *, cloud=None, isolated=False):
+    def execute(self, sources, requests, *, cloud=None, isolated=False, clean_empty=None):
         cloud = cloud or Mock()
         organizer = Organizer(client=cloud, scraper=Mock())
         rules = OrganizeRules(
             target_dir_id="archive",
             link_strm=False,
             notify_enabled=False,
-            clean_empty=isolated,
+            clean_empty=isolated if clean_empty is None else clean_empty,
         )
         # 真实日志执行与任务汇总；只替换外部扫描/识别及通知。
         for root, (plans, stats) in sources.items():
@@ -256,9 +256,10 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
         )
         self.assertIn("未匹配", row["organize_error"])
         self.assertEqual(manager._task["status"], "partial")
-        self.assertIn(
+        self.assertNotIn(
             request, [r["id"] for r in download_requests_repo.list_download_requests_requiring_attention()]
         )
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request), 0)
         self.assertEqual(self.admission_status(admission), "failed")
         with db.get_conn() as conn:
             self.assertEqual(
@@ -272,6 +273,15 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             self.assertEqual(cloud.deleted, [])
         db.init_db()
         media_subscriptions_repo.reconcile_startup_media_download_admissions()
+        history = download_requests_repo.list_download_request_summaries(scope="recent")
+        summary = next(item for item in history["items"] if item["request_number"] == request)
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["organize_status"], "failed")
+        self.assertIn({
+            "key": "organize", "label": "自动整理", "status": "failed",
+            "error": row["organize_error"],
+        }, summary["postprocess_issues"])
+        self.assertIn(row["organize_error"], summary["error"])
         self.assert_missing(key)
 
     def test_all_unmatched_skipped_remain_missing_after_restart(self):
@@ -297,6 +307,38 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             self.subscription, {key}, expected_revision=1
         )
         self.assertEqual(self.admission_status(admission), "completed")
+
+    def test_recycled_download_persists_facts_and_cleans_owned_root_with_cleanup_disabled(self):
+        request, _, _ = self.seed(root='stage', isolated=True)
+        cloud = _CloudTree()
+        cloud.add_dir('leaf', 'stage')
+        manager = self.execute({'stage': ([], self.stats(
+            total=1, skipped=1, duplicate_recycled=1, duplicate_cleanup_parent_ids=['leaf', 'leaf'],
+        ))}, [request], cloud=cloud, clean_empty=False)
+        row = download_requests_repo.get_download_request(request)
+        assert row is not None
+        self.assertEqual((row['organize_status'], row['gy_staging_cleanup_status']), ('completed', 'completed'))
+        self.assertEqual(cloud.deleted, ['leaf', 'stage'])
+        task = manager.task_status()
+        self.assertEqual(task['stats']['duplicate_recycled'], 1)
+        self.assertEqual(task['stats']['duplicate_cleanup_parent_ids'], ['leaf'])
+        saved = json.loads(assert_present(db.get_task_run(row['organize_run_id']))['result'])
+        self.assertEqual(saved['stats']['duplicate_recycled'], 1)
+        self.assertEqual(saved['sources'][0]['stats']['duplicate_cleanup_parent_ids'], ['leaf', 'leaf'])
+
+    def test_recycled_source_does_not_authorize_cleanup_of_another_download(self):
+        first, _, _ = self.seed(root='stage', isolated=True)
+        second, _, _ = self.seed(root='other-stage', episode=2, isolated=True)
+        cloud = _CloudTree()
+        cloud.add_dir('other-stage', 'source')
+        cloud.nodes['other-stage'].name = 'MF-case'
+        self.execute({
+            'stage': ([], self.stats(total=1, skipped=1, duplicate_recycled=1)),
+            'other-stage': ([], self.stats(total=1, moved=1)),
+        }, [first, second], cloud=cloud, clean_empty=False)
+        self.assertEqual(cloud.deleted, ['stage'])
+        self.assertEqual(assert_present(download_requests_repo.get_download_request(first))['gy_staging_cleanup_status'], 'completed')
+        self.assertNotEqual(assert_present(download_requests_repo.get_download_request(second))['gy_staging_cleanup_status'], 'completed')
 
     def test_empty_source_without_recognition_failure_keeps_completion(self):
         request, _, _ = self.seed()

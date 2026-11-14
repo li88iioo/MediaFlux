@@ -12,7 +12,7 @@ from app.repositories import download_requests as download_requests_repo
 from app.modules import organize_confirmations as confirmations
 from app.modules.organize import OrganizeRules
 from app.repositories.download_staging import requests_for_download_confirmation
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, assert_present
 from tests.test_download_staging_cleanup_lifecycle import _CloudTree
 
 
@@ -95,6 +95,40 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
         self.assertEqual(get_download_request_result_2['organize_status'], 'completed')
         self.assertEqual(self.cloud.deleted, [])
         self.assertEqual(self.cloud.reads, [])
+
+    def test_recycled_confirmation_finishes_owned_root_with_cleanup_disabled(self):
+        self.rules.clean_empty = False
+        self.stats = {'moved': 0, 'skipped': 1, 'duplicate_recycled': 1,
+                      'duplicate_cleanup_parent_ids': ['leaf']}
+        self.cloud.add_dir('leaf', 'stage')
+        organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(self.stats))
+        self.assertEqual(self.finish(), [self.request_id])
+        row = download_requests_repo.get_download_request(self.request_id)
+        assert row is not None
+        self.assertEqual((row['organize_status'], row['gy_staging_cleanup_status']), ('completed', 'completed'))
+        self.assertEqual(self.cloud.deleted, ['leaf', 'stage'])
+        self.assertEqual(self.stats['empty_dirs_cleaned'], 2)
+
+    def test_confirmation_rollup_preserves_raw_skip_and_recycle_facts(self):
+        row = dict(assert_present(organize_confirmations_repo.get_organize_confirmation('done')))
+        row['payload_json'] = json.dumps({**self.payload, 'organize_rollup': {
+            'version': 1, 'actionable_groups': 1,
+        }})
+        row['result_json'] = json.dumps({'moved': 0, 'skipped': 1, 'duplicate_recycled': 1})
+        _, outcomes = assert_present(confirmations._confirmation_rollup([row]))
+        self.assertEqual((outcomes['skipped'], outcomes['duplicate_recycled']), (1, 1))
+
+    def test_recycled_cleanup_uses_verified_owner_root_when_payload_is_a_child(self):
+        self.rules.clean_empty = False
+        self.stats = {'moved': 0, 'skipped': 1, 'duplicate_recycled': 1,
+                      'duplicate_cleanup_parent_ids': ['leaf']}
+        self.cloud.add_dir('leaf', 'stage')
+        owner = dict(assert_present(download_requests_repo.get_download_request(self.request_id)))
+        organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(self.stats))
+        with patch('app.repositories.download_staging.requests_for_download_confirmation', return_value=[owner]):
+            self.assertEqual(self.finish({**self.payload, 'source_dir_id': 'leaf'}), [self.request_id])
+        self.assertEqual(self.cloud.deleted, ['leaf', 'stage'])
+        self.assertEqual(assert_present(download_requests_repo.get_download_request(self.request_id))['gy_staging_cleanup_status'], 'completed')
 
     def test_nonempty_real_provider_view_prevents_filtered_scope_from_deleting(self):
         self.cloud.add_file('hidden-subtitle.srt', 'stage')

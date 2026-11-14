@@ -50,6 +50,19 @@ def _accepted() -> NotificationPublishResult:
 
 
 class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
+    def test_recycled_duplicate_is_completed_but_unrecycled_skip_stays_attention(self) -> None:
+        for skipped in (1, 2):
+            with self.subTest(skipped=skipped):
+                stats = {"total": skipped, "skipped": skipped, "duplicate_recycled": 1}
+                event = build_organize_lifecycle_event(
+                    stats, source_name="来源", strm_status="未启用", media_refresh="未触发",
+                )
+                self.assertEqual(event.state, "completed" if skipped == 1 else "partial")
+                self.assertIn("同版本已回收 1", str(dict(event.fields)["整理"]))
+                baseline = build_organize_confirmation_rollup(stats)
+                self.assertEqual(baseline["skipped"], skipped - 1)
+                self.assertEqual(baseline["duplicate_recycled"], 1)
+
     @staticmethod
     def _completed_stats(media_items: list[dict]) -> dict:
         return {

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from app import database as db
 from app.clients.guangya import GuangYaFile
 from app.config import web_credentials
 from app.main import create_app
@@ -27,7 +28,7 @@ from app.modules.organize import (
 from app.modules.organize_postprocess import media_role
 from app.modules.organize_runtime import OrganizeTaskRuntime
 from app.modules.scraper import MatchResult
-from tests.support import IsolatedDatabaseTestCase, release_parse_result
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database, release_parse_result
 
 
 class MediaVariantClassificationTests(unittest.TestCase):
@@ -737,18 +738,33 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
 
     def _organize(self, incoming_name, existing_name, *, incoming_size=1000,
                   existing_size=2000, incoming_id="incoming", existing_id="existing",
-                  dry_run=False, rules=None):
+                  dry_run=False, rules=None, operation_token=""):
         incoming = GuangYaFile(incoming_id, incoming_name, False, incoming_size, "incoming-etag")
         existing = GuangYaFile(existing_id, existing_name, False, existing_size, "existing-etag")
         client = _VariantTreeClient(incoming, existing)
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _VariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source", rules or self._rules(), dry_run=dry_run, post_actions=False
-            )
+        self.addCleanup(organizer.close)
+        plans, stats = organizer.organize(
+            "source", rules or self._rules(), dry_run=dry_run, post_actions=False,
+            operation_token=operation_token,
+        )
         return organizer, client, plans, stats
+
+    def _duplicate_fixture(self):
+        incoming = GuangYaFile(
+            "incoming", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-NEW.mkv",
+            False, 1000, "incoming-etag",
+        )
+        existing = GuangYaFile(
+            "existing", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-OLD.mkv",
+            False, 2000, "existing-etag",
+        )
+        client = _VariantTreeClient(incoming, existing)
+        organizer = Organizer(
+            client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _VariantScraper()),
+        )
+        self.addCleanup(organizer.close)
+        return organizer, client
 
     def test_larger_tv_episode_reuses_existing_show_and_recycles_old_episode(self):
         incoming = GuangYaFile(
@@ -767,15 +783,12 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         )
         client = _TvVariantTreeClient(incoming, existing)
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _TvVariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source",
-                self._rules(keep_multi_versions=False),
-                dry_run=False,
-                post_actions=False,
-            )
+        plans, stats = organizer.organize(
+            "source",
+            self._rules(keep_multi_versions=False),
+            dry_run=False,
+            post_actions=False,
+        )
 
         self.assertEqual(plans[0].target_path, (
             "动漫/Better Show (2021) {tmdb-113256}/Season 3"
@@ -793,22 +806,46 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
             "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-NEW.mkv",
             "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-OLD.mkv",
         )
+        before_preview = db.latest_organize_log_id()
         _organizer, preview_client, plans, _stats = self._organize(*names, dry_run=True)
 
         self.assertEqual(plans[0].action, "skip")
         self.assertEqual(getattr(plans[0], "conflict_decision", ""), "skip")
         self.assertIn("同版本", getattr(plans[0], "conflict_note", ""))
         self.assertEqual(preview_client.list_calls.count("movie"), 1)
+        self.assertEqual(preview_client.deleted, [])
+        self.assertEqual(db.list_organize_logs_after(before_preview), [])
 
-        _organizer, execute_client, _plans, stats = self._organize(*names)
+        before = db.latest_organize_log_id()
+        _organizer, execute_client, execute_plans, stats = self._organize(
+            *names, operation_token="organize-same-variant",
+        )
         self.assertEqual(stats["moved"], 0)
         self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["duplicate_recycled"], 1)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(execute_plans[0].action, "recycled")
         self.assertEqual(execute_client.moves, [])
-        self.assertEqual(execute_client.deleted, [])
+        self.assertEqual(execute_client.deleted, ["incoming"])
+        self.assertEqual(execute_client._find("existing")[0], "movie")
+        self.assertEqual(execute_client.tree["source"], [])
+        rows = db.list_organize_logs_after(before)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "deleted")
+        self.assertEqual(rows[0]["operation_token"], "organize-same-variant")
+        items = db.list_organize_log_items(rows[0]["id"])
+        self.assertEqual([(item["file_id"], item["status"]) for item in items], [
+            ("incoming", "deleted"),
+        ])
+        audits = db.list_organize_delete_audits(rows[0]["id"])
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["trigger"], "duplicate_cleanup")
+        self.assertEqual(audits[0]["status"], "success")
+        self.assertEqual(audits[0]["replacement_file_id"], "existing")
 
     def test_movie_named_interview_preserves_existing_version_in_preview_and_execution(self):
-        incoming = GuangYaFile("incoming", "The.Interview.2026.1080p.mp4", False, 1000)
-        existing = GuangYaFile("existing", "The.Interview.2026.{tmdb-123}.1080p.mkv", False, 2000)
+        incoming = GuangYaFile("incoming", "The.Interview.2026.1080p.mp4", False, 1000, "incoming-etag")
+        existing = GuangYaFile("existing", "The.Interview.2026.{tmdb-123}.1080p.mkv", False, 2000, "existing-etag")
         client = _VariantTreeClient(incoming, existing)
         client.tree["category"][0].name = "The Interview (2026) {tmdb-123}"
         scraper = _VariantScraper()
@@ -822,13 +859,15 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
                 plans, stats = organizer.organize(
                     "source", self._rules(conflict_strategy=1), dry_run=dry_run, post_actions=False,
                 )
-                self.assertEqual(plans[0].action, "skip")
+                self.assertEqual(plans[0].action, "skip" if dry_run else "recycled")
                 self.assertEqual(plans[0].conflict_existing_id, "existing")
                 self.assertEqual(stats["moved"], 0)
                 self.assertEqual(stats["skipped"], 1)
                 self.assertEqual(client.moves, [])
                 self.assertEqual(client.renames, [])
-                self.assertEqual(client.deleted, [])
+                self.assertEqual(client.deleted, [] if dry_run else ["incoming"])
+                self.assertEqual(stats["failed"], 0)
+                self.assertEqual(client._find("existing")[0], "movie")
 
     def test_dovi_and_sdr_reach_production_coexistence_helper(self):
         coexist_spy = Mock(wraps=variants_can_coexist)
@@ -920,7 +959,9 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
             incoming_size=1000, existing_size=2000,
         )
         self.assertEqual(size_stats["skipped"], 1)
-        self.assertEqual(size_client.deleted, [])
+        self.assertEqual(size_stats["duplicate_recycled"], 1)
+        self.assertEqual(size_stats["failed"], 0)
+        self.assertEqual(size_client.deleted, ["incoming"])
 
         _organizer, id_client, _plans, id_stats = self._organize(
             f"{common}-A.mkv", f"{common}-Z.mkv",
@@ -949,12 +990,9 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
 
         client.list_dir = fail_target_scan
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _VariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            _plans, stats = organizer.organize(
-                "source", self._rules(), dry_run=False, post_actions=False
-            )
+        _plans, stats = organizer.organize(
+            "source", self._rules(), dry_run=False, post_actions=False
+        )
 
         self.assertEqual(stats["failed"], 1)
         self.assertEqual(client.deleted, [])
@@ -1011,14 +1049,17 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         execute_client.tree["source"] = [execute_first, execute_second]
         execute_client.tree["movie"] = []
         execute_organizer = Organizer(client=cast(GuangYaClient, execute_client), scraper=cast(TMDBScraper, _VariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            _plans, execute_stats = execute_organizer.organize(
-                "source", self._rules(), dry_run=False, post_actions=False
-            )
+        execute_plans, execute_stats = execute_organizer.organize(
+            "source", self._rules(), dry_run=False, post_actions=False
+        )
         self.assertEqual(execute_stats["moved"], 1)
         self.assertEqual(execute_stats["skipped"], 1)
+        self.assertEqual(execute_stats["duplicate_recycled"], 1)
+        self.assertEqual(execute_stats["failed"], 0)
+        self.assertEqual(execute_plans[1].action, "recycled")
+        self.assertEqual(execute_client.deleted, ["b-second"])
+        self.assertEqual(execute_client._find("a-first")[0], "movie")
+        self.assertEqual(execute_client.tree["source"], [])
 
 
     def test_batch_winner_inherits_real_existing_target_for_replacement(self):
@@ -1055,7 +1096,7 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         )
 
 
-    def test_batch_arbitration_skips_earlier_smaller_candidate_before_cloud_write(self):
+    def test_batch_arbitration_recycles_earlier_smaller_candidate_after_winner_moves(self):
         smaller = GuangYaFile(
             "a-smaller", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-SMALL.mkv",
             False, 1000, "small-etag", "source",
@@ -1070,25 +1111,312 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         client.tree["movie"] = []
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _VariantScraper()))
 
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source", self._rules(), dry_run=False, post_actions=False
-            )
+        original_delete = client.delete
+
+        def delete_after_winner_moves(file_ids):
+            self.assertEqual(client._find("b-larger")[0], "movie")
+            return original_delete(file_ids)
+
+        client.delete = delete_after_winner_moves
+        plans, stats = organizer.organize(
+            "source", self._rules(), dry_run=False, post_actions=False
+        )
 
         by_id = {plan.file_id: plan for plan in plans}
-        self.assertEqual(by_id["a-smaller"].action, "skip")
+        self.assertEqual(by_id["a-smaller"].action, "recycled")
         self.assertEqual(
             by_id["a-smaller"].conflict_decision, "batch_superseded"
         )
-        self.assertIn("未执行云盘写入", by_id["a-smaller"].note)
+        self.assertIn("回收站", by_id["a-smaller"].note)
         self.assertEqual(by_id["b-larger"].action, "move")
         self.assertEqual(by_id["b-larger"].conflict_decision, "new")
         self.assertEqual(by_id["b-larger"].conflict_existing_id, "")
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["duplicate_recycled"], 1)
+        self.assertEqual(stats["failed"], 0)
         self.assertEqual(client.moves, [(("b-larger",), "movie")])
+        self.assertEqual(client.deleted, ["a-smaller"])
+        self.assertEqual(client.tree["source"], [])
+
+    def test_batch_winner_failure_preserves_loser_in_either_input_order(self):
+        for winner_first in (False, True):
+            with self.subTest(winner_first=winner_first), isolated_test_database():
+                organizer, client = self._duplicate_fixture()
+                loser = client.tree["source"][0]
+                winner = GuangYaFile(
+                    "winner", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-WINNER.mkv",
+                    False, 3000, "winner-etag", "source",
+                )
+                client.tree["source"] = [winner, loser] if winner_first else [loser, winner]
+                client.tree["movie"] = []
+                before = db.latest_organize_log_id()
+
+                with patch.object(client, "move", side_effect=RuntimeError("winner move failed")):
+                    plans, stats = organizer.organize(
+                        "source", self._rules(), dry_run=False, post_actions=False,
+                    )
+
+                self.assertEqual(stats["moved"], 0)
+                self.assertEqual(stats["failed"], 1)
+                self.assertGreaterEqual(stats["skipped"], 1)
+                self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+                self.assertEqual(client.deleted, [])
+                self.assertEqual(client._find("incoming")[0], "source")
+                self.assertEqual(client._find("winner")[0], "source")
+                self.assertNotIn("recycled", [plan.action for plan in plans])
+                rows = {row["file_id"]: row for row in db.list_organize_logs_after(before)}
+                self.assertEqual(rows["incoming"]["status"], "skipped")
+                self.assertEqual(rows["winner"]["status"], "failed")
+                self.assertEqual(db.list_organize_delete_audits(rows["incoming"]["id"]), [])
+
+    def test_files_already_in_target_are_never_recycled(self):
+        organizer, client = self._duplicate_fixture()
+        incoming = client.tree["source"].pop()
+        incoming.parent_id = "movie"
+        client.tree["movie"].append(incoming)
+        before = db.latest_organize_log_id()
+
+        plans, stats = organizer.organize(
+            "movie", self._rules(), dry_run=False, post_actions=False,
+        )
+
+        self.assertEqual(len(plans), 2)
+        self.assertTrue(all(plan.conflict_decision == "already_organized" for plan in plans))
+        self.assertTrue(all(plan.action == "skip" for plan in plans))
+        self.assertEqual(stats["skipped"], 2)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(client.moves, [])
+        self.assertEqual(client.renames, [])
+        self.assertCountEqual([item.file_id for item in client.tree["movie"]], ["incoming", "existing"])
+        self.assertTrue(all(row["status"] == "skipped" for row in db.list_organize_logs_after(before)))
+
+    def test_duplicate_cleanup_rechecks_real_target_after_preview(self):
+        for target_change in ("removed", "smaller", "different_variant"):
+            with self.subTest(target_change=target_change), isolated_test_database():
+                organizer, client = self._duplicate_fixture()
+                before = db.latest_organize_log_id()
+                original_execute = organizer._run_execution_stage
+
+                def change_after_preview(*args, **kwargs):
+                    existing = client.tree["movie"][0]
+                    if target_change == "removed":
+                        client.tree["movie"] = []
+                    elif target_change == "smaller":
+                        existing.size = 100
+                    else:
+                        client.tree["movie"] = [GuangYaFile(
+                            "external-dovi", "Variant.Movie.2026.2160p.DoVi.DDP5.1.x265-OLD.mkv",
+                            False, 2000, "external-dovi-etag", "movie",
+                        )]
+                    return original_execute(*args, **kwargs)
+
+                with patch.object(organizer, "_run_execution_stage", side_effect=change_after_preview):
+                    plans, stats = organizer.organize(
+                        "source", self._rules(), dry_run=False, post_actions=False,
+                    )
+
+                self.assertEqual(plans[0].conflict_decision, "skip")
+                self.assertEqual(plans[0].action, "skip")
+                self.assertEqual(stats["skipped"], 1)
+                self.assertEqual(stats["failed"], 1)
+                self.assertEqual(stats["duplicate_cleanup_failed"], 1)
+                self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+                self.assertEqual(client.deleted, [])
+                self.assertEqual(client._find("incoming")[0], "source")
+                rows = db.list_organize_logs_after(before)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], "failed")
+
+    def test_duplicate_cleanup_guards_target_and_source_again_before_provider_delete(self):
+        from app.modules.organize_correction import OrganizeCorrectionService
+
+        original_prepare = OrganizeCorrectionService._prepare_delete_group
+        for changed_file, change in (("existing", "removed"), ("existing", "etag"), ("incoming", "etag")):
+            with self.subTest(changed_file=changed_file, change=change), isolated_test_database():
+                organizer, client = self._duplicate_fixture()
+                before = db.latest_organize_log_id()
+
+                def change_after_preflight(service, *args, **kwargs):
+                    ordered = original_prepare(service, *args, **kwargs)
+                    parent_id, item = client._find(changed_file)
+                    if change == "removed":
+                        client.tree[parent_id].remove(item)
+                    else:
+                        item.etag = "changed-after-preflight"
+                    return ordered
+
+                with patch.object(
+                    OrganizeCorrectionService, "_prepare_delete_group",
+                    autospec=True, side_effect=change_after_preflight,
+                ), patch.object(client, "delete", wraps=client.delete) as delete:
+                    plans, stats = organizer.organize(
+                        "source", self._rules(), dry_run=False, post_actions=False,
+                    )
+
+                delete.assert_not_called()
+                self.assertEqual(plans[0].action, "skip")
+                self.assertEqual(stats["failed"], 1)
+                self.assertEqual(stats["duplicate_cleanup_failed"], 1)
+                self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+                self.assertEqual(client._find("incoming")[0], "source")
+                rows = db.list_organize_logs_after(before)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], "failed")
+                audits = db.list_organize_delete_audits(rows[0]["id"])
+                self.assertEqual(len(audits), 1)
+                self.assertEqual(audits[0]["status"], "blocked")
+                self.assertEqual(audits[0]["replacement_file_id"], "existing")
+
+    def test_duplicate_cleanup_preserves_shared_companions_and_recycles_exclusive_en_subtitle(self):
+        organizer, client = self._duplicate_fixture()
+        mib = 1024 * 1024
+        incoming = client.tree["source"][0]
+        incoming.size = 2 * mib
+        client.tree["movie"][0].size = 8 * mib
+        shared_stem = "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-SHARED"
+        shared_videos = [
+            GuangYaFile(f"shared-{ext}", f"{shared_stem}.{ext}", False, size, f"{ext}-etag", "source")
+            for ext, size in (("mkv", 2 * mib), ("mp4", 3 * mib))
+        ]
+        shared_companions = [
+            GuangYaFile("shared-subtitle", f"{shared_stem}.srt", False, 50, "shared-sub-etag", "source"),
+            GuangYaFile("shared-nfo", f"{shared_stem}.nfo", False, 55, "shared-nfo-etag", "source"),
+        ]
+        exclusive_stem = incoming.name.rsplit(".", 1)[0]
+        exclusive_companions = [
+            GuangYaFile("exclusive-en", f"{exclusive_stem}.en.srt", False, 60, "en-etag", "source"),
+            GuangYaFile("exclusive-nfo", f"{exclusive_stem}.nfo", False, 70, "nfo-etag", "source"),
+            GuangYaFile("exclusive-poster", f"{exclusive_stem}.poster.jpg", False, 80, "poster-etag", "source"),
+        ]
+        filtered_stem = "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-FILTERED"
+        filtered_shared_files = [
+            GuangYaFile("filtered-large", f"{filtered_stem}.mkv", False, 2 * mib, "filtered-large-etag", "source"),
+            GuangYaFile("filtered-small", f"{filtered_stem}.mp4", False, mib // 2, "filtered-small-etag", "source"),
+            GuangYaFile("filtered-shared-nfo", f"{filtered_stem}.nfo", False, 90, "filtered-nfo-etag", "source"),
+        ]
+        client.tree["source"] = [
+            *shared_videos, incoming, *shared_companions, *exclusive_companions, *filtered_shared_files,
+        ]
+        before = db.latest_organize_log_id()
+
+        plans, stats = organizer.organize(
+            "source", self._rules(clean_empty=False, small_file_mb=1), dry_run=False, post_actions=False,
+        )
+
+        self.assertNotIn("filtered-small", [plan.file_id for plan in plans])
+        self.assertIs(stats["scan_complete"], True)
+        self.assertEqual(stats["scan_errors"], [])
+        self.assertEqual(stats["moved"], 0)
+        self.assertEqual(stats["skipped"], 5)
+        self.assertEqual(stats["duplicate_recycled"], 4)
+        self.assertEqual(stats["failed"], 0)
+        self.assertTrue(all(plan.action == "recycled" for plan in plans))
+        self.assertCountEqual(client.deleted, [
+            "shared-mkv", "shared-mp4", "incoming", "exclusive-en", "exclusive-nfo", "exclusive-poster",
+            "filtered-large",
+        ])
+        self.assertCountEqual([item.file_id for item in client.tree["source"]], [
+            "shared-subtitle", "shared-nfo", "filtered-small", "filtered-shared-nfo",
+        ])
+        self.assertEqual(client._find("existing")[0], "movie")
+        rows = db.list_organize_logs_after(before)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["status"] == "deleted" for row in rows))
+        items = [item for row in rows for item in db.list_organize_log_items(row["id"])]
+        self.assertCountEqual([item["file_id"] for item in items], client.deleted)
+        self.assertTrue(all(item["status"] == "deleted" for item in items))
+
+    def test_duplicate_cleanup_stops_remaining_deletes_when_source_gains_companion_sharer(self):
+        organizer, client = self._duplicate_fixture()
+        stem = client.tree["source"][0].name.rsplit(".", 1)[0]
+        client.tree["source"].extend([
+            GuangYaFile("exclusive-nfo", f"{stem}.nfo", False, 70, "nfo-etag", "source"),
+            GuangYaFile("exclusive-poster", f"{stem}.poster.jpg", False, 80, "poster-etag", "source"),
+        ])
+        original_delete = client.delete
+
+        def add_sharer_after_first_delete(file_ids):
+            result = original_delete(file_ids)
+            client.tree["source"].append(GuangYaFile(
+                "external-sharer", f"{stem}.mp4", False, 500, "external-sharer-etag", "source",
+            ))
+            return result
+
+        before = db.latest_organize_log_id()
+        with patch.object(client, "delete", side_effect=add_sharer_after_first_delete) as delete:
+            plans, stats = organizer.organize(
+                "source", self._rules(), dry_run=False, post_actions=False,
+            )
+
+        self.assertEqual(delete.call_count, 1)
+        self.assertEqual(len(client.deleted), 1)
+        self.assertIn(client.deleted[0], {"exclusive-nfo", "exclusive-poster"})
+        self.assertEqual(client._find("incoming")[0], "source")
+        self.assertEqual(client._find("external-sharer")[0], "source")
+        self.assertEqual(client._find("existing")[0], "movie")
+        self.assertEqual(plans[0].action, "skip")
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["duplicate_cleanup_failed"], 1)
+        self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+        rows = db.list_organize_logs_after(before)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "partial_failed")
+        self.assertRegex(rows[0]["error"], "共[享用]")
+        audits = db.list_organize_delete_audits(rows[0]["id"])
+        self.assertCountEqual([audit["status"] for audit in audits], ["success", "blocked"])
+        items = db.list_organize_log_items(rows[0]["id"])
+        self.assertEqual([item["file_id"] for item in items if item["status"] == "deleted"], client.deleted)
+
+    def test_duplicate_cleanup_reports_provider_failures_and_partial_deletion(self):
+        for failure_mode in ("exception", "false", "partial"):
+            with self.subTest(failure_mode=failure_mode), isolated_test_database():
+                organizer, client = self._duplicate_fixture()
+                if failure_mode == "partial":
+                    stem = client.tree["source"][0].name.rsplit(".", 1)[0]
+                    client.tree["source"].append(GuangYaFile(
+                        "exclusive-en", f"{stem}.en.srt", False, 60, "en-etag", "source",
+                    ))
+                original_delete = client.delete
+
+                def fail_video_delete(file_ids):
+                    if "incoming" in file_ids:
+                        if failure_mode == "false":
+                            return False
+                        raise RuntimeError("provider recycle failed")
+                    return original_delete(file_ids)
+
+                before = db.latest_organize_log_id()
+                operation_token = f"organize-duplicate-{failure_mode}"
+                with patch.object(client, "delete", side_effect=fail_video_delete) as delete:
+                    plans, stats = organizer.organize(
+                        "source", self._rules(), dry_run=False, post_actions=False,
+                        operation_token=operation_token,
+                    )
+
+                self.assertEqual(delete.call_count, 2 if failure_mode == "partial" else 1)
+                self.assertEqual(stats["skipped"], 1)
+                self.assertEqual(stats["failed"], 1)
+                self.assertEqual(stats["duplicate_cleanup_failed"], 1)
+                self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+                self.assertEqual(plans[0].action, "skip")
+                self.assertEqual(client._find("incoming")[0], "source")
+                self.assertEqual(client._find("existing")[0], "movie")
+                self.assertEqual(client.deleted, ["exclusive-en"] if failure_mode == "partial" else [])
+                rows = db.list_organize_logs_after(before)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], "partial_failed" if failure_mode == "partial" else "failed")
+                self.assertEqual(rows[0]["operation_token"], operation_token)
+                audits = db.list_organize_delete_audits(rows[0]["id"])
+                self.assertEqual({row["file_id"]: row["status"] for row in audits}, {
+                    "incoming": "failed", **({"exclusive-en": "success"} if failure_mode == "partial" else {}),
+                })
+                items = {item["file_id"]: item["status"] for item in db.list_organize_log_items(rows[0]["id"])}
+                self.assertNotEqual(items["incoming"], "deleted")
+                if failure_mode == "partial":
+                    self.assertEqual(items["exclusive-en"], "deleted")
 
 
     def test_multi_episode_execution_reuses_chain_but_rechecks_shared_season_per_plan(self):
@@ -1106,12 +1434,9 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         client.tree["season"] = []
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _TvVariantScraper()))
 
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source", self._rules(), dry_run=False, post_actions=False
-            )
+        plans, stats = organizer.organize(
+            "source", self._rules(), dry_run=False, post_actions=False
+        )
 
         self.assertTrue(all(
             plan.target_path == (
@@ -1142,12 +1467,9 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         client.tree["season"] = []
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _TvVariantScraper()))
 
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            _plans, stats = organizer.organize(
-                "source", self._rules(), dry_run=False, post_actions=False,
-            )
+        _plans, stats = organizer.organize(
+            "source", self._rules(), dry_run=False, post_actions=False,
+        )
 
         self.assertEqual(stats["moved"], 3)
         self.assertEqual(client.list_calls.count("season"), 1)
@@ -1189,20 +1511,22 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
 
         client.file_info = file_info_with_external_change
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _TvVariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source", self._rules(keep_multi_versions=False),
-                dry_run=False, post_actions=False,
-            )
+        plans, stats = organizer.organize(
+            "source", self._rules(keep_multi_versions=False),
+            dry_run=False, post_actions=False,
+        )
 
         by_id = {plan.file_id: plan for plan in plans}
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["skipped"], 1)
-        self.assertEqual(client.list_calls.count("season"), 2)
+        # 两次库存读取之外，自动回收还会独立复核归档保留方。
+        self.assertEqual(client.list_calls.count("season"), 5)
         self.assertEqual(stats.get("target_revision_mismatches"), 1)
         self.assertEqual(by_id["versioned-2"].conflict_decision, "skip")
+        self.assertEqual(by_id["versioned-2"].action, "recycled")
+        self.assertEqual(stats["duplicate_recycled"], 1)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(client.deleted, ["versioned-2"])
         self.assertEqual(client._find("versioned-external-2")[0], "season")
 
     def test_target_inventory_retries_when_revision_changes_during_first_refresh(self):
@@ -1234,21 +1558,21 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
 
         client.file_info = file_info_with_change_during_refresh
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _TvVariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source", self._rules(keep_multi_versions=False),
-                dry_run=False, post_actions=False,
-            )
+        plans, stats = organizer.organize(
+            "source", self._rules(keep_multi_versions=False),
+            dry_run=False, post_actions=False,
+        )
 
         self.assertEqual(stats["moved"], 0)
         self.assertEqual(stats["skipped"], 1)
-        self.assertEqual(client.list_calls.count("season"), 2)
+        self.assertEqual(client.list_calls.count("season"), 5)
         self.assertEqual(stats.get("target_inventory_unstable_retries"), 1)
         self.assertEqual(plans[0].conflict_decision, "skip")
         self.assertEqual(client._find("unstable-external")[0], "season")
-        self.assertEqual(client._find("unstable-incoming")[0], "source")
+        self.assertEqual(plans[0].action, "recycled")
+        self.assertEqual(stats["duplicate_recycled"], 1)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(client.deleted, ["unstable-incoming"])
 
     def test_task_conflict_loader_refreshes_after_external_target_removal(self):
         incoming = GuangYaFile(
@@ -1328,21 +1652,21 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
 
         client.list_dir = list_dir_with_external_change
         organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _TvVariantScraper()))
-        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
-            "app.modules.organize.add_organize_log_items"
-        ):
-            plans, stats = organizer.organize(
-                "source", self._rules(keep_multi_versions=False),
-                dry_run=False, post_actions=False,
-            )
+        plans, stats = organizer.organize(
+            "source", self._rules(keep_multi_versions=False),
+            dry_run=False, post_actions=False,
+        )
 
         by_id = {plan.file_id: plan for plan in plans}
-        self.assertEqual(season_reads, 3)
+        self.assertEqual(season_reads, 6)
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(stats["failed"], 0)
         self.assertEqual(client.moves, [(("episode-1",), "season")])
         self.assertEqual(by_id["episode-2"].conflict_decision, "skip")
+        self.assertEqual(by_id["episode-2"].action, "recycled")
+        self.assertEqual(stats["duplicate_recycled"], 1)
+        self.assertEqual(client.deleted, ["episode-2"])
         self.assertIn("保留现有版本", by_id["episode-2"].conflict_note)
         self.assertEqual(client._find("external-2")[0], "season")
 

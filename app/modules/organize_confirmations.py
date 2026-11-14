@@ -976,6 +976,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
         "moved": 0,
         "metadata": 0,
         "skipped": 0,
+        "duplicate_recycled": 0,
         "failed": 0,
         "expired": 0,
     }
@@ -1000,6 +1001,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
                 result.get("metadata_moved"), 0, minimum=0,
             )
             outcomes["skipped"] += skipped
+            outcomes["duplicate_recycled"] += safe_int(result.get("duplicate_recycled"), 0, minimum=0)
             outcomes["failed"] += failed
             # 防御旧版本/异常执行留下的“completed + need_confirm”记录：
             # 候选卡已经终结，剩余文件不能从父汇总中凭空消失，应按未解决
@@ -2132,6 +2134,7 @@ def _confirmation_result_event(
     moved = safe_int(stats.get("moved"), 0, minimum=0)
     metadata = safe_int(stats.get("metadata_moved"), 0, minimum=0)
     skipped = safe_int(stats.get("skipped"), 0, minimum=0)
+    duplicate_recycled = safe_int(stats.get("duplicate_recycled"), 0, minimum=0)
     failed = safe_int(stats.get("failed"), 0, minimum=0)
     unresolved = safe_int(stats.get("need_confirm"), 0, minimum=0)
     warnings = len(list(stats.get("warnings") or []))
@@ -2150,11 +2153,14 @@ def _confirmation_result_event(
         or warnings
         or stats.get("empty_dir_cleanup_failed")
         or stats.get("source_dir_cleanup_failed")
+        or stats.get("duplicate_cleanup_failed")
         or (strm and not strm.get("ok") and not strm.get("skipped"))
     )
     result_label = (
-        f"已移动 {moved} · 元数据 {metadata} · 跳过 {skipped} · 失败 {failed}"
+        f"已移动 {moved} · 元数据 {metadata} · 跳过 {max(0, skipped - duplicate_recycled)} · 失败 {failed}"
     )
+    if duplicate_recycled:
+        result_label += f" · 同版本已回收 {duplicate_recycled}"
     if unresolved:
         result_label += f" · 待确认 {unresolved}"
     actor_label = "Agent 确认" if actor == "agent" else "人工确认"
@@ -2574,7 +2580,10 @@ def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: Org
             request_ids.append(int(row["id"]))
             if not confirmation_token:
                 closed = complete_staging_confirmation_phase(row)
-                if closed and not any(stats.get(key) for key in ("failed", "need_confirm", "stopped", "scan_errors", "audit_failures")):
+                if closed and not any(stats.get(key) for key in (
+                    "failed", "need_confirm", "stopped", "scan_errors", "audit_failures",
+                    "duplicate_cleanup_failed",
+                )):
                     cleanup_ids.append(int(row["id"]))
         if not request_ids:
             return []  # 普通手动确认无下载业务，不能误入下载维护或污染成功统计。
@@ -2598,6 +2607,7 @@ def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: Org
                 [{"id": str(row["gy_target_dir"]), "name": str(row["gy_staging_name"])}
                  for row in rows if int(row["id"]) in cleanup_ids],
                 rules=rules,
+                source_stats={str(row["gy_target_dir"]): stats for row in rows if int(row["id"]) in cleanup_ids},
             )
         stats["empty_dirs_cleaned"] = int(stats.get("empty_dirs_cleaned") or 0) + int(report.get("cleaned") or 0)
         for reason in report.get("reasons", []):
@@ -2615,11 +2625,14 @@ def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: Org
 
 
 def _cleanup_confirmed_source(payload: dict, organizer: Organizer, rules: OrganizeRules, stats: dict) -> None:
-    """仅沿本次成功移动的原父链收尾；不扫描其他子树或接管下载隔离目录。"""
-    if not rules.clean_empty or not stats.get("moved") or any(
+    """仅沿成功移动或明确回收的原父链收尾，不接管下载隔离目录。"""
+    recycled = stats.get("duplicate_recycled", 0)
+    duplicate_cleanup = type(recycled) is int and recycled > 0
+    if (not rules.clean_empty and not duplicate_cleanup) or not (stats.get("moved") or duplicate_cleanup) or any(
         stats.get(key) for key in (
             "failed", "need_confirm", "stopped", "scan_errors",
-            "replacement_cleanup_failed", "audit_failures",
+            "replacement_cleanup_failed", "duplicate_cleanup_failed", "audit_failures",
+            "empty_dir_cleanup_failed",
         )
     ):
         return
@@ -2631,6 +2644,8 @@ def _cleanup_confirmed_source(payload: dict, organizer: Organizer, rules: Organi
         parent_id = str(payload.get("source_parent_id") or "").strip()
         if not source_id or not parent_id:
             raise RuntimeError("来源目录身份缺失，已保留空目录")
+        if not rules.clean_empty and parent_id not in (stats.get("duplicate_cleanup_parent_ids") or []):
+            return  # 关闭普通清理时，只消费本次明确回收视频的精确原父目录。
         staging_ids = set(download_requests_repo.list_protected_guangya_staging_ids())
         if source_inside_protected_staging(organizer.client, parent_id, staging_ids):
             Organizer._append_reason(
@@ -2653,9 +2668,11 @@ def _cleanup_confirmed_source(payload: dict, organizer: Organizer, rules: Organi
         else:
             raise RuntimeError("来源父链异常，已保留空目录")
         for directory_id in parents:
+            if not rules.clean_empty and directory_id == source_id:
+                break  # 明确回收不扩大到扫描来源根；下载 MF 根由 staging 服务收口。
             cleaned = int(stats.get("empty_dirs_cleaned", 0) or 0)
             _cleanup_manual_source_root(
-                organizer, directory_id, "", rules, stats, trigger_type="manual",
+                organizer, directory_id, "", replace(rules, clean_empty=True), stats, trigger_type="manual",
             )
             if int(stats.get("empty_dirs_cleaned", 0) or 0) == cleaned:
                 break  # 非空、受保护或清理失败时，不再向上尝试。
@@ -2663,7 +2680,7 @@ def _cleanup_confirmed_source(payload: dict, organizer: Organizer, rules: Organi
         logger.warning("确认入库后源目录收尾失败 type=%s", type(exc).__name__)
         stats["source_dir_cleanup_failed"] = int(stats.get("source_dir_cleanup_failed", 0) or 0) + 1
         Organizer._append_reason(
-            stats, "empty_dir_cleanup_reasons", f"源目录收尾失败，已保留: {exc}", limit=8,
+            stats, "empty_dir_cleanup_reasons", f"源目录收尾失败，已保留: {redact_sensitive_text(exc)[:300]}", limit=8,
         )
 
 
@@ -2859,7 +2876,9 @@ def _execute_guangya_confirmation(
             # 记录执行前身份，禁止终态提交期间的同源重绑定获得新的清理授权。
             stats["download_staging_identity"] = staging_identity_snapshot(download_owners[0])
         if download_owners or not execution_rules.clean_empty:
-            stats["download_staging_policy"] = "cleanup_empty" if execution_rules.clean_empty else "retained"
+            stats["download_staging_policy"] = (
+                "cleanup_empty" if execution_rules.clean_empty or stats.get("duplicate_recycled") else "retained"
+            )
         if not download_owners:
             _cleanup_confirmed_source(payload, organizer, execution_rules, stats)
         terminal_event = _confirmation_result_event(

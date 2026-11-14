@@ -20,6 +20,7 @@ _COUNTER_FIELDS = (
     "skipped", "need_confirm", "failed", "conflict",
     "subtitle_moved", "subtitle_skipped",
     "empty_dirs_cleaned", "replacement_cleanup_failed", "audit_failures",
+    "duplicate_recycled", "duplicate_cleanup_failed",
 )
 
 
@@ -360,6 +361,7 @@ def _format_scan_summary(stats: dict) -> str:
         ("已识别", "matched"), ("待确认", "need_confirm"), ("跳过", "skipped"),
         ("冲突", "conflict"), ("失败", "failed"), ("已移动", "moved"),
         ("伴随文件", "metadata_moved"), ("特别篇", "specials_auto_mapped"),
+        ("同版本已回收", "duplicate_recycled"),
     ):
         value = count(key)
         if value:

@@ -50,6 +50,7 @@ _ALLOWED_RESULT_STATS = {
     "total", "matched", "need_confirm", "moved", "relocated", "renamed", "rename_failed",
     "metadata_moved", "stopped", "skipped", "conflict", "failed",
     "subtitle_moved", "subtitle_skipped", "replacement_cleanup_failed",
+    "duplicate_recycled", "duplicate_cleanup_failed",
     "empty_dir_cleanup_failed", "source_dir_cleanup_failed", "audit_failures",
     "strm_triggered", "strm_trigger_failed", "strm_scope_unknown", "strm_trigger_skipped",
     "quarantined", "empty_deleted", "verification_failed",
