@@ -10,6 +10,7 @@ from pathlib import Path
 from starlette.requests import Request
 
 from app.routes.tools_api import clean_scrape_query
+from tests.support import authenticated_session
 
 try:
     from playwright.sync_api import sync_playwright
@@ -148,7 +149,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         self.page.set_content(HARNESS)
         self.page.expose_function("__cleanQuery", lambda body: json.loads(bytes(clean_scrape_query(
-            Request({"type": "http", "session": {"logged_in": True}}), body,
+            Request({"type": "http", "session": authenticated_session()}), body,
         ).body)))
         self.page.evaluate(
             """

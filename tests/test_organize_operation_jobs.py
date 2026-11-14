@@ -36,7 +36,7 @@ from app.repositories.organize_operation_jobs import (
     sanitize_organize_operation_result,
     verify_organize_operation_payload,
 )
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, authenticated_session
 
 
 class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
@@ -181,7 +181,7 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
 
         @api.post("/__test/login")
         def login(request: Request):
-            request.session["logged_in"] = True
+            request.session.update(authenticated_session())
             return {"ok": True}
 
         with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), TestClient(api) as client:

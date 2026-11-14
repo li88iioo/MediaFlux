@@ -10,6 +10,7 @@ from starlette.requests import Request
 
 from app.modules.image_payload import MAX_IMAGE_BYTES
 from app.routes.media_image import media_image
+from tests.support import authenticated_session, preserve_web_auth_config
 
 
 _ITEM_ID = "f" * 32
@@ -22,7 +23,7 @@ def _request(query: bytes = b"tag=poster-tag") -> Request:
         "path": f"/media-image/jellyfin/{_ITEM_ID}",
         "headers": [],
         "query_string": query,
-        "session": {"logged_in": True},
+        "session": authenticated_session(),
     })
 
 
@@ -40,7 +41,7 @@ class MediaImageProxyTests(unittest.TestCase):
         with patch.dict(
             "app.routes.media_image._missing_image_cache", {}, clear=True,
         ), patch(
-            "app.routes.media_image.config.get", side_effect=_config_get,
+            "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
         ), patch(
             "app.routes.media_image.requests.get", return_value=upstream,
         ) as request_get, patch(
@@ -64,7 +65,7 @@ class MediaImageProxyTests(unittest.TestCase):
 
     def test_transport_failure_remains_502_and_is_logged(self):
         with patch(
-            "app.routes.media_image.config.get", side_effect=_config_get,
+            "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
         ), patch(
             "app.routes.media_image.requests.get",
             side_effect=requests.ConnectionError("offline"),
@@ -85,7 +86,7 @@ class MediaImageProxyTests(unittest.TestCase):
         upstream.raise_for_status.return_value = None
         upstream.iter_content.return_value = [b"\xff\xd8\xff\x00"]
         with patch(
-            "app.routes.media_image.config.get", side_effect=_config_get,
+            "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
         ), patch(
             "app.routes.media_image.requests.get", return_value=upstream,
         ):
@@ -108,7 +109,7 @@ class MediaImageProxyTests(unittest.TestCase):
         )
         upstream.raise_for_status.return_value = None
         with patch(
-            "app.routes.media_image.config.get", side_effect=_config_get,
+            "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
         ), patch(
             "app.routes.media_image.requests.get", return_value=upstream,
         ):
@@ -129,7 +130,7 @@ class MediaImageProxyTests(unittest.TestCase):
             b"x" * MAX_IMAGE_BYTES,
         ]
         with patch(
-            "app.routes.media_image.config.get", side_effect=_config_get,
+            "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
         ), patch(
             "app.routes.media_image.requests.get", return_value=upstream,
         ):
@@ -150,7 +151,7 @@ class MediaImageProxyTests(unittest.TestCase):
         upstream.raise_for_status.return_value = None
         upstream.iter_content.return_value = [content]
         with patch(
-            "app.routes.media_image.config.get", side_effect=_config_get,
+            "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
         ), patch(
             "app.routes.media_image.requests.get", return_value=upstream,
         ):
@@ -172,7 +173,7 @@ class MediaImageProxyTests(unittest.TestCase):
                 upstream.raise_for_status.return_value = None
                 upstream.iter_content.return_value = chunks
                 with patch(
-                    "app.routes.media_image.config.get", side_effect=_config_get,
+                    "app.routes.media_image.config.get", side_effect=preserve_web_auth_config(_config_get),
                 ), patch(
                     "app.routes.media_image.requests.get", return_value=upstream,
                 ):

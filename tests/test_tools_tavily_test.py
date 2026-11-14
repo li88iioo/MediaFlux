@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.routes import tools_api
+from tests.support import authenticated_session, preserve_web_auth_config
 
 
 @pytest.fixture
@@ -21,7 +22,7 @@ def probe():
     )
     values = {"TAVILY_API_KEY": "saved-secret", "TAVILY_TIMEOUT_SECONDS": "10"}
     with (
-        patch.object(tools_api.config, "get", side_effect=lambda key, default="": values.get(key, default)),
+        patch.object(tools_api.config, "get", side_effect=preserve_web_auth_config(lambda key, default="": values.get(key, default))),
         patch.object(tools_api.config, "set_and_save") as save,
         patch.object(tools_api.agent_rate_limiter, "allow", return_value=True) as limit,
         patch.object(tools_api, "FixedHostHttpClient", return_value=client) as factory,
@@ -31,7 +32,7 @@ def probe():
 
 
 def call(data, *, logged_in=True):
-    request = cast(Request, SimpleNamespace(session={"logged_in": logged_in, "csrf_token": "test-tavily"}))
+    request = cast(Request, SimpleNamespace(session=(authenticated_session(csrf_token="test-tavily") if logged_in else {})))
     response = asyncio.run(tools_api.tavily_test(request, data))
     return response.status_code, json.loads(bytes(response.body))
 

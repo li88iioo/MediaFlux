@@ -16,13 +16,14 @@ from app.modules.network_addresses import (
 )
 from app.routes import strm_api
 from app.routes.api import save_config
+from tests.support import authenticated_session
 
 
 class StrmBaseUrlCandidateTests(unittest.TestCase):
     @staticmethod
     def _request():
         return SimpleNamespace(
-            session={"logged_in": True},
+            session=authenticated_session(),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     background_services_enabled=False,

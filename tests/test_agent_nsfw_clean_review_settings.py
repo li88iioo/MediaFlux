@@ -15,6 +15,7 @@ from starlette.requests import Request
 
 from app import config
 from app.routes.api import get_config, save_config
+from tests.support import authenticated_session
 
 ROOT = Path(__file__).resolve().parents[1]
 PARENT_KEY = "AGENT_RECOGNITION_REVIEW_ENABLED"
@@ -28,7 +29,11 @@ class NsfwCleanReviewSettingsTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         directory = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.env_file = Path(directory) / "user.env"
-        self.stack.enter_context(patch.dict(os.environ, {}, clear=True))
+        self.stack.enter_context(patch.dict(os.environ, {
+            "ENV_WEB_PASSPORT": "nsfw-settings-admin",
+            "ENV_WEB_PASSWORD": "nsfw-settings-test-password",
+            "WEB_SECRET_KEY": "nsfw-settings-test-secret",
+        }, clear=True))
         self.stack.enter_context(patch.object(config, "ENV_FILE", self.env_file))
         self.stack.enter_context(patch.object(config, "_cache", None))
         self.stack.enter_context(patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()))
@@ -44,7 +49,7 @@ class NsfwCleanReviewSettingsTests(unittest.TestCase):
         initialize_runtime_fence()
         self.request = Request({
             "type": "http",
-            "session": {"logged_in": True},
+            "session": authenticated_session(),
             "app": SimpleNamespace(state=SimpleNamespace(
                 background_services_enabled=False, media_proxy_manager=None,
             )),

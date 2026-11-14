@@ -30,7 +30,7 @@ from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
 from app.indexers.service import IndexerService
 from tests.resource_presentation_test_harness import rpc_call
-from tests.support import isolated_test_database
+from tests.support import authenticated_session, isolated_test_database
 
 SECRET = 'native-resource-presentation-secret'
 
@@ -603,7 +603,7 @@ def test_real_sandbox_rpc_reaches_event_history_and_original_card_consumers(nati
             application.add_middleware(SessionMiddleware, secret_key=SECRET)
             @application.get('/_test_login')
             def login(request: Request):
-                request.session.update(logged_in=True, csrf_token='test')
+                request.session.update(authenticated_session(csrf_token='test'))
                 return {'ok': True}
             monkeypatch.setattr(agent_api, 'get_agent_kernel_runtime', lambda: runtime)
             monkeypatch.setattr(agent_api, 'get_web_secret', lambda: SECRET)

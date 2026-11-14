@@ -12,7 +12,7 @@ from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.scraper import Candidate, MatchResult, TMDBScraper
 from app.modules.nsfw import NsfwRecognizer, clear_nsfw_cache
-from tests.support import isolated_test_database
+from tests.support import authenticated_session, isolated_test_database
 
 
 @pytest.fixture
@@ -174,7 +174,7 @@ def test_stale_preview_api_returns_conflict_before_task_submission(log_case):
     service.client.file_info.return_value = GuangYaFile('video', 'KRI-079.2019.mp4', False, 100, 'etag', 'archived')
     data = {'provider': 'clean_title', 'external_id': 'KRI-079', 'media_type': 'movie',
             'operation_token': 'stale-preview', 'expected_version': 1}
-    request = Request({'type': 'http', 'method': 'POST', 'path': '/', 'headers': [], 'session': {'logged_in': True}})
+    request = Request({'type': 'http', 'method': 'POST', 'path': '/', 'headers': [], 'session': authenticated_session()})
     with patch('app.routes.logs_api.OrganizeCorrectionService', return_value=service), \
             patch('app.routes.logs_api.get_organize_manager') as manager:
         for endpoint in (preview_reorganize, run_reorganize):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import hmac
 import logging
 import secrets
 from functools import lru_cache
@@ -13,6 +14,9 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2 import pass_context
+
+from app import config
+from app.modules.web_secret import signed_context_fingerprint
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = (APP_DIR / "static").resolve()
@@ -123,13 +127,31 @@ def render_template(request: Request, name: str, *, status_code: int = 200, **co
     )
 
 
+def web_session_credential(verified_credentials: tuple[str, str]) -> str:
+    """绑定本次已验证的凭据快照；不将密码或裸密码摘要写进 Cookie。"""
+    return signed_context_fingerprint(verified_credentials, domain="web-session-credentials-v1")
+
+
+def is_web_authenticated(request: Request) -> bool:
+    binding = request.session.get("logged_in")
+    if not binding:
+        return False
+    credentials = config.web_credentials()
+    if isinstance(binding, str) and all(credentials) and hmac.compare_digest(
+        binding.encode("utf-8"), web_session_credential(credentials).encode("ascii"),
+    ):
+        return True
+    request.session.clear()
+    return False
+
+
 def require_api_login(request: Request) -> None:
-    if not request.session.get("logged_in"):
+    if not is_web_authenticated(request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
 def require_page_login(request: Request):
-    if not request.session.get("logged_in"):
+    if not is_web_authenticated(request):
         return RedirectResponse(request.url_for("auth.login"), status_code=302)
     return None
 

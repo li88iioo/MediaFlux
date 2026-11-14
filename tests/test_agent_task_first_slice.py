@@ -27,6 +27,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.owner_routes import web_kernel_owner
 from app.clients.http import FixedHostHttpClient
 from app.routes import agent_api
+from tests.support import authenticated_session
 
 GOAL = "观察 TMDB 和 qBittorrent 当前配置状态，仅观察、不修改。"
 OWNER = web_kernel_owner("admin")
@@ -260,7 +261,7 @@ def test_observe_checkpoint_prune_reopen_continue(tmp_path, budget):
                 "method": "GET",
                 "path": "/api/agent/sessions/task-session-0001",
                 "headers": [],
-                "session": {"logged_in": True},
+                "session": authenticated_session(),
             }
         )
         with patch.object(agent_api, "get_agent_kernel_runtime", return_value=runtime2):

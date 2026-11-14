@@ -29,7 +29,7 @@ from app.agent.kernel.ports.sdk_effects import media_path_mapping_tools
 from app.modules import media_server_path_mapping as service
 from app.modules.process_lock import CrossProcessLock
 from app.routes import media_libraries_api as web
-from tests.support import initialized_web_runtime
+from tests.support import authenticated_session, initialized_web_runtime
 from tests.test_agent_kernel_core import ScriptedModel
 from tests.test_agent_sdk_effects import context_for
 
@@ -222,7 +222,7 @@ def test_web_and_agent_share_lock_order_with_bounded_real_concurrency(backend, m
             return False
     def web_save():
         ready.wait()
-        request = Request({"type": "http", "session": {"logged_in": True}})
+        request = Request({"type": "http", "session": authenticated_session()})
         return web.save_media_library_mappings(request, {"strm_mappings": {
             "emby": [{"local": "/other", "server": "//NAS/Changed"}]}, "local_bindings": []})
     with ThreadPoolExecutor(max_workers=2) as pool:

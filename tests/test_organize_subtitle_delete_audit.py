@@ -34,7 +34,7 @@ from app.modules.organize_delete_audit import (
     record_blocked_delete,
 )
 from tests.test_organize_multiversion import _VariantScraper, _VariantTreeClient
-from tests.support import IsolatedDatabaseTestCase, isolated_test_database
+from tests.support import IsolatedDatabaseTestCase, authenticated_session, isolated_test_database
 
 
 def cloud_file(file_id: str, name: str, *, size: int = 100, etag: str = "") -> GuangYaFile:
@@ -1075,7 +1075,7 @@ class SkippedLogBatchRecycleTests(IsolatedDatabaseTestCase):
 
         @application.post("/__test/login")
         def login(request: Request):
-            request.session["logged_in"] = True
+            request.session.update(authenticated_session())
             return {"ok": True}
 
         manager = unittest.mock.Mock()

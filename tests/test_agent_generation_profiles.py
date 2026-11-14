@@ -21,6 +21,7 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.state_types import CancellationToken
 from app.clients.ai_recognition import AIRecognitionClient
 from app.clients.http import FixedHostHttpClient
+from tests.support import authenticated_session
 
 BASE = 'https://api.example.com/v1'
 KEY = 'AGENT_LLM_GENERATION_PROFILES'
@@ -186,7 +187,11 @@ def local_config(tmp_path, monkeypatch):
     # Restore environment mutations made by the real atomic config publisher.
     from app.agent import feature_gate
     from tests.support import isolated_test_database
-    with patch.dict(os.environ), isolated_test_database():
+    with patch.dict(os.environ, {
+        'ENV_WEB_PASSPORT': 'profiles-test-admin',
+        'ENV_WEB_PASSWORD': 'profiles-test-password',
+        'WEB_SECRET_KEY': 'profiles-test-secret',
+    }), isolated_test_database():
         config.write_env_file(config.ENV_FILE, {}, replace=False)
         feature_gate.initialize_runtime_fence()
         config.set_and_save({'AGENT_ENABLED': '1', 'AGENT_LLM_ENABLED': '1',
@@ -201,7 +206,7 @@ def local_config(tmp_path, monkeypatch):
 def admin_request():
     from types import SimpleNamespace
 
-    return SimpleNamespace(session={'logged_in': True}, app=SimpleNamespace(
+    return SimpleNamespace(session=authenticated_session(), app=SimpleNamespace(
         state=SimpleNamespace(background_services_enabled=False, media_proxy_manager=None)))
 
 
@@ -228,7 +233,7 @@ def config_api(local_config):
     application.state.media_proxy_manager = None
     @application.middleware('http')
     async def authenticated_fixture(request, call_next):
-        request.scope['session'] = {'logged_in': True}
+        request.scope['session'] = authenticated_session()
         return await call_next(request)
     application.include_router(router)
     application.include_router(tools_router)

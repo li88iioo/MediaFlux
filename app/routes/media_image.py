@@ -11,6 +11,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from app import config
+from app.web import require_api_login
 from app.logger import get_logger, log_throttled
 from app.modules.image_payload import ImagePayloadError, read_bounded_image
 
@@ -63,8 +64,7 @@ def _missing_image_response() -> Response:
 
 @router.get("/media-image/{server}/{item_id}", name="media_image.media_image")
 def media_image(request: Request, server: str, item_id: str):
-    if not request.session.get("logged_in"):
-        raise HTTPException(status_code=401, detail="unauthorized")
+    require_api_login(request)
     if not _ITEM_ID_RE.fullmatch(item_id):
         raise HTTPException(status_code=400, detail="invalid item id")
     if server == "jellyfin":

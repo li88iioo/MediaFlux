@@ -21,6 +21,7 @@ from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports.mediaflux_policy import MediaFluxAuthorizationPolicy
 from app.agent.kernel.ports.sdk_effects import policy_config_tool
 from app.modules import policy_config as service
+from tests.support import authenticated_session
 from tests.test_agent_feature_state import backend as backend  # noqa: PLC0414
 from tests.test_agent_sdk_effects import context_for
 
@@ -213,7 +214,7 @@ def test_web_and_sdk_reload_share_indexer_helper_after_guards_release(backend, m
         refresh = Mock(side_effect=shutdown)
         monkeypatch.setattr("app.indexers.runtime.refresh_indexer_configuration", refresh)
         if writer == "web":
-            request = Request({"type": "http", "session": {"logged_in": True},
+            request = Request({"type": "http", "session": authenticated_session(),
                 "app": SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))})
             assert save_config(request, {"INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": "3"}) == {"success": True}
         else:

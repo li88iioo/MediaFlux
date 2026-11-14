@@ -7,6 +7,7 @@ import re
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,28 @@ from app.clients.guangya import GuangYaFile
 from app.modules.scraper import Candidate, MatchResult
 
 _TEST_DATABASE_LOCK = threading.RLock()
+
+
+def authenticated_session(**extra: Any) -> dict[str, Any]:
+    """按当前配置签发正式 Web 会话，允许夹具附带 CSRF 等状态。"""
+    from app import config
+    from app.web import web_session_credential
+
+    return {"logged_in": web_session_credential(config.web_credentials()), **extra}
+
+
+def preserve_web_auth_config(getter: Callable[[str, str], str]) -> Callable[[str, str], str]:
+    """业务配置 mock 仍透传真实认证配置，确保签发与校验属于同一安装。"""
+    from app import config
+
+    real_get = config.get
+
+    def get(key: str, default: str = "") -> str:
+        if key in {"ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD", "WEB_SECRET_KEY"}:
+            return real_get(key, default)
+        return getter(key, default)
+
+    return get
 
 
 class FakeTelegramBot:

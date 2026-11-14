@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.routes.discovery_image import poster
+from tests.support import authenticated_session
 
 
 class FakeImageResponse:
@@ -39,7 +40,7 @@ def _mock_session(side_effect=None, return_value=None):
 class DiscoveryImageHeaderTests(unittest.TestCase):
     def test_douban_poster_request_sends_movie_referer(self):
         upstream = FakeImageResponse()
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         session = _mock_session(return_value=upstream)
 
         with patch(
@@ -55,7 +56,7 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
 
     def test_non_douban_poster_request_does_not_send_douban_referer(self):
         upstream = FakeImageResponse()
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         session = _mock_session(return_value=upstream)
 
         with patch(
@@ -73,7 +74,7 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
         first.status_code = 404
         second = FakeImageResponse()
         second.status_code = 404
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         session = _mock_session(side_effect=[first, second])
         with patch(
             "app.routes.discovery_image.decode_poster_token", return_value="poster.jpg"
@@ -88,7 +89,7 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
         fail_resp = FakeImageResponse()
         fail_resp.status_code = 502
         success_resp = FakeImageResponse()
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         session = _mock_session(side_effect=[fail_resp, success_resp])
 
         with patch(
@@ -109,7 +110,7 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
         fail_resp2 = FakeImageResponse()
         fail_resp2.status_code = 403
         success_resp = FakeImageResponse()
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         # 原始 URL 两次 403 → 备用节点 200
         session = _mock_session(side_effect=[fail_resp, fail_resp2, success_resp])
 
@@ -126,7 +127,7 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
     def test_douban_poster_headers_include_sec_fetch(self):
         """豆瓣请求头必须包含 Sec-Fetch-* 系列反爬头。"""
         upstream = FakeImageResponse()
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         session = _mock_session(return_value=upstream)
 
         with patch(
@@ -146,7 +147,7 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
     def test_douban_poster_allows_redirects(self):
         """豆瓣 CDN 请求必须跟随 302 重定向。"""
         upstream = FakeImageResponse()
-        request = SimpleNamespace(session={"logged_in": True})
+        request = SimpleNamespace(session=authenticated_session())
         session = _mock_session(return_value=upstream)
 
         with patch(

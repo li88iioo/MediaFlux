@@ -3992,6 +3992,96 @@ class SecurityTests(InitializedWebTestCase):
         rejected = self.client.post("/login", data={"csrf_token": "错误令牌"})
         self.assertEqual(rejected.status_code, 403)
 
+    def test_credential_change_revokes_old_cookies_across_all_web_entry_points(self):
+        from app.modules.web_secret import get_web_secret
+
+        original = dict(zip(("ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD"), config.web_credentials()))
+        original["DISCOVERY_ENABLED"] = config.get("DISCOVERY_ENABLED", "0")
+        self.addCleanup(config.set_and_save, original)
+        starting = {**original, "ENV_WEB_PASSWORD": "original-test-password", "DISCOVERY_ENABLED": "1"}
+        config.set_and_save(starting)
+        secret = get_web_secret()
+        for change in ({"ENV_WEB_PASSWORD": "changed-password-验证"}, {"ENV_WEB_PASSPORT": "changed-admin"}):
+            with self.subTest(field=next(iter(change))):
+                self.client.cookies.clear()
+                headers = self._authenticated()
+                old_cookie = self.client.cookies.get("session")
+                changed = self.client.post("/api/config", json=change, headers=headers)
+                self.assertEqual(changed.status_code, 200, changed.text)
+                self.assertIsNone(self.client.cookies.get("session"))
+                replay = {"Cookie": f"session={old_cookie}", **headers}
+                for path in (
+                    "/api/config", "/discovery-poster/tmdb/old-token",
+                    "/discovery-calendar-poster/youku/old-token", "/media-image/jellyfin/old-item",
+                ):
+                    self.assertEqual(self.client.get(path, headers=replay).status_code, 401, path)
+                self.assertEqual(self.client.get("/settings", headers=replay, follow_redirects=False).status_code, 302)
+                rejected = self.client.post("/api/config", json=original, headers=replay)
+                self.assertEqual(rejected.status_code, 401)
+                self.assertEqual(get_web_secret(), secret, "改密不能破坏已有播放或图片签名")
+                config.set_and_save(starting)
+
+    def test_ordinary_or_unchanged_configuration_keeps_authenticated_session(self):
+        original_password = config.web_credentials()[1]
+        self.addCleanup(config.set_and_save, {"ENV_WEB_PASSWORD": original_password})
+        config.set_and_save({"ENV_WEB_PASSWORD": "unchanged-test-password"})
+        headers = self._authenticated()
+        for updates in ({}, {"ENV_WEB_PASSWORD": ""}, {"ENV_WEB_PASSWORD": config.web_credentials()[1]}):
+            with self.subTest(updates=list(updates)):
+                saved = self.client.post("/api/config", json=updates, headers=headers)
+                self.assertEqual(saved.status_code, 200, saved.text)
+                self.assertEqual(self.client.get("/api/config").status_code, 200)
+
+    def test_legacy_boolean_cookie_requires_relogin_in_an_initialized_installation(self):
+        import json
+        from itsdangerous import TimestampSigner
+        from app.modules.web_secret import get_web_secret
+
+        payload = base64.b64encode(json.dumps({"logged_in": True, "csrf_token": "legacy-csrf"}).encode())
+        cookie = TimestampSigner(get_web_secret()).sign(payload).decode()
+        self.assertEqual(self.client.get("/api/config", headers={"Cookie": f"session={cookie}"}).status_code, 401)
+        self._authenticated()
+        self.assertEqual(self.client.get("/api/config").status_code, 200)
+
+    def test_waiting_config_write_revalidates_session_after_credentials_change(self):
+        from contextlib import contextmanager
+        from app.agent import feature_gate
+
+        original = dict(zip(("ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD"), config.web_credentials()))
+        self.addCleanup(config.set_and_save, original)
+        headers = self._authenticated()
+        transition = feature_gate.agent_runtime_transition
+
+        @contextmanager
+        def changed_before_lock_acquired():
+            with transition():
+                config.set_and_save({"ENV_WEB_PASSWORD": "prior-writer-password"})
+                yield
+
+        with patch.object(feature_gate, "agent_runtime_transition", changed_before_lock_acquired):
+            response = self.client.post("/api/config", json={"ENV_WEB_PASSWORD": "stale-writer-password"}, headers=headers)
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(config.web_credentials()[1], "prior-writer-password")
+
+    def test_login_uses_verified_credentials_even_if_password_changes_before_cookie_issuance(self):
+        import app.routes.auth as auth
+
+        original = dict(zip(("ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD"), config.web_credentials()))
+        self.addCleanup(config.set_and_save, original)
+        page = self.client.get("/login")
+        verified = config.web_credentials()
+
+        def changed_credentials():
+            config.set_and_save({"ENV_WEB_PASSWORD": "changed-during-login"})
+            return verified
+
+        with patch.object(auth, "web_credentials", side_effect=changed_credentials):
+            response = self.client.post("/login", data={
+                "csrf_token": self._csrf_token(page), "username": verified[0], "password": verified[1],
+            }, follow_redirects=False)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.client.get("/api/config").status_code, 401)
+
     def test_unauthenticated_dynamic_html_is_no_store_and_uses_versioned_shared_js(
         self,
     ):
@@ -4056,10 +4146,11 @@ class SecurityTests(InitializedWebTestCase):
 
     def test_download_overview_reports_unconfigured_qb_without_creating_client(self):
         headers = self._authenticated()
+        get_config = config.get
         with (
             patch(
                 "app.routes.downloads_api.config.get",
-                side_effect=lambda key, default="": "" if key == "QB_URL" else default,
+                side_effect=lambda key, default="": "" if key == "QB_URL" else get_config(key, default),
             ),
             patch("app.routes.downloads_api.QBittorrentClient") as qb_client,
         ):
@@ -4081,6 +4172,7 @@ class SecurityTests(InitializedWebTestCase):
 
     def test_download_overview_hides_configured_qb_connection_exception(self):
         headers = self._authenticated()
+        get_config = config.get
         client = Mock()
         client.list_torrents.side_effect = RuntimeError(
             "requests secret connection detail"
@@ -4089,7 +4181,7 @@ class SecurityTests(InitializedWebTestCase):
             patch(
                 "app.routes.downloads_api.config.get",
                 side_effect=lambda key, default="": (
-                    "http://qb.local:8080" if key == "QB_URL" else default
+                    "http://qb.local:8080" if key == "QB_URL" else get_config(key, default)
                 ),
             ),
             patch("app.routes.downloads_api.QBittorrentClient", return_value=client),
@@ -4800,6 +4892,7 @@ class SecurityTests(InitializedWebTestCase):
 
     def test_telegram_test_message_uses_saved_token_after_config_save(self):
         headers = self._authenticated()
+        get_config = config.get
         saved_token = "123456:saved-test-token"
         sent = SimpleNamespace(message_id=109)
         bot = Mock()
@@ -4808,7 +4901,7 @@ class SecurityTests(InitializedWebTestCase):
             patch(
                 "app.routes.api.config.get",
                 side_effect=lambda key, default="": (
-                    saved_token if key == "TG_BOT_TOKEN" else default
+                    saved_token if key == "TG_BOT_TOKEN" else get_config(key, default)
                 ),
             ),
             patch("telebot.TeleBot", return_value=bot) as bot_factory,
@@ -4904,6 +4997,7 @@ class SecurityTests(InitializedWebTestCase):
 
     def test_proxy_batch_uses_only_fixed_targets_and_injects_configured_services(self):
         headers = self._authenticated()
+        get_config = config.get
         values = {
             "PROXY_URL": "",
             "JELLYFIN_URL": "http://jellyfin.local:8096",
@@ -4915,7 +5009,7 @@ class SecurityTests(InitializedWebTestCase):
         with (
             patch(
                 "app.routes.tools_api.config.get",
-                side_effect=lambda key, default="": values.get(key, default),
+                side_effect=lambda key, default="": values.get(key, get_config(key, default)),
             ),
             patch(
                 "app.routes.tools_api.requests.get", return_value=response
@@ -6507,10 +6601,11 @@ class SecurityTests(InitializedWebTestCase):
 
     def test_config_endpoint_exposes_runtime_strm_default_without_persisting_it(self):
         headers = self._authenticated()
+        get_config = config.get
         with (
             patch("app.routes.api.config.all_items", return_value={}),
             patch("app.routes.api.config.has_external_override", return_value=False),
-            patch("app.routes.api.config.get", side_effect=lambda key, default="": "/data/strm" if key == "STRM_ROOT" else default) as get_value,
+            patch("app.routes.api.config.get", side_effect=lambda key, default="": "/data/strm" if key == "STRM_ROOT" else get_config(key, default)) as get_value,
             patch("app.routes.api.config.set_and_save") as save,
         ):
             response = self.client.get("/api/config", headers=headers)

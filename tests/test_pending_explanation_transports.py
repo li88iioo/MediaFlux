@@ -29,7 +29,7 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.transports import TelegramKernelTransport, WebKernelTransport
-from tests.support import initialized_web_runtime, isolated_test_database
+from tests.support import authenticated_session, initialized_web_runtime, isolated_test_database
 
 
 class NativeRuntime:
@@ -171,7 +171,7 @@ def api_client(runtime, monkeypatch, csrf="explain-csrf"):
 
         @application.get("/_test_login")
         def login(request: Request):
-            request.session.update(logged_in=True, csrf_token=csrf)
+            request.session.update(authenticated_session(csrf_token=csrf))
             return {"ok": True}
 
         monkeypatch.setattr(

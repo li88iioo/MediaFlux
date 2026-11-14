@@ -117,7 +117,7 @@ class EpisodeResearchSettingsTests(unittest.TestCase):
         module_patch.start()
         self.addCleanup(module_patch.stop)
         self.request = SimpleNamespace(
-            session={"logged_in": True},
+            session={},
             app=SimpleNamespace(state=SimpleNamespace(background_services_enabled=False, media_proxy_manager=None)),
         )
 

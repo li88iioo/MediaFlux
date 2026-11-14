@@ -29,7 +29,7 @@ from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.ports.mediaflux_policy import MediaFluxAuthorizationPolicy
 from app.agent.kernel.ports.sdk_effects import feature_config_tool
 from app.modules import feature_config as service
-from tests.support import initialized_web_runtime
+from tests.support import authenticated_session, initialized_web_runtime
 from tests.test_agent_kernel_core import ScriptedModel
 from tests.test_agent_sdk_effects import context_for
 
@@ -128,7 +128,7 @@ def test_reload_releases_confirmation_and_config_guards_before_waiting_for_old_w
             return True
         monkeypatch.setattr("app.discovery.service.shutdown_discovery_service", shutdown)
         if writer == "web":
-            request = Request({"type": "http", "session": {"logged_in": True},
+            request = Request({"type": "http", "session": authenticated_session(),
                 "app": SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))})
             assert save_config(request, {"DISCOVERY_ENABLED": "1"}) == {"success": True}
         else:
@@ -159,7 +159,7 @@ def test_agent_and_web_writes_refresh_the_same_runtime_component(backend, monkey
     if writer == "web":
         from app.routes.api import save_config
 
-        request = Request({"type": "http", "session": {"logged_in": True},
+        request = Request({"type": "http", "session": authenticated_session(),
             "app": SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))})
         assert save_config(request, {key: "1" if enabled else "0"}) == {"success": True}
     else:

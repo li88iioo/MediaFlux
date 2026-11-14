@@ -22,12 +22,12 @@ from app.modules.local_move_transaction import LocalMoveTransaction
 from app.modules.organize import OrganizeRules
 from app.modules.scraper import MatchResult
 from app.routes import local_media_api as api
-from tests.support import isolated_test_database
+from tests.support import authenticated_session, isolated_test_database
 from tests.test_local_media_service import FakeScraper
 
 
 def request():
-    return Request({"type": "http", "session": {"logged_in": True}})
+    return Request({"type": "http", "session": authenticated_session()})
 
 
 class LocalRetryAdmissionAuditTests(unittest.TestCase):

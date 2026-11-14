@@ -28,7 +28,7 @@ from app.modules.telegram_notification_policy import NotificationTopic
 from app.notifier import TelegramSendResult, render_event
 from app.repositories.telegram_notifications import get_notification
 from app.routes.api import save_config
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, authenticated_session, preserve_web_auth_config
 
 
 class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
@@ -305,7 +305,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
 
     def test_notification_switch_is_accepted_by_config_api(self):
         request = SimpleNamespace(
-            session={"logged_in": True},
+            session=authenticated_session(),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     background_services_enabled=False,
@@ -313,7 +313,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
                 )
             ),
         )
-        with patch("app.routes.api.config.get", return_value=""), patch(
+        with patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")), patch(
             "app.routes.api.config.set_and_save"
         ) as persist, patch("app.services.clear_dashboard_cache"):
             response = save_config(

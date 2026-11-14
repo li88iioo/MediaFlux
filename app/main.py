@@ -30,7 +30,7 @@ from app import config, database
 from app.logger import get_logger
 from app.modules import first_run, web_secret
 from app.security import SAFE_METHODS
-from app.web import APP_DIR, render_template
+from app.web import APP_DIR, is_web_authenticated, render_template
 
 logger = get_logger(__name__)
 
@@ -165,7 +165,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if (
             request.method not in SAFE_METHODS
             and request.url.path.startswith("/api/")
-            and not request.session.get("logged_in")
+            and not is_web_authenticated(request)
         ):
             return self._headers(
                 request, JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -229,6 +229,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                     response = PlainTextResponse("CSRF token invalid", status_code=403)
                 return self._headers(request, response)
         response = await call_next(request)
+        # 改密响应仍返回原结果，但不能把本次已失效的登录态继续留在浏览器。
+        is_web_authenticated(request)
         return self._headers(request, response)
 
     @staticmethod

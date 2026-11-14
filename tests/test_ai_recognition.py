@@ -17,7 +17,7 @@ import httpx
 import requests
 from fastapi.responses import JSONResponse
 
-from tests.support import IsolatedDatabaseTestCase, release_parse_result
+from tests.support import IsolatedDatabaseTestCase, release_parse_result, authenticated_session, preserve_web_auth_config
 
 
 class _Response:
@@ -1792,7 +1792,7 @@ class AIPreviewAndSettingsTests(unittest.TestCase):
 class AIRecognitionConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.request = SimpleNamespace(
-            session={"logged_in": True},
+            session=authenticated_session(),
             app=SimpleNamespace(
                 state=SimpleNamespace(background_services_enabled=False)
             ),
@@ -1811,7 +1811,7 @@ class AIRecognitionConfigTests(unittest.TestCase):
         # 当前有效配置；否则相同值会被生产代码按 no-op 正确过滤。
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda _key, default="": default,
+            side_effect=preserve_web_auth_config(lambda _key, default="": default),
         ), patch(
             "app.routes.api.config.has_external_override", return_value=False
         ), patch("app.routes.api.config.set_and_save") as persist, patch(

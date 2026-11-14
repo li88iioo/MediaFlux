@@ -491,10 +491,13 @@ class LoginWallpaperPageTests(unittest.TestCase):
         )
 
     def test_config_api_enforces_tmdb_requirement(self):
+        from app import config
+
+        get_config = config.get
         headers = self._authenticated_headers()
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": "" if key == "TMDB_API_KEY" else default,
+            side_effect=lambda key, default="": "" if key == "TMDB_API_KEY" else get_config(key, default),
         ):
             rejected = self.client.post(
                 "/api/config",
@@ -506,7 +509,7 @@ class LoginWallpaperPageTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": "saved-key" if key == "TMDB_API_KEY" else default,
+            side_effect=lambda key, default="": "saved-key" if key == "TMDB_API_KEY" else get_config(key, default),
         ), patch("app.routes.api.config.set_and_save") as save:
             accepted = self.client.post(
                 "/api/config",

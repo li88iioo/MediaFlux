@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, authenticated_session
 
 
 class RecognitionKnowledgeTestCase(IsolatedDatabaseTestCase):
@@ -245,7 +245,7 @@ class RecognitionKnowledgeApiTests(RecognitionKnowledgeTestCase):
     @staticmethod
     def request():
         request = Mock()
-        request.session = {"logged_in": True}
+        request.session = authenticated_session()
         return request
 
     @staticmethod

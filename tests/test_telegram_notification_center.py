@@ -50,7 +50,7 @@ from app.repositories.telegram_notifications import (
     upsert_notification,
 )
 from app.routes.api import save_config
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, authenticated_session, preserve_web_auth_config
 
 
 class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
@@ -1706,7 +1706,7 @@ class TelegramNotificationSettingsTests(unittest.TestCase):
     @staticmethod
     def _request():
         return SimpleNamespace(
-            session={"logged_in": True},
+            session=authenticated_session(),
             app=SimpleNamespace(state=SimpleNamespace(
                 background_services_enabled=False,
                 media_proxy_manager=None,
@@ -1728,7 +1728,7 @@ class TelegramNotificationSettingsTests(unittest.TestCase):
 
     def test_config_api_normalizes_switch_and_rejects_unknown_level(self) -> None:
         with patch(
-            "app.routes.api.config.get", side_effect=lambda _key, default="": default,
+            "app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": default),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.services.clear_dashboard_cache"
         ):

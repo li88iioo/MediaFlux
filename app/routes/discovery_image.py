@@ -14,6 +14,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from requests.adapters import HTTPAdapter
 
 from app import config
+from app.web import require_api_login
 from app.clients.http import HttpError
 from app.discovery.calendar.poster_http import fetch_platform_poster
 from app.discovery.calendar.posters import (
@@ -195,8 +196,7 @@ def _default_headers() -> dict[str, str]:
 
 @router.get("/discovery-poster/{provider}/{token}", name="discovery_image.poster")
 def poster(request: Request, provider: str, token: str):
-    if not request.session.get("logged_in"):
-        raise HTTPException(status_code=401, detail="unauthorized")
+    require_api_login(request)
     poster_key = decode_poster_token(provider, token)
     url = _upstream_url(provider, poster_key)
     is_douban = (provider or "").strip().lower() == "douban"
@@ -299,8 +299,7 @@ def poster(request: Request, provider: str, token: str):
 
 @router.get("/discovery-calendar-poster/{source}/{token}", name="discovery_image.calendar_poster")
 async def calendar_poster(request: Request, source: str, token: str):
-    if not request.session.get("logged_in"):
-        raise HTTPException(status_code=401, detail="unauthorized")
+    require_api_login(request)
     if source not in PLATFORM_IMAGE_HOSTS:
         raise HTTPException(status_code=404, detail="unknown calendar source")
     if request.query_params:

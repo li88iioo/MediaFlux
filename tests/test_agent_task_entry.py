@@ -19,6 +19,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.kernel.task_state import task_projection
 from app.routes import agent_api
 from tests.agent_task_native_helpers import returned_task, task_call
+from tests.support import authenticated_session
 from tests.test_agent_task_first_slice import OWNER, NativeScript, configuration_call
 
 GOAL = "帮我分别看看 TMDB 和 qBittorrent 当前配置，列出已检查和还没检查的内容；只读，不做修改。"
@@ -359,7 +360,7 @@ def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
                 "method": "GET",
                 "path": "/api/agent/sessions/entry-session-0001",
                 "headers": [],
-                "session": {"logged_in": True},
+                "session": authenticated_session(),
             }
         )
         with patch.object(agent_api, "get_agent_kernel_runtime", return_value=runtime2):

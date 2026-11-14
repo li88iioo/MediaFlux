@@ -19,7 +19,7 @@ from app.security import (
     record_setup_failure,
     setup_rate_limited,
 )
-from app.web import render_template
+from app.web import is_web_authenticated, render_template, web_session_credential
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -62,7 +62,7 @@ async def login_page(request: Request):
     activate = getattr(request.app.state, "activate_runtime", None)
     if activate is not None and not request.app.state.ready:
         await activate()
-    if request.session.get("logged_in"):
+    if is_web_authenticated(request):
         return RedirectResponse("/", status_code=302)
     return await asyncio.to_thread(_render_login, request)
 
@@ -86,7 +86,7 @@ async def login_submit(
                 _render_login, request, status_code=503,
                 error="服务尚未就绪，请检查日志并重启服务后登录",
             )
-    if request.session.get("logged_in"):
+    if is_web_authenticated(request):
         return RedirectResponse("/", status_code=302)
     identity = request.client.host if request.client else "unknown"
     if login_rate_limited(identity):
@@ -109,7 +109,7 @@ async def login_submit(
     if valid:
         clear_login_failures(identity)
         request.session.clear()
-        request.session["logged_in"] = True
+        request.session["logged_in"] = web_session_credential((ok_user, ok_pass))
         logger.info(f"用户登录成功: {username}")
         return RedirectResponse("/", status_code=302)
     record_login_failure(identity)

@@ -1098,11 +1098,11 @@ def _normalize_organize_extensions(value: object, *, defaults: tuple[str, ...], 
 @router.post("/config")
 def save_config(request: Request, data: Any = Body(default=None)):
     request_started = time.perf_counter()
-    require_api_login(request)
     from app.agent.feature_gate import agent_runtime_transition, invalidate_agent_runtime_generation
 
     # 与 Agent 写入使用同一锁顺序；关联校验、旧值和补偿必须属于同一次配置事务。
     with agent_runtime_transition(), config.runtime_config_read_guard():
+        require_api_login(request)
         if not isinstance(data, dict):
             return api_error("配置必须是 JSON 对象", 400)
         data = dict(data)

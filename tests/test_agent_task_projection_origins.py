@@ -17,6 +17,7 @@ from app.agent.kernel.bootstrap import build_agent_kernel_runtime
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.routes import agent_api
+from tests.support import authenticated_session
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript
 
 SID = "task-origin-session-01"
@@ -133,7 +134,7 @@ def test_private_call_id_stays_internal_and_native(storage):
         builder = TurnViewBuilder()
         for event in events:
             builder.apply(event)
-        request = Request({"type": "http", "method": "GET", "path": "/api/agent/sessions/" + SID, "headers": [], "session": {"logged_in": True}})
+        request = Request({"type": "http", "method": "GET", "path": "/api/agent/sessions/" + SID, "headers": [], "session": authenticated_session()})
         with patch.object(agent_api, "get_agent_kernel_runtime", return_value=runtime):
             response = await agent_api.get_session(request, SID)
         assert response.status_code == 200

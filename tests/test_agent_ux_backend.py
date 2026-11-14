@@ -43,6 +43,7 @@ from app.agent.kernel.tool_calls import ToolCallContext
 from app.agent.models import ToolReference, ToolResult
 from app.agent.transports import QueryEnvelope
 from app.routes import agent_api
+from tests.support import authenticated_session
 from tests.resource_presentation_test_harness import present, observe_fixture, model_resource_candidates
 
 SECRET = "agent-ux-backend-test-secret"
@@ -72,7 +73,7 @@ def api(store, monkeypatch):
 
     @application.get("/_test_login")
     def login(request: Request):
-        request.session.update(logged_in=True, csrf_token="ux-csrf")
+        request.session.update(authenticated_session(csrf_token="ux-csrf"))
         return {"ok": True}
 
     session, _, _ = _runtime(store)
@@ -203,12 +204,14 @@ def test_patch_auth_csrf_owner_missing_clean_title_and_stable_draft_scope(api, m
     assert api.client.get("/api/agent/sessions").json()["draft_scope"] == scope
     before = _row_snapshot()
     api.principal["username"] = "ux-account-b"
+    _login(api)
     assert api.client.patch(path, json={"pinned": False}, headers=CSRF).status_code == 404
     assert api.client.get("/api/agent/sessions").json()["sessions"] == []
     assert api.client.get("/api/agent/sessions").json()["draft_scope"] != scope
     assert api.client.patch("/api/agent/sessions/missing_1234567890", json={"title": "不存在"}, headers=CSRF).status_code == 404
     assert _row_snapshot() == before
     api.principal["username"] = "ux-account-a"
+    _login(api)
     monkeypatch.setattr(agent_api, "get_web_secret", lambda: SECRET + "rotated")
     assert api.client.get("/api/agent/sessions").json()["draft_scope"] != scope
 
@@ -663,6 +666,7 @@ def test_get_session_restores_only_valid_current_candidates_and_query_accepts_se
     for selection in (None, {}, {"ref": view["ref"], "position": True}, {**_selection(view), "url": "https://private"}):
         assert api.client.post("/api/agent/query", json={"message": "选择", "session_id": SESSION, "selection": selection}, headers=CSRF).status_code == 400
     api.principal["username"] = "foreign"
+    _login(api)
     response = api.client.get(f"/api/agent/sessions/{SESSION}")
     assert response.status_code == 200 and response.json()["candidate_view"] is None
     assert response.json()["scoped_trust"] == {"active": False}
@@ -1189,6 +1193,7 @@ def test_main_chat_adopts_latest_session_stays_fixed_and_cannot_be_deleted(api):
     assert api.client.get("/api/agent/sessions").json()["main_session_id"] == first
 
     api.principal["username"] = "ux-account-main"
+    _login(api)
     owner = _web_owner(api)
     older, latest, side = "session_main_older_01", "session_main_latest_1", "session_main_side_001"
     asyncio.run(_seed(api.store, owner=owner, session_id=older))

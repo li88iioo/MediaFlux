@@ -16,7 +16,7 @@ from app.main import create_app
 from app.modules.recognition.cleaner import _comparison_key
 from app.modules.scraper import TMDBScraper
 from app.routes.tools_api import clean_scrape_query
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, authenticated_session
 from tests.test_guangya_directory_scrape_browser import APP_MODAL_SCRIPT, POSITION_SCRIPT
 from tests.test_agent_kernel_browser import _chromium_executable, sync_playwright
 
@@ -29,7 +29,7 @@ MOVIE_RELEASE = '血玫瑰.Bloody.Rose.1988.LDVDRip.HALFCD.2Audios.mkv'
 class ManualScrapeCleanApiTests(IsolatedDatabaseTestCase):
     @staticmethod
     def clean(payload):
-        return clean_scrape_query(Request({'type': 'http', 'session': {'logged_in': True}}), payload)
+        return clean_scrape_query(Request({'type': 'http', 'session': authenticated_session()}), payload)
 
     def test_instance_releases_use_shared_cleaning_and_keep_year(self):
         cases = [json.loads(line) for line in (

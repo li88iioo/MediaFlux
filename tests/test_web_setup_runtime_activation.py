@@ -192,7 +192,6 @@ def _login_activation_action():
         assert application.state.activate_runtime is activate
         assert application.state.ready, 'POST /login did not activate the committed installation'
         assert browser.get('/readyz').status_code == 200
-        assert _session_data(application, browser).get('logged_in') is True
         assert browser.get('/api/config').status_code == 200
     return 'verified'
 

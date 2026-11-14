@@ -18,7 +18,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.bot.agent_adapter import _render_turn
 from app.bot.telegram_markdown import render_telegram_markdown
 from app.routes import agent_api
-from tests.support import isolated_test_database
+from tests.support import authenticated_session, isolated_test_database
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript
 
 
@@ -64,7 +64,7 @@ def native_snapshots():
                     "method": "GET",
                     "path": "/",
                     "headers": [],
-                    "session": {"logged_in": True},
+                    "session": authenticated_session(),
                 }
             )
             with patch.object(agent_api, "get_agent_kernel_runtime", return_value=cold):

@@ -21,7 +21,7 @@ from app.modules.episode_audit import EpisodeAuditResult
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
 from app.notifier import TelegramSendResult
 from app.routes.api import save_config
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, authenticated_session, preserve_web_auth_config
 
 
 class MutableClock:
@@ -69,7 +69,7 @@ class AgentLibraryPatrolConfigTests(unittest.TestCase):
     @staticmethod
     def _request():
         return SimpleNamespace(
-            session={"logged_in": True},
+            session=authenticated_session(),
             app=SimpleNamespace(
                 state=SimpleNamespace(
                     background_services_enabled=False, media_proxy_manager=None
@@ -86,7 +86,7 @@ class AgentLibraryPatrolConfigTests(unittest.TestCase):
             "AGENT_LIBRARY_PATROL_MAX_SERIES": "80",
         }
         with (
-            patch("app.routes.api.config.get", return_value=""),
+            patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")),
             patch("app.routes.api.config.set_and_save") as persist,
             patch("app.services.clear_dashboard_cache"),
             patch(
@@ -106,7 +106,7 @@ class AgentLibraryPatrolConfigTests(unittest.TestCase):
         ):
             with (
                 self.subTest(key=key),
-                patch("app.routes.api.config.get", return_value=""),
+                patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")),
                 patch("app.routes.api.config.set_and_save") as persist,
             ):
                 response = save_config(cast(Request, self._request()), {key: "enabled"})
@@ -123,7 +123,7 @@ class AgentLibraryPatrolConfigTests(unittest.TestCase):
         ):
             with (
                 self.subTest(payload=payload),
-                patch("app.routes.api.config.get", return_value=""),
+                patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")),
                 patch("app.routes.api.config.set_and_save") as persist,
             ):
                 response = save_config(cast(Request, self._request()), payload)

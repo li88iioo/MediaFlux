@@ -11,13 +11,14 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from app.routes.api import get_config, save_config
+from tests.support import authenticated_session, preserve_web_auth_config
 
 
 class DiscoveryConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.request = Request({
             "type": "http",
-            "session": {"logged_in": True},
+            "session": authenticated_session(),
             "app": SimpleNamespace(
                 state=SimpleNamespace(background_services_enabled=False)
             ),
@@ -35,7 +36,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         def get_value(key, default=""):
             return existing.get(key, default)
 
-        with patch("app.routes.api.config.get", side_effect=get_value), patch(
+        with patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(get_value)), patch(
             "app.routes.api.config.set_and_save"
         ) as persist, patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.scheduler.get_scheduler"
@@ -50,7 +51,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         from app.discovery.service import DiscoveryService
         from app.modules.policy_config import POLICY_BY_KEY
 
-        with patch("app.config.get", side_effect=lambda key, default="": default):
+        with patch("app.config.get", side_effect=preserve_web_auth_config(lambda key, default="": default)):
             service = DiscoveryService(registry=Mock(), cache=Mock())
             douban_ttl = service._provider_ttl("douban")
         self.assertEqual(service.cache_ttl_seconds, POLICY_BY_KEY["DISCOVERY_CACHE_TTL_SECONDS"].default)
@@ -110,7 +111,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         persist.assert_not_called()
 
     def test_indexer_config_save_refreshes_web_and_telegram_services(self):
-        with patch("app.routes.api.config.get", return_value=""), patch(
+        with patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")), patch(
             "app.routes.api.config.set_and_save"
         ) as persist, patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.scheduler.get_scheduler"
@@ -135,7 +136,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         shutdown_telegram.assert_called_once_with(timeout=5.0)
 
     def test_discovery_runtime_config_save_also_rebuilds_search_clients(self):
-        with patch("app.routes.api.config.get", return_value=""), patch(
+        with patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")), patch(
             "app.routes.api.config.set_and_save"
         ), patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.scheduler.get_scheduler"
@@ -417,7 +418,7 @@ class DiscoveryConfigTests(unittest.TestCase):
     def test_config_read_filters_agent_sources_and_preserves_legacy_sukebei(self):
         for version, expected in (("", "btbtla,sukebei"), ("2", "btbtla,sukebei")):
             values={"INDEXER_ENABLED_SITES":"btbtla", "INDEXER_SITE_CONFIG_VERSION":version,"INDEXER_SUKEBEI_ENABLED":"1"}
-            with self.subTest(version=version), patch("app.routes.api.config.all_items",return_value=values), patch("app.routes.api.config.get",side_effect=lambda key,default="":values.get(key,default)), patch("app.routes.api.config.get_bool",side_effect=lambda key,default=False: True if key=="INDEXER_SUKEBEI_ENABLED" else default):
+            with self.subTest(version=version), patch("app.routes.api.config.all_items",return_value=values), patch("app.routes.api.config.get",side_effect=preserve_web_auth_config(lambda key,default="":values.get(key,default))), patch("app.routes.api.config.get_bool",side_effect=lambda key,default=False: True if key=="INDEXER_SUKEBEI_ENABLED" else default):
                 result=get_config(self.request)
             self.assertEqual(result["INDEXER_ENABLED_SITES"],expected)
 
@@ -428,7 +429,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         saved={**old,**persist.call_args.args[0]}
         self.assertEqual(saved["INDEXER_SITE_CONFIG_VERSION"],"3")
         self.assertEqual(saved["INDEXER_SUKEBEI_ENABLED"],"0")
-        with patch("app.routes.api.config.all_items",return_value=saved), patch("app.routes.api.config.get",side_effect=lambda key,default="":saved.get(key,default)), patch("app.routes.api.config.get_bool",return_value=False):
+        with patch("app.routes.api.config.all_items",return_value=saved), patch("app.routes.api.config.get",side_effect=preserve_web_auth_config(lambda key,default="":saved.get(key,default))), patch("app.routes.api.config.get_bool",return_value=False):
             reloaded=get_config(self.request)
         self.assertEqual(reloaded["INDEXER_ENABLED_SITES"],"btbtla")
 

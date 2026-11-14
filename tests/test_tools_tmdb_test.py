@@ -8,10 +8,11 @@ from unittest.mock import MagicMock, patch
 from fastapi.responses import JSONResponse
 
 from app.routes import tools_api
+from tests.support import authenticated_session, preserve_web_auth_config
 
 
 def _request():
-    return SimpleNamespace(session={"logged_in": True, "csrf_token": "tmdb-test-token"})
+    return SimpleNamespace(session=authenticated_session(csrf_token="tmdb-test-token"))
 
 
 def _payload(response):
@@ -23,7 +24,7 @@ def _config(values):
     return patch.object(
         tools_api.config,
         "get",
-        side_effect=lambda key, default="": values.get(key, default),
+        side_effect=preserve_web_auth_config(lambda key, default="": values.get(key, default)),
     )
 
 

@@ -26,7 +26,7 @@ from app.routes import strm_api
 from app.routes.api import _validate_agent_llm_updates, get_config, save_config
 from app.security import redact_config
 from app.web import relative_url_for
-from tests.support import initialized_web_runtime
+from tests.support import initialized_web_runtime, authenticated_session, preserve_web_auth_config
 
 
 class AgentSettingsUiTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class AgentSettingsUiTests(unittest.TestCase):
     def _request():
         return Request({
             "type": "http",
-            "session": {"logged_in": True},
+            "session": authenticated_session(),
             "app": SimpleNamespace(
                 state=SimpleNamespace(
                     background_services_enabled=False,
@@ -83,14 +83,14 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertTrue(DEFAULT_BOOL_CONFIG_VALUES["AGENT_STREAM_DISPLAY_ENABLED"])
         with patch(
             "app.config.get",
-            side_effect=lambda _key, default="": default,
+            side_effect=preserve_web_auth_config(lambda _key, default="": default),
         ):
             self.assertTrue(config.get_bool("AGENT_STREAM_DISPLAY_ENABLED"))
         with patch("app.routes.api.config.all_items", return_value={}), patch(
             "app.routes.api.config.has_external_override", return_value=False
         ), patch(
             "app.routes.api.config.get",
-            side_effect=lambda _key, default="": default,
+            side_effect=preserve_web_auth_config(lambda _key, default="": default),
         ):
             payload = get_config(self._request())
 
@@ -365,7 +365,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             side_effect=lambda key: key in effective,
         ), patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": effective.get(key, default),
+            side_effect=preserve_web_auth_config(lambda key, default="": effective.get(key, default)),
         ):
             payload = get_config(self._request())
 
@@ -426,7 +426,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         }
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": values.get(key, default),
+            side_effect=preserve_web_auth_config(lambda key, default="": values.get(key, default)),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.bot.restart_bot"
         ) as restart, patch("app.services.clear_dashboard_cache"), patch(
@@ -466,7 +466,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         values = {"AGENT_STREAM_DISPLAY_ENABLED": "1"}
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": values.get(key, default),
+            side_effect=preserve_web_auth_config(lambda key, default="": values.get(key, default)),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.services.clear_dashboard_cache"
         ), patch(
@@ -490,7 +490,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         }
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": values.get(key, default),
+            side_effect=preserve_web_auth_config(lambda key, default="": values.get(key, default)),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.services.clear_dashboard_cache"
         ), patch(
@@ -572,7 +572,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": "1" if key == "AGENT_ENABLED" else default,
+            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "AGENT_ENABLED" else default),
         ), patch("app.routes.api.config.set_and_save"), patch(
             "app.bot.restart_bot"
         ) as restart, patch("app.services.clear_dashboard_cache"), patch(
@@ -603,7 +603,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": "1" if key == "AGENT_ENABLED" else default,
+            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "AGENT_ENABLED" else default),
         ), patch(
             "app.routes.api.config.set_and_save",
             side_effect=lambda _updates: events.append("persist"),
@@ -625,7 +625,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": "1" if key == "TG_AGENT_ENABLED" else default,
+            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "TG_AGENT_ENABLED" else default),
         ), patch("app.routes.api.config.set_and_save"), patch(
             "app.bot.restart_bot"
         ) as restart, patch("app.services.clear_dashboard_cache"), patch(
@@ -660,7 +660,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                 }
                 with patch(
                     "app.routes.api.config.get",
-                    side_effect=lambda name, default="": values.get(name, default),
+                    side_effect=preserve_web_auth_config(lambda name, default="": values.get(name, default)),
                 ), patch(
                     "app.routes.api.config.set_and_save"
                 ) as persist, patch(
@@ -682,9 +682,9 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": (
+            side_effect=preserve_web_auth_config(lambda key, default="": (
                 "1" if key == "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED" else default
-            ),
+            )),
         ), patch("app.routes.api.config.set_and_save"), patch(
             "app.services.clear_dashboard_cache"
         ), patch(
@@ -705,7 +705,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda _key, default="": default,
+            side_effect=preserve_web_auth_config(lambda _key, default="": default),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.services.clear_dashboard_cache"
         ), patch(
@@ -732,9 +732,9 @@ class AgentSettingsUiTests(unittest.TestCase):
     def test_blank_torrent_retention_normalizes_to_permanent(self):
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": (
+            side_effect=preserve_web_auth_config(lambda key, default="": (
                 "30" if key == "DOWNLOAD_TORRENT_RETENTION_DAYS" else default
-            ),
+            )),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.services.clear_dashboard_cache"
         ), patch(
@@ -759,9 +759,9 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": (
+            side_effect=preserve_web_auth_config(lambda key, default="": (
                 "existing-secret" if key == "AGENT_LLM_API_KEY" else default
-            ),
+            )),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.services.clear_dashboard_cache"
         ):
@@ -1179,7 +1179,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                 _validate_web_access_updates({key: value})
         with (
             initialized_web_runtime(),
-            patch("app.routes.api.config.get", side_effect=lambda key, default="": _AGENT_SETTINGS_DEFAULTS.get(key, default)),
+            patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda key, default="": _AGENT_SETTINGS_DEFAULTS.get(key, default))),
             patch("app.routes.api.config.has_external_override", return_value=False),
             patch("app.routes.api.config.set_and_save") as persist,
             patch("app.services.clear_dashboard_cache"),

@@ -28,7 +28,7 @@ from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizeRules
 from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.scraper import MatchResult
-from tests.support import isolated_test_database, release_parse_result
+from tests.support import authenticated_session, isolated_test_database, release_parse_result
 
 
 CANDIDATE = {
@@ -753,7 +753,7 @@ def test_batch_api_requires_auth_accepts_preview_and_rejects_legacy_implicit_req
 
     @api.post("/__test/login")
     def _test_login(request: Request):
-        request.session["logged_in"] = True
+        request.session.update(authenticated_session())
         return {"ok": True}
 
     created: list[OrganizeCorrectionService] = []
