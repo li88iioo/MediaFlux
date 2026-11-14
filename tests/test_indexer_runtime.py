@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -316,6 +320,36 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_on, [observed[0]])
         self.assertTrue(stopped)
         self.assertIsNone(runtime._runtime_loop)
+
+    def test_standalone_process_exit_closes_browser_session_before_executor(self):
+        script = """
+import asyncio
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+from app.clients.http import BrowserImpersonatingHttpClient
+from app.indexers import runtime
+
+marker = Path(sys.argv[1])
+client = BrowserImpersonatingHttpClient(allowed_hosts={"example.com"})
+client._session = SimpleNamespace(close=lambda: marker.write_text("closed"))
+runtime._service = SimpleNamespace(aclose=client.aclose)
+runtime.run_indexer_awaitable_sync(asyncio.to_thread(lambda: None), timeout_seconds=2)
+if sys.argv[2] == "explicit":
+    runtime.unbind_indexer_event_loop()
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            for mode in ("exit", "explicit"):
+                with self.subTest(mode=mode):
+                    marker = Path(temporary) / mode
+                    result = subprocess.run(
+                        [sys.executable, "-c", script, str(marker), mode],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(marker.exists(), result.stdout + result.stderr)
+                    self.assertEqual(marker.read_text(), "closed")
+                    self.assertNotIn("RuntimeError", result.stderr)
 
     async def test_standalone_shutdown_failure_keeps_runtime_handles_for_retry(self):
         async def capture_loop():

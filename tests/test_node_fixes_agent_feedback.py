@@ -33,6 +33,9 @@ FAILURE = {'ok': False, 'status': 'manual_review', 'summary': '下载提交结�
 
 class AgentFailureProjectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_kernel_failure_keeps_dto_and_retry_warning_for_telegram(self):
+        from app.indexers.runtime import unbind_indexer_event_loop
+
+        self.addCleanup(unbind_indexer_event_loop)
         class ReceiptModel(SameTurnSearchSubmitModel):
             async def stream(self, request, *, cancellation):
                 if len(self.requests) < 2:

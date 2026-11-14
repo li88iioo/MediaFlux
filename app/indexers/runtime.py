@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
 import inspect
 import re
 import threading
@@ -11,6 +10,8 @@ import unicodedata
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
+# 先登记线程池自身的退出钩子；下方的后进先出钩子须在它之前释放客户端。
+import concurrent.futures.thread  # noqa: F401
 from typing import Any, TypeVar
 
 from app import config
@@ -560,4 +561,6 @@ def refresh_indexer_configuration(*, timeout: float = 5.0) -> dict[str, bool]:
     return status
 
 
-atexit.register(_stop_standalone_runtime)
+# 客户端关闭需要 asyncio.to_thread，普通 atexit 已晚于线程池关闭。
+# 使用 CPython 的线程退出阶段，与 ThreadPoolExecutor 保持相同生命周期。
+threading._register_atexit(_stop_standalone_runtime)  # pyrefly: ignore [missing-attribute]
