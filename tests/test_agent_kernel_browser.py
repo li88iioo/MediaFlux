@@ -67,7 +67,7 @@ HTML = """
         <section class="agent-console is-empty" aria-label="Agent 对话工作区">
           <div class="agent-transcript" id="agentTranscript" role="log"></div>
           <div class="agent-empty-intro" id="agentEmptyIntro"><p>直接描述你想处理的任务</p></div>
-          <button type="button" class="agent-new-replies" id="agentNewReplies" hidden>有新回复</button>
+          <button type="button" class="agent-new-replies" id="agentNewReplies" hidden><span>回到底部</span></button>
           <form class="agent-composer" id="agentComposer">
             <div class="agent-composer-input-wrap">
               <textarea id="agentPrompt" rows="1" maxlength="1000" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea>
@@ -1020,7 +1020,9 @@ Season 1 / S01E01
         self.assertIn("暂停任务已提交", text_content)
         self.assertIn("不会自动重试", page.locator("#agentResponseStatus").inner_text())
         self.assertTrue(page.locator("#agentSend").get_attribute("aria-busy") == "false")
-        self.assertFalse(page.locator("#agentSend").is_hidden())
+        # 回合结束后停止按钮退场；输入框为空时发送按钮也不显示。
+        self.assertTrue(page.locator("#agentStopSession").is_hidden())
+        self.assertTrue(page.locator("#agentSend").is_hidden())
         self.assertEqual(page.locator(".agent-streaming").count(), 0)
         self.assertEqual(page.locator(".agent-cancelled").count(), 0)
         calls = page.evaluate("window.__kernelCalls")
@@ -1543,6 +1545,9 @@ Season 1 / S01E01
     def test_empty_composer_centers_prompt_with_leading_action(self) -> None:
         page = self.make_page({"sessions": {"sessions": []}})
         self.assertEqual(page.locator("#agentReleaseFormatGuide").count(), 0)
+        self.assertTrue(page.locator("#agentSend").is_hidden())
+        # 发送按钮只在有内容时出现；出现后仍须与单行输入垂直居中。
+        page.locator("#agentPrompt").fill("查看")
         layout = page.evaluate("""() => {
           const centerY = (selector) => {
             const rect = document.querySelector(selector).getBoundingClientRect();

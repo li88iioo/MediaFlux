@@ -29,8 +29,8 @@ class TaskStatusLayoutBrowserTests(AgentShellBrowserCase):
                 assert button is not None
                 self.assertLessEqual(button["y"] + button["height"], notice["y"] + notice["height"] + 0.5)
                 controls = page.locator(".agent-composer-header :is(a, button):visible")
-                self.assertEqual(controls.count(), 5)
-                self.assertTrue(page.locator("#agentSend").is_visible())
+                self.assertEqual(controls.count(), 4)
+                self.assertTrue(page.locator("#agentSend").is_hidden())
                 self.assertFalse(page.locator("#agentStopSession").is_visible())
                 boxes = []
                 for control in controls.all():

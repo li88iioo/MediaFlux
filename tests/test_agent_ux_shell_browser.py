@@ -215,8 +215,9 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
             'last_turn': {'request_id': 'background', 'turn_id': 'background-turn', 'status': 'waiting'},
         })
         self.assertTrue(page.locator('#agentStopSession').is_hidden())
-        self.assertTrue(page.locator('#agentSend').is_visible())
+        self.assertTrue(page.locator('#agentSend').is_hidden())
         page.locator('#agentPrompt').fill('继续问一个问题')
+        self.assertTrue(page.locator('#agentSend').is_visible())
         self.assertTrue(page.locator('#agentSend').is_enabled())
         self.assertEqual(unexpected, [])
         self.assertEqual(errors, [])

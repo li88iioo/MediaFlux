@@ -369,9 +369,16 @@ class AgentUXBrowserTests(unittest.TestCase):
                 page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
                 self.assertLess(page.locator('#agentTranscript').evaluate('(node) => node.scrollTop'), 10)
                 self.assertTrue(page.locator('#agentNewReplies').is_visible())
+                # 翻到顶部时按钮显示视口下方实际剩余的消息条数。
+                self.assertRegex(page.locator('#agentNewReplies').inner_text().strip(), r'^[1-9]\d* 条消息$')
                 page.locator('#agentNewReplies').click()
                 page.wait_for_function("() => {const node = document.querySelector('#agentTranscript'); return node.scrollHeight - node.clientHeight - node.scrollTop < 3;}")
                 self.assertTrue(page.locator('#agentNewReplies').is_hidden())
+                if outcome == 'turn.completed':
+                    # 只在最后一条长回复内部上翻时，没有更下方的消息，按钮显示“回到底部”。
+                    page.evaluate("() => { const node = document.querySelector('#agentTranscript'); node.scrollTop = node.scrollHeight - node.clientHeight - 400; node.dispatchEvent(new Event('scroll')); }")
+                    page.wait_for_function("() => !document.querySelector('#agentNewReplies').hidden")
+                    self.assertEqual(page.locator('#agentNewReplies').inner_text().strip(), '回到底部')
 
     def test_history_filter_rename_and_pin_keep_existing_conversation(self):
         page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': [

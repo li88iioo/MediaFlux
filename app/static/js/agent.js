@@ -336,10 +336,26 @@
         return !transcript || transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 140;
     }
 
+    function syncScrollPill(show = !followOutput) {
+        if (!newRepliesButton || !transcript) return;
+        if (!show) {
+            newRepliesButton.hidden = true;
+            return;
+        }
+        // 按视口下方实际剩余的消息计数，不随流式片段累加。
+        const limit = transcript.getBoundingClientRect().bottom;
+        const below = [...transcript.querySelectorAll('.agent-message')]
+            .filter(node => node.getBoundingClientRect().top >= limit - 1).length;
+        const label = newRepliesButton.querySelector('span');
+        if (label) label.textContent = below ? `${below} 条消息` : '回到底部';
+        newRepliesButton.setAttribute('aria-label', below ? `回到底部，下方还有 ${below} 条消息` : '回到底部');
+        newRepliesButton.hidden = false;
+    }
+
     function scrollToBottom(force = false) {
         if (!transcript) return;
         if (!force && (!followOutput || transcript.querySelector('.agent-process-toggle[aria-expanded="true"]'))) {
-            if (newRepliesButton) newRepliesButton.hidden = false;
+            syncScrollPill(true);
             return;
         }
         if (force) followOutput = true;
@@ -2200,7 +2216,8 @@
     function syncSend() {
         const showStop = busy || sessionStopPending;
         if (sendButton) {
-            sendButton.hidden = showStop;
+            // 有内容才出现发送按钮；任务进行中由停止按钮占位。
+            sendButton.hidden = showStop || !promptInput?.value.trim();
             sendButton.disabled = showStop || initialRestore || !promptInput?.value.trim();
         }
         if (sessionStopButton) {
@@ -2815,7 +2832,7 @@
         if (followOutput && ![...processStates.values()].some(state => state.expanded)) scrollToBottom(true);
         else if (transcript) {
             transcript.scrollTop = previousScrollTop;
-            if (newRepliesButton) newRepliesButton.hidden = false;
+            syncScrollPill(true);
         }
         setConsoleEmpty(!transcript?.childElementCount);
         return {candidateGroup, pendingCard};
@@ -3308,9 +3325,11 @@
         sendQuery(promptInput?.value || '');
     });
     promptInput?.addEventListener('input', () => { resizePrompt(); saveDraft(); });
+    let scrollPillFrame = 0;
     transcript?.addEventListener('scroll', () => {
         followOutput = transcriptNearBottom();
-        if (followOutput && newRepliesButton) newRepliesButton.hidden = true;
+        if (scrollPillFrame) return;
+        scrollPillFrame = requestAnimationFrame(() => { scrollPillFrame = 0; syncScrollPill(); });
     }, {passive: true});
     newRepliesButton?.addEventListener('click', () => scrollToBottom(true));
     function handlePageHide() {
