@@ -488,7 +488,7 @@
                                     <div class="metadata-option">
                                         <span>
                                             <strong>Agent 主动复核</strong>
-                                            <small>待确认时只读核对冻结候选；通过确定性快照与季集边界校验后复用原确认执行器，不确定则保留人工按钮</small>
+                                            <small>待确认时只读核对冻结候选，须通过确定性快照与季集边界校验；单组待确认直接复用原确认执行器，同一次整理产生多组时只给建议，在批次摘要中一键确认；不确定则保留人工按钮</small>
                                         </span>
                                         <label class="toggle">
                                             <input type="checkbox" data-key="AGENT_RECOGNITION_REVIEW_ENABLED" data-bool="1" aria-label="启用 Agent 主动识别复核">
@@ -534,7 +534,7 @@
                                                 </button>
                                             </span>
                                             <span class="metadata-help-tooltip" id="nsfwCleanReviewTooltip" role="tooltip">
-                                                <span id="nsfwCleanReviewDescription">仅光鸭 NSFW 无完整元数据时，授权 Agent 主动复核 clean_title 并自动执行清洗入库；不确定则保留人工确认，不影响本地媒体或 MetaTube 识别流程。</span>
+                                                <span id="nsfwCleanReviewDescription">仅光鸭 NSFW 无完整元数据时，授权 Agent 主动复核 clean_title 并自动执行清洗入库（同一次整理产生多组时只给建议，在批次摘要中一键确认）；不确定则保留人工确认，不影响本地媒体或 MetaTube 识别流程。</span>
                                                 <span id="nsfwCleanReviewDependency">需先启用「Agent 主动复核」。关闭任一开关会阻止后续文件开写，已开写文件按原流程收尾。</span>
                                             </span>
                                         </span>

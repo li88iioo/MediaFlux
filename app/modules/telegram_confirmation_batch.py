@@ -217,14 +217,16 @@ def _batch_event(
     else:
         metadata["detail_token"] = ""
         title = "⚠️ 整理待确认批次"
-        review_count = sum(item.get("review_status") in {"waiting", "pending", "running"} for item in items if item.get("status") == "pending")
+        reviewing = [item for item in items if item.get("status") == "pending" and item.get("review_status")]
+        review_count = sum(item["review_status"] in {"waiting", "pending", "running"} for item in reviewing)
         fields = (("媒体组", f"{len(items)}{'+' if truncated else ''}"), ("进度", status_text), ("分页", f"{page}/{pages}"))
         if any(downstream_counts.values()):
             fields += (("后续处理", " · ".join(f"{label} {downstream_counts[key]}" for key, label in (
                 ("partial", "部分完成"), ("waiting", "等待回执"), ("completed", "已完成"),
             ) if downstream_counts[key])),)
         if review_count:
-            fields += (("Agent 复核", "等待或进行中，可刷新查看已完成建议"),)
+            # 复核逐组完成时不重发消息，避免刷屏；进度在刷新或最后一组完成时更新。
+            fields += (("Agent 复核", f"已完成 {len(reviewing) - review_count}/{len(reviewing)} 组，点「刷新摘要」查看最新建议"),)
         for offset, item in enumerate(items[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE], (page - 1) * _PAGE_SIZE + 1):
             identity = truncate_telegram_text(item.get("identity") or item.get("directory") or "待确认媒体", 70)
             status = str(item.get("status") or "pending")

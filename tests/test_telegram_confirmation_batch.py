@@ -229,6 +229,20 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.edited.call_count, 1)
         self.assertEqual(self.sent.call_count, 1)
 
+    def test_summary_reports_review_progress_without_resending_per_group(self):
+        first, second, manual = self._create(3)
+        self._review(first, status="running")
+        self._review(second, status="pending")
+        batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+        self.assertTrue(str(dict(self._snapshot().event.fields)["Agent 复核"]).startswith("已完成 0/2 组"))
+        revision = self._snapshot().revision
+        self._review(first)
+        self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
+        self.assertEqual(self._snapshot().revision, revision)
+        self._callback(self._action("刷新摘要"))
+        self.assertTrue(str(dict(self._snapshot().event.fields)["Agent 复核"]).startswith("已完成 1/2 组"))
+        self.assertEqual(self._confirmation(manual)["review_status"], "")
+
     def test_readonly_review_button_preserves_approved_choice_and_never_executes(self):
         first, second = self._create()
         self._review(first, index=1)
