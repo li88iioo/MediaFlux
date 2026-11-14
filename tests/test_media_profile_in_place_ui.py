@@ -177,12 +177,12 @@ class ResourceConfirmLayerBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         from jinja2 import Environment, FileSystemLoader
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = next((path for name in ('google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser') if (path := shutil.which(name))), None)
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest('未找到 Chromium')
         cls.browser = cls.playwright.chromium.launch(executable_path=executable, headless=True, args=['--no-sandbox'])
+        cls.addClassCleanup(cls.browser.close)
         env = Environment(loader=FileSystemLoader(ROOT / 'app/templates'), autoescape=True)
         cls.html = env.from_string('''{% extends "base.html" %}{% block content %}
             <a id="openProfile" data-media-profile-link href="/discovery?detail_provider=tmdb&detail_type=tv&detail_id=123">打开资源</a>
@@ -192,11 +192,6 @@ class ResourceConfirmLayerBrowserTests(unittest.TestCase):
                 discovery_enabled=True, agent_enabled=False, csrf_token=lambda: 'offline-csrf',
                 static_url=lambda path: '/static/' + path, url_for=lambda name, **kwargs: '/' + name.split('.')[-1],
             )
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     def page(self, width=390, *, native=True):
         import mimetypes

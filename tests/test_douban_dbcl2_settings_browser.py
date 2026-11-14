@@ -80,7 +80,7 @@ class DoubanDbcl2SettingsBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         candidates = [
             Path(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or cls.playwright.chromium.executable_path),
             *sorted((Path.home() / ".cache/ms-playwright").glob("chromium-*/chrome-linux*/chrome"), reverse=True),
@@ -88,16 +88,11 @@ class DoubanDbcl2SettingsBrowserTests(unittest.TestCase):
         ]
         browser_path = next((str(path) for path in candidates if path.is_file()), None)
         if not browser_path:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chrome/Chromium")
         cls.browser = cls.playwright.chromium.launch(
             headless=True, executable_path=browser_path, args=["--no-sandbox"],
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
+        cls.addClassCleanup(cls.browser.close)
 
     def _page(self, width, *, status="unknown", status_error=False, status_deferred=False):
         page = self.browser.new_page(

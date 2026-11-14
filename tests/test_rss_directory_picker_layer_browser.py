@@ -32,15 +32,15 @@ class RssDirectoryPickerLayerBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = _chromium_executable(cls.playwright)
         if executable is None:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable, headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
+        cls.addClassCleanup(cls.browser.close)
         env = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         cls.html = env.get_template("rss.html").render(
             active="rss", app_version="offline-test", discovery_enabled=False,
@@ -48,11 +48,6 @@ class RssDirectoryPickerLayerBrowserTests(unittest.TestCase):
             static_url=lambda name: "/static/" + name,
             url_for=lambda name: "/" + name.split(".")[-1],
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     def make_page(self, viewport=(1280, 900), *, delayed=False):
         context = self.browser.new_context(

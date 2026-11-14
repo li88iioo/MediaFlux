@@ -60,19 +60,14 @@ class MediaSnapshotBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = _chromium_executable(cls.playwright)
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("没有可用的本地 Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable, headless=True, args=["--no-sandbox"],
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
+        cls.addClassCleanup(cls.browser.close)
 
     def setUp(self):
         self.fixture = page_fixture.MediaHubPageContractTests()

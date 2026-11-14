@@ -89,12 +89,14 @@ class AgentShellFixtureLifecycleTests(unittest.TestCase):
             self.skipTest("系统环境未安装 Playwright")
         program = '''
 import asyncio
+import importlib
+import sys
 import unittest
 from unittest.mock import patch
 from playwright.sync_api import BrowserType
-from tests.test_agent_confirmation_edit_browser import ConfirmationEditBrowserTests
 
-case = ConfirmationEditBrowserTests("test_confirmation_execution_collapses_both_same_session_forms")
+fixture = getattr(importlib.import_module(sys.argv[1]), sys.argv[2])
+case = fixture(unittest.defaultTestLoader.getTestCaseNames(fixture)[0])
 result = unittest.TestResult()
 with patch.object(BrowserType, "launch", side_effect=RuntimeError("browser launch failed")) as launch:
     unittest.TestSuite([case]).run(result)
@@ -103,11 +105,18 @@ assert len(result.errors) == 1 and "browser launch failed" in result.errors[0][1
 assert not result.failures and not result.skipped
 assert asyncio.run(asyncio.sleep(0, result="ready")) == "ready"
 '''
-        result = subprocess.run(
-            [sys.executable, "-c", program], cwd=Path(__file__).resolve().parents[1],
-            capture_output=True, text=True, timeout=30,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for module, fixture in (
+            ("test_free_calendar_browser", "FreeCalendarBrowserTests"),
+            ("test_release_formats_browser", "ReleaseFormatsBrowserTests"),
+            ("test_agent_confirmation_edit_browser", "ConfirmationEditBrowserTests"),
+        ):
+            with self.subTest(fixture=fixture):
+                result = subprocess.run(
+                    [sys.executable, "-c", program, "tests." + module, fixture],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_failed_page_fixture_cannot_restore_stale_runtime_after_traceback_gc(self):
         import gc

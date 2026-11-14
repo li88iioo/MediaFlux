@@ -33,18 +33,13 @@ class ReleaseFormatsBrowserTests(InitializedWebTestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable_path = _chromium_executable(cls.playwright)
         options: dict = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
         if executable_path:
             options["executable_path"] = executable_path
         cls.browser = cls.playwright.chromium.launch(**options)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.browser.close()
-        cls.playwright.stop()
-        super().tearDownClass()
+        cls.addClassCleanup(cls.browser.close)
 
     @contextmanager
     def real_app_page(self, *, touch: bool = False):

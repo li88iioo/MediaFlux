@@ -917,7 +917,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = next(
             (
                 path
@@ -927,22 +927,16 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             None,
         )
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到可用的本机 Chrome/Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable,
             headless=True,
             args=["--no-sandbox"],
         )
+        cls.addClassCleanup(cls.browser.close)
         cls.script = SCRIPT.read_text(encoding="utf-8")
         cls.dialog = PROFILE_DIALOG.read_text(encoding="utf-8")
         cls.styles = (ROOT / "app/static/css/main.css").read_text(encoding="utf-8")
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "browser"):
-            cls.browser.close()
-        cls.playwright.stop()
 
     def open_resource_panel(self, payload, *, next_payload=None, width=390):
         html = f"""<!doctype html>

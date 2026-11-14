@@ -44,17 +44,12 @@ class JellyfinPluginBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         if sync_playwright is None:
             raise unittest.SkipTest("未安装 Playwright")
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = _chromium_executable(cls.playwright)
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("未安装 Chrome/Chromium")
         cls.browser = cls.playwright.chromium.launch(executable_path=executable, headless=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
+        cls.addClassCleanup(cls.browser.close)
 
     def setUp(self):
         self.page = self.browser.new_page(viewport={"width": 1100, "height": 1100})

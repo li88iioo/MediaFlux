@@ -349,17 +349,13 @@ class FreeCalendarBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         options: dict = {'headless': True, 'args': ['--no-sandbox', '--disable-dev-shm-usage']}
         executable = _chromium_executable(cls.playwright)
         if executable:
             options['executable_path'] = executable
         cls.browser = cls.playwright.chromium.launch(**options)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
+        cls.addClassCleanup(cls.browser.close)
 
     def make_page(self, data=None, width=1440, hold=False, poster_failures=(), poster_holds=(),
                   *, resource_results_enabled=False):

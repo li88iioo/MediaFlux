@@ -185,24 +185,19 @@ class OrganizeRulesFirstPaintTests(unittest.TestCase):
         from jinja2 import Environment, FileSystemLoader
 
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         bundled = Path(cls.playwright.chromium.executable_path)
         executable = str(bundled) if bundled.is_file() else next(
             (path for name in ("google-chrome", "chromium", "chromium-browser")
              if (path := shutil.which(name))), None,
         )
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chrome/Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable, headless=True, args=["--no-sandbox"],
         )
+        cls.addClassCleanup(cls.browser.close)
         cls.templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     @classmethod
     def _html(cls, *, execute=False, pause_parser=True):

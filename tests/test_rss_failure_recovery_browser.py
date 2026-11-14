@@ -23,13 +23,13 @@ class RSSFailureRecoveryBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         bundled = Path(cls.playwright.chromium.executable_path)
         executable = str(bundled) if bundled.is_file() else next((p for name in ("google-chrome", "chromium", "chromium-browser") if (p := shutil.which(name))), None)
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chromium")
         cls.browser = cls.playwright.chromium.launch(executable_path=executable, headless=True, args=["--no-sandbox"])
+        cls.addClassCleanup(cls.browser.close)
         source = (ROOT / "app/templates/rss.html").read_text()
         cls.script = "\n".join((
             "let entries=[],rssEntriesRequestId=0,rssSelectionRevision=0,rssEntriesController=null,rssEntriesLoaded=false;const selectedEntries=new Set();",
@@ -48,11 +48,6 @@ class RSSFailureRecoveryBrowserTests(unittest.TestCase):
             "{id:2,title:'Episode S01E02',status:'downloaded',processed:true,delivery:{request_id:8,review_required:true,error:'结果未知'}},",
             "{id:3,title:'Episode S01E03',status:'skipped',processed:true,delivery:{request_id:9,failed:true,retryable:false}}];",
         ))
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     def page(self, width):
         context = self.browser.new_context(viewport={"width": width, "height": 960})

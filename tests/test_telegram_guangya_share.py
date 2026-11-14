@@ -856,22 +856,17 @@ class WebShareLifecycleBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = _chromium_executable(cls.playwright)
         if executable is None:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable, headless=True, args=["--no-sandbox"]
         )
+        cls.addClassCleanup(cls.browser.close)
         root = Path(__file__).resolve().parents[1] / "app/templates"
         cls.html = (root / "_share_transfer_content.html").read_text()
         cls.script = (root / "_share_transfer_scripts.html").read_text().removeprefix("<script>").removesuffix("</script>\n")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     def setUp(self):
         self.page = self.browser.new_page()

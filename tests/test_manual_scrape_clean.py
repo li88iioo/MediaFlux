@@ -94,20 +94,14 @@ class LocalManualScrapeCleanBrowserTests(IsolatedDatabaseTestCase):
     def setUpClass(cls):
         super().setUpClass()
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = _chromium_executable(cls.playwright)
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest('未找到 Chrome/Chromium')
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable, headless=True, args=['--no-sandbox'],
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
-        super().tearDownClass()
+        cls.addClassCleanup(cls.browser.close)
 
     def setUp(self):
         self.client = TestClient(create_app(start_background=False))

@@ -70,18 +70,13 @@ class LucideRenderingBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = next((path for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
                            if (path := shutil.which(name))), None)
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chrome/Chromium")
         cls.browser = cls.playwright.chromium.launch(executable_path=executable, headless=True, args=["--no-sandbox"])
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
+        cls.addClassCleanup(cls.browser.close)
 
     def setUp(self):
         context = self.browser.new_context()

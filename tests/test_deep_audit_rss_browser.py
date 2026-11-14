@@ -23,18 +23,18 @@ class RssFilterRefreshBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         bundled = Path(cls.playwright.chromium.executable_path)
         executable = str(bundled) if bundled.is_file() else next(
             (path for name in ("google-chrome", "chromium", "chromium-browser")
              if (path := shutil.which(name))), None,
         )
         if not executable:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chrome/Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable, headless=True, args=["--no-sandbox"],
         )
+        cls.addClassCleanup(cls.browser.close)
         source = (ROOT / "app/templates/rss.html").read_text()
         cls.feedback_script = "\n".join((
             "window.alerts=[];window.feedbackResponse={};",
@@ -56,11 +56,6 @@ class RssFilterRefreshBrowserTests(unittest.TestCase):
             "window.rows=[{id:1,name:'One',urls:'',enabled:true},{id:2,name:'Two',urls:'',enabled:true}];",
             "window.finish=(rows)=>pending.shift().resolve({ok:true,json:async()=>rows});",
         ))
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     def page(self, width):
         context = self.browser.new_context(viewport={"width": width, "height": 900})

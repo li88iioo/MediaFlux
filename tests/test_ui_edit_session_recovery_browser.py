@@ -95,10 +95,9 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert sync_playwright is not None
-        cls.playwright = sync_playwright().start()
+        cls.playwright = cls.enterClassContext(sync_playwright())
         executable = _chromium_executable(cls.playwright)
         if executable is None:
-            cls.playwright.stop()
             raise unittest.SkipTest("未找到 Chromium")
         cls.browser = cls.playwright.chromium.launch(
             executable_path=executable,
@@ -109,6 +108,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 "--disable-background-networking",
             ],
         )
+        cls.addClassCleanup(cls.browser.close)
         env = Environment(
             loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True
         )
@@ -124,11 +124,6 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             )
             for name in ("rss", "guangya", "media_proxy")
         }
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.browser.close()
-        cls.playwright.stop()
 
     def setUp(self):
         self.requests, self.unexpected, self.errors = [], [], []
