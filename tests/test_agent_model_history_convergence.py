@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.agent.kernel.conversation_state import commit_conversation, preserve_history
+from app.agent.kernel.conversation_state import commit_conversation, historical_user_sources, preserve_history
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.model import ModelMessage
 from app.agent.kernel.pipeline import ToolPipeline
@@ -71,12 +71,15 @@ def test_cold_commit_restores_event_order_after_model_serialization_drops_it():
         store = sqlite_store()
         lease, _ = await store.begin_turn(owner="o", session_id="cold-order", request_id="seed")
         first = "原始条件：" + "字" * 60000
+        quote = {"text": "引用对象Z17：仅检查，禁止删除", "origin": "web"}
         state = await store.commit(lease, conversation=[
-            {"role": "user", "content": first, "history_id": "z-oldest"},
+            {"role": "user", "content": first, "history_id": "z-oldest", "reply_context": quote},
             {"role": "user", "content": "保留最新条件", "history_id": "a-latest"},
         ])
         archived = json.loads(state.summary)["requests"][0]
         assert archived["text"] == first and archived["history_order"] == 0
+        assert archived["sha256"] == sha256(first.encode()).hexdigest()
+        assert archived["reply_context"] == {**quote, "untrusted_reference": True}
         assert not any(r.get("history_id") == "z-oldest" for r in state.conversation)
         serialized = [ModelMessage.from_dict(row).to_dict() for row in state.conversation]
         assert all("history_order" not in row for row in serialized)
@@ -87,12 +90,54 @@ def test_cold_commit_restores_event_order_after_model_serialization_drops_it():
         assert [(r["history_id"], r["history_order"]) for r in updated.conversation] == [
             ("a-latest", 1), ("m-new-same-text", 2)]
         assert json.loads(updated.summary)["requests"][0] == archived
+        assert first in historical_user_sources(updated)
+        assert quote["text"] not in str(historical_user_sources(updated))
         memory = preserve_history(updated, updated.conversation, [])
         assert [r["history_id"] for r in memory["requests"]] == ["z-oldest", "a-latest", "m-new-same-text"]
         assert [r["history_order"] for r in memory["requests"]] == [0, 1, 2]
         assert [r["text"] for r in memory["requests"]] == [first, "保留最新条件", "保留最新条件"]
     with isolated_test_database():
         asyncio.run(run())
+
+
+@pytest.mark.parametrize("reference", [
+    {"text": "引用对象Z17：仅检查，禁止删除", "origin": "web"},
+    {"text": "引用对象Z17：仅检查，禁止删除", "source": {"kind": "text", "message_id": 12},
+     "reference_handle": "expired-handle", "row_id": "old-source"},
+], ids=["web", "telegram"])
+def test_reference_survives_model_window_eviction_as_untrusted_data(reference):
+    from app.agent.kernel.events import AgentEventType
+    from app.agent.kernel.state import InMemorySessionStateStore
+    from app.agent.kernel.state_types import AgentInput
+    from tests.test_agent_notification_reply_context import RecordingModel
+
+    async def run():
+        store = InMemorySessionStateStore()
+        lease, _ = await store.begin_turn(owner="owner", session_id="session", request_id="seed")
+        await store.commit(lease, conversation=[
+            {"role": "user", "content": "这个什么意思", "history_id": "quoted-user", "reply_context": reference},
+            {"role": "assistant", "content": "历史答复" * 7000},
+        ])
+        model = RecordingModel()
+        catalog = ToolCatalog([])
+        session = AgentSession(model=model, catalog=catalog,
+                               pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store,
+                               limits=SessionLimits(context_window_tokens=16384))
+        events = [event async for event in session.run(AgentInput(message="继续解释", owner="owner", session_id="session"))]
+        assert events[-1].type == AgentEventType.TURN_COMPLETED, events[-1].payload
+        request, = model.requests
+        assert not any(message.history_id == "quoted-user" for message in request.messages)
+        memory = next(json.loads(line) for line in request.system_prompt.splitlines() if line.startswith('{"requests"'))
+        source, = memory["requests"]
+        assert source["text"] == "这个什么意思"
+        assert source["sha256"] == sha256(source["text"].encode()).hexdigest()
+        assert source["reply_context"] == {"untrusted_reference": True,
+                                            **{key: reference[key] for key in ("text", "source", "origin") if key in reference}}
+        assert "reference_handle" not in source["reply_context"]
+        state = await store.load(owner="owner", session_id="session")
+        assert historical_user_sources(state) == ("这个什么意思", "继续解释")
+        assert state.conversation[0]["reply_context"] == reference
+    asyncio.run(run())
 
 
 def test_id_without_order_and_without_original_row_stays_unknown():

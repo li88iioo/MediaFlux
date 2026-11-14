@@ -169,7 +169,15 @@ def preserve_history(
         content = row.get("content")
         event_id = row.get("history_id")
         if row.get("role") == "user" and isinstance(content, str) and event_id not in kept_users and event_id not in known_events:
-            memory["requests"].append({"text": content, "sha256": sha256(content.encode()).hexdigest(), "history_id": event_id})
+            request: dict[str, Any] = {"text": content, "sha256": sha256(content.encode()).hexdigest(), "history_id": event_id}
+            reply = row.get("reply_context")
+            if isinstance(reply, Mapping) and str(reply.get("text") or "").strip():
+                # 引用独立于用户原话/授权；来源行被裁剪后不再携带可续取票据。
+                request["reply_context"] = {
+                    "untrusted_reference": True,
+                    **{key: deepcopy(reply[key]) for key in ("text", "source", "origin") if key in reply},
+                }
+            memory["requests"].append(request)
             known_events.add(event_id)
         elif row.get("role") == "tool" and json_text(row) not in kept_tools:
             digest = sha256(json_text(row).encode()).hexdigest()
