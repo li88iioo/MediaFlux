@@ -360,7 +360,7 @@ class AgentUXBrowserTests(unittest.TestCase):
                 {'role': 'user', 'content': '诛仙出了吗', 'reply_to': '上一条提醒'},
                 {'role': 'assistant', 'content': answer}]}}})
         page.wait_for_selector('.agent-narrative')
-        self.assertEqual(page.locator('.agent-message-user .agent-message-quote').inner_text(), '上一条提醒')
+        self.assertEqual(page.locator('.agent-message-user .agent-message-quote span').inner_text(), '上一条提醒')
         self.assertTrue(page.locator('#agentReplyBar').is_hidden())
         page.locator('.agent-message-assistant [data-reply-message]').last.click()
         self.assertTrue(page.locator('#agentReplyBar').is_visible())
@@ -376,13 +376,42 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(body['message'], '推这个 4K')
         self.assertIn('4K HBR', body['reply_to']['text'])
         self.assertTrue(page.locator('#agentReplyBar').is_hidden())
-        self.assertIn('4K HBR', page.locator('.agent-message-user').last.locator('.agent-message-quote').inner_text())
+        self.assertIn('4K HBR', page.locator('.agent-message-user').last.locator('.agent-message-quote span').inner_text())
         page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+        # 引用只取回答正文，不带“已完成 · 用时”状态行。
+        page.locator('.agent-message-assistant [data-reply-message]').last.click()
+        self.assertEqual(page.locator('#agentReplyText').inner_text(), '已推送 4K。')
+        page.locator('#agentReplyCancel').click()
+        # 点引用回到被回复的消息并短暂高亮。
+        page.locator('.agent-message-user').last.locator('[data-quote-jump]').click()
+        page.wait_for_function("() => [...document.querySelectorAll('.agent-message-assistant')].some(node => node.classList.contains('is-quoted') && node.textContent.includes('4K HBR'))")
         page.locator('#agentPrompt').fill('再来一条')
         page.locator('#agentSend').click()
         page.wait_for_function("() => window.__kernelCalls.filter(call => call.url === '/api/agent/query').length === 2")
         second = json.loads(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query')[1].body"))
         self.assertNotIn('reply_to', second)
+
+    def test_time_separators_follow_gaps_between_user_messages(self):
+        base = 1_794_600_000
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+            {'session_id': SESSION_A, 'title': '主要', 'updated_at': base}]},
+            'sessionDetails': {SESSION_A: {'messages': [
+                {'role': 'user', 'content': '旧消息没有时间'},
+                {'role': 'assistant', 'content': '回复一'},
+                {'role': 'user', 'content': '第一问', 'at': base},
+                {'role': 'assistant', 'content': '回复二'},
+                {'role': 'user', 'content': '五分钟后', 'at': base + 300},
+                {'role': 'assistant', 'content': '回复三'},
+                {'role': 'user', 'content': '两小时后', 'at': base + 7500},
+                {'role': 'assistant', 'content': '回复四'}]}}})
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('回复四')")
+        separators = page.locator('.agent-time-separator')
+        self.assertEqual(separators.count(), 2)
+        order = page.evaluate("""() => [...document.querySelector('#agentTranscript').children].map(node =>
+            node.classList.contains('agent-time-separator') ? 'sep' : (node.querySelector('.agent-message-body p')?.textContent || ''))""")
+        self.assertEqual(order.index('sep'), order.index('第一问') - 1)
+        self.assertEqual(order[order.index('两小时后') - 1], 'sep')
+        self.assertEqual(page.locator('#agentNewReplies').count(), 1)
 
     def test_telegram_channel_is_read_only_and_returning_restores_main_chat(self):
         key = 'c' * 32

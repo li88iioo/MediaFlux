@@ -855,6 +855,8 @@ def public_conversation_messages(
                               if isinstance(reply, Mapping) and reply.get("origin") == "web" else "")
                 if reply_text:
                     user_message["reply_to"] = reply_text[:300]
+                if isinstance(item.get("at"), int):
+                    user_message["at"] = item["at"]
                 messages.append(user_message)
             continue
         if role == "tool":

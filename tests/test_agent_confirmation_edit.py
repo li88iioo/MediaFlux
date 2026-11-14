@@ -252,7 +252,7 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
         source_users = [row for row in initial.conversation if row.get("role") == "user"]
         assert len(source_users) == 1 and source_users[0]["history_id"]
         assert source_users == [{"role": "user", "content": "将影视探索缓存有效期改成600秒，先生成确认卡。",
-                                 "history_id": source_users[0]["history_id"], "history_order": 0}]
+                                 "history_id": source_users[0]["history_id"], "history_order": 0, "at": source_users[0]["at"]}]
         result = await session.edit_confirmation(owner=OWNER, session_id=SESSION, plan_id=old_id,
                                                 arguments={"value": 900}, request_id="actual-ui-edit")
         plan = result.effect_plan
@@ -288,7 +288,7 @@ def test_real_preference_edit_confirm_and_next_query_preserve_auditable_history(
         assert len(users) == 3 and users[-1]["history_id"] not in {source_users[0]["history_id"], edit["history_id"]}
         assert users == source_users + [
             {"role": "user", "content": edit["content"], "history_id": edit["history_id"], "history_order": 1},
-            {"role": "user", "content": "刚才缓存有效期最终设为多少？", "history_id": users[-1]["history_id"], "history_order": 2},
+            {"role": "user", "content": "刚才缓存有效期最终设为多少？", "history_id": users[-1]["history_id"], "history_order": 2, "at": users[-1]["at"]},
         ]
         calls = [call for row in state.conversation for call in row.get("tool_calls", ())]
         assert len(calls) == 1 and calls[0]["arguments"]["value"] == 600

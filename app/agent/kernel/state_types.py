@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import time
 import threading
 from collections.abc import Mapping
 from copy import deepcopy
@@ -44,6 +45,8 @@ class AgentInput:
     delivery_route: Mapping[str, Any] = field(default_factory=dict)
     initial_read_tool: str = ""  # 服务端固定接力；整个回合仅允许 READ，不是 quota 恢复。
     initial_read_arguments: Mapping[str, Any] = field(default_factory=dict)
+    # 用户消息的接收时间（Unix 秒），持久化到会话供页面显示时间分隔。
+    received_at: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
         message = (self.message or "").strip()

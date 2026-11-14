@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 
@@ -96,6 +97,7 @@ def test_reference_is_retained_across_followups_but_not_public_chat():
         assert first["reply_context"] == {"text": NOTICE}
         assert "do-not-store" not in str(stored.conversation)
         public = public_conversation_messages(stored.conversation)
+        assert isinstance(public[0].pop("at"), int)
         assert public[0] == {"role": "user", "content": "这个什么意思"}
         assert NOTICE not in str(public)
         assert any(NOTICE in message.content for message in restore_messages(stored))
@@ -253,5 +255,7 @@ def test_web_quote_of_a_visible_answer_is_shown_once_in_public_chat():
         stored = await state_store.load(owner="owner", session_id="session")
         assert stored.conversation[0]["reply_context"] == {"text": "4K HBR：1.42 GiB", "origin": "web"}
         public = public_conversation_messages(stored.conversation)
+        # 用户消息带接收时间（Unix 秒），供页面插入时间分隔。
+        assert abs(public[0].pop("at") - time.time()) < 60
         assert public[0] == {"role": "user", "content": "推这个", "reply_to": "4K HBR：1.42 GiB"}
     asyncio.run(scenario())

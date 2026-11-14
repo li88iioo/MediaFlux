@@ -60,7 +60,7 @@ def test_confirmed_observation_source_is_private_scoped_and_not_a_new_user_defau
         new_users = case.users(saved)
         assert len(new_users) == 2 and new_users[-1]["history_id"] != users[0]["history_id"]
         assert new_users == users + [{"role": "user", "content": new_message,
-                                     "history_id": new_users[-1]["history_id"], "history_order": 1}]
+                                     "history_id": new_users[-1]["history_id"], "history_order": 1, "at": new_users[-1]["at"]}]
     asyncio.run(run())
 
 

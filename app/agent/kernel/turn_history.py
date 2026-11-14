@@ -103,6 +103,7 @@ async def persist_conversation(turn: AgentTurn,
             original_message=turn.agent_input.message,
             reply_context=turn.agent_input.reply_context,
             prior_conversation=turn.state.conversation,
+            user_at=turn.agent_input.received_at,
         )
         if turn.activities and stored and not stored[-1].get("tool_calls") and (
             stored[-1].get("role") == "assistant" or stored[-1].get("effect_plan_id")

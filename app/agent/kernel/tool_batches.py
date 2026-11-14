@@ -80,6 +80,7 @@ def admit_calls(turn: AgentTurn, reply: _ModelRound) -> None:
         original_message=turn.agent_input.message,
         reply_context=turn.agent_input.reply_context,
         prior_conversation=turn.state.conversation,
+        user_at=turn.agent_input.received_at,
     )[turn.history_end:]
     try:
         retained = retain_conversation(stored)

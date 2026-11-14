@@ -276,6 +276,7 @@
             typed = '';
             if (promptInput) promptInput.value = '';
             transcript?.replaceChildren();
+            lastUserAt = 0;
             followOutput = true;
             if (newRepliesButton) newRepliesButton.hidden = true;
         }
@@ -405,11 +406,66 @@
         return {item, body};
     }
 
-    function appendUser(text, {replyTo = '', ...options} = {}) {
+    const SEPARATOR_GAP_SECONDS = 30 * 60;
+    let lastUserAt = 0;
+
+    function timeLabel(seconds) {
+        const date = new Date(seconds * 1000);
+        const now = new Date();
+        const time = new Intl.DateTimeFormat('zh-CN', {hour: 'numeric', minute: '2-digit'}).format(date);
+        if (date.toDateString() === now.toDateString()) return time;
+        const day = new Intl.DateTimeFormat('zh-CN', {
+            ...(date.getFullYear() === now.getFullYear() ? {} : {year: 'numeric'}), month: 'long', day: 'numeric',
+        }).format(date);
+        return `${day} ${time}`;
+    }
+
+    // 与上一条用户消息相隔半小时以上（或跨天）时插入居中的时间分隔；无时间的旧消息不分隔。
+    function appendTimeSeparator(seconds) {
+        if (!Number.isFinite(seconds) || seconds <= 0) return;
+        const previous = lastUserAt;
+        lastUserAt = seconds;
+        if (previous && seconds - previous < SEPARATOR_GAP_SECONDS
+            && new Date(previous * 1000).toDateString() === new Date(seconds * 1000).toDateString()) return;
+        const separator = element('div', 'agent-time-separator', timeLabel(seconds));
+        separator.setAttribute('role', 'separator');
+        transcript?.append(separator);
+    }
+
+    function appendUser(text, {replyTo = '', at = 0, ...options} = {}) {
+        appendTimeSeparator(Number(at));
         const view = appendMessage('user', options);
-        if (replyTo) view.body.append(element('blockquote', 'agent-message-quote', clipText(replyTo, 140)));
+        if (replyTo) {
+            const quote = element('button', 'agent-message-quote');
+            quote.type = 'button';
+            quote.dataset.quoteJump = replyTo.slice(0, 300);
+            quote.title = '定位到被回复的消息';
+            const label = element('small', '');
+            label.append(icon('reply'), document.createTextNode('回复了 Media Agent'));
+            quote.append(label, element('span', '', clipText(replyTo.replace(/\s+/g, ' '), 160)));
+            view.body.append(quote);
+            renderIcons(quote);
+        }
         view.body.append(element('p', '', text));
         return view;
+    }
+
+    function jumpToQuoted(text) {
+        const needle = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        if (!needle || !transcript) return;
+        const target = [...transcript.querySelectorAll('.agent-message-assistant')].find(node => {
+            const narrative = [...node.querySelectorAll('.agent-narrative')].map(item => item.innerText).join(' ');
+            return narrative.replace(/\s+/g, ' ').includes(needle);
+        });
+        if (!target) {
+            announce(responseStatus, '被回复的消息已不在当前记录中');
+            return;
+        }
+        target.scrollIntoView({block: 'center', behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});
+        target.classList.remove('is-quoted');
+        void target.offsetWidth;
+        target.classList.add('is-quoted');
+        setTimeout(() => target.classList.remove('is-quoted'), 1600);
     }
 
     const MAGNET_RE = /^magnet:\?\S*xt=urn:bt[im]h:/i;
@@ -2360,7 +2416,7 @@
         const replyTo = actionKey ? '' : replyDraft;
         ++sessionLoadGeneration;
         expireCandidateCards();
-        appendUser(message, {replyTo});
+        appendUser(message, {replyTo, at: Math.floor(Date.now() / 1000)});
         if (replyTo) setReply('');
         const turn = createAssistantTurn();
         turn.requestMessage = message;
@@ -2856,9 +2912,10 @@
         }
         expireCandidateCards();
         transcript?.replaceChildren();
+        lastUserAt = 0;
         const candidateGroups = new Map();
         for (const message of payload.messages || []) {
-            if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, scroll: !preserveScroll, replyTo: String(message.reply_to || '')});
+            if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, scroll: !preserveScroll, replyTo: String(message.reply_to || ''), at: Number(message.at) || 0});
             else if (message.role === 'assistant') {
                 const folded = message.candidate_result_ref === payload.candidate_view?.ref && payload.candidate_view?.last_result;
                 const content = folded ? String(message.candidate_followup || '') : String(message.content || '');
@@ -3215,8 +3272,9 @@
             if (generation !== channelGeneration) return;
             setChannelMode(key);
             transcript?.replaceChildren();
+            lastUserAt = 0;
             for (const message of payload?.messages || []) {
-                if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, replyTo: String(message.reply_to || '')});
+                if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, replyTo: String(message.reply_to || ''), at: Number(message.at) || 0});
                 else if (message.role === 'assistant') finalizeAnswer(createAssistantTurn({recovered: true}), String(message.content || ''));
             }
             setConsoleEmpty(!transcript?.childElementCount);
@@ -3245,6 +3303,7 @@
         followOutput = true;
         if (newRepliesButton) newRepliesButton.hidden = true;
         transcript?.replaceChildren();
+        lastUserAt = 0;
         setConsoleEmpty(true);
         promptInput?.focus();
         closeHistoryRail();
@@ -3739,7 +3798,14 @@
     });
     transcript?.addEventListener('click', (event) => {
         const reply = event.target.closest('[data-reply-message]');
-        if (reply) setReply(reply.closest('.agent-message')?.querySelector('.agent-message-body')?.innerText || '');
+        if (reply) {
+            // 只引用回答正文，不带“已完成 · 16秒”等状态行和处理过程。
+            const article = reply.closest('.agent-message');
+            const narrative = [...(article?.querySelectorAll('.agent-narrative') || [])].map(node => node.innerText).join('\n').trim();
+            setReply(narrative || article?.querySelector('.agent-message-body')?.innerText || '');
+        }
+        const quote = event.target.closest('[data-quote-jump]');
+        if (quote) jumpToQuoted(quote.dataset.quoteJump || '');
         const candidate = event.target.closest('[data-candidate-select]');
         if (candidate) selectCandidate(candidate);
         const confirm = event.target.closest('[data-effect-confirm]');

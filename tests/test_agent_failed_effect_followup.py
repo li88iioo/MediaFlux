@@ -292,7 +292,7 @@ class NativeCase:
         state = await self.store.load(owner=self.owner, session_id=self.sid)
         users = self.users(state)
         assert len(users) == 1 and users[0]["history_id"]
-        assert users == [{"role": "user", "content": GOAL, "history_id": users[0]["history_id"], "history_order": 0}]
+        assert users == [{"role": "user", "content": GOAL, "history_id": users[0]["history_id"], "history_order": 0, "at": users[0]["at"]}]
         self.assert_io(prepares=["A"], executions=[], reads=0, requests=1)
         with db.get_conn() as conn:
             actual_database = conn.execute("PRAGMA database_list").fetchone()[2]
@@ -778,7 +778,7 @@ def test_new_user_supersedes_failed_diagnosis_and_preserves_publication_facts(ca
             users = case.users(saved)
             assert len(users) == 2 and users[-1]["history_id"] != source_users[0]["history_id"]
             assert users == source_users + [{"role": "user", "content": new_message,
-                                             "history_id": users[-1]["history_id"], "history_order": 1}]
+                                             "history_id": users[-1]["history_id"], "history_order": 1, "at": users[-1]["at"]}]
             assert len(fresh_model.requests) == len(fresh_model.model_requests) == 1
             fresh_model.assert_user_inputs([GOAL, new_message])
             assert not any(e.payload.get("tool") == READ for e in old_events if e.type is AgentEventType.TOOL_STARTED)

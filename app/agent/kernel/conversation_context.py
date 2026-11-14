@@ -43,6 +43,7 @@ def persisted_conversation(
     original_message: str,
     reply_context: Mapping[str, Any] | None = None,
     prior_conversation: Sequence[Mapping[str, Any]] = (),
+    user_at: float | None = None,
 ) -> list[dict[str, Any]]:
     stored: list[dict[str, Any]] = []
     public_history: dict[tuple, list[dict[str, Any]]] = {}
@@ -62,6 +63,8 @@ def persisted_conversation(
             preserved["activities"] = prior["activities"]
         if isinstance(prior.get("reply_context"), Mapping):
             preserved["reply_context"] = telegram_reference.context_copy(prior["reply_context"])
+        if isinstance(prior.get("at"), int):
+            preserved["at"] = prior["at"]
         public_history.setdefault(key, []).append(preserved)
     for index, message in enumerate(messages):
         item = message.to_dict()
@@ -85,6 +88,8 @@ def persisted_conversation(
         }
         if reply_context and str(reply_context.get("text") or "").strip():
             stored[current_user_index]["reply_context"] = telegram_reference.context_copy(reply_context)
+        if user_at:
+            stored[current_user_index]["at"] = int(user_at)
     return stored
 
 
