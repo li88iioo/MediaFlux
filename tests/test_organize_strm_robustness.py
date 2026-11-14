@@ -639,11 +639,11 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
             "Client",
             (),
             {
-                "logged_in": True,
+                "logged_in": True, "download_url_cache_context": ("fixture", False),
                 "get_download_url": lambda _self, _file_id, **_kwargs: "https://storage.invalid/file?signature=secret",
             },
         )()
-        with patch("app.routes.proxy.GuangYaClient", return_value=client):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client):
             response = play_gy("file", "etag", "1", "Movie.mkv", **self._signed_args())
 
         self.assertEqual(response.status_code, 302)
@@ -655,46 +655,42 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
 
         class Client:
             logged_in = True
+            download_url_cache_context: tuple[str, bool] = ("fixture", False)
 
             def get_download_url(self, _file_id: str, **kwargs) -> str:
                 calls.append(kwargs)
                 return "https://storage.invalid/file?signature=secret"
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=Client()):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=Client()):
             first = play_gy("cached", "etag", "1", "Movie.mkv", **self._signed_args("cached"))
             second = play_gy("cached", "etag", "1", "Movie.mkv", **self._signed_args("cached"))
 
         self.assertEqual(first.status_code, 302)
         self.assertEqual(second.status_code, 302)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            calls[0]["timeout"], proxy_routes.PLAYGY_SIGNED_URL_TIMEOUT_SECONDS
-        )
+        self.assertGreater(calls[0]["timeout"], 0)
+        self.assertLessEqual(calls[0]["timeout"], proxy_routes.PLAYGY_SIGNED_URL_TIMEOUT_SECONDS)
         self.assertTrue(calls[0]["raise_timeout"])
 
     def test_cache_scope_changes_with_provider_token_and_bound_user_agent(self) -> None:
         calls: list[tuple[str, str]] = []
 
-        class Raw:
-            download_url_user_agent_bound = True
+        class Client:
+            logged_in = True
+            download_url_cache_context: tuple[str, bool] = ("fixture", False)
 
             def __init__(self, token: str):
                 self.token = token
-
-        class Client:
-            logged_in = True
-
-            def __init__(self, token: str):
-                self.raw = Raw(token)
+                self.download_url_cache_context = (token, True)
 
             def get_download_url(self, file_id: str, **_kwargs) -> str:
-                calls.append((self.raw.token, file_id))
-                return f"https://storage.invalid/{self.raw.token}/{file_id}"
+                calls.append((self.token, file_id))
+                return f"https://storage.invalid/{self.token}/{file_id}"
 
         first_request = SimpleNamespace(headers={"user-agent": "Player/A"})
         second_request = SimpleNamespace(headers={"user-agent": "Player/B"})
         with patch(
-            "app.routes.proxy.GuangYaClient",
+            "app.modules.media_proxy.GuangYaClient",
             side_effect=[Client("token-a"), Client("token-b"), Client("token-b")],
         ):
             first = play_gy(
@@ -722,24 +718,22 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
     def test_cache_shares_user_agents_without_sdk_capability_flag(self) -> None:
         calls: list[tuple[str, str]] = []
 
-        class Raw:
-            def __init__(self, token: str):
-                self.token = token
-
         class Client:
             logged_in = True
+            download_url_cache_context: tuple[str, bool] = ("fixture", False)
 
             def __init__(self, token: str):
-                self.raw = Raw(token)
+                self.token = token
+                self.download_url_cache_context = (token, False)
 
             def get_download_url(self, file_id: str, **_kwargs) -> str:
-                calls.append((self.raw.token, file_id))
+                calls.append((self.token, file_id))
                 return f"https://storage.invalid/{len(calls)}/{file_id}"
 
         request_a = SimpleNamespace(headers={"user-agent": "Player/A"})
         request_b = SimpleNamespace(headers={"user-agent": "Player/B"})
         with patch(
-            "app.routes.proxy.GuangYaClient",
+            "app.modules.media_proxy.GuangYaClient",
             side_effect=[Client("same-token"), Client("same-token"), Client("same-token")],
         ):
             first = play_gy(
@@ -763,11 +757,12 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
     def test_provider_timeout_returns_retryable_gateway_timeout(self) -> None:
         class Client:
             logged_in = True
+            download_url_cache_context: tuple[str, bool] = ("fixture", False)
 
             def get_download_url(self, _file_id: str, **_kwargs) -> str:
                 raise TimeoutError("signed provider secret")
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=Client()):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=Client()):
             response = play_gy("slow", "etag", "1", "Movie.mkv", **self._signed_args("slow"))
 
         self.assertEqual(response.status_code, 504)
@@ -778,9 +773,9 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
         client = type(
             "Client",
             (),
-            {"logged_in": True, "get_download_url": lambda _self, _file_id, **_kwargs: ""},
+            {"logged_in": True, "download_url_cache_context": ("fixture", False), "get_download_url": lambda _self, _file_id, **_kwargs: ""},
         )()
-        with patch("app.routes.proxy.GuangYaClient", return_value=client):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client):
             response = play_gy("file", "etag", "1", "Movie.mkv", **self._signed_args())
 
         self.assertEqual(response.status_code, 404)
@@ -788,11 +783,12 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
     def test_exception_response_does_not_expose_provider_details(self) -> None:
         class Client:
             logged_in = True
+            download_url_cache_context: tuple[str, bool] = ("fixture", False)
 
             def get_download_url(self, _file_id: str, **_kwargs) -> str:
                 raise RuntimeError("https://storage.invalid/file?signature=secret")
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=Client()):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=Client()):
             response = play_gy("file", "etag", "1", "Movie.mkv", **self._signed_args())
 
         payload = json.loads(bytes(response.body))
@@ -801,11 +797,48 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
         self.assertNotIn("storage.invalid", bytes(response.body).decode("utf-8"))
 
     def test_invalid_signature_is_rejected_before_provider_call(self) -> None:
-        with patch("app.routes.proxy.GuangYaClient") as client:
+        with patch("app.modules.media_proxy.GuangYaClient") as client:
             response = play_gy("file", "etag", "1", "Movie.mkv", v="1", sig="0" * 64)
 
         self.assertEqual(response.status_code, 403)
         client.assert_not_called()
+
+    def test_constructor_wait_has_deadline_and_holds_capacity_until_closed(self) -> None:
+        from app.modules import media_proxy
+
+        for view in ("", "variants"):
+            with self.subTest(view=view):
+                entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+                client = SimpleNamespace(
+                    logged_in=True, download_url_cache_context=("fixture", False),
+                    get_download_url=unittest.mock.Mock(), playback_info=unittest.mock.Mock(),
+                    close=closed.set,
+                )
+
+                def construct():
+                    entered.set()
+                    self.assertTrue(release.wait(2))
+                    return client
+
+                with (
+                    patch.object(media_proxy, "GuangYaClient", side_effect=construct),
+                    patch.object(media_proxy, "_signed_media_probe_worker_capacity", threading.BoundedSemaphore(1)),
+                    patch.object(media_proxy, "_SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS", 0.005),
+                    patch.object(proxy_routes, "PLAYGY_SIGNED_URL_TIMEOUT_SECONDS", 0.05),
+                ):
+                    try:
+                        response = play_gy("file", "etag", "1", "Movie.mkv", view=view, **self._signed_args())
+                        self.assertTrue(entered.is_set())
+                        self.assertEqual(response.status_code, 504)
+                        self.assertFalse(closed.is_set())
+                        second = play_gy("file", "etag", "1", "Movie.mkv", view=view, **self._signed_args())
+                        self.assertEqual(second.status_code, 503)
+                    finally:
+                        release.set()
+                        self.assertTrue(closed.wait(2))
+                client.get_download_url.assert_not_called()
+                client.playback_info.assert_not_called()
+                self.assertEqual(proxy_routes._playgy_signed_urls.entry_count, 0)
 
 
 class OrganizeTaskManagerRobustnessTests(IsolatedDatabaseTestCase):

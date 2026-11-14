@@ -6,10 +6,12 @@ import copy
 import json
 import logging
 import socket
+import tempfile
 import threading
 import time
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, patch
@@ -34,6 +36,8 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from yarl import URL
 
 from app.modules import media_proxy
+from app.clients import guangya as guangya_module
+from app.clients.guangya import GuangYaClient as RealGuangYaClient
 
 
 class _FakeUpstreamResponse:
@@ -138,6 +142,7 @@ class _FakeAuthAsyncClient:
 
 
 class _FakeGuangYaClient:
+    download_url_cache_context = ("fixture-account", False)
     calls: list[str] = []
     call_options: list[dict] = []
     results: dict[str, list[str | None | Exception]] = {}
@@ -3268,16 +3273,16 @@ class HybridMediaProxyTests(unittest.TestCase):
             self.fail(f"签名 URL 缓存缺少容量上限: {exc}")
         calls: list[str] = []
 
-        async def fetch(file_id: str, suffix: str = "") -> str:
+        def fetch(file_id: str, suffix: str = "") -> str:
             calls.append(file_id)
             return f"https://signed.invalid/{file_id}{suffix}"
 
         async def scenario():
-            (await cache.get_or_fetch_result("file-a", lambda: fetch("file-a"))).url
-            (await cache.get_or_fetch_result("file-b", lambda: fetch("file-b"))).url
-            (await cache.get_or_fetch_result("file-a", lambda: fetch("file-a", "-unexpected"))).url
-            (await cache.get_or_fetch_result("file-c", lambda: fetch("file-c"))).url
-            return (await cache.get_or_fetch_result("file-b", lambda: fetch("file-b", "-refetched"))).url
+            (await asyncio.to_thread(cache.get_or_fetch_sync_result, "file-a", lambda: fetch("file-a"))).url
+            (await asyncio.to_thread(cache.get_or_fetch_sync_result, "file-b", lambda: fetch("file-b"))).url
+            (await asyncio.to_thread(cache.get_or_fetch_sync_result, "file-a", lambda: fetch("file-a", "-unexpected"))).url
+            (await asyncio.to_thread(cache.get_or_fetch_sync_result, "file-c", lambda: fetch("file-c"))).url
+            return (await asyncio.to_thread(cache.get_or_fetch_sync_result, "file-b", lambda: fetch("file-b", "-refetched"))).url
 
         refetched = asyncio.run(scenario())
         self.assertEqual(refetched, "https://signed.invalid/file-b-refetched")
@@ -5091,6 +5096,93 @@ class HybridMediaProxyTests(unittest.TestCase):
         pin_target.assert_not_called()
         self.assertEqual(_FakeAsyncClient.requests, [])
 
+    def test_provider_deadline_covers_real_refresh_and_constructor_lock_without_blocking_loop(self):
+        for stage in ("refresh", "credential_lock"):
+            for method in ("GET", "HEAD"):
+                with self.subTest(stage=stage, method=method), tempfile.TemporaryDirectory() as directory:
+                    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+                    requests = []
+                    token_file = Path(directory) / "token.json"
+                    token_file.write_text(json.dumps({
+                        "access_token": "fixture-access", "refresh_token": "fixture-refresh",
+                        "expires_at": time.time() - 1, "device_id": "fixture-device",
+                    }))
+
+                    class Raw:
+                        def __init__(self, access_token=None, refresh_token=None, device_id=None):
+                            self.token = access_token
+                            self.refresh_token_value = refresh_token
+                            self.token_expires_at = None
+
+                        def refresh_token(self, refresh_token=None):
+                            entered.set()
+                            if not release.wait(2):
+                                raise TimeoutError("test refresh release missing")
+                            self.token = "fixture-rotated"
+                            self.token_expires_at = time.time() + 3600
+                            return {"access_token": self.token, "expires_in": 3600}
+
+                        def request(self, url, **_kwargs):
+                            requests.append(url)
+                            raise AssertionError("expired worker must not start a URL request")
+
+                        def close(self):
+                            closed.set()
+
+                    def construct():
+                        if stage == "credential_lock":
+                            entered.set()
+                        return RealGuangYaClient(token_file=token_file)
+
+                    cache = media_proxy.SignedUrlCache()
+                    app = media_proxy.create_proxy_app(
+                        7, signed_urls=cache,
+                        playback_record_writer=media_proxy.PlaybackRecordWriter(write_record=lambda _: None),
+                    )
+                    credential_lock = guangya_module._shared_token_process_lock(token_file)
+                    if stage == "credential_lock":
+                        credential_lock.acquire()
+                    real_async_client = httpx.AsyncClient
+
+                    async def scenario():
+                        async with app.router.lifespan_context(app):
+                            async with real_async_client(
+                                transport=httpx.ASGITransport(app=app), base_url="http://mediaflux.test",
+                            ) as http:
+                                target = "/playgy/file/etag/100/video.mp4"
+                                started = time.monotonic()
+                                first = asyncio.create_task(http.request(method, target))
+                                try:
+                                    self.assertTrue(await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), 1.2))
+                                    await asyncio.wait_for(asyncio.sleep(0.005), 0.03)
+                                    response = await asyncio.wait_for(first, 0.3)
+                                    self.assertEqual(response.status_code, 504)
+                                    self.assertLess(time.monotonic() - started, 0.4)
+                                    self.assertFalse(closed.is_set())
+                                    # HTTP 超时不能归还仍在刷新/等锁的真实 worker 容量。
+                                    second = await http.request(method, target)
+                                    self.assertEqual(second.status_code, 503)
+                                finally:
+                                    release.set()
+                                    if stage == "credential_lock":
+                                        credential_lock.release()
+                                    self.assertTrue(await asyncio.to_thread(closed.wait, 1))
+                                    await asyncio.gather(first, return_exceptions=True)
+                                self.assertEqual(requests, [])
+                                self.assertEqual(cache.entry_count, 0)
+
+                    with (
+                        patch.object(guangya_module, "_load_raw", return_value=Raw),
+                        patch.object(media_proxy, "GuangYaClient", side_effect=construct),
+                        patch.object(media_proxy, "_resolved_instance", return_value=self._instance()),
+                        patch.object(media_proxy, "_client_is_authorized", new=AsyncMock(return_value=True)),
+                        patch.object(media_proxy, "PLAYGY_SIGNED_URL_TIMEOUT_SECONDS", 0.04),
+                        patch.object(media_proxy, "_SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS", 0.06),
+                        patch.object(media_proxy, "_SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS", 0.005),
+                        patch.object(media_proxy, "_signed_media_probe_worker_capacity", threading.BoundedSemaphore(1)),
+                    ):
+                        asyncio.run(scenario())
+
     def test_native_head_blocked_dns_keeps_worker_capacity_until_completion(self):
         media_proxy._dynamic_guangya_mappings.register(
             7, "blocked-dns-item", "blocked-dns-source", "blocked-dns-file"
@@ -5247,10 +5339,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             logged_in = True
 
             def __init__(self) -> None:
-                self.raw = SimpleNamespace(
-                    token="provider-token",
-                    download_url_user_agent_bound=True,
-                )
+                self.download_url_cache_context = ("provider-token", True)
 
             def get_download_url(self, file_id: str, **_kwargs) -> str:
                 calls.append(file_id)
@@ -7765,12 +7854,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         authorize.assert_awaited_once()
 
     def test_playback_info_and_rewritten_stream_share_one_recording_session(self):
-        class Raw:
-            token = "provider-secret"
-
         class GuangYa:
             logged_in = True
-            raw = Raw()
+            download_url_cache_context = ("provider-secret", False)
 
             def get_download_url(self, _file_id, **_kwargs):
                 return "https://signed.invalid/file?Expires=4102444800"
@@ -7831,12 +7917,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(captured[-1]["guangya_file_id"], "file-session")
 
     def test_quality_switch_sessions_keep_recent_media_name_without_merging(self):
-        class Raw:
-            token = "provider-secret"
-
         class GuangYa:
             logged_in = True
-            raw = Raw()
+            download_url_cache_context = ("provider-secret", False)
 
             def get_download_url(self, _file_id, **_kwargs):
                 return "https://signed.invalid/file?Expires=4102444800"
@@ -8790,10 +8873,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(first.json(), {"error": "光鸭播放地址获取超时"})
         self.assertEqual(_FakeGuangYaClient.calls, ["timeout-file", "timeout-file"])
         self.assertTrue(all(
-            options == {
-                "timeout": media_proxy.PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
-                "raise_timeout": True,
-            }
+            0 < options["timeout"] <= media_proxy.PLAYGY_SIGNED_URL_TIMEOUT_SECONDS
+            and options["raise_timeout"] is True
             for options in _FakeGuangYaClient.call_options
         ))
 
@@ -8927,11 +9008,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         cache = media_proxy.SignedUrlCache(ttl_seconds=10, clock=lambda: now[0])
 
         async def scenario():
-            (await cache.get_or_fetch_result("old-file", lambda: _async_value("https://signed.invalid/old"))).url
+            (await asyncio.to_thread(cache.get_or_fetch_sync_result, "old-file", lambda: _async_value("https://signed.invalid/old"))).url
             now[0] = 111.0
-            (await cache.get_or_fetch_result("new-file", lambda: _async_value("https://signed.invalid/new"))).url
+            (await asyncio.to_thread(cache.get_or_fetch_sync_result, "new-file", lambda: _async_value("https://signed.invalid/new"))).url
 
-        async def _async_value(value: str) -> str:
+        def _async_value(value: str) -> str:
             return value
 
         asyncio.run(scenario())
@@ -8944,10 +9025,10 @@ class HybridMediaProxyTests(unittest.TestCase):
             for index in range(200):
                 file_id = f"file-{index}"
 
-                async def fetch(value=file_id):
+                def fetch(value=file_id):
                     return f"https://signed.invalid/{value}"
 
-                (await cache.get_or_fetch_result(file_id, fetch)).url
+                (await asyncio.to_thread(cache.get_or_fetch_sync_result, file_id, fetch)).url
 
         asyncio.run(scenario())
         self.assertLessEqual(cache.lock_count, 64)
@@ -8980,18 +9061,18 @@ class HybridMediaProxyTests(unittest.TestCase):
         cache = media_proxy.SignedUrlCache(ttl_seconds=10, clock=lambda: now[0])
         calls = []
 
-        async def fetch() -> str:
+        def fetch() -> str:
             calls.append("fetch")
-            await asyncio.sleep(0)
+            time.sleep(0.01)
             return "https://signed.invalid/file"
 
         async def scenario():
             first, second = (result.url for result in await asyncio.gather(
-                cache.get_or_fetch_result("file", fetch),
-                cache.get_or_fetch_result("file", fetch),
+                asyncio.to_thread(cache.get_or_fetch_sync_result, "file", fetch),
+                asyncio.to_thread(cache.get_or_fetch_sync_result, "file", fetch),
             ))
             now[0] = 111.0
-            third = (await cache.get_or_fetch_result("file", fetch)).url
+            third = (await asyncio.to_thread(cache.get_or_fetch_sync_result, "file", fetch)).url
             return first, second, third
 
         first, second, third = asyncio.run(scenario())

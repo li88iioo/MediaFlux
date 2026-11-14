@@ -119,8 +119,8 @@ class PlayGyQualityTests(unittest.TestCase):
         self.enterContext(patch.dict(guangya_module._READ_CONGESTION, {}, clear=True))
         self.enterContext(patch.object(guangya_module, "monotonic", side_effect=lambda: self.clock[0]))
         self.enterContext(patch.object(guangya_module, "sleep", side_effect=self._advance))
-        self.factory = self.enterContext(patch.object(proxy, "GuangYaClient", return_value=self.client))
-        self.enterContext(patch.object(proxy, "close_guangya_client"))
+        self.factory = self.enterContext(patch.object(media_proxy, "GuangYaClient", return_value=self.client))
+        self.enterContext(patch.object(media_proxy, "close_guangya_client"))
         self.enterContext(patch.object(proxy, "_playgy_signed_urls", proxy.SignedUrlCache(max_entries=16)))
         self.enterContext(patch("app.modules.playgy_signing.get_web_secret", return_value="quality-tests-isolated-signing-key"))
         app = FastAPI()
@@ -577,8 +577,10 @@ class PlayGyQualityTests(unittest.TestCase):
                 self.provider.on_request = consume_budget
                 self._error(self.http.get(self._url(view="resolve", quality=_HLS_GCID)), 504)
                 self.assertEqual(self._calls(), [_DETAIL] if detail_exhausts_budget else [_DETAIL, _VOD_URL])
-                self.assertEqual([call["timeout"] for call in self.provider.calls],
-                                 [8.0] if detail_exhausts_budget else [8.0, 5.0])
+                first_timeout = self.provider.calls[0]["timeout"]
+                self.assertTrue(0 < first_timeout <= 8.0)
+                if not detail_exhausts_budget:
+                    self.assertAlmostEqual(self.provider.calls[1]["timeout"], first_timeout - 3.0)
 
 
 if __name__ == "__main__":

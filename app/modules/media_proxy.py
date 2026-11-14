@@ -157,21 +157,27 @@ class _SignedMediaProbeExecutorRuntime:
 
     def submit(self, func: Callable[..., Any]) -> ConcurrentFuture[Any]:
         with self._lock:
-            if not self._accepting:
+            capacity = _signed_media_probe_worker_capacity
+            if not self._accepting or not capacity.acquire(blocking=False):
                 raise _SignedMediaProbeCapacityError
-            executor = self._executor
-            if executor is None:
-                executor = ThreadPoolExecutor(
-                    max_workers=_SIGNED_MEDIA_PROBE_MAX_CONCURRENCY,
-                    thread_name_prefix="media-proxy-head",
-                )
-                self._executor = executor
-            future = executor.submit(func)
-            self._futures.add(future)
+            try:
+                executor = self._executor
+                if executor is None:
+                    executor = ThreadPoolExecutor(
+                        max_workers=_SIGNED_MEDIA_PROBE_MAX_CONCURRENCY,
+                        thread_name_prefix="media-proxy-head",
+                    )
+                    self._executor = executor
+                future = executor.submit(func)
+                self._futures.add(future)
+            except BaseException:
+                capacity.release()
+                raise
 
         def forget(done_future: ConcurrentFuture[Any]) -> None:
             with self._lock:
                 self._futures.discard(done_future)
+            capacity.release()
 
         future.add_done_callback(forget)
         return future
@@ -201,6 +207,52 @@ def start_signed_media_probe_runtime() -> None:
 
 def shutdown_signed_media_probe_runtime(timeout_seconds: float = 5.0) -> bool:
     return _signed_media_probe_runtime.shutdown(timeout_seconds)
+
+
+async def run_signed_media_probe_blocking(
+    func: Callable[..., Any], /, *args: Any,
+    deadline: float | None = None, **kwargs: Any,
+) -> Any:
+    """异步等待同一受控池；取消等待不归还仍在运行的线程容量。"""
+    queue_deadline = time.monotonic() + _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS
+    if deadline is not None:
+        queue_deadline = min(queue_deadline, deadline)
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("媒体播放请求超时")
+        try:
+            future = _signed_media_probe_runtime.submit(partial(func, *args, **kwargs))
+            break
+        except _SignedMediaProbeCapacityError:
+            remaining = queue_deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            await asyncio.sleep(min(0.01, remaining))
+    task = asyncio.wrap_future(future)
+    task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+    async with asyncio.timeout(remaining):
+        return await asyncio.shield(task)
+
+
+def run_signed_media_probe_sync(
+    func: Callable[..., Any], /, *args: Any, deadline: float, **kwargs: Any,
+) -> Any:
+    """同步路由也只等待原有 Future，构造/锁等待包含在同一个截止时间内。"""
+    queue_deadline = min(deadline, time.monotonic() + _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS)
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("媒体播放请求超时")
+        try:
+            future = _signed_media_probe_runtime.submit(partial(func, *args, **kwargs))
+            return future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except _SignedMediaProbeCapacityError:
+            remaining = queue_deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.01, remaining))
+
+
 _SIGNED_MEDIA_REQUEST_HEADERS = {
     "accept",
     "if-range",
@@ -590,7 +642,6 @@ class SignedUrlCache:
         self._max_entries = max(1, max_entries)
         self._entries: OrderedDict[tuple[str, str, str], tuple[str, float]] = OrderedDict()
         stripe_count = max(1, lock_stripes)
-        self._locks = tuple(asyncio.Lock() for _ in range(stripe_count))
         self._sync_locks = tuple(threading.Lock() for _ in range(stripe_count))
         self._guard = threading.RLock()
         self._hits = 0
@@ -669,9 +720,6 @@ class SignedUrlCache:
             self._entries.pop(key, None)
         return None
 
-    def _file_lock(self, key: tuple[str, str, str]) -> asyncio.Lock:
-        return self._locks[hash(key) % len(self._locks)]
-
     def _sync_file_lock(self, key: tuple[str, str, str]) -> threading.Lock:
         return self._sync_locks[hash(key) % len(self._sync_locks)]
 
@@ -691,48 +739,7 @@ class SignedUrlCache:
 
     @property
     def lock_count(self) -> int:
-        return len(self._locks)
-
-    async def get_or_fetch_result(
-        self,
-        file_id: str,
-        fetcher: Callable[[], Awaitable[str | None]],
-        *,
-        scope: str = "",
-        user_agent: str = "",
-        ua_bound: bool = False,
-    ) -> "SignedUrlCacheResult":
-        normalized = (file_id or "").strip()
-        if not normalized:
-            return SignedUrlCacheResult(None, False)
-        key = self._key(normalized, scope, user_agent, ua_bound)
-        cached = self._cached(key)
-        if cached:
-            with self._guard:
-                self._hits += 1
-            return SignedUrlCacheResult(cached, True)
-        with self._guard:
-            self._misses += 1
-        async with self._file_lock(key):
-            cached = self._cached(key)
-            if cached:
-                with self._guard:
-                    self._hits += 1
-                return SignedUrlCacheResult(cached, True)
-            with self._guard:
-                self._fetches += 1
-            try:
-                url = await fetcher()
-            except Exception:
-                with self._guard:
-                    self._failures += 1
-                raise
-            if url:
-                self._remember(key, url)
-            else:
-                with self._guard:
-                    self._failures += 1
-            return SignedUrlCacheResult(url if url else None, False)
+        return len(self._sync_locks)
 
     def get_or_fetch_sync_result(
         self,
@@ -742,8 +749,11 @@ class SignedUrlCache:
         scope: str = "",
         user_agent: str = "",
         ua_bound: bool = False,
+        deadline: float | None = None,
     ) -> "SignedUrlCacheResult":
-        """同步路由使用的短缓存入口，保持与异步入口相同的单飞语义。"""
+        """worker 共用的单飞入口，等待锁与回源均计入同一预算。"""
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("媒体直链缓存等待超时")
         normalized = (file_id or "").strip()
         if not normalized:
             return SignedUrlCacheResult(None, False)
@@ -755,7 +765,10 @@ class SignedUrlCache:
             return SignedUrlCacheResult(cached, True)
         with self._guard:
             self._misses += 1
-        with self._sync_file_lock(key):
+        lock = self._sync_file_lock(key)
+        if not lock.acquire(timeout=-1 if deadline is None else max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("媒体直链缓存等待超时")
+        try:
             cached = self._cached(key)
             if cached:
                 with self._guard:
@@ -765,6 +778,8 @@ class SignedUrlCache:
                 self._fetches += 1
             try:
                 url = fetcher()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("媒体直链获取超时")
             except Exception:
                 with self._guard:
                     self._failures += 1
@@ -775,6 +790,8 @@ class SignedUrlCache:
                 with self._guard:
                     self._failures += 1
             return SignedUrlCacheResult(url if url else None, False)
+        finally:
+            lock.release()
 
     @property
     def entry_count(self) -> int:
@@ -829,6 +846,47 @@ class SignedUrlCache:
 class SignedUrlCacheResult:
     url: str | None
     cache_hit: bool
+
+
+def resolve_guangya_playback(
+    file_id: str, *, deadline: float, cache: SignedUrlCache | None = None,
+    user_agent: str = "", refresh: bool = False, quality: str | None = None,
+) -> SignedUrlCacheResult | dict | None:
+    """池内拥有完整 provider 生命周期；None 表示未登录，cache=None 查询画质。"""
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("光鸭播放地址获取超时")
+        return value
+
+    remaining()
+    client = GuangYaClient()
+    try:
+        remaining()
+        if not client.logged_in:
+            if cache is not None:
+                cache.clear()
+            return None
+        if cache is None:
+            payload = client.playback_info(file_id, quality=quality, timeout=remaining())
+            remaining()
+            return payload
+        scope, ua_bound = client.download_url_cache_context
+        options: dict[str, Any] = {"scope": scope, "user_agent": user_agent, "ua_bound": ua_bound}
+        if refresh:
+            cache.invalidate(file_id, **options)
+        result = cache.get_or_fetch_sync_result(
+            file_id,
+            lambda: client.get_download_url(file_id, timeout=remaining(), raise_timeout=True),
+            deadline=deadline, **options,
+        )
+        remaining()
+        # freshness 可以轮换 token；不把新凭据的直链留在旧身份的缓存域。
+        if client.download_url_cache_context != (scope, ua_bound):
+            cache.invalidate(file_id, **options)
+        return result
+    finally:
+        close_guangya_client(client)
 
 
 class BrowserDirectTargetCache:
@@ -4260,61 +4318,6 @@ def create_proxy_app(
         _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY
     )
 
-    async def run_signed_media_probe_blocking(
-        func: Callable[..., Any],
-        /,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        """在进程级共享有界线程池执行 signed media 的同步 SDK/DNS 调用。
-
-        请求被绝对 deadline 取消后，系统级 DNS/SDK 调用未必能立刻停止；
-        worker 槽位必须等底层 Future 真正结束后再释放，避免跨 runtime
-        累积不可取消任务或空闲线程。
-        """
-        loop = asyncio.get_running_loop()
-        worker_capacity = _signed_media_probe_worker_capacity
-        capacity_deadline = (
-            loop.time()
-            + max(0.001, _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS)
-        )
-        while not worker_capacity.acquire(blocking=False):
-            remaining = capacity_deadline - loop.time()
-            if remaining <= 0:
-                raise _SignedMediaProbeCapacityError
-            await asyncio.sleep(min(0.01, remaining))
-
-        try:
-            worker_future = _signed_media_probe_runtime.submit(
-                partial(func, *args, **kwargs)
-            )
-        except Exception:
-            worker_capacity.release()
-            raise
-
-        def release_worker_slot(done_future) -> None:
-            try:
-                done_future.exception()
-            except BaseException:
-                pass
-            worker_capacity.release()
-
-        worker_future.add_done_callback(release_worker_slot)
-        async_future = asyncio.wrap_future(worker_future, loop=loop)
-
-        def consume_async_exception(done_future: asyncio.Future) -> None:
-            if done_future.cancelled():
-                return
-            try:
-                done_future.exception()
-            except BaseException:
-                pass
-
-        async_future.add_done_callback(consume_async_exception)
-        # shield 确保请求超时只停止等待，不会把尚在执行的同步 Future 标成
-        # 已取消；容量由上面的 concurrent Future 完成回调按真实生命周期归还。
-        return await asyncio.shield(async_future)
-
     @app.middleware("http")
     async def record_playback_attempt(request: Request, call_next):
         route_class = classify_proxy_route(request.url.path, request.method)
@@ -4828,6 +4831,10 @@ def create_proxy_app(
         request.state.proxy_source = "guangya"
         request.state.proxy_action = "guangya_302"
         is_head_probe = request.method == "HEAD"
+        request_deadline = (
+            time.monotonic() + max(0.001, _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS)
+            if is_head_probe else None
+        )
 
         async def resolve_signed_media_response() -> Response:
             if not getattr(
@@ -4859,50 +4866,126 @@ def create_proxy_app(
                         status_code=401,
                     )
 
-            client = GuangYaClient()
+            async def fetch_url(*, refresh: bool = False) -> SignedUrlCacheResult | None:
+                provider_deadline = time.monotonic() + PLAYGY_SIGNED_URL_TIMEOUT_SECONDS
+                if request_deadline is not None:
+                    provider_deadline = min(provider_deadline, request_deadline)
+                started = time.monotonic()
+                try:
+                    return await run_signed_media_probe_blocking(
+                        partial(
+                            resolve_guangya_playback, file_id, deadline=provider_deadline,
+                            cache=signed_urls, user_agent=request.headers.get("user-agent", ""),
+                            refresh=refresh,
+                        ),
+                        deadline=provider_deadline,
+                    )
+                finally:
+                    request.state.proxy_upstream_latency_ms += round(
+                        (time.monotonic() - started) * 1000
+                    )
+
             try:
-                if not client.logged_in:
-                    request.state.proxy_failure_stage = "provider_auth"
-                    signed_urls.clear()
-                    browser_direct_targets.clear()
-                    return JSONResponse({"error": "光鸭未登录"}, status_code=503)
-                try:
-                    raw_client = client.raw
-                except AttributeError:  # 兼容测试替身与旧包装器
-                    raw_client = getattr(client, "_raw", None)
-                provider_token = str(getattr(raw_client, "token", "") or "")
-                provider_scope = _auth_scope_fingerprint(provider_token)
-                scope = f"{instance_id}:{provider_scope}"
-                ua_bound = bool(
-                    getattr(raw_client, "download_url_user_agent_bound", False)
+                result = await fetch_url()
+            except _SignedMediaProbeCapacityError:
+                request.state.proxy_failure_stage = "signed_url_probe_capacity"
+                return JSONResponse({"error": "媒体直链探测繁忙，请稍后重试"}, status_code=503)
+            except TimeoutError:
+                request.state.proxy_failure_stage = "signed_url_timeout"
+                return JSONResponse({"error": "光鸭播放地址获取超时"}, status_code=504)
+            if result is None:
+                request.state.proxy_failure_stage = "provider_auth"
+                browser_direct_targets.clear()
+                return JSONResponse({"error": "光鸭未登录"}, status_code=503)
+            request.state.proxy_cache_hit = result.cache_hit
+            if not result.url:
+                request.state.proxy_failure_stage = "signed_url"
+                return JSONResponse({"error": "无法获取光鸭直链"}, status_code=502)
+            client_url = result.url.strip()
+
+            async def refresh_cached_url() -> str | None:
+                refreshed = await fetch_url(refresh=True)
+                request.state.proxy_cache_hit = False
+                return refreshed.url if refreshed is not None else None
+            browser_direct_redirect = bool(
+                not is_head_probe
+                and getattr(
+                    request.state, "proxy_browser_direct_redirect", False
                 )
-
-                async def fetch_url() -> str | None:
-                    options = {
-                        "timeout": PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
-                        "raise_timeout": True,
-                    }
-                    if is_head_probe:
-                        return await run_signed_media_probe_blocking(
-                            client.get_download_url,
-                            file_id,
-                            **options,
-                        )
-                    return await asyncio.to_thread(
-                        client.get_download_url,
-                        file_id,
-                        **options,
+                and _request_allows_browser_direct_redirect(request)
+                and _browser_direct_target_is_secure(client_url)
+            )
+            prefers_direct_redirect = _request_prefers_direct_signed_redirect(
+                request
+            )
+            verified_native_chain_relay = bool(
+                not prefers_direct_redirect
+                and getattr(
+                    request.state,
+                    "proxy_native_signed_media_relay",
+                    False,
+                )
+            )
+            native_cross_protocol_relay = bool(
+                not prefers_direct_redirect
+                and not browser_direct_redirect
+                and _request_is_cross_protocol_media_target(request, client_url)
+                and (
+                    _request_uses_exoplayer(request)
+                    or getattr(
+                        request.state,
+                        "proxy_native_cross_protocol_relay",
+                        False,
                     )
-
-                signed_url_started = time.monotonic()
+                )
+            )
+            browser_relay_required = bool(
+                not browser_direct_redirect
+                and (
+                    getattr(request.state, "proxy_browser_relay", False)
+                    or _request_uses_browser_media_element(request)
+                )
+            )
+            if (
+                is_head_probe
+                or browser_relay_required
+                or verified_native_chain_relay
+                or native_cross_protocol_relay
+            ):
+                # HLS.js、转码与不具备直放能力的浏览器仍需同源响应规避 CDN
+                # CORS；只有 PlaybackInfo 已由 Jellyfin 判定 SupportsDirectPlay
+                # 的具体 source，才允许携带 capability 的媒体 GET 返回真 302。
+                # Media3/ExoPlayer 的跨协议链路继续按原有兼容策略 relay。
+                if verified_native_chain_relay:
+                    request.state.proxy_action = "guangya_relay_native_chain"
+                elif native_cross_protocol_relay:
+                    request.state.proxy_action = "guangya_relay_cross_protocol"
+                return await _relay_signed_media(
+                    request,
+                    client_url,
+                    refresh_signed_url=refresh_cached_url,
+                )
+            redirect_url = client_url
+            if browser_direct_redirect:
+                # 浏览器会自行解析 Location，无法复用 relay 的物理 IP pinning；
+                # 此处的解析结果只是对受信 provider 返回值做下发前的公网目标
+                # 健全性检查，并不等同于钉住浏览器随后采用的 DNS 结果。真正需要
+                # DNS pinning 的 HLS/XHR 与不安全协议降级仍统一走 relay。
                 try:
-                    result = await signed_urls.get_or_fetch_result(
-                        file_id,
-                        fetch_url,
-                        scope=scope,
-                        user_agent=request.headers.get("user-agent", ""),
-                        ua_bound=ua_bound,
-                    )
+                    if browser_direct_targets.contains(client_url):
+                        pinned_redirect = None
+                    else:
+                        pinned_redirect = await asyncio.wait_for(
+                            run_signed_media_probe_blocking(
+                                _pin_signed_media_target,
+                                client_url,
+                            ),
+                            timeout=max(
+                                0.001,
+                                _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS,
+                            ),
+                        )
+                        browser_direct_targets.remember(client_url)
                 except _SignedMediaProbeCapacityError:
                     request.state.proxy_failure_stage = (
                         "signed_url_probe_capacity"
@@ -4912,164 +4995,34 @@ def create_proxy_app(
                         status_code=503,
                     )
                 except TimeoutError:
-                    request.state.proxy_failure_stage = "signed_url_timeout"
+                    request.state.proxy_failure_stage = "signed_url_probe_timeout"
                     return JSONResponse(
-                        {"error": "光鸭播放地址获取超时"},
+                        {"error": "媒体直链探测超时"},
                         status_code=504,
                     )
-                finally:
-                    request.state.proxy_upstream_latency_ms += round(
-                        (time.monotonic() - signed_url_started) * 1000
+                except ValueError as exc:
+                    request.state.proxy_failure_stage = "signed_url_target"
+                    logger.warning(
+                        "媒体反代浏览器直链地址无效 instance=%s reason=%s",
+                        instance_id,
+                        str(exc),
                     )
-                request.state.proxy_cache_hit = result.cache_hit
-                if not result.url:
-                    request.state.proxy_failure_stage = "signed_url"
                     return JSONResponse(
-                        {"error": "无法获取光鸭直链"},
+                        {"error": "媒体直链地址无效"},
                         status_code=502,
                     )
-                client_url = result.url.strip()
-
-                async def refresh_cached_url() -> str | None:
-                    signed_urls.invalidate(
-                        file_id,
-                        scope=scope,
-                        user_agent=request.headers.get("user-agent", ""),
-                        ua_bound=ua_bound,
-                    )
-                    refresh_started = time.monotonic()
-                    try:
-                        refreshed = await signed_urls.get_or_fetch_result(
-                            file_id,
-                            fetch_url,
-                            scope=scope,
-                            user_agent=request.headers.get("user-agent", ""),
-                            ua_bound=ua_bound,
-                        )
-                    finally:
-                        request.state.proxy_upstream_latency_ms += round(
-                            (time.monotonic() - refresh_started) * 1000
-                        )
-                    request.state.proxy_cache_hit = False
-                    return refreshed.url
-                browser_direct_redirect = bool(
-                    not is_head_probe
-                    and getattr(
-                        request.state, "proxy_browser_direct_redirect", False
-                    )
-                    and _request_allows_browser_direct_redirect(request)
-                    and _browser_direct_target_is_secure(client_url)
-                )
-                prefers_direct_redirect = _request_prefers_direct_signed_redirect(
-                    request
-                )
-                verified_native_chain_relay = bool(
-                    not prefers_direct_redirect
-                    and getattr(
-                        request.state,
-                        "proxy_native_signed_media_relay",
-                        False,
-                    )
-                )
-                native_cross_protocol_relay = bool(
-                    not prefers_direct_redirect
-                    and not browser_direct_redirect
-                    and _request_is_cross_protocol_media_target(request, client_url)
-                    and (
-                        _request_uses_exoplayer(request)
-                        or getattr(
-                            request.state,
-                            "proxy_native_cross_protocol_relay",
-                            False,
-                        )
-                    )
-                )
-                browser_relay_required = bool(
-                    not browser_direct_redirect
-                    and (
-                        getattr(request.state, "proxy_browser_relay", False)
-                        or _request_uses_browser_media_element(request)
-                    )
-                )
-                if (
-                    is_head_probe
-                    or browser_relay_required
-                    or verified_native_chain_relay
-                    or native_cross_protocol_relay
-                ):
-                    # HLS.js、转码与不具备直放能力的浏览器仍需同源响应规避 CDN
-                    # CORS；只有 PlaybackInfo 已由 Jellyfin 判定 SupportsDirectPlay
-                    # 的具体 source，才允许携带 capability 的媒体 GET 返回真 302。
-                    # Media3/ExoPlayer 的跨协议链路继续按原有兼容策略 relay。
-                    if verified_native_chain_relay:
-                        request.state.proxy_action = "guangya_relay_native_chain"
-                    elif native_cross_protocol_relay:
-                        request.state.proxy_action = "guangya_relay_cross_protocol"
-                    return await _relay_signed_media(
-                        request,
-                        client_url,
-                        refresh_signed_url=refresh_cached_url,
-                    )
-                redirect_url = client_url
-                if browser_direct_redirect:
-                    # 浏览器会自行解析 Location，无法复用 relay 的物理 IP pinning；
-                    # 此处的解析结果只是对受信 provider 返回值做下发前的公网目标
-                    # 健全性检查，并不等同于钉住浏览器随后采用的 DNS 结果。真正需要
-                    # DNS pinning 的 HLS/XHR 与不安全协议降级仍统一走 relay。
-                    try:
-                        if browser_direct_targets.contains(client_url):
-                            pinned_redirect = None
-                        else:
-                            pinned_redirect = await asyncio.wait_for(
-                                run_signed_media_probe_blocking(
-                                    _pin_signed_media_target,
-                                    client_url,
-                                ),
-                                timeout=max(
-                                    0.001,
-                                    _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS,
-                                ),
-                            )
-                            browser_direct_targets.remember(client_url)
-                    except _SignedMediaProbeCapacityError:
-                        request.state.proxy_failure_stage = (
-                            "signed_url_probe_capacity"
-                        )
-                        return JSONResponse(
-                            {"error": "媒体直链探测繁忙，请稍后重试"},
-                            status_code=503,
-                        )
-                    except TimeoutError:
-                        request.state.proxy_failure_stage = "signed_url_probe_timeout"
-                        return JSONResponse(
-                            {"error": "媒体直链探测超时"},
-                            status_code=504,
-                        )
-                    except ValueError as exc:
-                        request.state.proxy_failure_stage = "signed_url_target"
-                        logger.warning(
-                            "媒体反代浏览器直链地址无效 instance=%s reason=%s",
-                            instance_id,
-                            str(exc),
-                        )
-                        return JSONResponse(
-                            {"error": "媒体直链地址无效"},
-                            status_code=502,
-                        )
-                    if pinned_redirect is not None:
-                        redirect_url = pinned_redirect.logical_url
-                    request.state.proxy_action = "guangya_302_web_direct"
-                return RedirectResponse(
-                    redirect_url,
-                    status_code=302,
-                    headers={
-                        "Cache-Control": "private, no-store, no-cache, max-age=0",
-                        "Pragma": "no-cache",
-                        "Referrer-Policy": "no-referrer",
-                    },
-                )
-            finally:
-                close_guangya_client(client)
+                if pinned_redirect is not None:
+                    redirect_url = pinned_redirect.logical_url
+                request.state.proxy_action = "guangya_302_web_direct"
+            return RedirectResponse(
+                redirect_url,
+                status_code=302,
+                headers={
+                    "Cache-Control": "private, no-store, no-cache, max-age=0",
+                    "Pragma": "no-cache",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
 
         if not is_head_probe:
             return await resolve_signed_media_response()
@@ -5078,7 +5031,8 @@ def create_proxy_app(
         # CDN 探测共用一个请求级绝对 deadline；不能把各阶段超时相加。
         loop = asyncio.get_running_loop()
         total_timeout = max(0.001, _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS)
-        deadline = loop.time() + total_timeout
+        assert request_deadline is not None
+        deadline = loop.time() + max(0.0, request_deadline - time.monotonic())
         queue_timeout = min(
             max(0.001, _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS),
             total_timeout,

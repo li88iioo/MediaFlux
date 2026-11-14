@@ -1845,6 +1845,16 @@ class GuangYaClient:
         return self._raw
 
     @property
+    def download_url_cache_context(self) -> tuple[str, bool]:
+        """已加载凭据的缓存身份；不刷新、不访问磁盘，也不等待凭据锁。"""
+        raw = self._raw
+        token = str(getattr(raw, "token", "") or "")
+        return (
+            hashlib.sha256(token.encode("utf-8")).hexdigest()[:24],
+            bool(getattr(raw, "download_url_user_agent_bound", False)),
+        )
+
+    @property
     def logged_in(self) -> bool:
         self._invalidate_if_stale()
         return self._raw is not None
@@ -3381,22 +3391,25 @@ class GuangYaClient:
             deadline = monotonic() + max(0.001, float(timeout))
 
         def fetch():
-            if deadline is None:
-                return self.raw.download_url(file_id)
-            if self._invalidate_if_stale():
-                raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
-            raw = self._raw
-            if raw is None:
-                raise RuntimeError("光鸭未登录，请先完成短信登录")
-            remaining = deadline - monotonic()
-            if remaining <= 0:
+            if deadline is not None and monotonic() >= deadline:
                 raise httpx.TimeoutException("get_download_url exceeded its deadline")
-            return raw.request(
+            # 有无预算共用 freshness；锁等待和刷新均消耗入口处建立的预算。
+            raw = self.raw
+            options = {}
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise httpx.TimeoutException("get_download_url exceeded its deadline")
+                options["timeout"] = remaining
+            result = raw.request(
                 "https://api.guangyapan.com/nd.bizuserres.s/v1/get_res_download_url",
                 method="POST",
                 json={"fileId": file_id},
-                timeout=max(0.001, remaining),
+                **options,
             ).json()
+            if deadline is not None and monotonic() >= deadline:
+                raise httpx.TimeoutException("get_download_url exceeded its deadline")
+            return result
 
         try:
             res = self._call_read(

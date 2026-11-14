@@ -688,17 +688,18 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
 
         app = FastAPI()
         app.include_router(playgy_router)
-        client_stub = Mock(logged_in=True)
+        client_stub = Mock(logged_in=True, download_url_cache_context=("fixture-account", False))
         client_stub.get_download_url.return_value = "https://storage.invalid/movie"
         target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client_stub):
             with TestClient(app) as client:
                 response = client.get(target, follow_redirects=False)
 
         self.assertEqual(response.status_code, 302)
-        client_stub.get_download_url.assert_called_once_with(
-            raw_file_id, timeout=8.0, raise_timeout=True
-        )
+        client_stub.get_download_url.assert_called_once()
+        self.assertEqual(client_stub.get_download_url.call_args.args, (raw_file_id,))
+        self.assertTrue(client_stub.get_download_url.call_args.kwargs["raise_timeout"])
+        self.assertTrue(0 < client_stub.get_download_url.call_args.kwargs["timeout"] <= 8.0)
 
     def test_playgy_head_returns_local_probe_metadata_after_provider_validation(self):
         from app.routes.proxy import router as playgy_router
@@ -710,10 +711,10 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         app = FastAPI()
         app.include_router(playgy_router)
-        client_stub = Mock(logged_in=True)
+        client_stub = Mock(logged_in=True, download_url_cache_context=("fixture-account", False))
         client_stub.get_download_url.return_value = "https://storage.invalid/movie"
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client_stub):
             with TestClient(app) as client:
                 response = client.head(
                     target,
@@ -734,9 +735,10 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertNotIn("location", response.headers)
         self.assertEqual(response.content, b"")
-        client_stub.get_download_url.assert_called_once_with(
-            "file-id", timeout=8.0, raise_timeout=True
-        )
+        client_stub.get_download_url.assert_called_once()
+        self.assertEqual(client_stub.get_download_url.call_args.args, ("file-id",))
+        self.assertTrue(client_stub.get_download_url.call_args.kwargs["raise_timeout"])
+        self.assertTrue(0 < client_stub.get_download_url.call_args.kwargs["timeout"] <= 8.0)
 
 
     def test_playgy_head_honors_matching_if_range_validator(self):
@@ -750,12 +752,12 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         app = FastAPI()
         app.include_router(playgy_router)
-        client_stub = Mock(logged_in=True)
+        client_stub = Mock(logged_in=True, download_url_cache_context=("fixture-account", False))
         client_stub.get_download_url.return_value = (
             "https://storage.invalid/matching-range-file"
         )
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client_stub):
             with TestClient(app) as client:
                 metadata = client.head(target, follow_redirects=False)
                 response = client.head(
@@ -786,12 +788,12 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         app = FastAPI()
         app.include_router(playgy_router)
-        client_stub = Mock(logged_in=True)
+        client_stub = Mock(logged_in=True, download_url_cache_context=("fixture-account", False))
         client_stub.get_download_url.return_value = (
             "https://storage.invalid/range-file"
         )
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client_stub):
             with TestClient(app) as client:
                 response = client.head(
                     target,
@@ -817,7 +819,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         app.include_router(playgy_router)
         client_stub = Mock(logged_in=False)
 
-        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+        with patch("app.modules.media_proxy.GuangYaClient", return_value=client_stub):
             with TestClient(app) as client:
                 response = client.head(target, follow_redirects=False)
 

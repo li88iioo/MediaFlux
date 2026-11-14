@@ -8,7 +8,7 @@ import time
 import unittest
 from collections import OrderedDict
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -20,19 +20,15 @@ from app.modules.media_proxy_safety import safe_media_name
 from tests.support import IsolatedDatabaseTestCase
 
 
-async def _value(value):
-    return value
-
-
 class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_releasing_old_runtime_cache_keeps_replacement_registered(self):
+    def test_releasing_old_runtime_cache_keeps_replacement_registered(self):
         old_cache = media_proxy.SignedUrlCache()
         new_cache = media_proxy.SignedUrlCache()
-        (await old_cache.get_or_fetch_result(
-            "old", lambda: _value("https://signed.invalid/old")
+        (old_cache.get_or_fetch_sync_result(
+            "old", lambda: "https://signed.invalid/old"
         )).url
-        (await new_cache.get_or_fetch_result(
-            "new", lambda: _value("https://signed.invalid/new")
+        (new_cache.get_or_fetch_sync_result(
+            "new", lambda: "https://signed.invalid/new"
         )).url
         with media_proxy._signed_url_caches_lock:
             previous = media_proxy._signed_url_caches.get(7)
@@ -50,7 +46,7 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     media_proxy._signed_url_caches[7] = previous
 
-    async def test_cache_is_scoped_by_instance_account_and_optional_user_agent(self):
+    def test_cache_is_scoped_by_instance_account_and_optional_user_agent(self):
         now = [100.0]
         cache = media_proxy.SignedUrlCache(
             ttl_seconds=60,
@@ -59,23 +55,23 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         )
         calls = []
 
-        async def fetch():
+        def fetch():
             calls.append(len(calls) + 1)
             return f"https://signed.invalid/{len(calls)}?Expires=2000"
 
-        first = (await cache.get_or_fetch_result("file", fetch, scope="instance-1:account-a")).url
-        second = (await cache.get_or_fetch_result("file", fetch, scope="instance-1:account-a")).url
-        third = (await cache.get_or_fetch_result("file", fetch, scope="instance-2:account-a")).url
-        ua_a = (await cache.get_or_fetch_result(
+        first = (cache.get_or_fetch_sync_result("file", fetch, scope="instance-1:account-a")).url
+        second = (cache.get_or_fetch_sync_result("file", fetch, scope="instance-1:account-a")).url
+        third = (cache.get_or_fetch_sync_result("file", fetch, scope="instance-2:account-a")).url
+        ua_a = (cache.get_or_fetch_sync_result(
             "ua-file", fetch, scope="instance-1:account-a", user_agent="UA-A", ua_bound=True
         )).url
-        ua_b = (await cache.get_or_fetch_result(
+        ua_b = (cache.get_or_fetch_sync_result(
             "ua-file", fetch, scope="instance-1:account-a", user_agent="UA-B", ua_bound=True
         )).url
-        no_ua_a = (await cache.get_or_fetch_result(
+        no_ua_a = (cache.get_or_fetch_sync_result(
             "plain-file", fetch, scope="instance-1:account-a", user_agent="UA-A"
         )).url
-        no_ua_b = (await cache.get_or_fetch_result(
+        no_ua_b = (cache.get_or_fetch_sync_result(
             "plain-file", fetch, scope="instance-1:account-a", user_agent="UA-B"
         )).url
 
@@ -89,7 +85,7 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["entries"], 5)
         self.assertNotIn("account-a", json.dumps(metrics))
 
-    async def test_provider_expiry_margin_shortens_cache_lifetime(self):
+    def test_provider_expiry_margin_shortens_cache_lifetime(self):
         mono = [50.0]
         wall = [1000.0]
         cache = media_proxy.SignedUrlCache(
@@ -100,22 +96,22 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         )
         calls = []
 
-        async def fetch():
+        def fetch():
             calls.append(1)
             return "https://signed.invalid/file?Expires=1015&token=must-not-leak"
 
-        (await cache.get_or_fetch_result("file", fetch, scope="one")).url
+        (cache.get_or_fetch_sync_result("file", fetch, scope="one")).url
         mono[0] += 4
         wall[0] += 4
-        (await cache.get_or_fetch_result("file", fetch, scope="one")).url
+        (cache.get_or_fetch_sync_result("file", fetch, scope="one")).url
         mono[0] += 2
         wall[0] += 2
-        (await cache.get_or_fetch_result("file", fetch, scope="one")).url
+        (cache.get_or_fetch_sync_result("file", fetch, scope="one")).url
 
         self.assertEqual(len(calls), 2)
         self.assertEqual(cache.metrics()["expired"], 1)
 
-    async def test_guangya_timestamp_cache_supports_exact_invalidation(self):
+    def test_guangya_timestamp_cache_supports_exact_invalidation(self):
         mono = [10.0]
         wall = [1000.0]
         cache = media_proxy.SignedUrlCache(
@@ -126,64 +122,51 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         )
         calls = []
 
-        async def fetch():
+        def fetch():
             calls.append(1)
             return f"https://signed.invalid/file?ts=1010&token={len(calls)}"
 
-        first = (await cache.get_or_fetch_result(
+        first = (cache.get_or_fetch_sync_result(
             "file", fetch, scope="1:account", user_agent="UA", ua_bound=True,
         )).url
         mono[0] += 4
         wall[0] += 4
-        second = (await cache.get_or_fetch_result(
+        second = (cache.get_or_fetch_sync_result(
             "file", fetch, scope="1:account", user_agent="UA", ua_bound=True,
         )).url
         self.assertEqual(first, second)
         self.assertTrue(cache.invalidate(
             "file", scope="1:account", user_agent="UA", ua_bound=True,
         ))
-        third = (await cache.get_or_fetch_result(
+        third = (cache.get_or_fetch_sync_result(
             "file", fetch, scope="1:account", user_agent="UA", ua_bound=True,
         )).url
 
         self.assertNotEqual(second, third)
         self.assertEqual(len(calls), 2)
 
-    async def test_guangya_issue_timestamp_does_not_disable_sync_or_async_cache(self):
-        for synchronous in (False, True):
-            for timestamp in ("990", "1000", "1010"):
-                with self.subTest(synchronous=synchronous, timestamp=timestamp):
-                    mono, wall = [10.0], [1000.0]
-                    cache = media_proxy.SignedUrlCache(
-                        ttl_seconds=60, clock=lambda: mono[0],
-                        wall_clock=lambda: wall[0],
-                    )
-                    url = f"https://signed.invalid/file?ts={timestamp}&s=fixture"
-                    calls = []
+    def test_guangya_issue_timestamp_keeps_bounded_cache_ttl(self):
+        for timestamp in ("990", "1000", "1010"):
+            with self.subTest(timestamp=timestamp):
+                mono, wall = [10.0], [1000.0]
+                cache = media_proxy.SignedUrlCache(
+                    ttl_seconds=60, clock=lambda: mono[0], wall_clock=lambda: wall[0],
+                )
+                fetch = Mock(return_value=f"https://signed.invalid/file?ts={timestamp}&s=fixture")
+                first = cache.get_or_fetch_sync_result("file", fetch)
+                second = cache.get_or_fetch_sync_result("file", fetch)
+                mono[0] += 59
+                wall[0] += 59
+                third = cache.get_or_fetch_sync_result("file", fetch)
+                self.assertEqual([r.cache_hit for r in (first, second, third)], [False, True, True])
+                fetch.assert_called_once()
+                mono[0] += 2
+                wall[0] += 2
+                refreshed = cache.get_or_fetch_sync_result("file", fetch)
+                self.assertFalse(refreshed.cache_hit)
+                self.assertEqual(fetch.call_count, 2)
 
-                    def fetch():
-                        calls.append(1)
-                        return url
-
-                    async def read():
-                        if synchronous:
-                            return cache.get_or_fetch_sync_result("file", fetch)
-                        return await cache.get_or_fetch_result("file", lambda: _value(fetch()))
-
-                    first = await read()
-                    second = await read()
-                    mono[0] += 59
-                    wall[0] += 59
-                    third = await read()
-                    self.assertEqual([r.cache_hit for r in (first, second, third)], [False, True, True])
-                    self.assertEqual(len(calls), 1)
-                    mono[0] += 2
-                    wall[0] += 2
-                    refreshed = await read()
-                    self.assertFalse(refreshed.cache_hit)
-                    self.assertEqual(len(calls), 2)
-
-    async def test_issue_timestamp_never_overrides_explicit_expiry(self):
+    def test_issue_timestamp_never_overrides_explicit_expiry(self):
         for query in (
             "ts=900&Expires=1015", "ts=2000&Expires=1015",
             "ts=1000&x-amz-date=19700101T001640Z&x-amz-expires=15",
@@ -194,17 +177,17 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
                 cache = media_proxy.SignedUrlCache(
                     clock=lambda: mono[0], wall_clock=lambda: wall[0],
                 )
-                fetch = AsyncMock(return_value=f"https://signed.invalid/file?{query}")
-                first = await cache.get_or_fetch_result("file", fetch)
+                fetch = Mock(return_value=f"https://signed.invalid/file?{query}")
+                first = cache.get_or_fetch_sync_result("file", fetch)
                 mono[0] += 4
                 wall[0] += 4
-                second = await cache.get_or_fetch_result("file", fetch)
+                second = cache.get_or_fetch_sync_result("file", fetch)
                 self.assertFalse(first.cache_hit)
                 self.assertTrue(second.cache_hit)
                 mono[0] += 2
                 wall[0] += 2
-                third = await cache.get_or_fetch_result("file", fetch)
-                fourth = await cache.get_or_fetch_result("file", fetch)
+                third = cache.get_or_fetch_sync_result("file", fetch)
+                fourth = cache.get_or_fetch_sync_result("file", fetch)
                 self.assertFalse(third.cache_hit)
                 self.assertFalse(fourth.cache_hit)
                 self.assertEqual(cache.entry_count, 0)
@@ -213,32 +196,32 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         cache = media_proxy.SignedUrlCache(wall_clock=lambda: 1000)
         calls = []
 
-        async def fetch():
+        def fetch():
             calls.append(1)
-            await asyncio.sleep(0)
+            time.sleep(0.01)
             return "https://signed.invalid/file?ts=1000&s=fixture"
 
         results = await asyncio.gather(*[
-            cache.get_or_fetch_result("file", fetch, scope="account") for _ in range(12)
+            asyncio.to_thread(cache.get_or_fetch_sync_result, "file", fetch, scope="account") for _ in range(12)
         ])
         self.assertEqual(len(calls), 1)
         self.assertEqual(sum(result.cache_hit for result in results), 11)
         self.assertEqual(cache.entry_count, 1)
 
-    async def test_clear_scope_does_not_evict_other_instances(self):
+    def test_clear_scope_does_not_evict_other_instances(self):
         cache = media_proxy.SignedUrlCache()
-        (await cache.get_or_fetch_result("file", lambda: _value("https://signed.invalid/1"), scope="1:a")).url
-        (await cache.get_or_fetch_result("file", lambda: _value("https://signed.invalid/2"), scope="2:a")).url
+        (cache.get_or_fetch_sync_result("file", lambda: "https://signed.invalid/1", scope="1:a")).url
+        (cache.get_or_fetch_sync_result("file", lambda: "https://signed.invalid/2", scope="2:a")).url
 
         self.assertEqual(cache.clear_scope("1:"), 1)
         self.assertEqual(cache.entry_count, 1)
 
-    async def test_global_cache_metrics_include_safe_aggregate_and_instances(self):
+    def test_global_cache_metrics_include_safe_aggregate_and_instances(self):
         first = media_proxy.SignedUrlCache()
         second = media_proxy.SignedUrlCache()
-        (await first.get_or_fetch_result("a", lambda: _value("https://signed.invalid/a"))).url
-        (await first.get_or_fetch_result("a", lambda: _value("https://signed.invalid/a"))).url
-        (await second.get_or_fetch_result("b", lambda: _value("https://signed.invalid/b"))).url
+        (first.get_or_fetch_sync_result("a", lambda: "https://signed.invalid/a")).url
+        (first.get_or_fetch_sync_result("a", lambda: "https://signed.invalid/a")).url
+        (second.get_or_fetch_sync_result("b", lambda: "https://signed.invalid/b")).url
         with media_proxy._signed_url_caches_lock:
             previous = dict(media_proxy._signed_url_caches)
             media_proxy._signed_url_caches.clear()
@@ -1161,10 +1144,9 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         old_cache = media_proxy.SignedUrlCache()
         old_app = media_proxy.create_proxy_app(7, old_cache)
         replacement_cache = media_proxy.SignedUrlCache()
-        asyncio.run(replacement_cache.get_or_fetch_result(
-            "replacement",
-            lambda: _value("https://signed.invalid/replacement"),
-        ))
+        replacement_cache.get_or_fetch_sync_result(
+            "replacement", lambda: "https://signed.invalid/replacement",
+        )
         instance = {
             "id": 7,
             "enabled": 1,
@@ -1197,14 +1179,11 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
                     media_proxy._signed_url_caches[7] = previous
 
     def test_guangya_redirect_records_cache_miss_then_hit_without_signed_url(self):
-        class Raw:
-            token = "provider-account-secret"
-
         class Client:
             calls = 0
             close_calls = 0
             logged_in = True
-            _raw = Raw()
+            download_url_cache_context = ("provider-account-secret", False)
 
             def get_download_url(self, _file_id, **_kwargs):
                 self.__class__.calls += 1
@@ -1260,7 +1239,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         class Client:
             logged_in = True
             calls = 0
-            raw = type("Raw", (), {"token": "fixture-account"})()
+            download_url_cache_context = ("fixture-account", False)
 
             def get_download_url(self, _file_id, **_kwargs):
                 type(self).calls += 1
@@ -1274,7 +1253,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         url = urlsplit(build_play_url("http://testserver", "file", "etag", 123, "Movie.mkv"))
         target = url.path + "?" + url.query
         with (
-            patch.object(proxy, "GuangYaClient", Client),
+            patch.object(media_proxy, "GuangYaClient", Client),
             patch.object(proxy, "_playgy_signed_urls", media_proxy.SignedUrlCache()),
             TestClient(app) as http,
         ):

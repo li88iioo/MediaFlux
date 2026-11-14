@@ -3,17 +3,22 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
+from functools import partial
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger, log_throttled
 from app.modules.media_proxy import (
     PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
     SignedUrlCache,
+    SignedUrlCacheResult,
+    _SignedMediaProbeCapacityError,
     _parse_range,
     media_content_type,
+    resolve_guangya_playback,
+    run_signed_media_probe_sync,
 )
 
 logger = get_logger(__name__)
@@ -60,52 +65,27 @@ def play_gy(
             return JSONResponse({"error": "播放文件大小无效"}, status_code=400)
         if content_length < 0:
             return JSONResponse({"error": "播放文件大小无效"}, status_code=400)
-    client = None
     try:
-        client = GuangYaClient()
-        if not client.logged_in:
+        deadline = time.monotonic() + PLAYGY_SIGNED_URL_TIMEOUT_SECONDS
+        result = run_signed_media_probe_sync(
+            partial(
+                resolve_guangya_playback, file_id, deadline=deadline,
+                cache=None if view else _playgy_signed_urls,
+                quality=quality if view == "resolve" else None,
+                user_agent=request.headers.get("user-agent", "") if request is not None else "",
+            ),
+            deadline=deadline,
+        )
+        if result is None:
             logger.warning("playgy 被访问但光鸭未登录")
             _playgy_signed_urls.clear()
             return JSONResponse({"error": "光鸭未登录"}, status_code=503)
         if view:
-            try:
-                payload = client.playback_info(
-                    file_id, quality=quality if view == "resolve" else None,
-                    timeout=PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
-                )
-            except FileNotFoundError:
-                return JSONResponse({"error": "所选画质已不可用，请刷新画质列表"}, status_code=404)
             return JSONResponse(
-                {"protocol": "mediaflux.playback.v1", **payload},
+                {"protocol": "mediaflux.playback.v1", **result},
                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
             )
-        try:
-            raw_client = client.raw
-        except (AttributeError, RuntimeError):
-            raw_client = getattr(client, "_raw", None)
-        provider_token = str(getattr(raw_client, "token", "") or "")
-        provider_scope = hashlib.sha256(
-            provider_token.encode("utf-8")
-        ).hexdigest()[:24]
-        ua_bound = bool(
-            getattr(raw_client, "download_url_user_agent_bound", False)
-        )
-        user_agent = request.headers.get("user-agent", "") if request is not None else ""
-
-        def fetch_url() -> str | None:
-            return client.get_download_url(
-                file_id,
-                timeout=PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
-                raise_timeout=True,
-            )
-
-        result = _playgy_signed_urls.get_or_fetch_sync_result(
-            file_id,
-            fetch_url,
-            scope=provider_scope,
-            user_agent=user_agent,
-            ua_bound=ua_bound,
-        )
+        assert isinstance(result, SignedUrlCacheResult)
         if result.url:
             if is_head:
                 logger.debug(
@@ -175,6 +155,8 @@ def play_gy(
             "光鸭直链获取失败",
         )
         return JSONResponse({"error": "无法获取直链"}, status_code=404)
+    except _SignedMediaProbeCapacityError:
+        return JSONResponse({"error": "媒体直链探测繁忙，请稍后重试"}, status_code=503)
     except TimeoutError:
         log_throttled(
             logger, logging.WARNING, "playgy-timeout",
@@ -182,13 +164,13 @@ def play_gy(
         )
         return JSONResponse({"error": "光鸭播放地址获取超时"}, status_code=504)
     except Exception as exc:
+        if view and isinstance(exc, FileNotFoundError):
+            return JSONResponse({"error": "所选画质已不可用，请刷新画质列表"}, status_code=404)
         log_throttled(
             logger, logging.ERROR, f"playgy-error:{type(exc).__name__}",
             "playgy 异常 type=%s", type(exc).__name__,
         )
         return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=502 if view else 500)
-    finally:
-        close_guangya_client(client)
 
 _PLAYGY_PATH = "/playgy/{file_id}/{etag}/{size}/{filename:path}"
 

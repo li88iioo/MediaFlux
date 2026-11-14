@@ -615,6 +615,74 @@ class GuangYaTokenClientTests(unittest.TestCase):
             self.assertTrue(status["valid"])
             self.assertNotIn("rotated-access-9999", json.dumps(status, ensure_ascii=False))
 
+    def test_download_cache_context_does_not_refresh_or_change_expired_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory, expires_at=time() - 1)
+            before = token_file.read_bytes()
+            with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
+                client = GuangYaClient(token_file=token_file)
+            raw = client._raw
+            assert raw is not None
+            with patch.object(client, "_invalidate_if_stale", side_effect=AssertionError("scope must not validate or lock")):
+                scope, ua_bound = client.download_url_cache_context
+            self.assertEqual(len(scope), 24)
+            self.assertNotIn("access-secret", scope)
+            self.assertFalse(ua_bound)
+            self.assertEqual(raw.refresh_calls, [])
+            self.assertEqual(token_file.read_bytes(), before)
+
+    def test_timed_and_untimed_downloads_refresh_and_persist_through_the_same_request(self):
+        class DownloadRaw(_RotatingRawClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.requests = []
+
+            def request(self, url, method="GET", **kwargs):
+                self.requests.append((url, method, kwargs, self.token))
+                return httpx.Response(200, json={"data": {"signedURL": "https://signed.invalid/file"}})
+
+        for timeout in (None, 1.0):
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:
+                token_file = self._token_file(directory, expires_at=time() - 1)
+                with patch("app.clients.guangya._load_raw", return_value=DownloadRaw):
+                    client = GuangYaClient(token_file=token_file)
+                generation = client.credential_generation
+                url = client.get_download_url("file-id", timeout=timeout, raise_timeout=True)
+                raw = client._raw
+                assert raw is not None
+                self.assertEqual(url, "https://signed.invalid/file")
+                self.assertEqual(raw.refresh_calls, [None])
+                self.assertEqual(len(raw.requests), 1)
+                endpoint, method, kwargs, token = raw.requests[0]
+                self.assertTrue(endpoint.endswith("/get_res_download_url"))
+                self.assertEqual((method, kwargs["json"], token), ("POST", {"fileId": "file-id"}, "rotated-access-9999"))
+                if timeout is None:
+                    self.assertNotIn("timeout", kwargs)
+                else:
+                    self.assertTrue(0 < kwargs["timeout"] <= timeout)
+                self.assertEqual(json.loads(token_file.read_text())["access_token"], token)
+                self.assertEqual(client.credential_generation, generation)
+
+    def test_download_refresh_exhausting_budget_never_starts_the_url_request(self):
+        clock = [1000.0]
+
+        class SlowRefreshRaw(_RotatingRawClient):
+            def refresh_token(self, refresh_token=None):
+                clock[0] += 2.0
+                return super().refresh_token(refresh_token)
+
+            def request(self, *_args, **_kwargs):
+                raise AssertionError("expired operation must not request a URL")
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory, expires_at=time() - 1)
+            with patch("app.clients.guangya._load_raw", return_value=SlowRefreshRaw):
+                client = GuangYaClient(token_file=token_file)
+            with patch.object(guangya_module, "monotonic", side_effect=lambda: clock[0]):
+                with self.assertRaises(TimeoutError):
+                    client.get_download_url("file-id", timeout=1.0, raise_timeout=True)
+            self.assertEqual(json.loads(token_file.read_text())["access_token"], "rotated-access-9999")
+
     def test_successful_refresh_preserves_login_generation_and_stales_old_client(self):
         with tempfile.TemporaryDirectory() as directory:
             token_file = self._token_file(directory, expires_at=time() + 7200)
@@ -1395,7 +1463,8 @@ class GuangYaReadRetryPolicyTests(unittest.TestCase):
 
     def test_download_url_forwards_bounded_transport_timeout(self):
         client = object.__new__(GuangYaClient)
-        client._raw = Mock()
+        client._raw = Mock(token="fixture-access", token_expires_at=None)
+        client._last_persisted_token = "fixture-access"
         client._raw.request.return_value = Mock(
             json=Mock(return_value={"data": {"signedURL": "https://example/file"}})
         )
