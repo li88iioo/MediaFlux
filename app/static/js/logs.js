@@ -1199,8 +1199,8 @@ if (initialTab === 'runtime') {
     const textValue=value=>typeof value==='object'&&value!==null?String(value.title||value.name||value.path||JSON.stringify(value)):String(value??'');
     const evidenceLabels={number:'番号',release_date:'发行日期',actors:'演员',maker:'制作商',label:'厂牌',series:'系列'};
     const evidenceValue=value=>Array.isArray(value)?value.map(textValue).join('、'):textValue(value);
-    const sameEntries=(left,right)=>Array.isArray(left)&&left.length===right.length&&new Set(left.map(entry=>entry.token)).size===right.length&&
-        right.every(entry=>left.some(other=>other.token===entry.token&&other.candidate_index===entry.candidate_index));
+    const sameEntries=(left,right)=>Array.isArray(left)&&left.length===right.length&&new Set(left.map(entry=>entry.confirmation_id)).size===right.length&&
+        right.every(entry=>left.some(other=>other.confirmation_id===entry.confirmation_id&&other.candidate_index===entry.candidate_index));
     const title=item=>textValue(item.identity)||textValue(item.directory)||'未命名媒体组';
     const visible=()=>!el('Modal').hidden;
     const cleanTokens=tokens=>[...new Set((Array.isArray(tokens)?tokens:[]).filter(token=>typeof token==='string'&&token).slice(0,limit))];
@@ -1221,18 +1221,18 @@ if (initialTab === 'runtime') {
     function entryFor(item){
         const index=serverIndex(item);
         if(item?.status!=='pending'||index===null)return null;
-        if(state.drafts.has(item.token)&&state.drafts.get(item.token)!==index)return null;
-        return {token:item.token,candidate_index:index};
+        if(state.drafts.has(item.confirmation_id)&&state.drafts.get(item.confirmation_id)!==index)return null;
+        return {confirmation_id:item.confirmation_id,candidate_index:index};
     }
     const entriesForSelection=()=>[...state.selected].map(token=>entryFor(state.cache.get(token))).filter(Boolean);
     function merge(items){
         for(const item of items){
-            const previous=state.cache.get(item.token);
-            state.cache.set(item.token,item);
-            if(state.preview&&state.preview.entries.some(entry=>entry.token===item.token)&&
+            const previous=state.cache.get(item.confirmation_id);
+            state.cache.set(item.confirmation_id,item);
+            if(state.preview&&state.preview.entries.some(entry=>entry.confirmation_id===item.confirmation_id)&&
                 JSON.stringify(entryFor(previous))!==JSON.stringify(entryFor(item)))invalidatePreview();
         }
-        state.items=state.items.map(item=>state.cache.get(item.token)||item);
+        state.items=state.items.map(item=>state.cache.get(item.confirmation_id)||item);
     }
     async function request(path='',body){
         const response=await api(endpoint+path,body===undefined?{}:{method:'POST',body:JSON.stringify(body)});
@@ -1244,7 +1244,7 @@ if (initialTab === 'runtime') {
     async function snapshot(tokens){
         const items=[];
         for(let offset=0;offset<tokens.length;offset+=100){
-            const query={tokens:tokens.slice(offset,offset+100),status:'all',page_size:100};
+            const query={confirmation_ids:tokens.slice(offset,offset+100),status:'all',page_size:100};
             let page=1,pages=1;
             do{
                 const data=await request('/query',{...query,page});
@@ -1276,7 +1276,7 @@ if (initialTab === 'runtime') {
         el('Scope').disabled=state.busy;
         el('Filters').querySelectorAll('input,button').forEach(input=>{input.disabled=state.busy;});
         const selectable=state.items.filter(item=>item.status==='pending');
-        const checked=selectable.filter(item=>state.selected.has(item.token)).length;
+        const checked=selectable.filter(item=>state.selected.has(item.confirmation_id)).length;
         const selectPage=el('SelectPage');
         selectPage.disabled=locked||state.loading||!selectable.length;
         selectPage.checked=selectable.length>0&&checked===selectable.length;
@@ -1305,16 +1305,16 @@ if (initialTab === 'runtime') {
         const existing=new Map([...list.children].map(row=>[row.dataset.token,row]));
         let cursor=list.firstElementChild;
         for(const item of state.items){
-            let row=existing.get(item.token);
+            let row=existing.get(item.confirmation_id);
             if(!row){
-                row=document.createElement('article');row.className='confirmation-review-row';row.dataset.token=item.token;
+                row=document.createElement('article');row.className='confirmation-review-row';row.dataset.token=item.confirmation_id;
                 row.innerHTML='<label class="confirmation-review-check"><input type="checkbox"></label><button type="button" class="confirmation-review-open"><strong></strong><small></small><span class="confirmation-review-row-status"></span></button>';
             }
-            const checkbox=row.querySelector('input');checkbox.dataset.token=item.token;
+            const checkbox=row.querySelector('input');checkbox.dataset.token=item.confirmation_id;
             checkbox.setAttribute('aria-label','选择待确认媒体组 '+title(item));
-            const button=row.querySelector('button');button.dataset.token=item.token;
-            button.setAttribute('aria-label','审阅 '+title(item));button.setAttribute('aria-current',String(state.active===item.token));
-            row.classList.toggle('is-active',state.active===item.token);
+            const button=row.querySelector('button');button.dataset.token=item.confirmation_id;
+            button.setAttribute('aria-label','审阅 '+title(item));button.setAttribute('aria-current',String(state.active===item.confirmation_id));
+            row.classList.toggle('is-active',state.active===item.confirmation_id);
             button.querySelector('strong').textContent=title(item);
             const context=[item.source,item.reason].filter(Boolean).join(' · ');
             button.querySelector('small').textContent=context;button.querySelector('small').title=context;
@@ -1324,14 +1324,14 @@ if (initialTab === 'runtime') {
             const statusNode=button.querySelector('.confirmation-review-row-status');
             if(statusNode.innerHTML!==statusMarkup)statusNode.innerHTML=statusMarkup;
             if(row!==cursor)list.insertBefore(row,cursor);
-            cursor=row.nextElementSibling;existing.delete(item.token);
+            cursor=row.nextElementSibling;existing.delete(item.confirmation_id);
         }
         existing.forEach(row=>row.remove());
     }
     function renderDetail(){
         const item=state.cache.get(state.active), detail=el('Detail');
         if(!item){detail.innerHTML='<p class="confirmation-review-empty">选择一个媒体组，查看文件与候选作品。</p>';delete detail.dataset.signature;return;}
-        const draft=state.drafts.has(item.token)?state.drafts.get(item.token):serverIndex(item);
+        const draft=state.drafts.has(item.confirmation_id)?state.drafts.get(item.confirmation_id):serverIndex(item);
         const signature=JSON.stringify([item,draft]);
         if(detail.dataset.signature===signature)return;
         detail.dataset.signature=signature;
@@ -1364,19 +1364,19 @@ if (initialTab === 'runtime') {
         if(scope==='pending')Object.entries(state.filters).forEach(([key,value])=>{if(value)params.set(key,value);});
         try{
             const data=scope==='pending'?await request('?'+params):frozen.length?
-                await request('/query',{tokens:frozen,status:'all',page,page_size:pageSize}):{items:[],total:0,pages:0,tokens:[],counts:{}};
+                await request('/query',{confirmation_ids:frozen,status:'all',page,page_size:pageSize}):{items:[],total:0,pages:0,confirmation_ids:[],counts:{}};
             if(serial!==state.serial||!visible())return;
             // pending 队列中的项入队后会消失，详情仍回读其真实运行状态。
             const active=state.active;
             let activeItems=[];
-            if(active&&!(data.items||[]).some(item=>item.token===active))activeItems=await snapshot([active]);
+            if(active&&!(data.items||[]).some(item=>item.confirmation_id===active))activeItems=await snapshot([active]);
             if(serial!==state.serial||!visible())return;
             merge([...(data.items||[]),...activeItems]);
-            state.items=data.items||[];state.tokens=cleanTokens(data.tokens);state.total=Number(data.total)||0;
+            state.items=data.items||[];state.tokens=cleanTokens(data.confirmation_ids);state.total=Number(data.total)||0;
             state.pages=Number(data.pages)||0;state.page=Number(data.page)||page;state.counts=data.counts||{};
             state.truncated=Boolean(data.selection_truncated);state.reviewEnabled=Boolean(data.review_enabled);
             state.synced=true;
-            if(!state.active||!state.cache.get(state.active))state.active=state.items[0]?.token||'';
+            if(!state.active||!state.cache.get(state.active))state.active=state.items[0]?.confirmation_id||'';
             render();
             if(!quiet)say(state.truncated?'匹配超过 1000 组，本次上限 1000 组；可细化筛选继续审阅。':'已同步服务器状态。');
         }catch(error){if(serial===state.serial)say(`刷新失败：${error.message}。已保留列表与选择，请重试。`,true);}
@@ -1393,11 +1393,11 @@ if (initialTab === 'runtime') {
         finally{state.busy=false;el('List').setAttribute('aria-busy','false');if(visible()){render();if(!state.synced)load();else schedule();}}
     }
     async function next(){
-        const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.token);
+        const order=state.selected.has(state.active)?[...state.selected]:state.items.map(item=>item.confirmation_id);
         const index=order.indexOf(state.active), token=order[index+1];
         if(token){
             merge(await snapshot([token]));state.active=token;render();
-            if(el('Scope').value==='selected'||(!state.items.some(item=>item.token===token)&&state.selected.has(token))){
+            if(el('Scope').value==='selected'||(!state.items.some(item=>item.confirmation_id===token)&&state.selected.has(token))){
                 el('Scope').value='selected';
                 state.page=Math.floor((index+1)/pageSize)+1;
                 // 外层 act 解锁后再加载新页。
@@ -1446,8 +1446,8 @@ if (initialTab === 'runtime') {
     });
     el('SelectPage').addEventListener('change',event=>{
         for(const item of state.items.filter(item=>item.status==='pending')){
-            if(event.target.checked){if(state.selected.size<limit)state.selected.add(item.token);}
-            else state.selected.delete(item.token);
+            if(event.target.checked){if(state.selected.size<limit)state.selected.add(item.confirmation_id);}
+            else state.selected.delete(item.confirmation_id);
         }
         selectionChanged();
     });
@@ -1474,9 +1474,9 @@ if (initialTab === 'runtime') {
             const token=state.active,index=state.drafts.get(token);
             if(!Number.isInteger(index))return;
             invalidatePreview();
-            await request('/selection',{token,candidate_index:index});
+            await request('/selection',{confirmation_id:token,candidate_index:index});
             const items=await snapshot([token]);merge(items);
-            const saved=items.find(item=>item.token===token);
+            const saved=items.find(item=>item.confirmation_id===token);
             if(saved?.suggestion?.source!=='human'||serverIndex(saved)!==index)throw new Error('选择已提交，尚未从服务器读回人工选择，请刷新核实');
             state.drafts.delete(token);say('人工选择已保存，尚未执行整理。');await next();
         });
@@ -1484,9 +1484,9 @@ if (initialTab === 'runtime') {
     el('Agent').addEventListener('click',()=>act(async()=>{
         invalidatePreview();
         const tokens=[...state.selected],items=await snapshot(tokens);merge(items);
-        const eligible=items.filter(item=>item.status==='pending'&&item.suggestion?.source!=='human'&&!['pending','queued','running'].includes(item.review_status)).map(item=>item.token);
+        const eligible=items.filter(item=>item.status==='pending'&&item.suggestion?.source!=='human'&&!['pending','queued','running'].includes(item.review_status)).map(item=>item.confirmation_id);
         if(!eligible.length){say('没有需要复核的待确认项；人工选择、已排队及已完成项已保留。');return;}
-        const data=await request('/review',{tokens:eligible});
+        const data=await request('/review',{confirmation_ids:eligible});
         merge(await snapshot(eligible));
         say(`已请求 ${data.requested??eligible.length} 组只读复核${data.unchanged?`，${data.unchanged} 组保持原状态`:''}；建议会自动刷新，未执行整理。`);
     }));
@@ -1501,7 +1501,7 @@ if (initialTab === 'runtime') {
         const data=await request('/preview',{entries});
         if(serial!==state.previewSerial||!visible())return;
         if(!data.digest||!sameEntries(data.entries,entries))throw new Error('预览与当前选择不一致，请重新预览');
-        if(!Array.isArray(data.items)||data.items.length!==entries.length||new Set(data.items.map(item=>item.token)).size!==entries.length||data.items.some(item=>item.error||!entries.some(entry=>entry.token===item.token)))throw new Error('部分媒体组无法预览，请刷新后检查');
+        if(!Array.isArray(data.items)||data.items.length!==entries.length||new Set(data.items.map(item=>item.confirmation_id)).size!==entries.length||data.items.some(item=>item.error||!entries.some(entry=>entry.confirmation_id===item.confirmation_id)))throw new Error('部分媒体组无法预览，请刷新后检查');
         state.preview={entries,digest:data.digest};
         const skipped=tokens.length-entries.length;
         el('PreviewSummary').textContent=`本次确认 ${entries.length} 组，各自使用下列候选；${skipped} 组不提交，其中仍待确认的项继续保留。`;
@@ -1518,16 +1518,16 @@ if (initialTab === 'runtime') {
     el('Submit').addEventListener('click',()=>act(async()=>{
         const preview=state.preview;if(!preview)return;
         // 点击确认后仍核实服务器状态；刷新恢复绝不自动重放此 POST。
-        const items=await snapshot(preview.entries.map(entry=>entry.token));
-        const current=new Map(items.map(item=>[item.token,item]));merge(items);
-        if(preview!==state.preview||preview.entries.some(entry=>JSON.stringify(entryFor(current.get(entry.token)))!==JSON.stringify(entry))){
+        const items=await snapshot(preview.entries.map(entry=>entry.confirmation_id));
+        const current=new Map(items.map(item=>[item.confirmation_id,item]));merge(items);
+        if(preview!==state.preview||preview.entries.some(entry=>JSON.stringify(entryFor(current.get(entry.confirmation_id)))!==JSON.stringify(entry))){
             invalidatePreview();say('服务器状态或候选已变化，请重新预览；已完成项不会重复提交。',true);return;
         }
-        invalidatePreview();state.batch=preview.entries.map(entry=>entry.token);persist();
+        invalidatePreview();state.batch=preview.entries.map(entry=>entry.confirmation_id);persist();
         let data;
         try{data=await request('/submit',preview);}
         catch(error){el('Scope').value='batch';state.active='';say(`提交状态待核实：${error.message}。请刷新当前批次，系统不会自动重试。`,true);return;}
-        merge((data.items||[]).map(receipt=>({...state.cache.get(receipt.token),...receipt})));
+        merge((data.items||[]).map(receipt=>({...state.cache.get(receipt.confirmation_id),...receipt})));
         el('Scope').value='batch';state.active='';state.page=1;
         say(`后台已接收 ${data.accepted??0} 组${data.failed?`，${data.failed} 组未入队`:''}；运行状态会自动刷新。`,Boolean(data.failed));
         // 保留回执供网络刷新失败时核对；最终以服务器查询状态恢复。

@@ -90,15 +90,15 @@ def _suggestion_preview(items: list[dict], chat_id: str) -> dict | None:
             continue
         index = suggestion.get("candidate_index")
         if _candidate(item, index) is not None:
-            entries.append({"token": item["token"], "candidate_index": index})
+            entries.append({"confirmation_id": item["confirmation_id"], "candidate_index": index})
     if not entries:
         return None
     preview = preview_choices(entries, chat_id=chat_id)
     scope_digest = preview["digest"]
     mapped = [item for item in preview["items"] if item.get("episode_mappings")]
     if mapped:
-        mapped_tokens = {item["token"] for item in mapped}
-        ordinary = [entry for entry in preview["entries"] if entry["token"] not in mapped_tokens]
+        mapped_tokens = {item["confirmation_id"] for item in mapped}
+        ordinary = [entry for entry in preview["entries"] if entry["confirmation_id"] not in mapped_tokens]
         preview = preview_choices(ordinary, chat_id=chat_id) if ordinary else {"entries": [], "digest": "", "items": []}
     return {**preview, "mapping_items": mapped, "scope_digest": scope_digest}
 
@@ -127,7 +127,7 @@ def _batch_event(
 ) -> NotificationEvent:
     pages = max(1, (len(items) + _PAGE_SIZE - 1) // _PAGE_SIZE)
     page = max(1, min(page, pages))
-    anchor = str(items[0]["token"])
+    anchor = str(items[0]["confirmation_id"])
     counts = Counter(str(item.get("status") or "pending") for item in items)
     downstream_counts = _downstream_counts(items)
     status_text = " · ".join(f"{label} {counts[status]}" for status, label in _STATUSES.items() if counts[status])
@@ -135,7 +135,7 @@ def _batch_event(
         "batch_id": batch_id, "page": page, "detail_token": detail_token,
         "progress": dict(counts), "downstream": downstream_counts, "truncated": truncated,
     }
-    detail = next((item for item in items if item["token"] == detail_token), None)
+    detail = next((item for item in items if item["confirmation_id"] == detail_token), None)
     lines: list[str] = []
     actions: list[NotificationAction] = []
     if detail is not None:
@@ -214,7 +214,7 @@ def _batch_event(
                 lines.append(f"建议：{_candidate_label(candidate)}\n{truncate_telegram_text(suggestion.get('summary') or '请查看候选详情', 140)}")
             elif item.get("review_summary") and status == "pending":
                 lines.append(f"复核：{truncate_telegram_text(item['review_summary'], 140)}")
-            actions.append(_button(f"查看 {offset} · {identity}", item["token"], "d", page))
+            actions.append(_button(f"查看 {offset} · {identity}", item["confirmation_id"], "d", page))
         if page > 1:
             actions.append(_button("上一页", anchor, "p", page - 1))
         if page < pages:
@@ -340,7 +340,7 @@ def handle_batch_callback(data: str, *, chat_id: str, message_id: int) -> str:
         result = _batch_items(batch_id, chat_id)
         if result.get("selection_truncated") or result["total"] > len(result["items"]):
             raise ValueError("此批次超过 1000 组，请在 Web 分批请求复核")
-        tokens = [item["token"] for item in result["items"] if item.get("status") == "pending"]
+        tokens = [item["confirmation_id"] for item in result["items"] if item.get("status") == "pending"]
         if tokens:
             counts = request_reviews(tokens, chat_id=chat_id)
             notice = f"只读复核：新请求 {counts['requested']} 组，保留 {counts['unchanged']} 组，不可用 {counts['unavailable']} 组；仍需人工确认"

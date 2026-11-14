@@ -196,7 +196,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             self.assertNotEqual(approval, old_approval)
             self.assertIn("已接纳 2 组", self._callback(approval))
             self.assertEqual(submit.call_count, 1)
-            self.assertEqual({entry["token"]: entry["candidate_index"] for entry in submit.call_args.args[0]}, {first: 0, second: 1})
+            self.assertEqual({entry["confirmation_id"]: entry["candidate_index"] for entry in submit.call_args.args[0]}, {first: 0, second: 1})
             with self.assertRaisesRegex(ValueError, "建议已变化"):
                 self._callback(approval)
             self.assertEqual(submit.call_count, 1)
@@ -289,7 +289,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         def preview(entries, **kwargs):
             result = original(entries, **kwargs)
             for item in result["items"]:
-                if item["token"] == mapped:
+                if item["confirmation_id"] == mapped:
                     item["episode_mappings"] = mappings
                     result["digest"] = hashlib.sha256((result["digest"] + json.dumps(mappings)).encode()).hexdigest()
             return result

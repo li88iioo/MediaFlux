@@ -2836,7 +2836,7 @@ def query_organize_confirmations(
             values.append(text)
     if tokens is not None:
         if not tokens:
-            return {"rows": [], "tokens": [], "total": 0, "counts": {}}
+            return {"rows": [], "tokens": [], "total": 0, "counts": {}, "log_ids": {}}
         clauses.append("token IN (" + ",".join("?" for _ in tokens) + ")")
         values.extend(tokens)
     elif not batch_id:
@@ -2858,7 +2858,17 @@ def query_organize_confirmations(
         selected = conn.execute(
             "SELECT token" + where + " ORDER BY id DESC LIMIT ?", [*values, selection_limit],
         ).fetchall()
-    return {"rows": rows, "tokens": [row["token"] for row in selected], "total": total, "counts": counts}
+        # 一次查询本页的精确执行关联；不按标题猜测，也不为每条确认单分别查日志。
+        log_ids: dict[str, list[int]] = {}
+        if rows:
+            operations = {f"recognition-confirm:{row['token']}": row["token"] for row in rows}
+            for log in conn.execute(
+                "SELECT id,operation_token FROM organize_log WHERE operation_token!='' AND operation_token IN ("
+                + ",".join("?" for _ in operations) + ") ORDER BY id", list(operations),
+            ):
+                log_ids.setdefault(operations[log["operation_token"]], []).append(log["id"])
+    return {"rows": rows, "tokens": [row["token"] for row in selected],
+            "total": total, "counts": counts, "log_ids": log_ids}
 
 
 def request_organize_confirmation_reviews(tokens: list[str], *, chat_id: str | None = None) -> dict:

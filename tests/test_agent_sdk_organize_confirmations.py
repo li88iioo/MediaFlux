@@ -44,7 +44,7 @@ def runtime(monkeypatch):
 def batches(monkeypatch):
     import app.modules
 
-    entries = [{"token": f"case-{i:04d}", "candidate_index": i % 3} for i in range(100)]
+    entries = [{"confirmation_id": f"case-{i:04d}", "candidate_index": i % 3} for i in range(100)]
     frozen = {"entries": entries, "digest": "frozen-choice-digest", "items": [
         {**entry, "identity": f"媒体 {i}", "directory": f"/source/{i}",
          "candidate": {"title": f"候选 {i}-{entry['candidate_index']}", "tmdb_id": str(1000 + i),
@@ -57,7 +57,7 @@ def batches(monkeypatch):
         submit_choices=Mock(return_value={"items": [{**entry, "status": "queued", "error": ""} for entry in entries],
                                          "accepted": 100, "failed": 0}),
         list_confirmations=Mock(return_value={"items": [], "total": 0, "pages": 0, "page": 1,
-                                             "tokens": [], "counts": {}, "selection_truncated": False,
+                                             "confirmation_ids": [], "counts": {}, "selection_truncated": False,
                                              "review_enabled": False}),
         request_reviews=Mock(return_value={"requested": 100, "unchanged": 0}),
         frozen=frozen,
@@ -91,15 +91,15 @@ def test_sdk_declares_effects_and_preserves_admin_activity_read_scope(batches):
     assert catalog.get(METHOD).effect is ToolEffect.DANGER
     registered = {tool.name for tool in catalog.visible() if tool.effect is not ToolEffect.READ}
     assert registered | {"session.batch"} == sdk.WRITE_METHODS
-    tokens = ["case-0001", "case-0050"]
+    confirmation_ids = ["case-0001", "case-0050"]
     with sdk.call_owner(OWNER):
         result = sdk.activity.organize_confirmations(batch_id="batch", task_id="task", source="guangya",
-            reason="ambiguous", q="媒体", status="all", tokens=tokens, page=2, page_size=5)
+            reason="ambiguous", q="媒体", status="all", confirmation_ids=confirmation_ids, page=2, page_size=5)
         assert result is batches.list_confirmations.return_value
-        assert sdk.activity.review_organize_confirmations(tokens) is batches.request_reviews.return_value
+        assert sdk.activity.review_organize_confirmations(confirmation_ids) is batches.request_reviews.return_value
     batches.list_confirmations.assert_called_once_with(batch_id="batch", task_id="task", source="guangya",
-        reason="ambiguous", q="媒体", status="all", tokens=tokens, page=2, page_size=5)
-    batches.request_reviews.assert_called_once_with(tokens)
+        reason="ambiguous", q="媒体", status="all", confirmation_ids=confirmation_ids, page=2, page_size=5)
+    batches.request_reviews.assert_called_once_with(confirmation_ids)
     batches.preview_choices.assert_not_called()
     batches.submit_choices.assert_not_called()
     with pytest.raises(TypeError):
@@ -172,7 +172,7 @@ def test_execution_rejects_wrong_frozen_scope_before_domain_submit(runtime, batc
         elif change == "session":
             plan = replace(plan, session_id="foreign")
         elif change == "arguments":
-            plan = replace(plan, arguments={"entries": [{"token": "foreign", "candidate_index": 0}]})
+            plan = replace(plan, arguments={"entries": [{"confirmation_id": "foreign", "candidate_index": 0}]})
         elif change == "tool":
             plan = replace(plan, tool_name="activity.reorganize")
         elif change == "metadata":
@@ -226,8 +226,8 @@ def test_real_confirmation_fences_reject_cancelled_foreign_and_stale_plans(runti
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("entries", [[], [{"token": "case", "candidate_index": True}],
-    [{"token": "case", "candidate_index": -1}], [{"token": "case", "candidate_index": 0, "actor": "human"}]])
+@pytest.mark.parametrize("entries", [[], [{"confirmation_id": "case", "candidate_index": True}],
+    [{"confirmation_id": "case", "candidate_index": -1}], [{"confirmation_id": "case", "candidate_index": 0, "actor": "human"}]])
 def test_write_schema_rejects_invalid_or_model_supplied_authority(runtime, batches, entries):
     async def check():
         store = SQLiteKernelStore()
@@ -256,11 +256,9 @@ def test_receipt_preserves_per_item_rejections_without_claiming_completion(runti
         result = (await effects.execute_confirmed(plan.plan_id, context=context)).outcome.public_content
         assert result["ok"] is bool(accepted)
         assert result["status"] == ("accepted" if accepted else "failed")
-        assert [{key: value for key, value in row.items() if key != "token"} for row in result["data"]["items"]] == [
-            {key: value for key, value in row.items() if key != "token"} for row in items]
+        assert result["data"]["items"] == items
         assert (result["data"]["accepted"], result["data"]["failed"]) == (accepted, failed)
-        # token 属原公开投影的敏感键；跟踪沿脚本此前保存的原 entries。
-        assert result["data"]["tokens"] == "[已隐藏]"
+        assert result["data"]["confirmation_ids"] == [entry["confirmation_id"] for entry in entries]
         assert "完成后会自动回报" not in result["summary"]
 
     asyncio.run(check())
@@ -305,9 +303,9 @@ def test_review_control_rpc_is_available_in_read_only_scope_without_confirmation
         (tmp_path / "run").mkdir()
         bridge = sandbox._SDKRequests(context, tmp_path, executor(store))
         bridge.uid = os.getuid()
-        tokens = [entry["token"] for entry in batches.frozen["entries"]]
+        confirmation_ids = [entry["confirmation_id"] for entry in batches.frozen["entries"]]
         request = tmp_path / "run/mf-requests/review.json"
-        request.write_text(json.dumps({"method": "activity.review_organize_confirmations", "arguments": {"tokens": tokens}}))
+        request.write_text(json.dumps({"method": "activity.review_organize_confirmations", "arguments": {"confirmation_ids": confirmation_ids}}))
         try:
             await bridge.dispatch(request.name)
             assert bridge.proposal is None
@@ -315,7 +313,7 @@ def test_review_control_rpc_is_available_in_read_only_scope_without_confirmation
             assert response["result"] == {"requested": 100, "unchanged": 0}
         finally:
             await bridge.close()
-        batches.request_reviews.assert_called_once_with(tokens)
+        batches.request_reviews.assert_called_once_with(confirmation_ids)
         batches.preview_choices.assert_not_called()
         batches.submit_choices.assert_not_called()
     asyncio.run(check())
@@ -353,9 +351,9 @@ def test_real_batch_service_queues_one_hundred_distinct_choices_as_explicit_agen
     from app import database as db
 
     page = sdk.activity.organize_confirmations(batch_id="sdk-batch")
-    assert (page["total"], page["pages"], len(page["tokens"]), len(page["items"])) == (100, 5, 100, 20)
+    assert (page["total"], page["pages"], len(page["confirmation_ids"]), len(page["items"])) == (100, 5, 100, 20)
     assert page["review_enabled"] is False
-    entries = [{"token": token, "candidate_index": int(token.rsplit("-", 1)[1]) % 2} for token in page["tokens"]]
+    entries = [{"confirmation_id": token, "candidate_index": int(token.rsplit("-", 1)[1]) % 2} for token in page["confirmation_ids"]]
 
     async def check():
         store = SQLiteKernelStore()
@@ -363,16 +361,16 @@ def test_real_batch_service_queues_one_hundred_distinct_choices_as_explicit_agen
         effects = executor(store)
         plan = (await effects.prepare(METHOD, {"entries": entries}, context=context)).effect_plan
         assert plan is not None and len(plan.metadata["organize_confirmations_preview"]["items"]) == 100
-        assert sdk.activity.organize_confirmations(tokens=page["tokens"])["counts"] == {"pending": 100}
+        assert sdk.activity.organize_confirmations(confirmation_ids=page["confirmation_ids"])["counts"] == {"pending": 100}
         result = (await effects.execute_confirmed(plan.plan_id, context=context)).outcome.public_content
         assert result["status"] == "accepted" and result["data"]["accepted"] == 100
-        progress = sdk.activity.organize_confirmations(tokens=page["tokens"], status="all", page_size=100)
+        progress = sdk.activity.organize_confirmations(confirmation_ids=page["confirmation_ids"], status="all", page_size=100)
         assert progress["counts"] == {"queued": 100}
-        by_token = {item["token"]: item for item in progress["items"]}
+        by_confirmation_id = {item["confirmation_id"]: item for item in progress["items"]}
         for entry in entries:
-            item = by_token[entry["token"]]
+            item = by_confirmation_id[entry["confirmation_id"]]
             assert item["selected_index"] == entry["candidate_index"] and not item["error"]
-            row = db.get_organize_confirmation(entry["token"])
+            row = db.get_organize_confirmation(entry["confirmation_id"])
             assert row is not None and row["confirmation_actor"] == "agent"
             assert json.loads(row["payload_json"])["_explicit_approval"] is True
         confirmation_backend.wake.assert_called_once_with()
@@ -381,7 +379,7 @@ def test_real_batch_service_queues_one_hundred_distinct_choices_as_explicit_agen
 
 
 @pytest.mark.skipif(not sandbox.sandbox_supported(), reason="需要真实 Linux 工作区隔离")
-def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_tokens(confirmation_backend, monkeypatch, tmp_path):
+def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_confirmation_ids(confirmation_backend, monkeypatch, tmp_path):
     from app import database as db
     from app.modules import agent_recognition_review as reviews, organize_confirmation_batches as batches
     from app.modules import organize_confirmations as confirmations
@@ -398,6 +396,12 @@ def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_tokens(conf
     start = Mock(wraps=confirmations.start_confirmation)
     monkeypatch.setattr(batches, "submit_choices", submit)
     monkeypatch.setattr(confirmations, "start_confirmation", start)
+    expected_choices = [
+        {"confirmation_id": item["confirmation_id"], "candidate_index": index,
+         "title": item["candidates"][index]["title"]}
+        for index, item in enumerate(sdk.activity.organize_confirmations(batch_id="sdk-batch", page_size=2)["items"])
+    ]
+    assert len({item["confirmation_id"] for item in expected_choices}) == 2
 
     def process_reviews(count):
         for _ in range(count):
@@ -429,23 +433,33 @@ except ModuleNotFoundError:
 else:
     raise AssertionError("工作区不得导入宿主 SDK")
 page = activity.organize_confirmations(batch_id="sdk-batch", page_size=1000)
-assert page["total"] == len(page["tokens"]) == 100
-Path("tokens.json").write_text(json.dumps(page["tokens"]))
-requested = activity.review_organize_confirmations(page["tokens"])
+assert page["total"] == len(page["confirmation_ids"]) == 100
+choices = [{"confirmation_id": item["confirmation_id"], "candidate_index": index,
+            "title": item["candidates"][index]["title"]} for index, item in enumerate(page["items"][:2])]
+print(json.dumps({"confirmation_ids": [item["confirmation_id"] for item in choices], "items": choices,
+                  "credentials": "sandbox-private-credential", "access_token": "sandbox-private-access"}, ensure_ascii=False))
+Path("confirmation_ids.json").write_text(json.dumps(page["confirmation_ids"]))
+requested = activity.review_organize_confirmations(page["confirmation_ids"])
 assert requested["requested"] == 100
-progress = activity.organize_confirmations(tokens=page["tokens"], status="all", page_size=1000)
+progress = activity.organize_confirmations(confirmation_ids=page["confirmation_ids"], status="all", page_size=1000)
 assert progress["counts"] == {"pending": 100}
 assert all(item["review_status"] == "pending" and item["suggestion"] is None for item in progress["items"])
 ''')
         assert read.effect_plan is None
+        # 实际 SDK RPC -> 沙箱 stdout -> 公开/模型投影；不能仅检查沙箱内未脱敏的原数据。
+        for content in (read.outcome.public_content, json.loads(read.outcome.model_content)):
+            visible = json.loads(content["data"]["stdout"])
+            assert visible["items"] == expected_choices
+            assert visible["confirmation_ids"] == [item["confirmation_id"] for item in expected_choices]
+            assert visible["credentials"] == visible["access_token"] == "********"
         assert [call["method"] for call in read.outcome.public_content["data"]["sdk_calls"]] == [
             "activity.organize_confirmations", "activity.review_organize_confirmations", "activity.organize_confirmations"]
         process_reviews(50)
         pending = await code('''import json
 from pathlib import Path
 from mf import activity
-tokens = json.loads(Path("tokens.json").read_text())
-progress = activity.organize_confirmations(tokens=tokens, status="all", page_size=1000)
+confirmation_ids = json.loads(Path("confirmation_ids.json").read_text())
+progress = activity.organize_confirmations(confirmation_ids=confirmation_ids, status="all", page_size=1000)
 assert progress["counts"] == {"pending": 100}
 assert sum(item["review_status"] == "pending" for item in progress["items"]) == 50
 assert sum(item["review_status"] == "approved" for item in progress["items"]) == 50
@@ -459,11 +473,11 @@ assert all(item["selected_index"] is None for item in progress["items"])
         prepared = await code('''import json
 from pathlib import Path
 from mf import activity
-tokens = json.loads(Path("tokens.json").read_text())
-page = activity.organize_confirmations(tokens=tokens, status="all", page_size=1000)
+confirmation_ids = json.loads(Path("confirmation_ids.json").read_text())
+page = activity.organize_confirmations(confirmation_ids=confirmation_ids, status="all", page_size=1000)
 assert page["counts"] == {"pending": 100}
 assert all(item["review_status"] == "approved" for item in page["items"])
-entries = [{"token": item["token"], "candidate_index": item["suggestion"]["candidate_index"]} for item in page["items"]]
+entries = [{"confirmation_id": item["confirmation_id"], "candidate_index": item["suggestion"]["candidate_index"]} for item in page["items"]]
 assert {entry["candidate_index"] for entry in entries} == {0, 1}
 Path("entries.json").write_text(json.dumps(entries))
 with Path("runs.txt").open("a") as stream:
@@ -476,7 +490,7 @@ Path("after-write.txt").write_text("must not run")
         assert prepared.outcome.public_content["status"] == "approval_required"
         root, _ = sandbox._workspace_location(OWNER, context.session_id)
         entries = json.loads((root / "work/entries.json").read_text())
-        tokens = json.loads((root / "work/tokens.json").read_text())
+        confirmation_ids = json.loads((root / "work/confirmation_ids.json").read_text())
         assert plan.arguments == {"entries": entries}
         assert (root / "work/runs.txt").read_text() == "once\n"
         assert not (root / "work/after-write.txt").exists()
@@ -501,20 +515,20 @@ Path("after-write.txt").write_text("must not run")
         followed = await code('''import json
 from pathlib import Path
 from mf import activity
-tokens = json.loads(Path("tokens.json").read_text())
+confirmation_ids = json.loads(Path("confirmation_ids.json").read_text())
 entries = json.loads(Path("entries.json").read_text())
-progress = activity.organize_confirmations(tokens=tokens, status="all", page_size=1000)
-assert set(progress["tokens"]) == set(tokens)
+progress = activity.organize_confirmations(confirmation_ids=confirmation_ids, status="all", page_size=1000)
+assert set(progress["confirmation_ids"]) == set(confirmation_ids)
 assert progress["counts"] == {"queued": 100}
-by_token = {item["token"]: item for item in progress["items"]}
-assert all(by_token[entry["token"]]["selected_index"] == entry["candidate_index"] for entry in entries)
+by_confirmation_id = {item["confirmation_id"]: item for item in progress["items"]}
+assert all(by_confirmation_id[entry["confirmation_id"]]["selected_index"] == entry["candidate_index"] for entry in entries)
 Path("progress.json").write_text(json.dumps(progress))
 assert Path("runs.txt").read_text() == "once\\n"
 assert not Path("after-write.txt").exists()
 ''')
         assert followed.effect_plan is None
         progress = json.loads((root / "work/progress.json").read_text())
-        assert set(progress["tokens"]) == set(tokens)
+        assert set(progress["confirmation_ids"]) == set(confirmation_ids)
         assert model.call_count == 100
         confirmation_backend.dispatch.assert_not_called()
         confirmation_backend.wake.assert_called_once_with()

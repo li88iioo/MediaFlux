@@ -738,15 +738,15 @@ def activity_confirm_organize_tool() -> KernelToolSpec:
                 requested = accepted["accepted"]
                 failed = accepted["failed"]
                 return ToolResult(bool(requested), "accepted" if requested else "failed",
-                    f"已受理 {requested} 组、未受理 {failed} 组；整理尚未完成，请按 tokens 查询队列进度" if requested
+                    f"已受理 {requested} 组、未受理 {failed} 组；整理尚未完成，请按 confirmation_ids 查询队列进度" if requested
                     else f"整理队列未受理请求，{failed} 组失败",
-                    data={**accepted, "tokens": [entry["token"] for entry in frozen["entries"]]})
+                    data={**accepted, "confirmation_ids": [entry["confirmation_id"] for entry in frozen["entries"]]})
         except (ValueError, LookupError, TypeError, ToolPipelineError, AgentRuntimeDisabled, RuntimeFenceError) as exc:
             error = ToolPipelineError(str(exc), code=getattr(exc, "code", "precondition_failed"))
             error.mark_execution_started(False)
             raise error from exc
         except Exception as exc:
-            error = ToolPipelineError("整理提交结果待核对，请按 tokens 查询队列，勿重复提交", code="outcome_unknown")
+            error = ToolPipelineError("整理提交结果待核对，请按 confirmation_ids 查询队列，勿重复提交", code="outcome_unknown")
             error.mark_execution_started(submitted)
             raise error from exc
 
@@ -754,8 +754,8 @@ def activity_confirm_organize_tool() -> KernelToolSpec:
         description=activity.confirm_organize.__doc__ or "", metadata={"risk": "danger"},
         input_schema={"type": "object", "required": ["entries"], "additionalProperties": False,
             "properties": {"entries": {"type": "array", "minItems": 1, "maxItems": 1000,
-                "items": {"type": "object", "required": ["token", "candidate_index"], "additionalProperties": False,
-                    "properties": {"token": {"type": "string", "minLength": 1},
+                "items": {"type": "object", "required": ["confirmation_id", "candidate_index"], "additionalProperties": False,
+                    "properties": {"confirmation_id": {"type": "string", "minLength": 1},
                         "candidate_index": {"type": "integer", "minimum": 0}}}}}},
         prepare=prepare, execute_confirmed=execute)
 

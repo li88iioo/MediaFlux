@@ -56,11 +56,11 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         for index in range(25):
             self.create(str(index))
         page = batches.list_confirmations(page_size=20)
-        self.assertEqual((page["total"], len(page["items"]), len(page["tokens"])), (25, 20, 25))
-        frozen = page["tokens"]
+        self.assertEqual((page["total"], len(page["items"]), len(page["confirmation_ids"])), (25, 20, 25))
+        frozen = page["confirmation_ids"]
         self.create("new")
-        self.assertEqual(batches.list_confirmations(tokens=frozen)["total"], 25)
-        entries = [{"token": "0", "candidate_index": 0}, {"token": "24", "candidate_index": 1}]
+        self.assertEqual(batches.list_confirmations(confirmation_ids=frozen)["total"], 25)
+        entries = [{"confirmation_id": "0", "candidate_index": 0}, {"confirmation_id": "24", "candidate_index": 1}]
         preview = batches.preview_choices(entries)
         self.assertNotEqual(preview["items"][0]["candidate"]["title"], preview["items"][1]["candidate"]["title"])
         self.assertEqual(self.row("0")["status"], "pending")
@@ -97,8 +97,8 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
             )
         result = batches.list_confirmations(page=11, page_size=100)
         self.assertEqual((result["total"], result["pages"], result["counts"]), (1001, 11, {"pending": 1001}))
-        self.assertEqual([item["token"] for item in result["items"]], ["seed"])
-        self.assertEqual(len(result["tokens"]), 1000)
+        self.assertEqual([item["confirmation_id"] for item in result["items"]], ["seed"])
+        self.assertEqual(len(result["confirmation_ids"]), 1000)
         self.assertTrue(result["selection_truncated"])
         self.assertEqual(batches.list_confirmations(page=12, page_size=100)["items"], [])
 
@@ -108,7 +108,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET expires_at='2000-01-01' WHERE token='one'")
         self.assertEqual(batches.list_confirmations(status="all")["counts"], {"pending": 1, "expired": 1})
-        self.assertEqual([item["token"] for item in batches.list_confirmations(status="expired")["items"]], ["one"])
+        self.assertEqual([item["confirmation_id"] for item in batches.list_confirmations(status="expired")["items"]], ["one"])
 
     def test_rescan_keeps_superseded_group_visible_in_original_batch_progress(self):
         payload = self.create("old", batch="old-batch")
@@ -159,7 +159,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         with self.assertRaises(ValueError):
             db.claim_organize_confirmation("one", chat_id="chat", selected_index=0, actor="agent")
         self.assertEqual(self.row("one")["status"], "pending")
-        preview = batches.preview_choices([{"token": "one", "candidate_index": 1}])
+        preview = batches.preview_choices([{"confirmation_id": "one", "candidate_index": 1}])
         result = batches.submit_choices(preview["entries"], preview["digest"], actor="agent")
         self.assertEqual(result["accepted"], 1)
         row = self.row("one")
@@ -168,7 +168,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_wrong_chat_changed_candidate_and_duplicate_group_are_rejected(self):
         self.create("one")
-        entries = [{"token": "one", "candidate_index": 0}]
+        entries = [{"confirmation_id": "one", "candidate_index": 0}]
         with self.assertRaises(ValueError):
             batches.preview_choices(entries, chat_id="other")
         self.assertEqual(batches.list_confirmations(chat_id="other")["items"], [])
@@ -176,7 +176,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
             batches.preview_choices(entries * 2)
         preview = batches.preview_choices(entries)
         with self.assertRaisesRegex(ValueError, "预览已变化"):
-            batches.submit_choices([{"token": "one", "candidate_index": 1}], preview["digest"])
+            batches.submit_choices([{"confirmation_id": "one", "candidate_index": 1}], preview["digest"])
         row = self.row("one")
         payload = json.loads(row["payload_json"])
         payload["files"][0]["size"] += 1
@@ -187,7 +187,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_expiry_and_rules_changes_reject_preview_without_cloud_writes(self):
         self.create("one")
-        entries = [{"token": "one", "candidate_index": 0}]
+        entries = [{"confirmation_id": "one", "candidate_index": 0}]
         self.rules.target_dir_id = "another-target"
         with self.assertRaisesRegex(ValueError, "整理规则已变化"):
             batches.preview_choices(entries)
@@ -200,7 +200,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
     def test_queue_rejection_does_not_replay_accepted_items(self):
         self.create("one")
         self.create("two")
-        entries = [{"token": token, "candidate_index": 0} for token in ("one", "two")]
+        entries = [{"confirmation_id": token, "candidate_index": 0} for token in ("one", "two")]
         preview = batches.preview_choices(entries)
         original = confirmations.start_confirmation
         def racing_start(token, *args, **kwargs):
@@ -226,18 +226,23 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         app = FastAPI()
         app.include_router(logs_api.router)
         self.create("one")
+        self.create("unselected")
         with patch.object(logs_api, "require_api_login"), TestClient(app) as client:
-            response = client.post("/api/logs/organize/confirmations/selection", json={"token": "one", "candidate_index": 1})
+            response = client.post("/api/logs/organize/confirmations/selection", json={"confirmation_id": "one", "candidate_index": 1})
             self.assertEqual(response.status_code, 200)
-            view = client.post("/api/logs/organize/confirmations/query", json={"tokens": ["one"]}).json()
+            view = client.post("/api/logs/organize/confirmations/query", json={"confirmation_ids": ["one"]}).json()
+            self.assertEqual(view["confirmation_ids"], ["one"])
+            self.assertEqual([item["confirmation_id"] for item in view["items"]], ["one"])
+            self.assertEqual(client.get("/api/logs/organize/confirmations",
+                                        params={"confirmation_ids": "one", "status": "all"}).json(), view)
             self.assertEqual(view["items"][0]["suggestion"]["candidate_index"], 1)
-            entries = [{"token": "one", "candidate_index": 1}]
+            entries = [{"confirmation_id": "one", "candidate_index": 1}]
             preview = client.post("/api/logs/organize/confirmations/preview", json={"entries": entries})
             self.assertEqual(preview.status_code, 200)
             accepted = client.post("/api/logs/organize/confirmations/submit", json={"entries": entries, "digest": preview.json()["digest"]})
             self.assertEqual(accepted.json()["accepted"], 1)
-            self.assertEqual(client.post("/api/logs/organize/confirmations/query", json={"tokens": ["one"]}).json()["items"][0]["status"], "queued")
-            invalid = client.post("/api/logs/organize/confirmations/review", json={"tokens": "one"})
+            self.assertEqual(client.post("/api/logs/organize/confirmations/query", json={"confirmation_ids": ["one"]}).json()["items"][0]["status"], "queued")
+            invalid = client.post("/api/logs/organize/confirmations/review", json={"confirmation_ids": "one"})
             self.assertEqual(invalid.status_code, 400)
 
     def test_agent_and_notifications_off_still_persist_web_candidates(self):
@@ -260,6 +265,81 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
             ))
         publish.assert_called_once_with("batch", chat_id="chat")
         self.assertEqual(batches.list_confirmations()["items"][0]["downstream"]["strm"], "完成")
+
+    def test_sdk_and_web_read_execution_receipt_without_requerying_cloud(self):
+        from app import sdk
+        from app.routes import logs_api
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        self.create("done", batch="batch")
+        receipt = {
+            "total": 3, "moved": 1, "renamed": 1, "skipped": 1, "failed": 1,
+            "scan_complete": True, "warnings": ["刮削失败 api_key=private-live-key"],
+            "scan_errors": ["扫描失败 access_token=private-scan-key", "目录暂不可读"],
+            "media_items": [{"title": "作品", "category": "电影/作品 (2026)",
+                             "filename": "作品.2026.mp4", "size": 100000000,
+                             "poster_path": "unneeded-poster"}],
+            "_downstream": {"strm": "已排队", "media_refresh": "等待 STRM 完成"},
+            "internal_context": "must-not-export",
+        }
+        db.update_organize_confirmation("done", status="completed", result_json=json.dumps(receipt),
+                                       completed_at="2026-11-14 10:00:00")
+        log_id = db.add_organize_log("guangya", "/source", "/archive", "done", "success",
+                                     operation_token="recognition-confirm:done")
+        app = FastAPI()
+        app.include_router(logs_api.router)
+        with patch("socket.socket.connect", side_effect=AssertionError("查询回执不应访问外部服务")), \
+                patch.object(logs_api, "require_api_login"), TestClient(app) as client:
+            sdk_result = sdk.activity.organize_confirmations(confirmation_ids=["done"], status="all")
+            response = client.post("/api/logs/organize/confirmations/query",
+                                   json={"confirmation_ids": ["done"], "status": "all"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), sdk_result)
+        item = sdk_result["items"][0]
+        self.assertEqual(item["status"], "completed")  # 队列结束，但实际执行仍有失败。
+        self.assertEqual(item["execution"]["failed"], 1)
+        self.assertEqual(item["execution"]["moved"], 1)
+        self.assertEqual(item["execution"]["warnings"], ["刮削失败 api_key=********"])
+        self.assertEqual(item["execution"]["scan_errors"], ["扫描失败 access_token=********", "目录暂不可读"])
+        self.assertEqual(item["execution"]["media_items"], [{
+            "title": "作品", "category": "电影/作品 (2026)", "filename": "作品.2026.mp4", "size": 100000000,
+        }])
+        self.assertEqual(item["completed_at"], "2026-11-14 10:00:00")
+        self.assertEqual(item["log_ids"], [log_id])
+        self.assertEqual(item["downstream"], receipt["_downstream"])
+        self.assertNotIn("internal_context", item["execution"])
+        self.assertNotIn("private-live-key", json.dumps(item))
+        self.assertNotIn("private-scan-key", json.dumps(item))
+
+    def test_missing_execution_receipt_stays_unknown_instead_of_zero_success(self):
+        for token, status, result in (("queued", "queued", {}), ("legacy", "completed", {}),
+                                      ("cancelled", "cancelled", {"resolution": "cancelled"})):
+            self.create(token)
+            db.update_organize_confirmation(token, status=status, result_json=json.dumps(result))
+        items = {item["confirmation_id"]: item for item in batches.list_confirmations(status="all")["items"]}
+        self.assertIsNone(items["queued"]["execution"])
+        self.assertIsNone(items["legacy"]["execution"])
+        self.assertEqual(items["cancelled"]["execution"], {"resolution": "cancelled"})
+        self.assertEqual(items["legacy"]["downstream"], {})
+
+    def test_exact_log_links_survive_same_names_and_receipt_survives_log_clear(self):
+        for token in ("first", "second"):
+            self.create(token)
+            db.update_organize_confirmation(token, status="completed", result_json=json.dumps({
+                "total": 1, "moved": 1, "failed": 0,
+            }))
+        ids = [db.add_organize_log("guangya", "/same", "/same-target", "same-file", "success",
+                                   operation_token=f"recognition-confirm:{token}")
+               for token in ("first", "second", "unrelated")]
+        items = {item["confirmation_id"]: item for item in batches.list_confirmations(status="all")["items"]}
+        self.assertEqual(items["first"]["log_ids"], ids[:1])
+        self.assertEqual(items["second"]["log_ids"], ids[1:2])
+        db.clear_organize_logs(origin="guangya", status="success")
+        after = {item["confirmation_id"]: item for item in batches.list_confirmations(status="all")["items"]}
+        for token in items:
+            self.assertEqual(after[token]["log_ids"], [])
+            self.assertEqual(after[token]["execution"], items[token]["execution"])
 
     def test_background_probe_resolves_batch_thread_without_losing_per_item_identity(self):
         from app.modules.organize_probe_notifications import build_notification_context, publish_probe_scope
@@ -293,7 +373,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET payload_json=?,review_result_json=? WHERE token='one'",
                          (json.dumps(payload), json.dumps(audit)))
-        entries = [{"token": "one", "candidate_index": 0}]
+        entries = [{"confirmation_id": "one", "candidate_index": 0}]
         preview = batches.preview_choices(entries)
         self.assertEqual(preview["items"][0]["episode_mappings"], [mapping])
         self.assertIn("Season 2", preview["items"][0]["target"])
@@ -306,7 +386,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_review_change_between_preview_check_and_claim_cannot_change_write_scope(self):
         self.create("one", review=True)
-        entries = [{"token": "one", "candidate_index": 0}]
+        entries = [{"confirmation_id": "one", "candidate_index": 0}]
         preview = batches.preview_choices(entries)
         original = confirmations.start_confirmation
         def racing_start(token, *args, **kwargs):

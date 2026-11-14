@@ -1999,39 +1999,43 @@ class Activity:
     @staticmethod
     @sdk_method('read')
     def organize_confirmations(*, batch_id: str = "", task_id: str = "", source: str = "", reason: str = "",
-                               q: str = "", status: str = "pending", tokens: list[str] | None = None,
+                               q: str = "", status: str = "pending", confirmation_ids: list[str] | None = None,
                                page: int = 1, page_size: int = 20) -> dict:
-        """分页读取光鸭整理待确认组、文件、逐项候选和只读复核建议；筛选口径沿管理端活动查询。
+        """读取光鸭待确认组、候选建议及已执行结果；筛选口径沿管理端活动查询。
 
-        page_size 为1–1000；返回 items/total/pages/page、全部匹配 tokens（最多1000）、counts、selection_truncated/review_enabled。
+        page_size 为1–1000；返回 items/total/pages/page、全部匹配 confirmation_ids（最多1000）、counts、selection_truncated/review_enabled。
         候选使用各项 candidates[].index；suggestion 仅为建议。例：activity.organize_confirmations(batch_id=batch_id)。
-        提交后用 activity.organize_confirmations(tokens=tokens, status="all") 查询各条 queued/running/终态。
+        提交后用 activity.organize_confirmations(confirmation_ids=confirmation_ids, status="all") 查询各条 queued/running/终态。
+        execution 为已保存的实际数量、归档文件及异常，completed_at 为结束时间；completed 只表示队列结束。
+        log_ids 直接关联仍保留的执行日志，可传 organize_detail；日志清理后 execution 仍保留。
+        reason 是最初进入待确认的原因；最终执行错误看 error，跳过等处理结果看 execution.resolution。
+        execution=null 或其中字段缺失表示未记录；downstream 是独立的 STRM/媒体库记录，不代表实时云盘核验。
         """
         from app.modules.organize_confirmation_batches import list_confirmations
 
         return list_confirmations(batch_id=batch_id, task_id=task_id, source=source, reason=reason, q=q,
-                                  status=status, tokens=tokens, page=page, page_size=page_size)
+                                  status=status, confirmation_ids=confirmation_ids, page=page, page_size=page_size)
 
     @staticmethod
     @sdk_method('control')
-    def review_organize_confirmations(tokens: list[str]) -> dict:
-        """将选定光鸭确认 token 持久排队，使用已配置的只读模型生成候选建议；返回 requested/unchanged 等受理统计。
+    def review_organize_confirmations(confirmation_ids: list[str]) -> dict:
+        """将选定光鸭确认 confirmation_id 持久排队，使用已配置的只读模型生成候选建议；返回 requested/unchanged 等受理统计。
 
-        例：activity.review_organize_confirmations(page["tokens"])。用 organize_confirmations 按 tokens 查询建议；
+        例：activity.review_organize_confirmations(page["confirmation_ids"])。用 organize_confirmations 按 confirmation_ids 查询建议；
         此操作不确认候选，也不移动或改名文件。
         """
         from app.modules.organize_confirmation_batches import request_reviews
 
-        return request_reviews(tokens)
+        return request_reviews(confirmation_ids)
 
     @staticmethod
     @sdk_method('write')
     def confirm_organize(entries: list[dict]) -> dict:
-        """为光鸭整理的每条 token 选择各自候选，生成一次完整确认预览；candidate_index 来自该条 candidates[].index。
+        """为光鸭整理的每条 confirmation_id 选择各自候选，生成一次完整确认预览；candidate_index 来自该条 candidates[].index。
 
-        例：activity.confirm_organize([{"token": token_a, "candidate_index": 0}, {"token": token_b, "candidate_index": 2}])。
+        例：activity.confirm_organize([{"confirmation_id": token_a, "candidate_index": 0}, {"confirmation_id": token_b, "candidate_index": 2}])。
         用户确认后复验冻结候选、文件和规则，再逐项进入原整理队列；AI 来源保留为 agent。
-        回执 data.items/accepted/failed 是逐项受理结果，accepted 尚未完成；用 organize_confirmations(tokens=..., status="all") 跟踪。
+        回执 data.items/accepted/failed 是逐项受理结果，accepted 尚未完成；用 organize_confirmations(confirmation_ids=..., status="all") 跟踪。
         """
         raise ValueError("整理候选确认须通过工作区 EffectExecutor 确认执行")
 

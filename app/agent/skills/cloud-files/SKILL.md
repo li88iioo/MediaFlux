@@ -42,6 +42,7 @@ sed -n '/^## 06 /,/^## 07 /p' /skills/cloud-files/references/examples.md
 | `cloud.change` / `cloud.scrape` 的 `operation_ref`（`GY-...`） | `cloud.operation(operation_ref)` |
 | 回收站等操作的云盘原生 `task_id` | `cloud.task(task_id)` |
 | `cloud.organize` 的 `data.run_id` | `cloud.organize_status(run_id)` |
+| 整理确认记录的 `confirmation_id` / 批次 `batch_id` | `activity.organize_confirmations(confirmation_ids=[confirmation_id], status="all")` / 按 `batch_id` 查询；`execution` 是实际整理回执，`log_ids` 精确关联详细日志 |
 | `activity.organize_logs` 的条目 `id` | `activity.organize_detail(log_id)` / `activity.timeline("organize", log_id)` |
 | 下载/转存回执的 `request_id` | `activity.timeline("download", request_id)` |
 | `strm.run` 的 `data.run_id` | `strm.status(run_id)` 的 `data.task` |

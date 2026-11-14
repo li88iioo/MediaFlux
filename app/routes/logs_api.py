@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/logs")
 @router.get("/organize/confirmations")
 def organize_confirmations(
     request: Request, batch_id: str = "", task_id: str = "", source: str = "",
-    reason: str = "", q: str = "", status: str = "pending", tokens: str | None = None,
+    reason: str = "", q: str = "", status: str = "pending", confirmation_ids: str | None = None,
     page: int = Query(default=1, ge=1), page_size: int = Query(default=20, ge=1, le=100),
 ):
     require_api_login(request)
@@ -34,7 +34,7 @@ def organize_confirmations(
     try:
         return list_confirmations(
             batch_id=batch_id, task_id=task_id, source=source, reason=reason, q=q,
-            status=status, tokens=tokens.split(",") if tokens is not None else None,
+            status=status, confirmation_ids=confirmation_ids.split(",") if confirmation_ids is not None else None,
             page=page, page_size=page_size,
         )
     except ValueError as exc:
@@ -46,7 +46,7 @@ def review_organize_confirmations(request: Request, data: dict = Body(...)):
     require_api_login(request)
     from app.modules.organize_confirmation_batches import request_reviews
     try:
-        return request_reviews(data.get("tokens", []))
+        return request_reviews(data.get("confirmation_ids", []))
     except ValueError as exc:
         return api_error(str(exc), 400)
 
@@ -57,7 +57,7 @@ def query_organize_confirmations(request: Request, data: dict = Body(...)):
     require_api_login(request)
     from app.modules.organize_confirmation_batches import list_confirmations
     try:
-        return list_confirmations(tokens=data.get("tokens", []), status=data.get("status", "all"),
+        return list_confirmations(confirmation_ids=data.get("confirmation_ids", []), status=data.get("status", "all"),
                                   page=data.get("page", 1), page_size=data.get("page_size", 20))
     except ValueError as exc:
         return api_error(str(exc), 400)
@@ -68,7 +68,7 @@ def select_organize_confirmation(request: Request, data: dict = Body(...)):
     require_api_login(request)
     from app.modules.organize_confirmation_batches import save_selection
     try:
-        return save_selection(data.get("token", ""), data.get("candidate_index", -1))
+        return save_selection(data.get("confirmation_id", ""), data.get("candidate_index", -1))
     except ValueError as exc:
         return api_error(str(exc), 400)
 

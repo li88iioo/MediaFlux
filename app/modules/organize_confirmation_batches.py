@@ -39,9 +39,28 @@ def _candidate_view(candidate: dict, index: int) -> dict:
     return result
 
 
+def _execution_view(result: dict) -> dict | None:
+    """投影已保存的执行回执；缺失字段保持未知，不把队列结束解释为全部成功。"""
+    execution = {key: result[key] for key in (
+        "total", "moved", "renamed", "rename_failed", "metadata_moved", "skipped",
+        "failed", "need_confirm", "conflict", "stopped", "scan_complete",
+        "audit_failures", "resolution",
+    ) if key in result}
+    if "media_items" in result:
+        execution["media_items"] = [{key: item[key] for key in (
+            "title", "year", "media_type", "tmdb_id", "provider", "external_id",
+            "season", "episode", "category", "filename", "size",
+        ) if key in item} for item in result["media_items"]]
+    for key in ("scan_errors", "warnings", "skip_reasons", "confirmations", "empty_dir_cleanup_reasons"):
+        if key in result:
+            execution[key] = [redact_sensitive_text(reason) for reason in result[key]]
+    return execution or None
+
+
 def _view(row) -> dict:
     payload = confirmations._decode_row(row)
     review = confirmations._decode_json_object(row["review_result_json"])
+    result = confirmations._decode_json_object(row["result_json"])
     candidates = [_candidate_view(candidate, index) for index, candidate in enumerate(payload.get("candidates") or [])]
     for evidence in review.get("evidence") or []:
         index = evidence.get("candidate_index")
@@ -59,7 +78,7 @@ def _view(row) -> dict:
         suggestion["source"] = review.get("source") or "agent"
         suggestion["summary"] = redact_sensitive_text(suggestion["summary"])
     return {
-        "token": row["token"], "task_id": row["organize_task_id"],
+        "confirmation_id": row["token"], "task_id": row["organize_task_id"],
         "batch_id": str(payload.get("_confirmation_batch") or ""),
         "source": row["source_name"], "directory": row["directory_path"],
         "identity": payload.get("identity") or row["directory_path"],
@@ -72,13 +91,14 @@ def _view(row) -> dict:
         "review_status": row["review_status"], "suggestion": suggestion,
         "review_summary": redact_sensitive_text(review.get("summary") or review.get("reason_code") or ""),
         "selected_index": row["selected_index"], "error": redact_sensitive_text(row["error"] or ""),
-        "downstream": confirmations._decode_json_object(row["result_json"]).get("_downstream") or {},
+        "execution": _execution_view(result), "completed_at": row["completed_at"],
+        "downstream": result.get("_downstream") or {},
     }
 
 
 def list_confirmations(
     *, batch_id: str = "", task_id: str = "", source: str = "", reason: str = "",
-    q: str = "", status: str = "pending", tokens: list[str] | None = None,
+    q: str = "", status: str = "pending", confirmation_ids: list[str] | None = None,
     page: int = 1, page_size: int = 20, chat_id: str | None = None,
 ) -> dict:
     if not isinstance(status, str) or status not in {"all", "pending", "queued", "running", "completed", "failed", "expired", "cancelled"}:
@@ -89,12 +109,13 @@ def list_confirmations(
         raise ValueError("分页参数无效")
     result = db.query_organize_confirmations(
         batch_id=batch_id, task_id=task_id, source=source, reason=reason,
-        keyword=q, status=status, tokens=_tokens(tokens) if tokens is not None else None,
+        keyword=q, status=status, tokens=_tokens(confirmation_ids) if confirmation_ids is not None else None,
         chat_id=chat_id, page=page, page_size=page_size, selection_limit=MAX_SELECTION,
     )
     return {
-        "items": [_view(row) for row in result["rows"]],
-        "tokens": result["tokens"], "total": result["total"],
+        "items": [{**_view(row), "log_ids": result["log_ids"].get(row["token"], [])}
+                  for row in result["rows"]],
+        "confirmation_ids": result["tokens"], "total": result["total"],
         "page": page, "pages": (result["total"] + page_size - 1) // page_size,
         "counts": result["counts"],
         "selection_truncated": result["total"] > len(result["tokens"]),
@@ -102,8 +123,8 @@ def list_confirmations(
     }
 
 
-def request_reviews(tokens: list[str], *, chat_id: str | None = None) -> dict:
-    values = _tokens(tokens)
+def request_reviews(confirmation_ids: list[str], *, chat_id: str | None = None) -> dict:
+    values = _tokens(confirmation_ids)
     if not confirmations._recognition_review_is_enabled():
         raise ValueError("请先在 Agent 设置中启用识别复核并配置模型；也可直接逐项选择候选")
     result = db.request_organize_confirmation_reviews(values, chat_id=chat_id)
@@ -120,12 +141,12 @@ def save_selection(token: str, candidate_index: int, *, chat_id: str | None = No
 def _choices(entries: list[dict], chat_id: str | None) -> list[tuple]:
     if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
         raise ValueError("批量候选参数无效")
-    tokens = _tokens([entry.get("token") for entry in entries])
+    tokens = _tokens([entry.get("confirmation_id") for entry in entries])
     if len(tokens) != len(entries):
         raise ValueError("同一媒体组只能选择一个候选")
     result = []
     for entry in entries:
-        row = _row(entry["token"], chat_id)
+        row = _row(entry["confirmation_id"], chat_id)
         payload = confirmations._decode_row(row)
         if confirmations._confirmation_kind(payload) != "guangya":
             raise ValueError("当前批量审阅仅支持光鸭整理，本地任务请使用原确认入口")
@@ -200,7 +221,7 @@ def preview_choices(entries: list[dict], *, chat_id: str | None = None) -> dict:
                           "episode_mappings": mappings})
     finally:
         organizer.close()
-    return {"entries": [{"token": row["token"], "candidate_index": index} for row, _payload, index in choices],
+    return {"entries": [{"confirmation_id": row["token"], "candidate_index": index} for row, _payload, index in choices],
             "digest": _digest(choices), "items": items,
             "note": "预览媒体目录；分类层级及文件名由现有整理规则生成，执行前仍会核验源文件、元数据及目标冲突。"}
 
@@ -218,9 +239,9 @@ def submit_choices(entries: list[dict], digest: str, *, chat_id: str | None = No
                 explicit_approval=True, dispatch=False,
                 expected_snapshot=(row["payload_json"], row["review_result_json"]),
             )
-            items.append({**result, "token": row["token"], "accepted": True})
+            items.append({**result, "confirmation_id": row["token"], "accepted": True})
         except ValueError as exc:
-            items.append({"token": row["token"], "accepted": False, "status": "rejected",
+            items.append({"confirmation_id": row["token"], "accepted": False, "status": "rejected",
                           "error": redact_sensitive_text(str(exc))})
     confirmations.wake_confirmation_dispatcher()
     return {"items": items, "accepted": sum(bool(item["accepted"]) for item in items),

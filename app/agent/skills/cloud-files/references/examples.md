@@ -194,28 +194,28 @@ print({"total": page["total"], "pages": page["pages"], "counts": page["counts"],
        "selection_truncated": page["selection_truncated"], "items": page["items"]})
 ```
 
-`items` 只是本页；按 `page=2,3,...` 读取其余页面。`tokens` 包含当前筛选全部匹配项，最多 1000；`selection_truncated=True` 时缩小筛选范围，不能声称已选全部。需要只读模型建议且 `review_enabled=True` 时：
+`items` 只是本页；按 `page=2,3,...` 读取其余页面。`confirmation_ids` 包含当前筛选全部匹配项，最多 1000；`selection_truncated=True` 时缩小筛选范围，不能声称已选全部。需要只读模型建议且 `review_enabled=True` 时：
 
 ```python
-print(mf.activity.review_organize_confirmations(page["tokens"]))
+print(mf.activity.review_organize_confirmations(page["confirmation_ids"]))
 ```
 
-这只把复核持久排队，不确认或整理文件。后续用原 `tokens` 读取 `review_status/suggestion`，结合各条文件与候选核对。每条选择来自该条 `candidates[].index`；下面 `token_a/token_b` 和候选序号均来自已核对记录：
+这只把复核持久排队，不确认或整理文件。后续用原 `confirmation_ids` 读取 `review_status/suggestion`，结合各条文件与候选核对。每条选择来自该条 `candidates[].index`；下面 `token_a/token_b` 和候选序号均来自已核对记录：
 
 ```python
-entries = [{"token": token_a, "candidate_index": index_a},
-           {"token": token_b, "candidate_index": index_b}]
+entries = [{"confirmation_id": token_a, "candidate_index": index_a},
+           {"confirmation_id": token_b, "candidate_index": index_b}]
 with open("/work/organize-choices.json", "w") as stream:
     json.dump(entries, stream, ensure_ascii=False)
 mf.activity.confirm_organize(entries)
 ```
 
-这一次调用冻结全部选择、文件和来源规则，生成一张确认卡；每组可以选不同候选。确认后逐项进入原队列，`data.accepted/failed/items` 是受理结果。另开命令按原 tokens 查进度；大于一页继续分页：
+这一次调用冻结全部选择、文件和来源规则，生成一张确认卡；每组可以选不同候选。确认后逐项进入原队列，`data.accepted/failed/items` 是受理结果。另开命令按原 confirmation_ids 查进度；大于一页继续分页：
 
 ```python
 with open("/work/organize-choices.json") as stream:
     entries = json.load(stream)
-progress = mf.activity.organize_confirmations(tokens=[entry["token"] for entry in entries], status="all")
+progress = mf.activity.organize_confirmations(confirmation_ids=[entry["confirmation_id"] for entry in entries], status="all")
 print(progress)
 ```
 

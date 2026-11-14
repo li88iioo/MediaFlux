@@ -9,7 +9,7 @@ from tests import test_logs_batch_correction_ui as support
 
 def groups(count=25) -> list[dict]:
     return [{
-        "token": f"group-{number:03d}", "batch_id": "source-batch", "task_id": "task-a",
+        "confirmation_id": f"group-{number:03d}", "batch_id": "source-batch", "task_id": "task-a",
         "source": "光鸭来源 A", "directory": f"/incoming/group-{number}",
         "identity": f"媒体组 {number:03d}", "reason": "识别歧义", "status": "pending",
         "expires_at": "2099-12-01T00:00:00Z", "review_status": "waiting",
@@ -47,7 +47,7 @@ CONFIRMATION_API = r"""
             const params=suffix==='/query'?body:Object.fromEntries(url.searchParams);
             if(config.failQuery&&suffix==='/query')return reply({error:'冻结状态读取失败'},503);
             const matched=config.items.filter(item=>{
-                if(params.tokens&&!params.tokens.includes(item.token))return false;
+                if(params.confirmation_ids&&!params.confirmation_ids.includes(item.confirmation_id))return false;
                 if(params.status!=='all'&&item.status!==(params.status||'pending'))return false;
                 return ['task_id','source'].every(key=>!params[key]||item[key]===params[key])&&
                     (!params.reason||item.reason.includes(params.reason))&&
@@ -56,31 +56,31 @@ CONFIRMATION_API = r"""
             const truncated=matched.length>1000, rows=matched.slice(0,1000);
             const page=Number(params.page)||1, size=Math.min(100,Number(params.page_size)||20);
             const data={items:matched.slice((page-1)*size,page*size),total:matched.length,pages:Math.ceil(matched.length/size),page,
-                tokens:rows.map(item=>item.token),counts:matched.reduce((counts,item)=>{counts[item.status]=(counts[item.status]||0)+1;return counts;},{}),
+                confirmation_ids:rows.map(item=>item.confirmation_id),counts:matched.reduce((counts,item)=>{counts[item.status]=(counts[item.status]||0)+1;return counts;},{}),
                 selection_truncated:truncated,review_enabled:config.reviewEnabled!==false};
             const response=config.failList&&!suffix?reply({error:'列表暂时不可用'},503):reply(data);
             if(config.holdList&&!suffix)return new Promise(resolve=>window.__heldConfirmationLists.push(()=>resolve(response)));
             return response;
         }
         if(suffix==='/review'){
-            body.tokens.forEach(token=>{const item=config.items.find(item=>item.token===token);item.review_status='pending';});
-            return reply({requested:body.tokens.length,unchanged:0});
+            body.confirmation_ids.forEach(token=>{const item=config.items.find(item=>item.confirmation_id===token);item.review_status='pending';});
+            return reply({requested:body.confirmation_ids.length,unchanged:0});
         }
         if(suffix==='/selection'){
             if(config.selectionError)return reply({error:'人工选择保存失败'},422);
-            const item=config.items.find(item=>item.token===body.token);
+            const item=config.items.find(item=>item.confirmation_id===body.confirmation_id);
             item.suggestion={candidate_index:body.candidate_index,source:'human',summary:'人工核对证据后选择'};
             item.review_status='approved';
             return reply({success:true});
         }
         if(suffix==='/preview'){
-            const entries=body.entries.map(entry=>config.reverseEntries?{candidate_index:entry.candidate_index,token:entry.token}:entry);
+            const entries=body.entries.map(entry=>config.reverseEntries?{candidate_index:entry.candidate_index,confirmation_id:entry.confirmation_id}:entry);
             if(config.reverseEntries)entries.reverse();
-            const data={entries,digest:'server-digest-'+body.entries.map(entry=>entry.token+':'+entry.candidate_index).join('|'),
+            const data={entries,digest:'server-digest-'+body.entries.map(entry=>entry.confirmation_id+':'+entry.candidate_index).join('|'),
                 items:body.entries.map(entry=>{
-                    const item=config.items.find(item=>item.token===entry.token);
+                    const item=config.items.find(item=>item.confirmation_id===entry.confirmation_id);
                     return {...item,candidate:item.candidates.find(candidate=>candidate.index===entry.candidate_index),
-                        episode_mappings:config.episodeMappings?.[item.token]||[],target:'TV/媒体目录 '+item.token};
+                        episode_mappings:config.episodeMappings?.[item.confirmation_id]||[],target:'TV/媒体目录 '+item.confirmation_id};
                 }),note:'仅预览媒体目录；分类层级及文件名由现有整理规则生成，执行前仍会核验源文件。'};
             if(config.previewError)return reply({error:config.previewError},422);
             const response=reply(data);
@@ -90,10 +90,10 @@ CONFIRMATION_API = r"""
         if(suffix==='/submit'){
             if(config.submitError)return reply({error:'连接中断'},503);
             const items=body.entries.map(entry=>{
-                const item=config.items.find(item=>item.token===entry.token);
-                item.status=config.rejectedTokens?.includes(entry.token)?'failed':'queued';
+                const item=config.items.find(item=>item.confirmation_id===entry.confirmation_id);
+                item.status=config.rejectedTokens?.includes(entry.confirmation_id)?'failed':'queued';
                 item.selected_index=entry.candidate_index;item.error=item.status==='failed'?'源文件已变更':'';
-                return {token:item.token,status:item.status,error:item.error};
+                return {confirmation_id:item.confirmation_id,status:item.status,error:item.error};
             });
             const failed=items.filter(item=>item.status==='failed').length;
             const response=reply({items,accepted:items.length-failed,failed});
@@ -167,8 +167,8 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.page.select_option('#confirmationReviewScope', 'selected')
         self.idle()
         self.assertEqual(self.page.locator('.confirmation-review-row').count(), 2)
-        self.assertEqual(set(self.calls('/query')[-1]['body']['tokens']), {'group-001', 'group-021'})
-        self.assertFalse(any('tokens=' in call['url'] for call in self.calls()))
+        self.assertEqual(set(self.calls('/query')[-1]['body']['confirmation_ids']), {'group-001', 'group-021'})
+        self.assertFalse(any('confirmation_ids=' in call['url'] for call in self.calls()))
         saved = self.page.evaluate("JSON.parse(sessionStorage.getItem('mediaflux.logs.confirmation-review'))")
         self.assertEqual(set(saved), {'selected', 'batch'})
         self.assertEqual(set(saved['selected']), {'group-001', 'group-021'})
@@ -187,7 +187,7 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.assertIn('25 / 1000', self.page.locator('#confirmationReviewSelectionCount').inner_text())
         self.page.select_option('#confirmationReviewScope', 'selected')
         self.idle()
-        self.assertEqual(len(self.calls('/query')[-1]['body']['tokens']), 25)
+        self.assertEqual(len(self.calls('/query')[-1]['body']['confirmation_ids']), 25)
         self.assertEqual(self.page.locator('.confirmation-review-row input:checked').count(), 20)
         self.page.locator('#confirmationReviewSelectPage').uncheck()
         self.idle()
@@ -202,7 +202,7 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.page.select_option('#confirmationReviewScope', 'selected')
         self.idle()
         call = self.calls('/query')[-1]
-        self.assertEqual(len(call['body']['tokens']), 1000)
+        self.assertEqual(len(call['body']['confirmation_ids']), 1000)
         self.assertLess(len(call['url']), 100)
         self.page.locator('[aria-label="关闭批量审阅"]').click()
         self.page.locator('#organizeSelectAll').check()
@@ -215,7 +215,7 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.page.locator('#confirmationReviewAgent').click()
         self.idle()
         self.assertEqual(len(self.calls('/review')), 1)
-        self.assertEqual(self.calls('/review')[0]['body']['tokens'], ['group-001', 'group-002', 'group-003'])
+        self.assertEqual(self.calls('/review')[0]['body']['confirmation_ids'], ['group-001', 'group-002', 'group-003'])
         self.assertIn('复核排队中', self.page.locator('#confirmationReviewList').inner_text())
         self.page.locator('#confirmationReviewAgent').click()
         self.idle()
@@ -249,13 +249,13 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.page.locator('#confirmationReviewDetail input[value="0"]').check()
         self.page.get_by_role('button', name='保存并下一条', exact=True).click()
         self.idle()
-        self.assertEqual(self.calls('/selection')[0]['body'], {'token': 'group-002', 'candidate_index': 0})
+        self.assertEqual(self.calls('/selection')[0]['body'], {'confirmation_id': 'group-002', 'candidate_index': 0})
         self.assertIn('媒体组 003', self.page.locator('#confirmationReviewDetail h3').inner_text())
         self.page.locator('#confirmationReviewDetail input[value="1"]').check()
         self.page.evaluate("Object.assign(window.__confirmationConfig,{reverseEntries:true,rejectedTokens:['group-002']})")
         self.page.locator('#confirmationReviewPrepare').click()
         self.idle()
-        entries = [{'token': 'group-001', 'candidate_index': 1}, {'token': 'group-002', 'candidate_index': 0}]
+        entries = [{'confirmation_id': 'group-001', 'candidate_index': 1}, {'confirmation_id': 'group-002', 'candidate_index': 0}]
         self.assertEqual(self.calls('/preview')[0]['body'], {'entries': entries})
         preview = self.page.locator('#confirmationReviewPreview').inner_text()
         self.assertIn('作品1候选B', preview)
@@ -375,7 +375,7 @@ class LogsConfirmationReviewBrowserTests(support.LogsBrowserCase):
         self.config['items'][0]['suggestion'] = None
         self.page.evaluate("""() => sessionStorage.setItem('mediaflux.logs.confirmation-review', JSON.stringify({
             selected:['group-001'],batch:[],candidate_index:0,
-            preview:{entries:[{token:'group-001',candidate_index:0}],digest:'forged-browser-digest'}
+            preview:{entries:[{confirmation_id:'group-001',candidate_index:0}],digest:'forged-browser-digest'}
         }))""")
         self.page.reload(wait_until='domcontentloaded')
         self.page.locator('#confirmationReviewModal').wait_for(state='visible')
