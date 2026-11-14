@@ -157,11 +157,11 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
             result = dispatcher.resubmit_download_request(request_id, "guangya")
         self.assertTrue(result["ok"], result)
         old = download_requests_repo.get_download_request(request_id)
-        self.assertTrue(result["source_attention_preserved"])
+        self.assertFalse(result["source_attention_preserved"])
         assert old is not None
         self.assertEqual(old["local_import_status"], "failed")
         self.assertEqual(old["qb_status"], "completed")
-        self.assertIn(request_id, {row["id"] for row in download_requests_repo.list_download_requests_requiring_attention()})
+        self.assertNotIn(request_id, {row["id"] for row in download_requests_repo.list_download_requests_requiring_attention()})
 
     def test_failed_retry_preserves_attention_and_other_backend(self):
         for backend_result in (

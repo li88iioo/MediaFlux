@@ -381,9 +381,11 @@ class SkippedLogBatchRecycleTests(IsolatedDatabaseTestCase):
     def setUp(self):
         super().setUp()
         from app.modules import organize_tasks
+        from app.repositories import download_requests
         from tests.support import isolated_test_database
 
         self.enterContext(isolated_test_database())
+        self.requests = download_requests
         self.rules = OrganizeRules(target_dir_id="archive", link_strm=False, clean_empty=False)
         self.enterContext(patch.object(OrganizeRules, "from_config", return_value=self.rules))
         original_get = organize_tasks.config.get
@@ -420,7 +422,7 @@ class SkippedLogBatchRecycleTests(IsolatedDatabaseTestCase):
         self.service = OrganizeCorrectionService(client=self.client, scraper=cast(TMDBScraper, object()))
         self.addCleanup(self.service.close)
 
-    def seed(self, file_id="video", *, parent="media", media_type="", subtitle=False):
+    def seed(self, file_id="video", *, parent="media", media_type="", subtitle=False, source="incoming"):
         filename = file_id + ".mp4"
         file = GuangYaFile(file_id, filename, False, 100, "etag-" + file_id, parent)
         self.remote[file_id] = file
@@ -431,7 +433,7 @@ class SkippedLogBatchRecycleTests(IsolatedDatabaseTestCase):
             members.append(sub)
         log_id = db.add_organize_log(
             "guangya", parent, filename, file_id, "skipped", "", media_type=media_type,
-            source_dir_id="incoming", original_parent_id=parent, current_parent_id=parent,
+            source_dir_id=source, original_parent_id=parent, current_parent_id=parent,
             original_name=filename, current_name=filename, legacy_incomplete=False,
         )
         db.add_organize_log_items(log_id, [{
@@ -444,6 +446,314 @@ class SkippedLogBatchRecycleTests(IsolatedDatabaseTestCase):
     def entries(self, ids):
         return [{"log_id": log_id, "operation_token": "recycle-" + str(log_id),
                  "expected_version": self.service.detail(log_id)["version"]} for log_id in ids]
+
+    def seed_staging_request(self, key, root):
+        request_id, _ = self.requests.create_download_request("manual-recycle-" + key, "magnet")
+        directory = self.remote[root]
+        self.requests.update_download_request(request_id, **{
+            "targets": "guangya", "status": "completed", "gy_status": "completed", "gy_isolated": 1,
+            "gy_target_dir": root, "gy_staging_parent_dir": directory.parent_id,
+            "gy_staging_name": directory.name, "gy_staging_cleanup_status": "retained",
+            "gy_staging_cleanup_error": "仍有下载残留文件", "organize_started": 1,
+            "organize_status": "completed", "organize_task_id": "organize-" + key,
+            "gy_task_id": "cloud-" + key, "gy_task_ids": json.dumps(["cloud-" + key]),
+        })
+        return request_id
+
+    def seed_staging(self, key):
+        chain = [key + suffix for suffix in ("-root", "-middle", "-season", "-leaf")]
+        parent = "incoming"
+        for directory_id in chain:
+            # 自有下载根可以被用户改名，归属证据来自持久身份与 live 父链。
+            self.remote[directory_id] = GuangYaFile(
+                directory_id, "重命名目录-" + directory_id, True, 0, "dir-" + directory_id,
+                parent, updated_at=1,
+            )
+            parent = directory_id
+        return self.seed_staging_request(key, chain[0]), chain
+
+    def delete_selected(self, log_ids, *, batch):
+        entries = self.entries(log_ids)
+        if batch:
+            return self.service.run_batch("delete", entries, "DELETE")
+        self.assertEqual(len(entries), 1)
+        return self.service.delete_group(**entries[0], confirm_text="DELETE")
+
+    def test_manual_delete_cleans_owned_staging_after_direct_parent_disappears(self):
+        for batch, source_kind in ((False, "incoming"), (True, "leaf")):
+            with self.subTest(batch=batch, source=source_kind):
+                key = "owned-" + str(batch)
+                request_id, chain = self.seed_staging(key)
+                source = "incoming" if source_kind == "incoming" else chain[-1]
+                log_id = self.seed(key + "-video", parent=chain[-1], source=source)
+                self.assertFalse(self.rules.clean_empty)
+
+                result = self.delete_selected([log_id], batch=batch)
+
+                self.assertTrue(result["success"])
+                self.assertEqual(result["deleted"], 1)
+                self.assertFalse(result["warnings"])
+                for directory_id in chain:
+                    self.assertNotIn(directory_id, self.remote)
+                    self.assertEqual(self.deleted.count(directory_id), 1)
+                # 直接父目录先被既有链路移除，staging 收尾仍须找到原来捕获的根。
+                with db.get_conn() as conn:
+                    audits = conn.execute(
+                        "SELECT file_id,trigger FROM organize_delete_audit "
+                        "WHERE status='success' AND file_id IN (?,?)", (chain[-1], chain[0]),
+                    ).fetchall()
+                self.assertEqual({row["file_id"]: row["trigger"] for row in audits}, {
+                    chain[-1]: "manual_delete_empty_dir_cleanup", chain[0]: "download_staging_cleanup",
+                })
+                request = self.requests.get_download_request(request_id)
+                assert request is not None
+                self.assertEqual(request["gy_staging_cleanup_status"], "completed")
+                self.assertEqual(request["gy_staging_cleanup_error"], "")
+                self.assertIn("incoming", self.remote)
+                self.assertIn("archive", self.remote)
+
+    def test_manual_delete_batch_isolates_owned_roots_and_failed_members(self):
+        original_delete = self.client.delete.side_effect
+        for unknown_failure in (False, True):
+            with self.subTest(unknown_failure=unknown_failure):
+                self.client.delete.side_effect = original_delete
+                roots = []
+                logs = []
+                failed_video = "first-b-" + str(unknown_failure)
+                failed_parent = ""
+                for prefix, count in (("first", 2), ("second", 1)):
+                    key = prefix + "-" + str(unknown_failure)
+                    request_id, chain = self.seed_staging(key)
+                    roots.append((request_id, chain))
+                    for index in range(count):
+                        video_id = (prefix + "-a-" + str(unknown_failure)) if index == 0 else failed_video
+                        parent = chain[-1]
+                        if unknown_failure and index == 1:
+                            parent = key + "-failed-leaf"
+                            failed_parent = parent
+                            self.remote[parent] = replace(self.remote[chain[-1]], file_id=parent, name=parent)
+                        logs.append(self.seed(video_id, parent=parent, source=parent))
+
+                if unknown_failure:
+                    def lose_one_response(ids):
+                        result = original_delete(ids)
+                        if failed_video in ids:
+                            raise TimeoutError("同根一条媒体回收响应丢失")
+                        return result
+
+                    self.client.delete.side_effect = lose_one_response
+
+                result = self.delete_selected(logs, batch=True)
+
+                self.assertEqual(result["success"], not unknown_failure)
+                self.assertEqual(result["deleted"], 2 if unknown_failure else 3)
+                for index, (request_id, chain) in enumerate(roots):
+                    request = self.requests.get_download_request(request_id)
+                    assert request is not None
+                    if unknown_failure and index == 0:
+                        self.assertNotIn(failed_video, self.remote)
+                        self.assertIn(failed_parent, self.remote)
+                        self.assertFalse(self.client.list_dir(failed_parent))
+                        self.assertIn(chain[0], self.remote)
+                        self.assertNotIn(chain[0], self.deleted)
+                        self.assertNotIn(chain[-1], self.remote)
+                        self.assertEqual(request["gy_staging_cleanup_status"], "retained")
+                        self.assertEqual(self.service.detail(logs[1])["status"], "failed")
+                        self.assertEqual(db.list_organize_delete_audits(logs[1])[0]["status"], "failed")
+                        continue
+                    for directory_id in chain:
+                        self.assertNotIn(directory_id, self.remote)
+                        self.assertEqual(self.deleted.count(directory_id), 1)
+                    self.assertEqual(request["gy_staging_cleanup_status"], "completed")
+                    self.assertEqual(request["gy_staging_cleanup_error"], "")
+                self.assertTrue(all(self.service.detail(log_id)["status"] == "deleted"
+                                    for log_id in (logs[0], logs[2])))
+                self.assertIn("incoming", self.remote)
+                self.assertIn("archive", self.remote)
+
+    def test_manual_delete_retains_staging_with_unselected_intermediate_files(self):
+        for batch in (False, True):
+            for suffix in (".txt", ".S01E02.mp4", ".srt"):
+                with self.subTest(batch=batch, remaining=suffix):
+                    key = "remaining-" + str(batch) + suffix
+                    request_id, chain = self.seed_staging(key)
+                    log_id = self.seed(key + "-selected", parent=chain[-1])
+                    remaining = key + "-other"
+                    self.remote[remaining] = GuangYaFile(
+                        remaining, "未选择" + suffix, False, 100, "other-" + key, chain[1],
+                    )
+
+                    result = self.delete_selected([log_id], batch=batch)
+
+                    self.assertTrue(result["success"])
+                    self.assertEqual(result["deleted"], 1)
+                    self.assertNotIn(chain[-1], self.remote)
+                    self.assertIn(remaining, self.remote)
+                    self.assertIn(chain[1], self.remote)
+                    self.assertIn(chain[0], self.remote)
+                    request = self.requests.get_download_request(request_id)
+                    assert request is not None
+                    self.assertEqual(request["gy_staging_cleanup_status"], "retained")
+                    self.assertTrue(request["gy_staging_cleanup_error"])
+
+    def test_manual_delete_does_not_clean_active_ambiguous_unowned_or_unknown_staging(self):
+        original_delete = self.client.delete.side_effect
+        for batch in (False, True):
+            for condition in ("active", "running", "ambiguous", "unowned", "unknown", "unknown-media"):
+                with self.subTest(batch=batch, condition=condition):
+                    self.client.delete.side_effect = original_delete
+                    key = condition + "-" + str(batch)
+                    request_id, chain = self.seed_staging(key)
+                    video_id = key + "-video"
+                    log_id = self.seed(video_id, parent=chain[-1])
+                    if condition == "active":
+                        self.requests.update_download_request(request_id, status="downloading", gy_status="downloading")
+                    elif condition == "running":
+                        self.requests.update_download_request(request_id, organize_status="running")
+                    elif condition == "ambiguous":
+                        self.seed_staging_request(key + "-other-owner", chain[0])
+                    elif condition == "unowned":
+                        self.requests.update_download_request(request_id, gy_isolated=0)
+                        self.remote[chain[0]].name = "MF-看似隔离目录但无归属"
+                    elif condition == "unknown":
+                        db.add_organize_delete_audit(
+                            trigger="download_staging_cleanup", file_id=chain[0], parent_id="incoming",
+                            reason="旧目录删除响应丢失", status="failed",
+                        )
+                    else:
+                        def lose_media_response(ids):
+                            original_delete(ids)
+                            raise TimeoutError("媒体回收响应丢失")
+
+                        self.client.delete.side_effect = lose_media_response
+
+                    if condition == "unknown-media" and not batch:
+                        with self.assertRaisesRegex(RuntimeError, "媒体回收响应丢失"):
+                            self.delete_selected([log_id], batch=batch)
+                    else:
+                        result = self.delete_selected([log_id], batch=batch)
+                        self.assertEqual(result["success"], condition != "unknown-media")
+                    if condition == "unknown-media":
+                        self.assertIn(chain[-1], self.remote)
+                        self.assertEqual(db.list_organize_delete_audits(log_id)[0]["status"], "failed")
+
+                    self.assertIn(chain[0], self.remote)
+                    self.assertNotIn(chain[0], self.deleted)
+                    request = self.requests.get_download_request(request_id)
+                    assert request is not None
+                    self.assertNotEqual(request["gy_staging_cleanup_status"], "completed")
+                    self.assertTrue(request["gy_staging_cleanup_error"])
+                    self.assertIn("incoming", self.remote)
+                    self.assertIn("archive", self.remote)
+
+    def test_manual_delete_preserves_rebound_request_root_and_cleanup_receipt(self):
+        original_delete = self.client.delete.side_effect
+        for batch in (False, True):
+            for rebind_to_leaf in (False, True):
+                with self.subTest(batch=batch, rebind_to_leaf=rebind_to_leaf):
+                    key = "rebound-" + str(batch) + "-" + str(rebind_to_leaf)
+                    request_id, chain = self.seed_staging(key)
+                    video_id = key + "-video"
+                    log_id = self.seed(video_id, parent=chain[-1])
+                    new_root = chain[-1] if rebind_to_leaf else key + "-new-root"
+                    if not rebind_to_leaf:
+                        self.remote[new_root] = GuangYaFile(
+                            new_root, new_root, True, 0, "new-dir", "incoming", updated_at=1,
+                        )
+                    new_directory = self.remote[new_root]
+                    new_status = "downloading" if rebind_to_leaf else "completed"
+
+                    def rebind_after_video(ids):
+                        result = original_delete(ids)
+                        if video_id in ids:
+                            self.requests.update_download_request(
+                                request_id, gy_target_dir=new_root,
+                                gy_staging_parent_dir=new_directory.parent_id,
+                                gy_staging_name=new_directory.name,
+                                status=new_status, gy_status=new_status,
+                                gy_staging_cleanup_error="新绑定目录仍待清理",
+                            )
+                        return result
+
+                    self.client.delete.side_effect = rebind_after_video
+                    result = self.delete_selected([log_id], batch=batch)
+
+                    self.assertTrue(result["success"])
+                    self.assertEqual(result["deleted"], 1)
+                    self.assertIn(chain[0], self.remote)
+                    self.assertIn(new_root, self.remote)
+                    self.assertFalse(any(call.args[0] == new_root
+                                         for call in self.client.delete_empty_directory.call_args_list))
+                    if rebind_to_leaf:
+                        self.assertTrue(result["warnings"])
+                    request = self.requests.get_download_request(request_id)
+                    assert request is not None
+                    self.assertEqual(request["gy_target_dir"], new_root)
+                    self.assertEqual(request["gy_staging_parent_dir"], new_directory.parent_id)
+                    self.assertEqual(request["gy_staging_name"], new_directory.name)
+                    self.assertEqual(request["gy_status"], new_status)
+                    self.assertEqual(request["gy_staging_cleanup_status"], "retained")
+                    self.assertEqual(request["gy_staging_cleanup_error"], "新绑定目录仍待清理")
+
+    def test_manual_delete_cleanup_failure_and_lost_response_preserve_failure_receipts(self):
+        from app.modules.download_staging_cleanup import cleanup_download_staging
+
+        original_delete_empty = self.client.delete_empty_directory.side_effect
+        for batch in (False, True):
+            for failed_node in ("root", "leaf"):
+                for lose_response in (False, True):
+                    with self.subTest(batch=batch, failed_node=failed_node, lose_response=lose_response):
+                        key = "failure-" + str(batch) + "-" + failed_node + "-" + str(lose_response)
+                        request_id, chain = self.seed_staging(key)
+                        log_id = self.seed(key + "-video", parent=chain[-1])
+                        failed_id = chain[0] if failed_node == "root" else chain[-1]
+
+                        def fail_directory(file_id, **kwargs):
+                            if file_id == failed_id:
+                                if lose_response:
+                                    original_delete_empty(file_id, **kwargs)
+                                raise TimeoutError("目录回收响应丢失")
+                            return original_delete_empty(file_id, **kwargs)
+
+                        self.client.delete_empty_directory.side_effect = fail_directory
+                        result = self.delete_selected([log_id], batch=batch)
+
+                        self.assertTrue(result["success"])
+                        self.assertEqual(self.service.detail(log_id)["status"], "deleted")
+                        self.assertTrue(result["warnings"])
+                        self.assertEqual(failed_id in self.remote, not lose_response)
+                        calls = [call for call in self.client.delete_empty_directory.call_args_list
+                                 if call.args[0] == failed_id]
+                        self.assertEqual(len(calls), 1)
+                        request = self.requests.get_download_request(request_id)
+                        assert request is not None
+                        with db.get_conn() as conn:
+                            audits = conn.execute(
+                                "SELECT trigger,status FROM organize_delete_audit WHERE file_id=? ORDER BY id",
+                                (failed_id,),
+                            ).fetchall()
+                        trigger = ("download_staging_cleanup" if failed_node == "root"
+                                   else "manual_delete_empty_dir_cleanup")
+                        self.assertEqual([(row["trigger"], row["status"]) for row in audits], [(trigger, "failed")])
+                        if failed_node == "root":
+                            self.assertEqual(request["gy_staging_cleanup_status"], "failed")
+                            self.assertTrue(request["gy_staging_cleanup_error"])
+                        elif lose_response:
+                            # 叶已不在 live 父成员中，允许核验剩余空树；保留原失败审计和警告。
+                            self.assertNotIn(chain[0], self.remote)
+                            self.assertEqual(request["gy_staging_cleanup_status"], "completed")
+                        else:
+                            self.assertIn(chain[0], self.remote)
+                            self.assertNotIn(chain[0], self.deleted)
+                            self.assertEqual(request["gy_staging_cleanup_status"], "retained")
+                            retry = cleanup_download_staging(
+                                self.client, [request_id], source_ids={chain[0]},
+                                protected_ids={"0", "incoming", "archive"},
+                            )
+                            self.assertEqual(retry["cleaned"], 0)
+                            self.assertIn(chain[0], self.remote)
+                            self.assertEqual(sum(call.args[0] == failed_id
+                                                 for call in self.client.delete_empty_directory.call_args_list), 1)
 
     def test_single_selected_unknown_log_recycles_files_and_empty_parent(self):
         log_id = self.seed(subtitle=True)

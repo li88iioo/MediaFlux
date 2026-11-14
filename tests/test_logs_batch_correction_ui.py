@@ -720,7 +720,7 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.assertEqual([entry['log_id'] for entry in self.execute_calls()[0]['body']['entries']], [10, 11])
         confirmation = self.page.evaluate('window.__confirmCalls[0]')
         self.assertEqual(confirmation['verifyText'], 'DELETE')
-        for scope in ('直接父目录', '不向上清理', '其他内容', '来源根', '归档根'):
+        for scope in ('直接父目录', '已确认归属', 'MF 目录', '其他文件', '公共下载目录', '来源根', '归档根'):
             self.assertIn(scope, confirmation['message'])
         self.assertEqual(len(self.page.evaluate('window.__confirmCalls')), 1)
         self.assertFalse(any(call['page'] == '2' for call in self.calls()))

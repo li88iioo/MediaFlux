@@ -1,4 +1,4 @@
-"""云端下载完成但落稳失败后的重投、RSS reset 与活跃任务防重回归。"""
+"""下载失败重投、后处理失败防重下载、RSS reset 与活跃任务防重回归。"""
 from __future__ import annotations
 
 from tests.support import assert_present
@@ -44,7 +44,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         item = dispatcher.DownloadInput("magnet", "Episode", source)
         request_id = int(dispatcher.create_request(item, "", "", origin="rss:test")["id"])
         fields = {
-            "status": "completed", "targets": "guangya", "gy_status": "completed",
+            "status": "failed", "targets": "guangya", "gy_status": "failed",
             "organize_started": -1, "organize_status": "failed",
             "organize_error": _SETTLE_ERROR, "organize_task_id": "",
             "strm_status": "skipped", "gy_target_dir": "old-isolated-stage",
@@ -76,10 +76,22 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
     def submitted(_row, **_kwargs) -> dict:
         return {"ok": True, "task_ids": ["gy-new-task"], "task_id": "gy-new-task"}
 
-    def test_completed_download_with_failed_settle_is_retryable(self):
-        request_id, _entry_id = self.resource()
+    def test_completed_download_with_failed_settle_is_not_retryable(self):
+        request_id, entry_id = self.resource(status="completed", gy_status="completed")
         capabilities = dispatcher.download_resubmit_capabilities(download_requests_repo.get_download_request(request_id))
-        self.assertTrue(capabilities["guangya"]["enabled"], capabilities)
+        self.assertFalse(capabilities["guangya"]["enabled"], capabilities)
+        before = dict(assert_present(download_requests_repo.get_download_request(request_id)))
+        with patch.object(dispatcher, "_submit_guangya") as backend:
+            result = dispatcher.resubmit_download_request(request_id, "guangya")
+            engine = RSSEngine()
+            self.addCleanup(engine.close)
+            rss_result = engine.download(entry_id)
+        self.assertFalse(result["ok"], result)
+        self.assertFalse(rss_result["ok"], rss_result)
+        self.assertTrue(rss_result["existing"], rss_result)
+        backend.assert_not_called()
+        self.assertEqual(dict(assert_present(download_requests_repo.get_download_request(request_id))), before)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request_id), 0)
 
     def test_resubmit_creates_successor_and_releases_old_attention(self):
         request_id, _entry_id = self.resource()
@@ -104,7 +116,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertEqual(old["organize_error"], _SETTLE_ERROR)
         self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request_id), 0)
 
-    def test_download_page_batch_does_not_skip_failed_settle(self):
+    def test_download_page_batch_retries_failed_download(self):
         request_id, _entry_id = self.resource()
         with patch.object(dispatcher, "_submit_guangya", side_effect=self.submitted) as backend:
             response = downloads_api.resubmit_issues_batch(
@@ -117,7 +129,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         backend.assert_called_once()
 
     def test_normal_completed_backend_stays_nonretryable(self):
-        request_id, _entry_id = self.resource(organize_status="completed", organize_started=1)
+        request_id, _entry_id = self.resource(status="completed", gy_status="completed", organize_status="completed", organize_started=1)
         capabilities = dispatcher.download_resubmit_capabilities(download_requests_repo.get_download_request(request_id))
         self.assertFalse(capabilities["guangya"]["enabled"])
         with patch.object(dispatcher, "_submit_guangya") as backend:
@@ -160,7 +172,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     def test_rss_reset_api_reopens_only_linked_failed_download(self):
         request_id, entry_id = self.resource()
-        healthy_id, healthy_entry = self.resource(organize_status="completed", organize_started=1)
+        healthy_id, healthy_entry = self.resource(status="completed", gy_status="completed", organize_status="completed", organize_started=1)
         before = rss_repo.get_rss_entry(entry_id)
         response = rss_api.mark_entries(cast(Request, None), {
             "entry_ids": [entry_id, healthy_entry], "processed": False,
@@ -200,7 +212,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertNotEqual(result["request_id"], request_id)
         backend.assert_called_once()
 
-    def test_rss_direct_download_retries_failed_settle_without_manual_reset(self):
+    def test_rss_direct_download_retries_failed_download_without_manual_reset(self):
         request_id, entry_id = self.resource()
         with patch.object(dispatcher, "_submit_guangya", side_effect=self.submitted) as backend:
             result = RSSEngine().download(entry_id)
@@ -234,7 +246,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         self.assertNotEqual(result["request_id"], request_id)
         backend.assert_called_once()
 
-    def test_binding_failed_settle_does_not_reproject_it_as_downloaded(self):
+    def test_binding_failed_download_does_not_reproject_it_as_downloaded(self):
         request_id, entry_id = self.resource()
         seed_rss_entry_state(entry_id, "pending")
         self.assertTrue(rss_repo.claim_rss_entry(entry_id))
@@ -260,6 +272,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         for status in ("completed", *_ACTIVE):
             with self.subTest(status=status):
                 _request_id, entry_id = self.resource(
+                    status="completed" if status == "completed" else "submitted",
                     gy_status=status, organize_status="completed" if status == "completed" else "failed"
                 )
                 self.assertEqual(rss_repo.update_rss_entries_processed([entry_id], False), 0)
@@ -331,7 +344,7 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
 
     def test_snapshot_reset_is_atomic_when_another_download_is_healthy(self):
         _request_id, entry_id = self.resource()
-        _healthy_request, healthy_entry = self.resource(organize_status="completed", organize_started=1)
+        _healthy_request, healthy_entry = self.resource(status="completed", gy_status="completed", organize_status="completed", organize_started=1)
         rows = [self.snapshot(entry_id), self.snapshot(healthy_entry)]
         with db.get_conn() as conn:
             conn.executemany(

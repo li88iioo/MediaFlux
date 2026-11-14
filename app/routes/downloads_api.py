@@ -33,7 +33,7 @@ from app.repositories.download_requests import (
     delete_filtered_download_logs,
     download_display_title,
     download_log_page,
-    download_postprocess_issues,
+    download_request_attention_stages,
     retry_download_local_import,
 )
 from app.web import api_error, api_response, require_api_login
@@ -141,50 +141,6 @@ def _transfer_json(info) -> dict:
     }
 
 
-def _attention_stages(row) -> list[dict[str, str]]:
-    """把下载请求中的异常字段归一为前端可直接展示的处理阶段。"""
-    stages: list[dict[str, str]] = []
-    request_error = str(row["error"] or "")
-
-    def backend_error(key: str) -> str:
-        """从汇总错误中提取指定后端的原因，避免重复显示 ``guangya:``。"""
-        prefix = f"{key}:"
-        for part in request_error.split(";"):
-            value = part.strip()
-            if value.lower().startswith(prefix):
-                return value[len(prefix):].strip()
-        return request_error
-
-    def append(key: str, label: str, status: object, error: object = "") -> None:
-        stages.append({
-            "key": key,
-            "label": label,
-            "status": str(status or "failed"),
-            "error": str(error or "")[:500],
-        })
-
-    qb_status = str(row["qb_status"] or "")
-    gy_status = str(row["gy_status"] or "")
-    status = str(row["status"] or "")
-    # 顶层失败通常只是具体下载后端失败的汇总；已有后端阶段时不重复展示同一错误。
-    if status in {"failed", "manual_review"} and not (
-        qb_status == "failed" or gy_status in {"failed", "manual_review"}
-    ):
-        append("request", "下载请求", status, request_error)
-    if qb_status in {"failed", "manual_review"}:
-        append("qb", "qB", qb_status, backend_error("qb"))
-    if gy_status in {"failed", "manual_review"}:
-        append("guangya", "光鸭", gy_status, backend_error("guangya"))
-    stages.extend(download_postprocess_issues(row))
-    cleanup_status = str(row["gy_staging_cleanup_status"] or "")
-    if cleanup_status in {"retained", "failed"}:
-        append(
-            "staging_cleanup", "暂存清理", cleanup_status,
-            row["gy_staging_cleanup_error"],
-        )
-    return stages
-
-
 def _attention_json(row) -> dict:
     return {
         "id": int(row["id"]),
@@ -193,7 +149,7 @@ def _attention_json(row) -> dict:
         "kind": str(row["kind"] or ""),
         "targets": str(row["targets"] or ""),
         "status": str(row["status"] or ""),
-        "stages": _attention_stages(row),
+        "stages": download_request_attention_stages(row),
         "retry_targets": download_resubmit_capabilities(row),
         "retry_local_import": can_retry_download_local_import(row),
         "created_at": str(row["created_at"] or ""),
@@ -436,7 +392,7 @@ def resubmit_issues_batch(request: Request, data: dict | None = Body(default=Non
                 "error": "待处理请求不存在",
             })
             continue
-        if not _attention_stages(row):
+        if not download_request_attention_stages(row):
             counts["skipped"] += 1
             items.append({
                 "source_request_id": request_id,
@@ -554,7 +510,7 @@ def resubmit_issue(
     row = download_requests_repo.get_download_request(request_id)
     if not row:
         return api_error("待处理请求不存在", 404)
-    if not _attention_stages(row):
+    if not download_request_attention_stages(row):
         return api_error("该请求已经处理，无需重复提交", 409)
     capability = download_resubmit_capabilities(row).get(target) or {}
     if not capability.get("enabled"):
@@ -616,6 +572,8 @@ def _logs(source: str | None, status: str | None, keyword: str = "",
         "backend_task_id": row["backend_task_id"] if "backend_task_id" in row.keys() else "",
         "progress": row["progress"] if "progress" in row.keys() else 0,
         "error": row["error"] if "error" in row.keys() else "",
+        "postprocess_issues": row["postprocess_issues"],
+        "retry_local_import": row["retry_local_import"],
         "created_at": row["created_at"],
     } for row in result["items"]]
     return result

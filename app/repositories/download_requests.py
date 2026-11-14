@@ -147,7 +147,22 @@ def download_log_page(source: str | None = None, status: str | None = None,
             "SELECT * FROM download_log" + filters + " ORDER BY id DESC LIMIT ? OFFSET ?",
             [*params, page_size, (effective_page - 1) * page_size],
         ).fetchall()
-    return {"items": rows, "page": effective_page, "page_size": page_size,
+        request_ids = list({row["request_id"] for row in rows if row["request_id"]})
+        requests = {row["id"]: row for row in conn.execute(
+            "SELECT id,status,qb_status,organize_started,organize_status,organize_error,"
+            "strm_status,strm_error,local_import_status,local_import_error,local_import_target,"
+            "gy_staging_cleanup_status,gy_staging_cleanup_error FROM download_requests "
+            "WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(request_ids),),
+        )} if request_ids else {}
+        items = []
+        for row in rows:
+            request = requests.get(row["request_id"])
+            items.append({**dict(row),
+                          "postprocess_issues": _public_postprocess_issues(request)
+                          if request is not None else [],
+                          "retry_local_import": request is not None and can_retry_download_local_import(request)})
+    return {"items": items, "page": effective_page, "page_size": page_size,
             "total": total, "pages": pages, "through_id": through_id}
 
 
@@ -187,8 +202,8 @@ def delete_download_logs(log_ids: list[int]) -> list[int]:
     return [value for value in normalized if value in existing]
 
 
-# 后处理异常的唯一阶段定义，SQL 待处理查询和各端结果投影共用。
-_POSTPROCESS_ATTENTION_STAGES = (
+# 后处理异常保留在请求详情与历史，不作为重新下载的待处理依据。
+_POSTPROCESS_ISSUE_STAGES = (
     ("local_import", "本地入库", ("failed", "requires_manual")),
     ("organize", "自动整理", ("failed", "requires_manual", "partial")),
     ("strm", "STRM 同步", ("failed", "partial")),
@@ -198,7 +213,7 @@ _POSTPROCESS_ATTENTION_STAGES = (
 def download_postprocess_issues(row) -> list[dict[str, str]]:
     values = dict(row)
     issues = []
-    for key, label, states in _POSTPROCESS_ATTENTION_STAGES:
+    for key, label, states in _POSTPROCESS_ISSUE_STAGES:
         status = str(values.get(f"{key}_status") or "")
         if key == "organize" and int(values.get("organize_started") or 0) < 0 and status not in states:
             status = "failed"
@@ -214,18 +229,56 @@ def download_postprocess_failure(key: str, detail: str) -> str:
     return f"下载后处理失败（{label}）：{detail or '请在下载记录中重试'}"[:500]
 
 
-_DOWNLOAD_ATTENTION_BASE_WHERE = (
-    "status IN ('failed','manual_review') OR "
-    "qb_status IN ('failed','manual_review') OR gy_status IN ('failed','manual_review') OR "
-    "organize_started<0 OR gy_staging_cleanup_status IN ('retained','failed') OR "
-    + " OR ".join(f"{key}_status IN ({','.join(repr(state) for state in states)})"
-                  for key, _label, states in _POSTPROCESS_ATTENTION_STAGES)
+def _public_postprocess_issues(row) -> list[dict[str, str]]:
+    """请求详情与下载日志共用的后处理摘要，不载入下载地址或种子内容。"""
+    issues = download_postprocess_issues(row)
+    cleanup_status = str(row["gy_staging_cleanup_status"] or "") if "gy_staging_cleanup_status" in row.keys() else ""
+    if cleanup_status in {"retained", "failed"}:
+        issues.append({"key": "staging_cleanup", "label": "暂存清理", "status": cleanup_status,
+                       "error": str(row["gy_staging_cleanup_error"] or "")})
+    return [{**item, "error": safe_download_text(item["error"], limit=500, fallback="需要处理，请查看原任务；无需重复下载")}
+            for item in issues]
+
+
+_DOWNLOAD_ATTENTION_STATUSES = ("failed", "manual_review", "outcome_unknown")
+_DOWNLOAD_ATTENTION_FIELDS = (
+    ("status", "request", "下载请求"),
+    ("qb_status", "qb", "qB"),
+    ("gy_status", "guangya", "光鸭"),
+)
+_DOWNLOAD_ATTENTION_BASE_WHERE = " OR ".join(
+    f"{field} IN ({','.join(repr(state) for state in _DOWNLOAD_ATTENTION_STATUSES)})"
+    for field, _key, _label in _DOWNLOAD_ATTENTION_FIELDS
 )
 
 
 _DOWNLOAD_ATTENTION_WHERE = (
     f"({_DOWNLOAD_ATTENTION_BASE_WHERE}) AND COALESCE(attention_cleared_at,'')=''"
 )
+
+
+def download_request_attention_stages(row) -> list[dict[str, str]]:
+    """待处理展示与重下载准入复用查询的下载层字段、状态和告警确认边界。"""
+    values = dict(row)
+    if values.get("attention_cleared_at"):
+        return []
+    request_error = str(values.get("error") or "")
+    stages = []
+    for field, key, label in _DOWNLOAD_ATTENTION_FIELDS:
+        status = str(values.get(field) or "")
+        if status not in _DOWNLOAD_ATTENTION_STATUSES:
+            continue
+        error = request_error
+        if key != "request":
+            prefix = f"{key}:"
+            for part in request_error.split(";"):
+                value = part.strip()
+                if value.lower().startswith(prefix):
+                    error = value[len(prefix):].strip()
+                    break
+        stages.append({"key": key, "label": label, "status": status, "error": error[:500]})
+    # 总状态通常汇总具体后端的异常，不重复展示同一错误。
+    return [stage for stage in stages if stage["key"] != "request"] if len(stages) > 1 else stages
 
 
 _DOWNLOAD_REQUEST_SCOPE_NOTE = (
@@ -341,13 +394,7 @@ def download_request_public_summary(row: Any) -> dict[str, Any]:
             review_required=review_required,
             error=raw_error,
         )
-    postprocess = download_postprocess_issues(row)
-    cleanup_status = str(row["gy_staging_cleanup_status"] or "") if "gy_staging_cleanup_status" in row.keys() else ""
-    if cleanup_status in {"retained", "failed"}:
-        postprocess.append({"key": "staging_cleanup", "label": "暂存清理", "status": cleanup_status,
-                            "error": str(row["gy_staging_cleanup_error"] or "")})
-    postprocess = [{**item, "error": safe_download_text(item["error"], limit=500, fallback="需要处理，请查看原任务；无需重复下载")}
-                   for item in postprocess]
+    postprocess = _public_postprocess_issues(row)
     error = "；".join(filter(None, (error, *(f"{item['label']}：{item['error']}" for item in postprocess))))
     return {
         "request_number": int(row["id"]),

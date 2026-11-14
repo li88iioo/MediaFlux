@@ -24,7 +24,6 @@ from app.agent.kernel.state_types import (
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.bot import handlers
 from app.modules import download_dispatcher as dispatcher
-from app.routes import downloads_api
 from tests.support import isolated_test_database
 
 
@@ -105,7 +104,7 @@ class TelegramDownloadResultBoundaryTests(unittest.TestCase):
         self.assertIn(f"请求: #{request_id}", text)
         self.assertIn("原因: 光鸭返回：文件违规", text)
 
-        stages = downloads_api._attention_stages(row)
+        stages = download_requests_repo.download_request_attention_stages(row)
         guangya_stage = next(stage for stage in stages if stage["key"] == "guangya")
         self.assertEqual(guangya_stage["error"], "文件违规")
 

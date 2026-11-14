@@ -119,15 +119,24 @@ def test_api_requires_auth_and_enabled_source(retry_case):
     assert get_download_request_result['local_import_status'] == 'failed'
 
 
-def test_attention_ui_exposes_only_local_retry_capability(retry_case):
-    rid, _path = retry_case
-    data = downloads_api._attention_json(download_requests_repo.get_download_request(rid))
-    assert data['retry_local_import'] is True
-    assert not data['retry_targets']['qb']['enabled']
-    script = Path('app/static/js/downloads.js').read_text()
-    assert 'r.retry_local_import?' in script
-    assert 'data-issue-local-retry' in script
-    assert '仅重试本地整理，不会重新下载' in script
+def test_local_retry_moves_to_history_without_becoming_download_attention(retry_case):
+    rid, path = retry_case
+    download_requests_repo.add_download_log('qb', title='Movie', request_id=rid, status='success')
+    download_requests_repo.add_download_log('qb', title='旧日志无请求', status='success')
+    data = downloads_api._logs(None, None)['items']
+    assert data[0]['retry_local_import'] is False and data[0]['postprocess_issues'] == []
+    assert data[1]['retry_local_import'] is True
+    assert data[1]['postprocess_issues'] == [{
+        'key': 'local_import', 'label': '本地入库', 'status': 'failed', 'error': '原路径映射错误',
+    }]
+    assert 'source_value' not in data[1] and 'torrent_data' not in data[1]
+    assert download_requests_repo.count_download_requests_requiring_attention(rid) == 0
+    local_media_repo.create_local_media_source(name='fixed', qb_profile='', qb_path_prefix='',
+                                              local_root=str(path.parent), owner='admin')
+    with patch.object(downloads_api, 'require_api_login'), patch('app.modules.download_tracker.get_download_tracker'):
+        assert downloads_api.retry_local_import_issue(rid, Mock()).status_code == 200
+    refreshed = downloads_api._logs(None, None)['items'][1]
+    assert refreshed['retry_local_import'] is False and refreshed['postprocess_issues'] == []
 
 
 def test_retry_ui_posts_only_local_action_and_keeps_busy_guard():
@@ -142,7 +151,7 @@ const issueActionBusy=new Set();let issueBatchBusy=false;let succeeds=true;
 const alerts=[],requests=[];const appConfirm=async()=>true;
 const appAlert=value=>alerts.push(value);const syncIssueActionButtons=()=>{};
 const syncIssueSelectionControls=()=>{};const loadIssues=async()=>{};
-const loadOverview=async()=>{};const downloadIssuePage=1;
+const loadOverview=async()=>{};const loadLogs=async()=>{};const downloadIssuePage=1,downloadLogPage=1;
 const api=async(path,options)=>{requests.push([path,options]);return {ok:succeeds,json:async()=>succeeds?{ok:true}:{error:'配置未修好'}}};
 '''+function+'''
 await retryLocalImport(12);succeeds=false;await retryLocalImport(12);

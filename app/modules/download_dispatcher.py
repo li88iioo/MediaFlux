@@ -686,16 +686,6 @@ def _request_content_type(row) -> str:
         return ""
 
 
-def guangya_download_needs_resubmit(row) -> bool:
-    """只有下载已结束、落稳/整理明确失败且没有活跃同伴时才接管旧请求。"""
-    return (
-        str(row["status"] or "") in {"completed", "failed"}
-        and str(row["gy_status"] or "") == "completed"
-        and str(row["organize_status"] or "") == "failed"
-        and str(row["qb_status"] or "") not in _ACTIVE_BACKEND_STATUSES
-    )
-
-
 def download_resubmit_capabilities(
     row,
     *,
@@ -707,6 +697,9 @@ def download_resubmit_capabilities(
     仍在处理或提交结果未知的后端不得创建第二份任务；另一个已经失败或进入
     ``manual_review`` 的后端仍可单独恢复。
     """
+    if not allow_completed and not download_requests_repo.download_request_attention_stages(row):
+        return {target: {"enabled": False, "reason": "当前没有下载失败或待核对事项，无需重新下载"}
+                for target in DOWNLOAD_TARGETS}
     kind = str(row["kind"] or "").strip().lower()
     source_value = str(row["source_value"] or "").strip()
     torrent_data = row["torrent_data"]
@@ -779,7 +772,7 @@ def download_resubmit_capabilities(
     elif gy_status == "resubmitted":
         gy_enabled = False
         gy_reason = "光鸭任务已重新提交"
-    elif gy_status == "completed" and not (allow_completed or guangya_download_needs_resubmit(row)):
+    elif gy_status == "completed" and not allow_completed:
         gy_enabled = False
         gy_reason = "光鸭任务已完成"
 
@@ -801,8 +794,7 @@ def download_resubmit_capabilities(
     elif qb_status == "resubmitted" or gy_status == "resubmitted":
         both_reason = "至少一个下载目标已重新提交"
     elif not allow_completed and (
-        qb_status == "completed"
-        or (gy_status == "completed" and not guangya_download_needs_resubmit(row))
+        qb_status == "completed" or gy_status == "completed"
     ):
         both_reason = "至少一个下载目标已完成"
     else:
@@ -843,14 +835,7 @@ def _download_retry_snapshot(row, target: str) -> tuple[dict[str, Any], int | No
         raise ValueError("下载待处理记录不存在")
     if row["attention_cleared_at"]:
         raise ValueError("该下载记录已经处理，无需重新提交")
-    stages = [label for key, label in (("status", "请求分发"), ("qb_status", "qBittorrent"), ("gy_status", "光鸭"))
-              if row[key] in {"failed", "manual_review"}]
-    stages.extend(label for key, label in (("local_import_status", "本地导入"), ("strm_status", "STRM"))
-                  if row[key] == "failed")
-    if int(row["organize_started"] or 0) < 0 or row["organize_status"] == "failed":
-        stages.append("媒体整理")
-    if row["gy_staging_cleanup_status"] in {"retained", "failed"}:
-        stages.append("光鸭暂存清理")
+    stages = [stage["label"] for stage in download_requests_repo.download_request_attention_stages(row)]
     if not stages:
         raise ValueError("该下载记录当前无需处理")
     capability = download_resubmit_capabilities(row).get(target) or {}

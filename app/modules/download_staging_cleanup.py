@@ -236,11 +236,11 @@ def cleanup_download_staging(
             other_staging = set(download_requests_repo.list_protected_guangya_staging_ids()) - {root_id}
             _verify_selected_scope(client, root_id, selected_scope)
             nodes = _empty_tree(client, row, live_protected | other_staging, report)
-            # 即使下载行被别处改回 retained，未知审计也不能被后台重放。
+            # 同一目录可能先由整理日志清理；任一入口的未知删除都不能在收尾时重放。
             with db.get_conn() as conn:
                 unknown = conn.execute(
-                    "SELECT 1 FROM organize_delete_audit WHERE trigger='download_staging_cleanup' "
-                    "AND status IN ('pending','failed') AND file_id IN (" + ','.join('?' for _ in nodes) + ') LIMIT 1',
+                    "SELECT 1 FROM organize_delete_audit WHERE status IN ('pending','failed') "
+                    "AND file_id IN (" + ','.join('?' for _ in nodes) + ') LIMIT 1',
                     [node[0] for node in nodes],
                 ).fetchone()
             if unknown:

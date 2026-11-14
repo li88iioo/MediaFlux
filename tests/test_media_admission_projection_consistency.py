@@ -19,9 +19,10 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                 media_subscriptions_repo.sync_media_download_admission_for_request(request)
                 self.assertEqual(self.view(admission)[:2], ("failed", f"下载后处理失败（{label}）：failed-stage"))
 
-    def test_postprocessing_attention_is_consistent_and_retains_admission_until_recovered(self):
-        from app.routes.downloads_api import _attention_stages
-        from app.repositories.download_requests import download_request_public_summary
+    def test_postprocessing_issues_retain_admission_without_download_attention_until_recovered(self):
+        from app.repositories.download_requests import (
+            download_postprocess_issues, download_request_attention_stages, download_request_public_summary,
+        )
         from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
 
         cases = (
@@ -46,8 +47,9 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                     media_subscriptions_repo.reconcile_media_download_admissions(self.subscription, {key} if present else set(), expected_revision=1)
                     self.assertEqual(self.view(admission), expected)
                 row = download_requests_repo.get_download_request(request)
-                self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request), 1)
-                issues = _attention_stages(row)
+                self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request), 0)
+                self.assertEqual(download_request_attention_stages(row), [])
+                issues = download_postprocess_issues(row)
                 self.assertTrue(any(item["key"] == stage and item["error"] == reason for item in issues))
                 summary = download_request_public_summary(row)
                 self.assertEqual(summary["status"], "completed")

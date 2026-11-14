@@ -202,7 +202,10 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
                 if mutation == 'duplicate':
                     self.request('duplicate', 'stage')
                 elif mutation == 'hidden':
-                    self.assertEqual(download_requests_repo.clear_download_request_attentions([self.request_id], batch=False)['cleared'], [self.request_id])
+                    # 保留旧版曾被用户清除待处理的身份边界；新版不将收尾问题列为下载失败。
+                    with db.get_conn() as conn:
+                        conn.execute('UPDATE download_requests SET attention_cleared_at=? WHERE id=?',
+                                     (db.now(), self.request_id))
                 elif mutation == 'cleared':
                     download_requests_repo.update_download_request(self.request_id, organize_status='cleared')
                 elif mutation == 'delete_unknown':
@@ -363,7 +366,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         get_download_request_result_3 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_3 is not None
         self.assertEqual(get_download_request_result_3['gy_staging_cleanup_status'], 'retained')
-        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         self.assertEqual(self.cloud.reads, [])
 
     def test_policy_skip_does_not_need_a_usable_cloud_client(self):
@@ -434,7 +437,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         get_download_request_result_5 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_5 is not None
         self.assertEqual(get_download_request_result_5['gy_staging_cleanup_status'], 'retained')
-        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         self.assertEqual(self.cloud.reads, [])
 
     def test_rebinding_between_phase_close_and_cleanup_does_not_become_new_authority(self):
@@ -649,7 +652,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         get_download_request_result_11 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_11 is not None
         self.assertEqual(get_download_request_result_11['gy_staging_cleanup_status'], 'failed')
-        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
 
     def test_worker_refreshes_permanent_source_at_final_audit_guard(self):
         self.enqueue()
@@ -677,7 +680,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         get_download_request_result_12 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_12 is not None
         self.assertEqual(get_download_request_result_12['gy_staging_cleanup_status'], 'retained')
-        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         self.assertEqual(self.cloud.reads, [])
 
     def test_worker_known_child_success_and_read_error_retries_only_remaining_root(self):

@@ -435,6 +435,9 @@ function renderLogs(data) {
         const st=statuses[r.status]||[r.status,''];
         const meta=[r.backend_task_id?`任务 #${r.backend_task_id}`:'',r.error||''].filter(Boolean).join(' · ');
         const parsed = parseEntryTitle(r.title);
+        const requestId=Number(r.request_id)||0;
+        const postprocess=Array.isArray(r.postprocess_issues)?r.postprocess_issues:[];
+        const localBusy=issueBatchBusy||issueActionBusy.has(requestId);
 
         return `<tr class="download-batch-row download-log-row${selected?' is-selected':''}" data-log-id="${id}">
             <td class="download-log-source-cell">
@@ -451,6 +454,8 @@ function renderLogs(data) {
                     <div class="dl-task-main-title" title="${attr(r.title)}">${esc(parsed.mainTitle||'-')}</div>
                     ${parsed.tags.length ? `<div class="dl-task-tags">${parsed.tags.map(t=>`<span class="dl-task-tag">${esc(t)}</span>`).join('')}</div>` : ''}
                     ${meta ? `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${esc(meta)}</div>` : ''}
+                    ${postprocess.length?`<div class="download-attention-meta">${postprocess.map(issue=>`${esc(issue.label)}：${esc(issue.error)}`).join('；')}</div>`:''}
+                    ${r.retry_local_import&&requestId?`<button type="button" class="rss-btn download-attention-action" data-issue-local-retry data-request-id="${requestId}" onclick="retryLocalImport(${requestId})" ${localBusy?'disabled':''} aria-busy="${issueActionBusy.has(requestId)?'true':'false'}" title="仅重试本地整理，不会重新下载"><i data-lucide="folder-sync"></i><span>重试本地整理</span></button>`:''}
                     <div class="download-log-mobile-details">
                         ${downloadLogTargetHtml(r.path)}
                         <span class="download-log-mobile-time">${esc(r.created_at||'-')}</span>
@@ -485,12 +490,7 @@ function renderIssues(data) {
         const selected=selectedIssueIds.has(id);
         const parsed=parseEntryTitle(r.title);
         const stages=Array.isArray(r.stages)?r.stages:[];
-        const issues=stages.map(stage=>{
-            const recovery=stage.key==='local_import'
-                ? `<a class="rss-btn download-attention-action" href="/local-media#${stage.status==='requires_manual'?'review':'tasks'}">处理本地整理</a>`
-                : stage.key==='strm'?'<a class="rss-btn download-attention-action" href="/guangya/strm">查看同步</a>':'';
-            return `<div class="download-attention-issue"><span class="download-attention-stage">${esc(stage.label||stage.key||'异常')}</span><span class="download-attention-message">${esc(stage.error||'状态异常，请核对相关服务与运行日志。')}${recovery}</span></div>`;
-        }).join('')||'<div class="download-attention-issue"><span class="download-attention-message">状态异常，请核对相关服务与运行日志。</span></div>';
+        const issues=stages.map(stage=>`<div class="download-attention-issue"><span class="download-attention-stage">${esc(stage.label||stage.key||'异常')}</span><span class="download-attention-message">${esc(stage.error||'状态异常，请核对相关服务与运行日志。')}</span></div>`).join('')||'<div class="download-attention-issue"><span class="download-attention-message">状态异常，请核对相关服务与运行日志。</span></div>';
         const meta=[`请求 #${r.id}`,origins[r.origin]||r.origin,kinds[r.kind]||r.kind].filter(Boolean).join(' · ');
         const capabilities=r.retry_targets||{};
         const rowBusy=issueActionBusy.has(id);
@@ -520,7 +520,7 @@ function renderIssues(data) {
                 <div class="download-attention-operation" aria-label="待处理操作">
                     <div class="download-attention-actions" role="group" aria-label="重新下载目标">
                         ${actionButton('guangya','光鸭','cloud-download')}
-                        ${r.retry_local_import?`<button type="button" class="rss-btn download-attention-action" data-issue-local-retry data-request-id="${id}" onclick="retryLocalImport(${id})" ${busy?'disabled':''} aria-busy="${rowBusy?'true':'false'}" aria-label="重试本地整理" title="仅重试本地整理，不会重新下载"><i data-lucide="folder-sync"></i><span>整理</span></button>`:actionButton('qb','qB','download')}
+                        ${actionButton('qb','qB','download')}
                         ${actionButton('both','两者','copy-plus')}
                     </div>
                     <button type="button" class="rss-btn download-attention-clear" data-issue-clear data-request-id="${r.id}" onclick="clearIssue(${r.id})" ${busy?'disabled':''} aria-busy="${rowBusy?'true':'false'}" title="移出待处理；不会删除文件、任务或日志"><i data-lucide="x"></i><span>清除</span></button>
@@ -671,7 +671,7 @@ async function retryLocalImport(requestId){
         const data=await response.json().catch(()=>({}));
         if(!response.ok||!data.ok)throw new Error(data.error||'本地整理未能重新排队');
         appAlert({type:'success',title:'本地整理已重新排队',message:`请求 #${id} 将由下载跟踪器重新检查，不会重新提交下载。`});
-        await Promise.all([loadIssues(downloadIssuePage),loadOverview()]);
+        await Promise.all([loadLogs(downloadLogPage),loadIssues(downloadIssuePage),loadOverview()]);
         return true;
     }catch(error){
         appAlert({type:receivedResponse?'error':'warning',title:receivedResponse?'重试整理失败':'重试状态待核对',message:receivedResponse?(error.message||'请核对本地来源配置'):'请先刷新任务状态核对，不要立即重复操作。'});

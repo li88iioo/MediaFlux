@@ -232,7 +232,7 @@ class DownloadBatchUiContractTests(unittest.TestCase):
 
 
 class DownloadLogCleanupBrowserTests(unittest.TestCase):
-    def test_clear_matching_pages_cancel_and_preserve_new_logs(self):
+    def test_history_clear_preserves_other_logs_and_local_retry_remains_accessible(self):
         """真实页面和 Chromium；API 替身只保存日志，不调用下载器。"""
         from urllib.parse import urlsplit
         from fastapi.testclient import TestClient
@@ -264,11 +264,15 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                     page = browser.new_page(viewport={'width': width, 'height': 960})
                     errors = []
                     page.on('pageerror', lambda error: errors.append(str(error)))
-                    rows = [{'id': i, 'source': 'guangya', 'title': f'剧集{i}.mp4',
+                    rows: list[dict] = [{'id': i, 'source': 'guangya', 'title': f'剧集{i}.mp4',
                              'status': 'failed', 'path': '', 'created_at': '2026-11-09 00:00:00'}
                             for i in range(1, 54)]
-                    rows.append({**rows[0], 'id': 54, 'source': 'qb', 'title': '保留的日志'})
+                    rows.append({**rows[0], 'id': 54, 'source': 'qb', 'title': '保留的日志',
+                                 'status': 'success', 'request_id': 94, 'retry_local_import': True,
+                                 'postprocess_issues': [{'key': 'local_import', 'label': '本地入库',
+                                                        'error': '路径映射错误 <img src=x onerror=alert(1)>'}]})
                     posted = []
+                    local_retries = []
 
                     def route_request(route):
                         path = urlsplit(route.request.url).path
@@ -296,6 +300,11 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                                 and (not payload['source'] or r['source'] == payload['source']))]
                             rows[:] = [r for r in rows if r not in selected]
                             route.fulfill(json={'ok': True, 'deleted': len(selected), 'missing': 0})
+                        elif path == '/api/downloads/issues/94/retry-local-import':
+                            local_retries.append(path)
+                            rows[-1]['retry_local_import'] = False
+                            rows[-1]['postprocess_issues'] = []
+                            route.fulfill(json={'ok': True, 'request_id': 94})
                         elif path.startswith('/api/'):
                             route.fulfill(json={})
                         else:
@@ -333,6 +342,20 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                     expect(page.locator('#downloadLogPageInfo')).to_have_text('共 0 条')
                     self.assertEqual(posted[1], {'log_ids': [55]})
                     expect(page.locator('#logClearAll')).to_be_disabled()
+                    page.select_option('#logSource', 'qb')
+                    expect(page.locator('#logList')).to_contain_text('本地入库：路径映射错误')
+                    self.assertEqual(page.locator('#logList img').count(), 0)
+                    retry = page.locator('#logList [data-issue-local-retry]')
+                    expect(retry).to_be_enabled()
+                    retry.click()
+                    expect(page.locator('#appConfirmTitle')).to_have_text('重试本地整理')
+                    page.locator('#appConfirmCancel').click()
+                    self.assertEqual(local_retries, [])
+                    retry.click()
+                    page.locator('#appConfirmSubmit').click()
+                    expect(page.locator('#logList [data-issue-local-retry]')).to_have_count(0)
+                    self.assertEqual(local_retries, ['/api/downloads/issues/94/retry-local-import'])
+                    self.assertEqual(len(posted), 2)
                     self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
                     self.assertEqual(errors, [])
                     page.close()

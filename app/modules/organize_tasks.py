@@ -2376,6 +2376,7 @@ class OrganizeTaskManager:
         client: GuangYaClient | PreviewSnapshotGuangYaClient | None, request_ids: list[int], sources: list[dict[str, str]],
         *, rules: OrganizeRules | None = None,
         expected_identities: dict[int, dict] | None = None,
+        allow_running: bool = True,
     ) -> dict:
         current_rules = rules or OrganizeRules.from_config()
         protected, error = _protected_organize_root_ids(current_rules)
@@ -2394,7 +2395,7 @@ class OrganizeTaskManager:
         protected.update({"0", (current_rules.target_dir_id or "0")})
         return cleanup_download_staging(
             client, request_ids, source_ids={item["id"] for item in sources},
-            protected_ids=protected, enabled=current_rules.clean_empty, allow_running=True,
+            protected_ids=protected, enabled=current_rules.clean_empty, allow_running=allow_running,
             expected_identities=expected_identities,
         )
 

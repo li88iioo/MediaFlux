@@ -1,4 +1,4 @@
-"""下载及后处理异常必须与看板计数共享口径并可被用户找到。"""
+"""下载待处理共享下载层口径，后处理异常继续保留在详情与历史。"""
 from __future__ import annotations
 
 import re
@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import database as db
@@ -17,7 +18,7 @@ from app.config import web_credentials
 from app.main import create_app
 from app.modules import download_dispatcher
 from app.modules.download_tracker import DownloadTracker
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, assert_present
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +28,7 @@ TORRENT_DATA = (
 )
 
 
-def _create_interrupted_request() -> int:
+def _create_failed_request() -> int:
     request_id, created = download_requests_repo.create_download_request(
         "attention:test-request",
         "torrent",
@@ -43,8 +44,9 @@ def _create_interrupted_request() -> int:
         raise AssertionError("测试下载请求未创建")
     download_requests_repo.update_download_request(
         request_id,
-        status="completed",
-        gy_status="completed",
+        status="failed",
+        gy_status="failed",
+        error="guangya: 下载提交失败，需人工核验",
         organize_started=-1,
         organize_status="failed",
         organize_error="上次进程在整理任务运行期间中断，需人工核验",
@@ -63,7 +65,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
     def test_attention_list_and_dashboard_count_share_the_same_predicate(self):
         from app.repositories.download_requests import list_download_request_summaries
 
-        request_id = _create_interrupted_request()
+        request_id = _create_failed_request()
 
         self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
         rows = download_requests_repo.list_download_requests_requiring_attention(limit=20, offset=0)
@@ -74,7 +76,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual({issue["key"] for issue in public["items"][0]["postprocess_issues"]},
                          {"organize", "strm"})
 
-    def test_retained_staging_directory_is_visible_as_attention(self):
+    def test_retained_staging_directory_stays_in_history_without_download_attention(self):
         from app.repositories.download_requests import list_download_request_summaries
 
         request_id, created = download_requests_repo.create_download_request(
@@ -94,10 +96,11 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             gy_staging_cleanup_error="隔离目录仍有 2 项未整理或未识别：sample.txt、poster.jpg",
         )
 
-        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         rows = download_requests_repo.list_download_requests_requiring_attention(limit=20, offset=0)
-        self.assertEqual([int(row["id"]) for row in rows], [request_id])
-        item = list_download_request_summaries(scope="attention")["items"][0]
+        self.assertEqual(rows, [])
+        self.assertEqual(list_download_request_summaries(scope="attention")["items"], [])
+        item = list_download_request_summaries(scope="recent")["items"][0]
         self.assertEqual(item["request_number"], request_id)
         self.assertEqual(item["status"], "completed")
         self.assertEqual(item["postprocess_issues"], [{
@@ -106,7 +109,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         }])
 
     def test_resubmit_creates_successor_and_resolves_previous_attention(self):
-        request_id = _create_interrupted_request()
+        request_id = _create_failed_request()
         capabilities = {
             "qb": {"enabled": True, "reason": ""},
             "guangya": {"enabled": True, "reason": ""},
@@ -146,7 +149,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertNotIn(successor_id, attention_ids)
         original = download_requests_repo.get_download_request(request_id)
         assert original is not None
-        self.assertEqual(original["organize_started"], 1)
+        self.assertEqual(original["organize_started"], 0)
         self.assertEqual(original["organize_status"], "resubmitted")
         self.assertEqual(original["strm_status"], "resubmitted")
         self.assertIn(f"请求 #{successor_id}", original["error"])
@@ -797,7 +800,7 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertIn("已重新提交", capabilities["both"]["reason"])
 
     def test_clear_attention_preserves_original_failure_and_audit_data(self):
-        request_id = _create_interrupted_request()
+        request_id = _create_failed_request()
         before = download_requests_repo.get_download_request(request_id)
 
         result = download_requests_repo.clear_download_request_attentions([request_id], batch=False)
@@ -855,7 +858,7 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
         return {"X-CSRF-Token": self._csrf_token(self.client.get("/downloads"))}
 
     def test_issues_api_exposes_actionable_stages_without_source_payload(self):
-        request_id = _create_interrupted_request()
+        request_id = _create_failed_request()
         response = self.client.get("/api/downloads/issues", headers=self._headers())
 
         self.assertEqual(response.status_code, 200)
@@ -863,14 +866,14 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(payload["total"], 1)
         item = payload["items"][0]
         self.assertEqual(item["id"], request_id)
-        self.assertEqual([stage["key"] for stage in item["stages"]], ["organize", "strm"])
+        self.assertEqual([stage["key"] for stage in item["stages"]], ["guangya"])
         self.assertIn("需人工核验", item["stages"][0]["error"])
         self.assertEqual(set(item["retry_targets"]), {"qb", "guangya", "both"})
         self.assertNotIn("source_value", item)
         self.assertNotIn("torrent_data", item)
 
     def test_resubmit_api_dispatches_selected_target(self):
-        request_id = _create_interrupted_request()
+        request_id = _create_failed_request()
         capabilities = {
             "qb": {"enabled": True, "reason": ""},
             "guangya": {"enabled": True, "reason": ""},
@@ -929,7 +932,7 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
             "资源中没有符合下载规则的文件：解析器标记为排除",
         )
 
-    def test_issues_api_exposes_retained_staging_cleanup(self):
+    def test_issues_api_excludes_retained_staging_and_rejects_clear_and_redownload(self):
         request_id, created = download_requests_repo.create_download_request(
             "attention:staging-api",
             "magnet",
@@ -947,16 +950,38 @@ class DownloadAttentionApiTests(IsolatedDatabaseTestCase):
             gy_staging_cleanup_error="隔离目录仍有 1 项未整理或未识别：sample.txt",
         )
 
-        response = self.client.get("/api/downloads/issues", headers=self._headers())
+        before = dict(assert_present(download_requests_repo.get_download_request(request_id)))
+        headers = self._headers()
+        response = self.client.get("/api/downloads/issues", headers=headers)
 
         self.assertEqual(response.status_code, 200)
-        item = response.json()["items"][0]
-        self.assertEqual([stage["key"] for stage in item["stages"]], ["staging_cleanup"])
-        self.assertEqual(item["stages"][0]["label"], "暂存清理")
-        self.assertIn("sample.txt", item["stages"][0]["error"])
+        self.assertEqual(response.json()["items"], [])
+        self.assertEqual(response.json()["total"], 0)
+        with patch("app.routes.downloads_api.resubmit_download_request") as resubmit:
+            rejected = self.client.post(
+                f"/api/downloads/issues/{request_id}/resubmit", headers=headers,
+                json={"target": "guangya"},
+            )
+            self.assertEqual(rejected.status_code, 409)
+            batch = self.client.post(
+                "/api/downloads/issues/batch/resubmit", headers=headers,
+                json={"request_ids": [request_id], "target": "guangya"},
+            )
+            self.assertEqual(batch.json()["skipped"], 1)
+            resubmit.assert_not_called()
+        cleared = self.client.post(f"/api/downloads/issues/{request_id}/clear", headers=headers)
+        self.assertEqual(cleared.status_code, 409)
+        batch_clear = self.client.post(
+            "/api/downloads/issues/batch/clear", headers=headers, json={"request_ids": [request_id]},
+        )
+        self.assertEqual(batch_clear.json()["cleared"], 0)
+        self.assertEqual(batch_clear.json()["skipped"], 1)
+        self.assertEqual(dict(assert_present(download_requests_repo.get_download_request(request_id))), before)
+        detail = download_requests_repo.download_request_public_summary(before)
+        self.assertIn("sample.txt", detail["postprocess_issues"][0]["error"])
 
     def test_clear_issue_only_hides_attention_without_deleting_request(self):
-        request_id = _create_interrupted_request()
+        request_id = _create_failed_request()
 
         response = self.client.post(
             f"/api/downloads/issues/{request_id}/clear",
@@ -1010,7 +1035,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_strm_refresh_pending_remains_visible_until_request_reconciles_completed():
+def test_strm_refresh_pending_remains_in_history_until_request_reconciles_completed():
     from app.routes import downloads_api
     from tests.support import isolated_test_database
 
@@ -1021,8 +1046,102 @@ def test_strm_refresh_pending_remains_visible_until_request_reconciles_completed
             strm_status="partial", strm_error="STRM 已完成，媒体库刷新等待后台重试",
             gy_staging_cleanup_status="completed",
         )
-        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 1
-        stages = downloads_api._attention_json(download_requests_repo.get_download_request(request_id))["stages"]
-        assert any(stage["key"] == "strm" and stage["status"] == "partial" for stage in stages)
+        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 0
+        row = download_requests_repo.get_download_request(request_id)
+        assert downloads_api._attention_json(row)["stages"] == []
+        detail = download_requests_repo.download_request_public_summary(row)
+        assert any(issue["key"] == "strm" and issue["status"] == "partial" for issue in detail["postprocess_issues"])
+        assert "媒体库刷新等待后台重试" in detail["error"]
         download_requests_repo.update_download_request(request_id, strm_status="completed", strm_error="")
         assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 0
+        assert download_requests_repo.download_request_public_summary(
+            download_requests_repo.get_download_request(request_id)
+        )["postprocess_issues"] == []
+
+
+@pytest.mark.parametrize(("fields", "stage"), [
+    ({"organize_status": "failed", "organize_started": -1}, "organize"),
+    ({"organize_started": -1}, "organize"),
+    ({"organize_status": "requires_manual"}, "organize"),
+    ({"organize_status": "partial"}, "organize"),
+    ({"strm_status": "failed"}, "strm"),
+    ({"strm_status": "partial"}, "strm"),
+    ({"local_import_status": "failed"}, "local_import"),
+    ({"local_import_status": "requires_manual"}, "local_import"),
+    ({"gy_staging_cleanup_status": "retained"}, "staging_cleanup"),
+    ({"gy_staging_cleanup_status": "failed"}, "staging_cleanup"),
+])
+def test_postprocess_only_failures_preserve_facts_without_download_attention_or_retry(fields, stage):
+    from app.routes import downloads_api
+    from tests.support import isolated_test_database
+
+    with isolated_test_database("postprocess-history.db"):
+        request_id, _ = download_requests_repo.create_download_request(
+            "postprocess-only", "magnet", source_value="magnet:?xt=urn:btih:" + "a" * 40,
+        )
+        error_key = "gy_staging_cleanup_error" if stage == "staging_cleanup" else f"{stage}_error"
+        download_requests_repo.update_download_request(request_id, **{
+            "status": "completed", "targets": "both", "qb_status": "completed", "gy_status": "completed",
+            "organize_started": 1, "organize_status": "completed", "local_import_status": "completed",
+            "strm_status": "completed", "error": "原下载请求错误记录", error_key: "后处理原始错误", **fields,
+        })
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        before = dict(row)
+        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 0
+        assert download_requests_repo.list_download_requests_requiring_attention() == []
+        assert db.get_dashboard_automation_summary()["downloads_review"] == 0
+        assert sdk.downloads.requests(scope="attention")["items"] == []
+        assert downloads_api._attention_json(row)["stages"] == []
+        detail = sdk.downloads.requests(scope="recent")["items"][0]
+        assert detail["postprocess_issues"] == [{
+            "key": stage, "label": {"organize": "自动整理", "strm": "STRM 同步",
+                                   "local_import": "本地入库", "staging_cleanup": "暂存清理"}[stage],
+            "status": "failed" if fields.get("organize_started") == -1 else fields.get(
+                "gy_staging_cleanup_status" if stage == "staging_cleanup" else f"{stage}_status"
+            ), "error": "后处理原始错误",
+        }]
+        assert "后处理原始错误" in detail["error"]
+        assert download_requests_repo.clear_download_request_attentions([request_id])["not_attention"] == [request_id]
+        with patch.object(download_dispatcher, "_submit_qb") as qb, patch.object(download_dispatcher, "_submit_guangya") as gy:
+            assert not any(cap["enabled"] for cap in download_dispatcher.download_resubmit_capabilities(row).values())
+            with pytest.raises(ValueError):
+                download_dispatcher.prepare_download_retry(request_id, "guangya")
+            assert not download_dispatcher.resubmit_download_request(request_id, "guangya")["ok"]
+        qb.assert_not_called()
+        gy.assert_not_called()
+        assert dict(assert_present(download_requests_repo.get_download_request(request_id))) == before
+
+
+@pytest.mark.parametrize("field,stage", [("status", "request"), ("qb_status", "qb"), ("gy_status", "guangya")])
+@pytest.mark.parametrize("status", ["failed", "manual_review", "outcome_unknown"])
+def test_download_failure_and_unknown_states_share_all_attention_views(field, stage, status):
+    from app.routes import downloads_api
+    from tests.support import isolated_test_database
+
+    with isolated_test_database("download-attention-states.db"):
+        request_id, _ = download_requests_repo.create_download_request("download-state", "magnet")
+        download_requests_repo.update_download_request(request_id, **{
+            "status": "completed", "targets": "both",
+            "qb_status": "" if field == "status" else "completed",
+            "gy_status": "" if field == "status" else "completed",
+            "error": "下载层原始错误", field: status,
+        })
+        row = download_requests_repo.get_download_request(request_id)
+        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 1
+        assert row is not None
+        assert [item["id"] for item in download_requests_repo.list_download_requests_requiring_attention()] == [request_id]
+        assert db.get_dashboard_automation_summary()["downloads_review"] == 1
+        assert [item["request_number"] for item in sdk.downloads.requests(scope="attention")["items"]] == [request_id]
+        assert downloads_api._attention_json(row)["stages"] == [{
+            "key": stage, "label": {"request": "下载请求", "qb": "qB", "guangya": "光鸭"}[stage],
+            "status": status, "error": "下载层原始错误",
+        }]
+        assert row["error"] == "下载层原始错误"
+        assert download_requests_repo.clear_download_request_attentions([request_id])["cleared"] == [request_id]
+        cleared = download_requests_repo.get_download_request(request_id)
+        assert cleared is not None
+        assert cleared["error"] == "下载层原始错误"
+        assert download_requests_repo.count_download_requests_requiring_attention(request_id) == 0
+        assert downloads_api._attention_json(cleared)["stages"] == []
+        assert not any(cap["enabled"] for cap in download_dispatcher.download_resubmit_capabilities(cleared).values())

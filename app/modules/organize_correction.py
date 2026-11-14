@@ -372,6 +372,7 @@ class OrganizeCorrectionService:
         prepared_deletes: dict[int, list[CorrectionItem]] = {}
         cleanup_directories: list[GuangYaFile] = []
         cleanup_protected: set[str] = set()
+        staging_requests: dict[str, list[dict]] = {}
         deleted_in_batch: set[str] = set()
         if action == "delete":
             if confirm_text != "DELETE":
@@ -387,7 +388,7 @@ class OrganizeCorrectionService:
                         "completed": [], "failed": [{"log_id": log_id, "error": str(exc)}],
                         "warnings": [], "deleted": 0, "empty_dirs_cleaned": 0,
                     }
-            cleanup_directories, cleanup_protected, warnings = self._capture_delete_parent_directories(
+            cleanup_directories, cleanup_protected, staging_requests, warnings = self._capture_delete_cleanup(
                 {item.current_parent_id for items in prepared_deletes.values() for item in items},
                 OrganizeRules.from_config(),
             )
@@ -427,11 +428,13 @@ class OrganizeCorrectionService:
                 item.current_parent_id: row["log_id"]
                 for row in completed for item in prepared_deletes[row["log_id"]]
             }
-            empty_dirs_cleaned, directory_warnings = self._cleanup_empty_directories(
+            empty_dirs_cleaned, directory_warnings = self._finish_delete_cleanup(
                 log_id=completed[0]["log_id"],
-                directories=[item for item in cleanup_directories if item.file_id in owners],
+                directories=cleanup_directories,
                 protected=cleanup_protected, directory_log_ids=owners,
-                trigger="manual_delete_empty_dir_cleanup",
+                staging_requests=staging_requests,
+                failed_parents={item.current_parent_id for row in failed
+                                for item in prepared_deletes[row["log_id"]]},
             )
             warnings.extend(directory_warnings)
         return {
@@ -1269,6 +1272,9 @@ class OrganizeCorrectionService:
         directory_log_ids: dict[str, int] | None = None,
     ) -> tuple[int, list[str]]:
         """统一回收已捕获的空目录；归档纠偏额外要求仍在原目标根下。"""
+        from app.modules.download_staging_cleanup import assert_guangya_download_delete_allowed
+        from app.modules.organize_tasks import _protected_organize_root_ids
+
         audit_owners = directory_log_ids or {}
         if not directories:
             return 0, []
@@ -1397,6 +1403,28 @@ class OrganizeCorrectionService:
                     read_directory=self.client.file_info,
                 ):
                     raise RuntimeError("目录已不属于当前整理目标根")
+                def delete_current_directory(
+                    current_id=directory_id, current_etag=expected_etag,
+                    current_updated_at=expected_updated_at,
+                ):
+                    # 审计写入期间下载请求也可能改绑目录，旧保护快照不能继续授权。
+                    try:
+                        live_protected, error = _protected_organize_root_ids(OrganizeRules.from_config())
+                        if error or current_id in live_protected:
+                            raise RuntimeError(error or "目录已成为受保护根，已停止清理")
+                        live_directory = self.client.file_info(current_id)
+                        if live_directory is None or not live_directory.is_dir:
+                            raise RuntimeError("目录身份无法确认，已停止清理")
+                        assert_guangya_download_delete_allowed(self.client, live_directory)
+                    except Exception as exc:
+                        # 只读校验失败应记为 blocked，不能伪报已发起的未知删除。
+                        setattr(exc, "provider_write_not_started", True)
+                        raise
+                    return delete_empty(
+                        current_id, expected_etag=current_etag,
+                        expected_updated_at=current_updated_at,
+                    )
+
                 execute_recycle_bin_delete(
                     self.client,
                     trigger=trigger,
@@ -1412,13 +1440,7 @@ class OrganizeCorrectionService:
                     ),
                     organize_log_id=audit_owners.get(directory_id, log_id),
                     safe_failure_message="目标目录状态已变化，已安全保留",
-                    delete_operation=lambda current_id=directory_id,
-                    current_etag=expected_etag,
-                    current_updated_at=expected_updated_at: delete_empty(
-                        current_id,
-                        expected_etag=current_etag,
-                        expected_updated_at=current_updated_at,
-                    ),
+                    delete_operation=delete_current_directory,
                 )
                 cleaned += 1
             except Exception as exc:
@@ -2009,17 +2031,33 @@ class OrganizeCorrectionService:
             "warnings": warnings,
         }
 
-    def _capture_delete_parent_directories(
+    def _capture_delete_cleanup(
         self, parent_ids: set[str], rules: OrganizeRules,
-    ) -> tuple[list[GuangYaFile], set[str], list[str]]:
-        """只捕获所选媒体的直接父目录，不扫描来源或扩张到未选择的祖先。"""
+    ) -> tuple[list[GuangYaFile], set[str], dict[str, list[dict]], list[str]]:
+        """删除前捕获直接父目录与所属下载根；子目录删空后不能再沿父链定位。"""
+        from app.modules.download_staging_cleanup import source_inside_protected_staging
         from app.modules.organize_tasks import _protected_organize_root_ids
+        from app.repositories.download_staging import list_staging_cleanup_requests
 
         protected, error = _protected_organize_root_ids(rules)
         if error:
-            return [], protected, ["来源根配置无法核验，已保留媒体父目录"]
+            return [], protected, {}, ["来源根配置无法核验，已保留媒体父目录"]
         directories: list[GuangYaFile] = []
+        staging_requests: dict[str, list[dict]] = {}
         warnings: list[str] = []
+        try:
+            requests = list_staging_cleanup_requests()
+            info_cache: dict = {}
+            for parent_id in sorted(parent_ids - {""}):
+                owners = [row for row in requests if source_inside_protected_staging(
+                    self.client, parent_id, {str(row["gy_target_dir"])}, info_cache=info_cache,
+                )]
+                if owners:
+                    staging_requests[parent_id] = owners
+        except Exception as exc:
+            logger.warning("删除前定位下载暂存目录失败 type=%s", type(exc).__name__)
+            # 归属未完整核验时不扩张清理范围，文件删除仍按原日志快照执行。
+            return [], protected, {}, ["下载目录归属无法核验，已保留空目录，请稍后核对"]
         for directory_id in sorted(parent_ids - protected - {""}):
             try:
                 directory = self.client.file_info(directory_id)
@@ -2029,7 +2067,41 @@ class OrganizeCorrectionService:
             except Exception as exc:
                 logger.warning("删除前核验媒体父目录失败 dir=%s type=%s", directory_id, type(exc).__name__)
                 warnings.append(f"无法核验父目录 {directory_id}，已保留该目录")
-        return directories, protected, warnings
+        return directories, protected, staging_requests, warnings
+
+    def _finish_delete_cleanup(
+        self, *, log_id: int, directories: list[GuangYaFile], protected: set[str],
+        directory_log_ids: dict[str, int], staging_requests: dict[str, list[dict]],
+        failed_parents: set[str],
+    ) -> tuple[int, list[str]]:
+        """单条和批量删除共用收尾；普通目录只清父级，下载目录清到自有 MF 根。"""
+        from app.modules.organize_tasks import OrganizeTaskManager
+
+        cleaned, warnings = self._cleanup_empty_directories(
+            log_id=log_id,
+            directories=[item for item in directories if item.file_id in directory_log_ids],
+            protected=protected, directory_log_ids=directory_log_ids,
+            trigger="manual_delete_empty_dir_cleanup",
+        )
+        blocked = {int(row["id"]) for parent in failed_parents
+                   for row in staging_requests.get(parent, [])}
+        requests = {int(row["id"]): row for parent in directory_log_ids
+                    for row in staging_requests.get(parent, []) if int(row["id"]) not in blocked}
+        # 这是用户明确选择“媒体及空目录”的删除，不受自动整理 clean_empty 开关影响。
+        rules = replace(OrganizeRules.from_config(), clean_empty=True)
+        for request_id, row in requests.items():
+            try:
+                report = OrganizeTaskManager._cleanup_download_staging(
+                    self.client, [request_id],
+                    [{"id": str(row["gy_target_dir"]), "name": str(row["gy_staging_name"])}],
+                    rules=rules, expected_identities={request_id: row}, allow_running=False,
+                )
+                cleaned += int(report.get("cleaned") or 0)
+                warnings.extend(f"下载 #{request_id}：{reason}" for reason in report.get("reasons", []))
+            except Exception as exc:
+                logger.warning("回收媒体后下载目录收尾失败 request=%s type=%s", request_id, type(exc).__name__)
+                warnings.append(f"下载 #{request_id}：媒体已回收，暂存目录清理未完成，请核对")
+        return cleaned, warnings
 
     def _prepare_delete_group(
         self, log_id: int, confirm_text: str,
@@ -2116,7 +2188,7 @@ class OrganizeCorrectionService:
     def delete_group(self, log_id: int, operation_token: str,
                      expected_version: int, confirm_text: str) -> dict:
         ordered = self._prepare_delete_group(log_id, confirm_text)
-        directories, protected, warnings = self._capture_delete_parent_directories(
+        directories, protected, staging_requests, warnings = self._capture_delete_cleanup(
             {item.current_parent_id for item in ordered}, OrganizeRules.from_config(),
         )
         if not db.claim_organize_log_operation(
@@ -2124,9 +2196,10 @@ class OrganizeCorrectionService:
         ):
             raise RuntimeError("日志状态或版本已变化，请刷新后重试")
         result = self._execute_claimed_delete(log_id, operation_token, ordered)
-        cleaned, directory_warnings = self._cleanup_empty_directories(
+        cleaned, directory_warnings = self._finish_delete_cleanup(
             log_id=log_id, directories=directories, protected=protected,
-            trigger="manual_delete_empty_dir_cleanup",
+            directory_log_ids={item.current_parent_id: log_id for item in ordered},
+            staging_requests=staging_requests, failed_parents=set(),
         )
         result["empty_dirs_cleaned"] = cleaned
         result["warnings"].extend([*warnings, *directory_warnings])

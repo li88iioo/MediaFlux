@@ -190,11 +190,11 @@ async function runOrganizeBatch(action){
     if(rows.length<(deleting?1:2)||rows.length>50)return;
     const movieRows=rows.filter(row=>row.media_type!=='tv');
     if(action==='revert'&&movieRows.length){_setOrganizeBatchState(`批量操作仅支持剧集，已混入 ${movieRows.length} 条电影或未知类型日志`,'error');return;}
-    const labels={revert:'批量回退最近操作',delete:'将所选媒体组及移空的直接父目录移入光鸭回收站'};
+    const labels={revert:'批量回退最近操作',delete:'将所选媒体组及相关空目录移入光鸭回收站'};
     let serial;
     if(deleting){organizeBatchDeletePending=true;updateOrganizeBatchState();}
     try{
-        const confirmed=await appConfirm({title:deleting?'批量移入光鸭回收站':'确认剧集批量操作',message:`${labels[action]}，共 ${rows.length} 条日志。${deleting?'全部媒体文件回收后，仅清理因此移空的直接父目录，不向上清理；其他内容、非空目录、来源根和归档根会保留。可在光鸭回收站恢复。':''}`,confirmText:deleting?'移入回收站':'开始执行',danger:deleting,verifyText:deleting?'DELETE':'',verifyLabel:'输入 DELETE 确认批量移入回收站'});
+        const confirmed=await appConfirm({title:deleting?'批量移入光鸭回收站':'确认剧集批量操作',message:`${labels[action]}，共 ${rows.length} 条日志。${deleting?'媒体回收后清理移空的直接父目录；属于已完成下载任务的，还会清理已确认归属的空暂存目录，直到该任务的 MF 目录。其他文件、非空目录、公共下载目录、来源根和归档根会保留。可在光鸭回收站恢复。':''}`,confirmText:deleting?'移入回收站':'开始执行',danger:deleting,verifyText:deleting?'DELETE':'',verifyLabel:'输入 DELETE 确认批量移入回收站'});
         if(!confirmed)return;
         serial=++organizeBatchTaskSerial;
         const entries=rows.map(row=>({log_id:row.id,expected_version:row.version,operation_token:_operationToken()}));
@@ -1057,7 +1057,7 @@ async function runOrganizeReorganize(){
 
 async function returnOrganizeToSource(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'送回源目录',message:'将视频和全部伴随文件送回各自保存的原始父目录，并恢复原文件名。',confirmText:'送回源目录',danger:true});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('/return-to-source');}
 async function revertOrganize(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'回退最近操作',message:'按最近一次成功操作的持久化步骤回退，不会从路径猜测文件名。',confirmText:'执行回退',danger:true});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('/revert');}
-async function deleteOrganizeGroup(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'移入光鸭回收站',message:'会将该日志明确记录的整个媒体组及因此移空的直接父目录移入光鸭回收站，不向上清理；其他内容、非空目录、来源根和归档根会保留。可在光鸭回收站恢复。',confirmText:'移入回收站',danger:true,verifyText:'DELETE',verifyLabel:'输入 DELETE 确认移入回收站'});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('','DELETE',{confirm:'DELETE'});}
+async function deleteOrganizeGroup(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'移入光鸭回收站',message:'会回收该日志明确记录的整个媒体组及移空的直接父目录；属于已完成下载任务的，还会清理已确认归属的空暂存目录，直到该任务的 MF 目录。其他文件、非空目录、公共下载目录、来源根和归档根会保留。可在光鸭回收站恢复。',confirmText:'移入回收站',danger:true,verifyText:'DELETE',verifyLabel:'输入 DELETE 确认移入回收站'});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('','DELETE',{confirm:'DELETE'});}
 document.getElementById('organizeTmdbSearchBtn').addEventListener('click',searchOrganizeTmdb);
 document.getElementById('organizeTmdbQuery').addEventListener('keydown',event=>{if(event.key==='Enter')searchOrganizeTmdb();});
 document.getElementById('organizeTmdbQuery').addEventListener('input',invalidateBatchSearchInputs);
