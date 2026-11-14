@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Request
@@ -444,7 +444,7 @@ async def list_sessions(request: Request):
         draft_scope = _draft_scope(owner)
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
         sessions = await runtime.store.list_sessions(owner=owner)
-        main_session_id = await run_in_threadpool(web_main_session_id, owner, sessions)
+        main_session_id = await _main_session_id(runtime, owner)
         response = api_response({
             "sessions": sessions, "draft_scope": draft_scope,
             "scope": "recent_sessions", "main_session_id": main_session_id,
@@ -478,17 +478,34 @@ async def patch_session(request: Request, session_id: str, data: Annotated[Any, 
         return _error(exc)
 
 
+async def _main_session_id(runtime, owner: str) -> str:
+    current = await run_in_threadpool(current_web_main_session_id, owner)
+    if current:
+        return current
+    newest = await runtime.store.list_sessions(owner=owner, limit=1, pinned_first=False)
+    return await run_in_threadpool(web_main_session_id, owner, newest)
+
+
 def _channel_key(owner: str, session_id: str) -> str:
     """渠道会话的不透明键：不向页面暴露 Telegram chat/user 标识。"""
     return hmac.new(get_web_secret().encode(), f"channel:v1\0{owner}\0{session_id}".encode(), hashlib.sha256).hexdigest()[:32]
 
 
-async def _telegram_channels(runtime) -> list[tuple[str, str, dict[str, Any]]]:
-    channels = []
+async def _session_summaries(runtime, owner: str) -> AsyncIterator[dict[str, Any]]:
+    after = None
+    while True:
+        page = await runtime.store.list_sessions(owner=owner, limit=50, after=after, pinned_first=False)
+        for summary in page:
+            yield summary
+        if len(page) < 50:
+            return
+        after = page[-1]
+
+
+async def _telegram_channels(runtime) -> AsyncIterator[tuple[str, str, dict[str, Any]]]:
     for owner in await run_in_threadpool(telegram_channel_owners):
-        for summary in await runtime.store.list_sessions(owner=owner):
-            channels.append((owner, str(summary["session_id"]), summary))
-    return channels
+        async for summary in _session_summaries(runtime, owner):
+            yield owner, str(summary["session_id"]), summary
 
 
 @router.get("/channels")
@@ -501,7 +518,7 @@ async def list_channels(request: Request):
             "key": _channel_key(owner, session_id), "channel": "telegram",
             "title": str(summary.get("title") or "Telegram"),
             "updated_at": summary.get("updated_at"), "message_count": summary.get("message_count", 0),
-        } for owner, session_id, summary in await _telegram_channels(runtime)]
+        } async for owner, session_id, summary in _telegram_channels(runtime)]
         channels.sort(key=lambda item: float(item["updated_at"] or 0), reverse=True)
         response = api_response({"channels": channels})
         response.headers["Cache-Control"] = "private, no-store"
@@ -515,7 +532,7 @@ async def get_channel(request: Request, key: str):
     require_api_login(request)
     try:
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
-        for owner, session_id, summary in await _telegram_channels(runtime):
+        async for owner, session_id, summary in _telegram_channels(runtime):
             if hmac.compare_digest(_channel_key(owner, session_id), key):
                 state = await runtime.store.load(owner=owner, session_id=session_id)
                 response = api_response({
@@ -536,7 +553,7 @@ async def delete_channel(request: Request, key: str):
     require_api_login(request)
     try:
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
-        for owner, session_id, _summary in await _telegram_channels(runtime):
+        async for owner, session_id, _summary in _telegram_channels(runtime):
             if hmac.compare_digest(_channel_key(owner, session_id), key):
                 deleted = await runtime.lifecycle.delete(owner=owner, session_id=session_id)
                 return api_response({"deleted": deleted, "key": key})
@@ -553,12 +570,15 @@ def _collapse_spaces(text: str) -> str:
 
 
 def _search_snippet(content: str, start: int, length: int) -> dict[str, str]:
-    left, right = max(0, start - 24), min(len(content), start + length + 48)
+    # casefold 可把 ß 展开成 ss，命中偏移必须映射回原文。
+    offsets = [index for index, char in enumerate(content) for _ in char.casefold()]
+    start, end = offsets[start], offsets[start + length - 1] + 1
+    left, right = max(0, start - 24), min(len(content), end + 48)
     clean = _collapse_spaces
     return {
         "before": ("…" if left else "") + clean(content[left:start]),
-        "match": content[start:start + length],
-        "after": clean(content[start + length:right]) + ("…" if right < len(content) else ""),
+        "match": content[start:end],
+        "after": clean(content[end:right]) + ("…" if right < len(content) else ""),
     }
 
 
@@ -570,33 +590,40 @@ async def search_messages(request: Request, q: str = ""):
     if not 1 <= len(query) <= 80:
         return api_error("搜索词需为 1–80 个字符", 400)
     try:
-        runtime = await run_in_threadpool(get_agent_kernel_runtime)
         owner = _owner()
-        sessions = await runtime.store.list_sessions(owner=owner)
-        main_session_id = await run_in_threadpool(web_main_session_id, owner, sessions)
-        scopes = [(owner, str(item["session_id"]), item,
-                   {"kind": "main" if str(item["session_id"]) == main_session_id else "side",
-                    "session_id": str(item["session_id"])}) for item in sessions]
-        scopes += [(tg_owner, session_id, item, {"kind": "channel", "key": _channel_key(tg_owner, session_id)})
-                   for tg_owner, session_id, item in await _telegram_channels(runtime)]
-        scopes.sort(key=lambda scope: float(scope[2].get("updated_at") or 0), reverse=True)
+        runtime = await run_in_threadpool(get_agent_kernel_runtime)
+        main_session_id = await run_in_threadpool(current_web_main_session_id, owner)
         needle = query.casefold()
         results: list[dict[str, Any]] = []
-        for scope_owner, session_id, summary, target in scopes:
-            state = await runtime.store.load(owner=scope_owner, session_id=session_id)
-            for message in reversed(public_conversation_messages(state.conversation)):
-                content = str(message.get("content") or "")
-                start = content.casefold().find(needle)
-                if start < 0:
-                    continue
-                results.append({**target, "title": str(summary.get("title") or "新对话"),
-                                "role": message.get("role"), "updated_at": summary.get("updated_at"),
-                                **_search_snippet(content, start, len(query))})
-                if len(results) >= _SEARCH_LIMIT:
+        owners = [owner, *(await run_in_threadpool(telegram_channel_owners))]
+        for scope_owner in owners:
+            async for summary in _session_summaries(runtime, scope_owner):
+                if len(results) > _SEARCH_LIMIT and float(summary["updated_at"]) < float(results[-1]["updated_at"]):
                     break
-            if len(results) >= _SEARCH_LIMIT:
-                break
-        response = api_response({"query": query, "results": results, "truncated": len(results) >= _SEARCH_LIMIT})
+                session_id = str(summary["session_id"])
+                if scope_owner == owner:
+                    # 搜索只读；未分配主会话时按与首次分配相同的最近会话展示。
+                    main_session_id = main_session_id or session_id
+                    target = {"kind": "main" if session_id == main_session_id else "side", "session_id": session_id}
+                else:
+                    target = {"kind": "channel", "key": _channel_key(scope_owner, session_id)}
+                state = await runtime.store.load(owner=scope_owner, session_id=session_id)
+                hits = 0
+                for message in reversed(public_conversation_messages(state.conversation)):
+                    content = str(message.get("content") or "")
+                    start = content.casefold().find(needle)
+                    if start < 0:
+                        continue
+                    results.append({**target, "title": str(summary.get("title") or "新对话"),
+                                    "role": message.get("role"), "updated_at": summary.get("updated_at"),
+                                    **_search_snippet(content, start, len(needle))})
+                    hits += 1
+                    if hits > _SEARCH_LIMIT:
+                        break
+                # 只保留结果上限加一条，用于准确标记截断；会话状态逐条读取。
+                results.sort(key=lambda item: float(item["updated_at"] or 0), reverse=True)
+                del results[_SEARCH_LIMIT + 1:]
+        response = api_response({"query": query, "results": results[:_SEARCH_LIMIT], "truncated": len(results) > _SEARCH_LIMIT})
         response.headers["Cache-Control"] = "private, no-store"
         return response
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
@@ -700,9 +727,9 @@ async def delete_session(request: Request, session_id: str):
     try:
         owner = _owner()
         normalized = _session_id(session_id)
-        if normalized == await run_in_threadpool(current_web_main_session_id, owner):
-            return api_error("主要聊天不能删除", 409)
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
+        if normalized == await _main_session_id(runtime, owner):
+            return api_error("主要聊天不能删除", 409)
         deleted = await runtime.lifecycle.delete(owner=owner, session_id=normalized)
         return api_response({"deleted": deleted, "session_id": normalized})
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary

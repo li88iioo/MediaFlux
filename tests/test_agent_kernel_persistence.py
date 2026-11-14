@@ -573,6 +573,45 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(recreated.generation, reset.generation)
 
+    async def test_session_pages_keep_pins_ties_and_skip_corrupt_rows(self) -> None:
+        self.store._clock = lambda: 1700000000
+        for index in range(12):
+            session_id = f"session_page_{index:016}"
+            lease, _ = await self.store.begin_turn(owner="owner", session_id=session_id, request_id="seed")
+            await self.store.commit(lease, conversation=[{"role": "user", "content": str(index)}])
+            if index in (0, 9):
+                await self.store.patch_session_display(owner="owner", session_id=session_id, patch={"pinned": True})
+        bad_json = self.store._scope("owner", "session_page_0000000000000005")[1]
+        bad_hmac = self.store._scope("owner", "session_page_0000000000000006")[1]
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_kernel_sessions SET state_json='bad json' WHERE session_digest=?", (bad_json,))
+            conn.execute("UPDATE agent_kernel_sessions SET state_hmac='invalid' WHERE session_digest=?", (bad_hmac,))
+        for pinned_first in (True, False):
+            with self.subTest(pinned_first=pinned_first):
+                after = None
+                summaries = []
+                while True:
+                    page = await self.store.list_sessions(owner="owner", limit=3, after=after, pinned_first=pinned_first)
+                    summaries.extend(page)
+                    if len(page) < 3:
+                        break
+                    after = page[-1]
+                ids = [item["session_id"] for item in summaries]
+                self.assertEqual(len(ids), 10)
+                self.assertEqual(len(set(ids)), 10)
+                self.assertEqual(summaries, sorted(summaries, key=lambda item: (
+                    -int(pinned_first and item["pinned"]), -item["updated_at"],
+                    self.store._scope("owner", item["session_id"])[1],
+                )))
+                self.assertEqual(await self.store.list_sessions(owner="foreign", limit=3, after=summaries[0],
+                                                               pinned_first=pinned_first), [])
+        first_page = await self.store.list_sessions(owner="owner", limit=3)
+        # 游标仅记录排序位置，游标行随后删除仍可继续读下一页。
+        await self.store.delete_session(owner="owner", session_id=first_page[-1]["session_id"])
+        next_page = await self.store.list_sessions(owner="owner", limit=3, after=first_page[-1])
+        self.assertTrue(next_page)
+        self.assertFalse({item["session_id"] for item in first_page} & {item["session_id"] for item in next_page})
+
     async def test_event_journal_records_real_public_events(self) -> None:
         event = AgentEvent(
             type=AgentEventType.TOOL_STARTED,

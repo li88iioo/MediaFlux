@@ -390,8 +390,10 @@ class SQLiteKernelStore:
         *,
         owner: str,
         limit: int = 50,
+        after: Mapping[str, Any] | None = None,
+        pinned_first: bool = True,
     ) -> list[dict[str, Any]]:
-        return await session_io(self._list_sessions_sync, owner, limit)
+        return await session_io(self._list_sessions_sync, owner, limit, after, pinned_first)
 
     async def patch_session_display(
         self, *, owner: str, session_id: str, patch: Mapping[str, Any]
@@ -866,21 +868,31 @@ class SQLiteKernelStore:
             )
             return session_summary(state, updated_at=float(row["updated_at"]))
 
-    def _list_sessions_sync(self, owner: str, limit: int) -> list[dict[str, Any]]:
+    def _list_sessions_sync(
+        self, owner: str, limit: int, after: Mapping[str, Any] | None = None, pinned_first: bool = True,
+    ) -> list[dict[str, Any]]:
         owner_digest = db.native_agent_owner_digest(owner, secret=self._secret())
         maximum = max(1, min(limit, 100))
         result: list[dict[str, Any]] = []
+        pinned_sql = ("CASE WHEN json_valid(state_json) THEN "
+                      "CASE WHEN json_type(state_json,'$.metadata.pinned')='true' "
+                      "THEN 1 ELSE 0 END ELSE 0 END" if pinned_first else "0")
+        cursor_sql = ""
+        params: tuple[Any, ...] = (owner_digest,)
+        if after is not None:
+            cursor_sql = "WHERE (-pinned, -updated_at, session_digest) > (?, ?, ?) "
+            params += (-int(pinned_first and after.get("pinned") is True),
+                       -float(after["updated_at"]), self._scope(owner, str(after["session_id"]))[1])
         with db.get_conn() as conn:
             # 排序与按键读取共用一个读快照，避免并发 PATCH/新回合混入旧排序。
             conn.execute("BEGIN")
             # 全历史只排序小键；不让完整 state_json 进入临时 B-tree。
             keys = conn.execute(
-                "SELECT session_digest "
-                "FROM agent_kernel_sessions WHERE owner_digest=? "
-                "ORDER BY CASE WHEN json_valid(state_json) THEN "
-                "CASE WHEN json_type(state_json,'$.metadata.pinned')='true' "
-                "THEN 1 ELSE 0 END ELSE 0 END DESC, updated_at DESC, session_digest",
-                (owner_digest,),
+                "WITH session_keys AS (SELECT session_digest, updated_at, "
+                f"{pinned_sql} AS pinned FROM agent_kernel_sessions WHERE owner_digest=?) "
+                f"SELECT session_digest FROM session_keys {cursor_sql}"
+                "ORDER BY pinned DESC, updated_at DESC, session_digest",
+                params,
             )
             for key in keys:
                 session_digest = str(key["session_digest"])

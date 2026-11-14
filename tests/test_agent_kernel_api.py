@@ -112,7 +112,7 @@ class FakeStore:
     def add_event(self, *, owner, session_id, event):
         self.events.append((owner, session_id, event))
 
-    async def list_sessions(self, *, owner):
+    async def list_sessions(self, *, owner, limit=50, after=None, pinned_first=True):
         return []
 
     async def load(self, *, owner, session_id):

@@ -830,8 +830,8 @@ def test_listing_sql_sorts_only_small_keys_and_explicitly_opens_read_transaction
 
     with patch.object(db, "get_conn", traced_conn):
         assert len(store._list_sessions_sync(OWNER, 50)) == 1
-    ordered = next(sql for sql in statements if "ORDER BY CASE WHEN json_valid" in sql)
-    assert ordered.partition("FROM")[0].strip() == "SELECT session_digest"
+    ordered = next(sql for sql in statements if "ORDER BY" in sql)
+    assert ordered.rpartition("SELECT")[2].partition("FROM")[0].strip() == "session_digest"
     assert any(sql.strip() == "BEGIN" for sql in statements)
     assert "LIMIT" not in ordered, "不能在 HMAC 核验之前截断有效名额"
 
@@ -1273,3 +1273,98 @@ def test_message_search_spans_main_side_and_channel_and_channel_delete(api, monk
     assert response.status_code == 200 and response.json()["deleted"] is True
     delete.assert_awaited_once_with(owner=tg_owner, session_id="tg_" + "d" * 32)
     assert api.client.delete("/api/agent/channels/" + "0" * 32, headers=CSRF).status_code == 404
+
+
+def test_main_session_allocation_is_shared_by_concurrent_requests(store):
+    from concurrent.futures import ThreadPoolExecutor
+    from app.agent.owner_routes import web_main_session_id
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        allocated = list(workers.map(lambda _: web_main_session_id(OWNER, []), range(24)))
+    assert len(set(allocated)) == 1
+    assert agent_api.SESSION_ID_RE.fullmatch(allocated[0])
+    assert web_main_session_id("another-owner", []) != allocated[0]
+
+
+def test_delete_cannot_race_first_main_session_assignment(api):
+    from app.agent.owner_routes import web_main_session_id
+
+    _login(api)
+    owner = _web_owner(api)
+    asyncio.run(_seed_conversation(api.store, owner=owner, session_id=SESSION,
+                                  conversation=[{"role": "user", "content": "主要聊天"}]))
+
+    async def delete(*, owner, session_id):
+        # 删除通过检查后，另一请求首次打开列表，将当前会话固定为主要聊天。
+        summaries = await api.store.list_sessions(owner=owner)
+        assert web_main_session_id(owner, summaries) == session_id
+        return await api.store.delete_session(owner=owner, session_id=session_id)
+
+    api.runtime.lifecycle = SimpleNamespace(delete=AsyncMock(side_effect=delete))
+    response = api.client.delete(f"/api/agent/sessions/{SESSION}", headers=CSRF)
+    assert response.status_code == 409, response.text
+    api.runtime.lifecycle.delete.assert_not_awaited()
+    assert asyncio.run(api.store.load(owner=owner, session_id=SESSION)).conversation
+
+
+@pytest.mark.parametrize(("content", "term", "match"), [
+    ("Straße qB", "qb", "qB"),
+    ("夜里 STRASSE 已完成", "straße", "STRASSE"),
+    ("Straße", "ss", "ß"),
+    ("İ qB", "qb", "qB"),
+])
+def test_message_search_casefold_keeps_original_character_offsets(api, content, term, match):
+    _login(api)
+    asyncio.run(_seed_conversation(api.store, owner=_web_owner(api), session_id=SESSION,
+                                  conversation=[{"role": "assistant", "content": content}]))
+    response = api.client.get("/api/agent/search", params={"q": term})
+    assert response.status_code == 200, response.text
+    result, = response.json()["results"]
+    assert result["match"] == match
+    assert result["before"] + result["match"] + result["after"] == content
+
+
+def test_message_search_pages_past_recent_sessions_and_keeps_owner_and_public_scope(api, monkeypatch):
+    _login(api)
+    owner = _web_owner(api)
+    tg_owner = "tg:v1:12345\x1f12345"
+    monkeypatch.setattr(agent_api, "telegram_channel_owners", lambda: [tg_owner])
+
+    async def seed():
+        for scope_owner in (owner, tg_owner):
+            for index in range(105):
+                api.store._clock = lambda index=index: 1000 + index
+                await _seed_conversation(api.store, owner=scope_owner, session_id=f"session_search_{index:016}",
+                                         conversation=[{"role": "assistant", "content": "旧会话关键字" if index == 0 else "无关内容"}])
+        await _seed_conversation(api.store, owner="another-owner", session_id=SESSION,
+                                 conversation=[{"role": "assistant", "content": "旧会话关键字"}])
+        await _seed_conversation(api.store, owner=owner, session_id=SESSION, conversation=[
+            {"role": "user", "content": "解释通知", "reply_context": {"text": "私有通知关键字"}},
+            {"role": "assistant", "tool_calls": [{"call_id": "private", "name": "fixture.read", "arguments": {}}]},
+            {"role": "tool", "tool_call_id": "private", "tool_name": "fixture.read", "content": "私有通知关键字"},
+        ])
+    asyncio.run(seed())
+    listing = AsyncMock(wraps=api.store.list_sessions)
+    monkeypatch.setattr(api.store, "list_sessions", listing)
+    response = api.client.get("/api/agent/search", params={"q": "关键字"})
+    assert response.status_code == 200, response.text
+    results = response.json()["results"]
+    assert len(results) == 2, results
+    assert sorted(result["kind"] for result in results) == ["channel", "side"]
+    assert all("私有" not in str(result) and "12345" not in str(result) for result in results)
+    assert len(listing.await_args_list) >= 6
+    assert all(call.kwargs.get("limit", 50) <= 100 for call in listing.await_args_list)
+    assert response.json()["truncated"] is False
+    # 搜索不能写入“主要聊天”的分配记录。
+    assert agent_api.current_web_main_session_id(owner) == ""
+
+
+@pytest.mark.parametrize("count", [50, 51])
+def test_message_search_only_marks_truncated_when_results_exceed_limit(api, count):
+    _login(api)
+    asyncio.run(_seed_conversation(api.store, owner=_web_owner(api), session_id=SESSION,
+                                  conversation=[{"role": "user", "content": f"命中 {index}"} for index in range(count)]))
+    response = api.client.get("/api/agent/search", params={"q": "命中"})
+    assert response.status_code == 200, response.text
+    assert len(response.json()["results"]) == 50
+    assert response.json()["truncated"] is (count > 50)
