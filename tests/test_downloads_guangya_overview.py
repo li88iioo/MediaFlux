@@ -7,7 +7,7 @@ from unittest.mock import Mock, PropertyMock, patch
 
 from fastapi.testclient import TestClient
 
-from tests.support import InitializedWebTestCase
+from tests.support import InitializedWebTestCase, preserve_web_auth_config
 
 from app.clients.guangya import GuangYaClient, IncompleteOfflineTaskListError
 from app.config import web_credentials
@@ -118,7 +118,7 @@ class GuangYaDownloadOverviewTests(InitializedWebTestCase):
         headers = self._authenticated_headers()
         with patch(
             "app.routes.downloads_api.config.get",
-            side_effect=lambda key, default="": "" if key == "QB_URL" else default,
+            side_effect=preserve_web_auth_config(lambda key, default="": "" if key == "QB_URL" else default),
         ), patch.object(downloads_api, "GuangYaClient", create=True) as guangya_client:
             response = self.client.get("/api/downloads/overview", headers=headers)
 

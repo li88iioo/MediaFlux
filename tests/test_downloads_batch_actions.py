@@ -14,7 +14,7 @@ from app.repositories import download_requests as download_requests_repo
 from app.config import web_credentials
 from app.main import create_app
 from app.modules.qb_control import QBControlConflict
-from tests.support import InitializedWebTestCase, isolated_test_database
+from tests.support import InitializedWebTestCase, isolated_test_database, preserve_web_auth_config
 
 
 class LoggedInDownloadsApiCase(InitializedWebTestCase):
@@ -86,10 +86,10 @@ class DownloadBatchActionApiTests(LoggedInDownloadsApiCase):
         headers = self._headers()
         with patch(
             "app.routes.downloads_api.config.get",
-            side_effect=lambda key, default="": {
+            side_effect=preserve_web_auth_config(lambda key, default="": {
                 "QB_URL": "http://192.168.1.10:8080",
                 "QB_API_KEY": "saved-secret",
-            }.get(key, default),
+            }.get(key, default)),
         ), patch("app.routes.downloads_api.QBittorrentClient") as client:
             response = self.client.post(
                 "/api/downloads/qb/test",

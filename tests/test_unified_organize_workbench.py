@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from app import database as db
 from app.repositories import local_media as local_media_repo
 from app.main import create_app
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, preserve_web_auth_config
 
 
 class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
@@ -122,7 +122,7 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
             "GY_ORGANIZE_TARGET_DIR": "99",
             "GY_ORGANIZE_TARGET_DIR_NAME": "整理",
         }
-        with patch("app.routes.pages.config.get", side_effect=lambda key, default="": values.get(key, default)):
+        with patch("app.routes.pages.config.get", side_effect=preserve_web_auth_config(lambda key, default="": values.get(key, default))):
             organize = self.client.get("/organize")
 
         self.assertEqual(organize.status_code, 200)

@@ -14,7 +14,7 @@ from app.repositories import local_media as local_media_repo
 from app.main import create_app
 from app.routes import media_libraries_api
 from app.modules.media_server_profiles import MediaServerProfile
-from tests.support import IsolatedDatabaseTestCase, isolated_test_database
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database, preserve_web_auth_config
 
 
 class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
@@ -230,7 +230,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
 
             with patch(
                 "app.routes.media_libraries_api.config.get",
-                side_effect=lambda key, default="": str(root) if key == "STRM_ROOT" else default,
+                side_effect=preserve_web_auth_config(lambda key, default="": str(root) if key == "STRM_ROOT" else default),
             ):
                 root_response = self.client.get("/api/media-libraries/strm-directories")
                 source_response = self.client.get(
@@ -262,14 +262,14 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
 
     def test_strm_directory_browser_requires_configured_existing_output_root(self):
         self.login()
-        with patch("app.routes.media_libraries_api.config.get", return_value=""):
+        with patch("app.routes.media_libraries_api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")):
             missing_config = self.client.get("/api/media-libraries/strm-directories")
         self.assertEqual(missing_config.status_code, 400, missing_config.text)
         self.assertIn("尚未配置", missing_config.text)
 
         with TemporaryDirectory() as temp_dir:
             missing_root = Path(temp_dir) / "missing"
-            with patch("app.routes.media_libraries_api.config.get", return_value=str(missing_root)):
+            with patch("app.routes.media_libraries_api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": str(missing_root))):
                 missing_output = self.client.get("/api/media-libraries/strm-directories")
         self.assertEqual(missing_output.status_code, 400, missing_output.text)
         self.assertIn("不存在", missing_output.text)

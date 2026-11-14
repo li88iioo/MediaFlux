@@ -28,7 +28,7 @@ from app.discovery.providers.douban import DoubanProvider
 from app.discovery.registry import ProviderRegistry
 from app.discovery.service import DiscoveryService
 from app.main import create_app
-from tests.support import InitializedWebTestCase
+from tests.support import InitializedWebTestCase, preserve_web_auth_config
 
 
 class FakeDiscoveryService:
@@ -193,7 +193,7 @@ class DiscoveryAPITests(_BaseClientTests):
         self.assertEqual(self.client.get("/api/douban/dbcl2/status").status_code, 401)
 
         self.authenticate()
-        with patch("app.routes.api.config.get", return_value=""):
+        with patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "")):
             response = self.client.get("/api/douban/dbcl2/status")
 
         self.assertEqual(response.status_code, 200)
@@ -218,7 +218,7 @@ class DiscoveryAPITests(_BaseClientTests):
                     return_value=client,
                 ), patch(
                     "app.routes.api.config.get",
-                    return_value="123456789:test-dbcl2-value",
+                    side_effect=preserve_web_auth_config(lambda _key, default="": "123456789:test-dbcl2-value"),
                 ):
                     response = self.client.get("/api/douban/dbcl2/status")
                 self.assertEqual(response.status_code, 200)
@@ -240,7 +240,7 @@ class DiscoveryAPITests(_BaseClientTests):
                     return_value=client,
                 ), patch(
                     "app.routes.api.config.get",
-                    return_value="123456789:test-dbcl2-value",
+                    side_effect=preserve_web_auth_config(lambda _key, default="": "123456789:test-dbcl2-value"),
                 ):
                     response = self.client.get("/api/douban/dbcl2/status")
                 self.assertEqual(response.status_code, 200)
@@ -258,7 +258,7 @@ class DiscoveryAPITests(_BaseClientTests):
         with patch("app.routes.api.requests.Session", return_value=session), patch(
             "app.routes.api.DoubanAuthenticatedClient", return_value=client
         ), patch(
-            "app.routes.api.config.get", return_value="123456789:test-dbcl2-value"
+            "app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "123456789:test-dbcl2-value")
         ):
             response = self.client.get("/api/douban/dbcl2/status")
 
@@ -280,7 +280,7 @@ class DiscoveryAPITests(_BaseClientTests):
         with patch("app.routes.api.requests.Session", return_value=session), patch(
             "app.routes.api.DoubanAuthenticatedClient", return_value=client
         ), patch(
-            "app.routes.api.config.get", return_value="123456789:test-dbcl2-value"
+            "app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda _key, default="": "123456789:test-dbcl2-value")
         ):
             response = self.client.get("/api/douban/dbcl2/status")
 
