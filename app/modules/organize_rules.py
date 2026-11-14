@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 
 from app.config import get, get_bool, get_int
+from app.defaults import DEFAULT_ORGANIZE_RECYCLE_DUPLICATES_ENABLED
 from app.modules.naming import (
     MOVIE_DEFAULT,
     MOVIE_DIR_DEFAULT,
@@ -113,6 +114,7 @@ class OrganizeRules:
     keep_multi_versions: bool = False
     keep_remux_variant: bool = False
     recycle_replaced_enabled: bool = False
+    recycle_duplicates_enabled: bool = DEFAULT_ORGANIZE_RECYCLE_DUPLICATES_ENABLED
     link_strm: bool = True
     video_exts: str = ""
     metadata_exts: str = ""
@@ -157,6 +159,7 @@ class OrganizeRules:
             keep_multi_versions=get_bool("GY_ORGANIZE_KEEP_MULTI_VERSIONS", False),
             keep_remux_variant=get_bool("GY_ORGANIZE_KEEP_REMUX_VARIANT", False),
             recycle_replaced_enabled=get_bool("GY_ORGANIZE_RECYCLE_REPLACED_ENABLED", False),
+            recycle_duplicates_enabled=get_bool("GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED"),
             link_strm=get_bool("GY_ORGANIZE_LINK_STRM", True),
             video_exts=get("GY_ORGANIZE_VIDEO_EXTS", ""),
             metadata_exts=get("GY_ORGANIZE_METADATA_EXTS", ""),
@@ -295,6 +298,8 @@ def organize_rules_snapshot_changes(
     """
     if not isinstance(snapshot, dict):
         return ["rules_snapshot"]
+    # 旧快照生成时同版本落选文件始终自动回收，缺键沿用该语义；显式关闭仍使预览失效。
+    snapshot = {"recycle_duplicates_enabled": True, **snapshot}
     current = organize_rules_snapshot(current_rules)
     ignored = _ORGANIZE_RULE_SERVER_ONLY_FIELDS | _ORGANIZE_RULE_NOTIFICATION_FIELDS
     changed = {

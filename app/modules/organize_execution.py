@@ -116,7 +116,8 @@ def execute_organize_plans(
 
     def duplicate_candidate(plan: OrganizePlan) -> bool:
         return (
-            plan.conflict_decision in {"skip", "batch_superseded"}
+            rules.recycle_duplicates_enabled
+            and plan.conflict_decision in {"skip", "batch_superseded"}
             and plan.match is not None and not plan.match.need_confirm
             and bool(plan.target_path)
         )

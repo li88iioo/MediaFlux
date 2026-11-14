@@ -2231,6 +2231,39 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                 OrganizeTaskManager._execute_durable_operation(dict(row))
             self.assertEqual(self.client.infos, after)
 
+    def test_old_durable_payload_keeps_default_and_rejects_disabled_recycling(self):
+        from dataclasses import asdict
+        from app.modules.directory_scrape import (
+            DirectoryScrapeService, DirectoryScrapeStore, _restore_directory_scrape_preview,
+        )
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+
+        def previous_rules(value):
+            data = asdict(value)
+            data.pop("recycle_duplicates_enabled", None)
+            return data
+
+        # 用上一版的规则字段生成真实签名，覆盖人工 v1 和原生 v2 持久任务。
+        with patch("app.modules.directory_scrape.asdict", side_effect=previous_rules):
+            payloads = [self._durable_payload(), self.service.build_execution(
+                "owner", "movie-dir", "movie", tmdb_id="1726",
+            )["execution_payload"]]
+        before = dict(self.client.infos)
+        for payload in payloads:
+            with self.subTest(version=payload["version"]):
+                fresh = DirectoryScrapeService(
+                    client=cast(GuangYaClient, self.client), scraper=cast(TMDBScraper, self.scraper),
+                    store=DirectoryScrapeStore(), rules_loader=lambda: self.rules,
+                )
+                self.addCleanup(fresh.close)
+                self.rules = replace(self.rules, recycle_duplicates_enabled=True)
+                _service, owner, preview_id = _restore_directory_scrape_preview(fresh, payload)
+                self.assertTrue(fresh.store.get_preview(owner, preview_id).rules.recycle_duplicates_enabled)
+                self.rules = replace(self.rules, recycle_duplicates_enabled=False)
+                with self.assertRaises(DirectoryScrapeConflictError):
+                    _restore_directory_scrape_preview(fresh, payload)
+                self.assertEqual(self.client.infos, before)
+
     def test_durable_job_rechecks_rules_and_cancellation_before_writing(self):
         from app.modules.directory_scrape import execute_durable_directory_scrape_job
         from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
@@ -2420,7 +2453,13 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(operation_tokens), 1)
         self.assertTrue(next(iter(operation_tokens)).startswith("manual-"))
         self.assertNotEqual(self.client.infos["v1"].parent_id, "movie-dir")
-        self.assertEqual(self.client.infos["v2"].parent_id, "movie-dir")
+        self.assertNotIn("v2", self.client.infos)
+        self.assertEqual(result["stats"]["duplicate_recycled"], 1)
+        self.assertIn("v2", self.client.deleted)
+        self.assertEqual(
+            {require_log(log_id)["file_id"]: require_log(log_id)["status"] for log_id in result["log_ids"]},
+            {"v1": "success", "v2": "deleted"},
+        )
         self.assertIn("钢铁侠.2008", self.client.infos["v1"].name)
         self.scraper.confirm.assert_called_once()
         args = self.scraper.confirm.call_args.args
@@ -2429,6 +2468,20 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             "Iron.Man.2008.1080p.mkv", "1726", "钢铁侠", "2008", "movie",
         ))
         self.assertEqual(kwargs["parent_path"], "钢铁侠")
+
+    def test_execute_preview_preserves_batch_loser_when_duplicate_recycling_is_disabled(self):
+        self.rules = replace(self.rules, recycle_duplicates_enabled=False)
+        inspection = self.service.inspect("owner", "movie-dir")
+        preview = self.service.preview("owner", inspection["inspection_id"], "1726", "movie")
+        result = self.service.execute_preview("owner", preview["preview_id"])
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.assertEqual(result["stats"]["skipped"], 1)
+        self.assertEqual(result["stats"].get("duplicate_recycled", 0), 0)
+        self.assertEqual(self.client.infos["v2"].parent_id, "movie-dir")
+        self.assertEqual(self.client.deleted, [])
+        for log_id in result["log_ids"]:
+            self.assertEqual(db.list_organize_delete_audits(log_id), [])
 
     def test_manual_learning_failure_does_not_rollback_successful_move(self):
         self.scraper.confirm = Mock(side_effect=RuntimeError("learning unavailable"))

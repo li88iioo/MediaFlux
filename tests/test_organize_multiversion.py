@@ -843,6 +843,40 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(audits[0]["status"], "success")
         self.assertEqual(audits[0]["replacement_file_id"], "existing")
 
+    def test_duplicate_recycling_can_be_disabled_and_enabled_for_the_same_source(self):
+        organizer, client = self._duplicate_fixture()
+        stem = client.tree["source"][0].name.rsplit(".", 1)[0]
+        client.tree["source"].append(GuangYaFile(
+            "subtitle", f"{stem}.zh.srt", False, 60, "subtitle-etag", "source",
+        ))
+        rules = self._rules(recycle_duplicates_enabled=False)
+        before = db.latest_organize_log_id()
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                plans, stats = organizer.organize(
+                    "source", rules, dry_run=dry_run, post_actions=False,
+                )
+                self.assertEqual(plans[0].action, "skip")
+                self.assertNotIn("自动回收", plans[0].note)
+                self.assertNotIn("自动回收", plans[0].conflict_note)
+                self.assertEqual(stats.get("duplicate_recycled", 0), 0)
+                self.assertEqual(stats["failed"], 0)
+                self.assertEqual(client.deleted, [])
+                self.assertEqual(client.moves, [])
+                self.assertCountEqual([item.file_id for item in client.tree["source"]], ["incoming", "subtitle"])
+        rows = db.list_organize_logs_after(before)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "skipped")
+        self.assertEqual(db.list_organize_delete_audits(rows[0]["id"]), [])
+
+        plans, stats = organizer.organize(
+            "source", self._rules(recycle_duplicates_enabled=True), dry_run=False, post_actions=False,
+        )
+        self.assertEqual(plans[0].action, "recycled")
+        self.assertEqual(stats["duplicate_recycled"], 1)
+        self.assertCountEqual(client.deleted, ["incoming", "subtitle"])
+        self.assertEqual(client._find("existing")[0], "movie")
+
     def test_movie_named_interview_preserves_existing_version_in_preview_and_execution(self):
         incoming = GuangYaFile("incoming", "The.Interview.2026.1080p.mp4", False, 1000, "incoming-etag")
         existing = GuangYaFile("existing", "The.Interview.2026.{tmdb-123}.1080p.mkv", False, 2000, "existing-etag")

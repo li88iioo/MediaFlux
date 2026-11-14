@@ -122,12 +122,16 @@ def scrape_execution_fingerprint(snapshot: dict, record: PreviewRecord) -> str:
     """同一冻结快照用于确认与冷恢复；保持已受理任务的签名协议。"""
     if record.claimed:
         raise DirectoryScrapeConflictError("刮削预览正在执行或已被领取")
+    rules = asdict(record.rules) if record.rules is not None else {}
+    # 此开关引入前始终启用。默认值省略以保持已受理任务的签名，关闭仍参与校验。
+    if rules.get("recycle_duplicates_enabled") is True:
+        rules.pop("recycle_duplicates_enabled")
     return signed_context_fingerprint({
         "scope": [snapshot["scope_type"], snapshot["scope_id"]],
         "inspection_fingerprint": str(getattr(record.inspection, "fingerprint", "") or ""),
         "signature": repr(record.signature),
         "target_snapshot": repr(getattr(record, "target_snapshot", ())),
-        "rules": asdict(record.rules) if record.rules is not None else {},
+        "rules": rules,
         "candidate": snapshot["selected_candidate"],
         "preview_arguments": snapshot["preview_arguments"],
         "preview_safe": snapshot["preview_guard"],

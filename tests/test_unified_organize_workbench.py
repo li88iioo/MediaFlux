@@ -64,6 +64,28 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
         )
         return guangya_id, local_id
 
+    def test_duplicate_recycling_setting_defaults_on_and_round_trips_to_execution_rules(self):
+        from app import config
+        from app.modules.organize_rules import OrganizeRules
+
+        key = "GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED"
+        self.assertNotIn(key, config.all_items())
+        self.assertEqual(self.client.get("/api/config").json()[key], "1")
+        self.assertTrue(OrganizeRules.from_config().recycle_duplicates_enabled)
+        page = self.client.get("/organize-rules")
+        token = re.search(r'<meta name="csrf-token" content="([^"]+)"', page.text)
+        assert token is not None
+        for value in ("0", "", "1"):
+            with self.subTest(value=value):
+                response = self.client.post(
+                    "/api/config", json={key: value}, headers={"X-CSRF-Token": token.group(1)},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(response.json()["success"], response.text)
+                config.reload_after_restore()
+                self.assertEqual(self.client.get("/api/config").json()[key], value)
+                self.assertEqual(OrganizeRules.from_config().recycle_duplicates_enabled, value == "1")
+
     def test_metatube_panel_defaults_collapsed_and_tracks_switch_state(self):
         rules = self.client.get("/organize-rules")
         self.assertEqual(rules.status_code, 200)

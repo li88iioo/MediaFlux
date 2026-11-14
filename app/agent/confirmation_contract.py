@@ -480,7 +480,7 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
     "cloud.organize": {
         "action": "立即执行一次光鸭整理",
         "object": "当前已配置的整理来源",
-        "impact": "会按现有规则扫描、识别并移动或整理匹配内容。",
+        "impact": "会按现有规则扫描、识别并移动或整理匹配内容；开启自动回收时，会回收已核实的同版本落选文件及专属伴随文件。",
         "reversibility": "部分移动操作可能无法自动回滚，建议先核对预检结果。",
     },
     "cloud.stop_organize": {

@@ -7242,7 +7242,7 @@ class Organizer:
 
         self._preview_conflicts_with_inventory(plans, rules, load_inventory)
         for plan in plans:
-            if plan.action == "skip" and plan.conflict_decision in {"skip", "batch_superseded"}:
+            if rules.recycle_duplicates_enabled and plan.action == "skip" and plan.conflict_decision in {"skip", "batch_superseded"}:
                 note = "正式执行核实保留版本后，自动回收来源新文件及其专属伴随文件"
                 plan.note = f"{plan.note}；{note}" if plan.note else note
                 plan.conflict_note = f"{plan.conflict_note}；{note}" if plan.conflict_note else note

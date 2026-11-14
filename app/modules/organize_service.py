@@ -185,8 +185,9 @@ def _preview(
             "scope": "selected_sources",
             "moves_files": True,
             "renames_files": rules.rename_enabled,
-            "may_clean_empty_directories": rules.clean_empty,
+            "may_clean_empty_directories": rules.clean_empty or rules.recycle_duplicates_enabled,
             "may_recycle_replaced_files": rules.recycle_replaced_enabled,
+            "may_recycle_duplicate_files": rules.recycle_duplicates_enabled,
             "triggers_strm_after_moves": rules.link_strm,
         },
     )

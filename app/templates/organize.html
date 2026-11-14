@@ -539,6 +539,20 @@
                         <span class="organize-toggle-hint">多版本模式下允许 Remux 共存</span>
                     </div>
 
+                    <div class="strm-toggle-card organize-toggle-tile">
+                        <div class="organize-toggle-top">
+                            <div class="organize-toggle-title">
+                                <div class="organize-toggle-icon"><i data-lucide="trash-2"></i></div>
+                                <label for="r_recycle_duplicates">自动回收同版本落选文件</label>
+                            </div>
+                            <label class="toggle">
+                                <input type="checkbox" id="r_recycle_duplicates" data-key="GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED" data-bool="1" aria-describedby="recycleDuplicatesHint" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                        <span class="organize-toggle-hint" id="recycleDuplicatesHint">光鸭同版本保留已有文件时，回收新文件及专属伴随文件并清理空目录；关闭则跳过并保留新文件</span>
+                    </div>
+
                     <div class="strm-toggle-card organize-toggle-tile" id="recycleReplacedRow">
                         <div class="organize-toggle-top">
                             <div class="organize-toggle-title">

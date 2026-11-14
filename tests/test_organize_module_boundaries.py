@@ -171,6 +171,33 @@ assert organize.OrganizeRules is organize_rules.OrganizeRules
         self.assertFalse(organize.organize_rules_snapshot_changes(snapshot, restored))
         self.assertEqual(organize.organize_rules_snapshot(restored), snapshot)
 
+    def test_duplicate_recycling_switch_is_frozen_and_invalidates_changed_previews(self):
+        rules = organize_rules.OrganizeRules()
+        self.assertTrue(rules.recycle_duplicates_enabled)
+        snapshot = organize_rules.organize_rules_snapshot(rules)
+        disabled = replace(rules, recycle_duplicates_enabled=False)
+        self.assertEqual(
+            organize_rules.organize_rules_snapshot_changes(snapshot, disabled),
+            ["recycle_duplicates_enabled"],
+        )
+        disabled_snapshot = organize_rules.organize_rules_snapshot(disabled)
+        restored = organize_rules.restore_organize_rules_snapshot(disabled_snapshot, trusted_rules=rules)
+        self.assertFalse(restored.recycle_duplicates_enabled)
+        self.assertEqual(organize_rules.organize_rules_snapshot_changes(disabled_snapshot, restored), [])
+        self.assertEqual(
+            organize_rules.organize_rules_snapshot_changes(disabled_snapshot, rules),
+            ["recycle_duplicates_enabled"],
+        )
+        legacy_snapshot = {key: value for key, value in snapshot.items() if key != "recycle_duplicates_enabled"}
+        self.assertEqual(organize_rules.organize_rules_snapshot_changes(legacy_snapshot, rules), [])
+        self.assertEqual(
+            organize_rules.organize_rules_snapshot_changes(legacy_snapshot, disabled),
+            ["recycle_duplicates_enabled"],
+        )
+        self.assertFalse(organize_rules.restore_organize_rules_snapshot(
+            legacy_snapshot, trusted_rules=disabled,
+        ).recycle_duplicates_enabled)
+
     def test_automatic_confirmation_and_result_formatting_keep_their_contract(self):
         matched = MatchResult(status="matched", confidence=0.95, need_confirm=False)
         self.assertFalse(organize_rules.automatic_match_requires_confirmation(matched))
