@@ -1,6 +1,8 @@
 """下载页 qBittorrent 批量任务操作契约。"""
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -377,3 +379,103 @@ class DirectDownloadApiTests(LoggedInDownloadsApiCase):
                                         data={"target": "nope", "url": "magnet:?xt=urn:btih:" + "b" * 40})
         self.assertEqual(response.status_code, 400)
         self.assertIn("下载目标无效", response.text)
+
+    def test_confirmed_torrent_keeps_bytes_and_deduplicates_equivalent_magnets(self):
+        from tests.test_torrent_manifest import _bencode, _torrent
+
+        headers = self._headers()
+        title = "测试 100% + S01E01.mkv"
+        v1 = {b"name": b"legacy-\xff", b"name.utf-8": title.encode(), b"length": 4_096,
+              b"piece length": 16_384, b"pieces": b"0" * 20}
+        v2 = {b"name": b"v2", b"meta version": 2, b"piece length": 16_384,
+              b"file tree": {b"Demo.mkv": {b"": {b"length": 4_096, b"pieces root": b"1" * 32}}}}
+        hybrid = {**v2, b"name": b"hybrid", b"pieces": b"0" * 20,
+                  b"files": [{b"length": 4_096, b"path": [b"Demo.mkv"]}]}
+        for count, info in enumerate((v1, v2, hybrid), 1):
+            payload = _torrent(info)
+            upload = {"file": ("上传 名称.TORRENT", payload, "application/x-bittorrent")}
+            raw_info = _bencode(info)
+            hashes = (["urn:btih:" + base64.b32encode(hashlib.sha1(raw_info).digest()).decode()]
+                      if info is not v2 else [])
+            if info is not v1:
+                hashes.append("urn:btmh:1220" + hashlib.sha256(raw_info).hexdigest())
+            with self.subTest(version=info.get(b"name")), \
+                 patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True}), \
+                 patch("app.modules.download_dispatcher._submit_qb", return_value={"ok": True}) as backend:
+                preview = self.client.post("/api/downloads/direct/preview", headers=headers, files=upload)
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertEqual((preview.json()["file_count"], preview.json()["total_size"]), (1, 4_096))
+                if info is v1:
+                    self.assertEqual(preview.json()["title"], title)
+                self.assertEqual(self._request_count(), count - 1)
+                backend.assert_not_called()
+                response = self.client.post("/api/downloads/direct/submit", headers=headers,
+                                            data={"target": "qb"}, files=upload)
+                self.assertEqual(response.status_code, 200, response.text)
+                first = response.json()
+                self.assertEqual(first["status"], "submitted")
+                row = download_requests_repo.get_download_request(first["request_id"])
+                assert row is not None
+                self.assertEqual(row["torrent_data"], payload)
+                self.assertEqual(backend.call_args.args[0]["torrent_data"], payload)
+                duplicate = self.client.post("/api/downloads/direct/submit", headers=headers,
+                                             data={"target": "qb"}, files=upload)
+                self.assertEqual(duplicate.json()["status"], "duplicate")
+                for xt in hashes:
+                    duplicate = self.client.post("/api/downloads/direct/submit", headers=headers,
+                                                 data={"target": "qb", "url": "magnet:?xt=" + xt})
+                    self.assertEqual(duplicate.status_code, 200, duplicate.text)
+                    self.assertEqual(duplicate.json()["status"], "duplicate")
+                    self.assertEqual(duplicate.json()["request_id"], first["request_id"])
+                backend.assert_called_once()
+                self.assertEqual(self._request_count(), count)
+
+    def test_partial_or_unknown_submission_is_not_implicitly_retried(self):
+        headers = self._headers()
+        for status, receipt in (("partial", {"ok": False, "error": "解析失败"}),
+                                ("manual_review", RuntimeError("回执丢失"))):
+            upload = {"file": ("fixture.torrent", _torrent_bytes(status.encode()), "application/x-bittorrent")}
+            with self.subTest(status=status), \
+                 patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}), \
+                 patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1), \
+                 patch("app.modules.download_dispatcher._submit_qb", return_value={"ok": True}) as qb, \
+                 patch("app.modules.download_dispatcher._submit_guangya") as gy:
+                if isinstance(receipt, Exception):
+                    gy.side_effect = receipt
+                else:
+                    gy.return_value = receipt
+                first = self.client.post("/api/downloads/direct/submit", headers=headers,
+                                         data={"target": "both"}, files=upload)
+                self.assertEqual(first.status_code, 200, first.text)
+                self.assertEqual(first.json()["status"], status)
+                repeated = self.client.post("/api/downloads/direct/submit", headers=headers,
+                                            data={"target": "guangya"}, files=upload)
+                self.assertEqual(repeated.status_code, 200, repeated.text)
+                self.assertEqual(repeated.json()["status"], "duplicate")
+                self.assertEqual(repeated.json()["request_id"], first.json()["request_id"])
+                qb.assert_called_once()
+                gy.assert_called_once()
+
+    def test_uploaded_streams_are_closed_after_success_or_rejection(self):
+        from starlette.datastructures import UploadFile
+
+        headers = self._headers()
+        streams = []
+        close = UploadFile.close
+
+        async def record_close(upload):
+            streams.append(upload.file)
+            await close(upload)
+
+        with patch.object(UploadFile, "close", record_close):
+            for payload, expected_status in ((_torrent_bytes(), 200), (b"invalid", 400),
+                                             (b"0" * (4 * 1024 * 1024 + 1), 400)):
+                with self.subTest(size=len(payload)):
+                    response = self.client.post(
+                        "/api/downloads/direct/preview", headers=headers,
+                        files={"file": ("fixture.torrent", payload, "application/x-bittorrent")},
+                    )
+                    self.assertEqual(response.status_code, expected_status, response.text)
+                    self.assertTrue(streams[-1].closed)
+        self.assertEqual(len(streams), 3)
+        self.assertEqual(self._request_count(), 0)
