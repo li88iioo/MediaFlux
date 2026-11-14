@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app import database as db
 from app.repositories import download_requests as download_requests_repo
+from app.repositories import organize_history as organize_history_repo
 from app.modules.organize_delete_audit import (
     DeleteCandidate,
     execute_recycle_bin_delete,
@@ -237,13 +237,7 @@ def cleanup_download_staging(
             _verify_selected_scope(client, root_id, selected_scope)
             nodes = _empty_tree(client, row, live_protected | other_staging, report)
             # 同一目录可能先由整理日志清理；任一入口的未知删除都不能在收尾时重放。
-            with db.get_conn() as conn:
-                unknown = conn.execute(
-                    "SELECT 1 FROM organize_delete_audit WHERE status IN ('pending','failed') "
-                    "AND file_id IN (" + ','.join('?' for _ in nodes) + ') LIMIT 1',
-                    [node[0] for node in nodes],
-                ).fetchone()
-            if unknown:
+            if organize_history_repo.has_unresolved_delete_audits([node[0] for node in nodes]):
                 raise _RetainDirectory('protected', '存在结果未知的目录删除审计，停止自动收尾')
             latest = download_requests_repo.get_download_request(request_id)
             if (

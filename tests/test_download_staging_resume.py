@@ -110,6 +110,31 @@ class StagingResumeTests(IsolatedDatabaseTestCase):
         organize_confirmations_repo.update_organize_confirmation('old-card', status='pending')
         self.assertEqual(self.resume(), [self.request])
 
+    def test_unknown_delete_blocks_relocation_only_for_root_or_direct_children(self):
+        for status, file_id, parent_id in (
+            ('pending', 'stage', 'old'),
+            ('failed', 'leaf', 'stage'),
+            ('interrupted', 'stage', 'old'),
+        ):
+            with self.subTest(status=status, file_id=file_id):
+                audit_id = db.add_organize_delete_audit(
+                    trigger='manual_delete_empty_dir_cleanup', reason='unresolved delete',
+                    status=status, file_id=file_id, parent_id=parent_id,
+                )
+                self.assertEqual(self.resume(), [])
+                row = download_requests_repo.get_download_request(self.request)
+                assert row is not None
+                self.assertEqual((row['gy_staging_parent_dir'], row['gy_settle_snapshot']), ('old', 'old-snapshot'))
+                card = organize_confirmations_repo.get_organize_confirmation('old-card')
+                assert card is not None
+                self.assertEqual(card['status'], 'pending')
+                db.update_organize_delete_audit(audit_id, status='blocked')
+        db.add_organize_delete_audit(
+            trigger='manual_delete_empty_dir_cleanup', reason='another download',
+            status='interrupted', file_id='other-stage', parent_id='old',
+        )
+        self.assertEqual(self.resume(), [self.request])
+
     def test_identity_scope_and_parent_membership_must_agree(self):
         for field, value in (('file_id', 'different'), ('parent_id', 'other'), ('name', 'renamed')):
             with self.subTest(field=field):

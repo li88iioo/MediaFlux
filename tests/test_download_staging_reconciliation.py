@@ -8,6 +8,7 @@ from app import database as db
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
+from app.repositories import organize_history
 from app.modules import download_staging_reconcile as worker
 from app.modules.organize import OrganizeRules
 from app.modules.process_lock import CrossProcessLock
@@ -512,19 +513,87 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         self.assertEqual(delta.total_seconds(), 3600)
         self.assertEqual(self.cloud.deleted, [])
 
-    def test_unknown_audit_is_not_replayed_or_policy_hidden_even_if_row_was_reset(self):
+    def _assert_unknown_audit_blocks_policy_skip(self, trigger, status, file_id, parent_id):
         self.enqueue()
-        db.add_organize_delete_audit(
-            trigger='download_staging_cleanup', reason='simulated lost response', status='pending',
-            file_id='stage', file_name='MF-case', parent_id='source',
+        before = download_requests_repo.get_download_request(self.request_id)
+        assert before is not None
+        audit_id = db.add_organize_delete_audit(
+            trigger=trigger, reason='simulated lost response', status=status,
+            file_id=file_id, parent_id=parent_id,
         )
         self.rules.clean_empty = False
         self.drain()
-        get_download_request_result_5 = download_requests_repo.get_download_request(self.request_id)
-        assert get_download_request_result_5 is not None
-        self.assertEqual(get_download_request_result_5['gy_staging_cleanup_status'], 'retained')
+        row = download_requests_repo.get_download_request(self.request_id)
+        assert row is not None
+        self.assertEqual(row['gy_staging_cleanup_status'], 'retained')
+        self.assertEqual(row['gy_staging_cleanup_error'], before['gy_staging_cleanup_error'])
+        self.assertEqual(self.job()['status'], 'blocked')
         self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(), 0)
         self.assertEqual(self.cloud.reads, [])
+        self.assertEqual(self.cloud.deleted, [])
+        audit = db.get_organize_delete_audit(audit_id)
+        assert audit is not None
+        self.assertEqual(audit['status'], status)
+
+    def test_unknown_audit_is_not_replayed_or_policy_hidden_even_if_row_was_reset(self):
+        self._assert_unknown_audit_blocks_policy_skip(
+            'download_staging_cleanup', 'pending', 'stage', 'source',
+        )
+
+    def test_cross_entry_failed_root_delete_prevents_policy_skip(self):
+        self._assert_unknown_audit_blocks_policy_skip(
+            'manual_delete_empty_dir_cleanup', 'failed', 'stage', 'source',
+        )
+
+    def test_cross_entry_interrupted_child_delete_prevents_policy_skip(self):
+        self._assert_unknown_audit_blocks_policy_skip(
+            'manual_delete_empty_dir_cleanup', 'interrupted', 'leaf', 'stage',
+        )
+
+    def test_policy_skip_ignores_known_results_and_unknown_audits_in_other_staging_roots(self):
+        self.enqueue()
+        for status, file_id, parent_id in (
+            ('failed', 'other-stage', 'source'),
+            ('interrupted', 'other-leaf', 'other-stage'),
+            ('blocked', 'stage', 'source'),
+            ('success', 'leaf', 'stage'),
+        ):
+            db.add_organize_delete_audit(
+                trigger='manual_delete_empty_dir_cleanup', reason='scope control',
+                status=status, file_id=file_id, parent_id=parent_id,
+            )
+        self.rules.clean_empty = False
+        self.drain()
+        row = download_requests_repo.get_download_request(self.request_id)
+        assert row is not None
+        self.assertEqual(row['gy_staging_cleanup_status'], 'skipped')
+        self.assertEqual(self.job()['status'], 'retained')
+        self.assertEqual(self.cloud.reads, [])
+        self.assertEqual(self.cloud.deleted, [])
+
+    def test_unknown_audit_shared_transaction_keeps_exact_id_and_direct_parent_scopes_separate(self):
+        audit_id = db.add_organize_delete_audit(
+            trigger='manual', reason='transaction visibility',
+            file_id='leaf', parent_id='stage', status='blocked',
+        )
+        with db.get_conn() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("UPDATE organize_delete_audit SET status='pending' WHERE id=?", (audit_id,))
+            self.assertTrue(organize_history.has_unresolved_delete_audits(['leaf'], conn=conn))
+            self.assertFalse(organize_history.has_unresolved_delete_audits(['stage'], conn=conn))
+            self.assertTrue(organize_history.has_unresolved_delete_audits(
+                [], parent_ids=iter(('stage',)), conn=conn,
+            ))
+            self.assertFalse(organize_history.has_unresolved_delete_audits(
+                [], parent_ids=('source',), conn=conn,
+            ))
+            self.assertFalse(organize_history.has_unresolved_delete_audits([], conn=conn))
+            self.assertTrue(conn.in_transaction)
+            conn.rollback()
+        audit = db.get_organize_delete_audit(audit_id)
+        assert audit is not None
+        self.assertEqual(audit['status'], 'blocked')
+        self.assertFalse(organize_history.has_unresolved_delete_audits(['leaf']))
 
     def test_rebinding_between_phase_close_and_cleanup_does_not_become_new_authority(self):
         self.enqueue()

@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta
 
 from app import database as db
+from app.repositories import organize_history as organize_history_repo
 from app.repositories.download_staging import (
     _unsafe_confirmation_stats,
     list_staging_cleanup_requests,
@@ -177,12 +178,7 @@ def _recover_reorganized_request(conn, recovery: dict, *, source_ids: list[str])
                 for proof in evidence
             ):
                 return False
-    unknown = conn.execute(
-        "SELECT 1 FROM organize_delete_audit WHERE trigger='download_staging_cleanup' "
-        "AND status IN ('pending','failed') AND (file_id=? OR parent_id=?) LIMIT 1",
-        (source_id, source_id),
-    ).fetchone()
-    if unknown:
+    if organize_history_repo.has_unresolved_delete_audits([source_id], parent_ids=[source_id], conn=conn):
         return False
     # BEGIN IMMEDIATE 已锁住读快照；仍明确带上原业务状态，不把历史成功当复活权限。
     changed = conn.execute(

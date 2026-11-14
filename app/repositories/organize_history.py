@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import Any
 
@@ -21,16 +22,22 @@ _BUSINESS_LOG_FIELDS = (
 _FINISH_FIELDS = {"status", "operation_type", "current_parent_id", "current_name", "error"}
 
 
-def has_unresolved_delete_audits(file_ids: list[str]) -> bool:
-    """精确文件 ID 的未知回收结果阻止自动重放；重启后的 interrupted 同样未知。"""
-    ids = tuple(dict.fromkeys(file_ids))
-    if not ids:
+def has_unresolved_delete_audits(
+    file_ids: list[str], *, parent_ids: Iterable[str] = (), conn: sqlite3.Connection | None = None,
+) -> bool:
+    """统一未知删除判定；父目录仅匹配直属子项，可加入调用方的状态更新事务。"""
+    filters, parameters = [], []
+    for field, values in (("file_id", file_ids), ("parent_id", parent_ids)):
+        ids = tuple(dict.fromkeys(values))
+        if ids:
+            filters.append(f"{field} IN (SELECT value FROM json_each(?))")
+            parameters.append(json.dumps(ids))
+    if not filters:
         return False
-    placeholders = ",".join("?" for _ in ids)
-    with db.get_conn() as conn:
-        return conn.execute(
+    with (nullcontext(conn) if conn is not None else db.get_conn()) as connection:
+        return connection.execute(
             "SELECT 1 FROM organize_delete_audit WHERE status IN ('pending','failed','interrupted') "
-            f"AND file_id IN ({placeholders}) LIMIT 1", ids,
+            f"AND ({' OR '.join(filters)}) LIMIT 1", parameters,
         ).fetchone() is not None
 
 

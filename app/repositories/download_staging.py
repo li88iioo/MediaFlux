@@ -7,6 +7,7 @@ from contextlib import nullcontext
 
 from app import database as db
 from app.repositories import organize_confirmations as organize_confirmations_repo
+from app.repositories import organize_history as organize_history_repo
 
 # 清理只读业务身份，避免列表查询载入磁力、种子内容和通知凭据。
 _IDENTITY_KEYS = (
@@ -197,12 +198,8 @@ def update_staging_cleanup(expected: dict, *, status: str, error: str = '') -> b
             ).fetchone()
             if current is None or str(current['gy_staging_cleanup_error'] or '') != str(expected.get('gy_staging_cleanup_error') or ''):
                 return False
-            unknown = conn.execute(
-                "SELECT 1 FROM organize_delete_audit WHERE trigger='download_staging_cleanup' "
-                "AND status IN ('pending','failed') AND (file_id=? OR parent_id=?) LIMIT 1",
-                (str(expected.get('gy_target_dir') or ''), str(expected.get('gy_target_dir') or '')),
-            ).fetchone()
-            if unknown:
+            source_id = str(expected.get('gy_target_dir') or '')
+            if organize_history_repo.has_unresolved_delete_audits([source_id], parent_ids=[source_id], conn=conn):
                 return False
         cur = conn.execute(
             'UPDATE download_requests SET gy_staging_cleanup_status=?,gy_staging_cleanup_error=?,updated_at=? '
@@ -258,10 +255,7 @@ def requeue_relocated_staging(expected: dict, *, parent_id: str, nsfw: bool) -> 
                 or int(row['organize_started'] or 0) < 0 or row['attention_cleared_at']
                 or (row['gy_staging_cleanup_status'] or '') not in ('', 'pending', 'retained')):
             return False
-        if conn.execute(
-            "SELECT 1 FROM organize_delete_audit WHERE status IN ('pending','failed') "
-            "AND (file_id=? OR parent_id=?) LIMIT 1", (source_id, source_id),
-        ).fetchone() or conn.execute(
+        if organize_history_repo.has_unresolved_delete_audits([source_id], parent_ids=[source_id], conn=conn) or conn.execute(
             "SELECT 1 FROM download_staging_reconcile WHERE request_id=? AND status='blocked' LIMIT 1",
             (row['id'],),
         ).fetchone():

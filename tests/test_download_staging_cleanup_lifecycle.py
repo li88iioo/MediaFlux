@@ -189,6 +189,31 @@ class DownloadStagingCleanupLifecycleTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.clean()['cleaned'], 0)
         self.assertEqual(self.cloud.deleted, ['stage'])
 
+    def test_restarted_unknown_nested_directory_delete_is_not_replayed(self):
+        self.cloud.add_dir('leaf', 'stage')
+        audit_id = db.add_organize_delete_audit(
+            trigger='manual_delete_empty_dir_cleanup', reason='response not recorded',
+            file_id='leaf', parent_id='stage', status='pending',
+        )
+        db.init_db()
+        audit = db.get_organize_delete_audit(audit_id)
+        assert audit is not None
+        self.assertEqual(audit['status'], 'interrupted')
+
+        for _ in range(2):
+            report = self.clean()
+            self.assertEqual(report['cleaned'], 0)
+            self.assertTrue(report['_blocked'])
+        self.assertEqual(self.cloud.deleted, [])
+        self.assertEqual(self.cloud.children['source'], ['stage'])
+        self.assertEqual(self.cloud.children['stage'], ['leaf'])
+        row = download_requests_repo.get_download_request(self.request_id)
+        assert row is not None
+        self.assertEqual(row['gy_staging_cleanup_status'], 'retained')
+        audit = db.get_organize_delete_audit(audit_id)
+        assert audit is not None
+        self.assertEqual(audit['status'], 'interrupted')
+
     def test_source_not_in_explicit_scope_is_not_touched(self):
         report = cleanup_download_staging(self.cloud, [self.request_id], source_ids={'other'}, protected_ids={'0'})
         self.assertEqual(report['cleaned'], 0)
