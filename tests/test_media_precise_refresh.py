@@ -518,7 +518,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["folders"], ["root-tv"])
                 self.assertEqual(result["scope"], "folder")
 
-    def test_existing_movie_file_is_matched_from_changed_parent_directory(self):
+    def test_movie_parent_refresh_covers_unlisted_siblings(self):
         items = {"lib-movie": [
             {"Id": "root-movies", "Type": "Folder", "Path": f"{ROOT}/电影"},
             {
@@ -533,8 +533,30 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 result = client.refresh_for_paths([f"{ROOT}/电影/作品 A"])
 
                 self.assertTrue(result["ok"])
-                self.assertEqual(recorder.refreshed, ["movie-a"])
-                self.assertEqual(result["scope"], "item")
+                self.assertEqual(recorder.refreshed, ["root-movies"])
+                self.assertEqual(result["scope"], "folder")
+                self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_flat_movie_directory_uses_covering_folder_but_file_target_stays_precise(self):
+        directory = f"{ROOT}/电影/合集"
+        for folder in (True, False):
+            items = {"lib-movie": [
+                {"Id": "old", "Type": "Movie", "Path": f"{directory}/Long-existing-title.strm"},
+                {"Id": "changed", "Type": "Movie", "Path": f"{directory}/B.strm"},
+            ]}
+            if folder:
+                items["lib-movie"].append({"Id": "collection", "Type": "Folder", "Path": directory})
+            for label, client in self._clients():
+                with self.subTest(server=label, folder=folder):
+                    recorder = _RefreshRecorder(client, _folders(), items)
+                    result = client.refresh_for_paths([directory])
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(recorder.refreshed, ["collection" if folder else "lib-movie"])
+                    recorder.refreshed.clear()
+                    result = client.refresh_for_paths([f"{directory}/B.strm"])
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(recorder.refreshed, ["changed"])
+                    self.assertEqual(recorder.refresh_all_calls, 0)
 
     def test_automatic_caller_can_forbid_configured_global_fallback(self):
         client = JellyfinClient(
@@ -549,6 +571,21 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["scope"], "skipped")
         self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_strict_file_batch_keeps_series_deduplication_without_broad_scan(self):
+        directory = f"{ROOT}/剧集/作品 A"
+        items = {"lib-tv": [{"Id": "series", "Type": "Series", "Path": directory}]}
+        for label, client in self._clients():
+            with self.subTest(server=label), patch("app.clients.base._MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY", 2):
+                recorder = _RefreshRecorder(client, _folders(), items)
+                result = client.refresh_for_paths(
+                    [f"{directory}/Season 1/E{i}.mkv" for i in range(3)],
+                    allowed_library_ids=("lib-tv",), allow_library_fallback=False,
+                )
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["scope"], "item")
+                self.assertEqual(recorder.refreshed, ["series"])
+                self.assertEqual(recorder.refresh_all_calls, 0)
 
     def test_recent_target_id_is_resolved_but_not_refreshed_again(self):
         for label, client in self._clients():

@@ -296,12 +296,34 @@ def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, med
         if change == "none":
             result = await executor().execute_confirmed(plan.plan_id, context=context)
             assert result.outcome.public_content["status"] == "completed"
-            client.refresh_for_paths.assert_called_once_with(["/nas/Shows/Show/Season 2"], allowed_library_ids=("real-library-id",), allow_library_fallback=False)
+            client.refresh_for_paths.assert_called_once_with(["/nas/Shows/Show/Season 2/E24.mkv"], allowed_library_ids=("real-library-id",), allow_library_fallback=False)
         else:
             with pytest.raises(ToolPipelineError):
                 await executor().execute_confirmed(plan.plan_id, context=context)
             client.refresh_for_paths.assert_not_called()
     asyncio.run(check())
+
+
+def test_bound_local_refresh_preserves_exact_movie_path_with_strict_scope(backend, media_server, monkeypatch):
+    from app.clients.jellyfin import JellyfinClient
+
+    selected, _, _, _ = media_server
+    client = JellyfinClient("http://media.invalid", "fixture-key")
+    client.list_virtual_folders = lambda: [{"id": "real-library-id", "name": "剧集", "locations": ["/nas/Shows"]}]
+    client._library_items_with_paths = lambda library_id: [
+        {"Id": "root", "Type": "Folder", "Path": "/nas/Shows"},
+        {"Id": "video", "Type": "Movie", "Path": "/nas/Shows/Show/Season 2/E24.mkv"},
+    ]
+    refresh = Mock(return_value=True)
+    client.refresh_library = refresh
+    client.refresh_all = Mock(side_effect=AssertionError("global refresh forbidden"))
+    monkeypatch.setattr(library, "_client_for_provider", lambda *args, **kwargs: client)
+    preview = library.prepare_local_task_refresh(selected)
+    result = library.refresh_local_task_library(selected, expected_fingerprint=preview["fingerprint"])
+    assert result["status"] == "completed"
+    refresh.assert_called_once_with("video")
+    assert result["data"]["paths"] == ["/nas/Shows/Show/Season 2/E24.mkv"]
+    client.refresh_all.assert_not_called()
 
 
 def test_refresh_two_owners_use_original_atomic_lease_and_unknown_not_replay(backend, media_server):

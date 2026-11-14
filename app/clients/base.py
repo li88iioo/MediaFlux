@@ -13,7 +13,6 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
 from typing import Any, Optional
 
 import requests
@@ -1387,22 +1386,10 @@ class MediaServerClient:
             f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
         )
 
-    @staticmethod
-    def _media_path_parent(path: str) -> str:
-        normalized = (path or "").rstrip("/")
-        if not normalized:
-            return ""
-        parent = str(PurePosixPath(normalized).parent)
-        return "" if parent in {".", "/"} else parent
-
     def _preferred_item_for_path(
         self, items: list[dict[str, Any]], target: str,
     ) -> dict[str, Any] | None:
-        """定位覆盖变化路径的 Item；电视剧统一提升到 Series。
-
-        Jellyfin 的 Movie.Path 通常指向具体 ``.strm``/视频文件，而刷新计划
-        使用其父目录，因此电影额外允许“目标目录包含 Movie 文件”的匹配。
-        """
+        """只选能覆盖完整变化路径的 Item；目录不能缩小成某个子文件。"""
         candidates: list[tuple[int, dict[str, Any]]] = []
         by_id: dict[str, dict[str, Any]] = {}
         for item in items:
@@ -1412,12 +1399,7 @@ class MediaServerClient:
             item_path = self._normalize_media_path(item.get("Path"))
             if not item_path:
                 continue
-            item_type = str(item.get("Type") or "").strip().casefold()
-            covers = media_server_path_is_within(target, item_path)
-            movie_child = (item_type == "movie"
-                and self._media_path_key(self._media_path_parent(item_path))
-                == self._media_path_key(target))
-            if covers or movie_child:
+            if media_server_path_is_within(target, item_path):
                 candidates.append((len(item_path), item))
         if not candidates:
             return None
@@ -1429,7 +1411,6 @@ class MediaServerClient:
                 if str(item.get("Type") or "").strip().casefold() == item_type
             ]
 
-        # Movie.Path 往往是目标目录下的文件；电影优先于同路径树中的 Folder。
         movie_candidates = typed_candidates("movie")
         if movie_candidates:
             return max(movie_candidates, key=lambda entry: entry[0])[1]
@@ -1641,7 +1622,7 @@ class MediaServerClient:
         dense_target_libraries: set[str] = set()
 
         for library_id, library_targets_for_id in targets_by_library.items():
-            if len(library_targets_for_id) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
+            if allow_library_fallback and len(library_targets_for_id) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
                 dense_target_libraries.add(library_id)
                 try:
                     root_rows = self._library_root_items_with_paths(

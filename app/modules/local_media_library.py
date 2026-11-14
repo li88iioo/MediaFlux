@@ -115,7 +115,7 @@ def bound_local_task_library(task: Any) -> dict[str, Any]:
             raise LocalMediaServiceError(
                 "任务目标媒体库绑定存在歧义"
             )
-        resolved.append((winners[0], target_path.parent))
+        resolved.append((winners[0], target_path))
     keys = {
         (str(target.provider).lower(), str(target.library_id), str(target.library_name))
         for target, _path in resolved
