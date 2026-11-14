@@ -11,6 +11,12 @@ from app.repositories import telegram_notifications
 # 重试确认绑定原候选的 payload 键；仓储与确认服务共用。
 RETRY_SELECTED_INDEX_KEY = "_retry_selected_index"
 
+# review_status / review_result_json 是每组的“建议槽”，Agent 复核与人工审阅共用：
+# - Agent：waiting → pending → running → approved / abstained / failed；
+# - 人工保存选择直接写 approved，review_result_json.source='human'，不认领、不执行；
+# - 模型结果只在 review_status='running' 时写回，因此迟到的复核不会覆盖人工选择。
+# 真正执行的候选只看 selected_index 与 status，建议槽不代表已确认。
+
 
 def create_organize_confirmation(
     *,
@@ -932,3 +938,53 @@ def get_organize_confirmation_delivery(token: str) -> sqlite3.Row | None:
             "SELECT * FROM organize_confirmation_delivery_outbox WHERE confirmation_token=?",
             ((token or ""),),
         ).fetchone()
+
+
+# ===== 调用方事务内的确认结算（下载重整、手动整理、重启恢复）=====
+def expire_relocated_confirmation_conn(conn: sqlite3.Connection, confirmation_id: int, *, timestamp: str) -> None:
+    """源目录已被重新整理接管时，结束仍待确认的旧候选。"""
+    conn.execute(
+        "UPDATE organize_confirmations SET status='expired',selected_index=NULL,queued_at=NULL,task_id='',result_json=?,error=?,"
+        "review_status='cancelled',review_completed_at=?,completed_at=?,rollup_applied=0,updated_at=? WHERE id=?",
+        (json.dumps({'resolution': 'source_relocated'}), '目录已移动，原确认已由重新整理接管',
+         timestamp, timestamp, timestamp, confirmation_id),
+    )
+
+
+def complete_reorganized_confirmation_conn(
+    conn: sqlite3.Connection, confirmation_id: int, *, expected_status: str, stats: dict, timestamp: str,
+) -> None:
+    """人工整理已覆盖同一组文件时，按完整审计结果把确认收口为已完成。"""
+    conn.execute(
+        "UPDATE organize_confirmations SET status='completed',result_json=?,error='',"
+        "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+        "THEN 'cancelled' ELSE review_status END,"
+        "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+        "THEN ? ELSE review_completed_at END,"
+        "completed_at=?,updated_at=?,rollup_applied=0 WHERE id=? AND status=?",
+        (json.dumps(stats, ensure_ascii=False), timestamp, timestamp, timestamp,
+         confirmation_id, expected_status),
+    )
+
+
+def fail_interrupted_running_confirmations_conn(conn: sqlite3.Connection, *, timestamp: str) -> None:
+    """启动恢复：上次进程执行中的确认一律标记失败，等待重新整理。"""
+    conn.execute(
+        "UPDATE organize_confirmations SET status='failed',"
+        "error=CASE WHEN COALESCE(error,'')='' "
+        "THEN '上次进程在 Telegram 确认整理执行期间中断，请重新执行整理' "
+        "ELSE error END,completed_at=COALESCE(completed_at,?),"
+        "rollup_applied=0,updated_at=? WHERE status='running'",
+        (timestamp, timestamp),
+    )
+
+
+def set_confirmation_downstream(token: str, downstream: dict) -> None:
+    """记录确认整理后的 STRM 与媒体库后续状态，供批次摘要展示。"""
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE organize_confirmations SET result_json=json_set("
+            "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
+            "'$._downstream',json(?)),updated_at=? WHERE token=?",
+            (json.dumps(downstream, ensure_ascii=False), db.now(), token),
+        )

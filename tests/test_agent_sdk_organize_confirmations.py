@@ -28,6 +28,7 @@ from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests.support import initialized_web_runtime
 from app.repositories import organize_confirmations as organize_confirmations_repo
+from app.agent import feature_gate
 
 
 OWNER = "webk:v1:" + "a" * 64
@@ -328,7 +329,7 @@ def confirmation_backend(runtime, monkeypatch):
     rules = OrganizeRules(target_dir_id="target")
     monkeypatch.setattr(OrganizeRules, "from_config", lambda: rules)
     monkeypatch.setattr(OrganizeRules, "for_source", lambda self, _source: rules)
-    monkeypatch.setattr(confirmations, "_recognition_review_is_enabled", lambda: False)
+    monkeypatch.setattr(feature_gate, "recognition_review_enabled", lambda: False)
     wake = Mock()
     monkeypatch.setattr(confirmations, "wake_confirmation_dispatcher", wake)
     dispatch = Mock(side_effect=AssertionError("仅入队，不执行云盘任务"))
@@ -383,7 +384,7 @@ def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_confirmatio
     from app.modules import organize_confirmations as confirmations
 
     monkeypatch.setattr(sandbox, "get_runtime_paths", lambda: SimpleNamespace(data_dir=tmp_path, runtime_dir=tmp_path / "runtime"))
-    monkeypatch.setattr(confirmations, "_recognition_review_is_enabled", lambda: True)
+    monkeypatch.setattr(feature_gate, "recognition_review_enabled", lambda: True)
     monkeypatch.setattr(confirmations, "wake_recognition_review_dispatcher", Mock())
     monkeypatch.setattr("app.modules.telegram_confirmation_batch.publish_batch_summary", Mock())
     model = Mock(side_effect=lambda payload: reviews.RecognitionReviewDecision(status="approved",

@@ -14,6 +14,7 @@ from app.modules import telegram_organize_lifecycle  # noqa: F401 -- 在测试�
 from app.modules.agent_recognition_review import RecognitionReviewDecision
 from app.modules.organize import OrganizeRules, organize_rules_snapshot
 from tests.support import IsolatedDatabaseTestCase
+from app.agent import feature_gate
 
 
 class ConfirmationBatchTests(IsolatedDatabaseTestCase):
@@ -141,7 +142,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         row = organize_confirmations_repo.claim_next_organize_confirmation_review()
         decision = RecognitionReviewDecision(status="approved", candidate_index=1, confidence=.99,
                                              reason_code="evidence_consistent", summary="核对年份一致")
-        with patch.object(confirmations, "_recognition_review_is_enabled", return_value=True), \
+        with patch.object(feature_gate, "recognition_review_enabled", return_value=True), \
                 patch("app.modules.agent_recognition_review.review_confirmation_payload", return_value=decision), \
                 patch("app.modules.telegram_confirmation_batch.publish_batch_summary"), \
                 patch.object(confirmations, "start_confirmation") as start:
@@ -154,7 +155,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.create("one", review=True)
         row = organize_confirmations_repo.claim_next_organize_confirmation_review()
         self.assertIsNotNone(row)
-        with patch.object(confirmations, "_recognition_review_is_enabled", return_value=True):
+        with patch.object(feature_gate, "recognition_review_enabled", return_value=True):
             result = batches.request_reviews(["one"])
         self.assertEqual(result["unchanged"], 1)
         with self.assertRaises(ValueError):
@@ -251,7 +252,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM organize_confirmations")
         group = {**payload, "files": payload["files"]}
-        with patch.object(confirmations, "_recognition_review_is_enabled", return_value=False), \
+        with patch.object(feature_gate, "recognition_review_enabled", return_value=False), \
                 patch.object(confirmations.Organizer, "_validated_task_confirmation_groups", return_value=([group], 1)):
             self.assertEqual(confirmations.schedule_guangya_recognition_reviews({"task_id": "silent"}, self.rules), 1)
         view = batches.list_confirmations(task_id="silent")

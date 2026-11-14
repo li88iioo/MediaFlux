@@ -6,6 +6,7 @@ import re
 from contextlib import nullcontext
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 
 # 清理只读业务身份，避免列表查询载入磁力、种子内容和通知凭据。
 _IDENTITY_KEYS = (
@@ -288,12 +289,7 @@ def requeue_relocated_staging(expected: dict, *, parent_id: str, nsfw: bool) -> 
         timestamp = db.now()
         for card in cards:
             if card['status'] == 'pending':
-                conn.execute(
-                    "UPDATE organize_confirmations SET status='expired',selected_index=NULL,queued_at=NULL,task_id='',result_json=?,error=?,"
-                    "review_status='cancelled',review_completed_at=?,completed_at=?,rollup_applied=0,updated_at=? WHERE id=?",
-                    (json.dumps({'resolution': 'source_relocated'}), '目录已移动，原确认已由重新整理接管',
-                     timestamp, timestamp, timestamp, card['id']),
-                )
+                organize_confirmations_repo.expire_relocated_confirmation_conn(conn, card['id'], timestamp=timestamp)
         _update_download_request_conn(
             conn, int(row['id']), dict(
                 gy_staging_parent_dir=parent_id, gy_requested_target_dir=parent_id, gy_requested_nsfw=int(nsfw),

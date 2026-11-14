@@ -20,6 +20,7 @@ from app.modules.scraper import MatchResult
 from tests.support import IsolatedDatabaseTestCase
 from tests.test_agent_nsfw_clean_review import clean_payload
 from tests.test_download_staging_cleanup_lifecycle import _CloudTree
+from app.agent import feature_gate
 
 
 class CleanConfirmationTests(IsolatedDatabaseTestCase):
@@ -42,8 +43,8 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(
             patch.object(
-                confirmations,
-                "_recognition_review_is_enabled",
+                feature_gate,
+                "recognition_review_enabled",
                 return_value=True,
             )
         )

@@ -9,6 +9,7 @@ from typing import Any
 from app.logger import get_logger
 from app.repositories import recognition
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import telegram_notifications
 
 logger = get_logger(__name__)
@@ -279,15 +280,9 @@ def reconcile_reorganized_confirmations(
                         'result': _object(confirmation['result_json']),
                     },
                 }
-                connection.execute(
-                    "UPDATE organize_confirmations SET status='completed',result_json=?,error='',"
-                    "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
-                    "THEN 'cancelled' ELSE review_status END,"
-                    "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
-                    "THEN ? ELSE review_completed_at END,"
-                    "completed_at=?,updated_at=?,rollup_applied=0 WHERE id=? AND status=?",
-                    (json.dumps(stats, ensure_ascii=False), timestamp, timestamp, timestamp,
-                     int(confirmation['id']), confirmation['status']),
+                organize_confirmations_repo.complete_reorganized_confirmation_conn(
+                    connection, int(confirmation['id']), expected_status=confirmation['status'],
+                    stats=stats, timestamp=timestamp,
                 )
                 token = str(confirmation['token'])
                 enqueue_confirmation_cleanup(connection, token=token, timestamp=timestamp)
@@ -683,14 +678,7 @@ def _recover_after_restart(conn, timestamp: str) -> None:
             timestamp=timestamp,
         )
 
-    conn.execute(
-        "UPDATE organize_confirmations SET status='failed',"
-        "error=CASE WHEN COALESCE(error,'')='' "
-        "THEN '上次进程在 Telegram 确认整理执行期间中断，请重新执行整理' "
-        "ELSE error END,completed_at=COALESCE(completed_at,?),"
-        "rollup_applied=0,updated_at=? WHERE status='running'",
-        (timestamp, timestamp),
-    )
+    organize_confirmations_repo.fail_interrupted_running_confirmations_conn(conn, timestamp=timestamp)
     # pending 候选由 Telegram 确认调度器统一过期并投递终态卡片；
     # 这里提前改状态会让卡片与父任务汇总失去主动收口机会。
     conn.execute(

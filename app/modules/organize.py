@@ -4182,9 +4182,9 @@ class Organizer:
                     batch_id, chat_id=chat_id, deliver_now=True,
                 )
                 if delivered:
-                    from app.modules.organize_confirmations import _recognition_review_is_enabled
+                    from app.agent import feature_gate
 
-                    if _recognition_review_is_enabled():
+                    if feature_gate.recognition_review_enabled():
                         from app.modules.organize_confirmation_batches import MAX_SELECTION, request_reviews
                         from app.notifier import notification_target_chat_id
 

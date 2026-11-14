@@ -26,6 +26,7 @@ from app.modules.agent_recognition_review import (
 )
 from app.modules.organize import OrganizeRules
 from tests.support import IsolatedDatabaseTestCase
+from app.agent import feature_gate
 
 
 class _ScriptedModel:
@@ -355,8 +356,8 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             "candidates": _review_payload()["candidates"],
         }
         with patch.object(
-            organize_confirmations,
-            "_recognition_review_is_enabled",
+            feature_gate,
+            "recognition_review_enabled",
             return_value=True,
         ):
             actions = organize_confirmations.create_confirmation_actions(
@@ -416,8 +417,8 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             "candidates": _review_payload()["candidates"],
         }
         with patch.object(
-            organize_confirmations,
-            "_recognition_review_is_enabled",
+            feature_gate,
+            "recognition_review_enabled",
             return_value=True,
         ):
             actions = organize_confirmations.create_confirmation_actions(
@@ -500,8 +501,8 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             "candidates": _review_payload()["candidates"],
         }
         with patch.object(
-            organize_confirmations,
-            "_recognition_review_is_enabled",
+            feature_gate,
+            "recognition_review_enabled",
             return_value=True,
         ):
             scheduled = organize_confirmations.schedule_local_media_recognition_review(
@@ -572,8 +573,8 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             duration_ms=12,
         )
         with patch.object(
-            organize_confirmations,
-            "_recognition_review_is_enabled",
+            feature_gate,
+            "recognition_review_enabled",
             return_value=True,
         ), patch(
             "app.modules.agent_recognition_review.review_confirmation_payload",
@@ -632,8 +633,8 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
             duration_ms=12,
         )
         with patch.object(
-            organize_confirmations,
-            "_recognition_review_is_enabled",
+            feature_gate,
+            "recognition_review_enabled",
             side_effect=(True, False),
         ), patch(
             "app.modules.agent_recognition_review.review_confirmation_payload",

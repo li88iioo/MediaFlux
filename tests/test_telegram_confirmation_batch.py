@@ -19,6 +19,7 @@ from app.modules.organize import Organizer, OrganizeRules
 from app.modules.telegram_notification_policy import NotificationTopic
 from app.notifier import NotificationEvent, TelegramSendResult, render_event
 from tests.support import FakeTelegramBot, IsolatedDatabaseTestCase, fake_telebot_types
+from app.agent import feature_gate
 
 
 class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
@@ -30,8 +31,8 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         was_stopped = notifications._dispatch_stop.is_set()
         notifications._dispatch_stop.clear()
         self.addCleanup(notifications._dispatch_stop.set if was_stopped else notifications._dispatch_stop.clear)
-        self.agent_enabled = self.enterContext(patch.object(batch, "recognition_review_enabled", return_value=False))
-        self.review_enabled = self.enterContext(patch.object(confirmations, "_recognition_review_is_enabled", return_value=False))
+        self.review_enabled = self.agent_enabled = self.enterContext(
+            patch.object(feature_gate, "recognition_review_enabled", return_value=False))
         self.enterContext(patch.object(confirmations, "wake_recognition_review_dispatcher", return_value=False))
         self.enterContext(patch.object(confirmations, "wake_confirmation_dispatcher", return_value=False))
         self.dispatch = self.enterContext(patch.object(confirmations, "_dispatch_next_queued_confirmation", return_value={"idle": True}))

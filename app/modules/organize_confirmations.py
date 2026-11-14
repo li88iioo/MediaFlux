@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
 
 from app import database as db
+from app.agent import feature_gate
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
@@ -220,25 +221,12 @@ def _fingerprint(payload: dict) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _confirmation_kind(payload: dict) -> str:
+def confirmation_kind(payload: dict) -> str:
     """旧记录没有 kind；缺省值必须永久保持为光鸭整理。"""
     kind = str(payload.get("kind") or "guangya").strip().lower()
     if kind not in {"guangya", "local_media"}:
         raise ValueError("确认任务类型无效，请重新执行整理")
     return kind
-
-
-def _recognition_review_is_enabled() -> bool:
-    """延迟读取配置，避免整理模块与 Agent Kernel 形成启动期耦合。"""
-    try:
-        from app.modules.agent_recognition_review import recognition_review_enabled
-
-        return recognition_review_enabled()
-    except Exception as exc:  # noqa: BLE001 - 自动复核不可影响人工链路
-        logger.warning(
-            "读取 Agent 主动复核配置失败 type=%s", type(exc).__name__
-        )
-        return False
 
 
 def _clean_review_candidate(candidate: dict) -> bool:
@@ -251,7 +239,7 @@ def _validate_agent_clean_authorization(payload: dict, candidate: dict) -> None:
         nsfw_clean_review_enabled,
     )
 
-    if not _recognition_review_is_enabled() or not nsfw_clean_review_enabled():
+    if not feature_gate.recognition_review_enabled() or not nsfw_clean_review_enabled():
         raise DirectoryScrapeConflictError("未授权或已关闭光鸭 NSFW 自动清洗，保留人工确认")
     evidence = inspect_nsfw_clean_candidate(payload, candidate)
     if not evidence["ok"]:
@@ -298,7 +286,7 @@ class _AgentCleanWriteBoundary:
             self.media_write_attempted = True
 
 
-def _episode_research_receipt_from_row(row) -> dict | None:
+def episode_research_receipt_from_row(row) -> dict | None:
     if row is None:
         return None
     try:
@@ -317,7 +305,7 @@ def _episode_research_for_execution(token: str, payload: dict, selected_index: i
     if actor != "agent":
         return None  # 人工候选按钮不隐式授权使用研究映射。
     row = organize_confirmations_repo.get_organize_confirmation(token)
-    receipt = _episode_research_receipt_from_row(row)
+    receipt = episode_research_receipt_from_row(row)
     if receipt is None:
         return None
     if (row is None or str(row["confirmation_actor"] or "") != "agent"
@@ -449,7 +437,7 @@ def _persist_confirmation_actions(
             + timedelta(hours=_CONFIRMATION_TTL_HOURS)
         ),
         organize_task_id=str(persisted_payload.get("organize_task_id") or ""),
-        review_requested=bool(candidates) and _recognition_review_is_enabled(),
+        review_requested=bool(candidates) and feature_gate.recognition_review_enabled(),
         review_ready=review_ready,
     )
     if review_ready:
@@ -511,7 +499,7 @@ def confirmation_token_from_event(event: NotificationEvent) -> str:
 def confirmation_thread_key(token: str) -> str:
     """候选拥有独立执行身份，同批候选共享通知线程。"""
     row = organize_confirmations_repo.get_organize_confirmation(token)
-    batch_id = str(_decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    batch_id = str(decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
     return f"confirmation-batch:{batch_id}" if batch_id else f"confirmation:{token}"
 
 
@@ -538,7 +526,7 @@ def publish_confirmation_event(
     if not resolved_token:
         return False
     row = organize_confirmations_repo.get_organize_confirmation(resolved_token)
-    batch_id = str(_decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    batch_id = str(decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
     if batch_id:
         from app.modules.telegram_confirmation_batch import publish_batch_summary
         return publish_batch_summary(
@@ -609,18 +597,12 @@ def update_confirmation_lifecycle_downstream(
     from app.modules.telegram_notification_policy import NotificationTopic
 
     row = organize_confirmations_repo.get_organize_confirmation(token)
-    batch_id = str(_decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    batch_id = str(decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
     if batch_id:
         from app.modules.telegram_confirmation_batch import publish_batch_summary
         downstream = {"strm": strm_status, "media_refresh": media_refresh,
                       "partial": partial, "error": redact_sensitive_text(error)}
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE organize_confirmations SET result_json=json_set("
-                "CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
-                "'$._downstream',json(?)),updated_at=? WHERE token=?",
-                (json.dumps(downstream, ensure_ascii=False), db.now(), token),
-            )
+        organize_confirmations_repo.set_confirmation_downstream(token, downstream)
         return publish_batch_summary(batch_id, chat_id=chat_id)
     thread_key = f"confirmation:{(token or '').strip()}"
     previous = get_notification_thread_event(
@@ -847,7 +829,7 @@ def schedule_guangya_recognition_reviews(
     """通知关闭仍保留同一候选队列，Web 人工审阅不依赖 Agent 开关。"""
     groups, _actionable_count = Organizer._validated_task_confirmation_groups(stats)
     batch_id = secrets.token_hex(8) if len(groups) > 1 else ""
-    review_enabled = _recognition_review_is_enabled()
+    review_enabled = feature_gate.recognition_review_enabled()
     scheduled = 0
     for group in groups:
         group = {**group, "organize_task_id": str(stats.get("task_id") or "")}
@@ -881,7 +863,7 @@ def schedule_local_media_recognition_review(
     chat_id: str = "",
 ) -> bool:
     """为无通知或静默本地任务创建同一冻结确认记录。"""
-    if not _recognition_review_is_enabled():
+    if not feature_gate.recognition_review_enabled():
         return False
     return bool(
         create_local_media_confirmation_actions(
@@ -896,7 +878,7 @@ def schedule_local_media_recognition_review(
     )
 
 
-def _decode_row(row) -> dict:
+def decode_row(row) -> dict:
     try:
         payload = json.loads(str(row["payload_json"] or "{}"))
     except (TypeError, ValueError) as exc:
@@ -911,7 +893,7 @@ def _finalize_guangya_manual_logs(
 ) -> None:
     """同步确认终态到光鸭整理时间线；本地媒体使用自身任务状态机。"""
     try:
-        if _confirmation_kind(payload) != "guangya":
+        if confirmation_kind(payload) != "guangya":
             return
         file_ids = [
             str(item.get("file_id") or "").strip()
@@ -936,7 +918,7 @@ def _finalize_guangya_manual_logs(
         )
 
 
-def _decode_json_object(value: object) -> dict:
+def decode_json_object(value: object) -> dict:
     try:
         decoded = json.loads(str(value or "{}"))
     except (TypeError, ValueError):
@@ -965,7 +947,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
     baseline: dict = {}
     payloads: dict[int, dict] = {}
     for row in reversed(latest_rows):
-        payload = _decode_json_object(row["payload_json"])
+        payload = decode_json_object(row["payload_json"])
         payloads[int(row["id"])] = payload
         candidate = payload.get("organize_rollup")
         if not baseline and isinstance(candidate, dict):
@@ -998,7 +980,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
         "expired": 0,
     }
     for row in latest_rows:
-        payload = payloads.get(int(row["id"])) or _decode_json_object(
+        payload = payloads.get(int(row["id"])) or decode_json_object(
             row["payload_json"]
         )
         file_count = len([
@@ -1007,7 +989,7 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
         ])
         outcomes["resolved_files"] += file_count
         status = str(row["status"] or "")
-        result = _decode_json_object(row["result_json"])
+        result = decode_json_object(row["result_json"])
         if status == "completed":
             moved = safe_int(result.get("moved"), 0, minimum=0)
             skipped = safe_int(result.get("skipped"), 0, minimum=0)
@@ -1107,7 +1089,7 @@ def _expired_confirmation_event(payload: dict, row) -> NotificationEvent:
 
 
 def _publish_expired_confirmation(row) -> bool:
-    payload = _decode_json_object(row["payload_json"])
+    payload = decode_json_object(row["payload_json"])
     chat_id = str(row["chat_id"] or "")
     token = str(row["token"] or "")
     event = _expired_confirmation_event(payload, row)
@@ -1180,7 +1162,7 @@ def cancel_confirmation(
     if expected_chat and expected_chat != (chat_id or ""):
         raise ValueError("确认操作不存在或已失效")
     _raise_if_confirmation_expired(current)
-    payload = _decode_row(current)
+    payload = decode_row(current)
     directory = str(current["directory_path"] or "/")
     try:
         resolved_message_id = int(message_id or 0)
@@ -1233,8 +1215,8 @@ def skip_confirmation(
     if expected_chat and expected_chat != (chat_id or ""):
         raise ValueError("确认操作不存在或已失效")
     _raise_if_confirmation_expired(current)
-    payload = _decode_row(current)
-    if _confirmation_kind(payload) != "guangya" or not bool(
+    payload = decode_row(current)
+    if confirmation_kind(payload) != "guangya" or not bool(
         payload.get("allow_skip_terminal")
     ):
         raise ValueError("该确认操作不支持跳过")
@@ -1324,7 +1306,7 @@ def _confirmation_selected_event(row, payload: dict, candidate: dict) -> Notific
 
 
 def _selected_candidate(row) -> tuple[dict, dict, int]:
-    payload = _decode_row(row)
+    payload = decode_row(row)
     candidates = list(payload.get("candidates") or [])
     selected_index = int(row["selected_index"] if row["selected_index"] is not None else -1)
     if selected_index < 0 or selected_index >= len(candidates):
@@ -1341,7 +1323,7 @@ def _dispatch_confirmation_token(token: str) -> dict:
         payload, candidate, selected_index = _selected_candidate(row)
     except Exception as exc:
         message = "确认任务数据损坏，请重新执行整理"
-        raw_payload = _decode_json_object(row["payload_json"])
+        raw_payload = decode_json_object(row["payload_json"])
         delivery_enabled = _confirmation_delivery_enabled(raw_payload)
         failure_event = NotificationEvent(
             "❌ Telegram 确认整理失败",
@@ -1444,7 +1426,7 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
 
     delivery_id = int(item["id"])
     generation = int(item["lease_generation"])
-    expected_revision = _decode_json_object(item['event_json']).get('_expected_notification_revision')
+    expected_revision = decode_json_object(item['event_json']).get('_expected_notification_revision')
     try:
         event = deserialize_notification_event(item["event_json"])
     except ValueError:
@@ -1565,7 +1547,7 @@ def _confirmation_dispatch_loop(
 def _process_recognition_review_row(row) -> str:
     """处理一条已领取记录；只返回审计状态，不暴露模型上下文。"""
     token = str(row["token"] or "")
-    if not _recognition_review_is_enabled():
+    if not feature_gate.recognition_review_enabled():
         organize_confirmations_repo.complete_organize_confirmation_review(
             token,
             status="cancelled",
@@ -1575,13 +1557,13 @@ def _process_recognition_review_row(row) -> str:
             },
         )
         return "cancelled"
-    payload = _decode_row(row)
+    payload = decode_row(row)
     from app.modules.agent_recognition_review import review_confirmation_payload
 
     decision = review_confirmation_payload(payload)
     audit = decision.audit_payload()
     current = organize_confirmations_repo.get_organize_confirmation(token)
-    if current is not None and _decode_row(current).get("review_only"):
+    if current is not None and decode_row(current).get("review_only"):
         # 批量审阅只保存建议，批准与候选入队由用户的同一份预览决定。
         saved = organize_confirmations_repo.complete_organize_confirmation_review(
             token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
@@ -1599,7 +1581,7 @@ def _process_recognition_review_row(row) -> str:
 
     # 用户可能在模型复核期间关闭开关。执行所有权竞争前再读取一次配置，
     # 保证关闭动作立即阻止新的自动确认，而不是等下一条任务才生效。
-    if not _recognition_review_is_enabled():
+    if not feature_gate.recognition_review_enabled():
         organize_confirmations_repo.complete_organize_confirmation_review(
             token,
             status="cancelled",
@@ -1629,7 +1611,7 @@ def _process_recognition_review_row(row) -> str:
     except ValueError as exc:
         current = organize_confirmations_repo.get_organize_confirmation(token)
         if (current is not None and current["status"] == "pending"
-                and _decode_row(current).get("review_only")):
+                and decode_row(current).get("review_only")):
             organize_confirmations_repo.complete_organize_confirmation_review(
                 token, status=decision.status, result={**audit, "summary": redact_sensitive_text(decision.summary)[:500]},
             )
@@ -1847,7 +1829,7 @@ def start_confirmation(
         raise ValueError("确认材料已变化，请重新预览")
     _raise_if_confirmation_expired(preview)
 
-    payload = _decode_row(preview)
+    payload = decode_row(preview)
     candidates = list(payload.get("candidates") or [])
     if selected_index < 0 or selected_index >= len(candidates):
         raise ValueError("候选参数无效")
@@ -1864,7 +1846,7 @@ def start_confirmation(
     if normalized_actor == "agent" and not explicit_approval and _clean_review_candidate(candidate) and status == "pending":
         _validate_agent_clean_authorization(payload, candidate)
     if normalized_actor == "agent" and status == "pending":
-        receipt = _episode_research_receipt_from_row(preview)
+        receipt = episode_research_receipt_from_row(preview)
         if receipt is not None:
             from app.modules.episode_research_service import (
                 revalidate_episode_research_receipt,
@@ -1917,7 +1899,7 @@ def start_confirmation(
                 if current["selected_index"] is not None else -1
             )
             if current_index == selected_index:
-                current_payload = _decode_row(current)
+                current_payload = decode_row(current)
                 current_candidate = dict(
                     list(current_payload.get("candidates") or [])[selected_index]
                 )
@@ -2223,7 +2205,7 @@ def enqueue_reorganized_confirmation_delivery(
     from app.notifier import _format_season_episode_range
     from app.repositories.telegram_notifications import _enqueue_confirmation_delivery
 
-    payload = _decode_row(confirmation)
+    payload = decode_row(confirmation)
     if not _confirmation_delivery_enabled(payload):
         return
     message_id = _confirmation_message_id(payload)
@@ -2240,7 +2222,7 @@ def enqueue_reorganized_confirmation_delivery(
         if previous is None or not any(
             isinstance(action, dict)
             and str(action.get('callback_data') or '').startswith(f"orgc:{confirmation['token']}:")
-            for action in _decode_json_object(previous['event_json']).get('actions', [])
+            for action in decode_json_object(previous['event_json']).get('actions', [])
         ):
             return
         message_id = int(previous['message_id'])
@@ -2286,7 +2268,7 @@ def enqueue_reorganized_confirmation_delivery(
         (confirmation['token'],),
     ).fetchone()
     if existing is not None:
-        previous_event = _decode_json_object(existing['event_json'])
+        previous_event = decode_json_object(existing['event_json'])
         previous_event.pop('_expected_notification_revision', None)
         if previous_event == encoded:
             return
@@ -2488,7 +2470,7 @@ def _execute_confirmation(
     selected_index: int, chat_id: str, actor: str = "human"
 ) -> dict:
     try:
-        if _confirmation_kind(payload) == "local_media":
+        if confirmation_kind(payload) == "local_media":
             return _execute_local_media_confirmation(
                 token,
                 payload,

@@ -10,6 +10,9 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 
 from app import config
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 RUNTIME_FENCE_KEY = "agent.runtime_fence.v1"
 
@@ -144,6 +147,21 @@ def is_agent_enabled() -> bool:
     """
 
     return config.get_bool(AGENT_ENABLED_KEY, False)
+
+
+def recognition_review_enabled() -> bool:
+    """整理候选的 Agent 只读复核是否可用；配置异常时按关闭处理，人工链路不受影响。"""
+    try:
+        return bool(
+            is_agent_enabled()
+            and config.get_bool("AGENT_LLM_ENABLED", False)
+            and config.get_bool("AGENT_RECOGNITION_REVIEW_ENABLED", False)
+            and (config.get("AGENT_LLM_API_URL", "") or "").strip()
+            and (config.get("AGENT_LLM_MODEL", "") or "").strip()
+        )
+    except Exception as exc:  # noqa: BLE001 - 可选复核不能阻断整理
+        logger.warning("读取 Agent 主动复核配置失败 type=%s", type(exc).__name__)
+        return False
 
 
 def current_agent_runtime_generation() -> int:

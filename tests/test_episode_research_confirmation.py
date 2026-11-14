@@ -110,7 +110,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
     def execute(self):
         row = organize_confirmations_repo.claim_queued_organize_confirmation("episode-case")
         assert (row) is not None
-        payload = confirmations._decode_row(row)
+        payload = confirmations.decode_row(row)
         with patch.object(confirmations, "TMDBScraper", return_value=self.scraper()):
             return confirmations._execute_guangya_confirmation("episode-case", payload, payload["candidates"][0],
                                                                selected_index=0, chat_id="owner-chat", actor="agent")

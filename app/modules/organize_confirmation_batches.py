@@ -5,6 +5,7 @@ import hashlib
 import json
 
 from app import database as db
+from app.agent import feature_gate
 from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.modules import organize_confirmations as confirmations
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot_changes
@@ -59,9 +60,9 @@ def _execution_view(result: dict) -> dict | None:
 
 
 def _view(row) -> dict:
-    payload = confirmations._decode_row(row)
-    review = confirmations._decode_json_object(row["review_result_json"])
-    result = confirmations._decode_json_object(row["result_json"])
+    payload = confirmations.decode_row(row)
+    review = confirmations.decode_json_object(row["review_result_json"])
+    result = confirmations.decode_json_object(row["result_json"])
     candidates = [_candidate_view(candidate, index) for index, candidate in enumerate(payload.get("candidates") or [])]
     for evidence in review.get("evidence") or []:
         index = evidence.get("candidate_index")
@@ -120,13 +121,13 @@ def list_confirmations(
         "page": page, "pages": (result["total"] + page_size - 1) // page_size,
         "counts": result["counts"],
         "selection_truncated": result["total"] > len(result["tokens"]),
-        "review_enabled": confirmations._recognition_review_is_enabled(),
+        "review_enabled": feature_gate.recognition_review_enabled(),
     }
 
 
 def request_reviews(confirmation_ids: list[str], *, chat_id: str | None = None) -> dict:
     values = _tokens(confirmation_ids)
-    if not confirmations._recognition_review_is_enabled():
+    if not feature_gate.recognition_review_enabled():
         raise ValueError("请先在 Agent 设置中启用识别复核并配置模型；也可直接逐项选择候选")
     result = organize_confirmations_repo.request_organize_confirmation_reviews(values, chat_id=chat_id)
     confirmations.wake_recognition_review_dispatcher()
@@ -148,8 +149,8 @@ def _choices(entries: list[dict], chat_id: str | None) -> list[tuple]:
     result = []
     for entry in entries:
         row = _row(entry["confirmation_id"], chat_id)
-        payload = confirmations._decode_row(row)
-        if confirmations._confirmation_kind(payload) != "guangya":
+        payload = confirmations.decode_row(row)
+        if confirmations.confirmation_kind(payload) != "guangya":
             raise ValueError("当前批量审阅仅支持光鸭整理，本地任务请使用原确认入口")
         index = entry.get("candidate_index")
         candidates = payload.get("candidates") or []
@@ -171,7 +172,7 @@ def _choices(entries: list[dict], chat_id: str | None) -> list[tuple]:
 def _digest(choices: list[tuple]) -> str:
     # 通知位置、模型建议和运行状态不属于文件变更范围；其更新不使已确认操作失去幂等性。
     frozen = [{"token": row["token"], "index": index,
-               "episode_research_receipt": confirmations._episode_research_receipt_from_row(row),
+               "episode_research_receipt": confirmations.episode_research_receipt_from_row(row),
                "payload": {key: payload.get(key) for key in (
                    "kind", "source_dir_id", "source_parent_id", "files", "companions", "candidates", "rules",
                    "rules_snapshot", "snapshot_digest", "local_task_id", "local_task_version", "download_request_ids",
@@ -180,7 +181,7 @@ def _digest(choices: list[tuple]) -> str:
 
 
 def _episode_mappings(row, index: int) -> list[dict]:
-    receipt = confirmations._episode_research_receipt_from_row(row)
+    receipt = confirmations.episode_research_receipt_from_row(row)
     if receipt is None:
         return []
     from app.modules.episode_research_service import POLICY_VERSION, proposal_receipt
@@ -198,11 +199,12 @@ def preview_choices(entries: list[dict], *, chat_id: str | None = None) -> dict:
     items = []
     # 仅使用命名器的纯函数，不为100个待确认项重新扫描云盘或拉取整部剧详情。
     organizer = Organizer(local_only=True, recognition_enabled=False)
+    rules = OrganizeRules.from_config()
     try:
         for row, payload, index in choices:
             candidate = payload["candidates"][index]
-            current = OrganizeRules.from_config().for_source(str(payload.get("source_dir_id") or ""))
-            if confirmations._confirmation_kind(payload) == "guangya" and row["status"] == "pending":
+            current = rules.for_source(str(payload.get("source_dir_id") or ""))
+            if confirmations.confirmation_kind(payload) == "guangya" and row["status"] == "pending":
                 changes = organize_rules_snapshot_changes(payload.get("rules"), current, files=payload.get("files"))
                 if changes:
                     raise ValueError("整理规则已变化，请重新整理生成候选")
@@ -234,7 +236,7 @@ def submit_choices(entries: list[dict], digest: str, *, chat_id: str | None = No
     items = []
     for row, _payload, index in choices:
         try:
-            execution_actor = "agent" if confirmations._episode_research_receipt_from_row(row) else actor
+            execution_actor = "agent" if confirmations.episode_research_receipt_from_row(row) else actor
             result = confirmations.start_confirmation(
                 row["token"], index, chat_id=str(row["chat_id"] or ""), actor=execution_actor,
                 explicit_approval=True, dispatch=False,

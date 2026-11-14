@@ -16,6 +16,7 @@ from pathlib import PurePath
 from typing import Any
 
 from app import config
+from app.agent import feature_gate
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel import (
     AgentEventType,
@@ -104,16 +105,6 @@ class RecognitionReviewDecision:
 
 class RecognitionReviewUnavailable(RuntimeError):
     """当前模型配置不具备主动复核条件。"""
-
-
-def recognition_review_enabled() -> bool:
-    return bool(
-        config.get_bool("AGENT_ENABLED", False)
-        and config.get_bool("AGENT_LLM_ENABLED", False)
-        and config.get_bool("AGENT_RECOGNITION_REVIEW_ENABLED", False)
-        and (config.get("AGENT_LLM_API_URL", "") or "").strip()
-        and (config.get("AGENT_LLM_MODEL", "") or "").strip()
-    )
 
 
 def _safe_leaf(value: object, fallback: str = "") -> str:
@@ -955,7 +946,7 @@ def _research_episode_decision(payload: dict) -> RecognitionReviewDecision:
 
 def review_confirmation_payload(payload: dict[str, Any]) -> RecognitionReviewDecision:
     """同步入口，供持久化后台 Worker 调用。异常一律收敛为人工回退。"""
-    if not recognition_review_enabled():
+    if not feature_gate.recognition_review_enabled():
         raise RecognitionReviewUnavailable("Agent 主动复核未启用或模型未配置")
     try:
         if _should_research_episodes(payload):

@@ -7,7 +7,7 @@ from collections import Counter
 from hmac import compare_digest
 
 from app.repositories import organize_confirmations as organize_confirmations_repo
-from app.modules.agent_recognition_review import recognition_review_enabled
+from app.agent import feature_gate
 from app.modules.telegram_notification_center import (
     get_notification_thread_snapshot,
     publish_notification_thread,
@@ -262,7 +262,7 @@ def _batch_event(
             footer += "\n确认仅授权本页显示的建议；其他页请翻页后分别确认，建议变化时需刷新后再次确认。"
             if preview.get("note"):
                 footer += f"\n{preview['note']}"
-        if not truncated and counts["pending"] and recognition_review_enabled():
+        if not truncated and counts["pending"] and feature_gate.recognition_review_enabled():
             actions.append(_button("请求 Agent 只读复核", anchor, "r", page))
         actions.append(_button("刷新摘要", anchor, "p", page))
     return NotificationEvent(
@@ -355,7 +355,7 @@ def handle_batch_callback(data: str, *, chat_id: str, message_id: int) -> str:
             raise ValueError("批次分页参数无效")
         page = int(value)
     if action == "r":
-        if not recognition_review_enabled():
+        if not feature_gate.recognition_review_enabled():
             raise ValueError("Agent 复核未启用，可直接手动选择候选")
         result = _batch_items(batch_id, chat_id)
         if result.get("selection_truncated") or result["total"] > len(result["items"]):
