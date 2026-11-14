@@ -7234,6 +7234,7 @@ class Organizer:
                 add_organize_log_items(log_id, items, _conn=conn)
                 if (len(log_args) >= 5 and str(log_args[4] or "") == "success"
                         and not str(log_kwargs.get("operation_token") or "").startswith("recognition-confirm:")):
+                    conn.execute("SAVEPOINT organize_confirmation_settlement")
                     try:
                         db.resolve_pending_organize_logs(
                             str(log_args[0] or ""),
@@ -7241,7 +7242,11 @@ class Organizer:
                             before_log_id=log_id,
                             _conn=conn,
                         )
+                        from app.repositories.organize_history import reconcile_reorganized_confirmations
+
+                        reconcile_reorganized_confirmations(file_ids=[str(log_args[3])], conn=conn)
                     except Exception as resolve_exc:
+                        conn.execute("ROLLBACK TO organize_confirmation_settlement")
                         # 前置待确认记录的展示结算不能反向污染已经成功的
                         # 云端移动；时间线仍可通过兼容查询折叠旧记录。
                         logger.warning(
@@ -7249,6 +7254,8 @@ class Organizer:
                             log_id,
                             type(resolve_exc).__name__,
                         )
+                    finally:
+                        conn.execute("RELEASE organize_confirmation_settlement")
             except Exception as exc:
                 item_error = exc
                 try:

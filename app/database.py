@@ -1558,6 +1558,11 @@ def clear_organize_logs(
             f"SELECT t.origin,t.id,t.status,t.raw_status,l.file_id,l.operation_token FROM ({sql}) t "
             "LEFT JOIN organize_log l ON t.origin='guangya' AND l.id=t.id", params,
         ).fetchall()
+        organize_history_repo.reconcile_reorganized_confirmations(
+            file_ids=list({row["file_id"] for row in rows
+                           if row["origin"] == "guangya" and row["status"] == "success" and row["file_id"]}),
+            conn=conn,
+        )
         active_files, active_local, active_tokens = organize_history_repo.active_organize_confirmation_refs(conn)
         selected: dict[str, list[int]] = {"guangya": [], "local": []}
         for row in rows:

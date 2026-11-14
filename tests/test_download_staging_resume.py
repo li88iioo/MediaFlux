@@ -185,7 +185,7 @@ class StagingResumeTests(IsolatedDatabaseTestCase):
         self.assertEqual(get_organize_confirmation_result_7['status'], 'pending')
 
     def test_late_review_and_background_reconciliation_cannot_revive_retired_card(self):
-        from app.repositories.download_staging_reconcile import reconcile_reorganized_confirmations
+        from app.repositories.organize_history import reconcile_reorganized_confirmations
         db.update_organize_confirmation('old-card', review_status='running')
         self.assertEqual(self.resume(), [self.request])
         get_organize_confirmation_result_8 = db.get_organize_confirmation('old-card')

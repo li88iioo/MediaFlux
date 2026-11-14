@@ -1,6 +1,7 @@
 """清理和列表必须使用同一范围，真实临时数据库验证，不接触媒体。"""
 import json
 import re
+import socket
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -12,15 +13,18 @@ from fastapi.testclient import TestClient
 from app import config
 from app import database as db
 from app.repositories import local_media as local_media_repo
+from app.repositories import organize_history
+from app.repositories import download_requests as download_requests_repo
 from app.main import create_app
 from app.modules.organize import Organizer
 from app.routes.logs_api import clear_organize_log_records
-from tests.support import initialized_web_runtime, isolated_test_database
+from tests.support import assert_present, initialized_web_runtime, isolated_test_database
 
 
 class OrganizeLogClearTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
+        self.enterContext(patch.object(socket.socket, "connect", side_effect=AssertionError("unexpected network")))
 
     def cloud(self, status="failed", name="Match", **kwargs):
         return db.add_organize_log("guangya", "/" + name, "/target", name, status,
@@ -99,6 +103,185 @@ class OrganizeLogClearTests(unittest.TestCase):
             token, status=status, result_json=json.dumps(result or {}),
             completed_at=db.now() if status == "completed" else None,
         )
+
+    def pending_group(self, token, files, *, source="scan-root", companions=None, **payload_fields):
+        with patch.object(db, "now", return_value="2026-11-14 18:27:00"):
+            db.create_organize_confirmation(
+                token=token, fingerprint=token, chat_id="", source_name="Synthetic scan", directory_path="/",
+                payload={"source_dir_id": source, "files": files, "companions": companions or [], **payload_fields},
+                expires_at="2026-11-15 18:27:00",
+            )
+
+    def committed_audit(self, file_id, *, source="scan-root", parent="leaf", stamp="2026-11-14 19:18:00"):
+        with patch.object(db, "now", return_value=stamp):
+            return Organizer._write_organize_audit(
+                ("guangya", "/" + file_id, "/target/" + file_id, file_id, "success"),
+                {"operation_token": "manual-" + file_id, "source_dir_id": source,
+                 "original_parent_id": parent, "original_name": file_id, "current_parent_id": "target",
+                 "target_parent_id": "target", "current_name": file_id},
+                [{"file_id": file_id, "role": "video", "original_parent_id": parent,
+                  "current_parent_id": "target", "target_parent_id": "target", "current_name": file_id,
+                  "target_name": file_id, "status": "success", "size": 100, "etag": "hash"}],
+            )
+
+    def test_restart_repairs_production_shaped_inplace_and_directory_audits_only(self):
+        # 生产 API 的日志 ID、时序和入口形状；确认 payload 为合成冻结快照。
+        records = (
+            (10133, "inplace", "scan-root", "leaf-a", "reorganize", "16:55:35", "20:17:25", 3),
+            (11207, "directory-a", "leaf-b", "leaf-b", "organize", "19:18:18", "19:18:18", 1),
+            (11206, "directory-b", "leaf-c", "leaf-c", "organize", "19:18:05", "19:18:05", 1),
+        )
+        for log_id, file_id, source, parent, operation, created, updated, version in records:
+            with patch.object(db, "now", return_value="2026-11-14 " + created):
+                generated = self.cloud("success", file_id, source_dir_id=source, original_parent_id=parent,
+                                       current_parent_id="target", target_parent_id="target", current_name=file_id,
+                                       operation_type=operation, operation_token="manual-" + file_id)
+            with db.get_conn() as conn:
+                conn.execute("UPDATE organize_log SET id=?,version=?,updated_at=? WHERE id=?",
+                             (log_id, version, "2026-11-14 " + updated, generated))
+            db.add_organize_log_items(log_id, [{
+                "file_id": file_id, "role": "video", "original_parent_id": parent,
+                "current_parent_id": "target", "target_parent_id": "target", "current_name": file_id,
+                "target_name": file_id, "size": 100, "etag": "hash", "status": "success",
+            }])
+            self.pending_group(file_id, [{"file_id": file_id, "parent_id": parent, "size": 100, "etag": "hash"}],
+                               _organize_log_upper_bound=11205)
+        with patch.object(db, "now", return_value="2026-11-14 20:17:25"):
+            organize_history.add_organize_operation_step(
+                10133, "manual-inplace", 1, "move_rename", file_id="inplace", status="success",
+                from_parent_id="leaf-a", to_parent_id="target", to_name="inplace", finished_at=db.now(),
+            )
+        manual_ids = [self.cloud("manual", name) for name in ("real-manual-a", "real-manual-b")]
+        for name in ("real-manual-a", "real-manual-b"):
+            self.pending_group(name, [{"file_id": name, "parent_id": "leaf", "size": 100, "etag": "hash"}])
+        with db.get_conn() as conn:
+            for token, review in (("inplace", "waiting"), ("directory-a", "pending"), ("directory-b", "running")):
+                conn.execute("UPDATE organize_confirmations SET review_status=? WHERE token=?", (review, token))
+        self.assertEqual(db.count_organize_timeline(), 5)
+        db.init_db()
+        for log_id, file_id, *_ in records:
+            card = assert_present(db.get_organize_confirmation(file_id))
+            self.assertEqual((card["status"], card["review_status"]), ("completed", "cancelled"))
+            self.assertEqual(json.loads(card["result_json"])["organize_log_ids"], [log_id])
+            self.assertTrue(card["review_completed_at"])
+            self.assertFalse(db.stage_organize_confirmation_review_result(file_id, {}))
+        snapshots = [dict(assert_present(db.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")]
+        db.init_db()
+        self.assertEqual([dict(assert_present(db.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")], snapshots)
+        result = db.clear_organize_logs()
+        self.assertEqual((result["deleted"], result["skipped_busy"]), (3, 2))
+        self.assertTrue(all(assert_present(db.get_organize_log(log_id)) is not None for log_id in manual_ids))
+        self.assertTrue(all(assert_present(db.get_organize_confirmation(name))["status"] == "pending"
+                            for name in ("real-manual-a", "real-manual-b")))
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_staging_reconcile").fetchone()[0], 0)
+
+    def test_live_audit_closes_only_matching_group_after_all_members_commit(self):
+        files = [{"file_id": name, "parent_id": "leaf", "size": 100, "etag": "hash"} for name in ("first", "second")]
+        self.pending_group("group", files)
+        self.pending_group("unrelated", [{"file_id": "unrelated", "parent_id": "leaf", "size": 100}])
+        first = self.committed_audit("first", source="leaf")
+        self.assertEqual(assert_present(db.get_organize_confirmation("group"))["status"], "pending")
+        second = self.committed_audit("second", source="leaf")
+        card = assert_present(db.get_organize_confirmation("group"))
+        self.assertEqual(card["status"], "completed")
+        self.assertEqual(json.loads(card["result_json"])["organize_log_ids"], [first, second])
+        self.assertEqual(assert_present(db.get_organize_confirmation("unrelated"))["status"], "pending")
+
+    def test_clear_repairs_only_selected_success_files_without_restart(self):
+        selected = self.committed_audit("selected")
+        other = self.committed_audit("other")
+        for file_id in ("selected", "other"):
+            self.pending_group(file_id, [{"file_id": file_id, "parent_id": "leaf", "size": 100}],
+                               _organize_log_upper_bound=0)
+        result = db.clear_organize_logs(origin="guangya", status="success", keyword="selected")
+        self.assertEqual((result["deleted"], result["skipped_busy"]), (1, 0))
+        self.assertIsNone(db.get_organize_log(selected))
+        self.assertIsNotNone(db.get_organize_log(other))
+        self.assertEqual(assert_present(db.get_organize_confirmation("selected"))["status"], "completed")
+        self.assertEqual(assert_present(db.get_organize_confirmation("other"))["status"], "pending")
+
+    def test_new_confirmation_and_unrelated_source_do_not_reuse_old_success(self):
+        log_id = self.committed_audit("old-success")
+        for token, stamp, source in (("same-second", "2026-11-14 19:18:00", "scan-root"),
+                                     ("later", "2026-11-14 19:19:00", "scan-root"),
+                                     ("different-root", "2026-11-14 18:27:00", "unrelated-root")):
+            self.pending_group(token, [{"file_id": "old-success", "parent_id": "leaf", "size": 100, "etag": "hash"}], source=source)
+            with db.get_conn() as conn:
+                conn.execute("UPDATE organize_confirmations SET created_at=? WHERE token=?", (stamp, token))
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=["old-success"]), [])
+        self.assertIsNotNone(db.get_organize_log(log_id))
+
+    def test_live_reconciliation_rolls_back_review_and_confirmation_but_keeps_success_audit(self):
+        self.pending_group("atomic-live", [{"file_id": "atomic-live", "parent_id": "leaf", "size": 100}])
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET review_status='running'")
+            conn.execute("CREATE TRIGGER reject_terminal_receipt BEFORE INSERT ON organize_confirmation_delivery_outbox "
+                         "BEGIN SELECT RAISE(ABORT,'receipt-failure'); END")
+        log_id = self.committed_audit("atomic-live")
+        self.assertEqual(assert_present(db.get_organize_log(log_id))["status"], "success")
+        card = assert_present(db.get_organize_confirmation("atomic-live"))
+        self.assertEqual((card["status"], card["review_status"]), ("pending", "running"))
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER reject_terminal_receipt")
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=["atomic-live"]), ["atomic-live"])
+
+    def test_queued_running_and_real_review_history_survive_live_audit(self):
+        for state in ("queued", "running", "approved", "abstained"):
+            with self.subTest(state=state):
+                self.pending_group(state, [{"file_id": state, "parent_id": "leaf", "size": 100}])
+                if state in {"queued", "running"}:
+                    db.update_organize_confirmation(state, status=state)
+                else:
+                    db.update_organize_confirmation(state, review_status=state, review_result_json='{"reason":"actual"}',
+                                                   review_completed_at="2026-11-14 18:30:00")
+                self.committed_audit(state)
+                card = assert_present(db.get_organize_confirmation(state))
+                if state in {"queued", "running"}:
+                    self.assertEqual(card["status"], state)
+                else:
+                    self.assertEqual((card["status"], card["review_status"]), ("completed", state))
+                    self.assertEqual(card["review_completed_at"], "2026-11-14 18:30:00")
+                    self.assertEqual(json.loads(card["review_result_json"]), {"reason": "actual"})
+
+    def test_broken_ambiguous_cancelled_or_cross_root_download_binding_stays_protected(self):
+        for case in ("missing", "mismatched-task", "cancelled", "ambiguous", "cross-root", "isolated-entry"):
+            with self.subTest(case=case):
+                source = "stage-" + case
+                fields: dict[str, Any] = {}
+                if case == "missing":
+                    fields["download_request_ids"] = [999999]
+                else:
+                    for index in range(2 if case == "ambiguous" else 1):
+                        request_id, _ = download_requests_repo.create_download_request(case + str(index), "magnet")
+                        download_requests_repo.update_download_request(
+                            request_id, targets="guangya", status="cancelled" if case == "cancelled" else "completed",
+                            gy_status="completed", gy_isolated=1, gy_target_dir="isolated-leaf" if case == "isolated-entry" else source,
+                            gy_staging_parent_dir="incoming", gy_staging_name="MF-test", organize_started=1,
+                            organize_status="requires_manual", organize_task_id="original-task",
+                        )
+                    if case == "mismatched-task":
+                        fields["organize_task_id"] = "different-task"
+                parent = "isolated-leaf" if case == "isolated-entry" else "leaf"
+                self.pending_group(case, [{"file_id": case, "parent_id": parent, "size": 100}], source=source, **fields)
+                self.committed_audit(case, parent=parent, source=parent if case in {"cross-root", "isolated-entry"} else source)
+                self.assertEqual(assert_present(db.get_organize_confirmation(case))["status"], "pending")
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_staging_reconcile").fetchone()[0], 0)
+
+    def test_unfinished_companion_keeps_whole_ordinary_group_pending(self):
+        self.pending_group("with-subtitle", [{"file_id": "video", "parent_id": "leaf", "size": 100}],
+                           companions=[{"file_id": "subtitle", "parent_id": "leaf", "size": 10, "etag": "sub-hash"}])
+        log_id = self.committed_audit("video", source="leaf")
+        db.add_organize_log_items(log_id, [{
+            "file_id": "subtitle", "role": "subtitle", "original_parent_id": "leaf", "status": "failed",
+            "current_parent_id": "target", "target_parent_id": "target", "current_name": "subtitle",
+            "target_name": "subtitle", "size": 10, "etag": "sub-hash",
+        }])
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=["video"]), [])
+        subtitle = next(item for item in db.list_organize_log_items(log_id) if item["file_id"] == "subtitle")
+        db.update_organize_log_item(subtitle["id"], status="success")
+        self.assertEqual(organize_history.reconcile_reorganized_confirmations(file_ids=["video"]), ["with-subtitle"])
 
     def test_completed_confirmation_settles_skipped_and_failed_file_receipts_atomically(self):
         previous = [self.cloud("manual", name) for name in ("skipped-file", "failed-file")]

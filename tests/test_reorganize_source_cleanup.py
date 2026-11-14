@@ -215,6 +215,9 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
                            "size": video.size, "etag": video.etag}, *(extra_files or [])],
             }, expires_at="2099-01-01 00:00:00",
         )
+        # 重整会原地更新旧日志；确认时间必须明确早于成功步骤，不能依赖同秒顺序。
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET created_at='2026-01-01 00:00:00' WHERE token=?", (token,))
         db.update_organize_confirmation(token, status=status)
         lock = CrossProcessLock("guangya-organize", directory=self.test_db_path.parent)
         self.assertTrue(lock.acquire(blocking=False))
@@ -997,7 +1000,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
             return original_update(log_id, **fields)
 
         with patch.object(db, "update_organize_log", side_effect=reject_commit), patch(
-            "app.repositories.download_staging_reconcile.reconcile_reorganized_confirmations",
+            "app.repositories.organize_history.reconcile_reorganized_confirmations",
         ) as hook, self.assertRaisesRegex(RuntimeError, "重整业务结果未能持久化"):
             self._reorganize()
         hook.assert_not_called()
@@ -1010,7 +1013,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
 
     def test_confirmation_hook_failure_preserves_source_and_reports_warning(self):
         with patch(
-            "app.repositories.download_staging_reconcile.reconcile_reorganized_confirmations",
+            "app.repositories.organize_history.reconcile_reorganized_confirmations",
             side_effect=RuntimeError("synthetic hook failure"),
         ):
             result = self._reorganize()

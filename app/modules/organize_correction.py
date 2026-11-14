@@ -1546,7 +1546,7 @@ class OrganizeCorrectionService:
 
     def _finalize_reorganized_source(
         self, source_dir_id: str, rules: OrganizeRules, *, request_snapshot: dict | None = None,
-        cleanup_source: bool = True,
+        cleanup_source: bool = True, file_ids: list[str],
     ) -> list[str]:
         """成功提交后闭环旧确认，并复用现有来源/下载隔离目录收尾。"""
         from app.modules.download_staging_cleanup import source_inside_protected_staging
@@ -1557,9 +1557,7 @@ class OrganizeCorrectionService:
             _protected_organize_root_ids,
         )
         from app.repositories.download_staging import list_staging_cleanup_requests
-        from app.repositories.download_staging_reconcile import (
-            reconcile_reorganized_confirmations,
-        )
+        from app.repositories.organize_history import reconcile_reorganized_confirmations
 
         source_dir_id = (source_dir_id or "").strip()
         if not source_dir_id:
@@ -1568,7 +1566,9 @@ class OrganizeCorrectionService:
         warnings: list[str] = []
         try:
             recovery = self._verified_download_recovery(request_snapshot)
-            tokens = reconcile_reorganized_confirmations([source_dir_id], recovery=recovery)
+            tokens = reconcile_reorganized_confirmations(
+                [source_dir_id], file_ids=file_ids, recovery=recovery,
+            )
             # 已入库作品纠正的是当前归档位置，不应重读早已清理的下载根。
             # 尚有确认/失败下载恢复工作时，仍走原有严格下载收尾。
             if not cleanup_source and not tokens and request_snapshot is None:
@@ -1796,6 +1796,7 @@ class OrganizeCorrectionService:
         warnings.extend(self._finalize_reorganized_source(
             str(previous_log["source_dir_id"] or "") if previous_log else "", rules,
             request_snapshot=request_snapshot, cleanup_source=not already_archived,
+            file_ids=[item.file_id for item in items if item.role == 'video'],
         ))
         warnings.extend(self._notify_reorganize_result(preview, items, rules))
         return {

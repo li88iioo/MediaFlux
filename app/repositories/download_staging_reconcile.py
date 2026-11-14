@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 
 from app import database as db
 from app.repositories.download_staging import (
-    _RELOCATED_CONFIRMATION_SQL,
     _unsafe_confirmation_stats,
     list_staging_cleanup_requests,
     requests_for_download_confirmation,
@@ -190,128 +189,10 @@ def _recover_reorganized_request(conn, recovery: dict, *, source_ids: list[str])
     return changed.rowcount == 1
 
 
-def reconcile_reorganized_confirmations(source_ids: list[str], *, conn=None,
-                                       recovery: dict | None = None) -> list[str]:
-    """以成功重整快照关闭旧确认，同事务登记收尾和回执，并补齐旧重整终态。"""
-    if not source_ids:
-        return []
-    from app.modules.organize_confirmations import enqueue_reorganized_confirmation_delivery
-
-    resolved: list[str] = []
-    placeholders = ','.join('?' for _ in source_ids)
-    with (nullcontext(conn) if conn is not None else db.get_conn()) as connection:
-        if conn is None:
-            connection.execute('BEGIN IMMEDIATE')
-        if recovery is not None:
-            _recover_reorganized_request(connection, recovery, source_ids=source_ids)
-        confirmations = connection.execute(
-            "SELECT c.* FROM organize_confirmations c "
-            "WHERE (c.status IN ('pending','failed','expired','cancelled') OR "
-            "(c.status='completed' AND CASE WHEN json_valid(c.result_json) THEN "
-            "json_extract(c.result_json,'$.resolution') END='reorganized')) "
-            f"AND NOT {_RELOCATED_CONFIRMATION_SQL} "
-            "AND CASE WHEN json_valid(c.payload_json) THEN "
-            f"CAST(json_extract(c.payload_json,'$.source_dir_id') AS TEXT) END IN ({placeholders}) "
-            "AND NOT EXISTS (SELECT 1 FROM organize_confirmations newer "
-            "WHERE newer.fingerprint=c.fingerprint AND newer.id>c.id)", source_ids,
-        ).fetchall()
-        for confirmation in confirmations:
-            if confirmation['status'] == 'completed':
-                # 已提交的成功不重写历史，也不再触碰可能已清理的目录。
-                if _success(confirmation['result_json']):
-                    enqueue_reorganized_confirmation_delivery(
-                        connection, confirmation, timestamp=db.now(), repair_existing=True,
-                    )
-                continue
-            payload = _object(confirmation['payload_json'])
-            source_id = str(payload.get('source_dir_id') or '')
-            owners = requests_for_download_confirmation(payload, conn=connection)
-            files = payload.get('files')
-            companions = payload.get('companions', [])
-            if (len(owners) != 1 or not _eligible(owners[0])
-                    or not isinstance(files, list) or not files
-                    or not isinstance(companions, list)):
-                continue
-            companion_evidence = {}
-            companion_ids = [str(item.get('file_id') or '') for item in companions if isinstance(item, dict)]
-            if companion_ids:
-                # 伴随文件可能属于多个视频日志：整包只扫描一次明细，再走唯一键取快照。
-                marks = ','.join('?' for _ in companion_ids)
-                companion_evidence = {row['file_id']: row for row in connection.execute(
-                    "WITH latest AS (SELECT file_id,MAX(log_id) AS log_id FROM organize_log_items "
-                    f"WHERE file_id IN ({marks}) GROUP BY file_id) "
-                    "SELECT i.*,l.status AS log_status,l.operation_type,l.source_dir_id,l.legacy_incomplete,"
-                    "(SELECT MAX(id) FROM organize_log WHERE file_id=i.file_id) AS primary_log_id "
-                    "FROM latest JOIN organize_log_items i ON i.log_id=latest.log_id AND i.file_id=latest.file_id "
-                    "JOIN organize_log l ON l.id=i.log_id", companion_ids,
-                )}
-            log_ids: set[int] = set()
-            for index, item in enumerate([*files, *companions]):
-                if not isinstance(item, dict) or not item.get('file_id') or not item.get('parent_id'):
-                    break
-                if index < len(files):
-                    # 先用主日志 file_id 索引定位最新操作；缺明细也不能回退到旧成功。
-                    evidence = connection.execute(
-                        "SELECT i.*,l.status AS log_status,l.operation_type,l.source_dir_id,l.legacy_incomplete,"
-                        "l.id AS primary_log_id FROM organize_log l LEFT JOIN organize_log_items i "
-                        "ON i.log_id=l.id AND i.file_id=l.file_id "
-                        "WHERE l.file_id=? ORDER BY l.id DESC LIMIT 1", (str(item['file_id']),),
-                    ).fetchone()
-                else:
-                    evidence = companion_evidence.get(str(item['file_id']))
-                if (evidence is None or evidence['log_status'] != 'success'
-                        or evidence['legacy_incomplete'] or evidence['log_id'] is None
-                        or int(evidence['primary_log_id'] or 0) > int(evidence['log_id'])
-                        or evidence['operation_type'] not in ('organize', 'reorganize') or evidence['status'] != 'success'
-                        or str(evidence['source_dir_id']) != source_id
-                        or str(evidence['original_parent_id']) != str(item['parent_id'])
-                        or not evidence['target_parent_id']
-                        or evidence['current_parent_id'] != evidence['target_parent_id']
-                        or evidence['current_parent_id'] == evidence['original_parent_id']
-                        or evidence['current_name'] != evidence['target_name']
-                        or (item.get('size') is not None and item['size'] != evidence['size'])
-                        or (item.get('etag') and str(item['etag']).lower() != str(evidence['etag']).lower())):
-                    break
-                log_ids.add(int(evidence['log_id']))
-            else:
-                # 同组字幕等伴随文件也必须落稳，不能只凭视频的成功记录释放目录。
-                placeholders = ','.join('?' for _ in log_ids)
-                unsafe = connection.execute(
-                    "SELECT 1 FROM organize_log_items WHERE log_id IN (" + placeholders + ") "
-                    "AND (status!='success' OR COALESCE(target_parent_id,'')='' "
-                    "OR COALESCE(current_parent_id,'')!=target_parent_id "
-                    "OR COALESCE(current_name,'')!=COALESCE(target_name,'')) LIMIT 1",
-                    tuple(log_ids),
-                ).fetchone()
-                if unsafe:
-                    continue
-                timestamp = db.now()
-                stats = {
-                    'moved': len(files), 'failed': 0, 'need_confirm': 0,
-                    'resolution': 'reorganized', 'organize_log_ids': sorted(log_ids),
-                    'previous_confirmation': {
-                        'status': confirmation['status'], 'error': confirmation['error'],
-                        'result': _object(confirmation['result_json']),
-                    },
-                }
-                connection.execute(
-                    "UPDATE organize_confirmations SET status='completed',result_json=?,error='',"
-                    "completed_at=?,updated_at=?,rollup_applied=0 WHERE id=?",
-                    (json.dumps(stats, ensure_ascii=False), timestamp, timestamp, int(confirmation['id'])),
-                )
-                token = str(confirmation['token'])
-                enqueue_confirmation_cleanup(connection, token=token, timestamp=timestamp)
-                completed = connection.execute(
-                    'SELECT * FROM organize_confirmations WHERE id=?', (int(confirmation['id']),),
-                ).fetchone()
-                assert completed is not None  # 同一写事务内刚刚更新的确认必定存在。
-                enqueue_reorganized_confirmation_delivery(connection, completed, timestamp=timestamp)
-                resolved.append(token)
-    return resolved
-
-
 def discover_legacy_confirmation_cleanup(*, limit: int = _MAX_BATCH) -> int:
     """按下载 ID 游标有界补建旧终态意图；不从名称猜关联，也不更新下载终态。"""
+    from app.repositories.organize_history import reconcile_reorganized_confirmations
+
     limit = max(1, min(limit, _MAX_BATCH))
     with db.get_conn() as conn:
         conn.execute('BEGIN IMMEDIATE')

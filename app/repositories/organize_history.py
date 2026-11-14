@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import nullcontext
 from typing import Any
 
 from app.logger import get_logger
@@ -120,6 +121,183 @@ def settle_completed_confirmation_logs(conn: sqlite3.Connection, *, token: str =
         )
         settled += 1
     return settled
+
+
+def reconcile_reorganized_confirmations(
+    source_ids: list[str] | None = None, *, file_ids: list[str] | None = None,
+    conn=None, recovery: dict | None = None,
+) -> list[str]:
+    """以成功重整快照关闭旧确认，同事务登记收尾和回执，并补齐旧重整终态。"""
+    if source_ids == [] or file_ids == []:
+        return []
+    from app.modules.organize_confirmations import enqueue_reorganized_confirmation_delivery
+
+    from app.repositories.download_staging import (
+        _RELOCATED_CONFIRMATION_SQL, list_staging_cleanup_requests, requests_for_download_confirmation,
+    )
+    from app.repositories.download_staging_reconcile import (
+        _eligible, _object, _recover_reorganized_request, _success, enqueue_confirmation_cleanup,
+    )
+
+    resolved: list[str] = []
+    clauses = ["json_valid(c.payload_json)",
+               "COALESCE(json_extract(c.payload_json,'$.kind'),'guangya')='guangya'",
+               "NOT " + _RELOCATED_CONFIRMATION_SQL,
+               "NOT EXISTS (SELECT 1 FROM organize_confirmations newer "
+               "WHERE newer.fingerprint=c.fingerprint AND newer.id>c.id)"]
+    params: list = []
+    if source_ids is None:
+        # 实时每个视频只核对相关 pending；启动恢复只扫描一次未决候选，不重扫历史回执。
+        clauses.append("c.status='pending'")
+    else:
+        clauses.append("(c.status IN ('pending','failed','expired','cancelled') OR "
+                       "(c.status='completed' AND CASE WHEN json_valid(c.result_json) THEN "
+                       "json_extract(c.result_json,'$.resolution') END='reorganized'))")
+    if source_ids is not None:
+        clauses.append("CAST(json_extract(c.payload_json,'$.source_dir_id') AS TEXT) IN ("
+                       + ",".join("?" for _ in source_ids) + ")")
+        params.extend(source_ids)
+    if file_ids is not None:
+        clauses.append("EXISTS (SELECT 1 FROM json_each(c.payload_json,'$.files') f "
+                       "WHERE json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id') "
+                       "IN (SELECT value FROM json_each(?)))")
+        params.append(json.dumps(file_ids))
+    with (nullcontext(conn) if conn is not None else db.get_conn()) as connection:
+        if conn is None:
+            connection.execute('BEGIN IMMEDIATE')
+        if recovery is not None:
+            _recover_reorganized_request(connection, recovery, source_ids=source_ids or [])
+        confirmations = connection.execute(
+            "SELECT c.* FROM organize_confirmations c WHERE " + " AND ".join(clauses), params,
+        ).fetchall()
+        for confirmation in confirmations:
+            if confirmation['status'] == 'completed':
+                # 已提交的成功不重写历史，也不再触碰可能已清理的目录。
+                if _success(confirmation['result_json']):
+                    enqueue_reorganized_confirmation_delivery(
+                        connection, confirmation, timestamp=db.now(), repair_existing=True,
+                    )
+                continue
+            payload = _object(confirmation['payload_json'])
+            source_id = str(payload.get('source_dir_id') or '')
+            try:
+                owners = requests_for_download_confirmation(payload, strict=True, conn=connection)
+            except ValueError:
+                # 显式下载关联损坏、多个隔离 owner 或任务换绑均不能降级为普通来源。
+                continue
+            files = payload.get('files')
+            companions = payload.get('companions', [])
+            if ((owners and not _eligible(owners[0]))
+                    or (not owners and confirmation['status'] != 'pending')
+                    or not isinstance(files, list) or not files
+                    or not isinstance(companions, list)):
+                continue
+            companion_evidence = {}
+            companion_ids = [str(item.get('file_id') or '') for item in companions if isinstance(item, dict)]
+            if companion_ids:
+                # 伴随文件可能属于多个视频日志：整包只扫描一次明细，再走唯一键取快照。
+                marks = ','.join('?' for _ in companion_ids)
+                companion_evidence = {row['file_id']: row for row in connection.execute(
+                    "WITH latest AS (SELECT file_id,MAX(log_id) AS log_id FROM organize_log_items "
+                    f"WHERE file_id IN ({marks}) GROUP BY file_id) "
+                    "SELECT i.*,l.status AS log_status,l.operation_type,l.source_dir_id,l.legacy_incomplete,"
+                    "l.created_at AS log_created_at,l.operation_token AS log_operation_token,"
+                    "(SELECT MAX(id) FROM organize_log WHERE source='guangya' AND file_id=i.file_id) AS primary_log_id "
+                    "FROM latest JOIN organize_log_items i ON i.log_id=latest.log_id AND i.file_id=latest.file_id "
+                    "JOIN organize_log l ON l.id=i.log_id WHERE l.source='guangya'", companion_ids,
+                )}
+            log_ids: set[int] = set()
+            for index, item in enumerate([*files, *companions]):
+                if not isinstance(item, dict) or not item.get('file_id') or not item.get('parent_id'):
+                    break
+                if index < len(files):
+                    # 先用主日志 file_id 索引定位最新操作；缺明细也不能回退到旧成功。
+                    evidence = connection.execute(
+                        "SELECT i.*,l.status AS log_status,l.operation_type,l.source_dir_id,l.legacy_incomplete,"
+                        "l.created_at AS log_created_at,l.operation_token AS log_operation_token,"
+                        "l.id AS primary_log_id FROM organize_log l LEFT JOIN organize_log_items i "
+                        "ON i.log_id=l.id AND i.file_id=l.file_id "
+                        "WHERE l.source='guangya' AND l.file_id=? ORDER BY l.id DESC LIMIT 1", (str(item['file_id']),),
+                    ).fetchone()
+                else:
+                    evidence = companion_evidence.get(str(item['file_id']))
+                if (evidence is None or evidence['log_status'] != 'success'
+                        or evidence['legacy_incomplete'] or evidence['log_id'] is None
+                        or int(evidence['primary_log_id'] or 0) > int(evidence['log_id'])
+                        or evidence['operation_type'] not in ('organize', 'reorganize') or evidence['status'] != 'success'
+                        or (str(evidence['source_dir_id']) != source_id and (
+                            owners or str(evidence['source_dir_id']) != str(item['parent_id'])))
+                        or str(evidence['original_parent_id']) != str(item['parent_id'])
+                        or not evidence['target_parent_id']
+                        or evidence['current_parent_id'] != evidence['target_parent_id']
+                        or evidence['current_parent_id'] == evidence['original_parent_id']
+                        or evidence['current_name'] != evidence['target_name']
+                        or (item.get('size') is not None and item['size'] != evidence['size'])
+                        or (item.get('etag') and str(item['etag']).lower() != str(evidence['etag']).lower())):
+                    break
+                if (not owners and str(evidence['source_dir_id']) != source_id
+                        and list_staging_cleanup_requests(source_id=str(evidence['source_dir_id']), conn=connection)):
+                    # 目录刮削入口本身属于隔离下载时，不能借更大的旧扫描根绕过下载归属。
+                    break
+                # 新审计以创建时冻结的 ID 上界区分同秒先后；原地重整使用本次成功步骤。
+                upper_bound = payload.get('_organize_log_upper_bound')
+                new_log = (int(evidence['log_id']) > upper_bound if type(upper_bound) is int
+                           else str(evidence['log_created_at']) > confirmation['created_at'])
+                if new_log:
+                    if str(evidence['log_created_at']) < confirmation['created_at']:
+                        break
+                else:
+                    step = connection.execute(
+                        "SELECT finished_at FROM organize_operation_steps WHERE log_id=? AND operation_token=? "
+                        "AND file_id=? AND action='move_rename' AND status='success' "
+                        "AND to_parent_id=? AND to_name=? ORDER BY id DESC LIMIT 1",
+                        (evidence['log_id'], evidence['log_operation_token'], str(item['file_id']),
+                         evidence['current_parent_id'], evidence['current_name']),
+                    ).fetchone()
+                    if (evidence['operation_type'] != 'reorganize' or step is None
+                            or str(step['finished_at'] or '') <= confirmation['created_at']):
+                        break
+                log_ids.add(int(evidence['log_id']))
+            else:
+                # 同组字幕等伴随文件也必须落稳，不能只凭视频的成功记录释放目录。
+                placeholders = ','.join('?' for _ in log_ids)
+                unsafe = connection.execute(
+                    "SELECT 1 FROM organize_log_items WHERE log_id IN (" + placeholders + ") "
+                    "AND (status!='success' OR COALESCE(target_parent_id,'')='' "
+                    "OR COALESCE(current_parent_id,'')!=target_parent_id "
+                    "OR COALESCE(current_name,'')!=COALESCE(target_name,'')) LIMIT 1",
+                    tuple(log_ids),
+                ).fetchone()
+                if unsafe:
+                    continue
+                timestamp = db.now()
+                stats = {
+                    'moved': len(files), 'failed': 0, 'need_confirm': 0,
+                    'resolution': 'reorganized', 'organize_log_ids': sorted(log_ids),
+                    'previous_confirmation': {
+                        'status': confirmation['status'], 'error': confirmation['error'],
+                        'result': _object(confirmation['result_json']),
+                    },
+                }
+                connection.execute(
+                    "UPDATE organize_confirmations SET status='completed',result_json=?,error='',"
+                    "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+                    "THEN 'cancelled' ELSE review_status END,"
+                    "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+                    "THEN ? ELSE review_completed_at END,"
+                    "completed_at=?,updated_at=?,rollup_applied=0 WHERE id=? AND status=?",
+                    (json.dumps(stats, ensure_ascii=False), timestamp, timestamp, timestamp,
+                     int(confirmation['id']), confirmation['status']),
+                )
+                token = str(confirmation['token'])
+                enqueue_confirmation_cleanup(connection, token=token, timestamp=timestamp)
+                completed = connection.execute(
+                    'SELECT * FROM organize_confirmations WHERE id=?', (int(confirmation['id']),),
+                ).fetchone()
+                assert completed is not None  # 同一写事务内刚刚更新的确认必定存在。
+                enqueue_reorganized_confirmation_delivery(connection, completed, timestamp=timestamp)
+                resolved.append(token)
+    return resolved
 
 
 def list_related_organize_logs(log_id: int) -> list[sqlite3.Row]:
@@ -461,6 +639,7 @@ def next_unsettled_organize_task_run(after_id: int = 0) -> sqlite3.Row | None:
 
 def _recover_after_restart(conn, timestamp: str) -> None:
     """恢复整理确认、写审计与版本化运行结果；回执使用同一事务。"""
+    reconcile_reorganized_confirmations(conn=conn)
     settle_completed_confirmation_logs(conn)
     _recover_return_receipts_conn(conn, timestamp, limit=-1)
     for run in conn.execute(
