@@ -6,6 +6,8 @@ import asyncio
 import json
 import types
 import unittest
+
+from tests.support import IsolatedDatabaseTestCase
 import unittest.mock
 from dataclasses import replace
 from unittest.mock import AsyncMock, patch
@@ -175,8 +177,10 @@ class FakeLifecycle:
         return True
 
 
-class AgentKernelApiTests(unittest.TestCase):
+class AgentKernelApiTests(IsolatedDatabaseTestCase):
     def setUp(self):
+        # 会话列表会分配并读取“主要聊天”，需要真实 settings_kv。
+        super().setUp()
         app = FastAPI()
         app.include_router(agent_kernel_api.router)
         self.client = TestClient(app, raise_server_exceptions=False)

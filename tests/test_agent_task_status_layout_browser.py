@@ -28,20 +28,14 @@ class TaskStatusLayoutBrowserTests(AgentShellBrowserCase):
                 button = page.locator("#agentRestoreNew").bounding_box()
                 assert button is not None
                 self.assertLessEqual(button["y"] + button["height"], notice["y"] + notice["height"] + 0.5)
-                controls = page.locator(".agent-composer-header :is(a, button):visible")
-                self.assertEqual(controls.count(), 4)
+                # 空输入框不显示任何操作按钮；窄屏会话入口在顶栏且保持 44px 触控尺寸。
+                self.assertEqual(page.locator("#agentComposer :is(a, button):visible").count(), 0)
                 self.assertTrue(page.locator("#agentSend").is_hidden())
                 self.assertFalse(page.locator("#agentStopSession").is_visible())
-                boxes = []
-                for control in controls.all():
-                    box = control.bounding_box()
-                    assert box is not None
-                    boxes.append(box)
-                for box in boxes:
-                    self.assertGreaterEqual(box["width"], 44)
-                    self.assertGreaterEqual(box["height"], 44)
-                    self.assertAlmostEqual(box["y"], boxes[0]["y"], delta=0.5)
-                self.assertEqual(page.locator("#agentResumeLatestSession").get_attribute("aria-label"), "继续上次会话")
+                toggle = page.locator("#toggleAgentRail").bounding_box()
+                assert toggle is not None
+                self.assertGreaterEqual(toggle["width"], 44)
+                self.assertGreaterEqual(toggle["height"], 44)
                 page.locator("#agentPrompt").click(position={"x": 20, "y": 8})
                 self.assertEqual(page.evaluate("document.activeElement.id"), "agentPrompt")
                 self.assertEqual(page.locator(".agent-console").evaluate("n=>n.scrollLeft"), 0)
@@ -81,7 +75,7 @@ class TaskStatusLayoutBrowserTests(AgentShellBrowserCase):
                 assert bounds is not None
                 self.assertAlmostEqual(bounds["x"], before["x"], delta=0.5)
                 self.assertAlmostEqual(bounds["width"], before["width"], delta=0.5)
-                self.assertTrue(page.locator(".agent-composer-header").evaluate(
+                self.assertTrue(page.locator("#agentComposer").evaluate(
                     "n=>n.scrollWidth<=n.clientWidth"
                 ))
                 self.assertFalse(panel.evaluate("n=>n.open"))

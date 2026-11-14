@@ -138,7 +138,7 @@ class ConfirmationEditBrowserTests(unittest.TestCase):
         self.assertEqual(body['tool_name'], grant['tool_name'])
         self.assertEqual(body['max_actions'], 5)
         self.assertEqual(body['ttl_seconds'], 300)
-        self.assertEqual(page.locator('.agent-composer-header button, .agent-composer-header a').count(), 6)
+        self.assertEqual(page.locator('#agentComposer button, #agentComposer a').count(), 2)
         page.locator('[data-effect-cancel]').click()
         page.locator('.agent-cancelled').wait_for()
         self.assertTrue(bar.is_visible())
@@ -150,6 +150,7 @@ class ConfirmationEditBrowserTests(unittest.TestCase):
         page.close()
         page = self.page(extra={"sessionDetails": {support.SESSION_ID: {"messages": [{"role": "user", "content": "A"}], "pending_approval": approval(), "scoped_trust": grant}}})
         page.locator('.agent-scoped-trust-bar').filter(has_text='剩余 5 次').wait_for()
+        support.open_sessions(page)
         page.locator('#agentNewSession').click()
         self.assertFalse(page.locator('.agent-scoped-trust-bar').filter(has_text='剩余 5 次').is_visible())
 
@@ -202,12 +203,13 @@ class ConfirmationEditBrowserTests(unittest.TestCase):
         page.add_script_tag(content=self.source)
         page.locator('.agent-confirmation-card').wait_for()
         self.assertIn('收藏A', page.locator('#agentTranscript').inner_text())
-        page.locator('#toggleAgentRail').click()
+        support.open_sessions(page)
         self.assertEqual(page.locator('#agentHandoffPanel, [data-handoff-active]').count(), 0)
         self.assertEqual(page.get_by_text('TG 单会话续接', exact=True).count(), 0)
-        page.locator('[data-agent-history-close]').click()
+        support.close_sessions(page)
         for count, message in enumerate(('只读查询', '新的Web查询'), 1):
             if count == 2:
+                support.open_sessions(page)
                 page.locator('#agentNewSession').click()
             page.locator('#agentPrompt').fill(message)
             expect(page.locator('#agentSend')).to_be_enabled()

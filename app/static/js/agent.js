@@ -12,7 +12,7 @@
     const sendButton = document.getElementById('agentSend');
     const sessionStopButton = document.getElementById('agentStopSession');
     const newSessionButton = document.getElementById('agentNewSession');
-    const resumeButton = document.getElementById('agentResumeLatestSession');
+    const mainChatButton = document.getElementById('agentMainChat');
     const historyButton = document.getElementById('toggleAgentRail');
     const historyRail = document.getElementById('agentHistoryRail');
     const sessionList = document.getElementById('agentSessionList');
@@ -20,8 +20,6 @@
     const sessionStatus = document.getElementById('agentSessionStatus');
     const responseStatus = document.getElementById('agentResponseStatus');
     const nextActions = document.getElementById('agentStartActions');
-    const resumeSlot = document.getElementById('agentStartResume');
-    const composerActions = composer?.querySelector('.agent-composer-actions');
     const nextActionsStatus = document.getElementById('agentStartActionsStatus');
     const newRepliesButton = document.getElementById('agentNewReplies');
     const sessionSearch = document.getElementById('agentSessionSearch');
@@ -62,13 +60,17 @@
     };
 
     let draftScope = '';
+    // 页面打开时是否已有记住的会话；没有则启动后进入主要聊天。草稿保存会写入临时会话，不能事后判断。
+    const startupHadSession = Boolean(storedSessionId());
     let sessionId = storedSessionId() || createId('session');
     let sessionItems = [];
     let followOutput = true;
     let candidateExpiryTimer = null;
     const memoryDrafts = new Map();
     const sessionEdits = new Set();
-    let latestSessionId = '';
+    let mainSessionId = '';
+    // 宽屏常驻会话栏；窄屏收为抽屉。
+    const railDocked = window.matchMedia?.('(min-width: 901px)') || null;
     let activeRequest = null;
     let elapsedTimer = null;
     const receiptObservationWindows = new Map();
@@ -112,6 +114,7 @@
             localStorage.setItem(SESSION_KEY, value);
             if (draftScope) localStorage.setItem(`${SESSION_KEY}.${draftScope}`, value);
         } catch (_) { /* private mode */ }
+        syncMainChatButton();
     }
 
     function clipText(value, limit) {
@@ -317,12 +320,6 @@
         placeTaskSnapshot();
         if (!initialRestore) {
             try { localStorage.setItem(LAYOUT_KEY, JSON.stringify({session_id: sessionId, mode: empty ? 'empty' : 'conversation'})); } catch (_) { /* 可选布局提示。 */ }
-        }
-        const resumeParent = empty && resumeSlot ? resumeSlot : composerActions;
-        if (resumeButton && resumeParent && resumeButton.parentElement !== resumeParent) {
-            const wasFocused = document.activeElement === resumeButton;
-            resumeParent.append(resumeButton);
-            if (wasFocused && !resumeButton.disabled) resumeButton.focus({preventScroll: true});
         }
         if (promptInput) {
             promptInput.placeholder = empty
@@ -2210,7 +2207,6 @@
         sendButton?.setAttribute('aria-busy', String(busy));
         syncSend();
         syncCandidateButtons();
-        resumeButton && (resumeButton.disabled = busy || !latestSessionId);
     }
 
     function syncSend() {
@@ -2513,11 +2509,10 @@
         sessionItems = (Array.isArray(items) ? items : []).filter((item) => SESSION_RE.test(String(item?.session_id || ''))).slice(0, 100)
             .map((item) => ({...item, pinned: item.pinned === true}));
         if (!sessionList) return;
-        const newest = [...sessionItems].sort((a, b) => (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0));
-        latestSessionId = newest[0]?.session_id || '';
-        if (resumeButton) resumeButton.disabled = busy || !latestSessionId;
+        syncMainChatButton();
         const query = String(sessionSearch?.value || '').trim().normalize('NFKC').toLocaleLowerCase();
-        const sorted = [...sessionItems].sort((a, b) => Number(b.pinned) - Number(a.pinned) ||
+        // 主要聊天固定在列表上方，旁聊列表只列其余会话。
+        const sorted = sessionItems.filter(item => item.session_id !== mainSessionId).sort((a, b) => Number(b.pinned) - Number(a.pinned) ||
             (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0));
         const existing = new Map([...sessionList.querySelectorAll('.agent-session-item')].map(row => [row.dataset.sessionId, row]));
         const ids = new Set(sorted.map(item => item.session_id));
@@ -2570,7 +2565,7 @@
                 sessionList.append(empty);
                 renderIcons(empty);
             }
-            empty.querySelector('span').textContent = query ? '没有匹配的会话，试试其他标题' : '尚无已保存的对话';
+            empty.querySelector('span').textContent = query ? '没有匹配的旁聊，试试其他标题' : '尚无旁聊';
         } else empty?.remove();
         if (sessionCount) sessionCount.textContent = `${shown} 条`;
         sessionList.scrollTop = scrollTop;
@@ -2701,8 +2696,10 @@
             if (!Array.isArray(payload?.sessions)) throw new Error('会话列表响应无效');
             if (historyController !== controller) return;
             configureDraftScope(payload.draft_scope);
+            if (SESSION_RE.test(String(payload.main_session_id || ''))) mainSessionId = payload.main_session_id;
             renderSessionList(payload.sessions || []);
-            announce(sessionStatus, '会话列表已更新');
+            // 常驻会话栏的静默刷新不留可见提示，只在用户主动打开时播报。
+            if (!quiet) announce(sessionStatus, '会话列表已更新');
             return payload;
         } catch (error) {
             if (error?.name !== 'AbortError' && !quiet) announce(sessionStatus, '会话列表加载失败');
@@ -2842,7 +2839,6 @@
         if (!SESSION_RE.test(targetId)) return false;
         if (!startup) stopInitialRestore();
         const switching = targetId !== sessionId;
-        const restoreResumeFocus = switching && document.activeElement === resumeButton;
         const previousSessionId = sessionId;
         if (switching) {
             clearTaskSnapshot();
@@ -2911,7 +2907,6 @@
                 else if (recovered) scheduleActiveObservation(recovered);
                 else setBusy(false);
             }
-            if (restoreResumeFocus && resumeButton && !resumeButton.disabled) resumeButton.focus({preventScroll: true});
             if (closeHistory) closeHistoryRail();
             if (!startup) refreshSessions({quiet: true});
             return true;
@@ -2935,12 +2930,32 @@
             removeDraft(targetId);
             if (targetId === sessionId) {
                 promptInput.value = '';
-                startNewSession();
+                openMainChat();
             }
             await refreshSessions();
         } catch (error) {
             announce(sessionStatus, error?.message || '会话删除失败');
         }
+    }
+
+    function syncMainChatButton() {
+        if (!mainChatButton) return;
+        mainChatButton.disabled = !mainSessionId;
+        const active = Boolean(mainSessionId) && sessionId === mainSessionId;
+        mainChatButton.classList.toggle('is-active', active);
+        mainChatButton.setAttribute('aria-current', active ? 'page' : 'false');
+    }
+
+    function openMainChat() {
+        if (!mainSessionId) {
+            startNewSession();
+            return;
+        }
+        if (mainSessionId === sessionId) {
+            closeHistoryRail();
+            return;
+        }
+        loadSession(mainSessionId);
     }
 
     function startNewSession() {
@@ -2962,9 +2977,25 @@
         refreshSessions({quiet: true});
     }
 
+    function syncRailMode() {
+        if (!historyRail) return;
+        if (railDocked?.matches) {
+            if (historyRail.open && historyRail.matches(':modal')) historyRail.close();
+            if (!historyRail.open) {
+                if (typeof historyRail.show === 'function') historyRail.show();
+                else historyRail.setAttribute('open', '');
+            }
+        } else if (historyRail.open && !historyRail.matches(':modal')) {
+            historyRail.close();
+        }
+        historyButton?.setAttribute('aria-expanded', String(historyRail.open));
+    }
+
     function openHistoryRail() {
         if (!historyRail) return;
-        if (typeof historyRail.showModal === 'function') {
+        if (railDocked?.matches) {
+            syncRailMode();
+        } else if (typeof historyRail.showModal === 'function') {
             if (!historyRail.open) historyRail.showModal();
         } else {
             historyRail.setAttribute('open', '');
@@ -2976,7 +3007,7 @@
     }
 
     function closeHistoryRail() {
-        if (!historyRail) return;
+        if (!historyRail || railDocked?.matches) return;
         if (typeof historyRail.close === 'function' && historyRail.open) historyRail.close();
         else historyRail.removeAttribute('open');
         historyButton?.setAttribute('aria-expanded', 'false');
@@ -3289,6 +3320,8 @@
             const payload = await refreshSessions({quiet: true, signal: controller.signal});
             if (attempt !== startupAttempt || generation !== sessionLoadGeneration) return;
             if (!payload) throw new Error('会话列表暂不可用');
+            // 没有本标签页记住的会话时，默认进入主要聊天。
+            if (!startupHadSession && mainSessionId) rememberSession(mainSessionId);
             if (storedSessionId()) {
                 const loaded = await loadSession(sessionId, {closeHistory: false, startup: true, signal: controller.signal});
                 if (attempt !== startupAttempt) return;
@@ -3368,7 +3401,11 @@
     newSessionButton?.addEventListener('click', startNewSession);
     document.getElementById('agentRestoreRetry')?.addEventListener('click', restoreInitialSession);
     document.getElementById('agentRestoreNew')?.addEventListener('click', startNewSession);
-    resumeButton?.addEventListener('click', () => latestSessionId && loadSession(latestSessionId));
+    mainChatButton?.addEventListener('click', openMainChat);
+    // 常驻会话栏没有“打开”动作；回到页面时刷新列表，及时发现新旁聊或登录主体变化。
+    window.addEventListener('focus', () => { if (railDocked?.matches && !startupController) refreshSessions({quiet: true}); });
+    railDocked?.addEventListener?.('change', syncRailMode);
+    syncRailMode();
     historyButton?.addEventListener('click', openHistoryRail);
     historyRail?.addEventListener('cancel', (event) => {
         event.preventDefault();

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from app import config
+from app import database as db
 
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _TELEGRAM_OWNER_RE = re.compile(r"^tg:v1:(-?[1-9][0-9]*)\x1f([1-9][0-9]*)$")
 
 _TELEGRAM_CHAT_RE = re.compile(r"^-?[1-9][0-9]*$")
@@ -118,3 +121,31 @@ def telegram_owner_route_is_currently_authorized(
 ) -> bool:
     """按当前 Agent/TG 配置重新授权持久化 owner，撤权后立即失效。"""
     return telegram_owner_route_access(value, chat_id=chat_id) == "allowed"
+
+
+_MAIN_SESSION_KEY = "agent.web.main_session.v1:"
+
+
+def _main_session_key(owner: str) -> str:
+    return _MAIN_SESSION_KEY + hashlib.sha256(owner.encode("utf-8")).hexdigest()[:32]
+
+
+def current_web_main_session_id(owner: str) -> str:
+    """只读当前“主要聊天”会话；尚未分配时返回空串。"""
+    value = db.kv_get(_main_session_key(owner))
+    return value if SESSION_ID_RE.fullmatch(value) else ""
+
+
+def web_main_session_id(owner: str, sessions: list[dict[str, Any]]) -> str:
+    """固定的“主要聊天”：首次分配时沿用最近一次会话，没有会话则新建，之后不随新会话改变。"""
+    key = _main_session_key(owner)
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM settings_kv WHERE key=?", (key,)).fetchone()
+        if row is not None and SESSION_ID_RE.fullmatch(str(row["value"])):
+            return str(row["value"])
+        candidates = [item for item in sessions if SESSION_ID_RE.fullmatch(str(item.get("session_id") or ""))]
+        newest = max(candidates, key=lambda item: float(item.get("updated_at") or 0), default=None)
+        value = str(newest["session_id"]) if newest else f"session_{secrets.token_hex(12)}"
+        db.kv_set_conn(conn, key, value)
+        return value

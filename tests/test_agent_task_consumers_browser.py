@@ -6,6 +6,7 @@ from pathlib import Path
 
 from tests.test_agent_task_consumers import native_snapshots
 from tests.test_agent_ux_shell_browser import AgentShellBrowserCase
+from tests import test_agent_kernel_browser as rail_support
 
 
 class TaskConsumerBrowserTests(AgentShellBrowserCase):
@@ -113,6 +114,7 @@ class TaskConsumerBrowserTests(AgentShellBrowserCase):
                     self.assertTrue(page.evaluate("""() => window.__taskNode === document.querySelector('#agentTaskSnapshot')
                         && window.__taskNode.nextElementSibling === document.querySelector('#agentComposer')"""))
                     self.assertTrue(panel.is_visible())
+                rail_support.open_sessions(page)
                 page.locator("#agentNewSession").click()
                 self.assertEqual(panel.count(), 0)
                 self.assertTrue(page.evaluate("!window.__taskNode?.isConnected"))
@@ -246,7 +248,7 @@ class TaskConsumerBrowserTests(AgentShellBrowserCase):
                 return result;};}""",
                 a,
             )
-            page.locator("#toggleAgentRail").click()
+            rail_support.open_sessions(page)
             page.locator(f'[data-session-open="{a}"]').click()
             page.wait_for_function("window.__held===true")
             self.assertEqual(page.locator("#agentTaskSnapshot").count(), 0)
@@ -309,7 +311,7 @@ class TaskConsumerBrowserTests(AgentShellBrowserCase):
                 self.assertNotIn("DO NOT DISPLAY", text_content)
             self.assertIn("部分完成", page.locator("#agentTranscript").inner_text())
         page.evaluate("window.__kernelConfig.sessions.draft_scope='b'.repeat(64)")
-        page.locator("#toggleAgentRail").click()
+        rail_support.open_sessions(page)
         page.wait_for_function('document.querySelector("#agentTaskSnapshot")===null')
         self.assertEqual(errors, [])
         self.assertEqual(unexpected, [])

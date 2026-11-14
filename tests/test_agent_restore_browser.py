@@ -387,7 +387,7 @@ class AgentRestoreBrowserTests(shell_support.AgentShellBrowserCase):
     def test_opening_history_observes_startup_request_instead_of_cancelling_it(self):
         page, _, errors, unexpected = self.restore_page(delay=600)
         page.wait_for_function("window.__restoreRequests.includes('/api/agent/sessions')")
-        page.locator('#toggleAgentRail').click()
+        browser_support.open_sessions(page)
         page.wait_for_function("document.querySelector('#agentTranscript').textContent.includes('历史回复')")
         page.keyboard.press('Escape')
         page.locator('#agentPrompt').fill('抽屉关闭后可以继续发送')
@@ -404,7 +404,7 @@ class AgentRestoreBrowserTests(shell_support.AgentShellBrowserCase):
         page.wait_for_function("document.querySelector('#agentTranscript').textContent.includes('历史回复')")
         other_scope = 'c' * 64
         page.evaluate("scope => {window.__kernelConfig.sessions={draft_scope:scope,sessions:[]};window.__kernelConfig.sessionDetails={};}", other_scope)
-        page.locator('#toggleAgentRail').click()
+        browser_support.open_sessions(page)
         page.wait_for_function("document.querySelector('#agentSessionCount').textContent === '0 条'")
         new_id = page.evaluate(f"localStorage.getItem('{SESSION_KEY}')")
         self.assertNotEqual(new_id, SESSION)

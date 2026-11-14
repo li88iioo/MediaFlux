@@ -114,15 +114,12 @@ class AgentUXShellBrowserTests(AgentShellBrowserCase):
                     self.assertLessEqual(abs(before['y'] - after['y']), 0.5)
                     self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), viewport['width'])
                     self.assertEqual(page.locator('#agentResponseStatus').evaluate('(node) => getComputedStyle(node).position'), 'absolute')
-                    if history:
-                        resume = page.locator('#agentResumeLatestSession').bounding_box()
-                        assert resume is not None
-                        status = page.locator('#agentStartActionsStatus').bounding_box()
-                        assert status is not None
-                        self.assertLessEqual(resume['y'] + resume['height'] + 4, status['y'])
-                    page.locator('#toggleAgentRail').click()
-                    self.assertEqual(page.locator('#agent-session-heading').inner_text(), '历史会话')
-                    self.assertTrue(page.locator('#agent-session-heading').evaluate('(node) => document.activeElement === node'))
+                    drawer = page.locator('#toggleAgentRail').is_visible()
+                    browser_support.open_sessions(page)
+                    self.assertEqual(page.locator('#agent-session-heading').inner_text(), '会话')
+                    self.assertTrue(page.locator('#agentMainChat').is_visible())
+                    if drawer:
+                        self.assertTrue(page.locator('#agent-session-heading').evaluate('(node) => document.activeElement === node'))
                     self.assertEqual(page.locator('#agentSessionCount').inner_text(), f'{1 if history else 0} 条')
                     self.assertEqual(unexpected, [])
                     self.assertEqual(errors, [])
@@ -156,7 +153,8 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
                 });
             };
         }""", snapshot or {})
-        page.locator('#agentResumeLatestSession').click()
+        browser_support.open_sessions(page)
+        page.locator('[data-session-open="session_shell_0000000001"]').click()
         page.locator('.agent-message-assistant').first.wait_for()
         page.evaluate('async () => { await document.fonts.ready; }')
         self.assertEqual(page.locator('#agentStopSession').count(), 1)
@@ -171,7 +169,7 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
                 send = page.locator('#agentSend')
                 self.assertTrue(stop.is_visible())
                 self.assertTrue(send.is_hidden())
-                self.assertEqual(page.locator('.agent-composer-actions-right > button').count(), 2)
+                self.assertEqual(page.locator('.agent-submit-slot > button').count(), 2)
                 self.assertEqual(stop.locator('..').get_attribute('class'), 'agent-submit-slot')
                 self.assertEqual(stop.locator('svg').get_attribute('data-lucide'), 'square')
                 expected_color = stop.evaluate("node => { const probe = document.createElement('span'); probe.style.color = 'var(--danger)'; node.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color; }")

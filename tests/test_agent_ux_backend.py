@@ -1180,3 +1180,27 @@ def test_explicit_sdk_query_contract_survives_empty_results_and_json_reload(tmp_
             assert len(result["items"]) == 1
             assert result["items"][0]["technical_evidence"]["dynamic_range"] == "SDR"
     assert len(service.search_calls) == 5  # 本地过滤不重新搜索。
+
+
+def test_main_chat_adopts_latest_session_stays_fixed_and_cannot_be_deleted(api):
+    _login(api)
+    first = api.client.get("/api/agent/sessions").json()["main_session_id"]
+    assert agent_api.SESSION_ID_RE.fullmatch(first)
+    assert api.client.get("/api/agent/sessions").json()["main_session_id"] == first
+
+    api.principal["username"] = "ux-account-main"
+    owner = _web_owner(api)
+    older, latest, side = "session_main_older_01", "session_main_latest_1", "session_main_side_001"
+    asyncio.run(_seed(api.store, owner=owner, session_id=older))
+    time.sleep(1.1)
+    asyncio.run(_seed(api.store, owner=owner, session_id=latest))
+    assert api.client.get("/api/agent/sessions").json()["main_session_id"] == latest
+    time.sleep(1.1)
+    asyncio.run(_seed(api.store, owner=owner, session_id=side))
+    payload = api.client.get("/api/agent/sessions").json()
+    assert payload["main_session_id"] == latest
+    assert payload["sessions"][0]["session_id"] == side
+
+    response = api.client.delete(f"/api/agent/sessions/{latest}", headers=CSRF)
+    assert response.status_code == 409 and "主要聊天" in response.text
+    assert latest in {item["session_id"] for item in api.client.get("/api/agent/sessions").json()["sessions"]}

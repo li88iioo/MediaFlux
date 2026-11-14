@@ -28,7 +28,7 @@ from app.agent.kernel.state_types import SelectionInvalidError, SessionBusyError
 from app.agent.kernel.task_state import task_projection
 from app.agent.kernel.turn_display import active_turn_view, last_turn_view
 from app.agent.kernel.ux_display import next_actions_view, session_display_patch
-from app.agent.owner_routes import web_kernel_owner
+from app.agent.owner_routes import SESSION_ID_RE, current_web_main_session_id, web_kernel_owner, web_main_session_id
 from app.agent.public_view import public_active_turn_events, public_activities, public_conversation_messages
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.transports import (
@@ -44,7 +44,6 @@ from app.web import api_error, api_response, require_api_login
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
-_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _REQUEST_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,160}$")
 
 
@@ -59,7 +58,7 @@ def _require_enabled() -> None:
 
 def _session_id(value: Any) -> str:
     normalized = str(value or "").strip()
-    if not _SESSION_RE.fullmatch(normalized):
+    if not SESSION_ID_RE.fullmatch(normalized):
         raise TransportInputError("session_id 无效")
     return normalized
 
@@ -425,9 +424,10 @@ async def list_sessions(request: Request):
         draft_scope = _draft_scope(owner)
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
         sessions = await runtime.store.list_sessions(owner=owner)
+        main_session_id = await run_in_threadpool(web_main_session_id, owner, sessions)
         response = api_response({
             "sessions": sessions, "draft_scope": draft_scope,
-            "scope": "recent_sessions",
+            "scope": "recent_sessions", "main_session_id": main_session_id,
         })
         response.headers["Cache-Control"] = "private, no-store"
         return response
@@ -555,6 +555,8 @@ async def delete_session(request: Request, session_id: str):
     try:
         owner = _owner()
         normalized = _session_id(session_id)
+        if normalized == await run_in_threadpool(current_web_main_session_id, owner):
+            return api_error("主要聊天不能删除", 409)
         runtime = await run_in_threadpool(get_agent_kernel_runtime)
         deleted = await runtime.lifecycle.delete(owner=owner, session_id=normalized)
         return api_response({"deleted": deleted, "session_id": normalized})

@@ -62,6 +62,7 @@ HTML = """
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body class="agent-page-body">
   <div class="app-shell"><main class="main"><div class="content">
+    <div class="agent-mobile-bar"><span>Media Agent</span><button type="button" class="icon-btn agent-sessions-toggle" id="toggleAgentRail" aria-label="会话" aria-expanded="false" aria-controls="agentHistoryRail">会话</button></div>
     <section class="agent-page" aria-label="Media Agent 工作台">
       <div class="agent-workbench">
         <section class="agent-console is-empty" aria-label="Agent 对话工作区">
@@ -72,34 +73,25 @@ HTML = """
             <div class="agent-composer-input-wrap">
               <textarea id="agentPrompt" rows="1" maxlength="1000" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea>
             </div>
-            <div class="agent-composer-header">
-              <div class="agent-composer-actions">
-                <a class="agent-action-btn" id="agentSettings" href="#settings" aria-label="Agent 设置"><svg aria-hidden="true"></svg></a>
-                <button type="button" class="agent-action-btn agent-resume-session" id="agentResumeLatestSession" disabled><span>继续上次</span></button>
-              </div>
-              <div class="agent-composer-actions-right">
-                <button type="button" class="agent-action-btn" id="toggleAgentRail" aria-expanded="false">历史</button>
-                <button type="button" class="agent-action-btn" id="agentNewSession">新会话</button>
-                <span class="agent-submit-slot">
-                  <button type="submit" class="agent-send" id="agentSend" disabled>发送</button>
-                  <button type="button" class="agent-send agent-stop" id="agentStopSession" aria-label="停止任务" aria-busy="false" hidden disabled>停止</button>
-                </span>
-              </div>
-            </div>
+            <span class="agent-submit-slot">
+              <button type="submit" class="agent-send" id="agentSend" hidden disabled>发送</button>
+              <button type="button" class="agent-send agent-stop" id="agentStopSession" aria-label="停止任务" aria-busy="false" hidden disabled>停止</button>
+            </span>
           </form>
-          <section class="agent-start-panel"><div class="agent-start-resume" id="agentStartResume"></div><p class="agent-start-status" id="agentStartActionsStatus" role="status">正在读取本地待办…</p><div class="agent-start-actions" id="agentStartActions" aria-busy="true"></div></section>
+          <section class="agent-start-panel"><p class="agent-start-status" id="agentStartActionsStatus" role="status">正在读取本地待办…</p><div class="agent-start-actions" id="agentStartActions" aria-busy="true"></div></section>
         </section>
         <dialog class="agent-rail agent-history-drawer" id="agentHistoryRail">
           <section class="agent-rail-section agent-session-panel">
+            <h2 class="sr-only" id="agent-session-heading" tabindex="-1">会话</h2>
             <div class="agent-session-heading">
-              <div class="agent-session-title"><h3 id="agent-session-heading" tabindex="-1">历史会话</h3><span class="agent-session-count" id="agentSessionCount">0 条</span></div>
-              <div class="agent-session-heading-actions">
-                <button type="button" class="agent-history-close" data-agent-history-close>关闭</button>
-              </div>
+              <label class="agent-session-search"><input id="agentSessionSearch" type="search" maxlength="80" placeholder="搜索"></label>
+              <button type="button" class="agent-history-close" data-agent-history-close>关闭</button>
             </div>
-            <label class="agent-session-search"><input id="agentSessionSearch" type="search" maxlength="80" placeholder="筛选会话标题"></label>
+            <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><span>主要聊天</span></button>
+            <div class="agent-session-group"><span class="agent-session-group-title">旁聊</span><span class="agent-session-count" id="agentSessionCount">0 条</span><button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊">新建旁聊</button></div>
             <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
             <p class="agent-history-feedback" id="agentSessionStatus" role="status"></p>
+            <a class="agent-session-settings" href="#settings">Agent 设置</a>
           </section>
         </dialog>
         <p class="sr-only" id="agentResponseStatus" role="status"></p>
@@ -108,6 +100,30 @@ HTML = """
   </div></main></div>
 </body></html>
 """
+
+
+def open_sessions(page) -> None:
+    """窄屏从顶栏打开会话抽屉；宽屏会话栏常驻，无需点击。"""
+    toggle = page.locator("#toggleAgentRail")
+    if toggle.is_visible():
+        toggle.click()
+    else:
+        page.evaluate("() => window.dispatchEvent(new Event('focus'))")
+    page.locator("#agentHistoryRail").wait_for(state="visible")
+
+
+def close_sessions(page) -> None:
+    """窄屏关闭会话抽屉；宽屏会话栏常驻，没有关闭按钮。"""
+    close = page.locator("[data-agent-history-close]")
+    if close.is_visible():
+        close.click()
+
+
+def wait_rail_settled(page) -> None:
+    """抽屉已关闭，或宽屏会话栏保持常驻。"""
+    page.wait_for_function(
+        "() => { const rail = document.querySelector('#agentHistoryRail'); return !rail.open || !rail.matches(':modal'); }"
+    )
 
 
 MOCK_FETCH = r"""
@@ -1560,16 +1576,12 @@ Season 1 / S01E01
             promptPaddingTop: parseFloat(promptStyle.paddingTop),
             promptPaddingBottom: parseFloat(promptStyle.paddingBottom),
             promptCenter: centerY('#agentPrompt'),
-            settingsCenter: centerY('#agentSettings'),
             sendCenter: centerY('#agentSend'),
           };
         }""")
         self.assertEqual(layout["promptDisplay"], "block")
         self.assertEqual(layout["promptPaddingTop"], 9)
         self.assertEqual(layout["promptPaddingBottom"], 7)
-        self.assertAlmostEqual(
-            layout["promptCenter"], layout["settingsCenter"], delta=0.5
-        )
         self.assertAlmostEqual(layout["promptCenter"], layout["sendCenter"], delta=0.5)
 
     def test_mobile_composer_stays_inside_viewport_and_stop_has_stable_slot(

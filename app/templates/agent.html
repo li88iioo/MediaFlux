@@ -6,6 +6,7 @@
 <div class="agent-mobile-bar">
     <button class="icon-btn workspace-menu-btn" id="toggleSidebar" aria-label="菜单" title="打开导航"><i data-lucide="menu"></i></button>
     <span><i data-lucide="bot"></i>Media Agent</span>
+    <button type="button" class="icon-btn agent-sessions-toggle" id="toggleAgentRail" aria-label="会话" title="会话" aria-expanded="false" aria-controls="agentHistoryRail"><i data-lucide="panel-left"></i></button>
     {{ theme_toggle('agent-mobile') }}
 </div>
 {% endblock %}
@@ -39,23 +40,12 @@
                     <label class="sr-only" for="agentPrompt">输入要交给 Agent 的任务</label>
                     <textarea id="agentPrompt" aria-describedby="agentDraftHelp" rows="1" maxlength="1000" placeholder="询问 MediaFlux" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务" autocomplete="off"></textarea>
                 </div>
-                <div class="agent-composer-header">
-                    <div class="agent-composer-actions">
-                        <a class="agent-action-btn" href="{{ url_for('pages.settings') }}#agent" aria-label="Agent 设置" title="Agent 设置"><i data-lucide="sliders-horizontal"></i></a>
-                        <button type="button" class="agent-action-btn agent-resume-session" id="agentResumeLatestSession" aria-label="继续上次会话" title="继续上次会话" disabled><i data-lucide="message-square-reply"></i><span>继续上次</span></button>
-                    </div>
-                    <div class="agent-composer-actions-right">
-                        <button type="button" class="agent-action-btn" id="toggleAgentRail" aria-label="历史会话" title="历史会话" aria-expanded="false" aria-controls="agentHistoryRail"><i data-lucide="history"></i></button>
-                        <button type="button" class="agent-action-btn" id="agentNewSession" aria-label="新会话" title="新会话"><i data-lucide="plus"></i></button>
-                        <span class="agent-submit-slot">
-                            <button type="submit" class="agent-send" id="agentSend" aria-label="发送" title="发送 (Enter)" disabled><i data-lucide="arrow-up"></i></button>
-                            <button type="button" class="agent-send agent-stop" id="agentStopSession" aria-label="停止任务" aria-describedby="agentSessionStopHelp" aria-busy="false" title="停止任务" hidden disabled><i data-lucide="square"></i></button>
-                        </span>
-                    </div>
-                </div>
+                <span class="agent-submit-slot">
+                    <button type="submit" class="agent-send" id="agentSend" aria-label="发送" title="发送 (Enter)" hidden disabled><i data-lucide="arrow-up"></i></button>
+                    <button type="button" class="agent-send agent-stop" id="agentStopSession" aria-label="停止任务" aria-describedby="agentSessionStopHelp" aria-busy="false" title="停止任务" hidden disabled><i data-lucide="square"></i></button>
+                </span>
             </form>
             <section class="agent-start-panel" aria-label="可以从这里开始">
-                <div class="agent-start-resume" id="agentStartResume"></div>
                 <p class="agent-start-status" id="agentStartActionsStatus" role="status">正在读取本地待办…</p>
                 <div class="agent-start-actions" id="agentStartActions" aria-busy="true"></div>
             </section>
@@ -63,15 +53,20 @@
 
         <dialog class="agent-rail agent-history-drawer" id="agentHistoryRail" aria-labelledby="agent-session-heading">
             <section class="agent-rail-section agent-session-panel">
+                <h2 class="sr-only" id="agent-session-heading" tabindex="-1">会话</h2>
                 <div class="agent-session-heading">
-                    <div class="agent-session-title"><h3 id="agent-session-heading" tabindex="-1">历史会话</h3><span class="agent-session-count" id="agentSessionCount">0 条</span></div>
-                    <div class="agent-session-heading-actions">
-                        <button type="button" class="agent-history-close" data-agent-history-close aria-label="关闭历史会话" title="关闭历史会话"><i data-lucide="x"></i></button>
-                    </div>
+                    <label class="agent-session-search"><i data-lucide="search"></i><span class="sr-only">筛选会话标题</span><input id="agentSessionSearch" type="search" maxlength="80" placeholder="搜索" autocomplete="off"></label>
+                    <button type="button" class="agent-history-close" data-agent-history-close aria-label="关闭会话栏" title="关闭会话栏"><i data-lucide="x"></i></button>
                 </div>
-                <label class="agent-session-search"><i data-lucide="search"></i><span class="sr-only">筛选最近会话标题</span><input id="agentSessionSearch" type="search" maxlength="80" placeholder="筛选会话标题" autocomplete="off"></label>
-                <div class="agent-session-list" id="agentSessionList" aria-live="polite" aria-busy="true"><div class="agent-session-empty"><i data-lucide="message-circle-dashed"></i><span>尚无已保存的查询摘要</span></div></div>
+                <button type="button" class="agent-main-chat" id="agentMainChat" aria-current="false"><i data-lucide="message-circle"></i><span>主要聊天</span></button>
+                <div class="agent-session-group">
+                    <span class="agent-session-group-title">旁聊</span>
+                    <span class="agent-session-count" id="agentSessionCount">0 条</span>
+                    <button type="button" class="agent-session-new" id="agentNewSession" aria-label="新建旁聊" title="新建旁聊"><i data-lucide="plus"></i></button>
+                </div>
+                <div class="agent-session-list" id="agentSessionList" aria-live="polite" aria-busy="true"><div class="agent-session-empty"><i data-lucide="message-circle-dashed"></i><span>尚无旁聊</span></div></div>
                 <p class="agent-history-feedback" id="agentSessionStatus" role="status" aria-live="polite"></p>
+                <a class="agent-session-settings" href="{{ url_for('pages.settings') }}#agent"><i data-lucide="sliders-horizontal"></i><span>Agent 设置</span></a>
             </section>
         </dialog>
         <p class="sr-only" id="agentResponseStatus" role="status" aria-live="polite" aria-atomic="true"></p>

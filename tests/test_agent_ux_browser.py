@@ -208,32 +208,29 @@ class AgentUXBrowserTests(unittest.TestCase):
                 self.assertTrue(all(height >= 44 for height in targets))
                 self.snapshot(page, f'start-{viewport["width"]}')
 
-    def test_empty_resume_has_its_own_slot_and_history_focus_matches_rounded_style(self):
+    def test_empty_start_centers_composer_and_session_rail_keeps_rounded_style(self):
         for viewport in ({'width': 1280, 'height': 800}, {'width': 390, 'height': 844}, {'width': 390, 'height': 430}):
             with self.subTest(viewport=viewport):
                 page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': [
                     {'session_id': SESSION_A, 'title': '媒体库排障', 'updated_at': 20, 'message_count': 16},
                 ]}, 'sessionDetails': {SESSION_A: {'messages': []}}}, viewport=viewport)
-                resume = page.locator('#agentStartResume #agentResumeLatestSession')
-                page.wait_for_function("() => !document.querySelector('#agentResumeLatestSession').disabled")
-                resume_box = resume.bounding_box()
                 status_box = page.locator('#agentStartActionsStatus').bounding_box()
                 composer_box = page.locator('#agentComposer').bounding_box()
-                assert (resume_box) is not None
                 console = page.locator('.agent-workbench').bounding_box()
                 assert composer_box is not None
                 assert console is not None
                 self.assertLessEqual(abs(composer_box['y'] + composer_box['height'] / 2 - console['y'] - console['height'] / 2), 0.5)
-                self.assertGreaterEqual(resume_box['y'], composer_box['y'] + composer_box['height'])
                 assert status_box is not None
-                self.assertLessEqual(resume_box['y'] + resume_box['height'] + 4, status_box['y'])
+                self.assertGreaterEqual(status_box['y'], composer_box['y'] + composer_box['height'])
                 self.assertLessEqual(composer_box['y'] + composer_box['height'], viewport['height'])
                 self.snapshot(page, f'feedback-empty-with-history-{viewport["width"]}-{viewport["height"]}')
-                page.locator('#toggleAgentRail').click()
+                drawer = page.locator('#toggleAgentRail').is_visible()
+                harness.open_sessions(page)
                 self.assertEqual(page.locator('#agentSessionCount').inner_text(), '1 条')
-                self.assertEqual(page.locator('#agent-session-heading').inner_text(), '历史会话')
+                self.assertEqual(page.locator('#agent-session-heading').inner_text(), '会话')
                 self.assertEqual(page.locator('.agent-history-drawer .agent-kicker').count(), 0)
-                self.assertTrue(page.locator('#agent-session-heading').evaluate('(node) => document.activeElement === node'))
+                if drawer:
+                    self.assertTrue(page.locator('#agent-session-heading').evaluate('(node) => document.activeElement === node'))
                 count = page.locator('#agentSessionCount').evaluate("node => {const style = getComputedStyle(node); return {border: style.borderTopWidth, background: style.backgroundColor, font: style.fontFamily};}")
                 self.assertEqual(count['border'], '0px')
                 self.assertEqual(count['background'], 'rgba(0, 0, 0, 0)')
@@ -299,7 +296,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         page = self.page()
         page.locator('#agentPrompt').fill('旧主体的草稿')
         page.evaluate("() => {window.__kernelConfig.sessions.draft_scope = 'b'.repeat(64);}")
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.wait_for_function("() => document.querySelector('#agentPrompt').value === ''")
         stored = page.evaluate("() => sessionStorage.getItem('mediaflux.agent.drafts.v1.' + 'b'.repeat(64))")
         self.assertNotIn('旧主体的草稿', stored or '')
@@ -309,7 +306,7 @@ class AgentUXBrowserTests(unittest.TestCase):
             {'session_id': SESSION_A, 'title': '准备改名', 'updated_at': 20},
             {'session_id': SESSION_B, 'title': '其他会话', 'updated_at': 10},
         ]}})
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator(f'[data-session-rename="{SESSION_A}"]').click()
         editor = page.locator('.agent-session-editor input')
         editor.fill('还没有保存的新名称')
@@ -336,18 +333,20 @@ class AgentUXBrowserTests(unittest.TestCase):
         page = self.page(config, stored_session=SESSION_A)
         page.wait_for_function("id => window.__kernelCalls.some(call => call.url.endsWith(id))", arg=SESSION_A)
         page.locator('#agentPrompt').fill('A 的草稿')
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator(f'[data-session-open="{SESSION_B}"]').click()
-        page.wait_for_function("() => !document.querySelector('#agentHistoryRail').open")
+        harness.wait_rail_settled(page)
         self.assertEqual(page.locator('#agentPrompt').input_value(), '')
         page.locator('#agentPrompt').fill('B 的草稿')
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator(f'[data-session-open="{SESSION_A}"]').click()
-        page.wait_for_function("() => !document.querySelector('#agentHistoryRail').open")
+        harness.wait_rail_settled(page)
         self.assertEqual(page.locator('#agentPrompt').input_value(), 'A 的草稿')
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator(f'[data-session-delete="{SESSION_A}"]').click()
-        page.wait_for_function("() => !document.querySelector('#agentHistoryRail').open")
+        harness.wait_rail_settled(page)
+        # 删除当前会话后切离该会话；宽屏会话栏不关闭，需等切换完成。
+        page.wait_for_function("id => localStorage.getItem('mediaflux.agent.kernel.session.v1') !== id", arg=SESSION_A)
         drafts = page.evaluate("scope => JSON.parse(sessionStorage.getItem('mediaflux.agent.drafts.v1.' + scope))", SCOPE)
         self.assertNotIn(SESSION_A, drafts)
         self.assertEqual(drafts[SESSION_B]['text'], 'B 的草稿')
@@ -386,7 +385,7 @@ class AgentUXBrowserTests(unittest.TestCase):
             {'session_id': SESSION_B, 'title': '最近选片', 'updated_at': 20, 'pinned': False},
         ]}})
         page.locator('#agentPrompt').fill('正在编辑的草稿')
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator('#agentSessionSearch').fill('排障')
         self.assertEqual(page.locator('.agent-session-item:visible').count(), 1)
         page.locator(f'[data-session-rename="{SESSION_A}"]').click()
@@ -407,7 +406,7 @@ class AgentUXBrowserTests(unittest.TestCase):
 
     def test_history_update_failure_keeps_editor_and_reports_error(self):
         page = self.page({'patchStatus': 409, 'sessions': {'sessions': [{'session_id': SESSION_A, 'title': '原会话'}]}})
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator('[data-session-rename]').click()
         page.locator('.agent-session-editor input').fill('新名称')
         page.keyboard.press('Enter')
@@ -801,7 +800,7 @@ class AgentUXBrowserTests(unittest.TestCase):
             },
         }, stored_session=SESSION_A)
         page.get_by_text('A 等待回执', exact=True).wait_for()
-        page.locator('#toggleAgentRail').click()
+        harness.open_sessions(page)
         page.locator(f'[data-session-open="{SESSION_B}"]').click()
         page.get_by_text('B 会话内容', exact=True).wait_for()
         page.wait_for_timeout(5300)
@@ -962,17 +961,27 @@ class AgentUXBrowserTests(unittest.TestCase):
                 self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
                 self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
 
-    def test_resume_nonempty_history_preserves_focused_resume_control(self):
-        page = self.page({'sessions': {'sessions': [{'session_id': SESSION_A, 'title': '已保存的历史'}]},
+    def test_main_chat_opens_by_default_and_side_chats_exclude_it(self):
+        page = self.page({'sessions': {'main_session_id': SESSION_A, 'sessions': [
+                              {'session_id': SESSION_A, 'title': '已保存的历史', 'updated_at': 10},
+                              {'session_id': SESSION_B, 'title': '另一条旁聊', 'updated_at': 20},
+                          ]},
                           'sessionDetails': {SESSION_A: {'messages': [{
                               'role': 'assistant', 'content': '之前已经完成的排障记录。',
                               'tools': ['agent.run_code', 'cloud.list'],
                               'tool_labels': ['工作区代码执行', '光鸭文件查询'],
-                          }]}}})
-        page.locator('#agentResumeLatestSession').click()
+                          }]}, SESSION_B: {'messages': [{'role': 'assistant', 'content': '旁聊内容。'}]}}})
         page.wait_for_selector('.agent-narrative')
-        self.assertTrue(page.locator('#agentResumeLatestSession').evaluate('(node) => document.activeElement === node'))
-        self.assertTrue(page.locator('#agentComposer #agentResumeLatestSession').is_visible())
+        self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'page')
+        self.assertEqual(page.locator(f'[data-session-open="{SESSION_A}"]').count(), 0)
+        self.assertEqual(page.locator(f'[data-session-delete="{SESSION_A}"]').count(), 0)
+        self.assertEqual(page.locator('#agentSessionCount').inner_text(), '1 条')
+        page.locator(f'[data-session-open="{SESSION_B}"]').click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('旁聊内容')")
+        self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'false')
+        page.locator('#agentMainChat').click()
+        page.wait_for_function("() => document.querySelector('#agentTranscript').textContent.includes('之前已经完成的排障记录')")
+        self.assertEqual(page.locator('#agentMainChat').get_attribute('aria-current'), 'page')
         self.assertEqual(page.locator('.agent-narrative').inner_text(), '之前已经完成的排障记录。')
         self.assertEqual(page.locator('time.agent-stream-elapsed').count(), 0)
         for tool in ('agent.run_code', 'cloud.list', '工作区代码执行', '光鸭文件查询'):
