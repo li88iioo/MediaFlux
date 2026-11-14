@@ -81,18 +81,27 @@ def _candidate_label(candidate: dict) -> str:
 
 
 def _suggestion_preview(items: list[dict], chat_id: str) -> dict | None:
+    """只预览传入项的建议；单组核验失败时剔除该组，不连累其余建议。"""
     from app.modules.organize_confirmation_batches import preview_choices
 
-    entries = []
+    entries, skipped = [], []
     for item in items:
         suggestion = item.get("suggestion")
         if item.get("status") != "pending" or not isinstance(suggestion, dict):
             continue
         index = suggestion.get("candidate_index")
-        if _candidate(item, index) is not None:
-            entries.append({"confirmation_id": item["confirmation_id"], "candidate_index": index})
+        if _candidate(item, index) is None:
+            continue
+        entry = {"confirmation_id": item["confirmation_id"], "candidate_index": index}
+        try:
+            preview_choices([entry], chat_id=chat_id)
+        except ValueError as exc:
+            skipped.append((item, str(exc)))
+            continue
+        entries.append(entry)
     if not entries:
-        return None
+        return {"entries": [], "digest": "", "items": [], "mapping_items": [], "scope_digest": "",
+                "skipped": skipped} if skipped else None
     preview = preview_choices(entries, chat_id=chat_id)
     scope_digest = preview["digest"]
     mapped = [item for item in preview["items"] if item.get("episode_mappings")]
@@ -100,7 +109,16 @@ def _suggestion_preview(items: list[dict], chat_id: str) -> dict | None:
         mapped_tokens = {item["confirmation_id"] for item in mapped}
         ordinary = [entry for entry in preview["entries"] if entry["confirmation_id"] not in mapped_tokens]
         preview = preview_choices(ordinary, chat_id=chat_id) if ordinary else {"entries": [], "digest": "", "items": []}
-    return {**preview, "mapping_items": mapped, "scope_digest": scope_digest}
+    return {**preview, "mapping_items": mapped, "scope_digest": scope_digest, "skipped": skipped}
+
+
+def _skipped_notice(item: dict, error: str) -> str:
+    identity = truncate_telegram_text(item.get("identity") or item.get("directory") or "待确认媒体", 60)
+    return f"{identity} 暂不可批量确认：{truncate_telegram_text(error, 120)}"
+
+
+def _page_items(items: list[dict], page: int) -> list[dict]:
+    return items[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE]
 
 
 def _mapping_notice(item: dict) -> str:
@@ -225,21 +243,23 @@ def _batch_event(
             footer = "此批次超过 1000 组，仅展示前 1000 组；请在 Web 分批审阅、复核和确认。"
         else:
             try:
-                preview = _suggestion_preview(items, chat_id)
+                # 批量确认只授权本页已展示的建议，其他页需翻页后分别确认。
+                preview = _suggestion_preview(_page_items(items, page), chat_id)
             except ValueError as exc:
                 lines.append(f"建议暂不可提交：{truncate_telegram_text(str(exc), 160)}")
+        lines.extend(_skipped_notice(item, error) for item, error in (preview or {}).get("skipped", [])[:3])
         mapped = preview.get("mapping_items", []) if preview else []
         if mapped:
             lines.extend(_mapping_notice(item) for item in mapped[:3])
-            footer += f"\n{len(mapped)} 组涉及季集映射，请在 Web 查看完整映射；TG 批量仅确认其余普通建议。"
+            footer += f"\n本页 {len(mapped)} 组涉及季集映射，请在 Web 查看完整映射；TG 仅确认本页其余普通建议。"
         if preview and preview.get("entries"):
             metadata["digest"] = preview["digest"]
             metadata["scope_digest"] = preview["scope_digest"]
             actions.append(_button(
-                f"{'确认普通建议' if mapped else '确认全部可执行建议'}（{len(preview['entries'])} 组）",
+                f"{'确认本页普通建议' if mapped else '确认本页建议'}（{len(preview['entries'])} 组）",
                 anchor, "a", str(preview["digest"])[:16],
             ))
-            footer += "\n确认仅授权当前摘要中的建议；建议变化时需刷新后再次确认。"
+            footer += "\n确认仅授权本页显示的建议；其他页请翻页后分别确认，建议变化时需刷新后再次确认。"
             if preview.get("note"):
                 footer += f"\n{preview['note']}"
         if not truncated and counts["pending"] and recognition_review_enabled():
@@ -351,7 +371,7 @@ def handle_batch_callback(data: str, *, chat_id: str, message_id: int) -> str:
         result = _batch_items(batch_id, chat_id)
         if result.get("selection_truncated") or result["total"] > len(result["items"]):
             raise ValueError("此批次超过 1000 组，请在 Web 分批确认")
-        preview = _suggestion_preview(result["items"], chat_id)
+        preview = _suggestion_preview(_page_items(result["items"], page), chat_id)
         if (not frozen_digest or not compare_digest(frozen_digest[:16], value)
                 or not preview or not compare_digest(str(preview["digest"]), frozen_digest)
                 or not compare_digest(str(preview["scope_digest"]), str(previous.get("scope_digest") or ""))):

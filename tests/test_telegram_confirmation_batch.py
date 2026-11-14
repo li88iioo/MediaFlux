@@ -187,13 +187,13 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         first, second, untouched = self._create(3)
         self._review(first)
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
-        old_approval = self._action("确认全部")
+        old_approval = self._action("确认本页建议")
         self._review(second, index=1)
         with patch.object(service, "submit_choices", wraps=service.submit_choices) as submit:
             with self.assertRaisesRegex(ValueError, "建议已变化"):
                 self._callback(old_approval)
             submit.assert_not_called()
-            approval = self._action("确认全部")
+            approval = self._action("确认本页建议")
             self.assertNotEqual(approval, old_approval)
             self.assertIn("已接纳 2 组", self._callback(approval))
             self.assertEqual(submit.call_count, 1)
@@ -219,7 +219,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self._review(last, index=None, status="abstained")
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
         self.assertEqual(self._snapshot().revision, initial.revision + 1)
-        self.assertTrue(self._action("确认全部"))
+        self.assertTrue(self._action("确认本页建议"))
         self.assertEqual(self._confirmation(last)["status"], "pending")
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
         self.assertEqual(self._snapshot().revision, initial.revision + 1)
@@ -258,7 +258,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self._review(second, index=None, status="abstained")
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
         self.assertGreater(self._snapshot().revision, before)
-        self.assertTrue(self._action("确认全部"))
+        self.assertTrue(self._action("确认本页建议"))
 
     def test_partial_submission_reports_each_outcome_and_keeps_rejected_group_pending(self):
         first, second = self._create()
@@ -273,7 +273,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             return original(token, index, **kwargs)
 
         with patch.object(confirmations, "start_confirmation", side_effect=start):
-            notice = self._callback(self._action("确认全部"))
+            notice = self._callback(self._action("确认本页建议"))
         self.assertIn("已接纳 1 组，未提交 1 组", notice)
         self.assertIn("此组已被其他请求取得所有权", notice)
         self.assertEqual(self._confirmation(first)["status"], "pending")
@@ -302,7 +302,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             self.assertIn("S01E01 → S02E03", render_event(summary))
             assert isinstance(summary.footer, str)
             self.assertIn("Web", summary.footer)
-            self.assertIn("已接纳 1 组", self._callback(self._action("确认普通建议")))
+            self.assertIn("已接纳 1 组", self._callback(self._action("确认本页普通建议")))
             self.assertEqual(self._confirmation(ordinary)["status"], "queued")
             self.assertEqual(self._confirmation(mapped)["status"], "pending")
             self.assertIsNone(self._confirmation(mapped)["selected_index"])
@@ -312,6 +312,55 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             self.assertIn("S01E01 → S02E03", render_event(detail))
             self.assertFalse(any(action.callback_data.startswith("orgc:") and not action.callback_data.endswith(":skip") for action in detail.actions))
         self.dispatch.assert_not_called()
+
+    def test_bulk_approval_only_covers_suggestions_shown_on_current_page(self):
+        tokens = self._create(7)
+        for token in tokens:
+            self._review(token)
+        newest_first = list(reversed(tokens))
+        batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+        approval = self._action("确认本页建议（5 组）")
+        with patch.object(service, "submit_choices", wraps=service.submit_choices) as submit:
+            self.assertIn("已接纳 5 组", self._callback(approval))
+            self.assertEqual([entry["confirmation_id"] for entry in submit.call_args.args[0]], newest_first[:5])
+        self.assertTrue(all(self._confirmation(token)["status"] == "queued" for token in newest_first[:5]))
+        self.assertTrue(all(self._confirmation(token)["status"] == "pending" for token in newest_first[5:]))
+        self.assertFalse(any(":a:" in action.callback_data for action in self._snapshot().event.actions))
+        self._callback(self._action("下一页"))
+        self.assertIn("已接纳 2 组", self._callback(self._action("确认本页建议（2 组）")))
+        self.assertTrue(all(self._confirmation(token)["status"] == "queued" for token in tokens))
+        self.dispatch.assert_not_called()
+
+    def test_one_unverifiable_suggestion_is_listed_without_blocking_the_rest_of_the_page(self):
+        broken, healthy = self._create()
+        for token in (broken, healthy):
+            self._review(token)
+        original = service.preview_choices
+
+        def preview(entries, **kwargs):
+            if any(entry["confirmation_id"] == broken for entry in entries):
+                raise ValueError("季集研究证据已变化，请重新复核或保存人工选择")
+            return original(entries, **kwargs)
+
+        with patch.object(service, "preview_choices", side_effect=preview):
+            batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+            rendered = render_event(self._snapshot().event)
+            self.assertIn("媒体 0 暂不可批量确认：季集研究证据已变化", rendered)
+            self.assertNotIn("建议暂不可提交", rendered)
+            self.assertIn("已接纳 1 组", self._callback(self._action("确认本页建议（1 组）")))
+        self.assertEqual(self._confirmation(healthy)["status"], "queued")
+        self.assertEqual(self._confirmation(broken)["status"], "pending")
+        self.assertIsNone(self._confirmation(broken)["selected_index"])
+
+    def test_page_with_only_unverifiable_suggestions_offers_no_bulk_approval(self):
+        (only,) = self._create(1)
+        self._create(1, start=1)
+        self._review(only)
+        with patch.object(service, "preview_choices", side_effect=ValueError("整理规则已变化，请重新整理生成候选")):
+            batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
+        event = self._snapshot().event
+        self.assertIn("暂不可批量确认：整理规则已变化", render_event(event))
+        self.assertFalse(any(":a:" in action.callback_data for action in event.actions))
 
     def test_wrong_chat_message_anchor_and_malformed_callbacks_cannot_mutate_batch(self):
         tokens = self._create()
