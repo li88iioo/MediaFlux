@@ -241,6 +241,43 @@ class StrmFirstInstallRecoveryTests(unittest.TestCase):
 
 
 class StrmMoveRecoveryTests(unittest.TestCase):
+    def test_moved_video_and_metadata_preserve_same_id_owned_by_another_source(self):
+        for metadata, relative_source in ((False, ""), (True, ""), (False, "source"), (False, "active"), (True, "source"), (True, "active")):
+            with self.subTest(metadata=metadata, relative=relative_source), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                namespace = "guangya-meta:" if metadata else "guangya:"
+                source, active = namespace + "source", namespace + "active"
+                file = GuangYaFile("shared", "Movie.nfo" if metadata else "Movie.mkv", False, 100, "etag", "source")
+                target_for = strm._metadata_target if metadata else strm._strm_target
+                old, target = (target_for(file, directory, root) for directory in ("Old", "New"))
+                old.parent.mkdir(parents=True)
+                payload = b"trusted shared content"
+                old.write_bytes(payload)
+                for owner in (source, active):
+                    stored = str(old.relative_to(root)) if owner == namespace + relative_source else str(old)
+                    strm_repo.upsert_strm_index(owner, file.file_id, file.etag, file.size, file.name,
+                                               stored, strm._content_fingerprint(old))
+                rows = strm_repo.list_strm_index(source)
+                if metadata:
+                    target.parent.mkdir(parents=True)
+                    temp = target.with_suffix(".part")
+                    temp.write_bytes(payload)
+                    cleaned = strm._install_metadata_candidate(file, "New", target, root, source, rows, "",
+                        prepared=strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp)))
+                else:
+                    by_id, by_path = strm._build_video_index_maps(rows)
+                    cleaned, _ = strm._install_video_candidate(file, "New", target, BASE_URL, root, source,
+                                                              by_id, by_path)
+                self.assertEqual(cleaned, 0)
+                self.assertEqual(old.read_bytes(), payload)
+                self.assertTrue(target.is_file())
+                stats, refreshed = {"cleaned": 0, "metadata_cleaned": 0}, []
+                strm.recover_pending_paths(source, root, stats, valid_ids={file.file_id}, on_refresh_paths=refreshed.extend)
+                self.assertEqual(old.read_bytes(), payload)
+                self.assertEqual(refreshed, [])
+                self.assertEqual(strm_repo.list_strm_path_cleanup(source), [])
+                active_path = str(old.relative_to(root)) if relative_source == "active" else str(old)
+                self.assertEqual(strm_repo.list_strm_index(active)[0]["strm_path"], active_path)
+
     def test_scoped_recovery_does_not_read_unrelated_receipts_or_index_rows(self):
         from app.modules.strm_recovery import recover_pending_paths
 

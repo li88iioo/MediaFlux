@@ -7,6 +7,7 @@ from app.clients.guangya import GuangYaClient
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import uuid
 from pathlib import Path
@@ -27,7 +28,7 @@ from app.modules.strm import (
     generate_strm,
     sync_strm,
 )
-from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin
+from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin, isolated_test_database
 
 
 class _TreeClient(PagedDirectoryTestMixin):
@@ -68,6 +69,204 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
     @staticmethod
     def _fingerprint(payload: bytes) -> str:
         return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+    def test_shared_path_cleanup_preserves_other_source_and_does_not_refresh(self) -> None:
+        from app.modules import strm
+
+        for mode in ("full", "incremental", "retired"):
+            for metadata in (False, True):
+                for active_file_id in ("shared", "other"):
+                    with self.subTest(mode=mode, metadata=metadata, owner=active_file_id), \
+                            isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                        prefix = "guangya-meta:" if metadata else "guangya:"
+                        namespace = prefix + "old"
+                        path = Path(root) / STRM_SUBDIR / ("shared.nfo" if metadata else "shared.strm")
+                        path.parent.mkdir(parents=True)
+                        payload = b"shared generated content"
+                        path.write_bytes(payload)
+                        for source, file_id in ((namespace, "shared"), (prefix + "active", active_file_id)):
+                            strm_repo.upsert_strm_index(source, file_id, "etag", len(payload), path.name,
+                                                       str(path), self._fingerprint(payload))
+                        policy = strm_repo.StrmRefreshPolicy(media_root=str(path.parent), allow_emby=False)
+                        if mode == "full":
+                            result = clean_invalid_strm(root, source_key=namespace, valid_ids=set(),
+                                                        clean_empty_dirs=False, refresh_policy=policy)
+                            removed = result["removed_paths"]
+                        elif mode == "retired":
+                            db.enqueue_strm_retired_source("old", "old", root)
+                            result = clean_retired_strm_sources({"active"}, clean_empty_dirs=False,
+                                                               refresh_policy=policy)
+                            removed = result["removed_paths"]
+                        else:
+                            result = strm.sync_strm_incremental("old", [{"source_id": "old", "file_id": "shared", "action": "remove",
+                                "kind": "metadata" if metadata else "video"}], "http://play.invalid", root,
+                                client=cast(GuangYaClient, _TreeClient({"old": []})), metadata_exts={"nfo"},
+                                refresh_policy=policy)
+                            self.assertFalse(result["fallback_required"], result)
+                            removed = result.get("changed_strm_paths", [])
+                        self.assertEqual(path.read_bytes(), payload)
+                        self.assertEqual(result["cleaned"], 0)
+                        self.assertEqual(result.get("metadata_cleaned", 0), 0)
+                        self.assertEqual(removed, [])
+                        self.assertEqual(strm_repo.list_strm_index(namespace), [])
+                        self.assertEqual(len(strm_repo.list_strm_index(prefix + "active")), 1)
+                        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_cleanup_commit_failure_restores_file_and_index(self) -> None:
+        from app.modules import strm
+
+        for mode in ("full", "incremental", "retired"):
+            for failure in ("index", "refresh"):
+                with self.subTest(mode=mode, failure=failure), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                    path = Path(root) / STRM_SUBDIR / "Movie.strm"
+                    path.parent.mkdir(parents=True)
+                    path.write_bytes(b"owned content")
+                    strm_repo.upsert_strm_index("guangya:old", "video", "etag", 13, "Movie.mkv",
+                                               str(path), strm._content_fingerprint(path))
+                    before = dict(strm_repo.list_strm_index("guangya:old")[0])
+                    policy = strm_repo.StrmRefreshPolicy(media_root=str(path.parent), allow_emby=False)
+                    event = "DELETE ON strm_index" if failure == "index" else "INSERT ON strm_refresh_outbox"
+                    with db.get_conn() as conn:
+                        conn.execute(f"CREATE TRIGGER reject_cleanup BEFORE {event} BEGIN SELECT RAISE(FAIL, 'cleanup commit failed'); END")
+                    if mode == "incremental":
+                        result = strm.sync_strm_incremental("old", [{"source_id": "old", "file_id": "video",
+                            "action": "remove", "kind": "video"}], "http://play.invalid", root,
+                            client=cast(GuangYaClient, _TreeClient({"old": []})), refresh_policy=policy)
+                        self.assertTrue(result["fallback_required"], result)
+                        self.assertEqual(result["changed_strm_paths"], [])
+                    else:
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            if mode == "retired":
+                                db.enqueue_strm_retired_source("old", "old", root)
+                                clean_retired_strm_sources(set(), clean_empty_dirs=False, refresh_policy=policy)
+                            else:
+                                clean_invalid_strm(root, source_key="guangya:old", valid_ids=set(),
+                                                   clean_empty_dirs=False, refresh_policy=policy)
+                    self.assertEqual(path.read_bytes(), b"owned content")
+                    row = dict(strm_repo.list_strm_index("guangya:old")[0])
+                    self.assertEqual({key: row[key] for key in before if key != "created_at"},
+                                     {key: value for key, value in before.items() if key != "created_at"})
+                    self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_failed_rollback_keeps_backup_and_restores_other_files(self) -> None:
+        from app.modules import strm
+
+        with isolated_test_database(), tempfile.TemporaryDirectory() as root:
+            base = Path(root) / STRM_SUBDIR
+            base.mkdir()
+            paths = [base / f"{index}.strm" for index in range(2)]
+            for index, path in enumerate(paths):
+                path.write_bytes(f"owned-{index}".encode())
+                strm_repo.upsert_strm_index("guangya:old", str(index), "etag", 7, path.name,
+                                           str(path), strm._content_fingerprint(path))
+            with db.get_conn() as conn:
+                conn.execute("CREATE TRIGGER reject_cleanup BEFORE DELETE ON strm_index "
+                             "BEGIN SELECT RAISE(FAIL, 'cleanup commit failed'); END")
+            replace = Path.replace
+
+            def fail_first_restore(backup, target):
+                if target == paths[0]:
+                    raise PermissionError("first restore denied")
+                return replace(backup, target)
+
+            with patch.object(Path, "replace", fail_first_restore), self.assertRaises(ExceptionGroup):
+                clean_invalid_strm(root, source_key="guangya:old", valid_ids=set(), clean_empty_dirs=False)
+            self.assertFalse(paths[0].exists())
+            self.assertEqual(paths[1].read_bytes(), b"owned-1")
+            backups = list(base.glob(".mediaflux-*.backup"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"owned-0")
+            self.assertEqual(len(strm_repo.list_strm_index("guangya:old")), 2)
+            self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_full_cleanup_queries_only_bounded_path_batches(self) -> None:
+        with isolated_test_database(), tempfile.TemporaryDirectory() as root:
+            base = Path(root) / STRM_SUBDIR
+            base.mkdir()
+            items = [{"file_id": str(index), "strm_path": str(base / f"{index}.strm")} for index in range(1201)]
+            strm_repo.upsert_strm_index_batch("guangya:old", items)
+            strm_repo.upsert_strm_index_batch("guangya:active", items)
+            with patch.object(strm_repo, "list_strm_path_owners", wraps=strm_repo.list_strm_path_owners) as owners, \
+                    patch.object(strm_repo, "delete_strm_index_ids", wraps=strm_repo.delete_strm_index_ids) as commits:
+                result = clean_invalid_strm(root, source_key="guangya:old", valid_ids=set(), clean_empty_dirs=False)
+            self.assertEqual(result["checked"], len(items))
+            self.assertEqual(result["removed_paths"], [])
+            self.assertEqual(strm_repo.list_strm_index("guangya:old"), [])
+            self.assertEqual(len(strm_repo.list_strm_index("guangya:active")), len(items))
+            self.assertLessEqual(owners.call_count, 3)
+            self.assertLessEqual(commits.call_count, 3)
+            with db.get_conn() as conn:
+                plans = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN SELECT * FROM strm_index WHERE strm_path IN (?,?)",
+                                                       (items[0]["strm_path"], items[-1]["strm_path"]))]
+            self.assertTrue(any("idx_strm_index_path" in plan for plan in plans), plans)
+
+    def test_shared_cleanup_matches_absolute_and_legacy_relative_paths(self) -> None:
+        from app.modules import strm
+
+        for mode in ("full", "incremental", "retired"):
+            for relative_source in ("old", "active"):
+                with self.subTest(mode=mode, relative=relative_source), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                    path = Path(root) / STRM_SUBDIR / "Shared.strm"
+                    path.parent.mkdir(parents=True)
+                    path.write_bytes(b"shared")
+                    for source in ("old", "active"):
+                        stored = str(path.relative_to(root)) if source == relative_source else str(path)
+                        strm_repo.upsert_strm_index(f"guangya:{source}", "same-id", "etag", 6, "Shared.mkv",
+                                                   stored, strm._content_fingerprint(path))
+                    policy = strm_repo.StrmRefreshPolicy(media_root=str(path.parent), allow_emby=False)
+                    if mode == "full":
+                        result = clean_invalid_strm(root, source_key="guangya:old", valid_ids=set(),
+                                                   clean_empty_dirs=False, refresh_policy=policy)
+                        self.assertFalse(result["skipped"], result)
+                    elif mode == "retired":
+                        db.enqueue_strm_retired_source("old", "old", root)
+                        result = clean_retired_strm_sources({"active"}, clean_empty_dirs=False, refresh_policy=policy)
+                        self.assertEqual(result["blocked"], 0, result)
+                    else:
+                        result = strm.sync_strm_incremental("old", [{"source_id": "old", "file_id": "same-id",
+                            "action": "remove", "kind": "video"}], "http://play.invalid", root,
+                            client=cast(GuangYaClient, _TreeClient({"old": []})), refresh_policy=policy)
+                        self.assertFalse(result["fallback_required"], result)
+                    self.assertEqual(result["cleaned"], 0)
+                    self.assertEqual(result.get("removed_paths", result.get("changed_strm_paths")), [])
+                    self.assertEqual(path.read_bytes(), b"shared")
+                    self.assertEqual(strm_repo.list_strm_index("guangya:old"), [])
+                    self.assertEqual(len(strm_repo.list_strm_index("guangya:active")), 1)
+                    self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+
+    def test_shared_stale_path_across_batches_commits_only_processed_owners(self) -> None:
+        for stop_after_batch in (False, True):
+            with self.subTest(stop=stop_after_batch), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / STRM_SUBDIR / "Shared.strm"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"owned")
+                strm_repo.upsert_strm_index_batch("guangya:old", [
+                    {"file_id": str(index), "strm_path": str(path), "content_fingerprint": self._fingerprint(b"owned")}
+                    for index in range(503)])
+                checks = 0
+
+                def stopped():
+                    nonlocal checks
+                    checks += 1
+                    return stop_after_batch and checks > 1
+
+                policy = strm_repo.StrmRefreshPolicy(media_root=str(path.parent), allow_emby=False)
+                result = clean_invalid_strm(root, source_key="guangya:old", valid_ids=set(), clean_empty_dirs=False,
+                                           should_stop=stopped, refresh_policy=policy)
+                if stop_after_batch:
+                    self.assertTrue(result["stopped"])
+                    self.assertEqual(result["cleaned"], 0)
+                    self.assertEqual(result["removed_paths"], [])
+                    self.assertEqual(path.read_bytes(), b"owned")
+                    self.assertEqual(len(strm_repo.list_strm_index("guangya:old")), 3)
+                    self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+                    result = clean_invalid_strm(root, source_key="guangya:old", valid_ids=set(),
+                                               clean_empty_dirs=False, refresh_policy=policy)
+                self.assertEqual(result["cleaned"], 1)
+                self.assertEqual(result["removed_paths"], [str(path)])
+                self.assertFalse(path.exists())
+                self.assertEqual(strm_repo.list_strm_index("guangya:old"), [])
+                self.assertEqual(len(strm_repo.list_strm_refresh_entries()), 1)
 
     def test_retired_source_deletes_only_fingerprinted_owned_file(self) -> None:
         source_id = f"retired-{uuid.uuid4().hex}"

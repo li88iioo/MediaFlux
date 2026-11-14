@@ -83,20 +83,22 @@ def recover_pending_paths(
         if not batch:
             return
         after_id = int(batch[-1]["id"])
+        paths = {int(row["id"]): _managed_path(row["strm_path"], strm_root) for row in batch}
+        retained = strm._retained_indexed_paths((str(path) for path in paths.values() if path), strm_root)
         completed: list[int] = []
         changed_targets: set[str] = set()
         for row in batch:
             if _stopped(stats, should_stop):
                 break
             file_id = str(row["file_id"])
-            path = _managed_path(row["strm_path"], strm_root)
+            path = paths[int(row["id"])]
             if path is None:
                 _blocked(
                     stats, row["strm_path"], "旧路径不在当前 STRM 根内，已保留清理凭据"
                 )
                 continue
             try:
-                if strm_repo.list_strm_path_owners(str(path)):
+                if str(path) in retained:
                     # 普通异常已回滚，或路径已被其他活跃对象复用；凭据不再适用。
                     completed.append(int(row["id"]))
                     continue

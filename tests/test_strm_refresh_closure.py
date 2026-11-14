@@ -225,16 +225,16 @@ def test_failed_file_index_outbox_commit_retries_instead_of_becoming_current(tmp
         _consume(providers=("jellyfin",), expected_paths=[str(path.parent)])
 
 
-def test_deleted_file_keeps_index_until_refresh_is_durable(tmp_path):
+def test_failed_delete_restores_file_and_index_until_refresh_is_durable(tmp_path):
     with isolated_test_database(), _providers():
         _run(tmp_path, enabled=False)
         with patch.object(repository, "_enqueue_strm_refresh_paths", side_effect=sqlite3.OperationalError("outbox unavailable")):
             _run(tmp_path, tree={"s": []})
-        assert not list(tmp_path.rglob("*.strm"))
+        assert len(list(tmp_path.rglob("*.strm"))) == 1
         assert len(repository.list_strm_index("guangya:s")) == 1
         assert repository.count_strm_refresh_paths() == 0
         replay = _run(tmp_path, tree={"s": []}, allow_emby=False)
-        assert replay["stats"]["cleaned"] == 0
+        assert replay["stats"]["cleaned"] == 1
         assert not repository.list_strm_index("guangya:s")
         _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Film")])
 

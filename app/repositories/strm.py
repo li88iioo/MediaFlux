@@ -244,12 +244,19 @@ def list_strm_file_owners(file_id: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def list_strm_path_owners(strm_path: str) -> list[sqlite3.Row]:
-    """跨来源查询目标路径所有者，防止清理复用路径或其他来源的文件。"""
+def list_strm_path_owners(strm_path: str | Iterable[str]) -> list[sqlite3.Row]:
+    """按路径索引分批查询全部来源；保留单路径调用，不扫描无关索引。"""
+    paths = list(dict.fromkeys([strm_path] if isinstance(strm_path, str) else strm_path))
+    if not paths:
+        return []
+    rows: list[sqlite3.Row] = []
     with db.get_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM strm_index WHERE strm_path=?", (strm_path,)
-        ).fetchall()
+        for start in range(0, len(paths), 500):
+            batch = paths[start:start + 500]
+            rows.extend(conn.execute(
+                f"SELECT * FROM strm_index WHERE strm_path IN ({','.join('?' for _ in batch)})", batch,
+            ).fetchall())
+    return rows
 
 
 def enqueue_strm_path_cleanup(items: list[dict[str, str]]) -> int:
