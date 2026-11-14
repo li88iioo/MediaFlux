@@ -351,6 +351,39 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertNotIn(SESSION_A, drafts)
         self.assertEqual(drafts[SESSION_B]['text'], 'B 的草稿')
 
+    def test_reply_quotes_an_answer_sends_it_once_and_survives_reload(self):
+        answer = '4K HBR：1.42 GiB，19 做种。\n\n1080p HBR：768 MiB。'
+        events = [harness._event(1, 'turn.started'), harness._event(2, 'turn.completed', {'status': 'success', 'answer': '已推送 4K。'})]
+        page = self.page({'queryEvents': events, 'sessions': {'draft_scope': SCOPE, 'main_session_id': SESSION_A, 'sessions': [
+            {'session_id': SESSION_A, 'title': '诛仙', 'updated_at': 10}]},
+            'sessionDetails': {SESSION_A: {'messages': [
+                {'role': 'user', 'content': '诛仙出了吗', 'reply_to': '上一条提醒'},
+                {'role': 'assistant', 'content': answer}]}}})
+        page.wait_for_selector('.agent-narrative')
+        self.assertEqual(page.locator('.agent-message-user .agent-message-quote').inner_text(), '上一条提醒')
+        self.assertTrue(page.locator('#agentReplyBar').is_hidden())
+        page.locator('.agent-message-assistant [data-reply-message]').last.click()
+        self.assertTrue(page.locator('#agentReplyBar').is_visible())
+        self.assertIn('4K HBR', page.locator('#agentReplyText').inner_text())
+        self.assertEqual(page.evaluate('document.activeElement.id'), 'agentPrompt')
+        page.locator('#agentReplyCancel').click()
+        self.assertTrue(page.locator('#agentReplyBar').is_hidden())
+        page.locator('.agent-message-assistant [data-reply-message]').last.click()
+        page.locator('#agentPrompt').fill('推这个 4K')
+        page.locator('#agentSend').click()
+        page.wait_for_function("() => window.__kernelCalls.some(call => call.url === '/api/agent/query')")
+        body = json.loads(page.evaluate("window.__kernelCalls.find(call => call.url === '/api/agent/query').body"))
+        self.assertEqual(body['message'], '推这个 4K')
+        self.assertIn('4K HBR', body['reply_to']['text'])
+        self.assertTrue(page.locator('#agentReplyBar').is_hidden())
+        self.assertIn('4K HBR', page.locator('.agent-message-user').last.locator('.agent-message-quote').inner_text())
+        page.wait_for_function("() => document.querySelector('#agentSend').getAttribute('aria-busy') === 'false'")
+        page.locator('#agentPrompt').fill('再来一条')
+        page.locator('#agentSend').click()
+        page.wait_for_function("() => window.__kernelCalls.filter(call => call.url === '/api/agent/query').length === 2")
+        second = json.loads(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query')[1].body"))
+        self.assertNotIn('reply_to', second)
+
     def test_completion_and_error_do_not_pull_reader_to_bottom(self):
         for outcome in ('turn.completed', 'turn.failed'):
             with self.subTest(outcome=outcome):

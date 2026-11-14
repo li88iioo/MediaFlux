@@ -13,6 +13,8 @@
     const sessionStopButton = document.getElementById('agentStopSession');
     const newSessionButton = document.getElementById('agentNewSession');
     const mainChatButton = document.getElementById('agentMainChat');
+    const replyBar = document.getElementById('agentReplyBar');
+    const replyText = document.getElementById('agentReplyText');
     const historyButton = document.getElementById('toggleAgentRail');
     const historyRail = document.getElementById('agentHistoryRail');
     const sessionList = document.getElementById('agentSessionList');
@@ -69,6 +71,7 @@
     const memoryDrafts = new Map();
     const sessionEdits = new Set();
     let mainSessionId = '';
+    let replyDraft = '';
     // 宽屏常驻会话栏；窄屏收为抽屉。
     const railDocked = window.matchMedia?.('(min-width: 901px)') || null;
     let activeRequest = null;
@@ -376,6 +379,17 @@
         item.setAttribute('aria-label', role === 'user' ? '你的消息' : '助手回复');
         const body = element('div', 'agent-message-body');
         item.append(body);
+        if (role === 'assistant') {
+            // 悬停或聚焦时出现“回复”，引用这条回复的正文继续追问。
+            const reply = element('button', 'agent-message-reply');
+            reply.type = 'button';
+            reply.dataset.replyMessage = '';
+            reply.setAttribute('aria-label', '回复这条消息');
+            reply.title = '回复';
+            reply.append(icon('reply'));
+            item.append(reply);
+            renderIcons(reply);
+        }
         transcript?.append(item);
         pruneTranscript();
         setConsoleEmpty(false);
@@ -383,10 +397,22 @@
         return {item, body};
     }
 
-    function appendUser(text, options = {}) {
+    function appendUser(text, {replyTo = '', ...options} = {}) {
         const view = appendMessage('user', options);
+        if (replyTo) view.body.append(element('blockquote', 'agent-message-quote', clipText(replyTo, 140)));
         view.body.append(element('p', '', text));
         return view;
+    }
+
+    const REPLY_LIMIT = 2000;
+
+    function setReply(text) {
+        replyDraft = String(text || '').trim().slice(0, REPLY_LIMIT);
+        if (replyText) replyText.textContent = clipText(replyDraft.replace(/\s+/g, ' '), 160);
+        if (replyBar) replyBar.hidden = !replyDraft;
+        syncSend();
+        syncViewportHeight();
+        if (replyDraft) promptInput?.focus();
     }
 
     function appendText(parent, value) {
@@ -2231,11 +2257,12 @@
         syncViewportHeight();
     }
 
-    function queryRequest(message, requestId, signal, selection = null, targetSessionId = sessionId, actionKey = '') {
+    function queryRequest(message, requestId, signal, selection = null, targetSessionId = sessionId, actionKey = '', replyTo = '') {
         return fetch('/api/agent/query', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({session_id: targetSessionId, request_id: requestId, stream: true,
-                ...(actionKey ? {action_key: actionKey} : {message, ...(selection ? {selection} : {})})}),
+                ...(actionKey ? {action_key: actionKey} : {message, ...(selection ? {selection} : {}),
+                    ...(replyTo ? {reply_to: {text: replyTo}} : {})})}),
             signal,
         });
     }
@@ -2244,9 +2271,11 @@
         if (busy || sessionStopPending || initialRestore || !text.trim()) return;
         clearReceiptObserverForNewRequest();
         const message = text.trim();
+        const replyTo = actionKey ? '' : replyDraft;
         ++sessionLoadGeneration;
         expireCandidateCards();
-        appendUser(message);
+        appendUser(message, {replyTo});
+        if (replyTo) setReply('');
         const turn = createAssistantTurn();
         turn.requestMessage = message;
         turn.boundSelection = Boolean(actionKey);
@@ -2270,7 +2299,7 @@
         setBusy(true);
         announce(responseStatus, 'Media Agent 正在处理请求');
         try {
-            const response = await queryRequest(message, requestId, controller.signal, null, targetSessionId, actionKey);
+            const response = await queryRequest(message, requestId, controller.signal, null, targetSessionId, actionKey, replyTo);
             if (!isCurrentActiveRequest(active)) return;
             const terminalEvent = await readEventStream(response, (event) => {
                 if (!isCurrentActiveRequest(active)) return;
@@ -2744,7 +2773,7 @@
         transcript?.replaceChildren();
         const candidateGroups = new Map();
         for (const message of payload.messages || []) {
-            if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, scroll: !preserveScroll});
+            if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, scroll: !preserveScroll, replyTo: String(message.reply_to || '')});
             else if (message.role === 'assistant') {
                 const folded = message.candidate_result_ref === payload.candidate_view?.ref && payload.candidate_view?.last_result;
                 const content = folded ? String(message.candidate_followup || '') : String(message.content || '');
@@ -2841,6 +2870,7 @@
         const switching = targetId !== sessionId;
         const previousSessionId = sessionId;
         if (switching) {
+            setReply('');
             clearTaskSnapshot();
             saveDraft();
             ++sessionLoadGeneration;
@@ -2959,6 +2989,7 @@
     }
 
     function startNewSession() {
+        setReply('');
         clearTaskSnapshot();
         stopInitialRestore();
         saveDraft();
@@ -3402,6 +3433,7 @@
     document.getElementById('agentRestoreRetry')?.addEventListener('click', restoreInitialSession);
     document.getElementById('agentRestoreNew')?.addEventListener('click', startNewSession);
     mainChatButton?.addEventListener('click', openMainChat);
+    document.getElementById('agentReplyCancel')?.addEventListener('click', () => { setReply(''); promptInput?.focus(); });
     // 常驻会话栏没有“打开”动作；回到页面时刷新列表，及时发现新旁聊或登录主体变化。
     window.addEventListener('focus', () => { if (railDocked?.matches && !startupController) refreshSessions({quiet: true}); });
     railDocked?.addEventListener?.('change', syncRailMode);
@@ -3429,6 +3461,8 @@
         if (remove) deleteSession(remove.dataset.sessionDelete || '');
     });
     transcript?.addEventListener('click', (event) => {
+        const reply = event.target.closest('[data-reply-message]');
+        if (reply) setReply(reply.closest('.agent-message')?.querySelector('.agent-message-body')?.innerText || '');
         const candidate = event.target.closest('[data-candidate-select]');
         if (candidate) selectCandidate(candidate);
         const confirm = event.target.closest('[data-effect-confirm]');

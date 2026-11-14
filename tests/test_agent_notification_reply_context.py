@@ -232,3 +232,26 @@ def test_sensitive_input_or_reference_is_never_presaved_or_sent_to_model():
             assert secret not in str(events)
         assert not model.requests
     asyncio.run(scenario())
+
+
+def test_web_quote_of_a_visible_answer_is_shown_once_in_public_chat():
+    async def scenario():
+        catalog = ToolCatalog([_read_tool("local.read")])
+        state_store = InMemorySessionStateStore()
+        model = RecordingModel()
+        session = AgentSession(
+            model=model, catalog=catalog,
+            pipeline=ToolPipeline(catalog=catalog, state_store=state_store),
+            state_store=state_store,
+        )
+        events = [event async for event in session.run(AgentInput(
+            message="推这个", owner="owner", session_id="session",
+            reply_context={"text": "4K HBR：1.42 GiB", "origin": "web"},
+        ))]
+        assert events[-1].type == AgentEventType.TURN_COMPLETED
+        assert "4K HBR：1.42 GiB" in "\n".join(message.content for message in model.requests[-1].messages)
+        stored = await state_store.load(owner="owner", session_id="session")
+        assert stored.conversation[0]["reply_context"] == {"text": "4K HBR：1.42 GiB", "origin": "web"}
+        public = public_conversation_messages(stored.conversation)
+        assert public[0] == {"role": "user", "content": "推这个", "reply_to": "4K HBR：1.42 GiB"}
+    asyncio.run(scenario())

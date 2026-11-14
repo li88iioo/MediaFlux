@@ -138,7 +138,7 @@ class ConfirmationEditBrowserTests(unittest.TestCase):
         self.assertEqual(body['tool_name'], grant['tool_name'])
         self.assertEqual(body['max_actions'], 5)
         self.assertEqual(body['ttl_seconds'], 300)
-        self.assertEqual(page.locator('#agentComposer button, #agentComposer a').count(), 2)
+        self.assertEqual(page.locator('#agentComposer button, #agentComposer a').count(), 3)
         page.locator('[data-effect-cancel]').click()
         page.locator('.agent-cancelled').wait_for()
         self.assertTrue(bar.is_visible())

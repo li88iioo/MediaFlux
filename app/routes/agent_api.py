@@ -63,6 +63,19 @@ def _session_id(value: Any) -> str:
     return normalized
 
 
+_MAX_REPLY_TEXT = 2000
+
+
+def _reply_context(value: Any) -> dict[str, str]:
+    """Web 引用回复：与 Telegram 无来源引用同一协议，正文按不可信参考包裹后交给模型。"""
+    if value is None:
+        return {}
+    text = value.get("text") if isinstance(value, dict) and set(value) == {"text"} else None
+    if not isinstance(text, str) or not text.strip() or len(text) > _MAX_REPLY_TEXT:
+        raise TransportInputError("reply_to 无效")
+    return {"text": text.strip(), "origin": "web"}
+
+
 def _request_id(value: Any) -> str:
     normalized = str(value or "").strip()
     if normalized and not _REQUEST_RE.fullmatch(normalized):
@@ -181,6 +194,7 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
             "request_id",
             "selection",
             "action_key",
+            "reply_to",
         }
     ):
         return api_error("请求字段无效", 400)
@@ -201,12 +215,16 @@ async def query(request: Request, data: Annotated[Any, Body()] = None):
             initial_read_arguments = handoff["arguments"]
         elif not isinstance(message, str):
             raise TransportInputError("message 必须是字符串")
+        reply_context = _reply_context(data.get("reply_to"))
+        if reply_context and "action_key" in data:
+            raise TransportInputError("工作区行动不能引用回复")
         envelope = QueryEnvelope(
             owner=owner,
             session_id=session_id,
             message=message,
             request_id=request_id,
             channel="web",
+            reply_context=reply_context,
             selection=normalize_selection(data["selection"]) if "selection" in data else None,
             initial_read_tool=initial_read_tool,
             initial_read_arguments=initial_read_arguments,

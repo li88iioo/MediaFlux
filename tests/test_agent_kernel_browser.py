@@ -70,6 +70,7 @@ HTML = """
           <div class="agent-empty-intro" id="agentEmptyIntro"><p>直接描述你想处理的任务</p></div>
           <button type="button" class="agent-new-replies" id="agentNewReplies" hidden><span>回到底部</span></button>
           <form class="agent-composer" id="agentComposer">
+            <div class="agent-reply-bar" id="agentReplyBar" hidden><div class="agent-reply-bar-text"><small>正在回复</small><p id="agentReplyText"></p></div><button type="button" class="agent-reply-cancel" id="agentReplyCancel" aria-label="取消回复">取消</button></div>
             <div class="agent-composer-input-wrap">
               <textarea id="agentPrompt" rows="1" maxlength="1000" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea>
             </div>

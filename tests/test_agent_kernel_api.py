@@ -257,6 +257,24 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(events[-1]["payload"]["answer"], "完成")
         self.assertEqual(self.web.queries[0].request_id, "request-1")
 
+    def test_query_reply_to_becomes_reply_context_and_rejects_invalid_quotes(self):
+        body = {"message": "这个 4K 的推到 qB", "session_id": "session_1234567890", "request_id": "request-r", "stream": True}
+        response = self.client.post("/api/agent/query", json={**body, "reply_to": {"text": "  4K HBR：1.42 GiB  "}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(dict(self.web.queries[-1].reply_context), {"text": "4K HBR：1.42 GiB", "origin": "web"})
+        self.client.post("/api/agent/query", json={**body, "request_id": "request-n"})
+        self.assertEqual(dict(self.web.queries[-1].reply_context), {})
+        before = len(self.web.queries)
+        for reply in ({"text": ""}, {"text": "x" * 2001}, {"text": "a", "source": {}}, "文本", {"text": 1}):
+            with self.subTest(reply=reply):
+                response = self.client.post("/api/agent/query", json={**body, "reply_to": reply})
+                self.assertEqual(response.status_code, 400, response.text)
+        response = self.client.post("/api/agent/query", json={
+            "session_id": "session_1234567890", "action_key": "a" * 32, "reply_to": {"text": "引用"},
+        })
+        self.assertGreaterEqual(response.status_code, 400)
+        self.assertEqual(len(self.web.queries), before)
+
     def test_non_stream_query_and_confirm_return_canonical_turn_view(self):
         query = self.client.post(
             "/api/agent/query",

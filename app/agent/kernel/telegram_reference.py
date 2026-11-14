@@ -12,7 +12,8 @@ from typing import Any
 from .references import ReferenceError
 
 SOURCE_KEYS = ('kind', 'chat_id', 'message_id', 'thread_id', 'incoming_message_id', 'incoming_thread_id')
-CONTEXT_KEYS = ('text', 'source', 'row_id', 'version', 'created_generation', 'reference_handle')
+# origin='web' 表示引用的是 Web 会话里已公开显示的回复，允许在会话记录中展示摘要。
+CONTEXT_KEYS = ('text', 'source', 'row_id', 'version', 'created_generation', 'reference_handle', 'origin')
 
 
 def context_copy(reply):
@@ -27,7 +28,7 @@ async def prepare(reply, lease, store):
     text = str(reply.get('text') or '')
     source = reply.get('source')
     if not isinstance(source, Mapping):
-        return {'text': text}
+        return {'text': text, **({'origin': 'web'} if reply.get('origin') == 'web' else {})}
     source = {key: source.get(key) for key in SOURCE_KEYS}
     pointer = {'source': source, 'row_id': secrets.token_urlsafe(18),
                'version': version(text, source), 'created_generation': lease.generation}

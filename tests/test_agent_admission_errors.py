@@ -269,3 +269,17 @@ def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(sto
         assert len([row for row in state.conversation if row.get("completion_receipt_id")]) == 1
 
     asyncio.run(run())
+
+
+def test_public_messages_show_a_short_quote_for_replied_user_turns():
+    conversation = [
+        {"role": "user", "content": "推这个", "reply_context": {"text": "4K HBR " + "说明" * 400, "origin": "web"}},
+        {"role": "assistant", "content": "好的"},
+        {"role": "user", "content": "普通消息"},
+        {"role": "user", "content": "TG 回复", "reply_context": {"text": "通知原文", "source": {"kind": "text"}}},
+    ]
+    messages = public_conversation_messages(conversation)
+    assert messages[0]["content"] == "推这个"
+    assert messages[0]["reply_to"].startswith("4K HBR") and len(messages[0]["reply_to"]) == 300
+    assert "reply_to" not in messages[2]
+    assert "reply_to" not in messages[3] and "通知原文" not in str(messages)

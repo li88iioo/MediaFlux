@@ -36,6 +36,10 @@
             <p class="sr-only" id="agentDraftHelp">未发送草稿仅保存在当前浏览器标签页，六小时后过期；疑似凭据不持久保存。等待回复时可继续编辑，但不会自动发送。</p>
             <p class="sr-only" id="agentSessionStopHelp">停止此会话的任务及等待中的后台续行；已经提交到外部服务的任务可能继续运行。</p>
             <form class="agent-composer" id="agentComposer">
+                <div class="agent-reply-bar" id="agentReplyBar" hidden>
+                    <div class="agent-reply-bar-text"><small>正在回复</small><p id="agentReplyText"></p></div>
+                    <button type="button" class="agent-reply-cancel" id="agentReplyCancel" aria-label="取消回复" title="取消回复"><i data-lucide="x"></i></button>
+                </div>
                 <div class="agent-composer-input-wrap">
                     <label class="sr-only" for="agentPrompt">输入要交给 Agent 的任务</label>
                     <textarea id="agentPrompt" aria-describedby="agentDraftHelp" rows="1" maxlength="1000" placeholder="询问 MediaFlux" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务" autocomplete="off"></textarea>

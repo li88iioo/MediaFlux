@@ -848,7 +848,14 @@ def public_conversation_messages(
             pending_tools.clear()
             content = str(item.get("content") or "").strip()
             if content:
-                messages.append({"role": "user", "content": content})
+                user_message: dict[str, Any] = {"role": "user", "content": content}
+                reply = item.get("reply_context")
+                # 只展示 Web 端对已显示回复的引用；Telegram/通知来源的引用正文不进入公开会话。
+                reply_text = (str(reply.get("text") or "").strip()
+                              if isinstance(reply, Mapping) and reply.get("origin") == "web" else "")
+                if reply_text:
+                    user_message["reply_to"] = reply_text[:300]
+                messages.append(user_message)
             continue
         if role == "tool":
             if candidate_view:
