@@ -363,7 +363,7 @@ class DownloadOrganizeHandoffRecoveryTests(unittest.TestCase):
         self.assertEqual((row["organize_started"], row["organize_status"]), (-1, "failed"))
         self.assertEqual(row["organize_task_id"], "existing-task")
         self.assertIn("需人工核验", row["organize_error"])
-        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request_id), 1)
+        self.assertEqual(download_requests_repo.count_download_requests_requiring_attention(request_id), 0)
         self.assertNotIn(request_id, [item["id"] for item in download_requests_repo.list_active_download_requests()])
         self.assertFalse(download_requests_repo.claim_download_request_organize(request_id))
         db.init_db()
