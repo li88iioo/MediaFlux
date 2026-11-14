@@ -232,8 +232,7 @@ def _rss_delivery_retry_sql(entry: str = "e") -> str:
         "(r.status IN ('failed','completed','resubmitted') "
         "AND COALESCE(r.qb_status,'') NOT IN ('submitting','submitted','downloading','outcome_unknown','manual_review') "
         "AND COALESCE(r.gy_status,'') NOT IN ('submitting','submitted','downloading','outcome_unknown','manual_review') "
-        f"AND (({backend})='failed' OR ({entry}.download_backend='guangya' "
-        "AND r.gy_status='completed' AND r.organize_status='failed')))"
+        f"AND ({backend})='failed')"
     )
 
 
@@ -246,9 +245,7 @@ def rss_retry_source_is_safe(source, target: str) -> bool:
         and source["status"] in {"failed", "completed", "resubmitted"}
         and source["qb_status"] not in active
         and source["gy_status"] not in active
-        and (source["qb_status" if target == "qb" else "gy_status"] == "failed"
-             or (target == "guangya" and source["gy_status"] == "completed"
-                 and source["organize_status"] == "failed"))
+        and source["qb_status" if target == "qb" else "gy_status"] == "failed"
     )
 
 def _rss_delivery_columns() -> str:

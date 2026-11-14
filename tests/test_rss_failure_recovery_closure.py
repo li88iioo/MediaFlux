@@ -266,23 +266,32 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                 peer = entries["guangya" if backend == "qb" else "qb"]
                 self.assertEqual(assert_present(rss_repo.get_rss_entry(peer))["download_request_id"], original)
 
-    def test_peer_postprocess_retry_reads_stable_owner_not_other_backend_canonical_owner(self):
+    def test_peer_postprocess_failure_retains_owner_without_redownloading(self):
         original, entries, engine = self.dual_receipts("qb")
         with patch.object(dispatcher, "_submit_qb", side_effect=self.success):
             first = engine.download(entries["qb"])
         qb_successor = first["request_id"]
         download_requests_repo.update_download_request(qb_successor, status="failed", qb_status="failed")
         download_requests_repo.update_download_request(original, organize_status="failed", organize_error="fixture organize failure")
+        before = dict(assert_present(rss_repo.get_rss_entry(entries["guangya"])))
+        delivery = rss_entry_delivery(before)
+        self.assertTrue(delivery["failed"])
+        self.assertFalse(delivery["retryable"])
+        self.assertFalse(rss_retry_source_is_safe(download_requests_repo.get_download_request(original), "guangya"))
+        self.assertEqual(rss_repo.update_rss_entries_processed([entries["guangya"]], False), 0)
         with patch.object(dispatcher, "resubmit_download_request", wraps=dispatcher.resubmit_download_request) as resubmit, patch.object(
             dispatcher, "_submit_guangya", side_effect=self.success
         ) as gy, patch.object(dispatcher, "_submit_qb") as qb:
             result = engine.download(entries["guangya"])
-        resubmit.assert_called_once()
-        self.assertEqual(resubmit.call_args.args[:2], (original, "guangya"))
-        self.assertTrue(result["ok"], result)
-        gy.assert_called_once()
+        resubmit.assert_not_called()
+        self.assertFalse(result["ok"], result)
+        self.assertIn("fixture organize failure", result["error"])
+        gy.assert_not_called()
         qb.assert_not_called()
-        self.assertNotIn(result["request_id"], {original, qb_successor})
+        self.assertEqual(result["request_id"], original)
+        self.assertEqual(dict(assert_present(rss_repo.get_rss_entry(entries["guangya"]))), before)
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 2)
         self.assertEqual(rss_entry_delivery(rss_repo.get_rss_entry(entries["qb"]))["request_id"], qb_successor)
         self.assertEqual(rss_entry_delivery(rss_repo.get_rss_entry(entries["guangya"]))["request_id"], result["request_id"])
 
@@ -523,7 +532,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
             first = engine.download(entries["qb"])
         self.assertTrue(first["ok"], first)
         download_requests_repo.update_download_request(first["request_id"], status="failed", qb_status="failed")
-        download_requests_repo.update_download_request(original, organize_status="failed", organize_error="fixture organize failure")
+        download_requests_repo.update_download_request(original, gy_status="failed")
         cloud_entry = assert_present(rss_repo.get_rss_entry(entries["guangya"]))
         self.assertEqual((cloud_entry["status"], cloud_entry["processed"], cloud_entry["delivery_retryable"]), ("downloaded", 1, 1))
         with patch.object(dispatcher, "_submit_guangya", side_effect=self.success) as gy, patch.object(dispatcher, "_submit_qb") as qb:
