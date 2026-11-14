@@ -1,9 +1,6 @@
 """光鸭目录级手动刮削与自动匹配回归测试。"""
 from __future__ import annotations
 
-from app.modules.directory_media import DirectoryInspection
-from app.modules.directory_scrape import PreviewRecord
-
 from app.modules.process_lock import CrossProcessLock
 
 from typing import cast
@@ -3258,6 +3255,155 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
         return service, store, client
 
+    def _build_mf_staging(self, *, active=False, with_confirmation=False):
+        from app.repositories import download_requests, organize_confirmations
+
+        self.enterContext(isolated_test_database("directory-mf-staging.db"))
+        self.enterContext(patch("app.modules.organize_tasks.config.get", side_effect=lambda key, default="": default))
+        self.enterContext(patch("app.modules.telegram_notification_center.wake_telegram_notification_dispatcher"))
+        self.enterContext(patch("app.modules.organize_confirmations.wake_recognition_review_dispatcher"))
+        service, _store, client = self._build(
+            clean_empty=True,
+            directory_name="MF-42-Arifureta Shokugyou de Sekai Saikyou 2nd Season",
+        )
+        self.addCleanup(service.close)
+        client.tree["0"] = [client.infos["source"], client.infos["archive"]]
+        videos = list(client.tree["source"])
+        nested_id = client.create_dir("Season 2", "source")
+        client.move([item.file_id for item in videos], nested_id)
+        request_id, _ = download_requests.create_download_request("directory-mf-staging", "magnet")
+        download_requests.update_download_request(
+            request_id, targets="guangya", status="downloading" if active else "completed",
+            gy_status="downloading" if active else "completed", gy_isolated=1,
+            gy_target_dir="source", gy_staging_parent_dir="0",
+            gy_staging_name=client.infos["source"].name,
+            gy_staging_cleanup_status="pending" if active else "retained",
+            organize_started=0 if active else 1,
+            organize_status="queued" if active else "requires_manual" if with_confirmation else "completed",
+            organize_task_id="old-task", gy_task_id="cloud-task", gy_task_ids='["cloud-task"]',
+        )
+        if with_confirmation:
+            organize_confirmations.create_organize_confirmation(
+                token="mf-old-card", fingerprint="mf-old-card", chat_id="", source_name="MF staging",
+                directory_path="/", expires_at="2099-01-01 00:00:00",
+                payload={
+                    "source_dir_id": "source", "organize_task_id": "old-task",
+                    "download_request_ids": [request_id],
+                    "files": [{
+                        "file_id": item.file_id, "parent_id": nested_id, "name": item.name,
+                        "size": item.size, "etag": item.etag,
+                    } for item in videos],
+                },
+            )
+        return service, client, request_id, nested_id
+
+    def _drain_mf_staging_cleanup(self, service, client):
+        from app.modules.download_staging_reconcile import reconcile_with_client
+
+        lock = CrossProcessLock("guangya-organize", directory=self.test_db_path.parent)
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            return reconcile_with_client(client, rules=service.rules_loader(), writer_lock=lock)
+        finally:
+            lock.release()
+
+    def test_execute_preserves_active_download_staging_root_and_children(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+        from app.repositories import download_requests
+
+        service, client, request_id, nested_id = self._build_mf_staging(active=True)
+        original_infos = dict(client.infos)
+        original_tree = {key: tuple(item.file_id for item in items) for key, items in client.tree.items()}
+        with (
+            patch.object(client, "create_dir", wraps=client.create_dir) as create,
+            patch.object(client, "move", wraps=client.move) as move,
+            patch.object(client, "rename", wraps=client.rename) as rename,
+            patch.object(client, "delete", wraps=client.delete) as delete,
+            patch.object(client, "delete_empty_directory", wraps=client.delete_empty_directory) as delete_empty,
+        ):
+            for scope_id in ("source", nested_id):
+                with self.subTest(scope_id=scope_id):
+                    inspected = service.inspect("owner", scope_id)
+                    preview = service.preview("owner", inspected["inspection_id"], "86034", "tv")
+                    with self.assertRaises(DirectoryScrapeConflictError):
+                        service.execute_preview("owner", preview["preview_id"])
+                    self.assertFalse(service.store.get_preview("owner", preview["preview_id"]).claimed)
+            for operation in (create, move, rename, delete, delete_empty):
+                operation.assert_not_called()
+        self.assertEqual(client.infos, original_infos)
+        self.assertEqual({key: tuple(item.file_id for item in items) for key, items in client.tree.items()}, original_tree)
+        self.assertEqual(client.deleted, [])
+        row = download_requests.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["gy_status"], row["gy_staging_cleanup_status"]), ("downloading", "pending"))
+
+    def test_execute_reconciles_completed_download_card_and_durable_staging_cleanup(self):
+        from app.repositories import download_requests, organize_confirmations
+
+        service, client, request_id, nested_id = self._build_mf_staging(with_confirmation=True)
+        inspected = service.inspect("owner", "source")
+        preview = service.preview("owner", inspected["inspection_id"], "86034", "tv")
+        result = service.execute_preview("owner", preview["preview_id"])
+
+        self.assertEqual(result["stats"]["moved"], 2)
+        self.assertEqual(result["stats"]["source_dir_cleaned"], int("source" not in client.infos))
+        card = organize_confirmations.get_organize_confirmation("mf-old-card")
+        assert card is not None
+        self.assertEqual(card["status"], "completed")
+        with db.get_conn() as conn:
+            job = conn.execute(
+                "SELECT status FROM download_staging_reconcile WHERE confirmation_id=?", (card["id"],),
+            ).fetchone()
+        self.assertIsNotNone(job)
+        self._drain_mf_staging_cleanup(service, client)
+        row = download_requests.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["status"], row["gy_status"]), ("completed", "completed"))
+        self.assertEqual((row["organize_status"], row["gy_staging_cleanup_status"]), ("completed", "completed"))
+        self.assertEqual(row["gy_staging_cleanup_error"], "")
+        for file_id in ("episode-1", "episode-2"):
+            video = client.infos[file_id]
+            self.assertNotIn(video.parent_id, ("source", nested_id))
+            self.assertIn(video, client.tree[video.parent_id])
+        self.assertNotIn("source", client.infos)
+        self.assertNotIn(nested_id, client.infos)
+        self.assertEqual(client.deleted.count("source"), 1)
+        self.assertEqual(client.deleted.count(nested_id), 1)
+        with db.get_conn() as conn:
+            job = conn.execute(
+                "SELECT status FROM download_staging_reconcile WHERE confirmation_id=?", (card["id"],),
+            ).fetchone()
+        assert job is not None
+        self.assertEqual(job["status"], "completed")
+        deleted = list(client.deleted)
+        self._drain_mf_staging_cleanup(service, client)
+        self.assertEqual(client.deleted, deleted)
+
+    def test_execute_cleans_completed_download_staging_without_a_confirmation_card(self):
+        from app.repositories import download_requests
+
+        service, client, request_id, nested_id = self._build_mf_staging()
+        inspected = service.inspect("owner", nested_id)
+        preview = service.preview("owner", inspected["inspection_id"], "86034", "tv")
+        result = service.execute_preview("owner", preview["preview_id"])
+
+        self.assertEqual(result["stats"]["moved"], 2)
+        self.assertEqual(result["stats"]["source_dir_cleaned"], int("source" not in client.infos))
+        row = download_requests.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["status"], row["gy_status"]), ("completed", "completed"))
+        self.assertEqual((row["organize_status"], row["gy_staging_cleanup_status"]), ("completed", "completed"))
+        self.assertEqual(row["gy_staging_cleanup_error"], "")
+        for file_id in ("episode-1", "episode-2"):
+            video = client.infos[file_id]
+            self.assertNotIn(video.parent_id, ("source", nested_id))
+            self.assertIn(video, client.tree[video.parent_id])
+        self.assertNotIn("source", client.infos)
+        self.assertNotIn(nested_id, client.infos)
+        deleted = list(client.deleted)
+        self._drain_mf_staging_cleanup(service, client)
+        self.assertEqual(client.deleted, deleted)
+
     def test_directory_inferred_season_is_used_by_preview_and_execute(self):
         service, store, client = self._build()
         inspected = service.inspect("owner", "source")
@@ -3550,7 +3696,7 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
         configured = '[{"id":"source","name":"永久来源"}]'
 
-        with patch("app.modules.directory_scrape.config.get", return_value=configured):
+        with patch("app.modules.organize_tasks.config.get", return_value=configured):
             result = service.execute_preview("owner", preview["preview_id"])
 
         self.assertEqual(result["stats"]["source_dir_cleaned"], 0)
@@ -3563,7 +3709,11 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         self.assertIn("source", client.infos)
 
     def test_cleanup_refreshes_directory_version_after_confirming_it_is_empty(self):
+        from app.modules.organize import Organizer
+        from app.modules.organize_tasks import _cleanup_manual_source_root
+
         service, _store, client = self._build(clean_empty=True)
+        self.addCleanup(service.close)
         client.tree["source"] = []
         fresh = GuangYaFile(
             "source", "下载目录", True, 0, "etag-fresh", "0", updated_at=99
@@ -3572,13 +3722,13 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         original_delete = client.delete_empty_directory
         client.file_info = Mock(wraps=client.file_info)
         client.delete_empty_directory = Mock(wraps=original_delete)
-        record = SimpleNamespace(
-            scope_type="directory", scope_id="source", rules=service.rules_loader()
-        )
-        current = SimpleNamespace(directory_id="source", directory_name="下载目录")
+        organizer = Organizer(client=cast(GuangYaClient, client), scraper=service.scraper)
+        self.addCleanup(organizer.close)
         stats = {}
 
-        service._cleanup_selected_source(cast(PreviewRecord, record), cast(DirectoryInspection, current), stats)
+        _cleanup_manual_source_root(
+            organizer, "source", "下载目录", service.rules_loader(), stats, trigger_type="manual",
+        )
 
         client.file_info.assert_called_once_with("source")
         client.delete_empty_directory.assert_called_once_with(
@@ -3587,20 +3737,20 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["source_dir_cleaned"], 1)
 
     def test_cleanup_rechecks_cancel_immediately_before_recycle_delete(self):
+        from app.modules.organize import Organizer
+        from app.modules.organize_tasks import _cleanup_manual_source_root
+
         service, _store, client = self._build(clean_empty=True)
+        self.addCleanup(service.close)
         client.tree["source"] = []
         client.delete_empty_directory = Mock(wraps=client.delete_empty_directory)
-        record = SimpleNamespace(
-            scope_type="directory", scope_id="source", rules=service.rules_loader()
-        )
-        current = SimpleNamespace(directory_id="source", directory_name="下载目录")
+        organizer = Organizer(client=cast(GuangYaClient, client), scraper=service.scraper)
+        self.addCleanup(organizer.close)
         stats = {}
         checks = iter((False, True))
 
-        service._cleanup_selected_source(
-            cast(PreviewRecord, record),
-            cast(DirectoryInspection, current),
-            stats,
+        _cleanup_manual_source_root(
+            organizer, "source", "下载目录", service.rules_loader(), stats, trigger_type="manual",
             cancel_check=lambda: next(checks),
         )
 
@@ -3616,17 +3766,19 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
 
     def test_cleanup_preserves_empty_source_when_execution_stats_are_unsafe(self):
-        from types import SimpleNamespace
+        from app.modules.organize import Organizer
+        from app.modules.organize_tasks import _cleanup_manual_source_root
 
         service, _store, client = self._build(clean_empty=True)
+        self.addCleanup(service.close)
         client.tree["source"] = []
-        record = SimpleNamespace(
-            scope_type="directory", scope_id="source", rules=service.rules_loader()
-        )
-        current = SimpleNamespace(directory_id="source", directory_name="下载目录")
+        organizer = Organizer(client=cast(GuangYaClient, client), scraper=service.scraper)
+        self.addCleanup(organizer.close)
         stats = {"failed": 1}
 
-        service._cleanup_selected_source(cast(PreviewRecord, record), cast(DirectoryInspection, current), stats)
+        _cleanup_manual_source_root(
+            organizer, "source", "下载目录", service.rules_loader(), stats, trigger_type="manual",
+        )
 
         self.assertEqual(stats["source_dir_cleaned"], 0)
         self.assertEqual(stats["source_dir_cleanup_skipped"], 1)
@@ -3655,9 +3807,11 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["stats"]["source_dir_cleaned"], 0)
         self.assertEqual(result["stats"]["source_dir_cleanup_not_empty"], 1)
         self.assertIn(
-            "仍有 1 个文件或子目录",
+            "仍含",
             result["stats"]["empty_dir_cleanup_reasons"][0],
         )
+        self.assertEqual([item.file_id for item in client.tree["source"]], ["note"])
+        self.assertEqual(client.infos["note"].name, "说明.txt")
         self.assertNotIn("source", client.deleted)
         self.assertIn("source", client.infos)
 

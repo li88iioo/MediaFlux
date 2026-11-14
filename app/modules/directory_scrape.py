@@ -12,7 +12,6 @@ from sqlite3 import Row
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 
-from app import config
 from app import database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.logger import get_logger
@@ -40,12 +39,7 @@ from app.modules.organize import (
     organize_rules_snapshot,
     organize_rules_snapshot_changes,
 )
-from app.modules.organize_delete_audit import (
-    DeleteCandidate,
-    execute_recycle_bin_delete,
-)
 from app.modules.organize_postprocess import companion_target_name, media_role
-from app.modules.organize_sources import normalize_organize_sources
 from app.modules.scraper import Candidate, MatchResult, ReleaseParseResult, TMDBScraper
 from app.modules.special_media import is_special_media_name, is_special_path
 from app.modules.subtitle_identity import plan_subtitle_companions
@@ -1663,6 +1657,17 @@ class DirectoryScrapeService:
             if self._plan_signature(current_plans, current_companions) != record.signature:
                 raise DirectoryScrapeConflictError("归档计划已变化，请重新检查并确认")
             check_cancel()
+            from app.modules.download_staging_cleanup import source_inside_protected_staging
+            from app.modules.organize_tasks import _cleanup_manual_source_root
+            from app.repositories import download_requests as download_requests_repo
+            from app.repositories.download_staging import list_staging_cleanup_requests
+
+            staging_ids = download_requests_repo.list_protected_guangya_staging_ids()
+            active_ids = {str(row["gy_target_dir"]) for row in list_staging_cleanup_requests(active_only=True)}
+            if active_ids.intersection(source_member_ids) or source_inside_protected_staging(
+                self.client, current.directory_id, active_ids,
+            ):
+                raise DirectoryScrapeConflictError("下载目录仍在写入或整理中，请等待当前任务完成后重新预览")
             _plans, stats = organizer.organize(
                 record.inspection.directory_id,
                 record.rules,
@@ -1672,6 +1677,7 @@ class DirectoryScrapeService:
                 source_snapshots=source_snapshots,
                 group_pipeline=record.scope_type == "directory" and not current.pending_videos,
                 source_name=record.inspection.directory_name,
+                protected_source_ids=staging_ids,
                 require_complete_scan=True,
                 # 执行阶段只读探测缓存，保证最终文件名与用户确认过的预览
                 # 完全一致；缓存由预览阶段的在线探测负责预热。
@@ -1689,8 +1695,11 @@ class DirectoryScrapeService:
         self._apply_pending_stats(stats, current)
         # 所有收尾步骤共用取消门，顺序仍为源目录清理、通知、联动。
         for finish in (
-            lambda: self._cleanup_selected_source(
-                record, current, stats, cancel_check=cancellation_requested),
+            lambda: _cleanup_manual_source_root(
+                organizer, record.scope_id, current.directory_name, record.rules, stats,
+                trigger_type="manual" if record.scope_type == "directory" else "file",
+                cancel_check=cancellation_requested,
+            ),
             lambda: Organizer.notify_directory_results(
                 stats, record.rules, source_name=record.inspection.directory_name),
             lambda: Organizer.trigger_post_actions(
@@ -1768,161 +1777,6 @@ class DirectoryScrapeService:
                     item.file_id,
                     type(exc).__name__,
                 )
-
-    def _cleanup_selected_source(
-        self,
-        record: PreviewRecord,
-        current: DirectoryInspection,
-        stats: dict,
-        *,
-        cancel_check: Callable[[], bool] | None = None,
-    ) -> None:
-        """目录刮削完成后，复核并清理用户本次选择的空目录根。"""
-        stats.setdefault("source_dir_cleaned", 0)
-        stats.setdefault("empty_dir_cleanup_reasons", [])
-        if record.scope_type != "directory" or not record.rules.clean_empty:
-            return
-        cleanup_unsafe = bool(
-            stats.get("failed")
-            or stats.get("scan_errors")
-            or stats.get("stopped")
-            or stats.get("replacement_cleanup_failed")
-            or stats.get("audit_failures")
-        )
-        if cleanup_unsafe:
-            stats["source_dir_cleanup_skipped"] = 1
-            Organizer._append_reason(
-                stats,
-                "empty_dir_cleanup_reasons",
-                "本次刮削存在失败或审计异常，已保留所选源目录用于核对",
-                limit=6,
-            )
-            logger.warning("目录刮削存在失败或审计异常，已保留所选源目录用于核对")
-            return
-        source_id = (record.scope_id or current.directory_id)
-        configured_sources, config_error = normalize_organize_sources(
-            config.get("GY_ORGANIZE_SOURCE_DIRS", "")
-        )
-        protected_ids = {
-            "0",
-            (record.rules.target_dir_id or "").strip(),
-            *((item.get("id") or "").strip() for item in configured_sources),
-        }
-        protected_ids.discard("")
-        if config_error:
-            stats["source_dir_cleanup_skipped"] = 1
-            Organizer._append_reason(
-                stats,
-                "empty_dir_cleanup_reasons",
-                "整理来源配置无法安全解析，已保留所选源目录",
-                limit=6,
-            )
-            logger.warning(
-                "永久整理源配置无效，目录刮削已保留所选源目录: %s",
-                config_error,
-            )
-            return
-        if source_id in protected_ids:
-            stats["source_dir_cleanup_protected"] = 1
-            Organizer._append_reason(
-                stats,
-                "empty_dir_cleanup_reasons",
-                "配置的来源或归档根目录按安全策略保留，仅清理其中的空子目录",
-                limit=6,
-            )
-            return
-        if cancel_check is not None and cancel_check():
-            stats["stopped"] = 1
-            stats["source_dir_cleanup_skipped"] = 1
-            Organizer._append_reason(
-                stats,
-                "empty_dir_cleanup_reasons",
-                "任务已停止，已保留所选源目录",
-                limit=6,
-            )
-            return
-        try:
-            remaining = self.client.list_dir(source_id)
-            if remaining:
-                stats["source_dir_cleanup_not_empty"] = len(remaining)
-                Organizer._append_reason(
-                    stats,
-                    "empty_dir_cleanup_reasons",
-                    f"所选源目录仍有 {len(remaining)} 个文件或子目录，已保留",
-                    limit=6,
-                )
-                return
-            source = self.client.file_info(source_id)
-            delete_empty = getattr(self.client, "delete_empty_directory", None)
-            explicit_capability = getattr(
-                self.client, "supports_guarded_empty_directory_delete", None
-            )
-            if explicit_capability is None:
-                explicit_capability = getattr(
-                    self.client, "supports_atomic_empty_directory_delete", None
-                )
-            if source is None or not source.is_dir:
-                stats["source_dir_cleanup_unavailable"] = 1
-                raise RuntimeError("所选源目录状态已变化，已安全保留")
-            if not callable(delete_empty) or explicit_capability is False:
-                stats["source_dir_cleanup_unsupported"] = 1
-                raise RuntimeError("云盘接口不支持安全清理所选源目录")
-            expected_etag = str(getattr(source, "etag", "") or "")
-            try:
-                expected_updated_at = max(
-                    0, int(getattr(source, "updated_at", 0) or 0)
-                )
-            except (TypeError, ValueError):
-                expected_updated_at = 0
-            if not expected_etag and not expected_updated_at:
-                raise RuntimeError("所选源目录缺少可验证版本信息")
-            def delete_operation():
-                if cancel_check is not None and cancel_check():
-                    raise OrganizeOperationCancelled("光鸭操作已取消")
-                return delete_empty(
-                    source_id,
-                    expected_etag=expected_etag,
-                    expected_updated_at=expected_updated_at,
-                )
-
-            execute_recycle_bin_delete(
-                self.client,
-                trigger="directory_scrape_source_cleanup",
-                reason="目录刮削完成后清理本次选择的空源目录",
-                candidate=DeleteCandidate(
-                    file_id=source_id,
-                    name=source.name or current.directory_name,
-                    parent_id=(source.parent_id or "0"),
-                ),
-                delete_operation=delete_operation,
-            )
-            stats["source_dir_cleaned"] = 1
-            stats["empty_dirs_cleaned"] = int(stats.get("empty_dirs_cleaned", 0) or 0) + 1
-            logger.info("目录刮削已清理空源目录: %s", source_id)
-        except OrganizeOperationCancelled:
-            stats["stopped"] = 1
-            stats["source_dir_cleanup_skipped"] = 1
-            Organizer._append_reason(
-                stats,
-                "empty_dir_cleanup_reasons",
-                "任务已停止，已保留所选源目录",
-                limit=6,
-            )
-        except Exception as exc:
-            stats["source_dir_cleanup_failed"] = 1
-            reason = " ".join(str(exc or type(exc).__name__).split())[:160]
-            Organizer._append_reason(
-                stats,
-                "empty_dir_cleanup_reasons",
-                reason or "所选源目录清理失败，已安全保留",
-                limit=6,
-            )
-            logger.warning(
-                "目录刮削清理空源目录失败 source=%s type=%s",
-                source_id,
-                type(exc).__name__,
-            )
-
 
     def _inspect_scope(
         self,

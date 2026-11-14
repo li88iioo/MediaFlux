@@ -7508,6 +7508,12 @@ class Organizer:
                 "reasons": ["云盘接口不支持安全空目录清理"] if candidates else [],
             }
 
+        # 通用目录清理不接管下载暂存树；完整请求身份与结算由专用收尾内核负责。
+        from app.modules.download_staging_cleanup import source_inside_protected_staging
+        from app.repositories import download_requests as download_requests_repo
+
+        staging_ids = download_requests_repo.list_protected_guangya_staging_ids() if unique_dirs else set()
+        parent_infos: dict[str, GuangYaFile] = {}
         failure_reasons: dict[str, int] = {}
         for item in sorted(unique_dirs.values(), key=lambda row: row[1], reverse=True):
             dir_id, _depth = item[:2]
@@ -7531,6 +7537,10 @@ class Organizer:
                 current = self.client.file_info(dir_id)
                 if current is None or not bool(getattr(current, "is_dir", False)):
                     unavailable += 1
+                    continue
+                parent_infos[dir_id] = current
+                if source_inside_protected_staging(self.client, dir_id, staging_ids, info_cache=parent_infos):
+                    protected_count += 1
                     continue
                 expected_etag = str(getattr(current, "etag", "") or "")
                 try:
@@ -7583,7 +7593,7 @@ class Organizer:
             )
         reasons: list[str] = []
         if protected_count:
-            reasons.append(f"{protected_count} 个来源或归档根目录按安全策略保留")
+            reasons.append(f"{protected_count} 个来源、归档或下载目录按安全策略保留")
         if not_empty:
             reasons.append(
                 f"{not_empty} 个目录仍含待确认、跳过、伴随或其他文件"

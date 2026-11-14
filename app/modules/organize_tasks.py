@@ -294,6 +294,7 @@ def _cleanup_manual_source_root(
     stats: dict[str, Any],
     *,
     trigger_type: str,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> None:
     """安全清理手动选择的临时空源根，永久配置根和归档根永不删除。"""
     stats.setdefault("source_dir_cleaned", 0)
@@ -336,6 +337,27 @@ def _cleanup_manual_source_root(
             limit=6,
         )
         return
+    try:
+        staging_ids = download_requests_repo.list_protected_guangya_staging_ids()
+        parents: dict[str, Any] = {}
+        if source_inside_protected_staging(organizer.client, source_id, staging_ids, info_cache=parents):
+            from app.modules.organize_confirmations import _finalize_confirmed_downloads
+
+            root_id = source_id if source_id in staging_ids else next(
+                str(item.parent_id) for item in parents.values() if str(item.parent_id) in staging_ids
+            )
+            _finalize_confirmed_downloads(
+                {"source_dir_id": root_id}, organizer.client, stats, rules,
+                cancel_check=cancel_check,
+            )
+            return
+    except Exception as exc:
+        stats["source_dir_cleanup_failed"] = int(stats.get("source_dir_cleanup_failed", 0) or 0) + 1
+        Organizer._append_reason(
+            stats, "empty_dir_cleanup_reasons", "下载目录归属无法核实，已保留来源目录", limit=6,
+        )
+        logger.warning("手动来源目录归属核验失败 type=%s", type(exc).__name__)
+        return
     if source_id in protected:
         stats["source_dir_cleanup_protected"] = int(
             stats.get("source_dir_cleanup_protected", 0) or 0
@@ -354,10 +376,14 @@ def _cleanup_manual_source_root(
     report = cleanup(
         [(source_id, 0, "", 0)],
         protected_source_ids=protected,
+        cancel_check=cancel_check,
     )
     if not isinstance(report, dict):
         return
     cleaned = int(report.get("cleaned", 0) or 0)
+    if report.get("stopped"):
+        stats["stopped"] = 1
+        stats["source_dir_cleanup_skipped"] = int(stats.get("source_dir_cleanup_skipped", 0) or 0) + 1
     failures = int(report.get("delete_failures", 0) or 0)
     unsupported = int(report.get("unsupported", 0) or 0)
     for report_key, stats_key in (
@@ -2388,6 +2414,7 @@ class OrganizeTaskManager:
         expected_identities: dict[int, dict] | None = None,
         allow_running: bool = True,
         source_stats: dict[str, dict] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict:
         current_rules = rules or OrganizeRules.from_config()
         protected, error = _protected_organize_root_ids(current_rules)
@@ -2416,6 +2443,7 @@ class OrganizeTaskManager:
                 client, request_ids, source_ids={source_id}, protected_ids=protected,
                 enabled=current_rules.clean_empty or (type(recycled) is int and recycled > 0),
                 allow_running=allow_running, expected_identities=expected_identities,
+                cancel_check=cancel_check,
             )
             merge_cleanup_report(combined, report)
         return combined

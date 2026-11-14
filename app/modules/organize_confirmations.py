@@ -15,6 +15,7 @@ import time
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
+from typing import Callable
 
 from app import database as db
 from app.agent import feature_gate
@@ -2558,7 +2559,8 @@ def _confirmation_notification_threads(
 
 
 def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: OrganizeRules,
-                                  *, confirmation_token: str = '') -> list[int]:
+                                  *, confirmation_token: str = '',
+                                  cancel_check: Callable[[], bool] | None = None) -> list[int]:
     """完成确认后收口原下载业务；通知rollup不是删除权限或业务身份。"""
 
     from app.modules.organize_tasks import OrganizeTaskManager
@@ -2570,6 +2572,9 @@ def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: Org
     request_ids: list[int] = []
     cleanup_ids: list[int] = []
     try:
+        if cancel_check is not None and cancel_check():
+            stats["stopped"] = 1
+            return []
         rows = requests_for_download_confirmation(payload)
         for row in rows:
             if (row.get("gy_status") != "completed"
@@ -2579,7 +2584,7 @@ def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: Org
                 continue
             request_ids.append(int(row["id"]))
             if not confirmation_token:
-                closed = complete_staging_confirmation_phase(row)
+                closed = row.get("organize_status") == "completed" or complete_staging_confirmation_phase(row)
                 if closed and not any(stats.get(key) for key in (
                     "failed", "need_confirm", "stopped", "scan_errors", "audit_failures",
                     "duplicate_cleanup_failed",
@@ -2608,7 +2613,12 @@ def _finalize_confirmed_downloads(payload: dict, client, stats: dict, rules: Org
                  for row in rows if int(row["id"]) in cleanup_ids],
                 rules=rules,
                 source_stats={str(row["gy_target_dir"]): stats for row in rows if int(row["id"]) in cleanup_ids},
+                cancel_check=cancel_check,
             )
+        if cancel_check is not None and cancel_check():
+            stats["stopped"] = 1
+        if str(payload.get("source_dir_id") or "") in report.get("_cleaned_roots", []):
+            stats["source_dir_cleaned"] = int(stats.get("source_dir_cleaned") or 0) + 1
         stats["empty_dirs_cleaned"] = int(stats.get("empty_dirs_cleaned") or 0) + int(report.get("cleaned") or 0)
         for reason in report.get("reasons", []):
             Organizer._append_reason(stats, "empty_dir_cleanup_reasons", reason, limit=8)

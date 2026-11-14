@@ -189,6 +189,30 @@ class DownloadStagingCleanupLifecycleTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.clean()['cleaned'], 0)
         self.assertEqual(self.cloud.deleted, ['stage'])
 
+    def test_cancellation_after_delete_audit_prevents_provider_write_and_allows_safe_retry(self):
+        stopped = False
+        add_audit = db.add_organize_delete_audit
+
+        def cancel_after_audit(**kwargs):
+            nonlocal stopped
+            audit_id = add_audit(**kwargs)
+            stopped = True
+            return audit_id
+
+        with patch.object(db, 'add_organize_delete_audit', side_effect=cancel_after_audit):
+            report = cleanup_download_staging(
+                self.cloud, [self.request_id], source_ids={'stage'}, protected_ids={'0'},
+                cancel_check=lambda: stopped,
+            )
+        self.assertEqual(report['cleaned'], 0)
+        self.assertEqual(self.cloud.deleted, [])
+        self.assertEqual(db.list_organize_delete_audits(limit=1)[0]['status'], 'blocked')
+        row = download_requests_repo.get_download_request(self.request_id)
+        assert row is not None
+        self.assertEqual(row['gy_staging_cleanup_status'], 'retained')
+        self.assertEqual(self.clean()['cleaned'], 1)
+        self.assertEqual(self.cloud.deleted, ['stage'])
+
     def test_restarted_unknown_nested_directory_delete_is_not_replayed(self):
         self.cloud.add_dir('leaf', 'stage')
         audit_id = db.add_organize_delete_audit(

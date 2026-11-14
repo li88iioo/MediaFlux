@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import organize_history as organize_history_repo
@@ -175,6 +175,7 @@ def cleanup_download_staging(
     enabled: bool = True, allow_running: bool = False,
     scope_ids: set[str] | None = None,
     expected_identities: dict[int, dict] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """只清理明确请求与来源根的交集；不从名称/时间猜测请求归属。"""
     report = cleanup_report()
@@ -250,6 +251,8 @@ def cleanup_download_staging(
 
             def validate_write(current_id, *, expected_version=None, chain=directory_chain,
                                expected_row=row, current_request_id=request_id, current_root=root_id):
+                if cancel_check is not None and cancel_check():
+                    raise _RetainDirectory('protected', '任务已停止，已保留剩余下载目录')
                 if expected_row.get('_confirmation_id') and not is_current_staging_confirmation(
                     expected_row['_confirmation_id'], current_root,
                 ):
@@ -457,6 +460,10 @@ def merge_cleanup_report(target: dict, other: dict) -> None:
     for key in ('cleaned', 'scanned', 'candidates', 'protected', 'not_empty', 'unavailable',
                 'unsupported', 'scan_failures', 'delete_failures'):
         target[key] = int(target.get(key) or 0) + max(0, int(other.get(key) or 0))
+    for key in ('_cleaned_roots', '_retained_roots'):
+        target[key] = list(dict.fromkeys([*target.get(key, []), *other.get(key, [])]))
+    for key in ('_retryable', '_blocked'):
+        target[key] = bool(target.get(key) or other.get(key))
     for reason in other.get('reasons', []):
         if reason not in target['reasons'] and len(target['reasons']) < 8:
             target['reasons'].append(reason)

@@ -615,6 +615,7 @@ class ManualSourceRootCleanupTests(unittest.TestCase):
         organizer._clean_empty_dirs_report.assert_called_once_with(
             [("temporary", 0, "", 0)],
             protected_source_ids={"0", "archive"},
+            cancel_check=None,
         )
         self.assertEqual(stats["source_dir_cleaned"], 1)
         self.assertEqual(stats["empty_dirs_cleaned"], 1)
