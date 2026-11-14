@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 import zipfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -789,89 +789,79 @@ class BackupTests(unittest.TestCase):
                 trusted_reader.close()
                 replacement_reader.close()
 
-    def test_interrupted_restore_rolls_back_all_files_on_recovery(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = make_paths(root / "source")
-            source.ensure_writable_dirs()
-            source_db = sqlite3.connect(source.database_path)
-            source_db.execute("CREATE TABLE sample(value TEXT)")
-            source_db.execute("INSERT INTO sample VALUES ('new')")
-            source_db.commit()
-            source_db.close()
-            source.env_file.write_text("WEB_PORT=12370\n", encoding="utf-8")
-            source.token_file.write_text('{"token":"new"}', encoding="utf-8")
-            archive = create_backup(source)
+    def test_hot_journal_restore_preserves_content_and_recovers_each_phase(self) -> None:
+        for phase in ("complete", "prepared", "committed"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, target = make_paths(root / "source"), make_paths(root / "target")
+                for paths, value, port in ((source, "new", 12370), (target, "old", 1)):
+                    paths.ensure_writable_dirs()
+                    with closing(sqlite3.connect(paths.database_path)) as conn, conn:
+                        conn.execute("CREATE TABLE sample(value TEXT)")
+                        conn.executemany("INSERT INTO sample VALUES (?)", [(value + "x" * 8000,)] * 200)
+                    paths.env_file.write_text(f"WEB_PORT={port}\n", encoding="utf-8")
+                    paths.token_file.write_text(json.dumps({"token": value}), encoding="utf-8")
+                archive = create_backup(source)
 
-            target = make_paths(root / "target")
-            target.ensure_writable_dirs()
-            target_db = sqlite3.connect(target.database_path)
-            target_db.execute("CREATE TABLE sample(value TEXT)")
-            target_db.execute("INSERT INTO sample VALUES ('old')")
-            target_db.commit()
-            target_db.close()
-            target.env_file.write_text("WEB_PORT=1\n", encoding="utf-8")
-            target.token_file.write_text('{"token":"old"}', encoding="utf-8")
+                # 小缓存强制未提交页落盘；进程直接退出，留下真正需要回滚的热日志。
+                crash = subprocess.run(
+                    [sys.executable, "-B", "-c", """
+import os, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute('PRAGMA journal_mode=DELETE')
+conn.execute('PRAGMA cache_size=5')
+conn.execute('BEGIN IMMEDIATE')
+conn.execute("UPDATE sample SET value='uncommitted-' || value")
+os._exit(0)
+""", str(target.database_path)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(crash.returncode, 0, crash.stdout + crash.stderr)
+                sqlite_journal = Path(str(target.database_path) + "-journal")
+                original_journal = sqlite_journal.read_bytes()
+                self.assertEqual(original_journal[:8], bytes.fromhex("d9d505f920a163d7"))
 
-            import app.modules.backup as backup_module
+                restore_journal = target.data_dir / ".mediaflux-restore.journal.json"
+                real_replace = os.replace
 
-            real_replace = backup_module.os.replace
-            interrupted = False
+                def replace_then_interrupt(source_path, destination_path):
+                    result = real_replace(source_path, destination_path)
+                    if Path(destination_path) == target.database_path and Path(source_path).name.endswith(".tmp"):
+                        raise KeyboardInterrupt("simulated power loss after database publication")
+                    return result
 
-            def replace_then_interrupt(source_path, destination_path):
-                nonlocal interrupted
-                result = real_replace(source_path, destination_path)
-                source_name = Path(source_path).name
-                if (
-                    not interrupted
-                    and Path(destination_path) == target.database_path
-                    and source_name.endswith(".tmp")
-                ):
-                    interrupted = True
-                    raise KeyboardInterrupt("simulated power loss")
-                return result
-
-            with patch("app.modules.backup.os.replace", side_effect=replace_then_interrupt):
-                with self.assertRaises(KeyboardInterrupt):
+                if phase == "complete":
                     restore_backup(target, archive)
+                else:
+                    interruption = (
+                        patch("app.modules.backup.os.replace", side_effect=replace_then_interrupt)
+                        if phase == "prepared" else patch(
+                            "app.modules.backup._recover_committed",
+                            side_effect=KeyboardInterrupt("simulated cleanup interruption"),
+                        )
+                    )
+                    with interruption, self.assertRaises(KeyboardInterrupt):
+                        restore_backup(target, archive)
+                    self.assertEqual(json.loads(restore_journal.read_text(encoding="utf-8"))["phase"], phase)
+                    self.assertEqual(sqlite_journal.read_bytes(), original_journal)
+                    self.assertTrue(recover_pending_restore(target))
 
-            self.assertTrue((target.data_dir / ".mediaflux-restore.journal.json").exists())
-            self.assertTrue(recover_pending_restore(target))
-            self.assertEqual(target.env_file.read_text(encoding="utf-8"), "WEB_PORT=1\n")
-            self.assertEqual(target.token_file.read_text(encoding="utf-8"), '{"token":"old"}')
-            check = sqlite3.connect(target.database_path)
-            try:
-                self.assertEqual(check.execute("SELECT value FROM sample").fetchone()[0], "old")
-            finally:
-                check.close()
-            self.assertFalse((target.data_dir / ".mediaflux-restore.journal.json").exists())
+                retained_journal = sqlite_journal.exists()
+                if phase == "prepared":
+                    self.assertEqual(sqlite_journal.read_bytes(), original_journal)
+                expected_value, expected_port = ("old", 1) if phase == "prepared" else ("new", 12370)
+                with closing(sqlite3.connect(target.database_path)) as check:
+                    self.assertEqual(check.execute("SELECT COUNT(*) FROM sample").fetchone()[0], 200)
+                    self.assertEqual(check.execute(
+                        "SELECT COUNT(*) FROM sample WHERE value=?", (expected_value + "x" * 8000,),
+                    ).fetchone()[0], 200)
+                    self.assertEqual(check.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(retained_journal, phase == "prepared")
+                self.assertEqual(target.env_file.read_text(encoding="utf-8"), f"WEB_PORT={expected_port}\n")
+                self.assertEqual(json.loads(target.token_file.read_text(encoding="utf-8")), {"token": expected_value})
+                self.assertFalse(restore_journal.exists())
+                self.assertFalse(recover_pending_restore(target))
 
-    def test_committed_restore_finishes_cleanup_after_interruption(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = make_paths(root / "source")
-            source.ensure_writable_dirs()
-            sqlite3.connect(source.database_path).close()
-            source.env_file.write_text("WEB_PORT=12370\n", encoding="utf-8")
-            archive = create_backup(source)
-
-            target = make_paths(root / "target")
-            target.ensure_writable_dirs()
-            sqlite3.connect(target.database_path).close()
-            target.env_file.write_text("WEB_PORT=1\n", encoding="utf-8")
-
-            with patch(
-                "app.modules.backup._recover_committed",
-                side_effect=KeyboardInterrupt("simulated cleanup interruption"),
-            ):
-                with self.assertRaises(KeyboardInterrupt):
-                    restore_backup(target, archive)
-
-            self.assertEqual(target.env_file.read_text(encoding="utf-8"), "WEB_PORT=12370\n")
-            self.assertTrue((target.data_dir / ".mediaflux-restore.journal.json").exists())
-            self.assertTrue(recover_pending_restore(target))
-            self.assertEqual(target.env_file.read_text(encoding="utf-8"), "WEB_PORT=12370\n")
-            self.assertFalse((target.data_dir / ".mediaflux-restore.journal.json").exists())
     def test_create_backup_fsyncs_archive_and_destination_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))

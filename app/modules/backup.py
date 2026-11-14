@@ -576,7 +576,7 @@ def _unlink_matching(path: Path, expected: dict[str, Any] | None) -> None:
 
 
 def _cleanup_database_sidecars(paths: RuntimePaths) -> None:
-    for suffix in ("-wal", "-shm"):
+    for suffix in ("-wal", "-shm", "-journal"):
         sidecar = Path(str(paths.database_path) + suffix)
         try:
             info = os.lstat(sidecar)
