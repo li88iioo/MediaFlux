@@ -71,12 +71,10 @@ class NyaaAdapter(DirectResultAdapter):
                     if self.endpoint_timeout_seconds is not None
                     else await operation
                 )
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, httpx.TimeoutException):
                 last_error = IndexerTimeout(f"Nyaa endpoint timed out: {base_url}")
-                continue
-            except httpx.TimeoutException:
-                last_error = IndexerTimeout(f"Nyaa endpoint timed out: {base_url}")
-                continue
+            except httpx.TransportError:
+                last_error = IndexerUnavailable(f"Nyaa endpoint unavailable: {base_url}")
             except (
                 HttpInvalidResponse,
                 IndexerRateLimited,
@@ -84,9 +82,9 @@ class NyaaAdapter(DirectResultAdapter):
                 IndexerUnavailable,
             ) as exc:
                 last_error = exc
-                continue
-            self._preferred_base_url = base_url
-            return page
+            else:
+                self._preferred_base_url = base_url
+                return page
         if last_error is None:
             raise IndexerUnavailable("Nyaa has no configured endpoint")
         raise last_error

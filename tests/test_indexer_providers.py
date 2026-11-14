@@ -420,7 +420,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.items[0].title, "Tefuda ga Oome no Victoria 04")
         self.assertEqual(page.items[0].detail_url, "https://nyaa.si/view/123")
 
-    async def test_nyaa_falls_back_to_mirror_when_primary_is_rate_limited(self):
+    async def test_nyaa_falls_back_to_mirror_when_primary_is_unavailable(self):
         class ScriptedHttpClient:
             def __init__(self, outcomes):
                 self.outcomes = list(outcomes)
@@ -428,7 +428,10 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
             async def get(self, url, *, params=None, headers=None, max_redirects=3):
                 self.calls.append({"url": url, "params": dict(params or {})})
-                status_code, body = self.outcomes.pop(0)
+                outcome = self.outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                status_code, body = outcome
                 return HttpResponse(
                     url=url,
                     status_code=status_code,
@@ -436,34 +439,36 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
                     body=body,
                 )
 
-        http = ScriptedHttpClient([(429, b""), (200, NYAA_HTML), (200, NYAA_HTML)])
-        adapter = NyaaAdapter(
-            site_id="nyaa",
-            site_name="Nyaa",
-            base_url="https://nyaa.si/",
-            http=http,
-            default_enabled=True,
-            mirror_base_urls=("https://nyaa.net/",),
-        )
+        for failure in ((429, b""), httpx.ConnectError("connection refused"), httpx.RemoteProtocolError("disconnected")):
+            with self.subTest(failure=type(failure).__name__):
+                http = ScriptedHttpClient([failure, (200, NYAA_HTML), (200, NYAA_HTML)])
+                adapter = NyaaAdapter(
+                    site_id="nyaa",
+                    site_name="Nyaa",
+                    base_url="https://nyaa.si/",
+                    http=http,
+                    default_enabled=True,
+                    mirror_base_urls=("https://nyaa.net/",),
+                )
 
-        page = await adapter.search(IndexerSearchRequest.create("Frieren", page=1))
+                page = await adapter.search(IndexerSearchRequest.create("Frieren", page=1))
 
-        self.assertEqual(len(http.calls), 2)
-        self.assertTrue(http.calls[0]["url"].startswith("https://nyaa.si/"))
-        self.assertTrue(http.calls[1]["url"].startswith("https://nyaa.net/"))
-        self.assertEqual(len(page.items), 1)
-        # 镜像返回的相对链接必须落在镜像域名上。
-        self.assertEqual(page.items[0].detail_url, "https://nyaa.net/view/123")
+                self.assertEqual(len(http.calls), 2)
+                self.assertTrue(http.calls[0]["url"].startswith("https://nyaa.si/"))
+                self.assertTrue(http.calls[1]["url"].startswith("https://nyaa.net/"))
+                self.assertEqual(len(page.items), 1)
+                # 镜像返回的相对链接必须落在镜像域名上。
+                self.assertEqual(page.items[0].detail_url, "https://nyaa.net/view/123")
 
-        await adapter.search(IndexerSearchRequest.create("Frieren 2", page=1))
-        self.assertEqual(len(http.calls), 3)
-        self.assertTrue(
-            http.calls[2]["url"].startswith("https://nyaa.net/"),
-            "最近成功的镜像应成为下一次搜索首选，避免重复请求已限流主站",
-        )
+                await adapter.search(IndexerSearchRequest.create("Frieren 2", page=1))
+                self.assertEqual(len(http.calls), 3)
+                self.assertTrue(
+                    http.calls[2]["url"].startswith("https://nyaa.net/"),
+                    "最近成功的镜像应成为下一次搜索首选，避免重复请求已限流主站",
+                )
 
-        resolved = await adapter.resolve(page.items[0])
-        self.assertEqual(resolved.kind, "magnet")
+                resolved = await adapter.resolve(page.items[0])
+                self.assertEqual(resolved.kind, "magnet")
 
     async def test_nyaa_endpoint_timeout_still_leaves_budget_for_mirror(self):
         class SlowPrimaryHttpClient:
@@ -498,6 +503,22 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(http.calls), 2)
         self.assertTrue(http.calls[0]["url"].startswith("https://nyaa.si/"))
         self.assertTrue(http.calls[1]["url"].startswith("https://nyaa.net/"))
+
+    async def test_nyaa_failed_endpoints_report_unavailable_but_cancellation_stops_immediately(self):
+        for error, expected, calls in (
+            (httpx.ConnectError("offline"), IndexerUnavailable, 2),
+            (asyncio.CancelledError(), asyncio.CancelledError, 1),
+        ):
+            with self.subTest(error=type(error).__name__):
+                http = FakeHttpClient(NYAA_HTML)
+                adapter = NyaaAdapter(
+                    site_id="nyaa", site_name="Nyaa", base_url="https://nyaa.si/", http=http,
+                    default_enabled=True, mirror_base_urls=("https://nyaa.net/",),
+                )
+                with patch.object(http, "get", side_effect=error) as get:
+                    with self.assertRaises(expected):
+                        await adapter.search(IndexerSearchRequest.create("Frieren"))
+                self.assertEqual(get.call_count, calls)
 
     async def test_nyaa_mirror_torrent_url_resolves_against_mirror_host(self):
         adapter = NyaaAdapter(
