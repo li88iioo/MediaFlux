@@ -127,7 +127,7 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertNotIn('class="agent-composer-header"', response.text)
         self.assertIn('id="toggleAgentRail"', response.text)
         self.assertIn('id="agentHistoryRail"', response.text)
-        self.assertIn("/settings#agent", response.text)
+        self.assertNotIn("/settings#agent", response.text)
         self.assertIn('id="agentSessionList"', response.text)
         self.assertIn('id="agentSessionCount"', response.text)
         self.assertRegex(

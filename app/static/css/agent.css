@@ -1954,9 +1954,10 @@ body.agent-page-body::after { display: none; }
 .agent-restore-actions button { flex: 0 0 auto; width: auto; min-height: 44px; padding-inline: 14px; font: inherit; }
 
 /* 会话栏：主要聊天固定在上方，旁聊在下；宽屏常驻，窄屏收为抽屉。输入框单行，发送按钮靠右。 */
-.agent-composer { flex-direction: row; align-items: flex-end; gap: 8px; padding: 6px 7px 6px 16px; border-radius: 24px; }
+/* +、文字、发送三者居中在同一条线上；多行时两侧图标相对整个输入框居中。 */
+.agent-composer { flex-direction: row; align-items: center; gap: 8px; padding: 6px 7px 6px 16px; border-radius: 24px; }
 .agent-composer-input-wrap { flex: 1 1 auto; width: auto; }
-.agent-composer textarea { padding: 9px 4px 7px; line-height: 22px; }
+.agent-composer textarea, .agent-console.is-empty .agent-composer textarea { min-height: 44px; padding: 10px 4px; line-height: 24px; }
 .agent-session-heading { gap: 8px; }
 .agent-session-heading .agent-session-search { flex: 1 1 auto; margin-top: 0; }
 .agent-main-chat { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; margin-top: 12px; padding: 0 12px; color: var(--text-primary); background: transparent; border: 1px solid transparent; border-radius: 12px; font: inherit; font-size: 13px; font-weight: 600; text-align: left; cursor: pointer; }
@@ -1969,9 +1970,6 @@ body.agent-page-body::after { display: none; }
 .agent-session-new:hover { color: var(--accent); background: var(--accent-soft); }
 .agent-session-new svg { width: 16px; height: 16px; }
 .agent-history-drawer .agent-session-list { margin-top: 4px; }
-.agent-session-settings { display: flex; align-items: center; gap: 8px; min-height: 44px; margin-top: 8px; padding: 0 12px; color: var(--text-secondary); font-size: 12px; text-decoration: none; border-radius: 10px; }
-.agent-session-settings:hover { color: var(--accent); background: var(--accent-soft); }
-.agent-session-settings svg { width: 15px; height: 15px; }
 .agent-sessions-toggle { width: 44px; height: 44px; }
 .agent-sessions-toggle svg { width: 18px; height: 18px; }
 @media (min-width: 901px) {
@@ -2026,7 +2024,7 @@ body.agent-page-body::after { display: none; }
 .agent-composer[hidden] { display: none !important; }
 
 /* + 添加种子：输入框左侧；下载卡片由用户选目标后提交，不经过模型。 */
-.agent-attach { flex: 0 0 36px; width: 36px; height: 36px; margin-bottom: 4px; display: inline-grid; place-items: center; padding: 0; color: var(--text-secondary); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
+.agent-attach { flex: 0 0 36px; width: 36px; height: 36px; display: inline-grid; place-items: center; padding: 0; color: var(--text-secondary); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
 .agent-attach:hover { color: var(--accent); background: var(--accent-soft); }
 .agent-attach:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 2px; }
 .agent-attach svg { width: 18px; height: 18px; }
@@ -2044,7 +2042,7 @@ body.agent-page-body::after { display: none; }
 .agent-download-cancel { color: var(--text-secondary); background: transparent; border: 1px solid var(--agent-line); }
 @media (max-width: 680px) {
     .agent-download-target, .agent-download-submit, .agent-download-cancel { height: 44px; font-size: 16px; }
-    .agent-attach { flex-basis: 44px; width: 44px; height: 44px; margin-bottom: 0; }
+    .agent-attach { flex-basis: 44px; width: 44px; height: 44px; }
 }
 
 /* 渠道/旁聊折叠、消息全文搜索结果、渠道删除。 */

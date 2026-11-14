@@ -99,7 +99,6 @@ HTML = """
               <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
             </div>
             <p class="agent-history-feedback" id="agentSessionStatus" role="status"></p>
-            <a class="agent-session-settings" href="#settings">Agent 设置</a>
           </section>
         </dialog>
         <p class="sr-only" id="agentResponseStatus" role="status"></p>
@@ -1592,9 +1591,9 @@ Season 1 / S01E01
         page = self.make_page({"sessions": {"sessions": []}})
         self.assertEqual(page.locator("#agentReleaseFormatGuide").count(), 0)
         self.assertTrue(page.locator("#agentSend").is_hidden())
-        # 发送按钮只在有内容时出现；出现后仍须与单行输入垂直居中。
+        # 发送按钮只在有内容时出现；+、文字与发送按钮须在同一条中线上。
         page.locator("#agentPrompt").fill("查看")
-        layout = page.evaluate("""() => {
+        measure = """() => {
           const centerY = (selector) => {
             const rect = document.querySelector(selector).getBoundingClientRect();
             return rect.top + rect.height / 2;
@@ -1606,13 +1605,21 @@ Season 1 / S01E01
             promptPaddingTop: parseFloat(promptStyle.paddingTop),
             promptPaddingBottom: parseFloat(promptStyle.paddingBottom),
             promptCenter: centerY('#agentPrompt'),
+            composerCenter: centerY('#agentComposer'),
+            attachCenter: centerY('#agentAttach'),
             sendCenter: centerY('#agentSend'),
           };
-        }""")
+        }"""
+        layout = page.evaluate(measure)
         self.assertEqual(layout["promptDisplay"], "block")
-        self.assertEqual(layout["promptPaddingTop"], 9)
-        self.assertEqual(layout["promptPaddingBottom"], 7)
+        self.assertEqual(layout["promptPaddingTop"], layout["promptPaddingBottom"])
         self.assertAlmostEqual(layout["promptCenter"], layout["sendCenter"], delta=0.5)
+        self.assertAlmostEqual(layout["promptCenter"], layout["attachCenter"], delta=0.5)
+        # 多行时两侧图标仍相对整个输入框居中。
+        page.locator("#agentPrompt").fill("1" * 400)
+        layout = page.evaluate(measure)
+        self.assertAlmostEqual(layout["attachCenter"], layout["composerCenter"], delta=0.5)
+        self.assertAlmostEqual(layout["sendCenter"], layout["composerCenter"], delta=0.5)
 
     def test_mobile_composer_stays_inside_viewport_and_stop_has_stable_slot(
         self,
