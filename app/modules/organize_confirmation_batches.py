@@ -5,6 +5,7 @@ import hashlib
 import json
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.modules import organize_confirmations as confirmations
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot_changes
 from app.modules.scraper import MatchResult
@@ -21,7 +22,7 @@ def _tokens(values: object) -> list[str]:
 
 
 def _row(token: str, chat_id: str | None = None):
-    row = db.get_organize_confirmation(token)
+    row = organize_confirmations_repo.get_organize_confirmation(token)
     if row is None or (chat_id is not None and row["chat_id"] != chat_id):
         raise ValueError("确认操作不存在或已失效")
     return row
@@ -107,7 +108,7 @@ def list_confirmations(
         raise ValueError("筛选参数无效")
     if type(page) is not int or page < 1 or type(page_size) is not int or not 1 <= page_size <= MAX_SELECTION:
         raise ValueError("分页参数无效")
-    result = db.query_organize_confirmations(
+    result = organize_confirmations_repo.query_organize_confirmations(
         batch_id=batch_id, task_id=task_id, source=source, reason=reason,
         keyword=q, status=status, tokens=_tokens(confirmation_ids) if confirmation_ids is not None else None,
         chat_id=chat_id, page=page, page_size=page_size, selection_limit=MAX_SELECTION,
@@ -127,14 +128,14 @@ def request_reviews(confirmation_ids: list[str], *, chat_id: str | None = None) 
     values = _tokens(confirmation_ids)
     if not confirmations._recognition_review_is_enabled():
         raise ValueError("请先在 Agent 设置中启用识别复核并配置模型；也可直接逐项选择候选")
-    result = db.request_organize_confirmation_reviews(values, chat_id=chat_id)
+    result = organize_confirmations_repo.request_organize_confirmation_reviews(values, chat_id=chat_id)
     confirmations.wake_recognition_review_dispatcher()
     return result
 
 
 def save_selection(token: str, candidate_index: int, *, chat_id: str | None = None) -> dict:
     _tokens([token])
-    db.save_organize_confirmation_selection(token, candidate_index, chat_id=chat_id)
+    organize_confirmations_repo.save_organize_confirmation_selection(token, candidate_index, chat_id=chat_id)
     return {"success": True}
 
 
@@ -154,7 +155,7 @@ def _choices(entries: list[dict], chat_id: str | None) -> list[tuple]:
         candidates = payload.get("candidates") or []
         if type(index) is not int or not 0 <= index < len(candidates):
             raise ValueError("候选参数无效")
-        retry_index = payload.get(confirmations._RETRY_SELECTED_INDEX_KEY)
+        retry_index = payload.get(organize_confirmations_repo.RETRY_SELECTED_INDEX_KEY)
         if retry_index is not None and retry_index != index:
             raise ValueError("该重试确认已绑定其他候选")
         if row["status"] == "pending" and row["expires_at"] <= db.now():

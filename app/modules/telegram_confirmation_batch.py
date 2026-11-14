@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from hmac import compare_digest
 
-from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.modules.agent_recognition_review import recognition_review_enabled
 from app.modules.telegram_notification_center import (
     get_notification_thread_snapshot,
@@ -315,7 +315,7 @@ def handle_batch_callback(data: str, *, chat_id: str, message_id: int) -> str:
     if not match or len(data.encode("utf-8")) > 64:
         raise ValueError("批次确认参数无效")
     token, action, value = match.groups()
-    row = db.get_organize_confirmation(token)
+    row = organize_confirmations_repo.get_organize_confirmation(token)
     if row is None or not chat_id or str(row["chat_id"] or "") != chat_id:
         raise ValueError("确认操作不存在或已失效")
     payload = json.loads(row["payload_json"])

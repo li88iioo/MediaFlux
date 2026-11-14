@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.modules import download_staging_reconcile as worker
 from app.modules import organize_confirmations as confirmations
@@ -60,11 +61,11 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
     def confirm(self, token, status, *, fingerprint='fingerprint'):
         # 明确候选早于成功证据；缺少 ID 上界的旧 payload 不能靠同秒时间猜先后。
         with patch.object(db, 'now', return_value='2026-01-01 00:00:00'):
-            db.create_organize_confirmation(
+            organize_confirmations_repo.create_organize_confirmation(
                 token=token, fingerprint=fingerprint, chat_id='test', source_name='stage', directory_path='/',
                 payload=self.payload, expires_at='2099-01-01 00:00:00',
             )
-        db.update_organize_confirmation(token, status=status, error='旧确认失败')
+        organize_confirmations_repo.update_organize_confirmation(token, status=status, error='旧确认失败')
 
     def evidence(self, file_id):
         log_id = db.add_organize_log(
@@ -107,14 +108,14 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
     def test_successful_reorganize_closes_card_and_request_then_cleans_empty_root(self):
         key = self.show_card()
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), ['card'])
-        card = db.get_organize_confirmation('card')
+        card = organize_confirmations_repo.get_organize_confirmation('card')
         assert card is not None
         stats = json.loads(card['result_json'])
         self.assertEqual(card['status'], 'completed')
         self.assertIsNone(card['selected_index'])
         self.assertEqual(stats['previous_confirmation']['status'], 'failed')
         self.assertEqual(stats['organize_log_ids'], [self.log_id])
-        delivery = assert_present(db.get_organize_confirmation_delivery('card'))
+        delivery = assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         event = notifications.deserialize_notification_event(delivery['event_json'])
         self.assertIn('Web', str(event.title))
         self.assertIn('完成', str(event.title))
@@ -145,10 +146,10 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
     def test_completed_reorganized_card_repairs_existing_initial_message_on_next_reconcile(self):
         key = self.show_card()
         stats = {'moved': 1, 'failed': 0, 'resolution': 'reorganized', 'organize_log_ids': [self.log_id]}
-        db.update_organize_confirmation('card', status='completed', result_json=json.dumps(stats),
+        organize_confirmations_repo.update_organize_confirmation('card', status='completed', result_json=json.dumps(stats),
                                        completed_at='2026-11-09 00:16:08')
         download_requests_repo.update_download_request(self.request_id, organize_status='completed', gy_staging_cleanup_status='completed')
-        before = dict(assert_present(db.get_organize_confirmation('card')))
+        before = dict(assert_present(organize_confirmations_repo.get_organize_confirmation('card')))
         with db.get_conn() as conn:
             conn.execute('DELETE FROM organize_log_items')
             conn.execute('DELETE FROM organize_log')
@@ -156,21 +157,21 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         self.assertEqual(queue.discover_legacy_confirmation_cleanup(), 0)
         self.assertEqual(db.kv_get(queue.LEGACY_CURSOR_KEY), '0')
         self.assertEqual(queue.discover_legacy_confirmation_cleanup(), 0)
-        self.assertIsNone(db.get_organize_confirmation_delivery('card'))
+        self.assertIsNone(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
-        self.assertIsNotNone(db.get_organize_confirmation_delivery('card'))
+        self.assertIsNotNone(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         self.assertTrue(confirmations._dispatch_due_confirmation_delivery('card'))
         self.assertTrue(notifications.drain_telegram_notifications(limit=1, event_key=key))
-        self.assertEqual(dict(assert_present(db.get_organize_confirmation('card'))), before)
+        self.assertEqual(dict(assert_present(organize_confirmations_repo.get_organize_confirmation('card'))), before)
         self.assertEqual(queue.list_due_cleanup_intents(), [])
         self.assertEqual(self.editor.call_count, 1)
         self.sender.assert_not_called()
 
     def test_completed_history_without_a_delivered_initial_candidate_message_never_sends(self):
         stats = {'moved': 1, 'failed': 0, 'resolution': 'reorganized', 'organize_log_ids': [self.log_id]}
-        db.update_organize_confirmation('card', status='completed', result_json=json.dumps(stats))
+        organize_confirmations_repo.update_organize_confirmation('card', status='completed', result_json=json.dumps(stats))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
-        self.assertIsNone(db.get_organize_confirmation_delivery('card'))
+        self.assertIsNone(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         key = self.show_card()
         baseline = assert_present(get_notification(key))
         mutations = (
@@ -184,7 +185,7 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
                                  + ' WHERE id=?', (*mutation.values(), baseline['id']))
                 before = get_notification(key)
                 self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
-                self.assertIsNone(db.get_organize_confirmation_delivery('card'))
+                self.assertIsNone(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
                 self.assertEqual(get_notification(key), before)
                 with db.get_conn() as conn:
                     conn.execute('UPDATE telegram_notification_outbox SET ' + ','.join(f'{key}=?' for key in mutation)
@@ -195,9 +196,9 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
     def test_history_repair_does_not_overwrite_thread_updated_after_reconcile(self):
         key = self.show_card()
         stats = {'moved': 1, 'failed': 0, 'resolution': 'reorganized', 'organize_log_ids': [self.log_id]}
-        db.update_organize_confirmation('card', status='completed', result_json=json.dumps(stats))
+        organize_confirmations_repo.update_organize_confirmation('card', status='completed', result_json=json.dumps(stats))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
-        self.assertIsNotNone(db.get_organize_confirmation_delivery('card'))
+        self.assertIsNotNone(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         newer = NotificationEvent('后续媒体库已刷新')
         self.assertTrue(confirmations.publish_confirmation_event(
             newer, token='card', chat_id='test', terminal=True, deliver_now=False,
@@ -205,7 +206,7 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         before = get_notification(key)
         self.assertTrue(confirmations._dispatch_due_confirmation_delivery('card'))
         self.assertEqual(get_notification(key), before)
-        self.assertEqual(assert_present(db.get_organize_confirmation_delivery('card'))['status'], 'sent')
+        self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))['status'], 'sent')
         self.assertFalse(confirmations._dispatch_due_confirmation_delivery('card'))
         self.editor.assert_not_called()
         self.sender.assert_not_called()
@@ -219,22 +220,22 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token='card'", (json.dumps(self.payload),))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), ['card'])
-        delivery = assert_present(db.get_organize_confirmation_delivery('card'))
+        delivery = assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))
         event = notifications.deserialize_notification_event(delivery['event_json'])
         self.assertIn('实际入库剧集 (2026) · S01E31-S01E32', str(event.lines))
         self.assertNotIn('无关作品', str(event))
         self.assertNotIn('旧候选', str(event))
-        self.assertIsNone(assert_present(db.get_organize_confirmation('card'))['selected_index'])
+        self.assertIsNone(assert_present(organize_confirmations_repo.get_organize_confirmation('card'))['selected_index'])
 
     def test_repeated_reconciliation_preserves_delivery_retry_and_later_downstream_card(self):
         key = self.show_card()
         organize_history.reconcile_reorganized_confirmations(['stage'])
         with patch.object(confirmations, 'publish_confirmation_event', return_value=False):
             self.assertTrue(confirmations._dispatch_due_confirmation_delivery('card'))
-        retry = dict(assert_present(db.get_organize_confirmation_delivery('card')))
+        retry = dict(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card')))
         self.assertEqual(retry['status'], 'retry_wait')
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
-        self.assertEqual(dict(assert_present(db.get_organize_confirmation_delivery('card'))), retry)
+        self.assertEqual(dict(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))), retry)
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmation_delivery_outbox SET next_attempt_at='' WHERE confirmation_token='card'")
         self.assertTrue(confirmations._dispatch_due_confirmation_delivery('card'))
@@ -252,11 +253,11 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
             'card', chat_id='test', strm_status='完成', media_refresh='已刷新',
         ))
         latest = assert_present(get_notification(key))
-        final_delivery = dict(assert_present(db.get_organize_confirmation_delivery('card')))
+        final_delivery = dict(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card')))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
         self.assertFalse(confirmations._dispatch_due_confirmation_delivery('card'))
         self.assertEqual(get_notification(key), latest)
-        self.assertEqual(dict(assert_present(db.get_organize_confirmation_delivery('card'))), final_delivery)
+        self.assertEqual(dict(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))), final_delivery)
 
     def test_reorganize_invalidates_inflight_old_failure_delivery(self):
         key = self.show_card()
@@ -266,7 +267,7 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
                 conn, token='card', event_json=notifications.serialize_notification_event(old_event),
                 chat_id='test', message_id=77, timestamp=db.now(),
             )
-        old = assert_present(db.claim_due_organize_confirmation_delivery(
+        old = assert_present(organize_confirmations_repo.claim_due_organize_confirmation_delivery(
             current_time=db.now(), stale_before='', token='card',
         ))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), ['card'])
@@ -279,10 +280,10 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         self.assertEqual(get_notification(key), terminal)
 
     def test_web_completion_wins_over_tg_selection_that_already_read_pending(self):
-        db.update_organize_confirmation('card', status='pending')
+        organize_confirmations_repo.update_organize_confirmation('card', status='pending')
         key = self.show_card()
         ready, resume = threading.Event(), threading.Event()
-        original_claim = db.claim_organize_confirmation
+        original_claim = organize_confirmations_repo.claim_organize_confirmation
 
         def delayed_claim(*args, **kwargs):
             ready.set()
@@ -290,7 +291,7 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
                 raise RuntimeError('TG selection timed out')
             return original_claim(*args, **kwargs)
 
-        with patch.object(db, 'claim_organize_confirmation', side_effect=delayed_claim), ThreadPoolExecutor(max_workers=1) as executor:
+        with patch.object(organize_confirmations_repo, 'claim_organize_confirmation', side_effect=delayed_claim), ThreadPoolExecutor(max_workers=1) as executor:
             selection = executor.submit(confirmations.start_confirmation, 'card', 0, chat_id='test')
             try:
                 self.assertTrue(ready.wait(timeout=5))
@@ -302,22 +303,22 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
             with self.assertRaisesRegex(ValueError, '已处理'):
                 selection.result(timeout=5)
         self.assertEqual(get_notification(key), terminal)
-        self.assertIsNone(assert_present(db.get_organize_confirmation('card'))['selected_index'])
+        self.assertIsNone(assert_present(organize_confirmations_repo.get_organize_confirmation('card'))['selected_index'])
 
     def test_tg_selection_wins_before_web_reconciliation_and_is_not_overwritten(self):
-        db.update_organize_confirmation('card', status='pending')
+        organize_confirmations_repo.update_organize_confirmation('card', status='pending')
         key = self.show_card()
         with patch.object(confirmations, '_dispatch_next_queued_confirmation'), patch.object(
             confirmations, '_dispatch_due_confirmation_delivery', return_value=False,
         ), patch.object(confirmations, 'wake_confirmation_dispatcher', return_value=False):
             selected = confirmations.start_confirmation('card', 0, chat_id='test')
         self.assertEqual(selected['status'], 'queued')
-        accepted = dict(assert_present(db.get_organize_confirmation_delivery('card')))
+        accepted = dict(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card')))
         visible = assert_present(get_notification(key))
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), [])
-        self.assertEqual(dict(assert_present(db.get_organize_confirmation_delivery('card'))), accepted)
+        self.assertEqual(dict(assert_present(organize_confirmations_repo.get_organize_confirmation_delivery('card'))), accepted)
         self.assertEqual(get_notification(key), visible)
-        self.assertEqual(assert_present(db.get_organize_confirmation('card'))['selected_index'], 0)
+        self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation('card'))['selected_index'], 0)
 
     def failed_recovery(self):
         from app.repositories.download_staging import list_staging_cleanup_requests
@@ -399,9 +400,9 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
 
     def test_failed_recovery_rejects_active_confirmation_and_unknown_delete(self):
         recovery = self.failed_recovery()
-        db.update_organize_confirmation('card', status='queued')
+        organize_confirmations_repo.update_organize_confirmation('card', status='queued')
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage'], recovery=recovery), [])
-        db.update_organize_confirmation('card', status='failed')
+        organize_confirmations_repo.update_organize_confirmation('card', status='failed')
         db.add_organize_delete_audit(trigger='download_staging_cleanup', reason='lost response',
                                     file_id='stage', file_name='MF-case', parent_id='source', status='failed')
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage'], recovery=recovery), [])
@@ -424,13 +425,13 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         get_download_request_result_7 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_7 is not None
         self.assertEqual(get_download_request_result_7['organize_started'], -1)
-        get_organize_confirmation_result = db.get_organize_confirmation('card')
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation('card')
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result['status'], 'failed')
 
     def test_successful_manual_organize_also_supersedes_old_expired_card(self):
         db.update_organize_log(self.log_id, operation_type='organize')
-        db.update_organize_confirmation('card', status='expired')
+        organize_confirmations_repo.update_organize_confirmation('card', status='expired')
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), ['card'])
 
     def test_newer_failed_log_prevents_reusing_old_success_evidence(self):
@@ -486,7 +487,7 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
 
     def test_history_discovery_repairs_old_reorganized_records_without_redownload(self):
         self.assertEqual(queue.discover_legacy_confirmation_cleanup(), 1)
-        get_organize_confirmation_result_2 = db.get_organize_confirmation('card')
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation('card')
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(get_organize_confirmation_result_2['status'], 'completed')
         self.assertEqual(len(queue.list_due_cleanup_intents()), 1)
@@ -496,17 +497,17 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         # 新票据不能复用签发前的成功；为重试补充新的成功提交。
         self.evidence('video')
         self.assertEqual(organize_history.reconcile_reorganized_confirmations(['stage']), ['retry'])
-        get_organize_confirmation_result_3 = db.get_organize_confirmation('card')
+        get_organize_confirmation_result_3 = organize_confirmations_repo.get_organize_confirmation('card')
         assert get_organize_confirmation_result_3 is not None
         self.assertEqual(get_organize_confirmation_result_3['status'], 'failed')
-        get_organize_confirmation_result_4 = db.get_organize_confirmation('retry')
+        get_organize_confirmation_result_4 = organize_confirmations_repo.get_organize_confirmation('retry')
         assert get_organize_confirmation_result_4 is not None
         self.assertEqual(get_organize_confirmation_result_4['status'], 'completed')
 
     def test_expired_and_cancelled_cards_can_be_resolved_but_active_execution_cannot(self):
         for status in ('expired', 'cancelled', 'queued', 'running'):
             with self.subTest(status=status):
-                db.update_organize_confirmation('card', status=status)
+                organize_confirmations_repo.update_organize_confirmation('card', status=status)
                 tokens = organize_history.reconcile_reorganized_confirmations(['stage'])
                 self.assertEqual(tokens, ['card'] if status in ('expired', 'cancelled') else [])
 
@@ -551,7 +552,7 @@ class ReorganizedDownloadReconciliationTests(IsolatedDatabaseTestCase):
         try:
             with self.assertRaisesRegex(sqlite3.IntegrityError, 'queue-failure'):
                 organize_history.reconcile_reorganized_confirmations(['stage'])
-            get_organize_confirmation_result_5 = db.get_organize_confirmation('card')
+            get_organize_confirmation_result_5 = organize_confirmations_repo.get_organize_confirmation('card')
             assert get_organize_confirmation_result_5 is not None
             self.assertEqual(get_organize_confirmation_result_5['status'], 'failed')
             self.assertEqual(queue.list_due_cleanup_intents(), [])

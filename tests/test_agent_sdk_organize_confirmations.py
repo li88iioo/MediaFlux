@@ -27,6 +27,7 @@ from app.agent.kernel.ports.sdk_effects import activity_confirm_organize_tool
 from app.agent.kernel.state_types import CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests.support import initialized_web_runtime
+from app.repositories import organize_confirmations as organize_confirmations_repo
 
 
 OWNER = "webk:v1:" + "a" * 64
@@ -321,7 +322,6 @@ def test_review_control_rpc_is_available_in_read_only_scope_without_confirmation
 
 @pytest.fixture
 def confirmation_backend(runtime, monkeypatch):
-    from app import database as db
     from app.modules import organize_confirmations as confirmations
     from app.modules.organize import OrganizeRules, organize_rules_snapshot
 
@@ -341,14 +341,13 @@ def confirmation_backend(runtime, monkeypatch):
             "candidates": [{"title": f"作品{i}-候选{index}", "tmdb_id": str(100 + index), "year": "2025",
                             "provider": "tmdb", "media_type": "movie"} for index in range(2)],
             "rules": organize_rules_snapshot(rules), "review_only": True}
-        db.create_organize_confirmation(token=token, fingerprint=confirmations._fingerprint(payload), chat_id=f"chat-{i % 2}",
+        organize_confirmations_repo.create_organize_confirmation(token=token, fingerprint=confirmations._fingerprint(payload), chat_id=f"chat-{i % 2}",
             source_name="SDK 来源", directory_path=payload["directory"], payload=payload,
             expires_at=(datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"))
     return SimpleNamespace(wake=wake, dispatch=dispatch)
 
 
 def test_real_batch_service_queues_one_hundred_distinct_choices_as_explicit_agent_and_reads_progress(confirmation_backend):
-    from app import database as db
 
     page = sdk.activity.organize_confirmations(batch_id="sdk-batch")
     assert (page["total"], page["pages"], len(page["confirmation_ids"]), len(page["items"])) == (100, 5, 100, 20)
@@ -370,7 +369,7 @@ def test_real_batch_service_queues_one_hundred_distinct_choices_as_explicit_agen
         for entry in entries:
             item = by_confirmation_id[entry["confirmation_id"]]
             assert item["selected_index"] == entry["candidate_index"] and not item["error"]
-            row = db.get_organize_confirmation(entry["confirmation_id"])
+            row = organize_confirmations_repo.get_organize_confirmation(entry["confirmation_id"])
             assert row is not None and row["confirmation_actor"] == "agent"
             assert json.loads(row["payload_json"])["_explicit_approval"] is True
         confirmation_backend.wake.assert_called_once_with()
@@ -380,7 +379,6 @@ def test_real_batch_service_queues_one_hundred_distinct_choices_as_explicit_agen
 
 @pytest.mark.skipif(not sandbox.sandbox_supported(), reason="需要真实 Linux 工作区隔离")
 def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_confirmation_ids(confirmation_backend, monkeypatch, tmp_path):
-    from app import database as db
     from app.modules import agent_recognition_review as reviews, organize_confirmation_batches as batches
     from app.modules import organize_confirmations as confirmations
 
@@ -405,7 +403,7 @@ def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_confirmatio
 
     def process_reviews(count):
         for _ in range(count):
-            row = db.claim_next_organize_confirmation_review()
+            row = organize_confirmations_repo.claim_next_organize_confirmation_review()
             assert row is not None
             assert confirmations._process_recognition_review_row(row) == "approved"
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import organize_history as organize_history_repo
 from app.clients.guangya import (
@@ -1582,7 +1583,7 @@ class OrganizeCorrectionService:
                 )
             )
             for token in tokens:
-                confirmation = db.get_organize_confirmation(token)
+                confirmation = organize_confirmations_repo.get_organize_confirmation(token)
                 assert confirmation is not None
                 _finalize_confirmed_downloads(
                     json.loads(confirmation["payload_json"]), self.client, stats, rules,

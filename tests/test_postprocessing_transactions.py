@@ -5,6 +5,7 @@ import json
 from unittest import mock
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_staging_reconcile as reconcile
 from tests.support import IsolatedDatabaseTestCase
 
@@ -43,7 +44,7 @@ class PostprocessingTransactionTests(IsolatedDatabaseTestCase):
         self.result = json.dumps({"moved": 1, "failed": 0, "need_confirm": 0, "scan_complete": True})
 
     def _complete(self, *, enqueue_delivery: bool = True) -> None:
-        db.complete_organize_confirmation_with_delivery(
+        organize_confirmations_repo.complete_organize_confirmation_with_delivery(
             "synthetic-token-78", result_json=self.result,
             event_json='{"title":"synthetic completion"}',
             chat_id="synthetic-chat", message_id=None, enqueue_delivery=enqueue_delivery,

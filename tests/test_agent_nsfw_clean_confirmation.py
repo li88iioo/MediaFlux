@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import organize_confirmations as confirmations
@@ -65,7 +66,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
 
     def ticket(self, *, running=False, actor="agent"):
         token = "frozen-clean-test"
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token,
             fingerprint="clean-test",
             chat_id="100",
@@ -76,12 +77,12 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
                 datetime.now(timezone.utc).astimezone() + timedelta(hours=1)
             ).strftime("%Y-%m-%d %H:%M:%S"),
         )
-        db.update_organize_confirmation(token, review_status="running")
+        organize_confirmations_repo.update_organize_confirmation(token, review_status="running")
         if running:
-            db.claim_organize_confirmation(
+            organize_confirmations_repo.claim_organize_confirmation(
                 token, chat_id="100", selected_index=0, actor=actor
             )
-            assert (db.claim_queued_organize_confirmation(token)) is not None
+            assert (organize_confirmations_repo.claim_queued_organize_confirmation(token)) is not None
         return token
 
     def pending_manual(self):
@@ -98,7 +99,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
         self.enabled = False
         with self.assertRaises(DirectoryScrapeConflictError):
             confirmations.start_confirmation(token, 0, chat_id="100", actor="agent")
-        get_organize_confirmation_result = db.get_organize_confirmation(token)
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result["status"], "pending")
         manager = SimpleNamespace(
@@ -108,7 +109,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ):
             confirmations.start_confirmation(token, 0, chat_id="100", actor="human")
-        get_organize_confirmation_result_2 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(
             get_organize_confirmation_result_2["confirmation_actor"], "human"
@@ -127,7 +128,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
 
         with self.assertRaises(DirectoryScrapeConflictError):
             confirmations.start_confirmation(token, 0, chat_id="100", actor="agent")
-        get_organize_confirmation_result_3 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_3 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_3 is not None
         self.assertEqual(get_organize_confirmation_result_3["status"], "pending")
 
@@ -147,7 +148,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
                 actor="agent",
             )
         client.assert_not_called()
-        get_organize_confirmation_result_4 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_4 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_4 is not None
         self.assertEqual(get_organize_confirmation_result_4["status"], "failed")
         manual = self.pending_manual()
@@ -192,7 +193,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
                 chat_id="100",
                 actor="agent",
             )
-        get_organize_confirmation_result_5 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_5 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_5 is not None
         self.assertEqual(get_organize_confirmation_result_5["status"], "failed")
         self.assertEqual(self.pending_manual(), [])
@@ -273,7 +274,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.cloud.deleted, ["parent"])
         self.assertEqual(result["stats"]["empty_dirs_cleaned"], 1)
         self.assertEqual(result["stats"]["moved"], 1)
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "completed")
         self.assertEqual(row["confirmation_actor"], "agent")
@@ -328,7 +329,7 @@ class CleanConfirmationTests(IsolatedDatabaseTestCase):
         ):
             token, result, _ = self.run_worker()
         generic_cleanup.assert_not_called()
-        get_organize_confirmation_delivery_result = db.get_organize_confirmation_delivery(token)
+        get_organize_confirmation_delivery_result = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert get_organize_confirmation_delivery_result is not None
         event = confirmations.deserialize_notification_event(get_organize_confirmation_delivery_result["event_json"])
         self.assertNotIn("已清理 0 个", str(event.fields))

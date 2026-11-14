@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import local_media as local_media_repo
 from app.repositories import organize_history
 from app.repositories import download_requests as download_requests_repo
@@ -80,7 +81,7 @@ class OrganizeLogClearTests(unittest.TestCase):
         cloud = self.cloud("failed", "review")
         token_log = self.cloud("success", "new", operation_token="recognition-confirm:review-token")
         local = self.local("failed", "local-review")
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token="review-token", fingerprint="review", chat_id="", source_name="", directory_path="/",
             payload={"files": [{"file_id": "review"}], "local_task_id": local}, expires_at="2099-01-01 00:00:00",
         )
@@ -91,22 +92,22 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual(db.clear_organize_logs()["deleted"], 3)
         self.assertIsNone(db.get_organize_log(cloud))
         self.assertIsNone(db.get_organize_log(token_log))
-        self.assertIsNotNone(db.get_organize_confirmation("review-token"))
+        self.assertIsNotNone(organize_confirmations_repo.get_organize_confirmation("review-token"))
 
     def confirmation(self, token, files, *, status="running", result=None):
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=token, chat_id="", source_name="", directory_path="/",
             payload={"files": [{"file_id": file_id} for file_id in files]},
             expires_at="2099-01-01 00:00:00",
         )
-        db.update_organize_confirmation(
+        organize_confirmations_repo.update_organize_confirmation(
             token, status=status, result_json=json.dumps(result or {}),
             completed_at=db.now() if status == "completed" else None,
         )
 
     def pending_group(self, token, files, *, source="scan-root", companions=None, **payload_fields):
         with patch.object(db, "now", return_value="2026-11-14 18:27:00"):
-            db.create_organize_confirmation(
+            organize_confirmations_repo.create_organize_confirmation(
                 token=token, fingerprint=token, chat_id="", source_name="Synthetic scan", directory_path="/",
                 payload={"source_dir_id": source, "files": files, "companions": companions or [], **payload_fields},
                 expires_at="2026-11-15 18:27:00",
@@ -160,18 +161,18 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual(db.count_organize_timeline(), 5)
         db.init_db()
         for log_id, file_id, *_ in records:
-            card = assert_present(db.get_organize_confirmation(file_id))
+            card = assert_present(organize_confirmations_repo.get_organize_confirmation(file_id))
             self.assertEqual((card["status"], card["review_status"]), ("completed", "cancelled"))
             self.assertEqual(json.loads(card["result_json"])["organize_log_ids"], [log_id])
             self.assertTrue(card["review_completed_at"])
-            self.assertFalse(db.stage_organize_confirmation_review_result(file_id, {}))
-        snapshots = [dict(assert_present(db.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")]
+            self.assertFalse(organize_confirmations_repo.stage_organize_confirmation_review_result(file_id, {}))
+        snapshots = [dict(assert_present(organize_confirmations_repo.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")]
         db.init_db()
-        self.assertEqual([dict(assert_present(db.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")], snapshots)
+        self.assertEqual([dict(assert_present(organize_confirmations_repo.get_organize_confirmation(name))) for name in ("inplace", "directory-a", "directory-b")], snapshots)
         result = db.clear_organize_logs()
         self.assertEqual((result["deleted"], result["skipped_busy"]), (3, 2))
         self.assertTrue(all(assert_present(db.get_organize_log(log_id)) is not None for log_id in manual_ids))
-        self.assertTrue(all(assert_present(db.get_organize_confirmation(name))["status"] == "pending"
+        self.assertTrue(all(assert_present(organize_confirmations_repo.get_organize_confirmation(name))["status"] == "pending"
                             for name in ("real-manual-a", "real-manual-b")))
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_staging_reconcile").fetchone()[0], 0)
@@ -181,12 +182,12 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.pending_group("group", files)
         self.pending_group("unrelated", [{"file_id": "unrelated", "parent_id": "leaf", "size": 100}])
         first = self.committed_audit("first", source="leaf")
-        self.assertEqual(assert_present(db.get_organize_confirmation("group"))["status"], "pending")
+        self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation("group"))["status"], "pending")
         second = self.committed_audit("second", source="leaf")
-        card = assert_present(db.get_organize_confirmation("group"))
+        card = assert_present(organize_confirmations_repo.get_organize_confirmation("group"))
         self.assertEqual(card["status"], "completed")
         self.assertEqual(json.loads(card["result_json"])["organize_log_ids"], [first, second])
-        self.assertEqual(assert_present(db.get_organize_confirmation("unrelated"))["status"], "pending")
+        self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation("unrelated"))["status"], "pending")
 
     def test_clear_repairs_only_selected_success_files_without_restart(self):
         selected = self.committed_audit("selected")
@@ -198,8 +199,8 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertEqual((result["deleted"], result["skipped_busy"]), (1, 0))
         self.assertIsNone(db.get_organize_log(selected))
         self.assertIsNotNone(db.get_organize_log(other))
-        self.assertEqual(assert_present(db.get_organize_confirmation("selected"))["status"], "completed")
-        self.assertEqual(assert_present(db.get_organize_confirmation("other"))["status"], "pending")
+        self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation("selected"))["status"], "completed")
+        self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation("other"))["status"], "pending")
 
     def test_new_confirmation_and_unrelated_source_do_not_reuse_old_success(self):
         log_id = self.committed_audit("old-success")
@@ -220,7 +221,7 @@ class OrganizeLogClearTests(unittest.TestCase):
                          "BEGIN SELECT RAISE(ABORT,'receipt-failure'); END")
         log_id = self.committed_audit("atomic-live")
         self.assertEqual(assert_present(db.get_organize_log(log_id))["status"], "success")
-        card = assert_present(db.get_organize_confirmation("atomic-live"))
+        card = assert_present(organize_confirmations_repo.get_organize_confirmation("atomic-live"))
         self.assertEqual((card["status"], card["review_status"]), ("pending", "running"))
         with db.get_conn() as conn:
             conn.execute("DROP TRIGGER reject_terminal_receipt")
@@ -231,12 +232,12 @@ class OrganizeLogClearTests(unittest.TestCase):
             with self.subTest(state=state):
                 self.pending_group(state, [{"file_id": state, "parent_id": "leaf", "size": 100}])
                 if state in {"queued", "running"}:
-                    db.update_organize_confirmation(state, status=state)
+                    organize_confirmations_repo.update_organize_confirmation(state, status=state)
                 else:
-                    db.update_organize_confirmation(state, review_status=state, review_result_json='{"reason":"actual"}',
+                    organize_confirmations_repo.update_organize_confirmation(state, review_status=state, review_result_json='{"reason":"actual"}',
                                                    review_completed_at="2026-11-14 18:30:00")
                 self.committed_audit(state)
-                card = assert_present(db.get_organize_confirmation(state))
+                card = assert_present(organize_confirmations_repo.get_organize_confirmation(state))
                 if state in {"queued", "running"}:
                     self.assertEqual(card["status"], state)
                 else:
@@ -265,7 +266,7 @@ class OrganizeLogClearTests(unittest.TestCase):
                 parent = "isolated-leaf" if case == "isolated-entry" else "leaf"
                 self.pending_group(case, [{"file_id": case, "parent_id": parent, "size": 100}], source=source, **fields)
                 self.committed_audit(case, parent=parent, source=parent if case in {"cross-root", "isolated-entry"} else source)
-                self.assertEqual(assert_present(db.get_organize_confirmation(case))["status"], "pending")
+                self.assertEqual(assert_present(organize_confirmations_repo.get_organize_confirmation(case))["status"], "pending")
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_staging_reconcile").fetchone()[0], 0)
 
@@ -288,7 +289,7 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.confirmation("partial", ["skipped-file", "failed-file"])
         receipts = [self.cloud(status, name, operation_token="recognition-confirm:partial")
                     for status, name in (("skipped", "skipped-file"), ("failed", "failed-file"))]
-        db.complete_organize_confirmation_with_delivery(
+        organize_confirmations_repo.complete_organize_confirmation_with_delivery(
             "partial", result_json=json.dumps({"skipped": 1, "failed": 1}),
             event_json="{}", chat_id="", message_id=None, enqueue_delivery=False,
         )
@@ -349,7 +350,7 @@ class OrganizeLogClearTests(unittest.TestCase):
                 {"operation_token": "recognition-confirm:frozen"},
                 [{"file_id": "same-file", "status": "success"}],
             )
-            db.complete_organize_confirmation_with_delivery(
+            organize_confirmations_repo.complete_organize_confirmation_with_delivery(
                 "frozen", result_json='{"total":1,"moved":1,"skipped":0,"failed":0,"need_confirm":0}',
                 event_json="{}", chat_id="", message_id=None, enqueue_delivery=False,
             )
@@ -387,10 +388,10 @@ class OrganizeLogClearTests(unittest.TestCase):
             conn.execute("CREATE TRIGGER reject_settlement BEFORE UPDATE ON organize_log "
                          "BEGIN SELECT RAISE(ABORT, 'settlement failure'); END")
         with self.assertRaisesRegex(Exception, "settlement failure"):
-            db.complete_organize_confirmation_with_delivery(
+            organize_confirmations_repo.complete_organize_confirmation_with_delivery(
                 "atomic", result_json="{}", event_json="{}", chat_id="", message_id=None,
             )
-        confirmation = db.get_organize_confirmation("atomic")
+        confirmation = organize_confirmations_repo.get_organize_confirmation("atomic")
         log = db.get_organize_log(pending)
         assert confirmation is not None and log is not None
         self.assertEqual(confirmation["status"], "running")
@@ -400,11 +401,11 @@ class OrganizeLogClearTests(unittest.TestCase):
         pending = self.local("requires_manual", "pending")
         referenced = self.local("failed", "reviewing")
         finished = self.local("completed", "finished")
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token="local-pending", fingerprint="local-pending", chat_id="", source_name="", directory_path="/",
             payload={"local_task_id": pending}, expires_at="2099-01-01 00:00:00",
         )
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token="local-review", fingerprint="local-review", chat_id="", source_name="", directory_path="/",
             payload={"local_task_id": referenced}, expires_at="2099-01-01 00:00:00",
         )

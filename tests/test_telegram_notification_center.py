@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app.repositories import agent_download_verification as agent_download_verification_repo
@@ -1326,7 +1327,7 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         sender.return_value = TelegramSendResult(ok=True, message_id=73)
         editor.return_value = TelegramSendResult(ok=True, message_id=73)
         token = "confirm-token"
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token,
             fingerprint="fingerprint",
             chat_id="100",

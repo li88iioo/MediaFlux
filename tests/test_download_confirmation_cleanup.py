@@ -7,6 +7,7 @@ import json
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.modules import organize_confirmations as confirmations
 from app.modules.organize import OrganizeRules
@@ -39,11 +40,11 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
         self.add_confirmation('done', status='completed')
 
     def add_confirmation(self, token, *, status, source_id='stage'):
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=token, chat_id='test', source_name='MF-case', directory_path='/',
             payload={**self.payload, 'source_dir_id': source_id}, expires_at='2099-01-01 00:00:00',
         )
-        db.update_organize_confirmation(token, status=status,
+        organize_confirmations_repo.update_organize_confirmation(token, status=status,
                                        result_json=json.dumps({'moved': 1, 'failed': 0, 'need_confirm': 0}))
 
     def finish(self, payload=None):
@@ -178,7 +179,7 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
             'app.modules.organize_confirmations.publish_confirmation_event', return_value=True,
         ):
             self.assertTrue(Organizer.notify_task_confirmations(stats, self.rules, chat_id='test'))
-        rows = db.list_organize_confirmations_for_task('task-case', chat_id='test')
+        rows = organize_confirmations_repo.list_organize_confirmations_for_task('task-case', chat_id='test')
         self.assertEqual(len(rows), 1)
         payload = json.loads(rows[0]['payload_json'])
         self.assertEqual(payload['download_request_ids'], [self.request_id])
@@ -216,12 +217,12 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
     def test_download_business_task_without_rollup_is_not_scheduled_as_unapplied_organize_notice(self):
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET organize_task_id='download-only' WHERE token='done'")
-        tasks = db.list_unapplied_organize_confirmation_tasks()
+        tasks = organize_confirmations_repo.list_unapplied_organize_confirmation_tasks()
         self.assertNotIn('download-only', [row['organize_task_id'] for row in tasks])
 
     def test_failed_completed_card_does_not_authorize_cleanup_without_successful_phase_close(self):
         self.stats['failed'] = 1
-        db.update_organize_confirmation('done', result_json=json.dumps(self.stats))
+        organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(self.stats))
         self.assertEqual(self.finish(), [self.request_id])
         get_download_request_result_6 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_6 is not None
@@ -230,11 +231,11 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
 
     def test_known_legacy_task_mismatch_is_not_downgraded_to_ordinary_organize(self):
         payload: dict[str, Any] = {**self.payload, 'organize_task_id': 'old-task'}
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token='legacy-mismatch', fingerprint='legacy-mismatch', chat_id='test',
             source_name='MF-case', directory_path='/', payload=payload, expires_at='2099-01-01 00:00:00',
         )
-        db.update_organize_confirmation('legacy-mismatch', status='running')
+        organize_confirmations_repo.update_organize_confirmation('legacy-mismatch', status='running')
         with patch.object(confirmations.OrganizeRules, 'from_config', return_value=self.rules), patch.object(
             confirmations, 'organize_rules_snapshot_changes', return_value=[],
         ), patch.object(confirmations, 'GuangYaClient') as client_factory, patch.object(
@@ -252,7 +253,7 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
                       {'need_confirm': 1}, {'stopped': 1}):
             with self.subTest(extra=extra):
                 self.stats: dict[str, Any] = {'moved': 1, 'failed': 0, 'need_confirm': 0, **extra}
-                db.update_organize_confirmation('done', result_json=json.dumps(self.stats))
+                organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(self.stats))
                 self.assertEqual(self.finish(), [self.request_id])
                 get_download_request_result_7 = download_requests_repo.get_download_request(self.request_id)
                 assert get_download_request_result_7 is not None
@@ -320,7 +321,7 @@ class DownloadConfirmationCleanupTests(IsolatedDatabaseTestCase):
         self.assertTrue(context['notify_enabled'])
         self.assertFalse(any(item['topic'] == 'organize' for item in context['notification_threads']))
         self.assertTrue(any(item['topic'] == 'confirmation' for item in context['notification_threads']))
-        get_organize_confirmation_result = db.get_organize_confirmation('done')
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation('done')
         assert get_organize_confirmation_result is not None
         persisted = json.loads(get_organize_confirmation_result['result_json'])
         self.assertEqual(persisted['download_staging_identity']['gy_task_id'], 'cloud-task')

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaFile
 from app.modules import download_staging_cleanup as cleanup
@@ -64,12 +65,12 @@ class _DeleteCase:
     def confirmation(self, status, *, source_id="stage"):
         self.sequence += 1
         token = f"active-delete-confirmation-{self.sequence}"
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=token, chat_id="test", source_name=source_id,
             directory_path="/", payload={"source_dir_id": source_id},
             expires_at="2099-01-01 00:00:00",
         )
-        db.update_organize_confirmation(token, status=status)
+        organize_confirmations_repo.update_organize_confirmation(token, status=status)
         return token
 
     def schedule(self, file_id="stage"):
@@ -313,7 +314,7 @@ def test_confirmation_finished_after_scheduling_is_allowed(delete_case):
     delete_case.request(status="completed", gy_status="completed", organize_status="completed")
     token = delete_case.confirmation("running")
     callback = delete_case.schedule()
-    db.update_organize_confirmation(token, status="completed")
+    organize_confirmations_repo.update_organize_confirmation(token, status="completed")
     delete_case.allowed(callback)
 
 
@@ -348,10 +349,10 @@ def test_confirmation_queued_during_parent_lookup_invalidates_initial_active_set
     def lookup(file_id):
         # 候选 deep 的快照已读取；走到 B 内部的 nested 时，guard 已取得仅含 A 的集合。
         if file_id == "nested":
-            get_organize_confirmation_result = db.get_organize_confirmation(token_b)
+            get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation(token_b)
             assert get_organize_confirmation_result is not None
             assert get_organize_confirmation_result["status"] == "pending"
-            db.update_organize_confirmation(token_b, status="queued")
+            organize_confirmations_repo.update_organize_confirmation(token_b, status="queued")
         return delete_case.nodes.get(file_id)
 
     delete_case.provider.file_info.side_effect = lookup
@@ -364,7 +365,7 @@ def test_confirmation_queued_during_parent_lookup_invalidates_initial_active_set
     assert read.call_count == 2
     assert all(call.kwargs == {"active_only": True} for call in read.call_args_list)
     assert sum(call.args == ("nested",) for call in delete_case.provider.file_info.call_args_list) == 1
-    get_organize_confirmation_result_2 = db.get_organize_confirmation(token_b)
+    get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation(token_b)
     assert get_organize_confirmation_result_2 is not None
     assert get_organize_confirmation_result_2["status"] == "queued"
     assert {row["id"] for row in cleanup.list_staging_cleanup_requests(active_only=True)} == {active_a, completed_b}

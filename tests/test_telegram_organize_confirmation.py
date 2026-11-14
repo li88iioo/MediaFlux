@@ -15,6 +15,7 @@ from unittest.mock import patch
 from telebot import TeleBot
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app import notifier
@@ -378,7 +379,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertRegex(actions[0].callback_data, r"^orgc:[A-Za-z0-9_-]+:0$")
         self.assertNotIn("105556", actions[0].callback_data)
         token = actions[0].callback_data.split(":")[1]
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "pending")
         payload = json.loads(row["payload_json"])
@@ -400,7 +401,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             group, OrganizeRules(), source_name="下载", chat_id="100",
         )
         first_token = first_actions[0].callback_data.split(":")[1]
-        first = db.get_organize_confirmation(first_token)
+        first = organize_confirmations_repo.get_organize_confirmation(first_token)
         assert first is not None
         first_payload = json.loads(first["payload_json"])
 
@@ -410,14 +411,14 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             group, OrganizeRules(), source_name="下载", chat_id="100",
         )
         second_token = second_actions[0].callback_data.split(":")[1]
-        second = db.get_organize_confirmation(second_token)
+        second = organize_confirmations_repo.get_organize_confirmation(second_token)
 
         self.assertEqual(first["organize_task_id"], "organize-parent-1")
         self.assertEqual(first_payload["organize_rollup"]["actionable_groups"], 1)
-        get_organize_confirmation_result = db.get_organize_confirmation(first_token)
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation(first_token)
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result["status"], "expired")
-        get_organize_confirmation_result_2 = db.get_organize_confirmation(first_token)
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation(first_token)
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(
             json.loads(get_organize_confirmation_result_2["result_json"])[
@@ -468,7 +469,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ) as update_parent:
             expired = confirmation_module._expire_due_pending_confirmations()
 
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         self.assertEqual(expired, 1)
         assert row is not None
         self.assertEqual(row["status"], "expired")
@@ -495,7 +496,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             group, OrganizeRules(), source_name="下载", chat_id="100",
         )
         token = actions[0].callback_data.split(":")[1]
-        db.update_organize_confirmation(
+        organize_confirmations_repo.update_organize_confirmation(
             token,
             status="completed",
             completed_at=db.now(),
@@ -506,7 +507,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
 
         rollup = confirmation_module._confirmation_rollup([
-            db.get_organize_confirmation(token),
+            organize_confirmations_repo.get_organize_confirmation(token),
         ])
 
         assert (rollup) is not None
@@ -519,7 +520,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+        organize_confirmations_repo.claim_organize_confirmation(token, chat_id="100", selected_index=0)
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE organize_confirmations SET expires_at=? WHERE token=?",
@@ -531,8 +532,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 ),
             )
 
-        queued = db.get_next_queued_organize_confirmation()
-        claimed = db.claim_queued_organize_confirmation(token)
+        queued = organize_confirmations_repo.get_next_queued_organize_confirmation()
+        claimed = organize_confirmations_repo.claim_queued_organize_confirmation(token)
 
         assert queued is not None
         self.assertEqual(queued["token"], token)
@@ -568,7 +569,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn("MetaTube javbus:ssis001", str(actions[0].label))
         self.assertTrue(actions[-1].callback_data.endswith(":skip"))
         token = actions[0].callback_data.split(":")[1]
-        get_organize_confirmation_result_3 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_3 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_3 is not None
         payload = json.loads(get_organize_confirmation_result_3["payload_json"])
         self.assertEqual(payload["candidates"][0]["provider"], "metatube")
@@ -619,7 +620,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn("- <b>💡 附带说明：</b> 以后重新执行整理时仍会再次尝试识别。", rendered)
 
         self.assertTrue(result["skipped"])
-        get_organize_confirmation_result_4 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_4 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_4 is not None
         self.assertEqual(get_organize_confirmation_result_4["status"], "cancelled")
         log = db.get_organize_log(log_id)
@@ -632,15 +633,15 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="-100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.bind_organize_confirmation_message(
+        organize_confirmations_repo.bind_organize_confirmation_message(
             token, chat_id="-100", message_id=77
         )
-        get_organize_confirmation_result_5 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_5 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_5 is not None
         payload = json.loads(get_organize_confirmation_result_5["payload_json"])
         self.assertEqual(payload["_telegram_message_id"], 77)
         with self.assertRaisesRegex(ValueError, "不存在或已失效"):
-            db.bind_organize_confirmation_message(
+            organize_confirmations_repo.bind_organize_confirmation_message(
                 token, chat_id="100", message_id=78
             )
 
@@ -660,7 +661,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertRegex(result["task_id"], r"^queue-\d{6}$")
         self.assertEqual(replay["task_id"], result["task_id"])
         self.assertTrue(replay["replayed"])
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "running")
         self.assertEqual(row["selected_index"], 0)
@@ -673,7 +674,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         manager = SimpleNamespace(start_operation=lambda *args, **kwargs: {
             "ok": True, "task_id": "task-1"
         })
-        original_claim = db.claim_organize_confirmation
+        original_claim = organize_confirmations_repo.claim_organize_confirmation
         barrier = threading.Barrier(2)
 
         def synchronized_claim(*args, **kwargs):
@@ -683,7 +684,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ), patch(
-            "app.modules.organize_confirmations.db.claim_organize_confirmation",
+            "app.repositories.organize_confirmations.claim_organize_confirmation",
             side_effect=synchronized_claim,
         ), ThreadPoolExecutor(max_workers=2) as executor:
             futures = [
@@ -696,7 +697,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             results[0]["task_id"]
         })
         self.assertEqual(sum(bool(result.get("replayed")) for result in results), 1)
-        get_organize_confirmation_result_6 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_6 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_6 is not None
         self.assertEqual(get_organize_confirmation_result_6["status"], "running")
 
@@ -720,7 +721,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             start_confirmation(token, 0, chat_id="100")
             with self.assertRaisesRegex(ValueError, "已选择其他候选"):
                 start_confirmation(token, 1, chat_id="100")
-        get_organize_confirmation_result_7 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_7 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_7 is not None
         self.assertEqual(get_organize_confirmation_result_7["selected_index"], 0)
 
@@ -738,7 +739,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "app.modules.organize_confirmations.wake_confirmation_dispatcher"
         ) as dispatcher:
             result = start_confirmation(token, 0, chat_id="100")
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         self.assertEqual(result["status"], "queued")
         assert row is not None
         self.assertEqual(row["status"], "queued")
@@ -802,21 +803,21 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
     def test_acceptance_receipt_survives_interruption_after_claim_commit(self):
         actions = create_confirmation_actions(self._group(), OrganizeRules(), chat_id="100")
         token = actions[0].callback_data.split(":")[1]
-        original_claim = db.claim_organize_confirmation
+        original_claim = organize_confirmations_repo.claim_organize_confirmation
 
         def interrupted_claim(*args, **kwargs):
             original_claim(*args, **kwargs)
             raise RuntimeError("interrupted after claim commit")
 
         with patch.object(
-            db, "claim_organize_confirmation", side_effect=interrupted_claim,
+            organize_confirmations_repo, "claim_organize_confirmation", side_effect=interrupted_claim,
         ), self.assertRaisesRegex(RuntimeError, "interrupted after claim commit"):
             start_confirmation(token, 0, chat_id="100")
 
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "queued")
-        delivery = db.get_organize_confirmation_delivery(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         self.assertIsNotNone(delivery, "queued 认领提交时必须已经持久化接纳事件")
         assert delivery is not None
         event = notification_center.deserialize_notification_event(delivery["event_json"])
@@ -842,13 +843,13 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             confirmation_module, "wake_confirmation_dispatcher", return_value=False,
         ), self.assertRaisesRegex(RuntimeError, "outbox write failed"):
             start_confirmation(token, 0, chat_id="100")
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertIsNone(row["selected_index"])
         self.assertIsNone(row["queued_at"])
         self.assertEqual(row["task_id"], "")
-        self.assertIsNone(db.get_organize_confirmation_delivery(token))
+        self.assertIsNone(organize_confirmations_repo.get_organize_confirmation_delivery(token))
 
     def test_acceptance_handoff_failure_retries_without_reselecting(self):
         actions = create_confirmation_actions(self._group(), OrganizeRules(), chat_id="100")
@@ -858,7 +859,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ), patch.object(confirmation_module, "publish_confirmation_event", return_value=False):
             result = start_confirmation(token, 0, chat_id="100")
         self.assertEqual(result["status"], "queued")
-        delivery = db.get_organize_confirmation_delivery(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         self.assertIsNotNone(delivery)
         assert delivery is not None
         self.assertEqual(delivery["status"], "retry_wait")
@@ -902,7 +903,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                     confirmation_module, "_dispatch_next_queued_confirmation",
                 ), patch.object(confirmation_module, "wake_confirmation_dispatcher", return_value=False):
                     start_confirmation(token, 0, chat_id="100")
-                self.assertIsNotNone(db.get_organize_confirmation_delivery(token))
+                self.assertIsNotNone(organize_confirmations_repo.get_organize_confirmation_delivery(token))
                 acceptance_ready = threading.Event()
                 resume_acceptance = threading.Event()
                 original_upsert = notification_center.upsert_notification
@@ -921,7 +922,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                     pending = executor.submit(confirmation_module._dispatch_due_confirmation_delivery, token)
                     try:
                         self.assertTrue(acceptance_ready.wait(timeout=5))
-                        self.assertIsNotNone(db.claim_queued_organize_confirmation(token))
+                        self.assertIsNotNone(organize_confirmations_repo.claim_queued_organize_confirmation(token))
                         common = dict(
                             event_json=notification_center.serialize_notification_event(
                                 notifier.NotificationEvent(terminal),
@@ -929,9 +930,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                             chat_id="100", message_id=77,
                         )
                         if terminal == "completed":
-                            db.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
+                            organize_confirmations_repo.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
                         else:
-                            db.fail_organize_confirmation_with_delivery(
+                            organize_confirmations_repo.fail_organize_confirmation_with_delivery(
                                 token, error="specific failure", retryable=False, **common,
                             )
                         self.assertTrue(confirmation_module._dispatch_due_confirmation_delivery(token))
@@ -939,7 +940,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                             f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
                         )
                         terminal_item = get_notification(event_key)
-                        delivery = db.get_organize_confirmation_delivery(token)
+                        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
                         assert delivery is not None
                         terminal_delivery = dict(delivery)
                     finally:
@@ -947,7 +948,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                     self.assertTrue(pending.result(timeout=5))
 
                 self.assertEqual(get_notification(event_key), terminal_item)
-                delivery = db.get_organize_confirmation_delivery(token)
+                delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
                 assert delivery is not None
                 self.assertEqual(dict(delivery), terminal_delivery)
                 visible = notification_center.get_notification_thread_event(
@@ -964,7 +965,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                     with self.assertRaisesRegex(ValueError, "已处理"):
                         start_confirmation(token, 0, chat_id="100")
                 self.assertEqual(get_notification(event_key), terminal_item)
-                row = db.get_organize_confirmation(token)
+                row = organize_confirmations_repo.get_organize_confirmation(token)
                 assert row is not None
                 self.assertEqual(row["status"], terminal)
                 self.assertEqual(row["error"], "specific failure" if terminal == "failed" else "")
@@ -980,7 +981,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 group["files"][0]["file_id"] = f"fast-consumer-{terminal}"
                 actions = create_confirmation_actions(group, OrganizeRules(), chat_id="100")
                 token = actions[0].callback_data.split(":")[1]
-                original_claim = db.claim_organize_confirmation
+                original_claim = organize_confirmations_repo.claim_organize_confirmation
 
                 def execute(*_args, **_kwargs):
                     common = dict(
@@ -990,9 +991,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                         chat_id="100", message_id=77,
                     )
                     if terminal == "completed":
-                        db.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
+                        organize_confirmations_repo.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
                     else:
-                        db.fail_organize_confirmation_with_delivery(
+                        organize_confirmations_repo.fail_organize_confirmation_with_delivery(
                             token, error="specific failure", retryable=False, **common,
                         )
                     confirmation_module._dispatch_due_confirmation_delivery(token)
@@ -1006,7 +1007,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 manager = SimpleNamespace(start_operation=lambda _name, _reference, callback: (
                     callback() or {"ok": True, "task_id": "fast-worker"}
                 ))
-                with patch.object(db, "claim_organize_confirmation", side_effect=claim_with_fast_consumer), patch(
+                with patch.object(organize_confirmations_repo, "claim_organize_confirmation", side_effect=claim_with_fast_consumer), patch(
                     "app.modules.organize_tasks.get_organize_manager", return_value=manager,
                 ), patch.object(confirmation_module, "_execute_confirmation", side_effect=execute), patch.object(
                     confirmation_module, "wake_confirmation_dispatcher", return_value=False,
@@ -1032,7 +1033,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             older_group, OrganizeRules(), source_name="下载", chat_id="100"
         )
         older_token = older_actions[0].callback_data.split(":")[1]
-        db.claim_organize_confirmation(
+        organize_confirmations_repo.claim_organize_confirmation(
             older_token, chat_id="100", selected_index=0
         )
 
@@ -1057,10 +1058,10 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(executed, ["先点击但仍在排队"])
         self.assertEqual(result["status"], "queued")
-        get_organize_confirmation_result_8 = db.get_organize_confirmation(older_token)
+        get_organize_confirmation_result_8 = organize_confirmations_repo.get_organize_confirmation(older_token)
         assert get_organize_confirmation_result_8 is not None
         self.assertEqual(get_organize_confirmation_result_8["status"], "running")
-        get_organize_confirmation_result_9 = db.get_organize_confirmation(newer_token)
+        get_organize_confirmation_result_9 = organize_confirmations_repo.get_organize_confirmation(newer_token)
         assert get_organize_confirmation_result_9 is not None
         self.assertEqual(get_organize_confirmation_result_9["status"], "queued")
 
@@ -1071,10 +1072,10 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             running_group, OrganizeRules(), source_name="下载", chat_id="100"
         )
         running_token = running_actions[0].callback_data.split(":")[1]
-        db.claim_organize_confirmation(
+        organize_confirmations_repo.claim_organize_confirmation(
             running_token, chat_id="100", selected_index=0
         )
-        db.update_organize_confirmation(running_token, status="running")
+        organize_confirmations_repo.update_organize_confirmation(running_token, status="running")
 
         queued_group = self._group()
         queued_group["directory"] = "稍后整理的媒体"
@@ -1111,11 +1112,11 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         result = cancel_confirmation(token, chat_id="100")
 
         self.assertTrue(result["cancelled"])
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "cancelled")
         self.assertIsNone(row["queued_at"])
-        self.assertIsNone(db.get_next_queued_organize_confirmation())
+        self.assertIsNone(organize_confirmations_repo.get_next_queued_organize_confirmation())
         log = db.get_organize_log(log_id)
         assert log is not None
         self.assertEqual(log["status"], "skipped")
@@ -1136,7 +1137,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             result = cancel_confirmation(token, chat_id="100", message_id=77)
 
         self.assertTrue(result["cancelled"])
-        get_organize_confirmation_result_10 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_10 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_10 is not None
         self.assertEqual(get_organize_confirmation_result_10["status"], "cancelled")
         key = notification_thread_event_key(
@@ -1161,7 +1162,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "is_set",
             side_effect=[False, True],
         ), patch.object(
-            confirmation_module.db,
+            confirmation_module.organize_confirmations_repo,
             "get_next_queued_organize_confirmation",
         ) as get_next:
             confirmation_module._confirmation_dispatch_loop()
@@ -1200,7 +1201,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                     return_value=False,
                 ),
                 patch.object(
-                    confirmation_module.db,
+                    confirmation_module.organize_confirmations_repo,
                     "get_next_queued_organize_confirmation",
                     side_effect=get_next,
                 ),
@@ -1251,7 +1252,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         token = actions[0].callback_data.split(":")[1]
         result = cancel_confirmation(token, chat_id="100")
         self.assertTrue(result["cancelled"])
-        cancelled = db.get_organize_confirmation(token)
+        cancelled = organize_confirmations_repo.get_organize_confirmation(token)
         assert cancelled is not None
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertEqual(json.loads(cancelled["result_json"])["resolution"], "deferred")
@@ -1266,7 +1267,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         token = actions[0].callback_data.split(":")[1]
         with self.assertRaisesRegex(ValueError, "不存在或已失效"):
             start_confirmation(token, 0, chat_id="200")
-        get_organize_confirmation_result_11 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_11 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_11 is not None
         self.assertEqual(get_organize_confirmation_result_11["status"], "pending")
 
@@ -1285,7 +1286,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             )
         with self.assertRaisesRegex(ValueError, "已过期"):
             start_confirmation(token, 0, chat_id="100")
-        get_organize_confirmation_result_12 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_12 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_12 is not None
         self.assertEqual(get_organize_confirmation_result_12["status"], "expired")
 
@@ -1306,7 +1307,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ) as dispatcher:
             result = start_confirmation(token, 0, chat_id="100")
         self.assertEqual(result["status"], "queued")
-        get_organize_confirmation_result_13 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_13 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_13 is not None
         self.assertEqual(get_organize_confirmation_result_13["status"], "queued")
         dispatcher.assert_called_once_with()
@@ -1316,7 +1317,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+        organize_confirmations_repo.claim_organize_confirmation(token, chat_id="100", selected_index=0)
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE organize_confirmations SET payload_json='{' WHERE token=?",
@@ -1336,11 +1337,11 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["terminal"])
         self.assertEqual(result["error"], "确认任务数据损坏，请重新执行整理")
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["error"], result["error"])
-        delivery = db.get_organize_confirmation_delivery(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert (delivery) is not None
         self.assertEqual(delivery["status"], "sent")
         event = published[-1]
@@ -1381,7 +1382,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ), self.assertRaisesRegex(RuntimeError, "TMDB 网络"):
             callback()
 
-        old_row = db.get_organize_confirmation(token)
+        old_row = organize_confirmations_repo.get_organize_confirmation(token)
         assert old_row is not None
         self.assertEqual(old_row["status"], "failed")
         event = published[-1]
@@ -1392,7 +1393,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn("重新尝试", str(event.actions[0].label))
         self.assertIn("旧确认已失效", event.footer)
 
-        retry_row = db.get_organize_confirmation(retry_token)
+        retry_row = organize_confirmations_repo.get_organize_confirmation(retry_token)
         assert (retry_row) is not None
         self.assertEqual(retry_row["status"], "pending")
         self.assertGreater(str(retry_row["expires_at"] or ""), db.now())
@@ -1404,7 +1405,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(retry_payload, old_payload)
         with self.assertRaisesRegex(ValueError, "已绑定其他候选"):
             start_confirmation(retry_token, 1, chat_id="100")
-        get_organize_confirmation_result_14 = db.get_organize_confirmation(retry_token)
+        get_organize_confirmation_result_14 = organize_confirmations_repo.get_organize_confirmation(retry_token)
         assert get_organize_confirmation_result_14 is not None
         self.assertEqual(get_organize_confirmation_result_14["status"], "pending")
 
@@ -1426,10 +1427,10 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         retry_token = published[-1].actions[0].callback_data.split(":")[1]
         with self.assertRaisesRegex(ValueError, "已处理"):
             start_confirmation(token, 0, chat_id="100")
-        get_organize_confirmation_result_15 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_15 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_15 is not None
         self.assertEqual(get_organize_confirmation_result_15["status"], "failed")
-        get_organize_confirmation_result_16 = db.get_organize_confirmation(retry_token)
+        get_organize_confirmation_result_16 = organize_confirmations_repo.get_organize_confirmation(retry_token)
         assert get_organize_confirmation_result_16 is not None
         self.assertEqual(get_organize_confirmation_result_16["status"], "pending")
 
@@ -1487,7 +1488,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ), self.assertRaisesRegex(RuntimeError, "写入结果未知"):
             callback()
 
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "failed")
         self.assertEqual(published[-1].actions, ())
@@ -1512,7 +1513,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 (token,),
             )
         db.init_db()
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "failed")
         self.assertIn("进程", row["error"])
@@ -1522,7 +1523,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.bind_organize_confirmation_message(
+        organize_confirmations_repo.bind_organize_confirmation_message(
             token, chat_id="100", message_id=77
         )
         with db.get_conn() as conn:
@@ -1533,7 +1534,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
 
         db.init_db()
 
-        delivery = db.get_organize_confirmation_delivery(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert (delivery) is not None
         self.assertEqual(delivery["status"], "pending")
         self.assertEqual(delivery["message_id"], 77)
@@ -1549,7 +1550,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn("已中断", str(event.title))
         self.assertEqual(publish_mock.call_args.kwargs["token"], token)
         self.assertEqual(publish_mock.call_args.kwargs["message_id"], 77)
-        get_organize_confirmation_delivery_result = db.get_organize_confirmation_delivery(token)
+        get_organize_confirmation_delivery_result = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert get_organize_confirmation_delivery_result is not None
         self.assertEqual(
             get_organize_confirmation_delivery_result["status"], "sent"
@@ -1560,15 +1561,15 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.bind_organize_confirmation_message(
+        organize_confirmations_repo.bind_organize_confirmation_message(
             token, chat_id="100", message_id=77
         )
-        db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
-        assert (db.claim_queued_organize_confirmation(token)) is not None
+        organize_confirmations_repo.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+        assert (organize_confirmations_repo.claim_queued_organize_confirmation(token)) is not None
         event = notifier.NotificationEvent(
             "✅ 人工确认整理完成", footer="已完成", layout="relaxed"
         )
-        db.complete_organize_confirmation_with_delivery(
+        organize_confirmations_repo.complete_organize_confirmation_with_delivery(
             token,
             result_json='{"moved":1}',
             event_json=notification_center.serialize_notification_event(event),
@@ -1583,7 +1584,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             attempted = confirmation_module._dispatch_due_confirmation_delivery(token)
         self.assertTrue(attempted)
         publish_mock.assert_called_once()
-        delivery = db.get_organize_confirmation_delivery(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert delivery is not None
         self.assertEqual(delivery["status"], "retry_wait")
         self.assertEqual(delivery["attempts"], 1)
@@ -1605,7 +1606,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 confirmation_module._dispatch_due_confirmation_delivery(token)
             )
         retry_publish.assert_called_once()
-        get_organize_confirmation_delivery_result_2 = db.get_organize_confirmation_delivery(token)
+        get_organize_confirmation_delivery_result_2 = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert get_organize_confirmation_delivery_result_2 is not None
         self.assertEqual(
             get_organize_confirmation_delivery_result_2["status"], "sent"
@@ -1616,16 +1617,16 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.bind_organize_confirmation_message(
+        organize_confirmations_repo.bind_organize_confirmation_message(
             token, chat_id="100", message_id=77
         )
-        db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
-        db.claim_queued_organize_confirmation(token)
+        organize_confirmations_repo.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+        organize_confirmations_repo.claim_queued_organize_confirmation(token)
 
         db.init_db()
-        interrupted_delivery = db.get_organize_confirmation_delivery(token)
+        interrupted_delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         with self.assertRaisesRegex(ValueError, "不存在或已失效"):
-            db.complete_organize_confirmation_with_delivery(
+            organize_confirmations_repo.complete_organize_confirmation_with_delivery(
                 token,
                 result_json='{"moved":1}',
                 event_json=notification_center.serialize_notification_event(
@@ -1635,8 +1636,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 message_id=77,
             )
 
-        row = db.get_organize_confirmation(token)
-        delivery = db.get_organize_confirmation_delivery(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert row is not None
         self.assertEqual(row["status"], "failed")
         assert delivery is not None
@@ -1650,11 +1651,11 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+        organize_confirmations_repo.claim_organize_confirmation(token, chat_id="100", selected_index=0)
 
         db.init_db()
 
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "queued")
         self.assertEqual(row["selected_index"], 0)
@@ -1669,8 +1670,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             )
             tokens.append(actions[0].callback_data.split(":")[1])
 
-        db.claim_organize_confirmation(tokens[1], chat_id="100", selected_index=0)
-        db.claim_organize_confirmation(tokens[0], chat_id="100", selected_index=0)
+        organize_confirmations_repo.claim_organize_confirmation(tokens[1], chat_id="100", selected_index=0)
+        organize_confirmations_repo.claim_organize_confirmation(tokens[0], chat_id="100", selected_index=0)
         executed = []
 
         def start_operation(_name, reference, callback):
@@ -1679,7 +1680,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             return {"ok": True, "task_id": f"task-{len(executed)}"}
 
         def complete(token, *_args, **_kwargs):
-            db.update_organize_confirmation(
+            organize_confirmations_repo.update_organize_confirmation(
                 token, status="completed", completed_at=db.now()
             )
             return {"ok": True}
@@ -1699,7 +1700,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(executed, ["后出现但先点击的消息", "先出现的消息"])
         statuses = []
         for token in tokens:
-            row = db.get_organize_confirmation(token)
+            row = organize_confirmations_repo.get_organize_confirmation(token)
             assert row is not None
             statuses.append(row["status"])
         self.assertEqual(statuses, ["completed", "completed"])
@@ -1784,16 +1785,16 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                         chat_id="100", message_id=77,
                     )
                     if terminal == "completed":
-                        db.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
+                        organize_confirmations_repo.complete_organize_confirmation_with_delivery(token, result_json="{}", **common)
                     else:
-                        db.fail_organize_confirmation_with_delivery(
+                        organize_confirmations_repo.fail_organize_confirmation_with_delivery(
                             token, error="specific failure", retryable=False, **common,
                         )
                     confirmation_module._dispatch_due_confirmation_delivery(token)
                     return {}
 
                 def start_operation(_name, _reference, callback):
-                    row = db.get_organize_confirmation(token)
+                    row = organize_confirmations_repo.get_organize_confirmation(token)
                     assert row is not None
                     self.assertEqual(row["task_id"], f"queue-{row['id']:06d}")
                     callback()  # 确定性重现：worker 在接纳回调返回前已经结束。
@@ -1807,7 +1808,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 ):
                     result = start_confirmation(token, 0, chat_id="100")
                 self.assertEqual(result["status"], terminal)
-                row = db.get_organize_confirmation(token)
+                row = organize_confirmations_repo.get_organize_confirmation(token)
                 assert row is not None
                 self.assertEqual(row["error"], "specific failure" if terminal == "failed" else "")
                 self.assertEqual(len(published), 2)
@@ -1830,8 +1831,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 group = self._group()
                 group["files"][0]["size"] = size
                 token = create_confirmation_actions(group, frozen, chat_id="100")[0].callback_data.split(":")[1]
-                db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
-                row = db.claim_queued_organize_confirmation(token)
+                organize_confirmations_repo.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+                row = organize_confirmations_repo.claim_queued_organize_confirmation(token)
                 assert row is not None
                 payload = json.loads(row["payload_json"])
                 with patch.object(OrganizeRules, "from_config", return_value=current), patch.object(
@@ -1842,7 +1843,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                             token, payload, payload["candidates"][0], selected_index=0, chat_id="100",
                         )
                 cloud.assert_not_called()
-                row = db.get_organize_confirmation(token)
+                row = organize_confirmations_repo.get_organize_confirmation(token)
                 assert row is not None
                 self.assertEqual(row["status"], "failed")
                 self.assertIn(reason, row["error"])
@@ -1861,7 +1862,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             group, rules, source_name="下载", chat_id="100"
         )
         token = actions[0].callback_data.split(":")[1]
-        db.bind_organize_confirmation_message(token, chat_id="100", message_id=77)
+        organize_confirmations_repo.bind_organize_confirmation_message(token, chat_id="100", message_id=77)
         callbacks = []
         manager = SimpleNamespace(
             start_operation=lambda _name, _reference, callback: (
@@ -1957,7 +1958,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         thread_ref = post_action_kwargs[0]["notification_threads"][0]
         self.assertEqual(thread_ref["topic"], "confirmation")
         self.assertEqual(thread_ref["token"], token)
-        get_organize_confirmation_result_17 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_17 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_17 is not None
         self.assertEqual(get_organize_confirmation_result_17["status"], "completed")
         self.assertIn("人工确认整理完成", published[-1].title)
@@ -2020,7 +2021,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             ):
                 callback()
 
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         self.assertEqual(calls, [True])
         assert row is not None
         self.assertEqual(row["status"], "failed")
@@ -2060,7 +2061,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ):
             with self.assertRaisesRegex(Exception, "已不存在"):
                 callbacks[0]()
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "failed")
         event = published[-1]
@@ -2132,7 +2133,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
         self.assertTrue(event.actions)
         token = event.actions[0].callback_data.split(":")[1]
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         payload = json.loads(row["payload_json"])
         self.assertEqual(row["organize_task_id"], "task-grouped")
@@ -2172,7 +2173,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
         self.assertEqual(len(event.actions), 2)
         token = event.actions[0].callback_data.split(":")[1]
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["organize_task_id"], "directory-confirmation")
@@ -2260,7 +2261,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(actions), 3)
         self.assertRegex(actions[0].callback_data, r"^orgc:[A-Za-z0-9_-]+:0$")
         token = actions[0].callback_data.split(":")[1]
-        get_organize_confirmation_result_18 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_18 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_18 is not None
         payload = json.loads(get_organize_confirmation_result_18["payload_json"])
         self.assertEqual(payload["kind"], "local_media")
@@ -2352,7 +2353,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertEqual(request["local_import_status"], "completed")
         self.assertEqual(request["local_import_error"], "")
         self.assertTrue(request["local_import_completed_at"])
-        get_organize_confirmation_result_19 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_19 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_19 is not None
         self.assertEqual(get_organize_confirmation_result_19["status"], "completed")
         self.assertIn("本地媒体确认整理完成", published[-1].title)
@@ -2404,7 +2405,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         assert request is not None
         self.assertEqual(request["local_import_status"], "failed")
         self.assertIn("归档写入失败", request["local_import_error"] or "")
-        get_organize_confirmation_result_20 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_20 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_20 is not None
         self.assertEqual(get_organize_confirmation_result_20["status"], "failed")
 
@@ -2442,7 +2443,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             get_local_media_task_result_2.status,
             "requires_manual",
         )
-        get_organize_confirmation_result_21 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_21 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_21 is not None
         self.assertEqual(get_organize_confirmation_result_21["status"], "failed")
 
@@ -2455,7 +2456,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         ):
             cancel_confirmation(token, chat_id="100")
 
-        get_organize_confirmation_result_22 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_22 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_22 is not None
         self.assertEqual(get_organize_confirmation_result_22["status"], "cancelled")
         get_local_media_task_result_3 = local_media_repo.get_local_media_task(self.task_id, owner="admin")
@@ -2574,7 +2575,7 @@ class TelegramCallbackTests(unittest.TestCase):
             },
         }
         with patch(
-            "app.bot.handlers.db.bind_organize_confirmation_message"
+            "app.repositories.organize_confirmations.bind_organize_confirmation_message"
         ) as bind_mock, patch(
             "app.modules.organize_confirmations.start_confirmation", return_value=result
         ):
@@ -2593,7 +2594,7 @@ class TelegramCallbackTests(unittest.TestCase):
                     id="callback", data="orgc:token:0", from_user=SimpleNamespace(id=9),
                     message=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=77),
                 )
-                with patch("app.bot.handlers.db.bind_organize_confirmation_message"), patch.object(
+                with patch("app.repositories.organize_confirmations.bind_organize_confirmation_message"), patch.object(
                     confirmation_module, "start_confirmation", return_value={"status": status},
                 ):
                     _handle_organize_confirmation_callback(bot, call)
@@ -2668,7 +2669,7 @@ class TelegramCallbackTests(unittest.TestCase):
             },
         }
         with patch(
-            "app.bot.handlers.db.bind_organize_confirmation_message"
+            "app.repositories.organize_confirmations.bind_organize_confirmation_message"
         ) as bind_mock, patch(
             "app.modules.organize_confirmations.start_confirmation", return_value=result
         ) as start_mock:

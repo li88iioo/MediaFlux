@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import local_media as local_media_repo
 from app.main import create_app
 from app.modules.local_media_recognition_summary import infer_recognition_summary
@@ -60,7 +61,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         source = local_media_repo.create_local_media_source("confirmation", "", "", str(self.local_root))
         task = local_media_repo.create_local_media_task(source, "", str(self.local_root / "Pending.mkv"))
         local_media_repo.update_local_media_task(task, status="requires_manual")
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token="pending", fingerprint="pending", chat_id="", source_name="", directory_path="/",
             payload={"local_task_id": task}, expires_at="2099-01-01 00:00:00",
         )

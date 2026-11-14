@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.bot import handlers
 from app.modules import organize_confirmation_batches as service
 from app.modules import organize_confirmations as confirmations
@@ -63,12 +64,12 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         )[0].callback_data.split(":")[1] for index in range(start, start + count)]
 
     def _confirmation(self, token: str) -> Row:
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None, f"确认记录不存在：{token}"
         return row
 
     def _review(self, token: str, *, index=0, status="approved") -> None:
-        db.update_organize_confirmation(
+        organize_confirmations_repo.update_organize_confirmation(
             token, review_status=status,
             review_result_json=json.dumps({
                 "candidate_index": index, "summary": "核对季集后建议选择", "confidence": 0.92,
@@ -176,7 +177,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.assertEqual(self._snapshot().message_id, 77)
         self.assertEqual(self.sent.call_count, 1)
         self.assertTrue(all(call.kwargs["message_id"] == 77 for call in self.edited.call_args_list))
-        delivery = db.get_organize_confirmation_delivery(token)
+        delivery = organize_confirmations_repo.get_organize_confirmation_delivery(token)
         assert delivery is not None
         self.assertEqual(delivery["status"], "sent")
         self._callback(self._action("返回批次"))
@@ -373,7 +374,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             {"strm": "已完成", "media_refresh": "已完成"},
         )
         for token, result in zip(tokens, downstream):
-            db.update_organize_confirmation(token, status="completed", result_json=json.dumps({"_downstream": result}, ensure_ascii=False))
+            organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=json.dumps({"_downstream": result}, ensure_ascii=False))
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
         summary = self._snapshot().event
         self.assertIn(("后续处理", "部分完成 1 · 等待回执 1 · 已完成 1"), summary.fields)
@@ -422,7 +423,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
             confirmations.start_confirmation(token, 0, chat_id="100", dispatch=False)
         revisions = []
         for token in tokens:
-            delivery = db.claim_due_organize_confirmation_delivery(
+            delivery = organize_confirmations_repo.claim_due_organize_confirmation_delivery(
                 current_time=db.now(), stale_before=(datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"), token=token,
             )
             assert delivery is not None
@@ -445,7 +446,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
                 self.batch_id, chat_id="100", expected_confirmation_delivery=lease, expected_revision=revision + 1,
             ))
             self.assertEqual(self._snapshot().revision, revision)
-            self.assertTrue(db.complete_organize_confirmation_delivery(
+            self.assertTrue(organize_confirmations_repo.complete_organize_confirmation_delivery(
                 lease[0], sent_at=db.now(), expected_lease_generation=lease[1],
             ))
             self.assertFalse(batch.publish_batch_summary(
@@ -461,7 +462,7 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         first, _second = self._create()
         batch.publish_batch_summary(self.batch_id, chat_id="100", deliver_now=True)
         confirmations.start_confirmation(first, 0, chat_id="100", dispatch=False)
-        delivery = db.claim_due_organize_confirmation_delivery(
+        delivery = organize_confirmations_repo.claim_due_organize_confirmation_delivery(
             current_time=db.now(), stale_before=(datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"), token=first,
         )
         assert delivery is not None

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.modules.download_staging_cleanup import cleanup_download_staging
 from tests.support import IsolatedDatabaseTestCase
@@ -81,13 +82,13 @@ class DownloadStagingCleanupLifecycleTests(IsolatedDatabaseTestCase):
 
     def add_confirmation(self, *, status='pending', source_id='stage'):
         token = 'confirmation-' + status
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=token, chat_id='test', source_name='MF-case',
             directory_path='/', payload={'source_dir_id': source_id, 'source_parent_id': source_id,
                                          'files': [{'file_id': 'video', 'parent_id': source_id}]},
             expires_at='2099-01-01 00:00:00',
         )
-        db.update_organize_confirmation(token, status=status)
+        organize_confirmations_repo.update_organize_confirmation(token, status=status)
         return token
 
     def test_retained_completed_request_is_cleaned_and_second_call_does_not_delete_again(self):

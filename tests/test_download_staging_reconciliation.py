@@ -5,6 +5,7 @@ import json
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app.modules import download_staging_reconcile as worker
@@ -43,11 +44,11 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         return request_id
 
     def confirm(self, token, *, payload=None, status='completed', fingerprint=None, stats=None):
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=fingerprint or token, chat_id='test', source_name='test',
             directory_path='/', payload=payload or self.payload, expires_at='2099-01-01 00:00:00',
         )
-        db.update_organize_confirmation(token, status=status, result_json=json.dumps(
+        organize_confirmations_repo.update_organize_confirmation(token, status=status, result_json=json.dumps(
             stats if stats is not None else {'moved': 1, 'failed': 0, 'need_confirm': 0},
         ))
 
@@ -96,8 +97,8 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(self.cloud.deleted), 3)
 
     def test_new_confirmation_and_intent_commit_atomically_without_notification(self):
-        db.update_organize_confirmation('done', status='running')
-        db.complete_organize_confirmation_with_delivery(
+        organize_confirmations_repo.update_organize_confirmation('done', status='running')
+        organize_confirmations_repo.complete_organize_confirmation_with_delivery(
             'done', result_json='{"moved":1,"failed":0}', event_json='{}', chat_id='',
             message_id=None, enqueue_delivery=False,
         )
@@ -107,13 +108,13 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.cloud.deleted, ['stage'])
 
     def test_atomic_enqueue_failure_rolls_back_terminal_confirmation(self):
-        db.update_organize_confirmation('done', status='running')
+        organize_confirmations_repo.update_organize_confirmation('done', status='running')
         with patch.object(queue, 'enqueue_confirmation_cleanup', side_effect=RuntimeError('db unavailable')), self.assertRaises(RuntimeError):
-            db.complete_organize_confirmation_with_delivery(
+            organize_confirmations_repo.complete_organize_confirmation_with_delivery(
                 'done', result_json='{"moved":1}', event_json='{}', chat_id='',
                 message_id=None, enqueue_delivery=False,
             )
-        get_organize_confirmation_result = db.get_organize_confirmation('done')
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation('done')
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result['status'], 'running')
 
@@ -132,7 +133,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         self.drain()
         self.assertEqual(self.cloud.deleted, ['stage'])
         self.assertEqual(self.job()['status'], 'completed')
-        get_organize_confirmation_result_2 = db.get_organize_confirmation('done')
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation('done')
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(get_organize_confirmation_result_2['status'], 'completed')
 
@@ -301,7 +302,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         get_download_request_result_16 = download_requests_repo.get_download_request(self.request_id)
         assert get_download_request_result_16 is not None
         before = dict(get_download_request_result_16)
-        db.update_organize_confirmation('done', result_json=json.dumps({
+        organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps({
             'moved': 1, 'download_staging_identity': before,
         }))
         download_requests_repo.update_download_request(self.request_id, gy_task_id='new-backend')
@@ -349,7 +350,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         self.drain()
         self.assertEqual(self.job()['status'], 'retry')
         self.assertEqual(self.cloud.reads, [])
-        db.update_organize_confirmation('waiting', status='completed', result_json='{"moved":1}')
+        organize_confirmations_repo.update_organize_confirmation('waiting', status='completed', result_json='{"moved":1}')
         self.due_now()
         self.drain()
         self.assertEqual(self.cloud.deleted, ['stage'])
@@ -560,7 +561,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
                 json.dumps({**self.payload, 'rules': {'clean_empty': True},
                             'candidates': [{'provider': 'clean_title'}]}),
             ))
-        db.update_organize_confirmation('done', confirmation_actor='agent', result_json=json.dumps({
+        organize_confirmations_repo.update_organize_confirmation('done', confirmation_actor='agent', result_json=json.dumps({
             'moved': 1, 'download_staging_policy': 'retained',
         }))
         self.enqueue()
@@ -576,7 +577,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
                 json.dumps({**self.payload, 'rules': {'clean_empty': True},
                             'candidates': [{'provider': 'clean_title'}]}),
             ))
-        db.update_organize_confirmation('done', confirmation_actor='agent', result_json=json.dumps({
+        organize_confirmations_repo.update_organize_confirmation('done', confirmation_actor='agent', result_json=json.dumps({
             'moved': 1, 'download_staging_policy': 'cleanup_empty',
         }))
         self.enqueue()
@@ -592,7 +593,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
                 json.dumps({**self.payload, 'rules': {'clean_empty': True},
                             'candidates': [{'provider': 'clean_title'}]}),
             ))
-        db.update_organize_confirmation('done', confirmation_actor='agent')
+        organize_confirmations_repo.update_organize_confirmation('done', confirmation_actor='agent')
         self.assertEqual(queue.discover_legacy_confirmation_cleanup(), 1)
         self.drain()
         get_download_request_result_9 = download_requests_repo.get_download_request(self.request_id)
@@ -617,7 +618,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
         finally:
             self.writer_lock.release()
         self.assertNotIn('empty_dir_cleanup_failed', stats)
-        db.update_organize_confirmation('done', result_json=json.dumps(stats))
+        organize_confirmations_repo.update_organize_confirmation('done', result_json=json.dumps(stats))
         self.assertEqual(self.job()['status'], 'retry')
         self.due_now()
         self.drain()

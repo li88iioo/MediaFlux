@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app import config
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.clients.tmdb import TMDBClient
 from app.modules import episode_research_service as service
 from app.modules import organize_confirmations as confirmations
@@ -84,11 +85,11 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
                                          episode_research_receipt=result["receipt"])
 
     def create(self, decision):
-        db.create_organize_confirmation(token="episode-case", fingerprint=confirmations._fingerprint(self.payload),
+        organize_confirmations_repo.create_organize_confirmation(token="episode-case", fingerprint=confirmations._fingerprint(self.payload),
                                        chat_id="owner-chat", source_name="Fixture Show", directory_path="Fixture Show",
                                        payload=self.payload, expires_at=(datetime.now(timezone.utc).astimezone()+timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),
                                        review_requested=True, review_ready=True)
-        row = db.claim_next_organize_confirmation_review()
+        row = organize_confirmations_repo.claim_next_organize_confirmation_review()
         assert (row) is not None
         with patch("app.modules.agent_recognition_review.review_confirmation_payload", return_value=decision):
             return confirmations._process_recognition_review_row(row)
@@ -107,7 +108,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
         return scraper
 
     def execute(self):
-        row = db.claim_queued_organize_confirmation("episode-case")
+        row = organize_confirmations_repo.claim_queued_organize_confirmation("episode-case")
         assert (row) is not None
         payload = confirmations._decode_row(row)
         with patch.object(confirmations, "TMDBScraper", return_value=self.scraper()):
@@ -116,7 +117,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
 
     def test_verified_research_runs_existing_frozen_executor_not_old_numbering_rule(self):
         self.assertEqual(self.create(self.decision()), "approved")
-        get_organize_confirmation_result = db.get_organize_confirmation("episode-case")
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation("episode-case")
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result["status"], "queued")
         result = self.execute()
@@ -126,7 +127,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
             self.assertIn(f"S00E{number:02d}", current.name)
             self.assertEqual(self.cloud.infos[current.parent_id].name, "Specials")
         self.assertEqual(self.cloud.deleted, [])
-        row = db.get_organize_confirmation("episode-case")
+        row = organize_confirmations_repo.get_organize_confirmation("episode-case")
         assert row is not None
         self.assertEqual((row["status"], row["confirmation_actor"]), ("completed", "agent"))
         self.assertIn("episode_research_receipt", json.loads(row["review_result_json"]))
@@ -148,7 +149,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
             current = self.cloud.infos[item["file_id"]]
             self.assertIn(f"S00E{number:02d}", current.name)
             self.assertEqual(self.cloud.infos[current.parent_id].name, "Specials")
-        row = db.get_organize_confirmation("episode-case")
+        row = organize_confirmations_repo.get_organize_confirmation("episode-case")
         assert row is not None
         self.assertEqual((row["status"], row["confirmation_actor"]), ("completed", "agent"))
         self.assertIs(json.loads(row["payload_json"])["_explicit_approval"], True)
@@ -158,7 +159,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
         decision = self.decision()
         self.values["AGENT_EPISODE_RESEARCH_ENABLED"] = "0"
         self.assertNotEqual(self.create(decision), "approved")
-        get_organize_confirmation_result_2 = db.get_organize_confirmation("episode-case")
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation("episode-case")
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(get_organize_confirmation_result_2["status"], "pending")
         self.assertEqual(self.cloud.deleted, [])

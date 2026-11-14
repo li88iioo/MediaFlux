@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
     from app.modules.local_media_models import LocalMediaSource
 
-from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import local_media as local_media_repo
 from app.repositories import rss as rss_repo
@@ -2838,7 +2838,7 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
                 )
             return
         selected_index = int(selection)
-        db.bind_organize_confirmation_message(
+        organize_confirmations_repo.bind_organize_confirmation_message(
             token, chat_id=chat_id, message_id=call.message.message_id
         )
         result = start_confirmation(token, selected_index, chat_id=chat_id)

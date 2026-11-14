@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import cast
 from unittest.mock import Mock, patch
 
-from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.clients.guangya import GuangYaClient
 from app.clients.tmdb import TMDBClient
 from app.modules import organize_confirmations as confirmations
@@ -345,8 +345,8 @@ class ConfirmedSourceSnapshotTests(IsolatedDatabaseTestCase):
         }
         actions = confirmations.create_confirmation_actions(group, rules, notification_suppressed=True)
         token = actions[0].callback_data.split(":")[1]
-        self.assertIsNotNone(db.claim_organize_confirmation(token, chat_id="", selected_index=0))
-        row = db.claim_queued_organize_confirmation(token)
+        self.assertIsNotNone(organize_confirmations_repo.claim_organize_confirmation(token, chat_id="", selected_index=0))
+        row = organize_confirmations_repo.claim_queued_organize_confirmation(token)
         assert row is not None
         payload = json.loads(row["payload_json"])
         return token, payload
@@ -386,7 +386,7 @@ class ConfirmedSourceSnapshotTests(IsolatedDatabaseTestCase):
                                 )
                         self.assertTrue(changed)
                         move.assert_not_called()
-                        saved = db.get_organize_confirmation(token)
+                        saved = organize_confirmations_repo.get_organize_confirmation(token)
                         assert saved is not None
                         self.assertEqual(saved["status"], "failed")
                         scraper.confirm.assert_not_called()
@@ -404,7 +404,7 @@ class ConfirmedSourceSnapshotTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["metadata_moved"], 1)
         self.assertEqual(stats["failed"], 0)
-        saved = db.get_organize_confirmation(token)
+        saved = organize_confirmations_repo.get_organize_confirmation(token)
         assert saved is not None
         self.assertEqual(saved["status"], "completed")
         scraper.confirm.assert_called_once()

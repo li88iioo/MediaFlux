@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.modules import organize_confirmation_batches as batches
 from app.modules import organize_confirmations as confirmations
 from app.modules import telegram_organize_lifecycle  # noqa: F401 -- 在测试替换通知函数前加载其正式导入绑定。
@@ -27,7 +28,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         self.enterContext(patch.object(confirmations, "wake_recognition_review_dispatcher"))
 
     def row(self, token: str):
-        row = db.get_organize_confirmation(token)
+        row = organize_confirmations_repo.get_organize_confirmation(token)
         assert row is not None
         return row
 
@@ -44,7 +45,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         }
         if batch:
             payload.update(_confirmation_batch=batch, review_only=True)
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=confirmations._fingerprint(payload), chat_id=chat,
             source_name="来源A", directory_path=payload["directory"], payload=payload,
             expires_at=(datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"),
@@ -73,9 +74,9 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_manual_draft_survives_late_model_result_without_executing(self):
         self.create("one", review=True)
-        db.claim_next_organize_confirmation_review()
+        organize_confirmations_repo.claim_next_organize_confirmation_review()
         batches.save_selection("one", 1)
-        self.assertFalse(db.complete_organize_confirmation_review(
+        self.assertFalse(organize_confirmations_repo.complete_organize_confirmation_review(
             "one", status="approved", result={"candidate_index": 0},
         ))
         view = batches.list_confirmations()["items"][0]
@@ -114,7 +115,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         payload = self.create("old", batch="old-batch")
         self.create("other", batch="old-batch")
         payload["_confirmation_batch"] = "new-batch"
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token="new", fingerprint=confirmations._fingerprint(payload), chat_id="chat",
             source_name="来源A", directory_path=payload["directory"], payload=payload,
             expires_at=self.row("old")["expires_at"],
@@ -137,7 +138,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_bulk_review_records_suggestion_but_does_not_claim_files(self):
         self.create("one", review=True, batch="b")
-        row = db.claim_next_organize_confirmation_review()
+        row = organize_confirmations_repo.claim_next_organize_confirmation_review()
         decision = RecognitionReviewDecision(status="approved", candidate_index=1, confidence=.99,
                                              reason_code="evidence_consistent", summary="核对年份一致")
         with patch.object(confirmations, "_recognition_review_is_enabled", return_value=True), \
@@ -151,13 +152,13 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_read_only_request_revokes_automatic_claim_even_if_worker_already_read_payload(self):
         self.create("one", review=True)
-        row = db.claim_next_organize_confirmation_review()
+        row = organize_confirmations_repo.claim_next_organize_confirmation_review()
         self.assertIsNotNone(row)
         with patch.object(confirmations, "_recognition_review_is_enabled", return_value=True):
             result = batches.request_reviews(["one"])
         self.assertEqual(result["unchanged"], 1)
         with self.assertRaises(ValueError):
-            db.claim_organize_confirmation("one", chat_id="chat", selected_index=0, actor="agent")
+            organize_confirmations_repo.claim_organize_confirmation("one", chat_id="chat", selected_index=0, actor="agent")
         self.assertEqual(self.row("one")["status"], "pending")
         preview = batches.preview_choices([{"confirmation_id": "one", "candidate_index": 1}])
         result = batches.submit_choices(preview["entries"], preview["digest"], actor="agent")
@@ -283,7 +284,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
             "_downstream": {"strm": "已排队", "media_refresh": "等待 STRM 完成"},
             "internal_context": "must-not-export",
         }
-        db.update_organize_confirmation("done", status="completed", result_json=json.dumps(receipt),
+        organize_confirmations_repo.update_organize_confirmation("done", status="completed", result_json=json.dumps(receipt),
                                        completed_at="2026-11-14 10:00:00")
         log_id = db.add_organize_log("guangya", "/source", "/archive", "done", "success",
                                      operation_token="recognition-confirm:done")
@@ -316,7 +317,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         for token, status, result in (("queued", "queued", {}), ("legacy", "completed", {}),
                                       ("cancelled", "cancelled", {"resolution": "cancelled"})):
             self.create(token)
-            db.update_organize_confirmation(token, status=status, result_json=json.dumps(result))
+            organize_confirmations_repo.update_organize_confirmation(token, status=status, result_json=json.dumps(result))
         items = {item["confirmation_id"]: item for item in batches.list_confirmations(status="all")["items"]}
         self.assertIsNone(items["queued"]["execution"])
         self.assertIsNone(items["legacy"]["execution"])
@@ -326,7 +327,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
     def test_exact_log_links_survive_same_names_and_receipt_survives_log_clear(self):
         for token in ("first", "second"):
             self.create(token)
-            db.update_organize_confirmation(token, status="completed", result_json=json.dumps({
+            organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=json.dumps({
                 "total": 1, "moved": 1, "failed": 0,
             }))
         ids = [db.add_organize_log("guangya", "/same", "/same-target", "same-file", "success",

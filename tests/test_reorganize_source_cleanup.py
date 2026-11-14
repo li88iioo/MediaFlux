@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from app import config
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import strm as strm_repo
 from app.repositories import organize_history as organize_history_repo
@@ -205,7 +206,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         )
         token = "bug1-confirmation"
         video = self.cloud.nodes["video"]
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=token, chat_id="synthetic-chat", source_name="Synthetic source",
             directory_path="Season 1", payload={
                 "source_dir_id": "source", "source_parent_id": "leaf",
@@ -218,7 +219,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         # 重整会原地更新旧日志；确认时间必须明确早于成功步骤，不能依赖同秒顺序。
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_confirmations SET created_at='2026-01-01 00:00:00' WHERE token=?", (token,))
-        db.update_organize_confirmation(token, status=status)
+        organize_confirmations_repo.update_organize_confirmation(token, status=status)
         lock = CrossProcessLock("guangya-organize", directory=self.test_db_path.parent)
         self.assertTrue(lock.acquire(blocking=False))
         self.addCleanup(lock.release)
@@ -789,7 +790,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         row = download_requests_repo.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row['organize_status'], row['organize_started'], row['organize_error']), ('completed', 1, ''))
-        get_organize_confirmation_result = db.get_organize_confirmation(token)
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result['status'], 'completed')
         self.assertEqual(row['gy_staging_cleanup_status'], 'completed')
@@ -864,7 +865,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertIn("source", self.cloud.nodes)
         self.assertIn("leaf", self.cloud.nodes)
         self.assertEqual(self.cloud.nodes["video"].parent_id, "leaf")
-        get_organize_confirmation_result_2 = db.get_organize_confirmation("bug1-confirmation")
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation("bug1-confirmation")
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(get_organize_confirmation_result_2["status"], "expired")
 
@@ -893,7 +894,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         result = self._reorganize()
         self.assertTrue(result["success"])
         self.assertEqual(self.cloud.deleted, ["leaf", "source"])
-        confirmation = db.get_organize_confirmation(token)
+        confirmation = organize_confirmations_repo.get_organize_confirmation(token)
         assert confirmation is not None
         self.assertEqual(confirmation["status"], "completed")
         self.assertEqual(json.loads(confirmation["result_json"])["previous_confirmation"]["status"], "expired")
@@ -912,7 +913,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         result = self._reorganize()
         self.assertTrue(result["success"])
         self.assertEqual(self.cloud.deleted, [])
-        get_organize_confirmation_result_3 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_3 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_3 is not None
         self.assertEqual(get_organize_confirmation_result_3["status"], "pending")
         get_download_request_result_3 = download_requests_repo.get_download_request(request_id)
@@ -924,7 +925,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         request_id, token = self._staging()
         self.assertTrue(self._reorganize()["success"])
         self.assertEqual(self.cloud.deleted, [])
-        get_organize_confirmation_result_4 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_4 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_4 is not None
         self.assertEqual(get_organize_confirmation_result_4["status"], "completed")
         request = download_requests_repo.get_download_request(request_id)
@@ -945,11 +946,11 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
 
     def test_completed_staging_with_already_completed_confirmation_is_cleaned(self):
         request_id, token = self._staging(status="completed")
-        db.update_organize_confirmation(token, result_json=json.dumps({"moved": 1, "failed": 0}))
+        organize_confirmations_repo.update_organize_confirmation(token, result_json=json.dumps({"moved": 1, "failed": 0}))
         download_requests_repo.update_download_request(request_id, organize_status="completed")
         self.assertTrue(self._reorganize()["success"])
         self.assertEqual(self.cloud.deleted, ["leaf", "source"])
-        get_organize_confirmation_result_5 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_5 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_5 is not None
         self.assertEqual(get_organize_confirmation_result_5["status"], "completed")
         get_download_request_result_5 = download_requests_repo.get_download_request(request_id)
@@ -973,7 +974,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
             conn.execute("UPDATE organize_log SET source_dir_id='leaf' WHERE id=?", (self.log_id,))
         self.assertTrue(self._reorganize()["success"])
         self.assertEqual(self.cloud.deleted, [])
-        get_organize_confirmation_result_6 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_6 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_6 is not None
         self.assertEqual(get_organize_confirmation_result_6["status"], "expired")
         get_download_request_result_6 = download_requests_repo.get_download_request(request_id)
@@ -1007,7 +1008,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertNotIn("source", self.cloud.deleted)
         self.assertNotIn("leaf", self.cloud.deleted)
         self.assertEqual(self.cloud.nodes["video"].parent_id, "leaf")
-        get_organize_confirmation_result_7 = db.get_organize_confirmation("bug1-confirmation")
+        get_organize_confirmation_result_7 = organize_confirmations_repo.get_organize_confirmation("bug1-confirmation")
         assert get_organize_confirmation_result_7 is not None
         self.assertEqual(get_organize_confirmation_result_7["status"], "expired")
 

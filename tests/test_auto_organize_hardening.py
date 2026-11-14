@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import media_probe as media_probe_repo
 from app.clients.ai_recognition import AIRecognitionInput, AIRecognitionResult
@@ -1640,11 +1641,11 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
     def test_queue_position_keeps_user_selected_items_after_candidate_ttl(self):
         expired_at = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
         valid_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
-        old_id = db.create_organize_confirmation(
+        old_id = organize_confirmations_repo.create_organize_confirmation(
             token="old", fingerprint="old", chat_id="1", source_name="source",
             directory_path="old", payload={}, expires_at=expired_at,
         )
-        new_id = db.create_organize_confirmation(
+        new_id = organize_confirmations_repo.create_organize_confirmation(
             token="new", fingerprint="new", chat_id="1", source_name="source",
             directory_path="new", payload={}, expires_at=valid_at,
         )
@@ -1654,8 +1655,8 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
                 (db.now(), old_id, new_id),
             )
 
-        self.assertEqual(db.get_organize_confirmation_queue_position(new_id), 1)
-        get_organize_confirmation_result = db.get_organize_confirmation("old")
+        self.assertEqual(organize_confirmations_repo.get_organize_confirmation_queue_position(new_id), 1)
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation("old")
         assert get_organize_confirmation_result is not None
         self.assertEqual(get_organize_confirmation_result["status"], "queued")
 

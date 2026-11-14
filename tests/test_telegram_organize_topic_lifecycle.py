@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.clients.guangya import GuangYaClient
 from app.bot import handlers
 from app.modules import organize_tasks
@@ -159,7 +160,7 @@ def test_task_result_delayed_confirmation_and_strm_keep_source_route(
         assert sender.call_args_list[0].kwargs["chat_id"] == str(chat_id)
 
         # 候选在初始整理之后才处理；真实 SQLite 确认行驱动父汇总更新。
-        candidates = db.list_organize_confirmations_for_task(state["id"], chat_id=str(chat_id))
+        candidates = organize_confirmations_repo.list_organize_confirmations_for_task(state["id"], chat_id=str(chat_id))
         assert len(candidates) == 1
         previous_revision = row["revision"]
         previous_sends = sender.call_count

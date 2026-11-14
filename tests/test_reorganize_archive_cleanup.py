@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app import config
 from app import database as db
+from app.repositories import organize_confirmations as organize_confirmations_repo
 from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaReadRejected
 from app.modules.organize import OrganizeRules
@@ -414,7 +415,7 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
             organize_task_id="archive-task", gy_task_id="cloud-task",
         )
         token = "archive-confirmation"
-        db.create_organize_confirmation(
+        organize_confirmations_repo.create_organize_confirmation(
             token=token, fingerprint=token, chat_id="synthetic", source_name="Synthetic source",
             directory_path="Season 1", payload={
                 "source_dir_id": "source", "organize_task_id": "archive-task",
@@ -423,11 +424,11 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
                 }],
             }, expires_at="2099-01-01 00:00:00",
         )
-        db.update_organize_confirmation(token, status="completed", result_json=json.dumps({"moved": 1}))
+        organize_confirmations_repo.update_organize_confirmation(token, status="completed", result_json=json.dumps({"moved": 1}))
         get_download_request_result = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result is not None
         request = dict(get_download_request_result)
-        get_organize_confirmation_result = db.get_organize_confirmation(token)
+        get_organize_confirmation_result = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result is not None
         confirmation = dict(get_organize_confirmation_result)
         result = self._reorganize()
@@ -437,7 +438,7 @@ class ReorganizeArchiveCleanupTests(IsolatedDatabaseTestCase):
         get_download_request_result_2 = download_requests_repo.get_download_request(request_id)
         assert get_download_request_result_2 is not None
         self.assertEqual(dict(get_download_request_result_2), request)
-        get_organize_confirmation_result_2 = db.get_organize_confirmation(token)
+        get_organize_confirmation_result_2 = organize_confirmations_repo.get_organize_confirmation(token)
         assert get_organize_confirmation_result_2 is not None
         self.assertEqual(dict(get_organize_confirmation_result_2), confirmation)
 
