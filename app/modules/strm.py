@@ -270,18 +270,14 @@ def apply_cleanup_decision(stats: dict, decision: CleanupDecision) -> bool:
 
 
 def finalize_changed_paths(stats: dict) -> dict:
-    """收敛本轮变化路径与其父目录，输出去重后的稳定顺序结果。"""
+    """去重本轮变化文件；changed_dirs 只保留超出精确跟踪上限的溢出目录。"""
     paths = [
         str(item) for item in (stats.get("changed_strm_paths") or []) if str(item)
     ]
-    unique_paths = list(dict.fromkeys(paths))
-    stats["changed_strm_paths"] = unique_paths
-    changed_dirs = [
+    stats["changed_strm_paths"] = list(dict.fromkeys(paths))
+    stats["changed_dirs"] = list(dict.fromkeys(
         str(item) for item in (stats.get("changed_overflow_dirs") or []) if str(item)
-    ]
-    for item in unique_paths:
-        changed_dirs.append(_parent_path_text(item))
-    stats["changed_dirs"] = list(dict.fromkeys(changed_dirs))
+    ))
     return stats
 
 DEFAULT_VIDEO_EXTS = {

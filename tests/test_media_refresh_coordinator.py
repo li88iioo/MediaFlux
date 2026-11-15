@@ -490,10 +490,10 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                 client = Mock(display_name="Jellyfin")
                 client.refresh_for_paths.return_value = {
                     "ok": deferred, "scope": "item", "requested": 2,
-                    "items": ["series-a"], "retryable": False,
+                    "items": ["series-a"], "retryable": not deferred,
                     "deduplicated": int(deferred),
                     "succeeded_target_ids": ["series-a"], "succeeded_paths": ["/media/A"],
-                    "fallback": "等待去重窗口" if deferred else "1 个变化路径未匹配媒体库",
+                    "fallback": "等待去重窗口" if deferred else "1 个刷新请求失败，将重试",
                 }
                 coordinator = MediaRefreshCoordinator()
                 coordinator._owner = "old"
@@ -522,6 +522,45 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                 ])
                 self.assertEqual(client.refresh_for_paths.call_args.kwargs["skip_item_ids"], ())
                 self.assertEqual(media_refresh_queue_status(now_epoch=1061)["paths"], 0)
+
+    def test_paths_outside_every_library_are_settled_without_retry(self):
+        # 生产事故：旧布局已删除的 4463 个路径永远匹配不到媒体库，曾被每 16 分钟重放一次，
+        # 还把同批新入库单集的去重等待从 90 秒拖成失败退避。
+        cases = {
+            "全部不属于媒体库": ({"scope": "skipped"}, [], None),
+            "去重等待不被拖成失败退避": ({"scope": "deduplicated", "deduplicated": 1}, ["/media/new"], 190),
+            "可重试失败只保留可刷新路径": (
+                {"scope": "item", "retryable": True, "fallback": "1 个刷新请求失败，将重试"},
+                ["/media/new"], 1060,
+            ),
+        }
+        for label, (fields, remaining, due_at) in cases.items():
+            with self.subTest(label):
+                clear_media_refresh_queue()
+                enqueue_media_refresh(
+                    "jellyfin", ["/old/A", "/old/B", "/media/new"], debounce_seconds=0, now_epoch=100,
+                )
+                claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
+                client = Mock(display_name="Jellyfin")
+                client.refresh_for_paths.return_value = {
+                    "ok": False, "requested": 3, "retryable": False, "deduplicated": 0,
+                    "succeeded_target_ids": [], "succeeded_paths": [],
+                    "unmatched_paths": ["/old/A", "/old/B"], **fields,
+                }
+                coordinator = MediaRefreshCoordinator()
+                coordinator._owner = "worker"
+                with patch.object(coordinator, "_client_for", return_value=client), patch(
+                    "app.modules.media_refresh_coordinator._retry_seconds", return_value=960,
+                ), patch(
+                    "app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90,
+                ), patch("app.repositories.media_refresh_queue.time.time", return_value=100):
+                    coordinator._process_group(claimed)
+
+                groups = json.loads(db.kv_get("media_refresh_queue:v1"))["groups"]
+                self.assertEqual(
+                    [path for group in groups.values() for path in group["pending_paths"]], remaining,
+                )
+                self.assertEqual([group["due_at"] for group in groups.values()], [due_at] if due_at else [])
 
     def test_disabled_provider_keeps_refresh_pending(self):
         enqueue_media_refresh(

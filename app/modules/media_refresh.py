@@ -4,9 +4,10 @@
 避免每次整理都对整个 ``STRM_ROOT`` 或全局媒体库做全量刷新。
 
 规则：
-- 同一目录内的多个文件只产生一个刷新目标。
-- 祖先目录已入选时，其后代目录不再单独刷新。
-- 不提前把不同作品的兄弟目录收敛为库根；最终由媒体服务器 Item ID 去重。
+- 目录内只有一个变化文件时保持文件粒度，让客户端只刷新该单集/电影。
+- 同一目录多个变化文件收敛为该目录（整季），与客户端粒度规则一致，
+  也让整批改写/删除的交接量按目录而不是按文件增长。
+- 祖先目录已入选时，其后代不再单独刷新；不把兄弟目录收敛为库根。
 """
 from __future__ import annotations
 
@@ -92,7 +93,7 @@ def plan_refresh_targets(
     media_roots: Iterable[object] | None = (),
     max_targets: int = MAX_REFRESH_TARGETS,
 ) -> RefreshPlan:
-    """把变化文件与目录收敛成最小刷新目标集合。"""
+    """把变化文件与溢出目录收敛成最小刷新目标集合。"""
     max_targets = _batch_size(max_targets)
     boundary = _Boundary(tuple(
         item for item in (_normalize(root) for root in media_roots or ()) if item
@@ -102,21 +103,22 @@ def plan_refresh_targets(
         normalized = _normalize(item)
         if normalized:
             candidates.append(normalized)
+    files_by_dir: dict[str, list[str]] = {}
     for item in changed_paths or ():
         normalized = _normalize(item)
-        if not normalized:
-            continue
-        parent = str(PurePosixPath(normalized).parent)
-        if parent and parent not in {".", "/"}:
-            # 单来源允许视频直接位于媒体根。不能把该变化扩大为根扫描，
-            # 也不能丢弃：保留明确的文件目标，由客户端做受控定位。
-            candidates.append(normalized if parent in boundary.roots else parent)
+        if normalized:
+            parent = str(PurePosixPath(normalized).parent)
+            files_by_dir.setdefault(parent, []).append(normalized)
+    for parent, files in files_by_dir.items():
+        files = list(dict.fromkeys(files))
+        # 媒体根本身不能成为目标；根下直放的文件只能逐个精确定位。
+        candidates.extend([parent] if len(files) > 1 and boundary.allows(parent) else files)
     unique = [item for item in dict.fromkeys(candidates) if boundary.allows(item)]
     if not unique:
         return RefreshPlan(reason="本轮没有可定位的变化目录")
 
-    # 兄弟目录可能是不同电影/剧集；过早折叠会把本可精准刷新的两个作品
-    # 放大成物理根扫描。相同 Series 的多季变化由客户端解析 Item ID 后去重。
+    # 兄弟目录可能是不同作品；过早折叠会把本可精准刷新的目标放大成物理根
+    # 扫描。整剧/物理根的取舍由客户端解析 Item 后统一决定。
     compressed = _drop_descendants(unique)
     ordered = sorted(compressed)
     if len(ordered) <= max_targets:

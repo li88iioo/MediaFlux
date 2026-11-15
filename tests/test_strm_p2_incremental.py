@@ -839,7 +839,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["stats"]["cleaned"], 0)
         self.assertIn(str(target), result["stats"]["changed_strm_paths"])
-        self.assertIn(str(target.parent), {entry["path"] for entry in entries})
+        self.assertIn(str(target), {entry["path"] for entry in entries})
         self.assertEqual(strm_repo.list_strm_index(f"guangya:{source_id}"), [])
 
     def test_full_schedule_persists_retired_missing_path_to_refresh_outbox(self):
@@ -867,7 +867,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["stats"]["cleaned"], 0)
         self.assertIn(str(target.resolve()), result["stats"]["changed_strm_paths"])
-        self.assertIn(str(target.parent), {entry["path"] for entry in entries})
+        self.assertIn(str(target), {entry["path"] for entry in entries})
         self.assertEqual(strm_repo.list_strm_index(f"guangya:{retired_id}"), [])
         self.assertFalse(any(
             row["source_id"] == retired_id for row in db.list_strm_retired_sources()

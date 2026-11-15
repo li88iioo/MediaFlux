@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
@@ -160,54 +162,34 @@ class MediaLibraryRefreshRequestTests(unittest.TestCase):
 class RefreshTargetPlanningTests(unittest.TestCase):
     """Task 4.1：变化路径压缩为最小刷新目标。"""
 
-    def test_multiple_episodes_in_one_season_produce_one_target(self):
+    def test_lone_file_stays_precise_and_same_directory_files_collapse(self):
+        episodes = [f"{ROOT}/剧集/作品 A/Season 01/E{index:02d}.strm" for index in range(1, 4)]
+        lone = f"{ROOT}/剧集/作品 A/Season 02/E01.strm"
+        movies = [f"{ROOT}/电影/作品 A/A.strm", f"{ROOT}/电影/作品 B/B.strm"]
+
+        plan = plan_refresh_targets([*episodes, lone, *movies, lone], media_roots=[ROOT])
+
+        # 单个变化文件交给客户端刷新单集/电影；同目录多文件即整季，不再逐集交接。
+        self.assertEqual(plan.targets, tuple(sorted([
+            f"{ROOT}/剧集/作品 A/Season 01", lone, *movies,
+        ])))
+
+    def test_files_directly_in_media_root_never_collapse_to_the_root(self):
+        files = [f"{ROOT}/A.strm", f"{ROOT}/B.strm"]
+
+        plan = plan_refresh_targets(files, media_roots=[ROOT])
+
+        self.assertEqual(plan.targets, tuple(files))
+
+    def test_overflow_directory_absorbs_files_beneath_it(self):
+        inside = f"{ROOT}/剧集/作品 A/Season 01/E01.strm"
+        outside = f"{ROOT}/剧集/作品 B/Season 01/E01.strm"
+
         plan = plan_refresh_targets(
-            [f"{ROOT}/剧集/作品 A/Season 01/E{index:02d}.strm" for index in range(1, 13)],
-            media_roots=[ROOT],
+            [inside, outside], [f"{ROOT}/剧集/作品 A/Season 01"], media_roots=[ROOT],
         )
 
-        self.assertEqual(plan.targets, (f"{ROOT}/剧集/作品 A/Season 01",))
-
-    def test_different_libraries_are_refreshed_separately(self):
-        plan = plan_refresh_targets(
-            [
-                f"{ROOT}/剧集/作品 A/Season 01/E01.strm",
-                f"{ROOT}/电影/作品 B/B.strm",
-            ],
-            media_roots=[ROOT],
-        )
-
-        self.assertEqual(sorted(plan.targets), sorted([
-            f"{ROOT}/电影/作品 B", f"{ROOT}/剧集/作品 A/Season 01",
-        ]))
-
-    def test_sibling_seasons_remain_precise_until_item_id_dedupe(self):
-        plan = plan_refresh_targets(
-            [
-                f"{ROOT}/剧集/作品 A/Season 01/E01.strm",
-                f"{ROOT}/剧集/作品 A/Season 02/E01.strm",
-            ],
-            media_roots=[ROOT],
-        )
-
-        self.assertEqual(plan.targets, (
-            f"{ROOT}/剧集/作品 A/Season 01",
-            f"{ROOT}/剧集/作品 A/Season 02",
-        ))
-
-    def test_sibling_movies_never_collapse_to_library_root(self):
-        plan = plan_refresh_targets(
-            [
-                f"{ROOT}/电影/作品 A/A.strm",
-                f"{ROOT}/电影/作品 B/B.strm",
-            ],
-            media_roots=[ROOT],
-        )
-
-        self.assertEqual(plan.targets, (
-            f"{ROOT}/电影/作品 A",
-            f"{ROOT}/电影/作品 B",
-        ))
+        self.assertEqual(plan.targets, (f"{ROOT}/剧集/作品 A/Season 01", outside))
 
     def test_descendants_of_a_selected_ancestor_are_dropped(self):
         plan = plan_refresh_targets(
@@ -259,20 +241,23 @@ class RefreshTargetPlanningTests(unittest.TestCase):
             media_roots=[r"D:\strm\光鸭云盘"],
         )
 
-        self.assertEqual(plan.targets, ("D:/strm/光鸭云盘/剧集/作品 A/Season 01",))
+        self.assertEqual(plan.targets, ("D:/strm/光鸭云盘/剧集/作品 A/Season 01/E01.strm",))
 
 
 class _RefreshRecorder:
     """记录刷新调用的媒体服务器桩。"""
 
-    def __init__(self, client, folders, items, *, items_error: bool = False):
+    def __init__(self, client, folders, items, *, items_error: bool = False, episodes=None):
         self.client = client
         self.folders = folders
         self.items = items
         self.items_error = items_error
+        self.episodes = episodes or {}
+        self.episode_lookups: list[str] = []
         self.refreshed: list[str] = []
         self.refresh_all_calls = 0
         client.list_virtual_folders = lambda: self.folders
+        client._request = self._request
         client._library_items_with_paths = self._library_items
         client._library_root_items_with_paths = self._library_roots
         client.refresh_library = self._refresh_library
@@ -295,6 +280,16 @@ class _RefreshRecorder:
                 or self.client._media_path_key(item.get("Path")) in wanted
             )
         ]
+
+    def _request(self, path: str, params=None):
+        params = params or {}
+        assert path == "/Items" and params.get("IncludeItemTypes") == "Episode", path
+        parent = params["ParentId"]
+        self.episode_lookups.append(parent)
+        rows = self.episodes.get(parent, [])
+        if isinstance(rows, Exception):
+            raise rows
+        return {"Items": rows, "TotalRecordCount": len(rows)}
 
     def _refresh_library(self, library_id: str) -> bool:
         self.refreshed.append(library_id)
@@ -453,26 +448,104 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(result["endpoints"], ["/Items/season-a1/Refresh"])
 
-    def test_existing_season_is_promoted_to_series_refresh(self):
-        items = {"lib-tv": [
-            {"Id": "root-tv", "Type": "Folder", "Path": f"{ROOT}/剧集"},
-            {"Id": "series-a", "Type": "Series", "Path": f"{ROOT}/剧集/作品 A"},
-            {
-                "Id": "season-a1", "Type": "Season", "SeriesId": "series-a",
-                "Path": f"{ROOT}/剧集/作品 A/Season 01",
-            },
-        ]}
+    def test_refresh_granularity_follows_the_scope_of_change(self):
+        # 单集→单集，同季多集→整季，同剧多季→整剧；新增/删除只能靠父目录扫描发现。
+        s1, s2, s3 = "作品 A/Season 01", "作品 A/Season 02", "作品 A/Season 03"
+        cases = (
+            ("单集更新", [f"{s1}/E01.strm"], [f"{s1}/E01.strm"], ["ep-1-1"], ["season-1"]),
+            ("单集字幕", [f"{s1}/E01.strm", f"{s1}/E01.zh.srt"], [f"{s1}/E01.zh.srt"], ["ep-1-1"], ["season-1"]),
+            ("新增单集", [f"{s1}/E03.strm"], [f"{s1}/E03.strm"], ["season-1"], ["season-1"]),
+            ("删除单集", [], [f"{s1}/E01.strm"], ["season-1"], []),
+            ("同季多集", [f"{s1}/E01.strm", f"{s1}/E02.strm"], [f"{s1}/E01.strm", f"{s1}/E02.strm"],
+             ["season-1"], []),
+            ("跨季单集各自精准", [f"{s1}/E01.strm", f"{s2}/E01.strm"], [f"{s1}/E01.strm", f"{s2}/E01.strm"],
+             ["ep-1-1", "ep-2-1"], ["season-1", "season-2"]),
+            ("同剧多季整季", [], [f"{s1}/E01.strm", f"{s1}/E02.strm", f"{s2}/E01.strm", f"{s2}/E02.strm"],
+             ["series-a"], []),
+            ("季目录", [], [s1], ["season-1"], []),
+            ("多个季目录", [], [s1, s2], ["series-a"], []),
+            ("整剧目录吸收其下单集", [f"{s1}/E01.strm"], ["作品 A", f"{s1}/E01.strm"], ["series-a"], []),
+            ("新季", [f"{s3}/E01.strm"], [f"{s3}/E01.strm"], ["series-a"], ["series-a"]),
+            ("新剧", [], ["全新作品/Season 01/E01.strm"], ["root-tv"], []),
+        )
         for label, client in self._clients():
-            with self.subTest(server=label):
-                recorder = _RefreshRecorder(client, _folders(), items)
+            for case, existing, changed, expected, lookups in cases:
+                with self.subTest(server=label, case=case), tempfile.TemporaryDirectory() as root:
+                    show_root = f"{root}/剧集"
+                    for name in existing:
+                        path = Path(show_root, name)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("http://play.invalid/x")
+                    recorder = _RefreshRecorder(client, [
+                        {"id": "lib-tv", "name": "剧集", "locations": [show_root]},
+                    ], {"lib-tv": [
+                        {"Id": "root-tv", "Type": "Folder", "Path": show_root},
+                        {"Id": "series-a", "Type": "Series", "Path": f"{show_root}/作品 A"},
+                        {"Id": "season-1", "Type": "Season", "SeriesId": "series-a", "Path": f"{show_root}/{s1}"},
+                        {"Id": "season-2", "Type": "Season", "SeriesId": "series-a", "Path": f"{show_root}/{s2}"},
+                    ]}, episodes={
+                        "season-1": [
+                            {"Id": "ep-1-1", "Type": "Episode", "Path": f"{show_root}/{s1}/E01.strm"},
+                            {"Id": "ep-1-2", "Type": "Episode", "Path": f"{show_root}/{s1}/E02.strm"},
+                        ],
+                        "season-2": [{"Id": "ep-2-1", "Type": "Episode", "Path": f"{show_root}/{s2}/E01.strm"}],
+                        "series-a": [],
+                    })
+                    paths = [f"{show_root}/{name}" for name in changed]
 
-                result = client.refresh_for_paths([
-                    f"{ROOT}/剧集/作品 A/Season 01",
-                ])
+                    result = client.refresh_for_paths(paths, allow_global_fallback=False)
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(sorted(recorder.refreshed), expected)
+                    self.assertEqual(sorted(recorder.episode_lookups), lookups)
+                    self.assertEqual(sorted(result["succeeded_paths"]), sorted(paths))
+                    self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_movie_refresh_stays_on_the_movie_unless_files_appear_or_vanish(self):
+        cases = (
+            ("电影更新", ["作品 B/B.strm"], "作品 B/B.strm", ["movie-b"]),
+            ("电影字幕", ["作品 B/B.strm", "作品 B/B.zh.srt"], "作品 B/B.zh.srt", ["movie-b"]),
+            ("同名新视频不算字幕", ["作品 B/B.strm", "作品 B/B.mkv"], "作品 B/B.mkv", ["root-movies"]),
+            ("电影删除", [], "作品 B/B.strm", ["root-movies"]),
+        )
+        for label, client in self._clients():
+            for case, existing, changed, expected in cases:
+                with self.subTest(server=label, case=case), tempfile.TemporaryDirectory() as root:
+                    movie_root = f"{root}/电影"
+                    for name in existing:
+                        path = Path(movie_root, name)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("x")
+                    recorder = _RefreshRecorder(client, [
+                        {"id": "lib-movie", "name": "电影", "locations": [movie_root]},
+                    ], {"lib-movie": [
+                        {"Id": "root-movies", "Type": "Folder", "Path": movie_root},
+                        {"Id": "movie-b", "Type": "Movie", "Path": f"{movie_root}/作品 B/B.strm"},
+                    ]})
+
+                    result = client.refresh_for_paths([f"{movie_root}/{changed}"])
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(recorder.refreshed, expected)
+                    self.assertEqual(recorder.episode_lookups, [])
+
+    def test_episode_lookup_failure_falls_back_to_the_season(self):
+        for label, client in self._clients():
+            with self.subTest(server=label), tempfile.TemporaryDirectory() as root:
+                season = Path(root, "剧集/作品 A/Season 01")
+                season.mkdir(parents=True)
+                (season / "E01.strm").write_text("x")
+                recorder = _RefreshRecorder(client, [
+                    {"id": "lib-tv", "name": "剧集", "locations": [f"{root}/剧集"]},
+                ], {"lib-tv": [
+                    {"Id": "series-a", "Type": "Series", "Path": str(season.parent)},
+                    {"Id": "season-1", "Type": "Season", "SeriesId": "series-a", "Path": str(season)},
+                ]}, episodes={"season-1": requests.ConnectionError("down")})
+
+                result = client.refresh_for_paths([str(season / "E01.strm")])
 
                 self.assertTrue(result["ok"])
-                self.assertEqual(recorder.refreshed, ["series-a"])
-                self.assertEqual(result["items"], ["series-a"])
+                self.assertEqual(recorder.refreshed, ["season-1"])
 
     def test_existing_series_wins_over_folder_at_same_season_path(self):
         items = {"lib-tv": [
@@ -557,7 +630,8 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, ["collection" if folder else "lib-movie"])
                     recorder.refreshed.clear()
-                    result = client.refresh_for_paths([f"{directory}/B.strm"])
+                    with patch("app.clients.base.os.path.isfile", return_value=True):
+                        result = client.refresh_for_paths([f"{directory}/B.strm"])
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, ["changed"])
                     self.assertEqual(recorder.refresh_all_calls, 0)
@@ -1189,11 +1263,11 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
 
         self.assertEqual(results, {"Jellyfin": "queued"})
         self.enqueue_outbox.assert_called_once_with(
-            [f"{ROOT}/剧集/作品 A/Season 01"], allow_emby=True
+            [f"{ROOT}/剧集/作品 A/Season 01/E01.strm"], allow_emby=True
         )
         self.ack_outbox.assert_called_once_with(self.enqueue_outbox.return_value)
         enqueue.assert_called_once_with(
-            [f"{ROOT}/剧集/作品 A/Season 01"],
+            [f"{ROOT}/剧集/作品 A/Season 01/E01.strm"],
             immediate=False,
             allow_emby=True,
         )

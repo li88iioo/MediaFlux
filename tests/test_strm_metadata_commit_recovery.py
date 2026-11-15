@@ -465,7 +465,7 @@ raise AssertionError("crash checkpoint not reached")
         self.crash_after_install(stage, check_empty_refresh=False)
         entries = {row["path"] for row in strm_repo.list_strm_refresh_entries()}
         self.assertTrue(
-            str(old.parent) in entries or strm_repo.list_strm_path_cleanup("guangya-meta:source"),
+            str(old) in entries or strm_repo.list_strm_path_cleanup("guangya-meta:source"),
             "确认旧凭据前必须先持久化刷新",
         )
         self.assertEqual(strm_repo.recover_stale_strm_metadata_jobs(force=True), 1)
@@ -476,7 +476,7 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(self.target.read_bytes(), b"metadata")
         self.assertEqual(
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
-            {str(old.parent), str(self.target.parent)},
+            {str(old), str(self.target)},
         )
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
@@ -504,7 +504,7 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
-            {str(old.parent), str(self.target.parent)},
+            {str(old), str(self.target)},
         )
 
     def test_move_old_refresh_failure_preserves_receipt_and_download_budget(self):
@@ -512,7 +512,7 @@ raise AssertionError("crash checkpoint not reached")
         with db.get_conn() as conn:
             conn.execute(
                 "CREATE TRIGGER fail_old_refresh BEFORE INSERT ON strm_refresh_outbox "
-                "WHEN new.path LIKE '%/Old' BEGIN SELECT RAISE(ABORT,'old-refresh-store'); END"
+                "WHEN new.path LIKE '%/Old/Movie.nfo' BEGIN SELECT RAISE(ABORT,'old-refresh-store'); END"
             )
         with patch("app.modules.strm.requests.get", return_value=_Response()) as download:
             self.worker._process_one()
@@ -533,7 +533,7 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
-            {str(old.parent), str(self.target.parent)},
+            {str(old), str(self.target)},
         )
 
     def test_move_ack_failure_after_receipt_confirmation_keeps_old_refresh(self):
@@ -549,7 +549,7 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(self.queue_row()["attempts"], 0)
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
-            {row["path"] for row in strm_repo.list_strm_refresh_entries()}, {str(old.parent)},
+            {row["path"] for row in strm_repo.list_strm_refresh_entries()}, {str(old)},
         )
         with db.get_conn() as conn:
             conn.execute("DROP TRIGGER fail_move_ack")
@@ -559,7 +559,7 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(self.queue_row()["status"], "completed")
         self.assertEqual(
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
-            {str(old.parent), str(self.target.parent)},
+            {str(old), str(self.target)},
         )
 
     def test_move_stop_before_receipt_handoff_keeps_task_and_receipt(self):
@@ -583,7 +583,7 @@ raise AssertionError("crash checkpoint not reached")
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
         self.assertEqual(
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
-            {str(old.parent), str(self.target.parent)},
+            {str(old), str(self.target)},
         )
 
     def test_moved_receipt_recovery_keeps_frozen_refresh_policy(self):
@@ -598,7 +598,7 @@ raise AssertionError("crash checkpoint not reached")
                 entries = strm_repo.list_strm_refresh_entries()
                 self.assertEqual(
                     {row["path"] for row in entries},
-                    {str(old.parent), str(self.target.parent)} if enabled else set(),
+                    {str(old), str(self.target)} if enabled else set(),
                 )
                 self.assertTrue(all(not row["allow_emby"] for row in entries))
                 self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
@@ -632,7 +632,7 @@ raise AssertionError("crash checkpoint not reached")
                     self.assertEqual(row["lease_owner"], "successor")
                 self.assertEqual(
                     {entry["path"] for entry in strm_repo.list_strm_refresh_entries()},
-                    {str(old.parent)},
+                    {str(old)},
                     "已落盘旧目录变化持久交接，但不能提前确认新目录或继任任务",
                 )
                 self.assertEqual(strm_repo.list_strm_path_cleanup("guangya-meta:source"), [])
@@ -698,7 +698,7 @@ raise AssertionError("crash checkpoint not reached")
                     self.assertEqual(strm_repo.list_strm_index("guangya-meta:other")[0]["strm_path"], str(old))
                 self.assertEqual(
                     {entry["path"] for entry in strm_repo.list_strm_refresh_entries()},
-                    {str(self.target.parent)},
+                    {str(self.target)},
                 )
                 with db.get_conn() as conn:
                     for table in ("strm_metadata_queue", "strm_index", "strm_path_cleanup", "strm_refresh_outbox"):

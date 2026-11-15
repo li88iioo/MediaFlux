@@ -157,7 +157,7 @@ def test_commit_crash_replays_refresh_without_rewriting_current_strm(tmp_path, m
         assert paths[0].read_bytes() == before
         assert repository.list_strm_refresh_entries() == entries
         if enabled:
-            _consume(providers=("jellyfin", "emby") if allow_emby else ("jellyfin",), expected_paths=[str(paths[0].parent)])
+            _consume(providers=("jellyfin", "emby") if allow_emby else ("jellyfin",), expected_paths=[str(paths[0])])
         else:
             with _providers("jellyfin", "emby"):
                 STRMMetadataWorker()._flush_media_refresh(force=True)
@@ -222,7 +222,7 @@ def test_failed_file_index_outbox_commit_retries_instead_of_becoming_current(tmp
         replay = _run(tmp_path, allow_emby=False)
         assert replay["stats"]["generated"] == 1 and replay["stats"]["skipped"] == 0
         assert repository.list_strm_index("guangya:s")[0]["etag"] == "e"
-        _consume(providers=("jellyfin",), expected_paths=[str(path.parent)])
+        _consume(providers=("jellyfin",), expected_paths=[str(path)])
 
 
 def test_failed_delete_restores_file_and_index_until_refresh_is_durable(tmp_path):
@@ -236,7 +236,7 @@ def test_failed_delete_restores_file_and_index_until_refresh_is_durable(tmp_path
         replay = _run(tmp_path, tree={"s": []}, allow_emby=False)
         assert replay["stats"]["cleaned"] == 1
         assert not repository.list_strm_index("guangya:s")
-        _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Film")])
+        _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Film" / "Movie.strm")])
 
 
 def test_root_file_fallback_does_not_allow_root_or_outside_directory_refresh():
@@ -281,7 +281,7 @@ def test_delete_commit_crash_retains_refresh_after_index_disappears(tmp_path, re
         replay = _run(tmp_path, tree={"s": []}, retire=retire, allow_emby=False)
         assert replay["stats"]["generated"] == replay["stats"]["cleaned"] == 0
         assert not db.list_strm_retired_sources()
-        _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Film")])
+        _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Film" / "Movie.strm")])
 
 
 def test_move_from_root_keeps_old_file_refresh_until_recovery_handoff(tmp_path):
@@ -292,7 +292,7 @@ def test_move_from_root_keeps_old_file_refresh_until_recovery_handoff(tmp_path):
         assert result["stats"]["generated"] == result["stats"]["cleaned"] == 1
         assert not previous.exists()
         assert not repository.list_strm_path_cleanup("guangya:s")
-        _consume(providers=("jellyfin",), expected_paths=[str(previous), str(previous.parent / "Film")])
+        _consume(providers=("jellyfin",), expected_paths=[str(previous), str(previous.parent / "Film" / "Movie.strm")])
 
 
 def test_skipped_provider_is_not_a_durable_handoff(tmp_path):
@@ -356,20 +356,20 @@ def test_commit_and_overflow_share_frozen_policy_and_do_not_duplicate_paths(tmp_
         path = Path(first.media_root) / "Film" / "Movie.strm"
         repository.upsert_strm_index("guangya:s", "v", "e", 1, "Movie.mkv", str(path), refresh_policy=first)
         first([str(path.parent)])
-        assert repository.count_strm_refresh_paths() == 1
+        assert repository.count_strm_refresh_paths() == 2
         scheduler._run_options = {"media_server_refresh_override": False, "emby_refresh_override": True}
         disabled = scheduler._refresh_overflow_sink(str(tmp_path / "second"))
         disabled([str(Path(disabled.media_root) / "Film")])
-        # 后一轮开关/根改变，不能污染上一轮已捕获策略。
+        # 后一轮开关/根改变，不能污染上一轮已捕获策略；同一路径重复交接不产生副本。
         first([str(path.parent)])
-        entries = repository.list_strm_refresh_entries()
-        assert len(entries) == 1 and entries[0]["allow_emby"] is False
-        assert entries[0]["path"] == str(path.parent)
+        assert {(entry["path"], entry["allow_emby"]) for entry in repository.list_strm_refresh_entries()} == {
+            (str(path), False), (str(path.parent), False),
+        }
         scheduler._run_options = {"media_server_refresh_override": True, "emby_refresh_override": True}
         second = scheduler._refresh_overflow_sink(str(tmp_path / "second"))
         second([str(Path(second.media_root) / "Film")])
         assert {(entry["path"], entry["allow_emby"]) for entry in repository.list_strm_refresh_entries()} == {
-            (str(path.parent), False), (str(Path(second.media_root) / "Film"), True),
+            (str(path), False), (str(path.parent), False), (str(Path(second.media_root) / "Film"), True),
         }
 
 

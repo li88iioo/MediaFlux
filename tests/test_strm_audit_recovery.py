@@ -251,5 +251,5 @@ def test_metadata_manual_move_honors_refresh_policy_for_old_and_new_paths(tmp_pa
         assert not old.exists()
         assert strm_repo.list_strm_path_cleanup("guangya-meta:s") == []
         events = strm_repo.list_strm_refresh_entries()
-        assert {event["path"] for event in events} == ({str(old.parent), str(target)} if enabled else set())
+        assert {event["path"] for event in events} == ({str(old), str(target)} if enabled else set())
         assert all(event["allow_emby"] is False for event in events)

@@ -742,7 +742,7 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
 class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
     """Task 2.3：变化目录结构化结果。"""
 
-    def test_changed_paths_dedupe_and_expose_parent_directories(self):
+    def test_changed_paths_dedupe_without_inventing_parent_directories(self):
         stats = {
             "changed_strm_paths": [
                 "/data/strm/光鸭云盘/剧集/A/Season 01/E01.strm",
@@ -755,10 +755,8 @@ class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
         finalize_changed_paths(stats)
 
         self.assertEqual(len(stats["changed_strm_paths"]), 3)
-        self.assertEqual(stats["changed_dirs"], [
-            "/data/strm/光鸭云盘/剧集/A/Season 01",
-            "/data/strm/光鸭云盘/电影/B",
-        ])
+        # 文件粒度交给媒体服务器决定单集/整季；目录只来自溢出。
+        self.assertEqual(stats["changed_dirs"], [])
 
     def test_empty_change_set_produces_empty_projection(self):
         stats: dict = {}
@@ -780,10 +778,7 @@ class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["changed_strm_paths"], [
             "/data/strm/光鸭云盘/A/E01.strm",
         ])
-        self.assertEqual(stats["changed_dirs"], [
-            "/data/strm/光鸭云盘/B",
-            "/data/strm/光鸭云盘/A",
-        ])
+        self.assertEqual(stats["changed_dirs"], ["/data/strm/光鸭云盘/B"])
 
     def test_source_stats_merge_unions_changed_paths(self):
         aggregate = STRMScheduler._empty_stats()
@@ -798,9 +793,7 @@ class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
         self.assertEqual(aggregate["changed_strm_paths"], [
             "/root/光鸭云盘/A/E01.strm", "/root/光鸭云盘/B/E01.strm",
         ])
-        self.assertEqual(aggregate["changed_dirs"], [
-            "/root/光鸭云盘/A", "/root/光鸭云盘/B",
-        ])
+        self.assertEqual(aggregate["changed_dirs"], [])
 
     def test_source_stats_sum_read_wait_and_keep_longest_single_wait(self):
         aggregate = STRMScheduler._empty_stats()

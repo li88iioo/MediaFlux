@@ -53,12 +53,14 @@ class RefreshFixesTests(unittest.TestCase):
                 self.assertFalse(old.exists())
                 self.assertTrue(new.is_file())
                 self.assertEqual(stats["cleaned"], 1)
-                self.assertEqual(set(stats["changed_dirs"]), {str(old.parent), str(new.parent)})
+                self.assertEqual(set(stats["changed_strm_paths"]), {str(old), str(new)})
+                self.assertEqual(stats["changed_dirs"], [])
                 with patch("app.modules.scheduler.get", side_effect=lambda k, d="": root if k == "STRM_ROOT" else d):
                     STRMScheduler._refresh_media_servers(changed_paths=stats["changed_strm_paths"],
                         changed_dirs=stats["changed_dirs"], persist_only=True)
+                # 删除的旧文件与新文件各自交接，由媒体服务器侧决定刷新单集还是父目录。
                 self.assertEqual({e["path"] for e in strm_repo.list_strm_refresh_entries()},
-                                 {str(old.parent), str(new.parent)})
+                                 {str(old), str(new)})
 
     def test_C01_failed_move_does_not_report_deleted_old_directory(self):
         with isolated_test_database(), tempfile.TemporaryDirectory() as root:
@@ -88,7 +90,8 @@ class RefreshFixesTests(unittest.TestCase):
             self.assertNotIn(str(source_root.parent), stats["changed_dirs"])
             persisted = {entry["path"] for entry in strm_repo.list_strm_refresh_entries()}
             self.assertEqual(len(persisted), 257)
-            self.assertEqual(persisted | set(stats["changed_dirs"]),
+            tracked_dirs = {str(Path(path).parent) for path in stats["changed_strm_paths"]}
+            self.assertEqual(persisted | set(stats["changed_dirs"]) | tracked_dirs,
                              {str(source_root / f"Library{i}") for i in range(5300)})
 
     def test_C02_unprefixed_source_overflow_reaches_durable_outbox(self):
@@ -103,7 +106,7 @@ class RefreshFixesTests(unittest.TestCase):
                 STRMScheduler._refresh_media_servers(changed_paths=stats["changed_strm_paths"],
                     changed_dirs=stats["changed_dirs"], persist_only=True)
             queued = {entry["path"] for entry in strm_repo.list_strm_refresh_entries()}
-            self.assertTrue(all(any(str(path.parent) == q or str(path.parent).startswith(q + "/") for q in queued)
+            self.assertTrue(all(any(str(path) == q or str(path).startswith(q + "/") for q in queued)
                                 for path in changed), f"漏刷新：{queued}")
 
     def test_C01_remove_only_has_no_stale_upsert_path(self):

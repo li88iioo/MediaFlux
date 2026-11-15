@@ -344,9 +344,16 @@ class MediaRefreshCoordinator:
                 bool(outcome.get("retryable")),
                 outcome.get("fallback") or "-",
             )
-            if outcome.get("retryable") or not outcome.get("ok"):
-                # “不自动扩大刷新范围”不等于已完成。映射缺失、歧义或部分
-                # 未匹配仍要保留路径，等待配置恢复；不能只看 retryable。
+            # 不属于任何媒体库的路径重试也不会变得可定位（旧布局已删除、目录不入库），
+            # 汇总告警一次后随本轮确认出队，避免拖住后续批次的结算。
+            ignored = list(outcome.get("unmatched_paths") or ())
+            if ignored:
+                logger.warning(
+                    "%s 有 %s 个变化路径不属于任何媒体库，已忽略且不再重试 样例=%s",
+                    client.display_name, len(ignored), "；".join(ignored[:3]),
+                )
+            acknowledged = [*(outcome.get("succeeded_paths") or ()), *ignored]
+            if outcome.get("retryable"):
                 settle_media_refresh(
                     group_key, outcome="failed",
                     owner=self._owner,
@@ -354,15 +361,12 @@ class MediaRefreshCoordinator:
                     error=outcome.get("fallback") or "媒体服务器刷新失败",
                     delay_seconds=_retry_seconds(attempts),
                     refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
-                    acknowledged_paths=outcome.get("succeeded_paths") or (),
+                    acknowledged_paths=acknowledged,
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 with self._state_lock:
                     self._failed_session += 1
-                    self._last_error_type = (
-                        "MediaRefreshRetryable" if outcome.get("retryable")
-                        else "MediaRefreshUnresolved"
-                    )
+                    self._last_error_type = "MediaRefreshRetryable"
                 return
             deduplicated = int(outcome.get("deduplicated") or 0)
             if deduplicated:
@@ -375,7 +379,7 @@ class MediaRefreshCoordinator:
                     delay_seconds=_recent_ttl_seconds(),
                     error=f"等待媒体库刷新去重窗口结束（{deduplicated} 项）",
                     refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
-                    acknowledged_paths=outcome.get("succeeded_paths") or (),
+                    acknowledged_paths=acknowledged,
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 return

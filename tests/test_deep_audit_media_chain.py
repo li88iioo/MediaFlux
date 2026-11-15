@@ -195,20 +195,21 @@ def drain_refresh(endpoint, *, owner="audit-consumer", now_epoch=None):
     return worker, claimed
 
 
-def assert_strm_refresh_delivery(worker, root, targets, series, *, allow_emby):
+def assert_strm_refresh_delivery(worker, root, targets, series, *, allow_emby, queued=None):
     """验证持久交接与真实客户端的最终作品范围，仅替换外部 HTTP。"""
     targets = {str(path) for path in targets}
+    queued = targets if queued is None else {str(path) for path in queued}
     assert {(entry["path"], entry["allow_emby"]) for entry in strm_repo.list_strm_refresh_entries()} == {
         (path, allow_emby) for path in targets
     }
     worker._flush_media_refresh(force=True)
     assert strm_repo.count_strm_refresh_paths() == 0
-    providers = (("jellyfin", "emby") if allow_emby else ("jellyfin",)) if targets else ()
-    assert queue.media_refresh_queue_status()["paths"] == len(targets) * len(providers)
+    providers = (("jellyfin", "emby") if allow_emby else ("jellyfin",)) if queued else ()
+    assert queue.media_refresh_queue_status()["paths"] == len(queued) * len(providers)
     endpoint = MediaEndpoint(root, series=series)
     coordinator, claimed = drain_refresh(endpoint)
     assert {group["provider"] for group in claimed} == set(providers)
-    assert all(set(group["paths"]) == targets for group in claimed)
+    assert all(set(group["paths"]) == queued for group in claimed)
     assert coordinator._completed_session == len(providers)
     assert sorted(endpoint.provider_posts) == sorted(
         (provider, f"/Items/{item_id}/Refresh")
@@ -408,7 +409,10 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
         worker._last_refresh_at = metadata.time.monotonic()
         media_root = root / strm.STRM_SUBDIR
         series_dir = media_root / "Audit Series"
-        targets = [series_dir / "Season 01"] if enabled else []
+        season = series_dir / "Season 01"
+        # 逐文件交接（单集精度），同季多集由客户端收敛为整剧/整季刷新。
+        videos = [season / f"Audit.Series.S01E0{n}.strm" for n in range(1, 5)] if enabled else []
+        nfos = [season / f"Audit.Series.S01E0{n}.nfo" for n in range(1, 5)] if enabled else []
         policy = StrmRefreshPolicy(str(media_root), enabled=enabled, allow_emby=allow_emby)
         with cloud_runtime(cloud, root, providers=("jellyfin", "emby")):
             result = generate_batch(cloud, root, refresh_policy=policy)
@@ -416,11 +420,11 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
             assert cloud.list_calls == 1 and cloud.info_calls == 0
             # 先交接视频意图，避免同目录已有记录掩盖元数据完成后的漏交接。
             assert {(entry["path"], entry["allow_emby"]) for entry in strm_repo.list_strm_refresh_entries()} == {
-                (str(path), allow_emby) for path in targets
+                (str(path), allow_emby) for path in videos
             }
             worker._flush_media_refresh(force=True)
             assert strm_repo.count_strm_refresh_paths() == 0
-            assert queue.media_refresh_queue_status()["paths"] == len(targets) * (2 if allow_emby else 1)
+            assert queue.media_refresh_queue_status()["paths"] == len(videos) * (2 if allow_emby else 1)
             for _ in range(4):
                 assert worker._process_one()
             assert len(list(root.rglob("*.strm"))) == 4
@@ -435,10 +439,10 @@ def test_batch_cloud_strm_metadata_outbox_and_media_service(tmp_path, enabled, a
             )
             assert len(strm_repo.list_strm_index("guangya:audit")) == 4
             assert len(strm_repo.list_strm_index("guangya-meta:audit")) == 4
-            # 视频安装与元数据交接均走冻结策略；同目录只交接一次。
+            # 视频安装与元数据交接均走冻结策略；同季多文件只触发一次整剧刷新。
             assert_strm_refresh_delivery(
-                worker, root, targets,
-                {"audit-series": series_dir}, allow_emby=allow_emby,
+                worker, root, nfos,
+                {"audit-series": series_dir}, allow_emby=allow_emby, queued=[*videos, *nfos],
             )
             repeated = generate_batch(cloud, root, refresh_policy=policy)
             assert repeated["generated"] == repeated["metadata_queued"] == 0
@@ -486,7 +490,7 @@ def test_batch_metadata_path_migration_keeps_both_refresh_intents(tmp_path, allo
             assert not old.exists()
             assert new.read_bytes() == cloud.paths["nfo-1"].read_bytes()
             assert_strm_refresh_delivery(
-                worker, root, [old.parent, new.parent],
+                worker, root, [old, new],
                 {"old-series": old.parent.parent, "new-series": new.parent.parent},
                 allow_emby=allow_emby,
             )
@@ -817,9 +821,11 @@ def test_normal_cloud_organize_write_to_strm_and_refresh(tmp_path, allow_emby):
             worker._client = cast(GuangYaClient, cloud)
             worker._last_refresh_at = metadata.time.monotonic()
             assert worker._process_one() and worker._process_one()
-            targets = {Path(path).parent for path in result["changed_strm_paths"]}
-            assert len(targets) == 1
+            videos = {Path(path) for path in result["changed_strm_paths"]}
+            season = {path.parent for path in videos}
+            assert len(season) == 1
+            nfos = {path.with_suffix(".nfo") for path in videos}
             assert_strm_refresh_delivery(
-                worker, root, targets, {"audit-series": next(iter(targets)).parent},
+                worker, root, videos | nfos, {"audit-series": next(iter(season)).parent},
                 allow_emby=allow_emby,
             )

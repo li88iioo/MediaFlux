@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -33,6 +34,39 @@ _RUNTIME_TICKS_PER_MINUTE = 600_000_000
 _MAX_RUNTIME_MINUTES = 525_600
 _MEDIA_ITEM_PAGE_SIZE = 5_000
 _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
+# 单集定位只查一个季/剧；超出时退回整季扫描而不是分页放大请求。
+_EPISODE_LOOKUP_LIMIT = 2_000
+
+
+_TV_TYPES = frozenset({"season", "series"})
+_LEAF_TYPES = frozenset({"movie", "episode"})
+
+
+def _item_id(item: Mapping[str, Any]) -> str:
+    return str(item.get("Id") or "").strip()
+
+
+def _item_type(item: Mapping[str, Any]) -> str:
+    return str(item.get("Type") or "").strip().casefold()
+
+
+def _series_id(item: Mapping[str, Any]) -> str:
+    if _item_type(item) == "series":
+        return _item_id(item)
+    return str(item.get("SeriesId") or "").strip()
+
+
+# 只认字幕与 nfo 为附属文件；其他同名文件可能是新视频，必须交给父目录扫描发现。
+_SIDECAR_SUFFIXES = frozenset({"srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "smi", "nfo"})
+
+
+def _is_sidecar_name(name: str, video_name: str) -> bool:
+    """附属文件以视频主名加点开头，例如 E01.zh.srt 归属 E01.strm。"""
+    stem = video_name.rpartition(".")[0]
+    return bool(
+        stem and name.startswith(f"{stem}.")
+        and name.rpartition(".")[2].casefold() in _SIDECAR_SUFFIXES
+    )
 
 
 class MediaLibraryEnumerationTooLarge(RuntimeError):
@@ -1386,45 +1420,169 @@ class MediaServerClient:
             f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
         )
 
-    def _preferred_items_for_paths(
+    def _resolve_refresh_items(
         self, items: list[dict[str, Any]], targets: Iterable[str],
+        sources_for_target: Mapping[str, list[str]],
     ) -> dict[str, dict[str, Any]]:
-        """每批索引一次，只查询变化路径的祖先；目录不能缩小成某个子文件。"""
+        """单集变化刷新单集，同季多集刷新整季，同剧多季刷新整剧。
+
+        新增或已删除的文件只能由父目录扫描发现/移除，因此落到所在季或剧；
+        不属于已有剧集的变化取最近的已有目录，找不到时交给调用方按物理根处理。
+        """
         by_path: dict[tuple[str, tuple[str, ...]], list[tuple[int, int, dict[str, Any]]]] = {}
+        leaves_by_dir: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = {}
         by_id: dict[str, dict[str, Any]] = {}
         for position, item in enumerate(items):
-            item_id = str(item.get("Id") or "").strip()
+            item_id = _item_id(item)
             if item_id:
                 by_id[item_id] = item
             item_path = self._normalize_media_path(item.get("Path"))
-            if item_path:
-                key = normalized_path_parts(self._media_path_key(item_path))
-                by_path.setdefault(key, []).append((len(item_path), position, item))
+            if not item_path:
+                continue
+            anchor, parts = normalized_path_parts(self._media_path_key(item_path))
+            by_path.setdefault((anchor, parts), []).append((len(item_path), position, item))
+            if _item_type(item) in _LEAF_TYPES:
+                leaves_by_dir.setdefault((anchor, parts[:-1]), []).append(item)
+
+        def at(key: tuple[str, tuple[str, ...]]) -> list[dict[str, Any]]:
+            # 沿用路径长度优先、同长按枚举顺序的规则，保留 Unicode 别名的选择行为。
+            return [item for *_rank, item in sorted(
+                by_path.get(key, ()), key=lambda entry: (-entry[0], entry[1]),
+            )]
 
         resolved: dict[str, dict[str, Any]] = {}
+        tv_groups: dict[str, list[str]] = {}
         for target in targets:
             anchor, parts = normalized_path_parts(self._media_path_key(target))
-            candidates = sorted((
-                entry
-                for depth in range(len(parts), -1, -1)
-                for entry in by_path.get((anchor, parts[:depth]), ())
-            ), key=lambda entry: (-entry[0], entry[1]))
-            if not candidates:
-                continue
-            # 沿用路径长度优先、同长按枚举顺序的规则，保留 Unicode 别名的选择行为。
-            by_type: dict[str, dict[str, Any]] = {}
-            for _length, _position, item in candidates:
-                by_type.setdefault(str(item.get("Type") or "").strip().casefold(), item)
-            season = by_type.get("season", {})
-            series_id = str(season.get("SeriesId") or "").strip()
-            linked = by_id.get(series_id)
-            if linked and str(linked.get("Type") or "").strip().casefold() != "series":
-                linked = None
-            resolved[target] = (
-                by_type.get("movie") or linked or by_type.get("series")
-                or season or candidates[0][2]
-            )
+            exact = at((anchor, parts))
+            nearby = [*exact, *(
+                item for depth in range(len(parts) - 1, -1, -1)
+                for item in at((anchor, parts[:depth]))
+            )]
+            may_be_file = self._local_state(sources_for_target.get(target, ())) in {"file", "unknown"}
+            leaf = next((item for item in exact if _item_type(item) in _LEAF_TYPES), None)
+            container = next((item for item in nearby if _item_type(item) in _TV_TYPES), None)
+            if leaf is not None and may_be_file:
+                resolved[target] = leaf
+            elif container is not None and any(item is container for item in exact):
+                resolved[target] = container
+            elif container is not None:
+                tv_groups.setdefault(_item_id(container), []).append(target)
+            else:
+                sidecar = None if leaf is not None else self._leaf_for_file(
+                    target, leaves_by_dir.get((anchor, parts[:-1]), ()),
+                )
+                chosen = sidecar or next((item for item in nearby if item is not leaf), None)
+                if chosen is not None:
+                    resolved[target] = chosen
+
+        selected_ids = {_item_id(item) for item in resolved.values()}
+        for container_id, members in tv_groups.items():
+            container = by_id[container_id]
+            episode = None
+            if (
+                len(members) == 1
+                and not {container_id, _series_id(container)} & selected_ids
+                and self._local_state(sources_for_target.get(members[0], ())) in {"file", "unknown"}
+            ):
+                episode = self._episode_for_file(container, members[0])
+            if episode is not None:
+                episode.setdefault("SeriesId", _series_id(container))
+            for member in members:
+                resolved[member] = episode or container
+
+        # 同剧多季整季变化，或整剧本身已入选时，季与单集统一并入整剧一次。
+        whole_series: set[str] = set()
+        seasons_by_series: dict[str, set[str]] = {}
+        for item in resolved.values():
+            if _item_type(item) == "series":
+                whole_series.add(_item_id(item))
+            elif _item_type(item) == "season" and _series_id(item):
+                seasons_by_series.setdefault(_series_id(item), set()).add(_item_id(item))
+        whole_series.update(
+            series_id for series_id, seasons in seasons_by_series.items() if len(seasons) >= 2
+        )
+        for target, item in resolved.items():
+            series = by_id.get(_series_id(item))
+            if (
+                series is not None and series is not item
+                and _item_type(series) == "series" and _item_id(series) in whole_series
+            ):
+                resolved[target] = series
         return resolved
+
+    def _leaf_for_file(
+        self, target: str, leaves: Iterable[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """精确匹配视频文件；同目录同名前缀的字幕等附属文件归属到该视频。"""
+        anchor, parts = normalized_path_parts(self._media_path_key(target))
+        if not parts:
+            return None
+        sidecar = None
+        for leaf in leaves:
+            leaf_anchor, leaf_parts = normalized_path_parts(
+                self._media_path_key(self._normalize_media_path(leaf.get("Path")))
+            )
+            if (leaf_anchor, leaf_parts) == (anchor, parts):
+                return leaf
+            if (
+                sidecar is None and leaf_parts and leaf_anchor == anchor
+                and leaf_parts[:-1] == parts[:-1]
+                and _is_sidecar_name(parts[-1], leaf_parts[-1])
+            ):
+                sidecar = leaf
+        return sidecar
+
+    def _episode_for_file(
+        self, container: dict[str, Any], target: str,
+    ) -> dict[str, Any] | None:
+        """在已有季/剧下定位单个变化文件对应的单集；查不到交给父目录扫描。"""
+        try:
+            data = self._request("/Items", params={
+                "ParentId": _item_id(container),
+                "Recursive": "true",
+                "IncludeItemTypes": "Episode",
+                "Fields": "Path",
+                "Limit": _EPISODE_LOOKUP_LIMIT,
+            })
+        except (requests.RequestException, ValueError) as exc:
+            logger.info(
+                "[%s] 单集定位失败，改为刷新所在季/剧 type=%s",
+                self.display_name, type(exc).__name__,
+            )
+            return None
+        rows = data.get("Items") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        return self._leaf_for_file(target, [row for row in rows if isinstance(row, dict)])
+
+    @staticmethod
+    def _local_state(paths: Iterable[str]) -> str:
+        """执行时的本地状态：file / dir / missing；不在本机的路径（服务端路径）为 unknown。
+
+        只有本机确认已删除（文件不在但某级父目录在）才必须交给父目录扫描移除；
+        无法在本机核验的路径按调用方给出的精确目标处理。
+        """
+        state = "unknown"
+        for raw in paths:
+            try:
+                if not os.path.isabs(raw):
+                    continue
+                if os.path.isfile(raw):
+                    return "file"
+                if os.path.isdir(raw):
+                    state = "dir"
+                    continue
+                parent = os.path.dirname(raw.rstrip("/"))
+                while parent != os.path.dirname(parent):
+                    if os.path.isdir(parent):
+                        if state == "unknown":
+                            state = "missing"
+                        break
+                    parent = os.path.dirname(parent)
+            except (OSError, ValueError):
+                continue
+        return state
 
     def _finish_unlocatable_refresh(
         self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
@@ -1467,10 +1625,11 @@ class MediaServerClient:
     ) -> dict[str, Any]:
         """按变化路径执行最小范围刷新。
 
-        已存在剧集统一提升到 Series；全新作品优先刷新对应物理根 Folder；
-        只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方默认禁止全局
-        ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的原始输入路径，
-        供队列逐项结算；不表示服务端异步扫描已经完成。
+        单集变化刷新单集，同季多集刷新整季，同剧多季刷新整剧；全新作品优先刷新
+        对应物理根 Folder，只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方
+        默认禁止全局 ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的
+        原始输入路径；unmatched_paths 是不属于任何（或唯一）媒体库的输入路径。
+        二者供队列逐项结算，不表示服务端异步扫描已经完成。
         """
         allowed_ids = {
             (item or "").strip() for item in allowed_library_ids or ()
@@ -1527,6 +1686,7 @@ class MediaServerClient:
             "deduplicated": 0,
             "succeeded_target_ids": [],
             "succeeded_paths": [],
+            "unmatched_paths": [],
             "allowed_libraries": sorted(allowed_ids),
         }
         if not targets:
@@ -1554,7 +1714,6 @@ class MediaServerClient:
                 if str(folder.get("id") or "").strip() in allowed_ids
             ]
 
-        source_for_target = {row["target"]: row["source"] for row in mapping_rows}
         library_for_target: dict[str, tuple[str, str]] = {}
         unmatched_targets: list[str] = []
         ambiguous_targets = 0
@@ -1579,10 +1738,14 @@ class MediaServerClient:
                     library_for_target[target] = next(iter(winners))
                     continue
                 ambiguous_targets += 1
-            unmatched_targets.append(source_for_target.get(target, target))
+            unmatched_targets.append(target)
 
         result["matched"] = len(library_for_target)
         result["unmatched"] = len(unmatched_targets)
+        result["unmatched_paths"] = _dedupe_texts([
+            source for target in unmatched_targets
+            for source in sources_for_target.get(target, [target])
+        ])
         result["ambiguous"] = ambiguous_targets
         if not library_for_target:
             if ambiguous_targets and ambiguous_targets == len(unmatched_targets):
@@ -1675,8 +1838,9 @@ class MediaServerClient:
                 if item_path and item_id:
                     root_items[self._media_path_key(item_path)] = item
 
-            preferred_items = self._preferred_items_for_paths(
+            preferred_items = self._resolve_refresh_items(
                 items, (target for target, _location in library_targets_for_id),
+                sources_for_target,
             )
             for target, library_location in library_targets_for_id:
                 matched_item = preferred_items.get(target)

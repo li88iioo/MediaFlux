@@ -79,7 +79,10 @@ def test_C02_saturated_sync_delivers_every_library_with_policy(tmp_path, mode, p
             handoff.assert_not_called()
         old = strm_repo.list_strm_refresh_entries()
         expected = {str(tmp_path / strm.STRM_SUBDIR / prefix / f"Library{i}") for i in range(6)}
-        assert {e["path"] for e in old} == (expected if refresh_enabled else set())
+        # 精确跟踪的文件保持文件粒度、溢出部分退到目录；每个库都要被覆盖且不越界。
+        def owner(path):
+            return next((root for root in expected if path == root or path.startswith(root + "/")), None)
+        assert {owner(e["path"]) for e in old} == (expected if refresh_enabled else set())
         assert all(e["allow_emby"] is allow_emby for e in old)
         assert len(result["stats"]["changed_strm_paths"]) <= 1
         assert len(result["stats"]["changed_overflow_dirs"]) <= 1
@@ -98,7 +101,7 @@ def test_C02_saturated_sync_delivers_every_library_with_policy(tmp_path, mode, p
                 items = {f"lib{i}": [{"Id": f"folder{i}", "Type": "Folder", "Path": path}] for i, path in enumerate(sorted(expected))}
                 recorder = _RefreshRecorder(client, folders, items)
                 outcome = client.refresh_for_paths(paths, allow_global_fallback=False)
-                assert outcome["ok"] and outcome["matched"] == 6, outcome
+                assert outcome["ok"] and outcome["unmatched"] == 0, outcome
                 assert set(recorder.refreshed) == {f"folder{i}" for i in range(6)}
                 assert recorder.refresh_all_calls == 0
                 recorders[name] = recorder
@@ -187,10 +190,10 @@ def test_C02_spill_write_failure_keeps_batch_and_stops_further_install(tmp_path,
         assert stats["generated"] == 3
         assert len(stats["changed_overflow_dirs"]) == 2  # 失败批次不删除；下一项前停止
         strm.finalize_changed_paths(stats)
-        assert len(stats["changed_dirs"]) == 3
+        changed = set(stats["changed_dirs"]) | {str(Path(p).parent) for p in stats["changed_strm_paths"]}
         rows = strm_repo.list_strm_index("guangya:source")
-        assert len(rows) == 3
-        assert {str(Path(r["strm_path"]).parent) for r in rows} == set(stats["changed_dirs"])
+        assert len(rows) == len(changed) == 3
+        assert {str(Path(r["strm_path"]).parent) for r in rows} == changed
 
 
 def test_C02_missing_policy_never_implicitly_enqueues_refresh(tmp_path):
@@ -201,7 +204,10 @@ def test_C02_missing_policy_never_implicitly_enqueues_refresh(tmp_path):
         assert strm_repo.count_strm_refresh_paths() == 0
         assert stats["stopped"] and stats["stop_stage"] == "refresh-persist"
         strm.finalize_changed_paths(stats)
-        assert len(stats["changed_dirs"]) == 3  # 返回全部已发生变化，不猜 provider
+        # 返回全部已发生变化（精确文件 + 溢出目录），不猜 provider
+        assert set(stats["changed_dirs"]) | {str(Path(p).parent) for p in stats["changed_strm_paths"]} == {
+            str(tmp_path / f"Library{i}") for i in range(3)
+        }
 
 
 @pytest.mark.parametrize("stage", ["full", "fast", "deferred-cleanup"])
@@ -253,7 +259,8 @@ def test_C02_scheduler_retries_failed_spill_on_stop_without_consuming(tmp_path, 
         handoff.assert_not_called()
         expected_count = 6 if stage == "deferred-cleanup" else 3
         entries = strm_repo.list_strm_refresh_entries()
-        assert len(entries) == expected_count
+        # 每个受影响目录都有持久刷新意图（文件或溢出目录粒度）。
+        assert len({Path(e["path"]).relative_to(tmp_path / strm.STRM_SUBDIR).parts[0] for e in entries}) == expected_count
         assert all(e["allow_emby"] is allow_emby for e in entries)
         assert set(attempts[0]) <= {e["path"] for e in entries}
         assert result["stats"]["generated"] == (0 if stage == "deferred-cleanup" else 3)

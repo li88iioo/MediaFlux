@@ -76,7 +76,7 @@ raise AssertionError("historical unlink window not reached")
         self.assertEqual(pending[0]["strm_path"], str(self.old))
         sync(self.root, "Current", on_refresh_paths=self.sink)
         entries = strm_repo.list_strm_refresh_entries()
-        self.assertIn(str(self.old.parent), {row["path"] for row in entries})
+        self.assertIn(str(self.old), {row["path"] for row in entries})
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
         strm_repo.acknowledge_strm_refresh_paths(entries)
         sync(self.root, "Current", on_refresh_paths=self.sink)
@@ -118,7 +118,7 @@ raise AssertionError("historical unlink window not reached")
         self.assertFalse(stats["clean_skipped"])
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
         self.assertIn(
-            str(self.old.parent),
+            str(self.old),
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
         )
 
@@ -137,7 +137,7 @@ raise AssertionError("historical unlink window not reached")
         self.assertFalse(recovered["clean_skipped"])
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
         self.assertIn(
-            str(self.old.parent),
+            str(self.old),
             {row["path"] for row in strm_repo.list_strm_refresh_entries()},
         )
 
@@ -215,7 +215,7 @@ raise AssertionError("historical unlink window not reached")
         self.assertFalse(self.old.exists())
         self.assertEqual(strm_repo.list_strm_path_cleanup("guangya:source"), [])
         entries = strm_repo.list_strm_refresh_entries()
-        self.assertIn(str(self.old.parent), {row["path"] for row in entries})
+        self.assertIn(str(self.old), {row["path"] for row in entries})
         strm_repo.acknowledge_strm_refresh_paths(entries)
         self.historical()
         self.assertEqual(strm_repo.list_strm_refresh_entries(), [])

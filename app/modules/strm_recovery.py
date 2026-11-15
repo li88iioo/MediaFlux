@@ -86,7 +86,7 @@ def recover_pending_paths(
         paths = {int(row["id"]): _managed_path(row["strm_path"], strm_root) for row in batch}
         retained = strm._retained_indexed_paths((str(path) for path in paths.values() if path), strm_root)
         completed: list[int] = []
-        changed_targets: set[str] = set()
+        changed_paths: list[str] = []
         for row in batch:
             if _stopped(stats, should_stop):
                 break
@@ -143,9 +143,7 @@ def recover_pending_paths(
                     )
                     if len(reported_paths) < strm._MAX_TRACKED_CHANGED_PATHS:
                         reported_paths.add(str(path))
-                changed_targets.update(plan_refresh_targets(
-                    [str(path)], media_roots=[str(Path(strm_root) / strm.STRM_SUBDIR)],
-                ).targets)
+                changed_paths.append(str(path))
                 if _stopped(stats, should_stop):
                     break
                 completed.append(int(row["id"]))
@@ -153,9 +151,12 @@ def recover_pending_paths(
                 _blocked(stats, path, str(exc))
         # 生产调用使用已固定刷新策略的 sink；持久化失败时不确认凭据。
         if completed:
+            changed_targets = plan_refresh_targets(
+                changed_paths, media_roots=[str(Path(strm_root) / strm.STRM_SUBDIR)],
+            ).targets
             if changed_targets and on_refresh_paths:
                 try:
-                    on_refresh_paths(sorted(changed_targets))
+                    on_refresh_paths(list(changed_targets))
                 except Exception as exc:
                     _blocked(
                         stats,

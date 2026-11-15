@@ -85,7 +85,7 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
     assert completed["status"] == "completed"
     assert completed["refresh_policy_json"] == queued["refresh_policy_json"]
     old_events = strm_repo.list_strm_refresh_entries()
-    assert {e["path"] for e in old_events} == ({str(target(old_root).parent)} if enabled else set())
+    assert {e["path"] for e in old_events} == ({str(target(old_root))} if enabled else set())
     assert all(e["allow_emby"] == allow_emby for e in old_events)
 
     # 新配置只由下一次真实 full 扫描形成新快照；不能因消费者提前写了新根而跳过刷新。
@@ -100,7 +100,7 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
     assert target(new_root).read_bytes() == b"metadata"
     assert strm_repo.list_strm_index("guangya-meta:source")[0]["strm_path"] == str(target(new_root))
     entries = strm_repo.list_strm_refresh_entries()
-    paths = {str(target(root).parent) for root in (old_root, new_root)} if enabled else set()
+    paths = {str(target(root)) for root in (old_root, new_root)} if enabled else set()
     assert {e["path"] for e in entries} == paths
     assert all(e["allow_emby"] == allow_emby for e in entries)
     work = refresh_work()
@@ -170,14 +170,14 @@ def test_new_revision_during_download_fences_old_root_and_freezes_successor(runt
     assert target(base / "B").is_file(), "新 revision 同样必须使用自己的冻结根，不随再次改配置漂移"
     assert not target(base / "C").exists()
     entries = strm_repo.list_strm_refresh_entries()
-    assert [(e["path"], e["allow_emby"]) for e in entries] == [(str(target(base / "B").parent), True)]
+    assert [(e["path"], e["allow_emby"]) for e in entries] == [(str(target(base / "B")), True)]
     assert refresh_work()[0]["request_id"] == owners[0]["request_id"]
     current_policy = replace(new_policy, media_root=str(base / "C" / strm.STRM_SUBDIR))
     assert scan(client, base / "C", current_policy)["metadata_queued"] == 1
     assert strm_repo.list_strm_refresh_entries() == entries
     assert worker._process_one()
     assert target(base / "C").read_bytes() == b"metadata"
-    paths = {str(target(base / root).parent) for root in ("B", "C")}
+    paths = {str(target(base / root)) for root in ("B", "C")}
     assert {entry["path"] for entry in strm_repo.list_strm_refresh_entries()} == paths
     assert {row["work_key"] for row in refresh_work()} == {refresh_work_key(path, True) for path in paths}
 
