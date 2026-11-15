@@ -1436,6 +1436,7 @@ class MediaServerClient:
     def _finish_unlocatable_refresh(
         self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
         permit_global_fallback: bool = False, retryable: bool = False,
+        source_paths: list[str],
     ) -> dict[str, Any]:
         """定位失败时默认安全跳过；自动链路绝不隐式全局扫描。"""
         result["fallback"] = reason
@@ -1451,6 +1452,8 @@ class MediaServerClient:
             result["scope"] = "global"
             result["endpoints"] = ["/Library/Refresh"]
             result["ok"] = self.refresh_all()
+            if result["ok"]:
+                result["succeeded_paths"] = source_paths
             return result
         logger.warning(
             "[%s] %s，已安全跳过；未触发全局媒体库扫描", self.display_name, reason
@@ -1473,7 +1476,8 @@ class MediaServerClient:
 
         已存在剧集统一提升到 Series；全新作品优先刷新对应物理根 Folder；
         只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方默认禁止全局
-        ``/Library/Refresh``。
+        ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的原始输入路径，
+        供队列逐项结算；不表示服务端异步扫描已经完成。
         """
         allowed_ids = {
             (item or "").strip() for item in allowed_library_ids or ()
@@ -1490,10 +1494,9 @@ class MediaServerClient:
         )
         mapping_rows: list[dict[str, Any]] = []
         mapped_targets: list[str] = []
-        for raw_path in paths or []:
-            raw = (raw_path or "").strip()
-            if not raw:
-                continue
+        source_paths = _dedupe_texts(paths or [])
+        sources_for_target: dict[str, list[str]] = {}
+        for raw in source_paths:
             try:
                 mapped, mapping = apply_media_server_path_mapping(raw, self.path_mappings)
             except Exception:
@@ -1509,6 +1512,7 @@ class MediaServerClient:
                 "mode": "explicit" if mapping is not None else "none",
             })
             mapped_targets.append(normalized_target)
+            sources_for_target.setdefault(normalized_target, []).append(raw)
 
         targets = list(dict.fromkeys(mapped_targets))
         result: dict[str, Any] = {
@@ -1529,6 +1533,7 @@ class MediaServerClient:
             "retryable": False,
             "deduplicated": 0,
             "succeeded_target_ids": [],
+            "succeeded_paths": [],
             "allowed_libraries": sorted(allowed_ids),
         }
         if not targets:
@@ -1548,6 +1553,7 @@ class MediaServerClient:
                 allow_global=not allowed_ids,
                 permit_global_fallback=permit_global_fallback,
                 retryable=True,
+                source_paths=source_paths,
             )
         if allowed_ids:
             folders = [
@@ -1606,6 +1612,7 @@ class MediaServerClient:
                 reason,
                 allow_global=not allowed_ids,
                 permit_global_fallback=permit_global_fallback,
+                source_paths=source_paths,
             )
 
         targets_by_library: dict[str, list[tuple[str, str]]] = {}
@@ -1620,6 +1627,7 @@ class MediaServerClient:
         failed_item_listings: set[str] = set()
         oversized_item_listings: set[str] = set()
         dense_target_libraries: set[str] = set()
+        target_ids: dict[str, str] = {}
 
         for library_id, library_targets_for_id in targets_by_library.items():
             if allow_library_fallback and len(library_targets_for_id) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
@@ -1638,7 +1646,7 @@ class MediaServerClient:
                     for item in root_rows
                     if self._media_path_key(item.get("Path"))
                 }
-                for _target, library_location in library_targets_for_id:
+                for target, library_location in library_targets_for_id:
                     root_item = root_items.get(self._media_path_key(library_location))
                     root_id = str(
                         root_item.get("Id") if isinstance(root_item, dict) else ""
@@ -1650,6 +1658,7 @@ class MediaServerClient:
                         }
                     else:
                         library_targets.add(library_id)
+                    target_ids[target] = root_id or library_id
                 continue
             try:
                 items = self._library_items_with_paths(library_id)
@@ -1673,7 +1682,7 @@ class MediaServerClient:
                     for item in root_rows
                     if self._media_path_key(item.get("Path"))
                 }
-                for _target, library_location in library_targets_for_id:
+                for target, library_location in library_targets_for_id:
                     root_item = root_items.get(self._media_path_key(library_location))
                     root_id = str(
                         root_item.get("Id") if isinstance(root_item, dict) else ""
@@ -1685,6 +1694,7 @@ class MediaServerClient:
                         }
                     else:
                         library_targets.add(library_id)
+                    target_ids[target] = root_id or library_id
                 continue
             except Exception as exc:
                 logger.warning(
@@ -1720,6 +1730,7 @@ class MediaServerClient:
                         }
                     else:
                         library_targets.add(library_id)
+                    target_ids[target] = root_id or library_id
                     continue
                 assert matched_item is not None
                 item_path = self._normalize_media_path(matched_item.get("Path"))
@@ -1740,9 +1751,13 @@ class MediaServerClient:
                         "type": item_type or "item",
                     })
                     entry["paths"] = _dedupe_texts([*entry["paths"], target])
+                target_ids[target] = item_id
 
         # 虚拟库扫描覆盖该库内所有更窄目标；物理根 Folder 扫描覆盖同根下条目。
         if library_targets:
+            for target, (library_id, _location) in library_for_target.items():
+                if library_id in library_targets:
+                    target_ids[target] = library_id
             item_targets = {
                 item_id: entry for item_id, entry in item_targets.items()
                 if str(entry.get("library_id") or "") not in library_targets
@@ -1762,6 +1777,8 @@ class MediaServerClient:
                     media_server_path_is_within(path, root_path) for path in changed
                 ):
                     item_targets.pop(item_id, None)
+                    for target in changed:
+                        target_ids[target] = folder_id
 
         item_ids = list(item_targets)
         folder_ids = [item for item in folder_targets if item not in item_targets]
@@ -1805,6 +1822,7 @@ class MediaServerClient:
                 "无法定位任何刷新目标",
                 allow_global=not allowed_ids,
                 permit_global_fallback=permit_global_fallback,
+                source_paths=source_paths,
             )
 
         ordered_ids = [*item_ids, *folder_ids, *library_ids]
@@ -1820,6 +1838,13 @@ class MediaServerClient:
         result["folders"] = folder_ids
         result["libraries"] = library_ids
         result["succeeded_target_ids"] = succeeded_ids
+        succeeded_set = set(succeeded_ids)
+        result["succeeded_paths"] = _dedupe_texts([
+            source
+            for target, item_id in target_ids.items()
+            if item_id in succeeded_set
+            for source in sources_for_target[target]
+        ])
         result["endpoints"] = [f"/Items/{item}/Refresh" for item in ordered_ids]
         active_scopes = sum(bool(group) for group in (item_ids, folder_ids, library_ids))
         if active_scopes > 1:

@@ -354,6 +354,7 @@ class MediaRefreshCoordinator:
                     error=outcome.get("fallback") or "媒体服务器刷新失败",
                     delay_seconds=_retry_seconds(attempts),
                     refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+                    acknowledged_paths=outcome.get("succeeded_paths") or (),
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 with self._state_lock:
@@ -374,6 +375,7 @@ class MediaRefreshCoordinator:
                     delay_seconds=_recent_ttl_seconds(),
                     error=f"等待媒体库刷新去重窗口结束（{deduplicated} 项）",
                     refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+                    acknowledged_paths=outcome.get("succeeded_paths") or (),
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 return

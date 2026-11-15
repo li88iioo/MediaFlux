@@ -298,10 +298,11 @@ def settle_media_refresh(
     delay_seconds: int = 0,
     error: object = "",
     refreshed_target_ids: Iterable[object] | None = (),
+    acknowledged_paths: Iterable[object] | None = (),
     recent_ttl_seconds: int = 90,
     now_epoch: float | None = None,
 ) -> bool:
-    """统一结算当前租约；完成只消费在途路径，延后/失败保留全部路径。"""
+    """结算当前租约，只消费已完成的在途路径；租约期间新增的变化始终保留。"""
     if outcome not in {"completed", "deferred", "failed"}:
         raise ValueError("媒体库刷新结算结果无效")
     now_value = float(time.time() if now_epoch is None else now_epoch)
@@ -324,15 +325,18 @@ def settle_media_refresh(
             for item_id in _normalized_paths(refreshed_target_ids):
                 state["recent"][f"{provider}:{item_id}"] = expiry
         completed = outcome == "completed"
-        if completed and not _normalized_paths(group.get("pending_paths")):
+        acknowledged = set(_normalized_paths(acknowledged_paths))
+        remaining = [] if completed else [
+            path for path in _normalized_paths(group.get("inflight_paths"))
+            if path not in acknowledged
+        ]
+        group["pending_paths"] = _merge_paths(remaining, group.get("pending_paths"))
+        if not group["pending_paths"]:
             state["groups"].pop(group_key, None)
         else:
             if completed:
                 group["attempts"] = 0
             else:
-                group["pending_paths"] = _merge_paths(
-                    group.get("inflight_paths"), group.get("pending_paths")
-                )
                 if outcome == "failed":
                     group["attempts"] = max(0, int(group.get("attempts") or 0)) + 1
                 minimum = 5 if outcome == "failed" else 1

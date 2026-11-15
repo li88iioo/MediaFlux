@@ -517,6 +517,10 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["items"], [])
                 self.assertEqual(result["folders"], ["root-tv"])
                 self.assertEqual(result["scope"], "folder")
+                self.assertEqual(result["succeeded_paths"], [
+                    f"{ROOT}/剧集/作品 A/Season 01",
+                    f"{ROOT}/剧集/全新作品/Season 01",
+                ])
 
     def test_movie_parent_refresh_covers_unlisted_siblings(self):
         items = {"lib-movie": [
@@ -1028,6 +1032,32 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["matched"], 1)
                 self.assertEqual(result["unmatched"], 1)
                 self.assertIn("安全跳过", result["fallback"])
+                self.assertEqual(result["succeeded_paths"], [
+                    f"{ROOT}/剧集/作品 A/Season 01",
+                ])
+
+    def test_successful_paths_preserve_input_spelling_and_exclude_unsubmitted_targets(self):
+        paths = [
+            r"D:\STRM\剧集\作品 A\Season 01",
+            "D:/STRM/剧集/作品 A/Season 01",
+            "D:/STRM/电影/作品 B",
+            "D:/outside/unmapped",
+        ]
+        for label, client in self._clients():
+            for deferred in (False, True):
+                with self.subTest(server=label, deferred=deferred):
+                    client.path_mappings = (MediaServerPathMapping("D:/STRM", ROOT),)
+                    _RefreshRecorder(client, _folders(), _items())
+                    client.refresh_library = Mock(side_effect=lambda item: item != "movie-b")
+                    result = client.refresh_for_paths(
+                        paths, skip_item_ids=("movie-b",) if deferred else (),
+                    )
+
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["succeeded_paths"], paths[:2])
+                    self.assertEqual(result["succeeded_target_ids"], ["season-a1"])
+                    self.assertEqual(result["retryable"], not deferred)
+                    self.assertEqual(result["deduplicated"], int(deferred))
 
     def test_partial_match_never_uses_opt_in_global_fallback(self):
         clients = (
