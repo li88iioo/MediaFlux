@@ -22,6 +22,14 @@
         initialized: false,
         dirty: false,
     };
+    const waitingState = {
+        data: null,
+        selected: new Map(),
+        loading: false,
+        action: false,
+        requestId: 0,
+        controller: null,
+    };
 
     function icons(root = document) {
         if (window.lucide) window.lucide.createIcons({nodes: [root]});
@@ -33,8 +41,158 @@
             ...options,
         });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data.error || '请求失败');
+        if (!response.ok) {
+            const error = new Error(data.error || '请求失败');
+            error.status = response.status;
+            throw error;
+        }
         return data;
+    }
+
+    function waitingNotice(message, error = false) {
+        const node = $('#mlWaitingNotice');
+        node.textContent = message;
+        node.classList.toggle('is-error', error);
+    }
+
+    function updateWaitingActions() {
+        const items = waitingState.data?.items || [];
+        const selected = [...waitingState.selected.values()];
+        const pathCount = selected.reduce((sum, selection) => sum + selection.paths.size, 0);
+        const totalPaths = items.reduce((sum, item) => sum + item.path_count, 0);
+        $('#mlWaitingSelection').textContent = `已选 ${selected.length} 组 · ${pathCount} 条路径`;
+        const all = $('[data-select-all-waiting]');
+        all.checked = totalPaths > 0 && pathCount === totalPaths;
+        all.indeterminate = pathCount > 0 && pathCount < totalPaths;
+        all.disabled = waitingState.action || !items.length;
+        $$('[data-select-waiting]').forEach((checkbox) => {
+            const item = items.find((record) => record.group_key === checkbox.value);
+            const count = waitingState.selected.get(checkbox.value)?.paths.size || 0;
+            checkbox.checked = count > 0 && count === item.path_count;
+            checkbox.indeterminate = count > 0 && count < item.path_count;
+            checkbox.disabled = waitingState.action;
+        });
+        $$('[data-select-waiting-path]').forEach((checkbox) => {
+            const key = checkbox.closest('[data-waiting-group]').dataset.waitingGroup;
+            checkbox.checked = Boolean(waitingState.selected.get(key)?.paths.has(checkbox.value));
+            checkbox.disabled = waitingState.action;
+        });
+        $$('[data-resolve-waiting]').forEach((button) => {
+            button.disabled = waitingState.loading || waitingState.action || !selected.length;
+        });
+        $('[data-refresh-waiting]').disabled = waitingState.loading || waitingState.action;
+        $('#mlWaitingList').setAttribute('aria-busy', String(waitingState.loading || waitingState.action));
+    }
+
+    function waitingRow(item) {
+        const provider = providerLabels[item.provider] || item.provider;
+        return `
+            <div class="ml-waiting-head">
+                <label class="ml-queue-check">
+                    <input type="checkbox" data-select-waiting value="${esc(item.group_key)}">
+                    <span>${esc(provider)} · 全选本组 ${item.path_count} 条等待路径</span>
+                </label>
+                <span class="ml-waiting-badge">等待配置</span>
+            </div>
+            <p class="ml-waiting-reason">${esc(item.reason || '变化路径未匹配媒体库，请检查目录与路径映射')}</p>
+            <div class="ml-waiting-preview" title="${esc(item.paths[0] || '')}">${esc(item.paths[0] || '')}</div>
+            <details class="ml-waiting-details">
+                <summary>查看全部 ${item.path_count} 条路径</summary>
+                <ul>${item.paths.map((path) => `<li><label class="ml-waiting-path"><input type="checkbox" data-select-waiting-path value="${esc(path)}"><code>${esc(path)}</code></label></li>`).join('')}</ul>
+            </details>`;
+    }
+
+    function renderWaitingRefreshes() {
+        const {items, summary} = waitingState.data;
+        const tokens = new Map(items.map((item) => [item.group_key, item.token]));
+        let changedSelection = false;
+        for (const [key, selection] of waitingState.selected) {
+            if (tokens.get(key) !== selection.token) {
+                waitingState.selected.delete(key);
+                changedSelection = true;
+            }
+        }
+        $('#mlWaitingCount').textContent = `${summary.waiting_configuration} 组 · ${summary.waiting_paths} 条等待路径`;
+        const list = $('#mlWaitingList');
+        const nodes = new Map($$('[data-waiting-group]', list).map((node) => [node.dataset.waitingGroup, node]));
+        for (const node of [...list.children]) {
+            if (!tokens.has(node.dataset.waitingGroup)) node.remove();
+        }
+        if (!items.length) {
+            list.innerHTML = '<div class="ml-empty-row">暂无等待配置的刷新，正常刷新任务继续处理。</div>';
+        }
+        items.forEach((item, index) => {
+            const node = nodes.get(item.group_key) || document.createElement('article');
+            const snapshot = JSON.stringify(item);
+            if (node.dataset.snapshot !== snapshot) {
+                const open = $('details', node)?.open || false;
+                node.className = 'ml-waiting-row';
+                node.dataset.waitingGroup = item.group_key;
+                node.dataset.snapshot = snapshot;
+                node.innerHTML = waitingRow(item);
+                $('details', node).open = open;
+            }
+            if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null);
+        });
+        updateWaitingActions();
+        return changedSelection;
+    }
+
+    async function loadWaitingRefreshes({afterAction = false, message = '', error = false} = {}) {
+        if (waitingState.action && !afterAction) return;
+        const requestId = ++waitingState.requestId;
+        waitingState.controller?.abort();
+        const controller = new AbortController();
+        waitingState.controller = controller;
+        waitingState.loading = true;
+        updateWaitingActions();
+        try {
+            const data = await api('/api/media-libraries/refresh-queue', {signal: controller.signal});
+            if (requestId !== waitingState.requestId) return;
+            waitingState.data = data;
+            const changed = renderWaitingRefreshes();
+            waitingNotice(message || (changed ? '部分等待记录已变化，请重新选择后操作。' : ''), error);
+        } catch (failure) {
+            if (requestId !== waitingState.requestId || failure.name === 'AbortError') return;
+            waitingNotice(`${message ? message + '；' : ''}${failure.message}，请更新列表重试。`, true);
+            if (!waitingState.data) $('#mlWaitingList').innerHTML = '<div class="ml-empty-row">暂时无法读取等待记录，请点击“更新列表”重试。</div>';
+        } finally {
+            if (requestId === waitingState.requestId) {
+                waitingState.loading = false;
+                waitingState.controller = null;
+                updateWaitingActions();
+            }
+        }
+    }
+
+    async function resolveWaitingRefreshes(action, button) {
+        if (waitingState.action || waitingState.loading || !waitingState.selected.size) return;
+        const records = [...waitingState.selected].map(([group_key, selection]) => ({
+            group_key, token: selection.token, paths: [...selection.paths],
+        }));
+        waitingState.action = true;
+        setBusy(button, true, action === 'retry' ? '重新核对' : '清除刷新请求');
+        updateWaitingActions();
+        try {
+            const result = await api(`/api/media-libraries/refresh-queue/${action}`, {
+                method: 'POST', body: JSON.stringify({records}),
+            });
+            records.forEach((record) => waitingState.selected.delete(record.group_key));
+            const message = action === 'retry'
+                ? `已提交 ${result.processed_groups} 组、${result.processed_paths} 条路径重新核对，结果以实际匹配为准。`
+                : `已清除所选 ${result.processed_groups} 组中的 ${result.processed_paths} 条刷新请求，媒体、STRM 和刮削文件均保留。`;
+            await loadWaitingRefreshes({afterAction: true, message});
+        } catch (failure) {
+            if (failure.status === 409) {
+                await loadWaitingRefreshes({afterAction: true, message: `${failure.message}；请核对最新路径并重新选择。`, error: true});
+            } else {
+                waitingNotice(failure.message, true);
+            }
+        } finally {
+            waitingState.action = false;
+            setBusy(button, false, '');
+            updateWaitingActions();
+        }
     }
 
     function sleep(ms) {
@@ -365,8 +523,10 @@
 
     function applyOverview({reloadRows = true} = {}) {
         renderSummary();
-        if (reloadRows) hydrateRows();
-        renderRows();
+        if (reloadRows && !state.dirty) {
+            hydrateRows();
+            renderRows();
+        }
     }
 
     async function loadAll({manual = false, reloadRows = true} = {}) {
@@ -627,15 +787,17 @@
                 server_path: row.server,
             })));
 
+        const savedRows = JSON.stringify(state.rows);
         setBusy(button, true, '保存中');
         try {
             await api('/api/media-libraries/mappings', {
                 method: 'POST',
                 body: JSON.stringify({strm_mappings: strmMappings, local_bindings: localBindings}),
             });
-            state.dirty = false;
-            window.showToast?.('媒体库与路径映射已保存', 'success');
+            state.dirty = JSON.stringify(state.rows) !== savedRows;
+            window.showToast?.(state.dirty ? '映射已保存，新增编辑尚未保存' : '媒体库与路径映射已保存', 'success');
             await loadAll({reloadRows: true});
+            await loadWaitingRefreshes();
         } catch (error) {
             window.showToast?.(error.message, 'error', 4200);
         } finally {
@@ -644,7 +806,37 @@
         }
     }
 
-    $('#mlRefreshBtn')?.addEventListener('click', () => loadAll({manual: true}));
+    $('#mlRefreshBtn')?.addEventListener('click', () => {
+        loadAll({manual: true});
+        loadWaitingRefreshes();
+    });
+    $('[data-refresh-waiting]').addEventListener('click', () => loadWaitingRefreshes());
+    $$('[data-resolve-waiting]').forEach((button) => {
+        button.addEventListener('click', () => resolveWaitingRefreshes(button.dataset.resolveWaiting, button));
+    });
+    $('#mlRefreshQueue').addEventListener('change', (event) => {
+        if (event.target.matches('[data-select-all-waiting]')) {
+            waitingState.selected.clear();
+            if (event.target.checked) {
+                for (const item of waitingState.data.items) {
+                    waitingState.selected.set(item.group_key, {token: item.token, paths: new Set(item.paths)});
+                }
+            }
+        } else if (event.target.matches('[data-select-waiting]')) {
+            const item = waitingState.data.items.find((record) => record.group_key === event.target.value);
+            if (event.target.checked) waitingState.selected.set(item.group_key, {token: item.token, paths: new Set(item.paths)});
+            else waitingState.selected.delete(item.group_key);
+        } else if (event.target.matches('[data-select-waiting-path]')) {
+            const key = event.target.closest('[data-waiting-group]').dataset.waitingGroup;
+            const item = waitingState.data.items.find((record) => record.group_key === key);
+            const selection = waitingState.selected.get(key) || {token: item.token, paths: new Set()};
+            if (event.target.checked) selection.paths.add(event.target.value);
+            else selection.paths.delete(event.target.value);
+            if (selection.paths.size) waitingState.selected.set(key, selection);
+            else waitingState.selected.delete(key);
+        } else return;
+        updateWaitingActions();
+    });
     $('[data-add-library-mapping]')?.addEventListener('click', addLibraryMapping);
     $('[data-save-mappings]')?.addEventListener('click', (event) => saveMappings(event.currentTarget));
 
@@ -748,4 +940,5 @@
     icons(page);
     setInitialLoading(true);
     loadAll();
+    loadWaitingRefreshes();
 })();

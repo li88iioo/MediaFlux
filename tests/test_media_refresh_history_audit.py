@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import unittest
 from pathlib import Path
@@ -15,8 +16,8 @@ from app import database as db
 from app.repositories import local_media as local_media_repo
 from app.modules.backup import create_backup, recover_pending_restore, restore_backup
 from app.modules.local_media_service import LocalMediaService, LocalMovePlan
-from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
-from app.modules.media_server_path_mapping import MediaServerPathMapping
+from app.modules.media_refresh_coordinator import MediaRefreshCoordinator, _configuration_revisions
+from app.modules.media_server_path_mapping import MediaServerPathMapping, parse_media_server_path_mappings
 from app.repositories import media_refresh_queue as queue
 from app.routes import media_libraries_api as api
 from app.runtime_paths import RuntimePaths
@@ -25,6 +26,56 @@ from tests.test_deep_audit_media_chain import MediaEndpoint, Response
 
 
 class MediaRefreshHistoryAuditTests(unittest.TestCase):
+    def test_mapping_repair_during_inflight_lookup_is_picked_up_by_real_worker(self):
+        with isolated_test_database("mediaflux.db"):
+            queue.enqueue_media_refresh("jellyfin", ["/mf-absent-media/A/E01.strm"], debounce_seconds=0)
+            endpoint = MediaEndpoint("//nas/strm", series={"series-a": "//nas/strm/A"})
+            worker = MediaRefreshCoordinator()
+            lookup_finished, release_lookup, refreshed = threading.Event(), threading.Event(), threading.Event()
+            mapping = {"value": ""}
+            original_get, original_post = config.get, endpoint.post
+            calls = []
+
+            def client_for(provider):
+                client = endpoint.client(provider)
+                client.path_mappings = parse_media_server_path_mappings(mapping["value"])
+                refresh = client.refresh_for_paths
+
+                def controlled_refresh(*args, **kwargs):
+                    result = refresh(*args, **kwargs)
+                    calls.append(result)
+                    if len(calls) == 1:
+                        lookup_finished.set()
+                        if not release_lookup.wait(5):
+                            raise AssertionError("configuration repair gate timed out")
+                    return result
+
+                client.refresh_for_paths = controlled_refresh
+                return client
+
+            def post(*args, **kwargs):
+                result = original_post(*args, **kwargs)
+                refreshed.set()
+                return result
+
+            with patch.object(worker, "_client_for", side_effect=client_for), patch.object(
+                endpoint, "post", side_effect=post,
+            ), patch.object(config, "get", side_effect=lambda key, default="": (
+                mapping["value"] if key == "JELLYFIN_PATH_MAPPINGS" else original_get(key, default)
+            )):
+                try:
+                    worker.start()
+                    self.assertTrue(lookup_finished.wait(5))
+                    mapping["value"] = json.dumps([{"local": "/mf-absent-media", "server": "//nas/strm"}])
+                    release_lookup.set()
+                    self.assertTrue(refreshed.wait(5))
+                finally:
+                    release_lookup.set()
+                    self.assertTrue(worker.stop(timeout=5))
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(endpoint.posts, ["/Items/series-a/Refresh"])
+            self.assertEqual(queue.media_refresh_queue_status()["paths"], 0)
+
     def test_unmapped_retry_does_not_postpone_new_pending_refresh_after_restart(self):
         with isolated_test_database("mediaflux.db"):
             old, new = "/unmapped/B", "/mf-absent-media/A/new.strm"
@@ -60,14 +111,15 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             self.assertEqual(queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=120), [])
             pending = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=121)
             self.assertEqual(len(pending), 1)
-            self.assertEqual(pending[0]["paths"], [old, new])
+            self.assertEqual(pending[0]["paths"], [new])
             with patch.object(worker, "_client_for", side_effect=endpoint.client), patch(
                 "app.repositories.media_refresh_queue.time.time", return_value=121,
             ):
                 worker._process_group(pending[0])
             self.assertEqual(endpoint.posts, ["/Items/series-a/Refresh"])
             remaining = queue.claim_due_media_refreshes(owner=worker._owner, force=True, now_epoch=122)
-            self.assertEqual(remaining[0]["paths"], [old])
+            self.assertEqual(remaining, [])
+            self.assertEqual(queue.list_waiting_media_refreshes()[0]["paths"], [old])
 
     def test_unmapped_deleted_or_inaccessible_file_recovers_after_mapping_and_restart(self):
         for provider in ("jellyfin", "emby"):
@@ -106,6 +158,14 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
                     # 补映射并重启后必须继续提交父级刷新，清除旧条目或更新仍存在的文件。
                     db.init_db()
                     worker = MediaRefreshCoordinator()
+                    original_get = config.get
+                    with patch.object(config, "get", side_effect=lambda key, default="": (
+                        f'{root} => //nas/strm' if key == f"{provider.upper()}_PATH_MAPPINGS"
+                        else original_get(key, default)
+                    )):
+                        self.assertEqual(queue.reconcile_media_refresh_configuration(
+                            _configuration_revisions(), now_epoch=130,
+                        ), 1)
                     retry = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=130)[0]
                     client = endpoint.client(provider)
                     client.path_mappings = (MediaServerPathMapping(str(root), "//nas/strm"),)
@@ -138,6 +198,10 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
 
                     db.init_db()
                     worker = MediaRefreshCoordinator()
+                    self.assertEqual(queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=1060), [])
+                    self.assertEqual(queue.list_waiting_media_refreshes()[0]["paths"], ["/unmapped/B"])
+                    # 用户显式重新核对；仍然只重新检查未匹配部分。
+                    queue.resolve_waiting_media_refreshes(queue.list_waiting_media_refreshes(), "retry", now_epoch=1060)
                     retry = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=1060)[0]
                     self.assertEqual(retry["paths"], ["/unmapped/B"])
                     with patch.object(worker, "_client_for", side_effect=endpoint.client), patch(
@@ -178,6 +242,15 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
                 owner="admin",
             )
             initial_bindings = api._local_bindings()
+            queue.enqueue_media_refresh("emby", ["/unmapped/deleted.strm"], debounce_seconds=0)
+            waiting_lease = queue.claim_due_media_refreshes(owner="paused")[0]
+            revision = _configuration_revisions()
+            queue.settle_media_refresh(
+                waiting_lease["group_key"], owner="paused", lease_generation=waiting_lease["lease_generation"],
+                outcome="completed", waiting_paths=waiting_lease["paths"], waiting_reason="缺少路径映射",
+                configuration_revision=revision["emby"],
+            )
+            waiting_snapshot = queue.list_waiting_media_refreshes()
             plan = SimpleNamespace(
                 provider="jellyfin",
                 library_id="audit-library",
@@ -210,7 +283,7 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             ):
                 self.assertEqual(LocalMediaService._refresh_plans([cast(LocalMovePlan, plan)]), [])
             saved_state = db.kv_get(queue._QUEUE_KEY)
-            self.assertEqual(queue.media_refresh_queue_status()["paths"], 2)
+            self.assertEqual(queue.media_refresh_queue_status()["paths"], 3)
             archive = create_backup(paths)
 
             queue.clear_media_refresh_queue()
@@ -229,6 +302,8 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
             self.assertFalse(recover_pending_restore(paths))
             self.assertEqual(api._local_bindings(), initial_bindings)
             self.assertEqual(db.kv_get(queue._QUEUE_KEY), saved_state)
+            self.assertEqual(queue.list_waiting_media_refreshes(), waiting_snapshot)
+            self.assertEqual(queue.reconcile_media_refresh_configuration(_configuration_revisions()), 0)
 
             worker = MediaRefreshCoordinator()
             entered_post = threading.Event()
@@ -264,7 +339,7 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
                 finally:
                     release_post.set()
                     self.assertTrue(worker.stop(timeout=5))
-                self.assertEqual(queue.media_refresh_queue_status()["paths"], 0)
+                self.assertEqual(queue.media_refresh_queue_status()["paths"], 1)
                 self.assertEqual(worker.status()["completed_session"], 1)
                 self.assertEqual(endpoint.posts, ["/Items/audit-library/Refresh"])
                 try:
@@ -272,11 +347,12 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
                 finally:
                     self.assertTrue(worker.stop(timeout=5))
             db.init_db()
-            self.assertEqual(queue.media_refresh_queue_status()["paths"], 0)
+            self.assertEqual(queue.media_refresh_queue_status()["paths"], 1)
             self.assertEqual(
                 queue.recent_media_refresh_target_ids("jellyfin"), ("audit-library",)
             )
             self.assertEqual(endpoint.posts, ["/Items/audit-library/Refresh"])
+            self.assertEqual(queue.list_waiting_media_refreshes(), waiting_snapshot)
             self.assertEqual(api._local_bindings(), initial_bindings)
 
     def test_invalid_historical_queue_is_not_silently_rewritten_on_recovery(self):

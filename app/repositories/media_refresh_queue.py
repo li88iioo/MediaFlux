@@ -10,11 +10,8 @@ import hashlib
 import json
 import time
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 from app import database as db
-
-if TYPE_CHECKING:
-    pass
 
 _QUEUE_KEY = "media_refresh_queue:v1"
 _STATE_VERSION = 1
@@ -211,6 +208,9 @@ def enqueue_media_refresh(
         ):
             raise RuntimeError("媒体库刷新队列分组冲突")
         before = len(_normalized_paths(group.get("pending_paths")))
+        waiting = group.get("waiting_paths", {})
+        for path in normalized_paths:
+            waiting.pop(path, None)
         group["pending_paths"] = _merge_paths(
             group.get("pending_paths"), normalized_paths
         )
@@ -299,10 +299,13 @@ def settle_media_refresh(
     error: object = "",
     refreshed_target_ids: Iterable[object] | None = (),
     acknowledged_paths: Iterable[object] | None = (),
+    waiting_paths: Iterable[object] | None = (),
+    waiting_reason: str = "",
+    configuration_revision: str = "",
     recent_ttl_seconds: int = 90,
     now_epoch: float | None = None,
 ) -> bool:
-    """只消费已完成的在途路径；租约期间新增的变化及其 quiet window 始终保留。"""
+    """逐路径结算成功、配置等待与可重试工作；保留租约期间新变化的 quiet window。"""
     if outcome not in {"completed", "deferred", "failed"}:
         raise ValueError("媒体库刷新结算结果无效")
     now_value = float(time.time() if now_epoch is None else now_epoch)
@@ -326,13 +329,20 @@ def settle_media_refresh(
                 state["recent"][f"{provider}:{item_id}"] = expiry
         completed = outcome == "completed"
         acknowledged = set(_normalized_paths(acknowledged_paths))
-        remaining = [] if completed else [
-            path for path in _normalized_paths(group.get("inflight_paths"))
-            if path not in acknowledged
-        ]
         pending = _normalized_paths(group.get("pending_paths"))
+        inflight = _normalized_paths(group.get("inflight_paths"))
+        waiting = group.setdefault("waiting_paths", {})
+        blocked = set(_normalized_paths(waiting_paths)) & set(inflight) - acknowledged
+        for path in blocked - set(pending):
+            waiting[path] = {
+                "reason": waiting_reason,
+                "configuration_revision": configuration_revision,
+            }
+        remaining = [] if completed else [
+            path for path in inflight if path not in acknowledged and path not in blocked
+        ]
         group["pending_paths"] = _merge_paths(remaining, pending)
-        if not group["pending_paths"]:
+        if not group["pending_paths"] and not waiting:
             state["groups"].pop(group_key, None)
         else:
             if completed:
@@ -347,7 +357,7 @@ def settle_media_refresh(
                     group["due_at"] = now_value + max(minimum, (delay_seconds or minimum))
             group.update(
                 inflight_paths=[],
-                status="queued" if completed else "retry_wait",
+                status=("queued" if completed else "retry_wait") if group["pending_paths"] else "waiting_configuration",
                 lease_owner="",
                 lease_until=0,
                 last_error="" if completed else " ".join(str(error or "").split())[:300],
@@ -416,13 +426,18 @@ def media_refresh_queue_status(*, now_epoch: float | None = None) -> dict[str, i
     now_value = float(time.time() if now_epoch is None else now_epoch)
     with db.get_conn() as conn:
         state = _read_state(conn)
-    counts = {"queued": 0, "running": 0, "retry_wait": 0, "paths": 0, "recent": 0}
+    counts = {"queued": 0, "running": 0, "retry_wait": 0, "waiting_configuration": 0,
+              "waiting_paths": 0, "paths": 0, "recent": 0}
     for group in state["groups"].values():
         if not isinstance(group, dict):
             continue
         status = str(group.get("status") or "")
-        if status in counts:
+        if status in {"queued", "running", "retry_wait"}:
             counts[status] += 1
+        waiting = len(group.get("waiting_paths", {}))
+        counts["waiting_configuration"] += bool(waiting)
+        counts["waiting_paths"] += waiting
+        counts["paths"] += waiting
         counts["paths"] += len(_normalized_paths(group.get("pending_paths")))
         counts["paths"] += len(_normalized_paths(group.get("inflight_paths")))
     recent_count = 0
@@ -435,6 +450,95 @@ def media_refresh_queue_status(*, now_epoch: float | None = None) -> dict[str, i
             recent_count += 1
     counts["recent"] = recent_count
     return counts
+
+
+def _waiting_token(group: dict[str, Any]) -> str:
+    snapshot = [group.get("created_at"), group.get("waiting_paths", {}), group.get("lease_generation", 0)]
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+
+
+def list_waiting_media_refreshes() -> list[dict[str, Any]]:
+    """查看需要配置处理的刷新意图，不查询媒体服务器。"""
+    with db.get_conn() as conn:
+        state = _read_state(conn)
+    return [{
+        "group_key": key, "provider": group["provider"], "token": _waiting_token(group),
+        "path_count": len(group["waiting_paths"]), "paths": list(group["waiting_paths"]),
+        "reason": "；".join(dict.fromkeys(item["reason"] for item in group["waiting_paths"].values())),
+    } for key, group in state["groups"].items() if group.get("waiting_paths")]
+
+
+def _resume_waiting(group: dict[str, Any], paths: list[str], now_value: float) -> None:
+    if not group.get("pending_paths"):
+        group["due_at"] = now_value
+    group["pending_paths"] = _merge_paths(group.get("pending_paths"), paths)
+    for path in paths:
+        group["waiting_paths"].pop(path)
+    if group.get("status") != "running":
+        group["status"] = "queued"
+    group.update(attempts=0, last_error="", updated_at=now_value)
+
+
+def reconcile_media_refresh_configuration(
+    revisions: dict[str, str], *, now_epoch: float | None = None,
+) -> int:
+    """配置变化只唤醒相关等待项；摘要随意图持久化，重启也不会无故重新轮询。"""
+    now_value = float(time.time() if now_epoch is None else now_epoch)
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _read_state(conn)
+        resumed = 0
+        for group in state["groups"].values():
+            provider = group.get("provider")
+            if provider not in revisions:
+                continue
+            paths = [path for path, item in group.get("waiting_paths", {}).items()
+                     if item["configuration_revision"] != revisions[provider]]
+            if paths:
+                _resume_waiting(group, paths, now_value)
+                resumed += len(paths)
+        if resumed:
+            _write_state(conn, state)
+    return resumed
+
+
+def resolve_waiting_media_refreshes(
+    records: list[dict[str, Any]], action: Literal["retry", "clear"], *,
+    now_epoch: float | None = None,
+) -> dict[str, int]:
+    """核对页面快照后重新排队或丢弃所选等待意图；不操作文件或运行中路径。"""
+    if action not in {"retry", "clear"} or not records:
+        raise ValueError("请选择待处理刷新记录和有效操作")
+    now_value = float(time.time() if now_epoch is None else now_epoch)
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _read_state(conn)
+        selected = {}
+        for item in records:
+            key = item.get("group_key", "")
+            group = state["groups"].get(key)
+            if not group or not group.get("waiting_paths") or item.get("token") != _waiting_token(group):
+                raise ValueError("刷新记录已变化，请更新列表后重新选择")
+            raw_paths = item.get("paths", list(group["waiting_paths"]))
+            if not isinstance(raw_paths, list) or not raw_paths or any(
+                not isinstance(path, str) or path not in group["waiting_paths"] for path in raw_paths
+            ):
+                raise ValueError("所选刷新路径无效或已变化，请更新列表后重新选择")
+            if key in selected:
+                raise ValueError("刷新记录不能重复选择")
+            selected[key] = (group, list(dict.fromkeys(raw_paths)))
+        count = 0
+        for key, (group, paths) in selected.items():
+            count += len(paths)
+            if action == "retry":
+                _resume_waiting(group, paths, now_value)
+            else:
+                for path in paths:
+                    group["waiting_paths"].pop(path)
+                if not group["waiting_paths"] and not group.get("pending_paths") and not group.get("inflight_paths"):
+                    state["groups"].pop(key)
+        _write_state(conn, state)
+    return {"processed_paths": count, "processed_groups": len(selected)}
 
 
 def clear_media_refresh_queue() -> None:

@@ -31,7 +31,8 @@ def test_real_unmapped_refresh_result_is_retained_not_acknowledged():
                 coordinator._process_group(job)
             status = media_refresh_queue_status()
             assert status["paths"] == 1, status
-            assert status["retry_wait"] == 1, status
+            assert status["waiting_configuration"] == 1, status
+            assert claim_due_media_refreshes(owner="later", force=True) == []
             assert coordinator._completed_session == 0
             client.refresh_all.assert_not_called()
 

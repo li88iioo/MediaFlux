@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Request
 
 from app import config, database as db
 from app.repositories import local_media as local_media_repo
+from app.repositories import media_refresh_queue as media_refresh_repo
 from app.clients.base import close_media_server_client
 from app.logger import get_logger
 from app.modules.local_directory_browser import VIRTUAL_ROOT, browse_local_directories
@@ -329,6 +330,61 @@ def media_library_overview(request: Request):
     }
 
 
+@router.get("/refresh-queue")
+def list_media_library_refresh_queue(request: Request):
+    """仅投影统一刷新队列，不探测媒体服务器或访问媒体文件。"""
+    require_api_login(request)
+    try:
+        return {
+            "summary": media_refresh_repo.media_refresh_queue_status(),
+            "items": media_refresh_repo.list_waiting_media_refreshes(),
+        }
+    except Exception as exc:
+        logger.error("媒体库等待刷新记录读取失败 type=%s", type(exc).__name__)
+        return api_error("等待刷新记录读取失败，请稍后重试", 500)
+
+
+@router.post("/refresh-queue/{action}")
+def resolve_media_library_refresh_queue(
+    request: Request,
+    action: Literal["retry", "clear"],
+    data: dict | None = Body(default=None),
+):
+    """按已展示的组快照处理所选等待路径；清除不触碰媒体文件。"""
+    require_api_login(request)
+    records = (data or {}).get("records")
+    if not isinstance(records, list) or not records:
+        return api_error("请选择需要处理的等待刷新记录", 400)
+    selected: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict) or any(
+            not isinstance(record.get(key), str) or not record[key].strip()
+            for key in ("group_key", "token")
+        ):
+            return api_error("等待刷新记录格式无效，请刷新列表后重新选择", 400)
+        item: dict[str, Any] = {key: record[key] for key in ("group_key", "token")}
+        if "paths" in record:
+            paths = record["paths"]
+            if not isinstance(paths, list) or not paths or any(
+                not isinstance(path, str) or not path.strip() for path in paths
+            ):
+                return api_error("请选择需要处理的等待路径", 400)
+            item["paths"] = paths
+        selected.append(item)
+    try:
+        result = media_refresh_repo.resolve_waiting_media_refreshes(selected, action=action)
+    except ValueError as exc:
+        return api_error(str(exc), 409)
+    except Exception as exc:
+        logger.error("媒体库等待刷新记录处理失败 action=%s type=%s", action, type(exc).__name__)
+        return api_error("等待刷新记录处理失败，请稍后重试", 500)
+    if action == "retry":
+        from app.modules.media_refresh_coordinator import get_media_refresh_coordinator
+
+        get_media_refresh_coordinator().wake()
+    return {"success": True, **result}
+
+
 def _required_text(payload: dict[str, Any], key: str, label: str) -> str:
     value = payload.get(key, "")
     if isinstance(value, (dict, list, tuple, bool)):
@@ -444,6 +500,9 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
                     "统一媒体库映射保存后调度器重载失败 type=%s",
                     type(exc).__name__,
                 )
+            from app.modules.media_refresh_coordinator import get_media_refresh_coordinator
+
+            get_media_refresh_coordinator().wake()
             return {"success": True, "local_bindings": _local_bindings()}
     except (ValueError, LookupError) as exc:
         return api_error(str(exc), 400)

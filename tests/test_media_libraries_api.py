@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app.repositories import local_media as local_media_repo
+from app.repositories import media_refresh_queue as refresh_repo
 from app.main import create_app
 from app.routes import media_libraries_api
 from app.modules.media_server_profiles import MediaServerProfile
@@ -71,6 +72,9 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(self.client.get("/api/media-libraries/overview").status_code, 401)
         self.assertEqual(self.client.get("/api/media-libraries/strm-directories").status_code, 401)
         self.assertEqual(self.client.get("/api/media-libraries/local-directories").status_code, 401)
+        self.assertEqual(self.client.get("/api/media-libraries/refresh-queue").status_code, 401)
+        for action in ("retry", "clear"):
+            self.assertEqual(self.client.post(f"/api/media-libraries/refresh-queue/{action}", json={}).status_code, 401)
         self.assertEqual(self.client.post("/api/media-libraries/mappings", json={}).status_code, 401)
         self.assertEqual(
             self.client.post("/api/media-libraries/path-test", json={}).status_code,
@@ -85,6 +89,119 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             self.client.post("/api/media-libraries/path-test", json={}).status_code,
             403,
         )
+        for action in ("retry", "clear"):
+            self.assertEqual(self.client.post(f"/api/media-libraries/refresh-queue/{action}", json={}).status_code, 403)
+
+    def _waiting_refresh(self, paths, provider="jellyfin"):
+        queued = refresh_repo.enqueue_media_refresh(provider, paths, debounce_seconds=0)
+        lease = refresh_repo.claim_due_media_refreshes(owner="api-fixture", force=True)[0]
+        self.assertTrue(refresh_repo.settle_media_refresh(
+            lease["group_key"], owner="api-fixture", lease_generation=lease["lease_generation"],
+            outcome="completed", waiting_paths=paths, waiting_reason="路径未匹配，请检查媒体库目录",
+            configuration_revision="fixture-before", refreshed_target_ids=["accepted"],
+        ))
+        return next(item for item in refresh_repo.list_waiting_media_refreshes() if item["group_key"] == queued["group_key"])
+
+    def test_refresh_queue_projects_waiting_groups_without_probing_servers(self):
+        self.login()
+        self._waiting_refresh(["/old/A", "/unmapped/B"])
+        self._waiting_refresh(["/emby/C"], "emby")
+        with patch.object(media_libraries_api, "_client_for") as client, patch.object(media_libraries_api, "_probe_profile") as probe:
+            response = self.client.get("/api/media-libraries/refresh-queue")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "summary": refresh_repo.media_refresh_queue_status(),
+            "items": refresh_repo.list_waiting_media_refreshes(),
+        })
+        self.assertEqual(response.json()["summary"]["waiting_configuration"], 2)
+        self.assertEqual(response.json()["summary"]["waiting_paths"], 3)
+        client.assert_not_called()
+        probe.assert_not_called()
+
+    def test_refresh_queue_clear_selected_path_preserves_files_and_live_work(self):
+        headers = {"X-CSRF-Token": self.login()}
+        with TemporaryDirectory() as root:
+            files = [Path(root) / name for name in ("old.strm", "current.strm", "current.nfo", "poster.jpg")]
+            for path in files:
+                path.write_text(path.name)
+            old, current = map(str, files[:2])
+            self._waiting_refresh([old, current])
+            refresh_repo.enqueue_media_refresh("jellyfin", ["/live/inflight"], debounce_seconds=0)
+            lease = refresh_repo.claim_due_media_refreshes(owner="live", force=True)[0]
+            refresh_repo.enqueue_media_refresh("jellyfin", ["/live/pending"], debounce_seconds=0)
+            record = refresh_repo.list_waiting_media_refreshes()[0]
+            recent = refresh_repo.recent_media_refresh_target_ids("jellyfin")
+            with patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator") as coordinator:
+                response = self.client.post("/api/media-libraries/refresh-queue/clear", headers=headers, json={
+                    "records": [{"group_key": record["group_key"], "token": record["token"], "paths": [old]}],
+                })
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), {"success": True, "processed_groups": 1, "processed_paths": 1})
+            self.assertEqual(refresh_repo.list_waiting_media_refreshes()[0]["paths"], [current])
+            self.assertEqual(refresh_repo.media_refresh_queue_status()["paths"], 3)
+            self.assertEqual(refresh_repo.recent_media_refresh_target_ids("jellyfin"), recent)
+            coordinator.assert_not_called()
+            self.assertTrue(refresh_repo.settle_media_refresh(
+                lease["group_key"], owner="live", lease_generation=lease["lease_generation"], outcome="completed",
+            ))
+            self.assertEqual(refresh_repo.claim_due_media_refreshes(owner="live", force=True)[0]["paths"], ["/live/pending"])
+            for path in files:
+                self.assertEqual(path.read_text(), path.name)
+
+    def test_refresh_queue_retry_only_selected_path_and_wakes_original_consumer(self):
+        headers = {"X-CSRF-Token": self.login()}
+        record = self._waiting_refresh(["/old/A", "/unmapped/B"])
+        with patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator") as coordinator:
+            response = self.client.post("/api/media-libraries/refresh-queue/retry", headers=headers, json={
+                "records": [{"group_key": record["group_key"], "token": record["token"], "paths": ["/unmapped/B"]}],
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["processed_paths"], 1)
+        coordinator.return_value.wake.assert_called_once_with()
+        self.assertEqual(refresh_repo.list_waiting_media_refreshes()[0]["paths"], ["/old/A"])
+        self.assertEqual(refresh_repo.claim_due_media_refreshes(owner="retry", force=True)[0]["paths"], ["/unmapped/B"])
+
+    def test_refresh_queue_stale_group_token_rejects_entire_batch(self):
+        headers = {"X-CSRF-Token": self.login()}
+        stale = self._waiting_refresh(["/old/A", "/unmapped/B"])
+        other = self._waiting_refresh(["/emby/C"], "emby")
+        refresh_repo.resolve_waiting_media_refreshes([
+            {"group_key": stale["group_key"], "token": stale["token"], "paths": ["/old/A"]},
+        ], action="clear")
+        before = refresh_repo.list_waiting_media_refreshes()
+        for action in ("retry", "clear"):
+            with self.subTest(action=action), patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator") as coordinator:
+                response = self.client.post(f"/api/media-libraries/refresh-queue/{action}", headers=headers, json={
+                    "records": [
+                        {"group_key": other["group_key"], "token": other["token"], "paths": other["paths"]},
+                        {"group_key": stale["group_key"], "token": stale["token"], "paths": ["/unmapped/B"]},
+                    ],
+                })
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(refresh_repo.list_waiting_media_refreshes(), before)
+                coordinator.assert_not_called()
+
+    def test_refresh_queue_validates_selection_and_keeps_optional_whole_group_contract(self):
+        headers = {"X-CSRF-Token": self.login()}
+        record = self._waiting_refresh(["/old/A", "/unmapped/B"])
+        base = {"group_key": record["group_key"], "token": record["token"]}
+        invalid = [{}, {"records": []}, {"records": "all"}, {"records": [None]},
+                   {"records": [{"group_key": "", "token": "x"}]},
+                   {"records": [dict(base, token=True)]}, {"records": [dict(base, paths=[])]},
+                   {"records": [dict(base, paths="/old/A")]}, {"records": [dict(base, paths=[False])]}]
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/media-libraries/refresh-queue/clear", headers=headers, json=payload)
+                self.assertEqual(response.status_code, 400, response.text)
+        unknown = self.client.post("/api/media-libraries/refresh-queue/clear", headers=headers, json={
+            "records": [dict(base, paths=["/not-selected"])],
+        })
+        self.assertEqual(unknown.status_code, 409, unknown.text)
+        self.assertEqual(refresh_repo.list_waiting_media_refreshes(), [record])
+        response = self.client.post("/api/media-libraries/refresh-queue/clear", headers=headers, json={"records": [base]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["processed_paths"], 2)
+        self.assertEqual(refresh_repo.list_waiting_media_refreshes(), [])
 
     def test_library_payload_preserves_collection_type_for_local_category_inference(self):
         normalized = media_libraries_api._library_payload({
@@ -318,6 +435,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             with (
                 patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
                 patch("app.routes.media_libraries_api.config.set_and_save") as save_config,
+                patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator") as coordinator,
                 patch(
                     "app.modules.local_media_scheduler.get_local_media_scheduler",
                     return_value=scheduler,
@@ -350,6 +468,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             "JELLYFIN_PATH_MAPPINGS": '[{"local":"/data/strm","server":"//NAS/STRM"}]',
         })
         scheduler.reload.assert_called_once_with()
+        coordinator.return_value.wake.assert_called_once_with()
 
     def test_unified_save_rejects_local_mapping_without_media_library(self):
         csrf = self.login()
@@ -403,6 +522,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                 source_id, "default", str(old_target), owner="admin"
             )
             with (
+                patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator") as coordinator,
                 patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
                 patch(
                     "app.routes.media_libraries_api.config.set_and_save",
@@ -426,6 +546,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                     },
                 )
         self.assertEqual(response.status_code, 503, response.text)
+        coordinator.assert_not_called()
         targets = local_media_repo.list_local_library_targets(source_id, owner="admin")
         self.assertEqual([item.path for item in targets], [str(old_target)])
 
