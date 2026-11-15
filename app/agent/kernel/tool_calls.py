@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 from .capabilities import ToolEffect
 
 if TYPE_CHECKING:
+    from asyncio import Timeout
+    from app.agent.errors import ToolPipelineError
     from app.agent.kernel.state_types import CancellationToken, PublicationLease
 
     from .capabilities import KernelToolSpec
@@ -101,6 +103,7 @@ class ToolCallContext:
     current_task: dict | None = None
     task_control: Callable[[TaskPatch | None], Awaitable[dict | None]] | None = None
     task_budget: Callable[[], Awaitable[None]] | None = None
+    read_execution: tuple[Timeout, ToolPipelineError] | None = None
     active_effect_plan: EffectPlan | None = None
     batch_progress: dict | None = None
     user_source: str = ""

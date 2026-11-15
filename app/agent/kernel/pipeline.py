@@ -75,13 +75,14 @@ class ToolPipeline(EffectExecutor):
         if admitted is not None:
             admitted.set()
         deadline = asyncio.timeout_at((context.continuation_policy or {}).get("deadline"))
+        timeout_error = ToolPipelineError("活跃执行时间额度已用完。", code="active_time_budget_exceeded")
         try:
             async with deadline:
-                value = await invoke(tool.read, resolved, context)
+                value = await invoke(tool.read, resolved, replace(context, read_execution=(deadline, timeout_error)))
         except TimeoutError as exc:
             if not deadline.expired():
                 raise
-            raise ToolPipelineError("活跃执行时间额度已用完。", code="active_time_budget_exceeded") from exc
+            raise timeout_error from exc
         except ToolPipelineError as exc:
             if tool.observe is not None:
                 exc.task_patch = observation_patch(context.current_task, owner=context.owner,

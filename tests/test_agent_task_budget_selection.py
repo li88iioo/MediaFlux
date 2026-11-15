@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import socket
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +11,8 @@ from unittest.mock import patch
 import pytest
 
 from app.agent.feature_gate import initialize_runtime_fence
+from app.agent.errors import ToolPipelineError
+from app.agent.kernel import sandbox
 from app.agent.kernel.bootstrap import _capture_creation_binding
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.continuation import _ContinuationAction
@@ -21,9 +25,149 @@ from app.agent.kernel.task_state import proposal
 from tests.agent_task_native_helpers import task_call
 from tests.test_agent_kernel_core import ScriptedModel, collect, read_tool
 from tests.test_agent_task_cas import task_store as task_store
+from tests.test_agent_session_result import native_workspace as native_workspace
 
 OWNER, SID, GOAL = "budget-selection-owner", "budget-selection", "检查旧媒体库状态"
 READ = "library.inspect"
+
+
+@pytest.mark.parametrize("remaining,recheck", [(0, False), (0.25, False), (0.25, True)],
+                         ids=["already-exhausted", "inherited-deadline", "next-rpc-exhausted"])
+def test_native_budget_stops_script_batch_and_model_but_keeps_completed_facts(
+    task_store, native_workspace, monkeypatch, remaining, recheck,
+):
+    from app.agent.kernel.persistence import SQLiteKernelStore
+
+    queried = []
+    clock = [100.0]
+    monkeypatch.setattr(task_store, "_clock", lambda: clock[0])
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: pytest.fail("禁止外联"))
+
+    def search(query):
+        queried.append(query)
+        if recheck:
+            clock[0] += 1.0
+        return {"ok": True, "status": "success", "summary": "真实离线查询", "query": query}
+
+    monkeypatch.setitem(sandbox.METHODS, "media.search", search)
+
+    async def run():
+        initialize_runtime_fence()
+        binding = _capture_creation_binding()
+        lease, _ = await task_store.begin_turn(owner=OWNER, session_id=SID, request_id="active-seed")
+        budget = SessionLimits().budget()
+        budget.update(active_limit=1.0, active_spent=1.0 - remaining, active_since=None)
+        before = await task_store.commit(lease, task_patch=proposal(declaration(), SimpleNamespace(
+            request_id=lease.request_id, user_source=GOAL, current_task=None,
+        )), updates=(_ContinuationAction("", {"operation": "seed", "budget": budget}, binding=binding),))
+        code = f'''import time
+try:
+    print(mf.media.search('first'), flush=True)
+    if {recheck!r}:
+        mf.media.search('after')
+except mf.Error:
+    open('/work/caught', 'w').write('budget was catchable')
+time.sleep(0.4)
+open('/work/continued', 'w').write('continued after deadline')
+mf.media.search('after')'''
+        observed = []
+        agent, model = session(task_store, [calls(
+            (sandbox.RUN_CODE_TOOL, {"code": code, "timeout_seconds": 5}),
+            (sandbox.RUN_CODE_TOOL, {"code": "open('/work/next-call', 'w').write('ran')"}),
+            (READ, {}),
+        ), final("不应再请求模型伪造成功")], observed)
+        events = await asyncio.wait_for(collect(agent.run(AgentInput(
+            message="继续检查旧任务", owner=OWNER, session_id=SID))), 5)
+        workspace, _ = sandbox._workspace_location(OWNER, SID)
+        assert queried == (["first"] if remaining else [])
+        assert observed == [] and len(model.requests) == 1
+        assert events[-1].type.value == "turn.failed"
+        assert events[-1].payload["code"] == "active_time_budget_exceeded"
+        assert not any((workspace / "work" / name).exists() for name in ("caught", "continued", "next-call"))
+        assert not (workspace / "run/mf-requests").exists()
+        assert not (workspace / "run/mf-responses").exists()
+        cold = SQLiteKernelStore(secret_provider=lambda: "task-test-only", clock=lambda: clock[0])
+        after = await cold.load(owner=OWNER, session_id=SID)
+        calls_in_history = [call["call_id"] for row in after.conversation for call in row.get("tool_calls", [])]
+        results_in_history = [row for row in after.conversation if row["role"] == "tool"]
+        assert calls_in_history == ["call-0", "call-1", "call-2"]
+        assert [row["tool_call_id"] for row in results_in_history] == calls_in_history
+        assert all(json.loads(row["content"])["status"] == "error"
+                   and json.loads(row["content"])["code"] == "not_executed" for row in results_in_history[1:])
+        assert len(after.metadata["task"]["verified_facts"]) == bool(remaining)
+        archived = [json.loads(path.read_text()) for path in (workspace / "output").glob("*.sdk.json")]
+        assert [item["result"]["query"] for item in archived] == queried
+        if not remaining:
+            assert after.metadata["task"] == before.metadata["task"]
+            assert after.metadata["read_wait"]["budget"] == before.metadata["read_wait"]["budget"]
+    asyncio.run(run())
+
+
+def test_native_rpc_rechecks_budget_without_recharging_attempts(task_store, native_workspace, monkeypatch):
+    from app.agent.kernel.turn import AgentTurn
+
+    uses, queried = [], []
+    reserve = AgentTurn.reserve_budget
+
+    async def counted(turn, **kwargs):
+        await reserve(turn, **kwargs)
+        if kwargs.get("task_operation") == "use":
+            stored = await task_store.load(owner=OWNER, session_id=SID)
+            uses.append({key: stored.metadata["read_wait"]["budget"][key]
+                         for key in ("model_spent", "tool_spent", "token_spent")})
+
+    def search(query):
+        queried.append(query)
+        return {"ok": True, "status": "success", "summary": "真实离线查询", "query": query}
+
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: pytest.fail("禁止外联"))
+    monkeypatch.setitem(sandbox.METHODS, "media.search", search)
+
+    async def run():
+        before = await old_task(task_store, exhaust="none")
+        monkeypatch.setattr(AgentTurn, "reserve_budget", counted)
+        agent, model = session(task_store, [calls((sandbox.RUN_CODE_TOOL, {
+            "code": "for query in ('one', 'two', 'three'):\n    print(mf.media.search(query))",
+        })), final()])
+        events = await collect(agent.run(AgentInput(message=GOAL, owner=OWNER, session_id=SID)))
+        assert events[-1].payload.get("status") == "success"
+        assert queried == ["one", "two", "three"] and len(uses) == 3
+        assert uses[0] == uses[1] == uses[2]  # 三次准入的真实持久累计值完全相等。
+        assert uses[0]["model_spent"] == before.metadata["read_wait"]["budget"]["model_spent"] + 1
+        assert uses[0]["tool_spent"] == before.metadata["read_wait"]["budget"]["tool_spent"] + 1
+        assert uses[0]["token_spent"] > before.metadata["read_wait"]["budget"]["token_spent"]
+        after = await task_store.load(owner=OWNER, session_id=SID)
+        assert after.metadata["read_wait"]["budget"]["model_spent"] == before.metadata["read_wait"]["budget"]["model_spent"] + 2
+        assert after.metadata["read_wait"]["budget"]["tool_spent"] == before.metadata["read_wait"]["budget"]["tool_spent"] + 1
+        assert len(model.requests) == 2 and len(after.metadata["task"]["verified_facts"]) == 3
+    asyncio.run(run())
+
+
+def test_sdk_business_error_with_budget_code_remains_catchable(task_store, native_workspace, monkeypatch):
+    queried = []
+
+    def search(query):
+        queried.append(query)
+        if query == "retry":
+            raise ToolPipelineError("普通后端错误，非宿主预算拒绝", code="active_time_budget_exceeded")
+        return {"ok": True, "status": "success", "summary": "重试读取完成"}
+
+    monkeypatch.setitem(sandbox.METHODS, "media.search", search)
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: pytest.fail("禁止外联"))
+
+    async def run():
+        await old_task(task_store, exhaust="none")
+        agent, model = session(task_store, [calls((sandbox.RUN_CODE_TOOL, {"code": '''try:
+    mf.media.search('retry')
+except mf.Error as exc:
+    assert exc.code == 'active_time_budget_exceeded'
+print(mf.media.search('success'))'''})), final()])
+        events = await collect(agent.run(AgentInput(message=GOAL, owner=OWNER, session_id=SID)))
+        assert events[-1].payload.get("status") == "success"
+        assert queried == ["retry", "success"] and len(model.requests) == 2
+        data = next(event.payload["result"]["data"] for event in events if event.type.value == "tool.completed")
+        assert data["exit_code"] == 0 and len(data["sdk_calls"]) == 2
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("ending", ["answer", "provider-error", "cancel"])

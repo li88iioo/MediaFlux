@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from contextlib import ExitStack
 from dataclasses import replace
+from functools import partial
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -132,9 +133,7 @@ class AgentTurn:
         self.model_calls = 0
         self.round_index = 0
         self._budget_task_id = ""
-        self._budget_model_attempts = self._budget_tool_attempts = 0
-        self._budget_paid_models = self._budget_paid_tools = 0
-        self._budget_token_attempts = self._budget_paid_tokens = 0
+        self._pending_budget: dict[str, int] = {}
         self._local_budget = session.limits.budget()
         self.confirmed_result: dict[str, Any] | None = None
         self.diagnosing_effect = False
@@ -417,7 +416,8 @@ class AgentTurn:
             lease=self.lease,
             cancellation=self.token,
             report_progress=self.report_progress,
-            task_control=self.control_task, task_budget=self.adopt_task_budget,
+            # 每 RPC 复核原累计预算；reserve 仅收取 pending debit，成功后清空。
+            task_control=self.control_task, task_budget=partial(self.reserve_budget, task_operation="use"),
             wait_for_completion=True,
             read_only=bool(self.agent_input.initial_read_tool),
             channel=self.agent_input.channel,
@@ -483,9 +483,7 @@ class AgentTurn:
             if not lease.continuation_id:
                 self._budget_task_id = frozen.get("task_id", "")
                 self._local_budget = deepcopy(frozen["budget"])
-            self._budget_paid_models = self._budget_model_attempts
-            self._budget_paid_tools = self._budget_tool_attempts
-            self._budget_paid_tokens = self._budget_token_attempts
+            self._pending_budget.clear()
         await self.reserve_budget()
         public_result: dict[str, Any]
         result = None
@@ -531,11 +529,9 @@ class AgentTurn:
                 self.lease = adopted
                 self.state = await self.session.state_store.load(owner=adopted.owner, session_id=adopted.session_id)
                 self.tool_context = replace(self.tool_context, lease=adopted)
-                # 新租约已继承冻结预算；本地已入账尝试只防止重复扣减，不清零原账。
+                # 新租约已继承冻结预算；仅清空本地待计费差额，不清零原账。
                 self._budget_task_id = ""
-                self._budget_paid_models = self._budget_model_attempts
-                self._budget_paid_tools = self._budget_tool_attempts
-                self._budget_paid_tokens = self._budget_token_attempts
+                self._pending_budget.clear()
                 self.sync_budget_context()
                 if result is None:
                     from .continuation import confirmed_result as restore_confirmed
@@ -943,10 +939,6 @@ class AgentTurn:
             self.tool_context = replace(self.tool_context, current_task=self.state.metadata.get("task"))
         return deepcopy(self.state.metadata.get("task"))
 
-    async def adopt_task_budget(self) -> None:
-        # 每段代码首次业务调用选取一次原累计预算，不按每个RPC重复记账。
-        await self.reserve_budget(task_operation="use")
-
     @property
     def uses_session_task(self) -> bool:
         """显式新目标不自动继承旧任务；结构化任务选择和续行仍使用原任务。"""
@@ -981,9 +973,7 @@ class AgentTurn:
     def seed_budget(self) -> dict:
         budget = deepcopy(self._local_budget) if self.task_budget is None else {
                 **self.session.limits.budget(),
-                "model_spent": self._budget_model_attempts - self._budget_paid_models,
-                "tool_spent": self._budget_tool_attempts - self._budget_paid_tools,
-                "token_spent": self._budget_token_attempts - self._budget_paid_tokens,
+                **self._pending_budget,
                 "active_since": self.session.state_store._clock()}
         # task预算一直计全部尝试；前台业务调用的发现折算不能扩大持久续行额度。
         budget.pop("discovery_spent", None)
@@ -993,9 +983,8 @@ class AgentTurn:
                              tool: KernelToolSpec | None = None,
                              arguments: Mapping[str, Any] | None = None, stop: bool = False,
                              task_operation: str | None = None) -> None:
-        self._budget_model_attempts += model
-        self._budget_tool_attempts += tools
-        self._budget_token_attempts += tokens
+        debit = {"model_spent": model, "tool_spent": tools, "token_spent": tokens}
+        self._pending_budget = {key: self._pending_budget.get(key, 0) + amount for key, amount in debit.items()}
         lease = self.tool_context.lease
         operation = task_operation
         control = not lease.continuation_id and operation in ("create", "cancel")
@@ -1018,9 +1007,7 @@ class AgentTurn:
         value["discovery_spent"] = 0
         try:
             if budget is not None and not control:
-                value.update(model_spent=0 if stop else self._budget_model_attempts - self._budget_paid_models,
-                             tool_spent=0 if stop else self._budget_tool_attempts - self._budget_paid_tools,
-                             token_spent=0 if stop else self._budget_token_attempts - self._budget_paid_tokens)
+                value.update({} if stop else self._pending_budget)
                 if selected:
                     reserve_budget_values(self._local_budget, {"stop": True}, self.session.state_store._clock())
                     value["active_spent"] = self._local_budget["active_spent"]
@@ -1028,12 +1015,9 @@ class AgentTurn:
                 self.state = await self.session.state_store.commit(lease, updates=(_ContinuationAction("", {
                     **value, "operation": "reserve", "task_id": self._budget_task_id,
                 }, binding=self.session.continuation_binding),))
-                self._budget_paid_models = self._budget_model_attempts
-                self._budget_paid_tools = self._budget_tool_attempts
-                self._budget_paid_tokens = self._budget_token_attempts
+                self._pending_budget.clear()
             elif not control or budget is None:
-                reserve_budget_values(self._local_budget, {**value, "model_spent": model,
-                    "tool_spent": tools, "token_spent": tokens}, self.session.state_store._clock())
+                reserve_budget_values(self._local_budget, {**value, **debit}, self.session.state_store._clock())
         except ValueError as exc:
             if selected:
                 self._budget_task_id = ""  # 未取得原任务预算，不能在收尾时改写它。

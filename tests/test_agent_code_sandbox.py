@@ -212,6 +212,125 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(result.outcome.full_model_content or result.outcome.model_content)
         return payload["data"]
 
+    async def test_active_deadlines_are_per_execution_and_do_not_leak_to_other_sessions(self):
+        from app.agent.errors import ToolPipelineError
+
+        loop = asyncio.get_running_loop()
+        queried, budgets = [], []
+
+        def read(query):
+            queried.append(query)
+            return {"ok": True, "query": query}
+
+        async def context(session, seconds):
+            value = await make_context(self.store, session=session)
+            policy: dict[str, float | None] = {"deadline": loop.time() + 5}
+
+            async def budget():
+                budgets.append(session)
+                policy["deadline"] = None if seconds is None else loop.time() + seconds
+
+            return replace(value, task_budget=budget, continuation_policy=policy)
+
+        def code(session):
+            return f'''import subprocess, time
+subprocess.Popen(['python', '-c', 'import time; time.sleep(30)', {self.directory.name!r}])
+print(mf.library.episodes({session + '-before'!r}), flush=True)
+time.sleep(0.35)
+print(mf.library.episodes({session + '-after'!r}), flush=True)'''
+
+        short, other = await context("short", 0.15), await context("other", 2)
+        with patch.dict(sandbox.METHODS, {"library.episodes": read}):
+            results = await asyncio.wait_for(asyncio.gather(
+                self.execute(code("short"), context=short), self.execute(code("other"), context=other),
+                return_exceptions=True), 5)
+            self.assertIsInstance(results[0], ToolPipelineError)
+            self.assertEqual(results[0].code, "active_time_budget_exceeded")
+            self.assertIsInstance(results[1], dict)
+            self.assertEqual(results[1]["exit_code"], 0)
+            self.assertCountEqual(queried, ["short-before", "other-before", "other-after"])
+            self.assertEqual(budgets.count("short"), 1)
+            self.assertEqual(budgets.count("other"), 2)
+            # 同会话下一执行段取得自己的 Timeout，旧 expired timer 不得被复活或复用。
+            fresh = await context("short", None)
+            result = await self.execute("print(mf.library.episodes('fresh'))", context=fresh)
+            self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(self.background_processes())
+        for value in (short, other, fresh):
+            workspace, _ = sandbox._workspace_location(value.owner, value.session_id)
+            self.assertFalse((workspace / "run/mf-requests").exists())
+            self.assertFalse((workspace / "run/mf-responses").exists())
+
+    async def test_parent_cancel_during_native_timeout_cleanup_keeps_cancel_semantics(self):
+        from app.agent.kernel import pipeline as pipeline_module
+
+        ready, release = asyncio.Event(), asyncio.Event()
+        invoke = pipeline_module.invoke
+
+        async def after_cleanup(function, arguments, context):
+            try:
+                return await invoke(function, arguments, context)
+            except asyncio.CancelledError:
+                ready.set()  # 真实 worker/rpc 清理已完成，Timeout.__aexit__ 尚未运行。
+                await release.wait()
+                raise
+
+        policy = {"deadline": asyncio.get_running_loop().time() + 2}
+
+        async def budget():
+            policy["deadline"] = asyncio.get_running_loop().time() + 0.1
+
+        context = replace(self.context, continuation_policy=policy, task_budget=budget)
+        code = f'''import subprocess, time
+subprocess.Popen(['python', '-c', 'import time; time.sleep(30)', {self.directory.name!r}])
+mf.library.episodes('completed')
+time.sleep(30)'''
+        with patch.dict(sandbox.METHODS, {"library.episodes": lambda query: {"ok": True}}), \
+             patch.object(pipeline_module, "invoke", after_cleanup):
+            task = asyncio.create_task(self.execute(code, context=context))
+            try:
+                await asyncio.wait_for(ready.wait(), 5)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 5)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertFalse(self.background_processes())
+        workspace, _ = sandbox._workspace_location(context.owner, context.session_id)
+        self.assertFalse((workspace / "run/mf-requests").exists())
+        self.assertFalse((workspace / "run/mf-responses").exists())
+
+    async def test_expired_native_deadline_rejects_queued_rpc_without_reviving_it(self):
+        from app.agent.errors import ToolPipelineError
+
+        deadline = asyncio.timeout(0)
+        with self.assertRaises(TimeoutError):
+            async with deadline:
+                await asyncio.sleep(0)
+        queried = []
+
+        async def budget():
+            pass
+
+        context = replace(self.context, task_budget=budget,
+            continuation_policy={"deadline": asyncio.get_running_loop().time() + 60},
+            read_execution=(deadline, ToolPipelineError("原执行段已到期", code="active_time_budget_exceeded")))
+        code = '''from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(4) as pool:
+    list(pool.map(mf.library.episodes, ['one', 'two', 'three', 'four']))'''
+        with patch.dict(sandbox.METHODS, {"library.episodes": lambda query: queried.append(query)}):
+            with self.assertRaises(ToolPipelineError) as raised:
+                await asyncio.wait_for(sandbox.run_code(self.pipeline, {"code": code}, context), 5)
+        self.assertEqual(raised.exception.code, "active_time_budget_exceeded")
+        self.assertEqual(queried, [])
+        self.assertTrue(deadline.expired())
+        workspace, _ = sandbox._workspace_location(context.owner, context.session_id)
+        self.assertFalse((workspace / "run/mf-requests").exists())
+        self.assertFalse((workspace / "run/mf-responses").exists())
+
     async def test_sdk_rate_limit_error_survives_real_workspace_client(self):
         from unittest.mock import Mock
         from app.agent import rate_limit as rates

@@ -175,7 +175,6 @@ class _SDKRequests:
         self.proposal: PipelineResult | None = None
         self.approval_ready = asyncio.Event()
         self.effect_lock = asyncio.Lock()
-        self.task_budget_admitted = False
         self.uid = None
         for name, mode in (("mf-requests", 0o700), ("mf-responses", 0o755)):
             directory = root / "run" / name
@@ -229,6 +228,13 @@ class _SDKRequests:
             key: fact for patch in pending for key, fact in patch.payload["observations"].items()
         }}) if pending else None
 
+    def sync_deadline(self):
+        if self.context.read_execution is not None:
+            deadline, error = self.context.read_execution
+            if deadline.expired():
+                raise error
+            deadline.reschedule((self.context.continuation_policy or {}).get("deadline"))
+
     async def session_call(self, method, arguments):
         if method in _TASK_METHODS:
             patch = self.task_observations()
@@ -240,14 +246,15 @@ class _SDKRequests:
                 self.session_service.context = self.context
         result = await getattr(self.session_service, method)(**arguments)
         self.context = self.session_service.context
-        if method in {"start_task", "revise_task", "cancel_task"}:
-            self.task_budget_admitted = False
+        self.sync_deadline()
         return result
 
     async def dispatch(self, name):
         method = ""
         arguments = {}
         read_result = None
+        budget_error = None
+        activity = None
         activity_id = f"{self.context.call_id}:{name.removesuffix('.json')}"
         current_task = self.context.current_task
         observation: dict[str, Any] = {}
@@ -289,9 +296,12 @@ class _SDKRequests:
             current_task = self.context.current_task
             if not method.startswith("session.") and method not in {"skills.save", "skills.restore"} and self.context.task_budget is not None:
                 async with self.effect_lock:
-                    if not self.task_budget_admitted:
+                    try:
                         await self.context.task_budget()
-                        self.task_budget_admitted = True
+                        self.sync_deadline()
+                    except ToolPipelineError as exc:
+                        budget_error = exc
+                        raise
             if self.context.read_only and effect in {"write", "local_write"}:
                 raise ToolPipelineError("工作区行动接力仅允许只读 SDK。", code="read_scope_required")
             activity = _sdk_activity(activity_id, method, arguments)
@@ -345,8 +355,6 @@ class _SDKRequests:
             activity = _sdk_activity(activity_id, method, arguments,
                 status="failed" if not ok else "partial" if result.get("partial") or status == "partial" else "success",
                 result=result)
-            if activity:
-                await self.context.report_progress({"activity": activity})
             encoded = json.dumps({**observation, "result": result}, ensure_ascii=False, allow_nan=False).encode()
             call = {"method": method, "ok": ok, "status": status}
             if observation:
@@ -363,6 +371,8 @@ class _SDKRequests:
                 self.completed_reads.append((name, call))
             raise
         except Exception as exc:
+            if exc is budget_error:
+                raise  # 真实宿主预算拒绝交给 poller；SDK 业务错误仍返回可 catch 的响应。
             message = redact_sensitive_text(getattr(exc, "public_message", None) or str(exc))
             code = str(getattr(exc, "code", None) or type(exc).__name__)
             call = {"method": str(method), "ok": False, "status": code}
@@ -381,8 +391,8 @@ class _SDKRequests:
             if method in METHODS:
                 activity = _sdk_activity(activity_id, method, arguments if isinstance(arguments, dict) else {},
                                          status="failed", error=message)
-                if activity:
-                    await self.context.report_progress({"activity": activity})
+        if activity:
+            await self.context.report_progress({"activity": activity})
         if observation:
             call["called_at"] = observation["called_at"]
             patch = observation_patch(current_task, owner=self.context.owner, session_id=self.context.session_id,
@@ -522,10 +532,15 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
         if io_error is not None:
             data["error"] = {"code": "workspace_io_error", "message": redact_sensitive_text(str(io_error))}
         return data, rpc
-    except BaseException:
+    except BaseException as exc:
         if rpc.proposal is not None:
             assert rpc.proposal.effect_plan is not None
             await effects.discard_unpublished_effect(plan=rpc.proposal.effect_plan, context=context)
+        error = exc if isinstance(exc, ToolPipelineError) else None
+        if error is None and context.read_execution is not None:
+            error = context.read_execution[1]
+        if error is not None and error.task_patch is None:
+            error.task_patch = rpc.task_observations()
         raise
 
 

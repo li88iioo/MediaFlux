@@ -149,9 +149,7 @@ async def persist_conversation(turn: AgentTurn,
             if task_patch is not None and not lease.continuation_id:
                 if task_patch.operation == "create" and turn.session.continuation_binding is not None:
                     turn._budget_task_id = turn.state.metadata["task"]["task_id"]
-                    turn._budget_paid_models = turn._budget_model_attempts
-                    turn._budget_paid_tools = turn._budget_tool_attempts
-                    turn._budget_paid_tokens = turn._budget_token_attempts
+                    turn._pending_budget.clear()
                     turn.sync_budget_context()
                 elif task_patch.operation == "cancel":
                     turn._budget_task_id = ""

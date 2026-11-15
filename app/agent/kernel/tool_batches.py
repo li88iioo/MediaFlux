@@ -232,21 +232,19 @@ async def execute_calls(turn: AgentTurn, reply: _ModelRound, round_task: Mapping
                         "model_calls": turn.model_calls, "tool_calls": turn.total_tool_calls,
                     })
                     return True
-            if exc.task_patch is not None:
-                staged = [*turn.messages, tool_error_message(call, exc, input_schema=tool.input_schema)]
-                done = turn.completed_call_ids | {call.call_id}
-                await persist_conversation(turn, close_pending=True, task_patch=exc.task_patch,
-                                           staged_messages=staged, staged_completed=done)
-                turn.messages, turn.completed_call_ids = staged, done
-                record_result(turn, tool.name, arguments, {"ok": False, "summary": str(exc)}, error=exc)
-                await turn.publish_tool(AgentEventType.TOOL_FAILED, call, code=exc.code, message=str(exc))
-            else:
-                record_result(turn, tool.name, arguments, {"ok": False, "status": exc.code, "summary": str(exc)}, error=exc)
-                await turn.close_failed_call(
-                    call, exc,
-                    tool_name=tool.name,
-                    input_schema=tool.input_schema,
-                )
+            staged = [*turn.messages, tool_error_message(call, exc, input_schema=tool.input_schema)]
+            done = turn.completed_call_ids | {call.call_id}
+            await persist_conversation(turn, close_pending=True, task_patch=exc.task_patch,
+                                       staged_messages=staged, staged_completed=done)
+            turn.messages, turn.completed_call_ids = staged, done
+            record_result(turn, tool.name, arguments, {"ok": False, "summary": str(exc),
+                **({"status": exc.code} if exc.task_patch is None else {})}, error=exc)
+            await turn.publish_tool(AgentEventType.TOOL_FAILED, call,
+                tool_name=tool.name if exc.task_patch is None else None, code=exc.code, message=str(exc))
+            if exc.code in {"model_round_budget_exceeded", "tool_budget_exceeded", "task_budget_exceeded",
+                            "token_budget_exceeded", "active_time_budget_exceeded"}:
+                await turn.finish_answer("", "partial", exc.code, turn.model_calls, interrupted=True)
+                return True
             if resuming_read:
                 # Only trusted acquire rejection above may repark.
                 # Preserve the closed error/TaskPatch, never retry a started READ.
