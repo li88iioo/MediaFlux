@@ -135,13 +135,15 @@
                     </select>
                     <select class="strm-select-input" id="proxyRecordSource">
                         <option value="">全部来源</option>
-                        <option value="guangya">光鸭直链</option>
+                        <option value="guangya">光鸭云盘</option>
                         <option value="upstream">上游直放/转码</option>
                         <option value="playback_info">PlaybackInfo</option>
                         <option value="hls">HLS 上游</option>
                     </select>
                 </div>
             </div>
+
+            <p class="panel-desc">云盘直连（302）：播放器直接访问光鸭 CDN；MF 转发：视频数据经过 MediaFlux 转发，不转码；HEAD 探测仅检查响应头。</p>
 
             <!-- Playback Sessions -->
             <div class="proxy-record-list" id="proxyRecordList" aria-live="polite" aria-busy="true">
@@ -532,25 +534,25 @@
         const method=String(record?.method||'GET').toUpperCase();
         const status=Number(record?.status_code||0);
         if(method==='HEAD')return ['search','HEAD 探测'];
-        if(record?.route_class==='guangya_direct'&&status===302)return ['cloud','光鸭 302'];
-        if(record?.route_class==='guangya_direct'&&method==='GET'&&[200,206].includes(status))return ['cloud','光鸭直链中转'];
-        if(source==='guangya')return ['cloud-off','光鸭直链（未知）'];
+        if(record?.route_class==='guangya_direct'&&status===302)return ['cloud','云盘直连（302）'];
+        if(record?.route_class==='guangya_direct'&&method==='GET'&&[200,206].includes(status))return ['server','MF 转发'];
+        if(source==='guangya')return ['cloud-off','光鸭云盘（方式未知）'];
         return {upstream:['server','上游'],playback_info:['list-video','PlaybackInfo'],hls:['radio-tower','HLS']}[source]||['route','未知'];
     }
     function proxySessionSourceBadge(session){
         const redirect=Number(session.redirect_request_count||0)>0;
         const relay=Number(session.relay_request_count||0)>0;
         const probe=Number(session.head_probe_request_count||0)>0;
-        const evidence=[redirect&&'302',relay&&'中转',probe&&'探测'].filter(Boolean);
+        const evidence=[redirect&&'直连',relay&&'MF 转发',probe&&'探测'].filter(Boolean);
         if(evidence.length>1)return ['route',evidence.join(' + ')];
-        if(redirect)return ['cloud','光鸭 302'];
-        if(relay)return ['cloud','直链中转'];
+        if(redirect)return ['cloud','云盘直连（302）'];
+        if(relay)return ['server','MF 转发'];
         if(probe)return ['search','HEAD 探测'];
         return sourceBadge({source:session.last_source});
     }
     function statusBadge(code){const value=Number(code||0);if(value>=200&&value<400)return ['running',String(value||'成功')];if(value>=400)return ['failed',String(value)];return ['paused','未完成'];}
     function sessionStatusBadge(session){const errors=Number(session.error_count||0);const successes=Number(session.success_count||0);const last=Number(session.last_status_code||0);if(errors&&last>=200&&last<400)return ['paused','有重试'];if(errors)return ['failed',String(last>=400?last:'失败')];if(successes)return ['running','成功'];return ['paused','未完成'];}
-    function routeLabel(route){return {guangya_direct:'原画直链',stream:'视频流',playback_info:'播放信息',upstream_hls:'HLS/分片'}[route]||route||'上游请求';}
+    function routeLabel(route){return {guangya_direct:'光鸭媒体',stream:'视频流',playback_info:'播放信息',upstream_hls:'HLS/分片'}[route]||route||'上游请求';}
     function setProxyRecordsBusy(busy){document.querySelectorAll('.proxy-record-action').forEach(button=>button.disabled=busy||button.dataset.pageDisabled==='1');const text=document.getElementById('proxyRecordRefreshText');text.textContent=busy?'刷新中':'刷新记录';document.getElementById('proxyRecordList').setAttribute('aria-busy',busy?'true':'false');}
     function renderProxyCacheMetrics(metrics){
         const root=document.getElementById('proxyCacheMetrics');
@@ -598,10 +600,10 @@
         const isRelay=record.route_class==='guangya_direct'&&String(record.method||'GET').toUpperCase()==='GET'&&[200,206].includes(Number(record.status_code||0));
         let meta='总耗时';
         if(record.failure_stage)meta=`失败阶段 ${record.failure_stage}`;
-        else if(isRelay)meta='中转响应头';
+        else if(isRelay)meta='转发响应头';
         else if(upstream>0)meta=`上游 ${upstream} · 内部 ${internal}`;
         else if(record.source==='guangya'&&record.cache_hit)meta='缓存命中 · 无直链拉取';
-        const title=isRelay?`中转请求至响应头 ${total} ms；不代表整个媒体下载时间`:upstream>0?`总耗时 ${total} ms；上游阶段 ${upstream} ms；MediaFlux 内部 ${internal} ms`:`总耗时 ${total} ms`;
+        const title=isRelay?`MF 转发请求至响应头 ${total} ms；不代表整个媒体下载时间`:upstream>0?`总耗时 ${total} ms；上游阶段 ${upstream} ms；MediaFlux 内部 ${internal} ms`:`总耗时 ${total} ms`;
         return {total,meta,title};
     }
     function proxyRecordMarkup(record){const source=sourceBadge(record);const status=statusBadge(record.status_code);const latency=proxyRecordLatency(record);const cache=record.source==='guangya'?`<span class="proxy-record-cache ${record.cache_hit?'hit':'miss'}">${record.cache_hit?'HIT':'MISS'}</span>`:'<span class="proxy-record-cache neutral">—</span>';return `<article class="proxy-record-card" data-record-id="${record.id}"><div class="proxy-record-primary"><time>${esc(record.created_at||'—')}</time><strong>${esc(routeLabel(record.route_class))}</strong><small>${esc(record.method||'GET')} · 实例 #${record.instance_id}</small></div><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span>${cache}<div class="proxy-record-latency" title="${esc(latency.title)}"><strong>${latency.total} ms</strong><small>${esc(latency.meta)}</small></div>${record.error?`<p class="proxy-record-error">${esc(record.error)}</p>`:''}</article>`;}
@@ -620,12 +622,12 @@
         const playbackAverage=Math.max(0,Number(session.average_playback_info_latency_ms||0));
         const stages=[];
         if(directCount)stages.push(`302 ${directCount} 次 · 平均 ${directAverage} ms`);
-        if(relayCount)stages.push(`中转响应头 ${relayCount} 次 · 平均 ${relayAverage} ms（非整段下载）`);
+        if(relayCount)stages.push(`转发响应头 ${relayCount} 次 · 平均 ${relayAverage} ms（非整段下载）`);
         if(playbackCount)stages.push(`PlaybackInfo ${playbackCount} 次 · 平均 ${playbackAverage} ms`);
         if(probeCount)stages.push(`HEAD 探测 ${probeCount} 次`);
         const title=`全链平均 ${overall} ms；${stages.join('；')||'暂无分项数据'}；全链峰值 ${peak} ms`;
-        if(directCount)return {value:directAverage,label:`302 平均 · 全链峰值 ${peak}`,detail:`中转 ${relayCount?`${relayAverage} ms`:'—'} · PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title};
-        if(relayCount)return {value:relayAverage,label:`中转响应头平均 · 全链峰值 ${peak}`,detail:`非整段下载 · PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title};
+        if(directCount)return {value:directAverage,label:`302 平均 · 全链峰值 ${peak}`,detail:`MF 转发 ${relayCount?`${relayAverage} ms`:'—'} · PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title};
+        if(relayCount)return {value:relayAverage,label:`转发响应头平均 · 全链峰值 ${peak}`,detail:`仅计响应头 · PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title};
         if(playbackCount)return {value:playbackAverage,label:`PlaybackInfo 平均 · 全链峰值 ${peak}`,detail:`全链平均 ${overall} ms`,title};
         return {value:overall,label:`全链平均 · 全链峰值 ${peak}`,detail:probeCount?`HEAD 探测 ${probeCount} 次`:'暂无分项数据',title};
     }

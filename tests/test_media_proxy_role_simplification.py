@@ -1235,10 +1235,10 @@ class MediaProxyRecordDisplayJavaScriptTests(unittest.TestCase):
             "proxySessionSourceBadge({redirect_request_count:0,relay_request_count:0,head_probe_request_count:0,last_source:'upstream'})[1]]})"
         )
         self.assertEqual(actual["records"], [
-            "光鸭 302", "光鸭直链中转", "HEAD 探测", "HEAD 探测", "光鸭直链（未知）",
+            "云盘直连（302）", "MF 转发", "HEAD 探测", "HEAD 探测", "光鸭云盘（方式未知）",
         ])
         self.assertEqual(actual["sessions"], [
-            "302 + 中转 + 探测", "直链中转", "HEAD 探测", "光鸭直链（未知）", "上游",
+            "直连 + MF 转发 + 探测", "MF 转发", "HEAD 探测", "光鸭云盘（方式未知）", "上游",
         ])
 
     def test_relay_latency_is_separate_from_redirect_and_not_full_download_time(self):
@@ -1252,15 +1252,15 @@ class MediaProxyRecordDisplayJavaScriptTests(unittest.TestCase):
             "relay:proxySessionLatency({average_total_latency_ms:90,max_total_latency_ms:90,"
             "redirect_request_count:0,relay_request_count:1,average_relay_latency_ms:90})})"
         )
-        self.assertEqual(actual["record"]["meta"], "中转响应头")
+        self.assertEqual(actual["record"]["meta"], "转发响应头")
         self.assertIn("不代表整个媒体下载时间", actual["record"]["title"])
         self.assertEqual(actual["mixed"]["value"], 55)
         self.assertIn("302 平均 · 全链峰值 100", actual["mixed"]["label"])
-        self.assertIn("中转 90 ms", actual["mixed"]["detail"])
+        self.assertIn("MF 转发 90 ms", actual["mixed"]["detail"])
         self.assertIn("非整段下载", actual["mixed"]["title"])
         self.assertIn("全链峰值 100 ms", actual["mixed"]["title"])
         self.assertEqual(actual["relay"]["value"], 90)
-        self.assertIn("中转响应头平均 · 全链峰值 90", actual["relay"]["label"])
+        self.assertIn("转发响应头平均 · 全链峰值 90", actual["relay"]["label"])
 
 
 class MediaProxySessionEvidenceAggregationTests(IsolatedDatabaseTestCase):
