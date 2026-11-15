@@ -551,18 +551,19 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
         groups = json.loads(db.kv_get("media_refresh_queue:v1"))["groups"]
         return coordinator, list(groups.values())
 
-    def test_unmatched_paths_drop_only_deleted_strm_paths_and_keep_missing_mappings(self):
-        # 生产事故：旧布局已删除的 4463 个路径永远匹配不到媒体库，曾被每 16 分钟重放；
-        # 但文件仍在、只是缺映射的路径（如未映射的综艺目录）必须保留，修好映射后自动刷新。
+    def test_unmatched_paths_keep_refresh_intent_without_replaying_accepted_paths(self):
+        # 文件不在本机不能证明 Jellyfin 中没有旧条目；缺映射的删除事件也必须保留。
+        # 只确认上游已接受的路径，避免一次未匹配把同批已成功的刷新反复重放。
         with tempfile.TemporaryDirectory() as root:
-            obsolete = f"{root}/光鸭云盘/NSFW/old"
+            deleted = f"{root}/光鸭云盘/NSFW/old"
             unmapped = f"{root}/光鸭云盘/整理/综艺/节目/S01E01.strm"
             Path(unmapped).parent.mkdir(parents=True)
             Path(unmapped).write_text("x")
             server_only = "/server-only/剧集/作品/E01.strm"
             cases = {
-                "已删除的 STRM 旧路径确认出队": (
-                    {"scope": "skipped", "unmatched_paths": [obsolete]}, [obsolete], [], None, "",
+                "已删除但未匹配的路径仍需清理媒体库旧条目": (
+                    {"scope": "skipped", "unmatched_paths": [deleted]}, [deleted], [deleted], 1060,
+                    "MediaRefreshUnmapped",
                 ),
                 "文件仍在的缺映射路径保留并单列": (
                     {"scope": "skipped", "unmatched_paths": [unmapped]}, [unmapped], [unmapped], 1060,
@@ -574,17 +575,17 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                 ),
                 "正常刷新照常确认不被缺映射拖住": (
                     {"scope": "item", "succeeded_paths": ["/media/new"], "succeeded_target_ids": ["ep"],
-                     "unmatched_paths": [obsolete, unmapped]},
-                    ["/media/new", obsolete, unmapped], [unmapped], 1060, "MediaRefreshUnmapped",
+                     "unmatched_paths": [deleted, unmapped]},
+                    ["/media/new", deleted, unmapped], [deleted, unmapped], 1060, "MediaRefreshUnmapped",
                 ),
                 "去重等待不被拖成失败退避": (
-                    {"scope": "deduplicated", "deduplicated": 1, "unmatched_paths": [obsolete]},
-                    ["/media/new", obsolete], ["/media/new"], 190, "",
+                    {"scope": "deduplicated", "deduplicated": 1, "unmatched_paths": [deleted]},
+                    ["/media/new", deleted], ["/media/new", deleted], 190, "",
                 ),
-                "可重试失败只保留可刷新路径": (
+                "可重试失败保留所有尚未被接受的路径": (
                     {"scope": "item", "retryable": True, "fallback": "1 个刷新请求失败，将重试",
-                     "unmatched_paths": [obsolete]},
-                    ["/media/new", obsolete], ["/media/new"], 1060, "MediaRefreshRetryable",
+                     "unmatched_paths": [deleted]},
+                    ["/media/new", deleted], ["/media/new", deleted], 1060, "MediaRefreshRetryable",
                 ),
             }
             for label, (outcome, paths, remaining, due_at, error_type) in cases.items():

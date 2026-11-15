@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import unittest
 from pathlib import Path
@@ -9,11 +10,13 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
+from app import config
 from app import database as db
 from app.repositories import local_media as local_media_repo
 from app.modules.backup import create_backup, recover_pending_restore, restore_backup
 from app.modules.local_media_service import LocalMediaService, LocalMovePlan
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
+from app.modules.media_server_path_mapping import MediaServerPathMapping
 from app.repositories import media_refresh_queue as queue
 from app.routes import media_libraries_api as api
 from app.runtime_paths import RuntimePaths
@@ -22,6 +25,53 @@ from tests.test_deep_audit_media_chain import MediaEndpoint, Response
 
 
 class MediaRefreshHistoryAuditTests(unittest.TestCase):
+    def test_unmapped_deleted_or_inaccessible_file_recovers_after_mapping_and_restart(self):
+        for provider in ("jellyfin", "emby"):
+            for inaccessible in (False, True):
+                with (
+                    self.subTest(provider=provider, inaccessible=inaccessible),
+                    isolated_test_database("mediaflux.db") as database_path,
+                ):
+                    root = database_path.parent / "strm"
+                    changed = root / "A/S01E01.strm"
+                    changed.parent.mkdir(parents=True)
+                    if inaccessible:
+                        changed.write_text("http://fixture.invalid/play")
+                    endpoint = MediaEndpoint("//nas/strm", series={"series-a": "//nas/strm/A"})
+                    original_get, original_lstat = config.get, os.lstat
+
+                    def lstat(path, *args, **kwargs):
+                        if inaccessible and os.fspath(path) == str(changed):
+                            raise PermissionError("directory is not searchable")
+                        return original_lstat(path, *args, **kwargs)
+
+                    queue.enqueue_media_refresh(provider, [str(changed)], debounce_seconds=0, now_epoch=100)
+                    worker = MediaRefreshCoordinator()
+                    first = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=100)[0]
+                    with patch.object(worker, "_client_for", side_effect=endpoint.client), patch(
+                        "app.modules.media_refresh_coordinator.config.get",
+                        side_effect=lambda key, default="": str(root) if key == "STRM_ROOT" else original_get(key, default),
+                    ), patch("os.lstat", side_effect=lstat), patch(
+                        "app.repositories.media_refresh_queue.time.time", return_value=100,
+                    ), patch("app.modules.media_refresh_coordinator._retry_seconds", return_value=30):
+                        worker._process_group(first)
+                    self.assertEqual(endpoint.posts, [])
+                    self.assertEqual(queue.media_refresh_queue_status(now_epoch=101)["paths"], 1)
+                    self.assertEqual(changed.exists(), inaccessible)
+
+                    # 补映射并重启后必须继续提交父级刷新，清除旧条目或更新仍存在的文件。
+                    db.init_db()
+                    worker = MediaRefreshCoordinator()
+                    retry = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=130)[0]
+                    client = endpoint.client(provider)
+                    client.path_mappings = (MediaServerPathMapping(str(root), "//nas/strm"),)
+                    with patch.object(worker, "_client_for", return_value=client), patch(
+                        "app.repositories.media_refresh_queue.time.time", return_value=130,
+                    ):
+                        worker._process_group(retry)
+                    self.assertEqual(endpoint.posts, ["/Items/series-a/Refresh"])
+                    self.assertEqual(queue.media_refresh_queue_status(now_epoch=131)["paths"], 0)
+
     def test_unmapped_path_does_not_replay_accepted_refresh_after_restart(self):
         with isolated_test_database("mediaflux.db"):
             for provider in ("jellyfin", "emby"):
