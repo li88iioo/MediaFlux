@@ -1131,7 +1131,6 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM media_proxy_playback_records")
             conn.execute("DELETE FROM media_proxy_playback_sessions")
-        media_proxy._playback_sessions.clear()
 
     def test_logged_out_request_from_old_runtime_does_not_clear_replacement_cache(self):
         class LoggedOutClient:
@@ -1142,7 +1141,9 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
                 type(self).close_calls += 1
 
         old_cache = media_proxy.SignedUrlCache()
-        old_app = media_proxy.create_proxy_app(7, old_cache)
+        old_app = media_proxy.create_proxy_app(
+            {"id": 7, "enabled": 1, "upstream_url": "http://127.0.0.1:8096"}, old_cache
+        )
         replacement_cache = media_proxy.SignedUrlCache()
         replacement_cache.get_or_fetch_sync_result(
             "replacement", lambda: "https://signed.invalid/replacement",
@@ -1200,10 +1201,15 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         }
         Client.calls = 0
         Client.close_calls = 0
-        with patch("app.modules.media_proxy._resolved_instance", return_value=instance), patch(
-            "app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)
-        ), patch("app.modules.media_proxy.GuangYaClient", Client):
-            with TestClient(media_proxy.create_proxy_app(7)) as client:
+        with (
+            patch("app.modules.media_proxy._resolved_instance", return_value=instance),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.modules.media_proxy.GuangYaClient", Client),
+        ):
+            with TestClient(media_proxy.create_proxy_app(instance)) as client:
                 first = client.get("/playgy/file-1/e/1/Movie.mkv", follow_redirects=False)
                 second = client.get("/playgy/file-1/e/1/Movie.mkv", follow_redirects=False)
 

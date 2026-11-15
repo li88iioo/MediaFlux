@@ -30,7 +30,7 @@ from fastapi.testclient import TestClient
 from multidict import CIMultiDict, CIMultiDictProxy
 from starlette.datastructures import Headers
 from starlette.requests import Request
-from starlette.routing import Route, WebSocketRoute
+from starlette.routing import WebSocketRoute
 from starlette.testclient import _TestClientTransport
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from yarl import URL
@@ -344,12 +344,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.calls = []
         _FakeGuangYaClient.call_options = []
         _FakeGuangYaClient.results = {}
-        media_proxy._dynamic_guangya_mappings.clear()
-        media_proxy._item_level_binding_scopes.clear()
-        if hasattr(media_proxy, "_playback_grants"):
-            media_proxy._playback_grants.clear()
-        if hasattr(media_proxy, "_playback_sessions"):
-            media_proxy._playback_sessions.clear()
+        self.app = media_proxy.create_proxy_app(self._instance())
 
     @staticmethod
     def _instance() -> dict:
@@ -359,6 +354,321 @@ class HybridMediaProxyTests(unittest.TestCase):
             "upstream_url": "http://127.0.0.1:8096",
             "local_root": "",
         }
+
+    def test_app_upstream_identity_rejects_old_http_capability_before_reconcile(self):
+        for changed in (
+            {"upstream_url": "http://127.0.0.1:8097"},
+            {"upstream_url": "http://127.0.0.1:8096/new-base"},
+            {"server_type": "emby"},
+        ):
+            with self.subTest(changed=changed):
+                instance = {**self._instance(), "server_type": "jellyfin"}
+                payload = {
+                    "MediaSources": [{"Id": "source", "Path": "/playgy/old-file/e/1/a.mkv"}]
+                }
+                _FakeAsyncClient.responses = [
+                    _FakeUpstreamResponse(
+                        body=json.dumps(payload).encode(),
+                        content_type="application/json",
+                    )
+                ]
+                app = media_proxy.create_proxy_app(dict(instance))
+                authorize = AsyncMock(return_value=False)
+                with (
+                    patch(
+                        "app.repositories.media_proxy.get_media_proxy_instance",
+                        side_effect=lambda _: dict(instance),
+                    ),
+                    patch(
+                        "app.repositories.media_proxy.get_media_proxy_binding",
+                        return_value=None,
+                    ),
+                    patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient),
+                    patch.object(media_proxy, "GuangYaClient", _FakeGuangYaClient),
+                    patch.object(media_proxy, "_client_is_authorized", authorize),
+                    TestClient(app) as client,
+                ):
+                    playback = client.get(
+                        "/Items/identity-item/PlaybackInfo?api_key=identity-user"
+                    )
+                    self.assertEqual(playback.status_code, 200)
+                    stream_url = playback.json()["MediaSources"][0]["DirectStreamUrl"]
+                    before = len(_FakeAsyncClient.requests)
+                    instance.update(changed)
+                    stream = client.get(stream_url, follow_redirects=False)
+                    self.assertEqual(stream.status_code, 401)
+                    self.assertEqual(len(_FakeAsyncClient.requests), before)
+                    authorize.assert_not_awaited()
+                    instance.update(self._instance(), server_type="jellyfin")
+                    self.assertEqual(
+                        client.get(stream_url, follow_redirects=False).status_code, 401
+                    )
+                    with patch.object(media_proxy, "_pin_upstream_target") as pin:
+                        with self.assertRaises(WebSocketDisconnect) as closed:
+                            with client.websocket_connect("/socket"):
+                                pass
+                        self.assertEqual(closed.exception.code, 1013)
+                        pin.assert_not_called()
+
+    def test_instance_resolution_failure_is_recorded_and_included_in_total_latency(self):
+        records = []
+        recorder = media_proxy.PlaybackRecordWriter(
+            write_record=lambda row: records.append(dict(row))
+        )
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
+
+        def failed_read(_):
+            time.sleep(0.03)
+            raise RuntimeError("private-database-diagnostic")
+
+        with (
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_instance",
+                side_effect=failed_read,
+            ),
+            patch.object(media_proxy.logger, "debug") as diagnostic,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/Videos/failed-instance/stream?api_key=private-token")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status_code"], 500)
+        self.assertEqual(records[0]["error"], "RuntimeError")
+        self.assertGreaterEqual(records[0]["total_latency_ms"], 25)
+        self.assertEqual(records[0]["media_item_id"], "failed-instance")
+        self.assertNotIn("private-database-diagnostic", str(diagnostic.call_args_list))
+        self.assertNotIn("private-token", str(diagnostic.call_args_list))
+        self.assertNotIn("private", json.dumps(records))
+
+    def test_missing_disabled_or_invalid_instance_keeps_503_for_playback_tokens(self):
+        for row in (
+            None,
+            {**self._instance(), "enabled": 0},
+            {**self._instance(), "upstream_url": "invalid://server"},
+        ):
+            with self.subTest(row=row):
+                app = media_proxy.create_proxy_app(self._instance())
+                with (
+                    patch(
+                        "app.repositories.media_proxy.get_media_proxy_instance",
+                        return_value=row,
+                    ),
+                    patch.object(media_proxy, "_pin_upstream_target") as pin,
+                    patch.object(media_proxy, "GuangYaClient") as provider,
+                    TestClient(app) as client,
+                ):
+                    for query in ("_mfps=old&_mfss=old", "PlaySessionId=old"):
+                        self.assertEqual(
+                            client.get("/Videos/item/stream?" + query).status_code, 503
+                        )
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        with client.websocket_connect("/socket"):
+                            pass
+                    self.assertEqual(closed.exception.code, 1013)
+                    pin.assert_not_called()
+                    provider.assert_not_called()
+
+    def test_stopped_app_rejects_http_and_websocket_even_with_unchanged_identity(self):
+        cache = media_proxy.SignedUrlCache()
+        app = media_proxy.create_proxy_app(self._instance(), cache)
+
+        async def stop():
+            task = asyncio.create_task(asyncio.sleep(0))
+            await task
+            runtime = media_proxy.ProxyRuntime(
+                instance_id=7,
+                bind=("127.0.0.1", 18097),
+                server=cast(media_proxy.uvicorn.Server, SimpleNamespace()),
+                task=task,
+                sock=cast(socket.socket, SimpleNamespace(close=lambda: None)),
+                signed_urls=cache,
+                app=app,
+            )
+            await media_proxy.MediaProxyManager._stop_runtime(runtime)
+
+        with (
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch.object(media_proxy, "_pin_upstream_target") as pin,
+            TestClient(app) as client,
+        ):
+            assert client.portal is not None
+            client.portal.call(stop)
+            self.assertEqual(client.get("/System/Info").status_code, 503)
+            self.assertEqual(
+                client.get("/Videos/item/stream?_mfps=old&_mfss=old").status_code, 401
+            )
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                with client.websocket_connect("/socket"):
+                    pass
+            self.assertEqual(closed.exception.code, 1013)
+            pin.assert_not_called()
+
+    def test_app_upstream_identity_rejects_websocket_before_connect_and_stays_retired(self):
+        for changed in (
+            {"upstream_url": "http://127.0.0.1:8097"},
+            {"upstream_url": "http://127.0.0.1:8096/new-base"},
+            {"server_type": "emby"},
+        ):
+            with self.subTest(changed=changed):
+                instance = {**self._instance(), "server_type": "jellyfin"}
+                app = media_proxy.create_proxy_app(dict(instance))
+                with (
+                    patch(
+                        "app.repositories.media_proxy.get_media_proxy_instance",
+                        side_effect=lambda _: dict(instance),
+                    ),
+                    patch.object(
+                        media_proxy,
+                        "_pin_upstream_target",
+                        side_effect=AssertionError("不应解析上游"),
+                    ) as pin,
+                    patch.object(media_proxy, "ClientSession") as session,
+                    TestClient(app) as client,
+                ):
+                    instance.update(changed)
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        with client.websocket_connect("/socket?api_key=old-user"):
+                            pass
+                    self.assertEqual(closed.exception.code, 1013)
+                    pin.assert_not_called()
+                    session.assert_not_called()
+                    instance.update(self._instance(), server_type="jellyfin")
+                    self.assertEqual(
+                        client.get("/Items/item/PlaybackInfo?api_key=old-user").status_code,
+                        503,
+                    )
+
+    def test_retiring_one_app_preserves_other_instance_playback(self):
+        instances = {key: {**self._instance(), "id": key} for key in (7, 8)}
+        apps = {key: media_proxy.create_proxy_app(row) for key, row in instances.items()}
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(
+                    {
+                        "MediaSources": [
+                            {"Id": "source", "Path": f"/playgy/file-{key}/e/1/a.mkv"}
+                        ]
+                    }
+                ).encode(),
+                content_type="application/json",
+            )
+            for key in (7, 8)
+        ]
+        with (
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_instance",
+                side_effect=lambda key: dict(instances[key]),
+            ),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
+            ),
+            patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient),
+            patch.object(media_proxy, "GuangYaClient", _FakeGuangYaClient),
+            patch.object(
+                media_proxy, "_client_is_authorized", new=AsyncMock(return_value=False)
+            ),
+            TestClient(apps[7]) as first,
+            TestClient(apps[8]) as second,
+        ):
+            urls = [
+                client.get("/Items/shared/PlaybackInfo?api_key=shared-user").json()[
+                    "MediaSources"
+                ][0]["DirectStreamUrl"]
+                for client in (first, second)
+            ]
+            instances[7]["upstream_url"] = "http://127.0.0.1:8097"
+            self.assertEqual(first.get(urls[0], follow_redirects=False).status_code, 401)
+            self.assertEqual(second.get(urls[0], follow_redirects=False).status_code, 401)
+            response = second.get(urls[1], follow_redirects=False)
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.headers["location"], "https://signed.invalid/file-8")
+            self.assertEqual(_FakeGuangYaClient.calls, ["file-8"])
+
+    def test_late_app_response_and_shutdown_cannot_overwrite_replacement_authorization(
+        self,
+    ):
+        started, release = threading.Event(), threading.Event()
+        instance = self._instance()
+        old_payload = {
+            "MediaSources": [{"Id": "source", "Path": "/playgy/old-file/e/1/a.mkv"}]
+        }
+        new_payload = {
+            "MediaSources": [{"Id": "source", "Path": "/playgy/new-file/e/1/b.mkv"}]
+        }
+
+        class DelayedPlayback(_FakeUpstreamResponse):
+            async def aiter_bytes(self):
+                started.set()
+                await asyncio.to_thread(release.wait)
+                yield self._body
+
+        _FakeAsyncClient.responses = [
+            DelayedPlayback(body=json.dumps(old_payload).encode())
+        ]
+        old_cache, new_cache = media_proxy.SignedUrlCache(), media_proxy.SignedUrlCache()
+        old_app = media_proxy.create_proxy_app(dict(instance), old_cache)
+        results = []
+        with (
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_instance",
+                side_effect=lambda _: dict(instance),
+            ),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
+            ),
+            patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient),
+            patch.object(media_proxy, "GuangYaClient", _FakeGuangYaClient),
+            patch.object(
+                media_proxy, "_client_is_authorized", new=AsyncMock(return_value=False)
+            ),
+            ExitStack() as old_stack,
+        ):
+            old_client = old_stack.enter_context(TestClient(old_app))
+            worker = threading.Thread(
+                target=lambda: results.append(
+                    old_client.get(
+                        "/Items/late-item/PlaybackInfo?api_key=old-user",
+                    )
+                )
+            )
+            worker.start()
+            try:
+                self.assertTrue(started.wait(2))
+                instance["upstream_url"] = "http://127.0.0.1:8097"
+                _FakeAsyncClient.responses.append(
+                    _FakeUpstreamResponse(
+                        body=json.dumps(new_payload).encode(),
+                        content_type="application/json",
+                    )
+                )
+                new_app = media_proxy.create_proxy_app(dict(instance), new_cache)
+                with TestClient(new_app) as client:
+                    playback = client.get("/Items/late-item/PlaybackInfo?api_key=new-user")
+                    self.assertEqual(playback.status_code, 200)
+                    new_url = playback.json()["MediaSources"][0]["DirectStreamUrl"]
+                    release.set()
+                    worker.join(2)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(results[0].status_code, 200)
+                    old_url = results[0].json()["MediaSources"][0]["DirectStreamUrl"]
+                    old_stack.close()
+                    self.assertEqual(
+                        client.get(old_url, follow_redirects=False).status_code, 401
+                    )
+                    response = client.get(new_url, follow_redirects=False)
+                    self.assertEqual(response.status_code, 302)
+                    self.assertEqual(
+                        response.headers["location"], "https://signed.invalid/new-file"
+                    )
+                    self.assertIs(media_proxy._signed_url_caches[7], new_cache)
+            finally:
+                release.set()
+                worker.join(2)
 
     def test_saved_instance_probe_pins_host_sni_and_bounds_response(self):
         upstream = _FakeUpstreamResponse(
@@ -446,7 +756,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(upstream.closed)
 
     def _client(self, *, base_url: str = "http://testserver"):
-        app = media_proxy.create_proxy_app(7)
+        app = self.app
         stack = ExitStack()
         stack.enter_context(
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance())
@@ -461,10 +771,17 @@ class HybridMediaProxyTests(unittest.TestCase):
             raise_server_exceptions=False,
         )
 
-    @staticmethod
-    def _grant_file(token: str, item_id: str, source_id: str, file_id: str,
-                    binding: dict | None = None) -> None:
-        media_proxy._playback_grants.register(
+    def _grant_file(
+        self,
+        token: str,
+        item_id: str,
+        source_id: str,
+        file_id: str,
+        binding: dict | None = None,
+        *,
+        app=None,
+    ) -> None:
+        (app or self.app).state.playback_grants.register(
             media_proxy._auth_scope_fingerprint(token),
             7,
             item_id,
@@ -502,7 +819,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             ),
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -538,7 +855,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             ),
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -586,9 +903,6 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         for source_type, payload, binding, file_id in cases:
             with self.subTest(source_type=source_type):
-                media_proxy._dynamic_guangya_mappings.clear()
-                media_proxy._item_level_binding_scopes.clear()
-                media_proxy._playback_grants.clear()
                 _FakeGuangYaClient.calls = []
                 _FakeAsyncClient.responses = [
                     _FakeUpstreamResponse(
@@ -597,7 +911,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                         content_type="application/json",
                     )
                 ]
-                app = media_proxy.create_proxy_app(7)
+                app = media_proxy.create_proxy_app(self._instance())
                 with (
                     patch(
                         "app.repositories.media_proxy.get_media_proxy_instance",
@@ -637,9 +951,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeGuangYaClient.calls, [])
 
 
-    def test_upstream_timeout_keeps_stream_reads_unbounded_but_bounds_connect_and_write(self):
+    def test_upstream_timeout_keeps_stream_reads_unbounded_but_bounds_connect_and_write(
+        self,
+    ):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"ok")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -660,7 +976,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         first_upstream = _FakeUpstreamResponse(body=b"first")
         second_upstream = _FakeUpstreamResponse(body=b"second")
         _FakeAsyncClient.responses = [first_upstream, second_upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -681,7 +997,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(_FakeAsyncClient.instances[0].closed)
 
     def test_oversized_request_body_is_rejected_before_contacting_upstream(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -696,7 +1012,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeAsyncClient.init_kwargs, [])
 
     def test_client_disconnect_while_reading_body_is_not_raised_as_asgi_error(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -724,9 +1040,11 @@ class HybridMediaProxyTests(unittest.TestCase):
                 64 * 1024 * 1024,
             )
 
-    def test_sensitive_query_tokens_are_removed_from_upstream_url_and_forwarded_as_header(self):
+    def test_sensitive_query_tokens_are_removed_from_upstream_url_and_forwarded_as_header(
+        self,
+    ):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -747,7 +1065,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_camel_case_api_key_is_recognized_and_removed_from_upstream_url(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -781,7 +1099,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -818,7 +1136,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -850,7 +1168,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertNotIn("EnableDirectStream", query)
 
     def test_conflicting_media_server_credentials_are_rejected_before_upstream(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app({**self._instance(), "server_type": "jellyfin"})
         instance = {**self._instance(), "server_type": "jellyfin"}
         with (
             patch(
@@ -878,7 +1196,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeAsyncClient.requests, [])
 
     def test_duplicate_conflicting_auth_headers_are_rejected(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app({**self._instance(), "server_type": "jellyfin"})
         instance = {**self._instance(), "server_type": "jellyfin"}
         header_sets = (
             [
@@ -919,7 +1237,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeAsyncClient.requests, [])
 
     def test_conflicting_credentials_do_not_touch_playback_sessions(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with TestClient(app, raise_server_exceptions=False) as client:
             response = client.get(
                 "/playgy/file-id/etag/1/video.mkv?api_key=query-token",
@@ -930,12 +1248,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(media_proxy._playback_sessions._entries, {})
-        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
+        self.assertEqual(app.state.playback_sessions._entries, {})
+        self.assertEqual(app.state.playback_sessions._capability_index, {})
 
     def test_jellyfin_rebuilds_duplicate_physical_authorization_headers(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app({**self._instance(), "server_type": "jellyfin"})
         instance = {**self._instance(), "server_type": "jellyfin"}
         duplicate_headers = [
             (
@@ -1063,7 +1381,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_jellyfin_replaces_unrelated_authorization_with_canonical_token(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app({**self._instance(), "server_type": "jellyfin"})
         instance = {**self._instance(), "server_type": "jellyfin"}
         with (
             patch(
@@ -1097,7 +1415,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_duplicate_same_media_server_credential_is_canonicalized(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app({**self._instance(), "server_type": "jellyfin"})
         instance = {**self._instance(), "server_type": "jellyfin"}
         authorization = 'MediaBrowser Token="same-token", Client="Jellyfin"'
         with (
@@ -1128,7 +1446,7 @@ class HybridMediaProxyTests(unittest.TestCase):
     def test_jellyfin_sensitive_query_token_uses_media_browser_authorization(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
         instance = {**self._instance(), "server_type": "jellyfin"}
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1171,7 +1489,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "server_type": "jellyfin",
             "api_key": "instance-admin-token",
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1211,7 +1529,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "server_type": "jellyfin",
             "api_key": "instance-admin-token",
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1253,7 +1571,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "server_type": "jellyfin",
             "api_key": "instance-admin-token",
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         path = "/Videos/hls-item/hls1/playlist/0.mp4"
         with (
             patch(
@@ -1292,7 +1610,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "server_type": "emby",
             "api_key": "instance-admin-token",
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1326,7 +1644,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "server_type": "jellyfin",
             "api_key": "instance-admin-token",
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1370,13 +1688,14 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.results["cross-protocol-file"] = [
             "https://signed.invalid/cross-protocol-file"
         ]
+        app = media_proxy.create_proxy_app(self._instance())
         self._grant_file(
             "client-token",
             "cross-protocol-item",
             "cross-protocol-source",
             "cross-protocol-file",
+            app=app,
         )
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1419,18 +1738,15 @@ class HybridMediaProxyTests(unittest.TestCase):
             ("Yamby", "Yamby/2.0.5.5 ExoPlayerLib/1.8.0", "yamby-file"),
             ("Moonfin", "Moonfin/0.10 Media3/1.8.0", "moonfin-file"),
         )
+        app = media_proxy.create_proxy_app(self._instance())
         for _client_name, _user_agent, file_id in cases:
             _FakeGuangYaClient.results[file_id] = [
                 f"https://signed.invalid/{file_id}"
             ]
             self._grant_file(
-                "client-token",
-                f"{file_id}-item",
-                f"{file_id}-source",
-                file_id,
+                "client-token", f"{file_id}-item", f"{file_id}-source", file_id, app=app
             )
 
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -1659,7 +1975,14 @@ class HybridMediaProxyTests(unittest.TestCase):
             "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=binding,
         ):
-            rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "multi-item")
+            rewritten, changed = media_proxy.rewrite_playback_info(
+                payload,
+                7,
+                "multi-item",
+                dynamic_mappings=self.app.state.dynamic_mappings,
+                item_level_scopes=self.app.state.item_level_scopes,
+                playback_grants=self.app.state.playback_grants,
+            )
 
         self.assertTrue(changed)
         source = rewritten["MediaSources"][0]
@@ -1689,11 +2012,15 @@ class HybridMediaProxyTests(unittest.TestCase):
             "app.repositories.media_proxy.get_media_proxy_binding",
             side_effect=binding_lookup,
         ):
+            app = media_proxy.create_proxy_app(self._instance())
             rewritten, changed = media_proxy.rewrite_playback_info(
                 payload,
                 7,
                 "path-item",
                 auth_scope=media_proxy._auth_scope_fingerprint("client-token"),
+                dynamic_mappings=app.state.dynamic_mappings,
+                item_level_scopes=app.state.item_level_scopes,
+                playback_grants=app.state.playback_grants,
             )
 
         self.assertTrue(changed)
@@ -1703,7 +2030,6 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(cloud["DirectStreamUrl"], expected_path)
         self.assertEqual(local, payload["MediaSources"][1])
 
-        app = media_proxy.create_proxy_app(7)
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch(
@@ -1741,7 +2067,14 @@ class HybridMediaProxyTests(unittest.TestCase):
             "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=item_binding,
         ):
-            rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "mixed-item")
+            rewritten, changed = media_proxy.rewrite_playback_info(
+                payload,
+                7,
+                "mixed-item",
+                dynamic_mappings=self.app.state.dynamic_mappings,
+                item_level_scopes=self.app.state.item_level_scopes,
+                playback_grants=self.app.state.playback_grants,
+            )
 
         self.assertFalse(changed)
         self.assertEqual(rewritten, before)
@@ -1756,7 +2089,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(status_code=206, body=b"local-version")
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=item_binding),
@@ -1786,11 +2119,15 @@ class HybridMediaProxyTests(unittest.TestCase):
             "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=item_binding,
         ):
+            app = media_proxy.create_proxy_app(self._instance())
             rewritten, changed = media_proxy.rewrite_playback_info(
                 payload,
                 7,
                 "single-item",
                 auth_scope=media_proxy._auth_scope_fingerprint("client-token"),
+                dynamic_mappings=app.state.dynamic_mappings,
+                item_level_scopes=app.state.item_level_scopes,
+                playback_grants=app.state.playback_grants,
             )
 
         self.assertTrue(changed)
@@ -1802,7 +2139,6 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertEqual(source["Path"], direct_url)
 
-        app = media_proxy.create_proxy_app(7)
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=item_binding),
@@ -1921,7 +2257,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         instance = {**self._instance(), "upstream_url": "http://media.internal.example:8096/emby"}
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"system-info")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=instance),
             patch("app.modules.media_proxy.socket.getaddrinfo", return_value=resolved) as resolver,
@@ -1959,7 +2295,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2002,7 +2338,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                     headers={"Location": location},
                 )
                 _FakeAsyncClient.responses = [upstream]
-                app = media_proxy.create_proxy_app(7)
+                app = media_proxy.create_proxy_app(instance)
                 with (
                     patch(
                         "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2049,7 +2385,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2082,7 +2418,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2110,7 +2446,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             headers={"Location": "https://cdn.example.invalid/media?api_key=secret"},
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2139,7 +2475,7 @@ class HybridMediaProxyTests(unittest.TestCase):
     def test_upstream_with_emby_base_path_is_not_duplicated(self):
         instance = {**self._instance(), "upstream_url": "http://127.0.0.1:8096/emby"}
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"system-info")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=instance),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
@@ -2165,7 +2501,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
 
     def test_websocket_rejects_conflicting_credentials_before_upstream(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with TestClient(app, raise_server_exceptions=False) as client:
             with self.assertRaises(WebSocketDisconnect) as closed:
                 with client.websocket_connect(
@@ -2192,7 +2528,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             async def close(self, **kwargs) -> None:
                 self.closed = dict(kwargs)
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         websocket_route = next(
             route
             for route in app.routes
@@ -2273,7 +2609,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             async def close(self, **kwargs) -> None:
                 self.closed = dict(kwargs)
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         websocket_route = next(
             route
             for route in app.routes
@@ -2343,7 +2679,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             async def close(self) -> None:
                 self.closed = True
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         connector = object()
         with (
             patch(
@@ -2450,7 +2786,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             async def close(self) -> None:
                 self.closed = True
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2579,7 +2915,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             async def close(self) -> None:
                 self.closed = True
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -2648,7 +2984,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             async def close(self, **_kwargs) -> None:
                 pass
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         websocket_route = next(
             route
             for route in app.routes
@@ -2733,7 +3069,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 self.closed = True
 
         downstream = DisconnectingWebSocket()
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         websocket_route = next(
             route
             for route in app.routes
@@ -2833,7 +3169,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 self.close_calls.append(kwargs)
 
         downstream = Downstream()
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         websocket_route = next(
             route
             for route in app.routes
@@ -2934,7 +3270,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 self.close_calls.append(kwargs)
 
         downstream = Downstream()
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(instance)
         websocket_route = next(
             route
             for route in app.routes
@@ -2987,41 +3323,24 @@ class HybridMediaProxyTests(unittest.TestCase):
                 headers={"content-encoding": "gzip", "content-length": "9999"},
             )
         ]
-        app = media_proxy.create_proxy_app(7)
-        route = next(
-            route for route in app.routes
-            if getattr(route, "path", None) == "/{path:path}" and getattr(route, "methods", None)
-        )
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": "/Items/local-item/PlaybackInfo",
-            "raw_path": b"/Items/local-item/PlaybackInfo",
-            "query_string": b"",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("testserver", 80),
-        }
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        from starlette.requests import Request
-        request = Request(scope, receive)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
-            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
+            ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
         ):
-            assert isinstance(route, Route)
-            response = asyncio.run(route.endpoint(request, path="Items/local-item/PlaybackInfo"))
+            response = client.get("/Items/local-item/PlaybackInfo")
 
         self.assertNotIn("content-encoding", response.headers)
         self.assertNotEqual(response.headers.get("content-length"), "9999")
-        self.assertEqual(response.body, raw)
+        self.assertEqual(response.content, raw)
+
 
     def test_playback_info_invalid_encoded_body_fails_closed(self):
         upstream = _FakeUpstreamResponse(
@@ -3030,7 +3349,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             headers={"content-encoding": "br"},
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -3063,7 +3382,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             headers={"content-encoding": "br"},
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -3095,42 +3414,25 @@ class HybridMediaProxyTests(unittest.TestCase):
             content_type="application/json",
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
-        route = next(
-            route for route in app.routes
-            if getattr(route, "path", None) == "/{path:path}" and getattr(route, "methods", None)
-        )
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": "/Items/local-item/PlaybackInfo",
-            "raw_path": b"/Items/local-item/PlaybackInfo",
-            "query_string": b"",
-            "headers": [],
-            "client": ("127.0.0.1", 12345),
-            "server": ("testserver", 80),
-        }
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        from starlette.requests import Request
-        request = Request(scope, receive)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
-            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
-            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
+            ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             patch("app.modules.media_proxy._playback_info_response_limit", return_value=4),
+            TestClient(app, raise_server_exceptions=False) as client,
         ):
-            assert isinstance(route, Route)
-            response = asyncio.run(route.endpoint(request, path="Items/local-item/PlaybackInfo"))
+            response = client.get("/Items/local-item/PlaybackInfo")
 
         self.assertEqual(response.status_code, 502)
-        self.assertEqual(json.loads(response.body), {"error": "上游响应过大"})
+        self.assertEqual(response.json(), {"error": "上游响应过大"})
         self.assertTrue(upstream.closed)
+
 
     def test_playback_info_rejects_oversize_declared_content_length(self):
         upstream = _FakeUpstreamResponse(
@@ -3261,7 +3563,9 @@ class HybridMediaProxyTests(unittest.TestCase):
             "app.repositories.media_proxy.get_media_proxy_binding",
             side_effect=lookup,
         ):
-            resolved = media_proxy._media_proxy_binding(7, compact, compact)
+            resolved = media_proxy._media_proxy_binding(
+                7, compact, compact, item_level_scopes=self.app.state.item_level_scopes
+            )
 
         self.assertIs(resolved, binding)
         self.assertIn((7, stored_canonical, stored_canonical), calls)
@@ -3328,7 +3632,9 @@ class HybridMediaProxyTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertEqual(media_proxy._playback_media_name(payload), expected)
 
-    def test_rewrite_auto_detects_absolute_and_relative_playgy_and_preserves_other_sources(self):
+    def test_rewrite_auto_detects_absolute_and_relative_playgy_and_preserves_other_sources(
+        self,
+    ):
         local_source = {
             "Id": "local-source",
             "Path": "/srv/media/movie.mkv",
@@ -3366,8 +3672,17 @@ class HybridMediaProxyTests(unittest.TestCase):
         local_before = copy.deepcopy(local_source)
         unknown_before = copy.deepcopy(unknown_source)
 
-        with patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None):
-            rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "item-1")
+        with patch(
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
+        ):
+            rewritten, changed = media_proxy.rewrite_playback_info(
+                payload,
+                7,
+                "item-1",
+                dynamic_mappings=self.app.state.dynamic_mappings,
+                item_level_scopes=self.app.state.item_level_scopes,
+                playback_grants=self.app.state.playback_grants,
+            )
 
         self.assertTrue(changed)
         absolute, relative, local_after, unknown_after = rewritten["MediaSources"]
@@ -3395,11 +3710,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(local_after, local_before)
         self.assertEqual(unknown_after, unknown_before)
         self.assertEqual(
-            media_proxy._dynamic_guangya_mappings.get(7, "item-1", "cloud-absolute"),
+            self.app.state.dynamic_mappings.get(7, "item-1", "cloud-absolute"),
             "file-a",
         )
         self.assertEqual(
-            media_proxy._dynamic_guangya_mappings.get(7, "item-1", "cloud-relative"),
+            self.app.state.dynamic_mappings.get(7, "item-1", "cloud-relative"),
             "file-b",
         )
 
@@ -3416,7 +3731,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -3476,7 +3791,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
             media_response,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -3610,7 +3925,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             relay_response,
             manifest_response,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -3700,74 +4015,74 @@ class HybridMediaProxyTests(unittest.TestCase):
             self.assertEqual(lan_transcode.content, b"needs-relay")
             self.assertNotIn("location", lan_transcode.headers)
 
-        self.assertEqual(playback.status_code, 200)
-        self.assertTrue(direct_source["SupportsDirectPlay"])
-        self.assertTrue(direct_source["SupportsTranscoding"])
-        self.assertTrue(direct_source["IsRemote"])
-        self.assertEqual(direct_source["Protocol"], "Http")
-        self.assertEqual(direct_source["RequiredHttpHeaders"], {})
-        self.assertNotIn("TranscodingSubProtocol", direct_source)
-        self.assertEqual(
-            direct_source["TranscodingUrl"],
-            "/Videos/web-direct-item/master.m3u8",
-        )
-        self.assertFalse(transcode_source["IsRemote"])
-        self.assertEqual(transcode_source["Protocol"], "File")
-        self.assertEqual(transcode_source["TranscodingSubProtocol"], "hls")
-        self.assertEqual(direct.status_code, 302)
-        self.assertEqual(
-            direct.headers["location"],
-            "https://signed.invalid/web-direct-file",
-        )
-        self.assertEqual(direct.headers["cache-control"], "private, no-store, no-cache, max-age=0")
-        self.assertEqual(direct.headers["pragma"], "no-cache")
-        self.assertEqual(direct.headers["referrer-policy"], "no-referrer")
-        self.assertEqual(direct_audio.status_code, 302)
-        self.assertEqual(
-            direct_audio.headers["location"],
-            "https://signed.invalid/web-direct-file",
-        )
-        self.assertFalse(transcode_source["SupportsDirectPlay"])
-        self.assertTrue(transcode_source["SupportsTranscoding"])
-        self.assertEqual(relayed.status_code, 206)
-        self.assertEqual(relayed.content, b"relay")
-        self.assertNotIn("location", relayed.headers)
-        self.assertEqual(hls.status_code, 200)
-        self.assertEqual(hls.content, b"#EXTM3U\n")
-        self.assertNotIn("location", hls.headers)
-        self.assertEqual(
-            _FakeGuangYaClient.calls,
-            ["web-direct-file", "web-transcode-file"],
-        )
-        self.assertEqual(len(_FakeAsyncClient.requests), 4)
-        self.assertEqual(
-            [item.args[0] for item in pin_signed_target.call_args_list],
-            [
+            self.assertEqual(playback.status_code, 200)
+            self.assertTrue(direct_source["SupportsDirectPlay"])
+            self.assertTrue(direct_source["SupportsTranscoding"])
+            self.assertTrue(direct_source["IsRemote"])
+            self.assertEqual(direct_source["Protocol"], "Http")
+            self.assertEqual(direct_source["RequiredHttpHeaders"], {})
+            self.assertNotIn("TranscodingSubProtocol", direct_source)
+            self.assertEqual(
+                direct_source["TranscodingUrl"],
+                "/Videos/web-direct-item/master.m3u8",
+            )
+            self.assertFalse(transcode_source["IsRemote"])
+            self.assertEqual(transcode_source["Protocol"], "File")
+            self.assertEqual(transcode_source["TranscodingSubProtocol"], "hls")
+            self.assertEqual(direct.status_code, 302)
+            self.assertEqual(
+                direct.headers["location"],
                 "https://signed.invalid/web-direct-file",
-                "https://signed.invalid/web-transcode-file",
-                "https://signed.invalid/web-transcode-file",
-            ],
-        )
-        self.assertTrue(relay_response.closed)
-        self.assertTrue(manifest_response.closed)
-        direct_query = parse_qs(urlsplit(direct_source["Path"]).query)
-        transcode_query = parse_qs(
-            urlsplit(transcode_source["DirectStreamUrl"]).query
-        )
-        self.assertTrue(
-            media_proxy._playback_sessions.capability_allows_browser_direct_redirect(
-                7,
-                direct_query["_mfps"][0],
-                direct_query["_mfss"][0],
             )
-        )
-        self.assertFalse(
-            media_proxy._playback_sessions.capability_allows_browser_direct_redirect(
-                7,
-                transcode_query["_mfps"][0],
-                transcode_query["_mfss"][0],
+            self.assertEqual(direct.headers["cache-control"], "private, no-store, no-cache, max-age=0")
+            self.assertEqual(direct.headers["pragma"], "no-cache")
+            self.assertEqual(direct.headers["referrer-policy"], "no-referrer")
+            self.assertEqual(direct_audio.status_code, 302)
+            self.assertEqual(
+                direct_audio.headers["location"],
+                "https://signed.invalid/web-direct-file",
             )
-        )
+            self.assertFalse(transcode_source["SupportsDirectPlay"])
+            self.assertTrue(transcode_source["SupportsTranscoding"])
+            self.assertEqual(relayed.status_code, 206)
+            self.assertEqual(relayed.content, b"relay")
+            self.assertNotIn("location", relayed.headers)
+            self.assertEqual(hls.status_code, 200)
+            self.assertEqual(hls.content, b"#EXTM3U\n")
+            self.assertNotIn("location", hls.headers)
+            self.assertEqual(
+                _FakeGuangYaClient.calls,
+                ["web-direct-file", "web-transcode-file"],
+            )
+            self.assertEqual(len(_FakeAsyncClient.requests), 4)
+            self.assertEqual(
+                [item.args[0] for item in pin_signed_target.call_args_list],
+                [
+                    "https://signed.invalid/web-direct-file",
+                    "https://signed.invalid/web-transcode-file",
+                    "https://signed.invalid/web-transcode-file",
+                ],
+            )
+            self.assertTrue(relay_response.closed)
+            self.assertTrue(manifest_response.closed)
+            direct_query = parse_qs(urlsplit(direct_source["Path"]).query)
+            transcode_query = parse_qs(
+                urlsplit(transcode_source["DirectStreamUrl"]).query
+            )
+            self.assertTrue(
+                app.state.playback_sessions.capability_allows_browser_direct_redirect(
+                    7,
+                    direct_query["_mfps"][0],
+                    direct_query["_mfss"][0],
+                )
+            )
+            self.assertFalse(
+                app.state.playback_sessions.capability_allows_browser_direct_redirect(
+                    7,
+                    transcode_query["_mfps"][0],
+                    transcode_query["_mfss"][0],
+                )
+            )
 
     def test_jellyfin_web_direct_redirect_rejects_private_signed_target(self):
         payload = {
@@ -3793,7 +4108,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.results["web-private-file"] = [
             "http://127.0.0.1/private-video.mp4"
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -3867,7 +4182,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.results["web-downgrade-file"] = [
             "http://signed.invalid/web-downgrade-file"
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -3969,7 +4284,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             media_response,
             cross_origin_media_response,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -4198,6 +4513,9 @@ class HybridMediaProxyTests(unittest.TestCase):
                         playback_session_token="ambiguous-capability",
                         native_client_mode="web",
                         browser_direct_redirect_signatures=allowed_signatures,
+                        dynamic_mappings=self.app.state.dynamic_mappings,
+                        item_level_scopes=self.app.state.item_level_scopes,
+                        playback_grants=self.app.state.playback_grants,
                     )
 
                 self.assertTrue(changed)
@@ -4235,7 +4553,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
             relay_response,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -4302,6 +4620,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "id": 91,
             "source_type": "guangya",
             "guangya_file_id": "legacy-web-file",
+            "media_source_id": "",
         }
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(
@@ -4309,7 +4628,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -4352,26 +4671,26 @@ class HybridMediaProxyTests(unittest.TestCase):
                 follow_redirects=False,
             )
 
-        self.assertEqual(playback.status_code, 200)
-        path_query = parse_qs(urlsplit(source["Path"]).query)
-        direct_query = parse_qs(urlsplit(source["DirectStreamUrl"]).query)
-        self.assertNotIn("MediaSourceId", path_query)
-        self.assertEqual(
-            direct_query["MediaSourceId"], ["legacy-source"]
-        )
-        self.assertTrue(
-            media_proxy._playback_sessions.capability_allows_browser_direct_redirect(
-                7, path_query["_mfps"][0], path_query["_mfss"][0]
+            self.assertEqual(playback.status_code, 200)
+            path_query = parse_qs(urlsplit(source["Path"]).query)
+            direct_query = parse_qs(urlsplit(source["DirectStreamUrl"]).query)
+            self.assertEqual(path_query["MediaSourceId"], ["legacy-source"])
+            self.assertEqual(
+                direct_query["MediaSourceId"], ["legacy-source"]
             )
-        )
-        self.assertEqual(stream.status_code, 302)
-        self.assertEqual(
-            stream.headers["location"],
-            "https://signed.invalid/legacy-web-file",
-        )
+            self.assertTrue(
+                app.state.playback_sessions.capability_allows_browser_direct_redirect(
+                    7, path_query["_mfps"][0], path_query["_mfss"][0]
+                )
+            )
+            self.assertEqual(stream.status_code, 302)
+            self.assertEqual(
+                stream.headers["location"],
+                "https://signed.invalid/legacy-web-file",
+            )
 
     def test_native_https_client_keeps_zero_bandwidth_302_redirect(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        self.app.state.dynamic_mappings.register(
             7, "native-item", "native-source", "native-file"
         )
         self._grant_file(
@@ -4399,7 +4718,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
 
     def test_native_https_head_probe_then_get_keeps_zero_bandwidth_302(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "native-probe-item", "native-probe-source", "native-probe-file"
         )
         self._grant_file(
@@ -4407,6 +4727,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "native-probe-item",
             "native-probe-source",
             "native-probe-file",
+            app=app,
         )
         upstream = _FakeUpstreamResponse(
             status_code=206,
@@ -4419,7 +4740,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
         headers = {
             "Accept": "application/json",
             "If-Range": '"native-etag"',
@@ -4491,7 +4811,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
 
     def test_native_head_probe_preserves_range_conditions_and_avoids_cdn_406(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "probe-accept-item", "probe-accept-source", "probe-accept-file"
         )
         self._grant_file(
@@ -4499,6 +4820,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "probe-accept-item",
             "probe-accept-source",
             "probe-accept-file",
+            app=app,
         )
         upstream = _FakeUpstreamResponse(
             status_code=206,
@@ -4510,7 +4832,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -4558,11 +4879,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeAsyncClient.init_kwargs[0]["timeout"].read, 10.0)
 
     def test_native_head_if_range_miss_keeps_full_response_semantics(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "if-range-item", "if-range-source", "if-range-file"
         )
         self._grant_file(
-            "client-token", "if-range-item", "if-range-source", "if-range-file"
+            "client-token", "if-range-item", "if-range-source", "if-range-file", app=app
         )
         upstream = _FakeUpstreamResponse(
             status_code=200,
@@ -4575,7 +4897,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -4619,7 +4940,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(probe.headers["If-Range"], '"stale-etag"')
 
     def test_native_head_fallback_preserves_full_redirect_budget(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "redirect-budget-item", "redirect-budget-source", "redirect-budget-file"
         )
         self._grant_file(
@@ -4627,6 +4949,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "redirect-budget-item",
             "redirect-budget-source",
             "redirect-budget-file",
+            app=app,
         )
         responses = []
         for index in range(media_proxy._SIGNED_MEDIA_MAX_REDIRECTS):
@@ -4648,7 +4971,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         )
         _FakeAsyncClient.responses = responses.copy()
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -4692,7 +5014,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
 
     def test_native_head_probe_injects_one_byte_range_without_reading_body(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "ignored-range-item", "ignored-range-source", "ignored-range-file"
         )
         self._grant_file(
@@ -4700,6 +5023,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "ignored-range-item",
             "ignored-range-source",
             "ignored-range-file",
+            app=app,
         )
 
         class UnreadBodyResponse(_FakeUpstreamResponse):
@@ -4722,7 +5046,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [one_byte_probe]
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -4768,7 +5091,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertNotIn("if-range", probe.headers)
 
     def test_native_head_invalid_ranges_return_416_and_close_upstream(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "invalid-range-item", "invalid-range-source", "invalid-range-file"
         )
         self._grant_file(
@@ -4776,6 +5100,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "invalid-range-item",
             "invalid-range-source",
             "invalid-range-file",
+            app=app,
         )
         invalid_ranges = (
             "bytes=bad-1",
@@ -4795,7 +5120,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             for _ in invalid_ranges
         ]
         _FakeAsyncClient.responses = upstream_responses.copy()
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -4842,7 +5166,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             self.assertEqual(request.headers["Range"], "bytes=0-1023")
 
     def test_native_head_probe_has_absolute_deadline_and_closes_client(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "slow-probe-item", "slow-probe-source", "slow-probe-file"
         )
         self._grant_file(
@@ -4850,6 +5175,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "slow-probe-item",
             "slow-probe-source",
             "slow-probe-file",
+            app=app,
         )
 
         class SlowAsyncClient(_FakeAsyncClient):
@@ -4864,7 +5190,6 @@ class HybridMediaProxyTests(unittest.TestCase):
                 await asyncio.sleep(0.05)
                 return _FakeUpstreamResponse(status_code=206)
 
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -4903,7 +5228,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(all(client.closed for client in SlowAsyncClient.instances))
 
     def test_native_head_request_queue_shares_the_absolute_deadline(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        with patch(
+            "app.modules.media_proxy._SIGNED_MEDIA_PROBE_MAX_CONCURRENCY",
+            1,
+        ):
+            app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "queued-head-item", "queued-head-source", "queued-head-file"
         )
         self._grant_file(
@@ -4911,6 +5241,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "queued-head-item",
             "queued-head-source",
             "queued-head-file",
+            app=app,
         )
         real_async_client = httpx.AsyncClient
         first_relay_entered: asyncio.Event
@@ -4935,12 +5266,6 @@ class HybridMediaProxyTests(unittest.TestCase):
                         "content-range": "bytes 0-99/100",
                     },
                 )
-
-        with patch(
-            "app.modules.media_proxy._SIGNED_MEDIA_PROBE_MAX_CONCURRENCY",
-            1,
-        ):
-            app = media_proxy.create_proxy_app(7)
 
         target = (
             "/Videos/queued-head-item/stream"
@@ -5045,7 +5370,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             def __init__(self) -> None:
                 raise AssertionError("鉴权超时后不应初始化光鸭客户端")
 
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5078,14 +5403,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(callable(captured["blocking_runner"]))
 
     def test_native_head_deadline_includes_signed_url_acquisition(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "slow-url-item", "slow-url-source", "slow-url-file"
         )
         self._grant_file(
-            "client-token",
-            "slow-url-item",
-            "slow-url-source",
-            "slow-url-file",
+            "client-token", "slow-url-item", "slow-url-source", "slow-url-file", app=app
         )
 
         class SlowUrlClient(_FakeGuangYaClient):
@@ -5101,7 +5424,6 @@ class HybridMediaProxyTests(unittest.TestCase):
                 finally:
                     self.__class__.finished.set()
 
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5147,10 +5469,15 @@ class HybridMediaProxyTests(unittest.TestCase):
         pin_target.assert_not_called()
         self.assertEqual(_FakeAsyncClient.requests, [])
 
-    def test_provider_deadline_covers_real_refresh_and_constructor_lock_without_blocking_loop(self):
+    def test_provider_deadline_covers_real_refresh_and_constructor_lock_without_blocking_loop(
+        self,
+    ):
         for stage in ("refresh", "credential_lock"):
             for method in ("GET", "HEAD"):
-                with self.subTest(stage=stage, method=method), tempfile.TemporaryDirectory() as directory:
+                with (
+                    self.subTest(stage=stage, method=method),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
                     entered, release, closed = threading.Event(), threading.Event(), threading.Event()
                     requests = []
                     token_file = Path(directory) / "token.json"
@@ -5187,8 +5514,11 @@ class HybridMediaProxyTests(unittest.TestCase):
 
                     cache = media_proxy.SignedUrlCache()
                     app = media_proxy.create_proxy_app(
-                        7, signed_urls=cache,
-                        playback_record_writer=media_proxy.PlaybackRecordWriter(write_record=lambda _: None),
+                        self._instance(),
+                        signed_urls=cache,
+                        playback_record_writer=media_proxy.PlaybackRecordWriter(
+                            write_record=lambda _: None
+                        ),
                     )
                     credential_lock = guangya_module._shared_token_process_lock(token_file)
                     if stage == "credential_lock":
@@ -5235,7 +5565,12 @@ class HybridMediaProxyTests(unittest.TestCase):
                         asyncio.run(scenario())
 
     def test_native_head_blocked_dns_keeps_worker_capacity_until_completion(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        with patch(
+            "app.modules.media_proxy._SIGNED_MEDIA_PROBE_MAX_CONCURRENCY",
+            1,
+        ):
+            app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "blocked-dns-item", "blocked-dns-source", "blocked-dns-file"
         )
         self._grant_file(
@@ -5243,6 +5578,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "blocked-dns-item",
             "blocked-dns-source",
             "blocked-dns-file",
+            app=app,
         )
         entered = threading.Event()
         release = threading.Event()
@@ -5277,11 +5613,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             "/Videos/blocked-dns-item/stream"
             "?MediaSourceId=blocked-dns-source&api_key=client-token"
         )
-        with patch(
-            "app.modules.media_proxy._SIGNED_MEDIA_PROBE_MAX_CONCURRENCY",
-            1,
-        ):
-            app = media_proxy.create_proxy_app(7)
 
         with (
             patch(
@@ -5337,9 +5668,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             self.assertEqual(calls, 2)
 
     def test_native_clients_share_signed_url_when_provider_is_not_ua_bound(self):
-        media_proxy._dynamic_guangya_mappings.register(
-            7, "ua-item", "ua-source", "ua-file"
-        )
+        self.app.state.dynamic_mappings.register(7, "ua-item", "ua-source", "ua-file")
         self._grant_file("client-token", "ua-item", "ua-source", "ua-file")
         _FakeGuangYaClient.results["ua-file"] = [
             "https://signed.invalid/ua-shared",
@@ -5375,14 +5704,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeGuangYaClient.calls, ["ua-file"])
 
     def test_native_clients_isolate_cache_when_provider_declares_ua_binding(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "ua-bound-item", "ua-bound-source", "ua-bound-file"
         )
         self._grant_file(
-            "client-token",
-            "ua-bound-item",
-            "ua-bound-source",
-            "ua-bound-file",
+            "client-token", "ua-bound-item", "ua-bound-source", "ua-bound-file", app=app
         )
         calls: list[str] = []
 
@@ -5396,7 +5723,6 @@ class HybridMediaProxyTests(unittest.TestCase):
                 calls.append(file_id)
                 return f"https://signed.invalid/bound-{len(calls)}"
 
-        app = media_proxy.create_proxy_app(7)
         target = (
             "/Videos/ua-bound-item/stream"
             "?MediaSourceId=ua-bound-source&api_key=client-token"
@@ -5439,10 +5765,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(calls, ["ua-bound-file", "ua-bound-file"])
 
     def test_browser_head_relays_range_headers_without_body(self):
-        media_proxy._dynamic_guangya_mappings.register(
-            7, "head-item", "head-source", "head-file"
-        )
-        self._grant_file("client-token", "head-item", "head-source", "head-file")
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(7, "head-item", "head-source", "head-file")
+        self._grant_file("client-token", "head-item", "head-source", "head-file", app=app)
         upstream = _FakeUpstreamResponse(
             status_code=206,
             body=b"must-not-be-returned",
@@ -5454,7 +5779,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [upstream]
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5500,11 +5824,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(relay_request.headers["Range"], "bytes=0-1023")
 
     def test_browser_relay_follows_provider_redirect_internally(self):
-        media_proxy._dynamic_guangya_mappings.register(
+        app = media_proxy.create_proxy_app(self._instance())
+        app.state.dynamic_mappings.register(
             7, "redirect-item", "redirect-source", "redirect-file"
         )
         self._grant_file(
-            "client-token", "redirect-item", "redirect-source", "redirect-file"
+            "client-token", "redirect-item", "redirect-source", "redirect-file", app=app
         )
         first = _FakeUpstreamResponse(
             status_code=302,
@@ -5520,7 +5845,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             },
         )
         _FakeAsyncClient.responses = [first, second]
-        app = media_proxy.create_proxy_app(7)
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5603,7 +5927,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         request_body = {"DeviceProfile": {"Name": "Integration Client"}}
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5679,7 +6003,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         }
         switched_request_body = copy.deepcopy(initial_request_body)
         switched_request_body["MaxStreamingBitrate"] = 4_000_000
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5798,7 +6122,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             'MediaBrowser Client="Jellyfin Web", Device="Browser", '
             'DeviceId="web-device", Version="10.10.7", Token="client-token"'
         )
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -5899,7 +6223,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 }],
             },
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6025,7 +6349,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 }],
             },
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6090,7 +6414,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 }],
             },
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6150,7 +6474,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 }],
             },
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6214,7 +6538,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 }],
             },
         }
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6280,7 +6604,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "EnableDirectPlay": False,
         }
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -6326,8 +6650,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         query = parse_qs(urlsplit(str(upstream.url)).query)
         self.assertNotIn("EnableDirectPlay", query)
         self.assertNotIn("EnableDirectStream", query)
-        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
-        self.assertEqual(media_proxy._playback_grants._entries, {})
+        self.assertEqual(app.state.playback_sessions._capability_index, {})
+        self.assertEqual(app.state.playback_grants._entries, {})
         authorize.assert_not_awaited()
 
     def test_android_retry_three_preserves_upstream_transcoding_contract(self):
@@ -6360,7 +6684,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "EnableDirectStream": False,
         }
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -6407,8 +6731,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         query = parse_qs(urlsplit(str(upstream.url)).query)
         self.assertNotIn("EnableDirectPlay", query)
         self.assertNotIn("EnableDirectStream", query)
-        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
-        self.assertEqual(media_proxy._playback_grants._entries, {})
+        self.assertEqual(app.state.playback_sessions._capability_index, {})
+        self.assertEqual(app.state.playback_grants._entries, {})
         authorize.assert_not_awaited()
 
     def test_android_direct_stream_and_yamby_direct_play_after_playback_info(self):
@@ -6453,7 +6777,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
             for item_id, file_id, _client_name, _user_agent in cases
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6550,7 +6874,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "http://signed.invalid/android-sdk-file"
         ]
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -6599,7 +6923,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(len(_FakeAsyncClient.requests), 1)
         self.assertEqual(authorize.await_count, 2)
 
-    def test_android_http_stream_recovers_tokenless_session_and_uses_same_protocol_cdn(self):
+    def test_android_http_stream_recovers_tokenless_session_and_uses_same_protocol_cdn(
+        self,
+    ):
         payload = {
             "PlaySessionId": "android-tokenless-session",
             "MediaSources": [
@@ -6626,7 +6952,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.results["android-tokenless-file"] = [
             "http://signed.invalid/android-tokenless-file"
         ] * 8
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -6735,7 +7061,13 @@ class HybridMediaProxyTests(unittest.TestCase):
             return_value=None,
         ):
             rewritten, changed = media_proxy.rewrite_playback_info(
-                payload, 7, "web-item", native_client_mode="web"
+                payload,
+                7,
+                "web-item",
+                native_client_mode="web",
+                dynamic_mappings=self.app.state.dynamic_mappings,
+                item_level_scopes=self.app.state.item_level_scopes,
+                playback_grants=self.app.state.playback_grants,
             )
 
         self.assertTrue(changed)
@@ -6774,7 +7106,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -6811,23 +7143,23 @@ class HybridMediaProxyTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(playback.status_code, 200)
-        source = playback.json()["MediaSources"][0]
-        self.assertFalse(source["SupportsDirectPlay"])
-        self.assertFalse(source["SupportsDirectStream"])
-        self.assertTrue(source["SupportsTranscoding"])
-        self.assertEqual(
-            source["TranscodingUrl"],
-            "/Videos/android-web-item/master.m3u8",
-        )
-        self.assertEqual(source["TranscodingContainer"], "ts")
-        self.assertTrue(
-            any(
-                entry.browser_relay
-                for entry in media_proxy._playback_sessions._entries.values()
+            self.assertEqual(playback.status_code, 200)
+            source = playback.json()["MediaSources"][0]
+            self.assertFalse(source["SupportsDirectPlay"])
+            self.assertFalse(source["SupportsDirectStream"])
+            self.assertTrue(source["SupportsTranscoding"])
+            self.assertEqual(
+                source["TranscodingUrl"],
+                "/Videos/android-web-item/master.m3u8",
             )
-        )
-        authorize.assert_not_awaited()
+            self.assertEqual(source["TranscodingContainer"], "ts")
+            self.assertTrue(
+                any(
+                    entry.browser_relay
+                    for entry in app.state.playback_sessions._entries.values()
+                )
+            )
+            authorize.assert_not_awaited()
 
     def test_android_webview_direct_play_source_keeps_true_302(self):
         payload = {
@@ -6854,7 +7186,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         headers = {
             "X-Emby-Token": "client-token",
             "X-Emby-Client": "Jellyfin for Android",
@@ -6972,6 +7304,9 @@ class HybridMediaProxyTests(unittest.TestCase):
                         7,
                         "android-item",
                         native_client_mode="jellyfin_android",
+                        dynamic_mappings=self.app.state.dynamic_mappings,
+                        item_level_scopes=self.app.state.item_level_scopes,
+                        playback_grants=self.app.state.playback_grants,
                     )
 
                 self.assertTrue(changed)
@@ -6989,7 +7324,9 @@ class HybridMediaProxyTests(unittest.TestCase):
                     rewritten_source["TranscodingSubProtocol"], "http"
                 )
 
-    def test_findroid_capability_relays_full_redirect_chain_and_rejects_same_nat_standard_url(self):
+    def test_findroid_capability_relays_full_redirect_chain_and_rejects_same_nat_standard_url(
+        self,
+    ):
         payload = {
             "PlaySessionId": "findroid-upstream-session",
             "MediaSources": [
@@ -7027,7 +7364,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="video/x-matroska",
             ),
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         _FakeGuangYaClient.results["findroid-file"] = [
             "http://signed.invalid/findroid-file"
         ]
@@ -7139,7 +7476,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -7176,7 +7513,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeGuangYaClient.calls, [])
         authorize.assert_awaited_once()
 
-    def test_android_playback_info_without_device_recovers_stream_with_device_via_verified_token_scope(self):
+    def test_android_playback_info_without_device_recovers_stream_with_device_via_verified_token_scope(
+        self,
+    ):
         payload = {
             "PlaySessionId": "android-no-device-session",
             "MediaSources": [
@@ -7193,7 +7532,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -7272,7 +7611,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.results["address-bound-file"] = [
             "http://signed.invalid/address-bound-file"
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -7382,7 +7721,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeGuangYaClient.results["multi-source-file-b"] = [
             "http://signed.invalid/multi-source-file-b"
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -7458,7 +7797,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         authorize.assert_awaited_once()
 
     def test_android_playback_info_rejects_cross_carrier_device_id_conflict(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorize = AsyncMock(return_value=True)
         with (
             patch(
@@ -7520,7 +7859,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 raise AssertionError("fallback must not release native auth capacity")
 
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -7559,8 +7898,8 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
-        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
-        self.assertEqual(media_proxy._playback_grants._entries, {})
+        self.assertEqual(app.state.playback_sessions._capability_index, {})
+        self.assertEqual(app.state.playback_grants._entries, {})
         authorize.assert_not_awaited()
 
     def test_android_playback_info_fails_fast_when_auth_capacity_is_full(self):
@@ -7591,7 +7930,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 raise AssertionError("busy capacity must not be released")
 
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -7654,7 +7993,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             fallback,
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -7721,7 +8060,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
             fallback,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Yamby", Device="Phone", '
@@ -7780,7 +8119,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
             fallback,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         playback_headers = {
             "Authorization": (
                 'MediaBrowser Client="Jellyfin for Android", '
@@ -7850,7 +8189,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             media_response,
         ]
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Browser", '
             'Token="client-token"'
@@ -7928,7 +8267,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         recorder = media_proxy.PlaybackRecordWriter(
             write_record=lambda record: captured.append(dict(record))
         )
-        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -7999,7 +8340,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         recorder = media_proxy.PlaybackRecordWriter(
             write_record=lambda record: captured.append(dict(record))
         )
-        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8062,7 +8405,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8080,29 +8423,29 @@ class HybridMediaProxyTests(unittest.TestCase):
                 json={"MediaSourceId": "source-forged"},
             )
 
-        scope = media_proxy._auth_scope_fingerprint("client-token")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            media_proxy._playback_sessions.resolve_media_name(
-                scope,
-                7,
-                "item-confirmed",
-                ("source-forged",),
-            ),
-            "",
-        )
-        self.assertEqual(
-            media_proxy._playback_sessions.resolve_media_name(
-                scope,
-                7,
-                "item-confirmed",
-                ("source-confirmed",),
-            ),
-            "Confirmed Source Movie",
-        )
+            scope = media_proxy._auth_scope_fingerprint("client-token")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                app.state.playback_sessions.resolve_media_name(
+                    scope,
+                    7,
+                    "item-confirmed",
+                    ("source-forged",),
+                ),
+                "",
+            )
+            self.assertEqual(
+                app.state.playback_sessions.resolve_media_name(
+                    scope,
+                    7,
+                    "item-confirmed",
+                    ("source-confirmed",),
+                ),
+                "Confirmed Source Movie",
+            )
 
     def test_hls_conflicting_playback_parameters_are_rejected_before_upstream(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         queries = (
             "MediaSourceId=source-a&MediaSourceId=source-b"
             "&PlaySessionId=session-a",
@@ -8151,7 +8494,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         recorder = media_proxy.PlaybackRecordWriter(
             write_record=lambda record: captured.append(dict(record))
         )
-        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8215,7 +8560,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         recorder = media_proxy.PlaybackRecordWriter(
             write_record=lambda record: captured.append(dict(record))
         )
-        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8267,7 +8614,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         recorder = media_proxy.PlaybackRecordWriter(
             write_record=lambda record: captured.append(dict(record))
         )
-        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Legacy Browser", '
             'Token="client-token"'
@@ -8352,7 +8701,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
             media_response,
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         authorization = (
             'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
             'Token="client-token"'
@@ -8437,12 +8786,14 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
         with (
-            patch.object(media_proxy, "_playback_sessions", sessions),
-            patch.object(media_proxy, "_dynamic_guangya_mappings", mappings),
-            patch.object(media_proxy, "_item_level_binding_scopes", scopes),
-            patch.object(media_proxy, "_playback_grants", grants),
+            patch.object(media_proxy, "PlaybackSessionRegistry", return_value=sessions),
+            patch.object(media_proxy, "DynamicGuangYaMappings", return_value=mappings),
+            patch.object(media_proxy, "ItemLevelBindingScopes", return_value=scopes),
+            patch.object(media_proxy, "PlaybackGrantRegistry", return_value=grants),
+        ):
+            app = media_proxy.create_proxy_app(self._instance())
+        with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
@@ -8486,7 +8837,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
         ]
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8519,7 +8870,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_unknown_mfps_with_raw_credential_is_rejected_before_upstream(self):
         authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8541,7 +8892,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         authorize.assert_not_awaited()
 
     def test_unknown_mfps_on_hls_stream_is_rejected_before_upstream(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8582,7 +8933,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8631,7 +8982,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             _FakeUpstreamResponse(status_code=401, body=b"unauthorized"),
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8682,7 +9033,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8750,7 +9101,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
         ]
         authorize = AsyncMock(return_value=False)
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8780,7 +9131,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(status_code=500, body=b"upstream failure")
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
@@ -8795,8 +9146,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 500)
-        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
-        self.assertEqual(media_proxy._playback_sessions._entries, {})
+        self.assertEqual(app.state.playback_sessions._capability_index, {})
+        self.assertEqual(app.state.playback_sessions._entries, {})
 
     def test_passthrough_playback_info_does_not_issue_capability(self):
         payload = {
@@ -8811,13 +9162,17 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         recorder = media_proxy.PlaybackRecordWriter(write_record=lambda _record: None)
-        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        app = media_proxy.create_proxy_app(
+            self._instance(), playback_record_writer=recorder
+        )
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",
                 return_value=self._instance(),
             ),
-            patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
+            patch(
+                "app.repositories.media_proxy.get_media_proxy_binding", return_value=None
+            ),
             patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
             TestClient(app, raise_server_exceptions=False) as client,
         ):
@@ -8825,20 +9180,21 @@ class HybridMediaProxyTests(unittest.TestCase):
                 "/Items/local-item/PlaybackInfo?api_key=client-token"
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), payload)
-        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
-        self.assertEqual(len(media_proxy._playback_sessions._entries), 1)
-        entry = next(iter(media_proxy._playback_sessions._entries.values()))
-        self.assertEqual(entry.media_name, "local.mkv")
-        self.assertEqual(entry.capability_expires_at, 0.0)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), payload)
+            self.assertEqual(app.state.playback_sessions._capability_index, {})
+            self.assertEqual(len(app.state.playback_sessions._entries), 1)
+            entry = next(iter(app.state.playback_sessions._entries.values()))
+            self.assertEqual(entry.media_name, "local.mkv")
+            self.assertEqual(entry.capability_expires_at, 0.0)
 
     def test_manual_binding_has_priority_over_dynamic_mapping_on_emby_stream(self):
-        media_proxy._dynamic_guangya_mappings.register(7, "item-2", "source-2", "dynamic-file")
+        self.app.state.dynamic_mappings.register(7, "item-2", "source-2", "dynamic-file")
         manual = {
             "source_type": "guangya",
             "guangya_file_id": "manual-file",
             "media_source_id": "source-2",
+            "id": 91,
         }
         self._grant_file("client-token", "item-2", "source-2", "manual-file", manual)
         stack, client = self._client()
@@ -8855,7 +9211,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeGuangYaClient.calls, ["manual-file"])
 
     def test_dynamic_mapping_redirects_and_signed_url_is_short_cached(self):
-        media_proxy._dynamic_guangya_mappings.register(7, "item-3", "source-3", "dynamic-file")
+        self.app.state.dynamic_mappings.register(7, "item-3", "source-3", "dynamic-file")
         self._grant_file("client-token", "item-3", "source-3", "dynamic-file")
         stack, client = self._client()
         with stack, patch(
@@ -8930,7 +9286,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         ))
 
     def test_direct_playgy_uses_existing_client_token_authorization(self):
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
@@ -8964,7 +9320,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 },
             )
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None),
@@ -9010,13 +9366,21 @@ class HybridMediaProxyTests(unittest.TestCase):
             "source_type": "guangya",
             "guangya_file_id": "manual-cloud",
             "media_source_id": "cloud",
+            "id": 91,
         }
 
         with patch(
             "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=fallback_binding,
         ):
-            rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "mixed-item")
+            rewritten, changed = media_proxy.rewrite_playback_info(
+                payload,
+                7,
+                "mixed-item",
+                dynamic_mappings=self.app.state.dynamic_mappings,
+                item_level_scopes=self.app.state.item_level_scopes,
+                playback_grants=self.app.state.playback_grants,
+            )
 
         self.assertTrue(changed)
         self.assertEqual(rewritten["MediaSources"][1], local_before)
@@ -9026,11 +9390,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             "source_type": "guangya",
             "guangya_file_id": "manual-cloud",
             "media_source_id": "cloud-source",
+            "id": 91,
         }
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(status_code=206, body=b"local-video")
         ]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=self._instance()),
             patch(
@@ -9217,7 +9582,7 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_proxy_diagnostic_logs_safe_range_if_range_and_ua_flags(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"video")]
-        app = media_proxy.create_proxy_app(7)
+        app = media_proxy.create_proxy_app(self._instance())
         with (
             patch(
                 "app.repositories.media_proxy.get_media_proxy_instance",

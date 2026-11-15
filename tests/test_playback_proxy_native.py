@@ -61,9 +61,24 @@ def executor():
 
 
 def runtime(instance_id: int) -> service.ProxyRuntime:
-    return service.ProxyRuntime(instance_id=instance_id, bind=("127.0.0.1", 19096),
-        server=Mock(spec=service.uvicorn.Server), task=Mock(spec=asyncio.Task),
-        sock=Mock(spec=socket.socket), signed_urls=service.SignedUrlCache())
+    cache = service.SignedUrlCache()
+    app = service.create_proxy_app(
+        {
+            "id": instance_id,
+            "enabled": 1,
+            "upstream_url": "http://127.0.0.1:8096",
+        },
+        cache,
+    )
+    return service.ProxyRuntime(
+        instance_id=instance_id,
+        bind=("127.0.0.1", 19096),
+        server=Mock(spec=service.uvicorn.Server),
+        task=Mock(spec=asyncio.Task),
+        sock=Mock(spec=socket.socket),
+        signed_urls=cache,
+        app=app,
+    )
 
 
 def record(instance_id, index, status=502):

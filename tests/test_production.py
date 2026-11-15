@@ -517,6 +517,8 @@ class MediaProxyTests(InitializedWebTestCase):
         )
 
     def test_playback_info_rewrite_forces_bound_source_to_direct_play(self):
+        from app.modules import media_proxy as proxy_module
+
         payload = {
             "MediaSources": [
                 {
@@ -532,18 +534,26 @@ class MediaProxyTests(InitializedWebTestCase):
             "id": 1,
             "source_type": "guangya",
             "guangya_file_id": "file-1",
+            "media_source_id": "",
         }
         with patch(
             "app.repositories.media_proxy.get_media_proxy_binding",
             return_value=binding,
         ):
-            rewritten, changed = rewrite_playback_info(payload, 1, "item-1")
+            rewritten, changed = rewrite_playback_info(
+                payload,
+                1,
+                "item-1",
+                dynamic_mappings=proxy_module.DynamicGuangYaMappings(),
+                item_level_scopes=proxy_module.ItemLevelBindingScopes(),
+                playback_grants=proxy_module.PlaybackGrantRegistry(),
+            )
         self.assertTrue(changed)
         source = rewritten["MediaSources"][0]
         self.assertTrue(source["SupportsDirectPlay"])
         self.assertTrue(source["SupportsDirectStream"])
         self.assertFalse(source["SupportsTranscoding"])
-        self.assertEqual(source["Path"], "/Videos/item-1/stream")
+        self.assertEqual(source["Path"], "/Videos/item-1/stream?MediaSourceId=source-1")
         self.assertNotIn("TranscodingUrl", source)
 
     def test_database_crud_and_binding_lookup(self):

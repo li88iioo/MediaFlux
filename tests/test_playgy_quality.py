@@ -138,7 +138,9 @@ class PlayGyQualityTests(unittest.TestCase):
         return [call["url"] for call in self.provider.calls]
 
     @contextmanager
-    def _proxy_http(self, source_url=None, *, binding=None, enabled=1, forwarded_https=False):
+    def _proxy_http(
+        self, source_url=None, *, binding=None, enabled=1, forwarded_https=False
+    ):
         upstream_requests = []
         payload = {"MediaSources": [
             {"Id": "cloud", "Protocol": "Http", "Path": source_url or build_play_url(
@@ -159,9 +161,6 @@ class PlayGyQualityTests(unittest.TestCase):
 
         async_client = httpx.AsyncClient
         with ExitStack() as stack:
-            for name in ("_dynamic_guangya_mappings", "_item_level_binding_scopes",
-                         "_playback_grants", "_playback_sessions"):
-                stack.enter_context(patch.object(media_proxy, name, type(getattr(media_proxy, name))()))
             stack.enter_context(patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={
                 "id": 7, "enabled": enabled, "upstream_url": "http://127.0.0.1:8096", "local_root": "",
             }))
@@ -174,7 +173,15 @@ class PlayGyQualityTests(unittest.TestCase):
             authorized = stack.enter_context(patch.object(media_proxy, "_client_is_authorized",
                 new=AsyncMock(return_value=False)))
             recorder = media_proxy.PlaybackRecordWriter(write_record=lambda _payload: None)
-            app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+            app = media_proxy.create_proxy_app(
+                {
+                    "id": 7,
+                    "enabled": enabled,
+                    "upstream_url": "http://127.0.0.1:8096",
+                    "local_root": "",
+                },
+                playback_record_writer=recorder,
+            )
             if forwarded_https:
                 app = ProxyHeadersMiddleware(cast(ASGI3Application, app), trusted_hosts=["127.0.0.1"])
             http = stack.enter_context(TestClient(
@@ -362,8 +369,18 @@ class PlayGyQualityTests(unittest.TestCase):
                            "MediaFluxPlayback": {"protocol": "stale", "source_url": self.strm_url}}]}
                 binding = {"id": 1, "source_type": "guangya", "guangya_file_id": file_id,
                            "media_source_id": "cloud"}
-                with patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=binding):
-                    result, changed = media_proxy.rewrite_playback_info(payload, 7, "quality-item")
+                with patch(
+                    "app.repositories.media_proxy.get_media_proxy_binding",
+                    return_value=binding,
+                ):
+                    result, changed = media_proxy.rewrite_playback_info(
+                        payload,
+                        7,
+                        "quality-item",
+                        dynamic_mappings=media_proxy.DynamicGuangYaMappings(),
+                        item_level_scopes=media_proxy.ItemLevelBindingScopes(),
+                        playback_grants=media_proxy.PlaybackGrantRegistry(),
+                    )
                 self.assertTrue(changed)
                 self.assertNotIn("MediaFluxPlayback", result["MediaSources"][0])
 

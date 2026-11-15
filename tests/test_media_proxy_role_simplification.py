@@ -25,6 +25,21 @@ from app.modules.media_proxy import _UpstreamClientPool
 from tests.support import InitializedWebTestCase, IsolatedDatabaseTestCase
 
 
+def _runtime_app(instance_id=9, pool=None):
+    from app.modules import media_proxy
+
+    app = media_proxy.create_proxy_app(
+        {
+            "id": instance_id,
+            "enabled": 1,
+            "upstream_url": "http://127.0.0.1:8096",
+        }
+    )
+    if pool is not None:
+        app.state.upstream_clients = pool
+    return app
+
+
 class MediaServerProfileTests(unittest.TestCase):
     def test_profile_resolver_module_exists(self):
         assert (importlib.util.find_spec("app.modules.media_server_profiles")) is not None, "缺少服务端媒体服务器配置解析模块"
@@ -355,6 +370,158 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconcile_uses_effective_upstream_identity_for_custom_and_configured_profiles(
+        self,
+    ):
+        from app.modules import media_proxy, media_server_profiles as profiles
+
+        cases = (
+            ("custom", {"upstream_url": "http://127.0.0.1:8097"}, {}, True),
+            ("custom", {"upstream_url": "http://127.0.0.1:8096/base"}, {}, True),
+            ("custom", {"server_type": "emby"}, {}, True),
+            (
+                "configured:jellyfin",
+                {},
+                {"JELLYFIN_URL": "http://127.0.0.1:8097/base"},
+                True,
+            ),
+            ("configured:jellyfin", {"config_source": "configured:emby"}, {}, True),
+            ("custom", {"config_source": "configured:jellyfin"}, {}, False),
+        )
+        for source, changed, changed_profile, should_restart in cases:
+            with self.subTest(source=source, changed=changed, profile=changed_profile):
+                row = {
+                    "id": 9,
+                    "enabled": 1,
+                    "listen_host": "127.0.0.1",
+                    "listen_port": 18099,
+                    "server_type": "jellyfin",
+                    "config_source": source,
+                    "upstream_url": "http://127.0.0.1:8096",
+                }
+                values = {
+                    "JELLYFIN_ENABLED": "true",
+                    "JELLYFIN_URL": row["upstream_url"],
+                    "JELLYFIN_API_KEY": "fixture-jellyfin",
+                    "EMBY_ENABLED": "true",
+                    "EMBY_URL": row["upstream_url"],
+                    "EMBY_TOKEN": "fixture-emby",
+                }
+                with (
+                    patch.object(
+                        profiles.config,
+                        "get_many",
+                        side_effect=lambda keys: {key: values.get(key, "") for key in keys},
+                    ),
+                ):
+                    app = media_proxy.create_proxy_app(profiles.resolve_proxy_instance(row))
+                    task = MagicMock()
+                    task.done.return_value = False
+                    runtime = media_proxy.ProxyRuntime(
+                        instance_id=9,
+                        bind=("127.0.0.1", 18099),
+                        server=MagicMock(),
+                        task=task,
+                        sock=MagicMock(),
+                        signed_urls=MagicMock(),
+                        app=app,
+                    )
+                    row.update(changed)
+                    values.update(changed_profile)
+                    effective = profiles.resolve_proxy_instance(row)
+                    manager = media_proxy.MediaProxyManager()
+                    manager._runtimes[9] = runtime
+                    replacement = MagicMock()
+                    with (
+                        patch(
+                            "app.repositories.media_proxy.list_media_proxy_instances",
+                            return_value=[row],
+                        ),
+                        patch("app.repositories.media_proxy.update_media_proxy_instance"),
+                        patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop,
+                        patch.object(
+                            manager,
+                            "_start_runtime",
+                            new=AsyncMock(return_value=replacement),
+                        ) as start,
+                    ):
+                        result = await manager.reconcile()
+                    if should_restart:
+                        stop.assert_awaited_once_with(runtime)
+                        start.assert_awaited_once_with(effective)
+                        self.assertIs(manager._runtimes[9], replacement)
+                        self.assertEqual(
+                            result, {"started": [9], "stopped": [9], "failed": {}}
+                        )
+                    else:
+                        stop.assert_not_awaited()
+                        start.assert_not_awaited()
+                        self.assertIs(manager._runtimes[9], runtime)
+
+    async def test_identity_change_stop_failure_preserves_old_app_until_cleanup_retry(self):
+        from app.modules import media_proxy
+
+        class FailOncePool:
+            calls = 0
+
+            async def aclose(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("simulated close failure")
+
+        app = _runtime_app(9)
+        pool = FailOncePool()
+        app.state.upstream_clients = pool
+        server = SimpleNamespace(should_exit=False)
+
+        async def serve():
+            while not server.should_exit:
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(serve())
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        runtime = media_proxy.ProxyRuntime(
+            instance_id=9,
+            bind=("127.0.0.1", 18099),
+            server=cast(media_proxy.uvicorn.Server, server),
+            task=task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+            app=app,
+        )
+        manager = media_proxy.MediaProxyManager()
+        manager._runtimes[9] = runtime
+        row = {
+            "id": 9,
+            "enabled": 1,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18099,
+            "upstream_url": "http://127.0.0.1:8097",
+        }
+        replacement = MagicMock()
+        with (
+            patch(
+                "app.repositories.media_proxy.list_media_proxy_instances",
+                return_value=[row],
+            ),
+            patch("app.repositories.media_proxy.update_media_proxy_instance"),
+            patch.object(media_proxy, "_release_signed_url_cache"),
+            patch.object(
+                manager, "_start_runtime", new=AsyncMock(return_value=replacement)
+            ) as start,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated close failure"):
+                await manager.reconcile()
+            self.assertIs(manager._runtimes[9], runtime)
+            self.assertFalse(app.state.playback_accepting)
+            start.assert_not_awaited()
+            result = await manager.reconcile()
+        self.assertEqual(pool.calls, 2)
+        self.assertIs(manager._runtimes[9], replacement)
+        self.assertEqual(result["started"], [9])
+        start.assert_awaited_once_with(media_proxy.resolve_proxy_instance(row))
+
     async def test_reconcile_restarts_a_runtime_whose_task_exited(self):
         from app.modules import media_proxy
 
@@ -377,6 +544,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=failed_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(9),
         )
         replacement = MagicMock()
         manager = media_proxy.MediaProxyManager()
@@ -420,6 +588,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(9),
         )
         replacement = MagicMock()
         manager = media_proxy.MediaProxyManager()
@@ -448,7 +617,9 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(manager._runtimes[9], replacement)
         self.assertEqual(result, {"started": [9], "stopped": [9], "failed": {}})
 
-    async def test_reconcile_stop_failure_retains_runtime_and_does_not_start_replacement(self):
+    async def test_reconcile_stop_failure_retains_runtime_and_does_not_start_replacement(
+        self,
+    ):
         from app.modules import media_proxy
 
         row = {
@@ -467,6 +638,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(9),
         )
         manager = media_proxy.MediaProxyManager()
         manager._runtimes[9] = previous
@@ -488,7 +660,9 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         start.assert_not_awaited()
         self.assertIs(manager._runtimes[9], previous)
 
-    async def test_restart_stop_failure_retains_runtime_and_does_not_start_replacement(self):
+    async def test_restart_stop_failure_retains_runtime_and_does_not_start_replacement(
+        self,
+    ):
         from app.modules import media_proxy
 
         row = {
@@ -507,6 +681,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(9),
         )
         manager = media_proxy.MediaProxyManager()
         manager._runtimes[9] = previous
@@ -771,7 +946,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            upstream_clients=pool,
+            app=_runtime_app(12, pool=pool),
         )
         with patch.object(media_proxy, "_release_signed_url_cache"):
             await media_proxy.MediaProxyManager._stop_runtime(runtime)
@@ -800,7 +975,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=runtime_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            upstream_clients=cast(_UpstreamClientPool, pool),
+            app=_runtime_app(14, pool=cast(_UpstreamClientPool, pool)),
         )
         with patch.object(media_proxy, "_release_signed_url_cache"):
             stop_task = asyncio.create_task(
@@ -837,7 +1012,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=runtime_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            upstream_clients=cast(_UpstreamClientPool, pool),
+            app=_runtime_app(16, pool=cast(_UpstreamClientPool, pool)),
         )
         manager._runtimes = {16: runtime}
 
@@ -859,6 +1034,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=MagicMock(),
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(13),
         )
         manager._runtimes = {13: runtime}
 
@@ -892,6 +1068,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 task=MagicMock(),
                 sock=MagicMock(),
                 signed_urls=MagicMock(),
+                app=_runtime_app(instance_id),
             )
 
         first, second = runtime(1), runtime(2)
@@ -945,7 +1122,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=runtime_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
-            upstream_clients=cast(_UpstreamClientPool, pool),
+            app=_runtime_app(15, pool=cast(_UpstreamClientPool, pool)),
         )
         manager._runtimes = {15: runtime}
 
@@ -973,6 +1150,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=MagicMock(),
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(7),
         )
         manager._runtimes = {7: runtime}
         stop_started = asyncio.Event()
@@ -1015,6 +1193,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             task=failed_task,
             sock=MagicMock(),
             signed_urls=MagicMock(),
+            app=_runtime_app(9),
         )
         with patch.object(media_proxy, "_release_signed_url_cache"):
             await media_proxy.MediaProxyManager._stop_runtime(runtime)
@@ -1044,7 +1223,8 @@ class MediaProxyRuntimeProfileTests(unittest.TestCase):
         with patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row), \
              patch.object(profiles.config, "get", side_effect=lambda key, default="": values.get(key, default)), \
              patch.object(profiles.config, "get_bool", return_value=True):
-            resolved = media_proxy._resolved_instance(9)
+            app = media_proxy.create_proxy_app(profiles.resolve_proxy_instance(row))
+            resolved = media_proxy._resolved_instance(app)
         assert resolved is not None
         self.assertEqual(resolved["upstream_url"], "http://127.0.0.1:8096")
         self.assertEqual(resolved["api_key"], "current-key")
@@ -1098,8 +1278,17 @@ class LocalPlaybackPassthroughTests(unittest.TestCase):
             "local_relative_path": "Movies/example.mkv",
             "enabled": 1,
         }
-        with patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=binding):
-            rewritten, changed = media_proxy.rewrite_playback_info(payload, 7, "item-local")
+        with patch(
+            "app.repositories.media_proxy.get_media_proxy_binding", return_value=binding
+        ):
+            rewritten, changed = media_proxy.rewrite_playback_info(
+                payload,
+                7,
+                "item-local",
+                dynamic_mappings=media_proxy.DynamicGuangYaMappings(),
+                item_level_scopes=media_proxy.ItemLevelBindingScopes(),
+                playback_grants=media_proxy.PlaybackGrantRegistry(),
+            )
         self.assertFalse(changed)
         self.assertEqual(rewritten["MediaSources"][0], source)
 
