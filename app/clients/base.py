@@ -1424,12 +1424,14 @@ class MediaServerClient:
 
     def _resolve_refresh_items(
         self, items: list[dict[str, Any]], targets: Iterable[str],
-        sources_for_target: Mapping[str, list[str]],
+        presence: Mapping[str, tuple[str, int]],
     ) -> dict[str, dict[str, Any]]:
         """单集变化刷新单集，同季多集刷新整季，同剧多季刷新整剧。
 
-        新增或已删除的文件只能由父目录扫描发现/移除，因此落到所在季或剧；
-        不属于已有剧集的变化取最近的已有目录，找不到时交给调用方按物理根处理。
+        新增文件只能由父目录扫描发现，落到所在季或剧；已删除的文件或目录从本机
+        仍存在的最深一层目录定位（季目录也删了就刷整剧），因为 Jellyfin 只在
+        父级校验子项时移除条目。不属于已有剧集的变化取最近的已有目录，找不到时
+        交给调用方按物理根处理。
         """
         by_path: dict[tuple[str, tuple[str, ...]], list[tuple[int, int, dict[str, Any]]]] = {}
         leaves_by_dir: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = {}
@@ -1455,26 +1457,29 @@ class MediaServerClient:
         resolved: dict[str, dict[str, Any]] = {}
         tv_groups: dict[str, list[str]] = {}
         for target in targets:
+            removed_depth = presence.get(target, ("unknown", 0))[1]
             anchor, parts = normalized_path_parts(self._media_path_key(target))
+            parts = parts[:len(parts) - removed_depth]
             exact = at((anchor, parts))
             nearby = [*exact, *(
                 item for depth in range(len(parts) - 1, -1, -1)
                 for item in at((anchor, parts[:depth]))
             )]
-            may_be_file = self._local_state(sources_for_target.get(target, ())) in {"file", "unknown"}
-            leaf = next((item for item in exact if _item_type(item) in _LEAF_TYPES), None)
+            leaf = None if removed_depth else next(
+                (item for item in exact if _item_type(item) in _LEAF_TYPES), None,
+            )
             container = next((item for item in nearby if _item_type(item) in _TV_TYPES), None)
-            if leaf is not None and may_be_file:
+            if leaf is not None:
                 resolved[target] = leaf
             elif container is not None and any(item is container for item in exact):
                 resolved[target] = container
             elif container is not None:
                 tv_groups.setdefault(_item_id(container), []).append(target)
             else:
-                sidecar = None if leaf is not None else self._leaf_for_file(
+                sidecar = None if removed_depth else self._leaf_for_file(
                     target, leaves_by_dir.get((anchor, parts[:-1]), ()),
                 )
-                chosen = sidecar or next((item for item in nearby if item is not leaf), None)
+                chosen = sidecar or next(iter(nearby), None)
                 if chosen is not None:
                     resolved[target] = chosen
 
@@ -1485,7 +1490,7 @@ class MediaServerClient:
             if (
                 len(members) == 1
                 and not {container_id, _series_id(container)} & selected_ids
-                and self._local_state(sources_for_target.get(members[0], ())) in {"file", "unknown"}
+                and presence.get(members[0], ("unknown", 0))[0] in {"file", "unknown"}
             ):
                 episode = self._episode_for_file(container, members[0])
             if episode is not None:
@@ -1516,11 +1521,11 @@ class MediaServerClient:
     def _leaf_for_file(
         self, target: str, leaves: Iterable[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        """精确匹配视频文件；同目录同名前缀的字幕等附属文件归属到该视频。"""
+        """精确匹配视频文件；同目录附属文件归属主文件名最长的视频，同名歧义时不猜。"""
         anchor, parts = normalized_path_parts(self._media_path_key(target))
         if not parts:
             return None
-        sidecar = None
+        matches: list[tuple[int, dict[str, Any]]] = []
         for leaf in leaves:
             leaf_anchor, leaf_parts = normalized_path_parts(
                 self._media_path_key(self._normalize_media_path(leaf.get("Path")))
@@ -1528,12 +1533,14 @@ class MediaServerClient:
             if (leaf_anchor, leaf_parts) == (anchor, parts):
                 return leaf
             if (
-                sidecar is None and leaf_parts and leaf_anchor == anchor
-                and leaf_parts[:-1] == parts[:-1]
+                leaf_parts and leaf_anchor == anchor and leaf_parts[:-1] == parts[:-1]
                 and _is_sidecar_name(parts[-1], leaf_parts[-1])
             ):
-                sidecar = leaf
-        return sidecar
+                matches.append((len(leaf_parts[-1].rpartition(".")[0]), leaf))
+        longest = max((size for size, _leaf in matches), default=0)
+        best = [leaf for size, leaf in matches if size == longest]
+        # E01.part2.zh.srt 属于 E01.part2.strm 而非 E01.strm；B.strm 与 B.mkv 同名时交给父目录。
+        return best[0] if len(best) == 1 else None
 
     def _episode_for_file(
         self, container: dict[str, Any], target: str,
@@ -1559,32 +1566,29 @@ class MediaServerClient:
         return self._leaf_for_file(target, [row for row in rows if isinstance(row, dict)])
 
     @staticmethod
-    def _local_state(paths: Iterable[str]) -> str:
-        """执行时的本地状态：file / dir / missing；不在本机的路径（服务端路径）为 unknown。
+    def _local_presence(path: str, local_root: str) -> tuple[str, int]:
+        """执行时的本地状态 file / dir / missing / unknown，及已删除时需上溯的层数。
 
-        只有本机确认已删除（文件不在但某级父目录在）才必须交给父目录扫描移除；
-        无法在本机核验的路径按调用方给出的精确目标处理。
+        只有该路径所属媒体库的本地根（映射的本地前缀，或同路径空间下的媒体库
+        目录）在本机存在时才能判断删除；否则（仅服务端可见的路径）为 unknown，
+        按调用方给出的精确目标处理。
         """
-        state = "unknown"
-        for raw in paths:
-            try:
-                if not os.path.isabs(raw):
-                    continue
-                if os.path.isfile(raw):
-                    return "file"
-                if os.path.isdir(raw):
-                    state = "dir"
-                    continue
-                parent = os.path.dirname(raw.rstrip("/"))
-                while parent != os.path.dirname(parent):
-                    if os.path.isdir(parent):
-                        if state == "unknown":
-                            state = "missing"
-                        break
-                    parent = os.path.dirname(parent)
-            except (OSError, ValueError):
-                continue
-        return state
+        try:
+            root = local_root.rstrip("/")
+            if not root or not os.path.isabs(path) or not os.path.isdir(root):
+                return "unknown", 0
+            if os.path.isfile(path):
+                return "file", 0
+            if os.path.isdir(path):
+                return "dir", 0
+            current, removed = path.rstrip("/"), 0
+            while len(current) > len(root):
+                current, removed = os.path.dirname(current), removed + 1
+                if os.path.isdir(current):
+                    break
+            return "missing", removed
+        except (OSError, ValueError):
+            return "unknown", 0
 
     def _finish_unlocatable_refresh(
         self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
@@ -1650,11 +1654,14 @@ class MediaServerClient:
         mapped_targets: list[str] = []
         source_paths = _dedupe_texts(paths or [])
         sources_for_target: dict[str, list[str]] = {}
+        local_root_for_source: dict[str, str] = {}
         for raw in source_paths:
             try:
                 mapped, mapping = apply_media_server_path_mapping(raw, self.path_mappings)
             except Exception:
                 mapped, mapping = self._normalize_media_path(raw), None
+            if mapping is not None:
+                local_root_for_source[raw] = mapping.local_prefix
             normalized_source = self._normalize_media_path(raw)
             normalized_target = self._normalize_media_path(mapped)
             if not normalized_target:
@@ -1840,9 +1847,21 @@ class MediaServerClient:
                 if item_path and item_id:
                     root_items[self._media_path_key(item_path)] = item
 
+            # 映射命中时以映射的本地前缀为根；未配置任何映射时本机与媒体服务器同路径
+            # 空间，以媒体库目录为根；配置了映射却未命中的路径只在服务端可见，不判断删除。
+            presence = {
+                target: next((
+                    state for state in (
+                        self._local_presence(raw, local_root_for_source.get(raw) or (
+                            "" if self.path_mappings else location
+                        ))
+                        for raw in sources_for_target.get(target, [target])
+                    ) if state[0] != "unknown"
+                ), ("unknown", 0))
+                for target, location in library_targets_for_id
+            }
             preferred_items = self._resolve_refresh_items(
-                items, (target for target, _location in library_targets_for_id),
-                sources_for_target,
+                items, (target for target, _location in library_targets_for_id), presence,
             )
             for target, library_location in library_targets_for_id:
                 matched_item = preferred_items.get(target)

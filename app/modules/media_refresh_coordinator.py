@@ -5,13 +5,16 @@
 """
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 from app import config
 from app.clients.base import close_media_server_client
-from app.logger import get_logger, redact_sensitive_text
+from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.modules.media_server_path_mapping import configured_media_server_refresh_options
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.process_lock import CrossProcessLock
@@ -42,6 +45,24 @@ def _recent_ttl_seconds() -> int:
     return max(10, min(config.get_int(
         "MEDIA_REFRESH_DEDUPE_SECONDS", _DEFAULT_RECENT_TTL_SECONDS,
     ), 1800))
+
+
+def _split_unmatched(paths: Iterable[object]) -> tuple[list[str], list[str]]:
+    """拆分不属于任何媒体库的路径：(已删除的废弃路径, 缺少映射的有效路径)。
+
+    只有 STRM 根下、本机确认已删除的路径（如旧目录布局）才永远不会再入库，
+    可以确认出队；文件仍在或无法证明已删除时属于配置缺失，必须保留，
+    补上路径映射或媒体库目录后由重试自动刷新。
+    """
+    root = (config.get("STRM_ROOT", "") or "").rstrip("/")
+    root_visible = bool(root) and os.path.isdir(root)
+    obsolete: list[str] = []
+    unmapped: list[str] = []
+    for raw in paths:
+        path = str(raw)
+        gone = root_visible and path.startswith(f"{root}/") and not os.path.lexists(path)
+        (obsolete if gone else unmapped).append(path)
+    return obsolete, unmapped
 
 
 def _retry_seconds(attempts: int) -> int:
@@ -344,31 +365,44 @@ class MediaRefreshCoordinator:
                 bool(outcome.get("retryable")),
                 outcome.get("fallback") or "-",
             )
-            # 不属于任何媒体库的路径重试也不会变得可定位（旧布局已删除、目录不入库），
-            # 汇总告警一次后随本轮确认出队，避免拖住后续批次的结算。
-            ignored = list(outcome.get("unmatched_paths") or ())
-            if ignored:
+            obsolete, unmapped = _split_unmatched(outcome.get("unmatched_paths") or ())
+            if obsolete:
                 logger.warning(
-                    "%s 有 %s 个变化路径不属于任何媒体库，已忽略且不再重试 样例=%s",
-                    client.display_name, len(ignored), "；".join(ignored[:3]),
+                    "%s 有 %s 个已删除的 STRM 路径不属于任何媒体库，已确认出队 样例=%s",
+                    client.display_name, len(obsolete), "；".join(obsolete[:3]),
                 )
-            acknowledged = [*(outcome.get("succeeded_paths") or ()), *ignored]
-            if outcome.get("retryable"):
+            if unmapped:
+                log_throttled(
+                    logger, logging.WARNING, f"media-refresh-unmapped:{provider}",
+                    "%s 有 %s 个变化路径仍在但不属于任何媒体库，请检查路径映射或媒体库目录；"
+                    "已保留，修复后自动刷新 样例=%s",
+                    client.display_name, len(unmapped), "；".join(unmapped[:3]),
+                    interval_seconds=3600,
+                )
+            acknowledged = [*(outcome.get("succeeded_paths") or ()), *obsolete]
+            refreshed = outcome.get("succeeded_target_ids") or ()
+            deduplicated = int(outcome.get("deduplicated") or 0)
+            if outcome.get("retryable") or (unmapped and not deduplicated):
+                # 配置缺失单列为 Unmapped：已刷新的路径照常确认，只保留缺映射的部分。
+                retryable = bool(outcome.get("retryable"))
                 settle_media_refresh(
                     group_key, outcome="failed",
                     owner=self._owner,
                     lease_generation=generation,
-                    error=outcome.get("fallback") or "媒体服务器刷新失败",
+                    error=(outcome.get("fallback") or "媒体服务器刷新失败") if retryable else (
+                        f"{len(unmapped)} 个变化路径缺少媒体库映射（文件仍在），配置修复后自动重试"
+                    ),
                     delay_seconds=_retry_seconds(attempts),
-                    refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+                    refreshed_target_ids=refreshed,
                     acknowledged_paths=acknowledged,
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 with self._state_lock:
                     self._failed_session += 1
-                    self._last_error_type = "MediaRefreshRetryable"
+                    self._last_error_type = (
+                        "MediaRefreshRetryable" if retryable else "MediaRefreshUnmapped"
+                    )
                 return
-            deduplicated = int(outcome.get("deduplicated") or 0)
             if deduplicated:
                 # 同一媒体目标刚刷新过时，新的变化路径仍可能包含随后入库的剧集。
                 # 等去重窗口结束后再校准一次，不能把这批路径直接确认丢弃。
@@ -378,7 +412,7 @@ class MediaRefreshCoordinator:
                     lease_generation=generation,
                     delay_seconds=_recent_ttl_seconds(),
                     error=f"等待媒体库刷新去重窗口结束（{deduplicated} 项）",
-                    refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+                    refreshed_target_ids=refreshed,
                     acknowledged_paths=acknowledged,
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
@@ -387,7 +421,7 @@ class MediaRefreshCoordinator:
                 group_key, outcome="completed",
                 owner=self._owner,
                 lease_generation=generation,
-                refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+                refreshed_target_ids=refreshed,
                 recent_ttl_seconds=_recent_ttl_seconds(),
             )
             with self._state_lock:

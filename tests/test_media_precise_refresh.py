@@ -300,6 +300,18 @@ class _RefreshRecorder:
         return True
 
 
+def _make_tree(root: str, entries) -> None:
+    """建立本机文件树；媒体库根总是存在，以 / 结尾的条目是目录。"""
+    Path(root).mkdir(parents=True, exist_ok=True)
+    for name in entries:
+        path = Path(root, name)
+        if name.endswith("/"):
+            path.mkdir(parents=True, exist_ok=True)
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("http://play.invalid/x")
+
+
 def _folders() -> list[dict]:
     return [
         {"id": "lib-tv", "name": "剧集", "locations": [f"{ROOT}/剧集"]},
@@ -449,33 +461,32 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["endpoints"], ["/Items/season-a1/Refresh"])
 
     def test_refresh_granularity_follows_the_scope_of_change(self):
-        # 单集→单集，同季多集→整季，同剧多季→整剧；新增/删除只能靠父目录扫描发现。
+        # 单集→单集，同季多集→整季，同剧多季→整剧；新增/删除只能靠仍存在的父目录扫描发现。
         s1, s2, s3 = "作品 A/Season 01", "作品 A/Season 02", "作品 A/Season 03"
+        e11, e12, e21, e22 = f"{s1}/E01.strm", f"{s1}/E02.strm", f"{s2}/E01.strm", f"{s2}/E02.strm"
         cases = (
-            ("单集更新", [f"{s1}/E01.strm"], [f"{s1}/E01.strm"], ["ep-1-1"], ["season-1"]),
-            ("单集字幕", [f"{s1}/E01.strm", f"{s1}/E01.zh.srt"], [f"{s1}/E01.zh.srt"], ["ep-1-1"], ["season-1"]),
+            ("单集更新", [e11], [e11], ["ep-1-1"], ["season-1"]),
+            ("单集字幕", [e11, f"{s1}/E01.zh.srt"], [f"{s1}/E01.zh.srt"], ["ep-1-1"], ["season-1"]),
             ("新增单集", [f"{s1}/E03.strm"], [f"{s1}/E03.strm"], ["season-1"], ["season-1"]),
-            ("删除单集", [], [f"{s1}/E01.strm"], ["season-1"], []),
-            ("同季多集", [f"{s1}/E01.strm", f"{s1}/E02.strm"], [f"{s1}/E01.strm", f"{s1}/E02.strm"],
-             ["season-1"], []),
-            ("跨季单集各自精准", [f"{s1}/E01.strm", f"{s2}/E01.strm"], [f"{s1}/E01.strm", f"{s2}/E01.strm"],
-             ["ep-1-1", "ep-2-1"], ["season-1", "season-2"]),
-            ("同剧多季整季", [], [f"{s1}/E01.strm", f"{s1}/E02.strm", f"{s2}/E01.strm", f"{s2}/E02.strm"],
-             ["series-a"], []),
-            ("季目录", [], [s1], ["season-1"], []),
-            ("多个季目录", [], [s1, s2], ["series-a"], []),
-            ("整剧目录吸收其下单集", [f"{s1}/E01.strm"], ["作品 A", f"{s1}/E01.strm"], ["series-a"], []),
+            ("删除单集", [f"{s1}/"], [e11], ["season-1"], []),
+            ("同季多集", [e11, e12], [e11, e12], ["season-1"], []),
+            ("跨季单集各自精准", [e11, e21], [e11, e21], ["ep-1-1", "ep-2-1"], ["season-1", "season-2"]),
+            ("同剧多季整季", [e11, e12, e21, e22], [e11, e12, e21, e22], ["series-a"], []),
+            ("季目录", [f"{s1}/"], [s1], ["season-1"], []),
+            ("多个季目录", [f"{s1}/", f"{s2}/"], [s1, s2], ["series-a"], []),
+            ("整剧目录吸收其下单集", [e11], ["作品 A", e11], ["series-a"], []),
             ("新季", [f"{s3}/E01.strm"], [f"{s3}/E01.strm"], ["series-a"], ["series-a"]),
-            ("新剧", [], ["全新作品/Season 01/E01.strm"], ["root-tv"], []),
+            ("新剧", ["全新作品/Season 01/E01.strm"], ["全新作品/Season 01/E01.strm"], ["root-tv"], []),
+            # Jellyfin 只在父级校验子项时移除条目：季目录已删就刷整剧，剧目录已删就刷物理根。
+            ("删除整季目录", ["作品 A/"], [s1], ["series-a"], []),
+            ("删除整季后的单集变化", ["作品 A/"], [e11], ["series-a"], []),
+            ("删除整剧目录", [], ["作品 A"], ["root-tv"], []),
         )
         for label, client in self._clients():
             for case, existing, changed, expected, lookups in cases:
                 with self.subTest(server=label, case=case), tempfile.TemporaryDirectory() as root:
                     show_root = f"{root}/剧集"
-                    for name in existing:
-                        path = Path(show_root, name)
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text("http://play.invalid/x")
+                    _make_tree(show_root, existing)
                     recorder = _RefreshRecorder(client, [
                         {"id": "lib-tv", "name": "剧集", "locations": [show_root]},
                     ], {"lib-tv": [
@@ -485,10 +496,10 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                         {"Id": "season-2", "Type": "Season", "SeriesId": "series-a", "Path": f"{show_root}/{s2}"},
                     ]}, episodes={
                         "season-1": [
-                            {"Id": "ep-1-1", "Type": "Episode", "Path": f"{show_root}/{s1}/E01.strm"},
-                            {"Id": "ep-1-2", "Type": "Episode", "Path": f"{show_root}/{s1}/E02.strm"},
+                            {"Id": "ep-1-1", "Type": "Episode", "Path": f"{show_root}/{e11}"},
+                            {"Id": "ep-1-2", "Type": "Episode", "Path": f"{show_root}/{e12}"},
                         ],
-                        "season-2": [{"Id": "ep-2-1", "Type": "Episode", "Path": f"{show_root}/{s2}/E01.strm"}],
+                        "season-2": [{"Id": "ep-2-1", "Type": "Episode", "Path": f"{show_root}/{e21}"}],
                         "series-a": [],
                     })
                     paths = [f"{show_root}/{name}" for name in changed]
@@ -502,25 +513,30 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertEqual(recorder.refresh_all_calls, 0)
 
     def test_movie_refresh_stays_on_the_movie_unless_files_appear_or_vanish(self):
+        b, other = "作品 B/B.strm", "作品 B/B.part2.strm"
         cases = (
-            ("电影更新", ["作品 B/B.strm"], "作品 B/B.strm", ["movie-b"]),
-            ("电影字幕", ["作品 B/B.strm", "作品 B/B.zh.srt"], "作品 B/B.zh.srt", ["movie-b"]),
-            ("同名新视频不算字幕", ["作品 B/B.strm", "作品 B/B.mkv"], "作品 B/B.mkv", ["root-movies"]),
-            ("电影删除", [], "作品 B/B.strm", ["root-movies"]),
+            ("电影更新", [b], b, [b], ["movie-b"]),
+            ("电影字幕", [b, "作品 B/B.zh.srt"], "作品 B/B.zh.srt", [b], ["movie-b"]),
+            ("同名新视频不算字幕", [b, "作品 B/B.mkv"], "作品 B/B.mkv", [b], ["root-movies"]),
+            ("电影删除", [], b, [b], ["root-movies"]),
+            ("删除视频但目录仍在", ["作品 B/"], b, [b], ["root-movies"]),
+            # 附属文件取主文件名最长的视频；主文件名相同无法区分时交给父目录。
+            ("字幕归属更具体的分段", [b, other, "作品 B/B.part2.zh.srt"], "作品 B/B.part2.zh.srt", [b, other],
+             ["movie-part2"]),
+            ("同名视频歧义", [b, "作品 B/B.mkv", "作品 B/B.zh.srt"], "作品 B/B.zh.srt", [b, "作品 B/B.mkv"],
+             ["root-movies"]),
         )
+        ids = {b: "movie-b", other: "movie-part2", "作品 B/B.mkv": "movie-mkv"}
         for label, client in self._clients():
-            for case, existing, changed, expected in cases:
+            for case, existing, changed, listed, expected in cases:
                 with self.subTest(server=label, case=case), tempfile.TemporaryDirectory() as root:
                     movie_root = f"{root}/电影"
-                    for name in existing:
-                        path = Path(movie_root, name)
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text("x")
+                    _make_tree(movie_root, existing)
                     recorder = _RefreshRecorder(client, [
                         {"id": "lib-movie", "name": "电影", "locations": [movie_root]},
                     ], {"lib-movie": [
                         {"Id": "root-movies", "Type": "Folder", "Path": movie_root},
-                        {"Id": "movie-b", "Type": "Movie", "Path": f"{movie_root}/作品 B/B.strm"},
+                        *({"Id": ids[name], "Type": "Movie", "Path": f"{movie_root}/{name}"} for name in listed),
                     ]})
 
                     result = client.refresh_for_paths([f"{movie_root}/{changed}"])
@@ -528,6 +544,43 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, expected)
                     self.assertEqual(recorder.episode_lookups, [])
+
+    def test_deletion_is_only_judged_where_the_library_root_is_visible_locally(self):
+        # 映射命中时按本地前缀判断；同路径空间按媒体库目录判断；只在服务端可见的路径保持精确。
+        for label, client_type in (("Jellyfin", JellyfinClient), ("Emby", EmbyClient)):
+            for case, mapped, server_only_root, create, expected in (
+                ("映射路径已删除", True, False, False, ["root-movies"]),
+                ("映射路径仍在", True, False, True, ["movie-b"]),
+                ("服务端独有目录恰好与本机上级同名", False, True, False, ["movie-b"]),
+                ("配置了映射但路径未命中映射", "other", False, False, ["movie-b"]),
+            ):
+                with self.subTest(server=label, case=case), tempfile.TemporaryDirectory() as root:
+                    local_root = f"{root}/local/电影"
+                    _make_tree(local_root, ["作品 B/B.strm"] if create else [])
+                    if mapped is True:
+                        server_root = "//nas/share/电影"
+                        mappings = (MediaServerPathMapping(local_root, server_root),)
+                        source_root = local_root
+                    else:
+                        # 本机有 {root}，媒体库目录却只在服务端存在；或映射只覆盖别的目录。
+                        server_root = f"{root}/server-only/电影" if server_only_root else local_root
+                        mappings = (
+                            (MediaServerPathMapping(f"{root}/elsewhere", "//nas/share/其他"),)
+                            if mapped == "other" else ()
+                        )
+                        source_root = server_root
+                    client = client_type("http://media.invalid", "token", path_mappings=mappings)
+                    recorder = _RefreshRecorder(client, [
+                        {"id": "lib-movie", "name": "电影", "locations": [server_root]},
+                    ], {"lib-movie": [
+                        {"Id": "root-movies", "Type": "Folder", "Path": server_root},
+                        {"Id": "movie-b", "Type": "Movie", "Path": f"{server_root}/作品 B/B.strm"},
+                    ]})
+
+                    result = client.refresh_for_paths([f"{source_root}/作品 B/B.strm"])
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(recorder.refreshed, expected)
 
     def test_episode_lookup_failure_falls_back_to_the_season(self):
         for label, client in self._clients():
@@ -630,8 +683,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, ["collection" if folder else "lib-movie"])
                     recorder.refreshed.clear()
-                    with patch("app.clients.base.os.path.isfile", return_value=True):
-                        result = client.refresh_for_paths([f"{directory}/B.strm"])
+                    result = client.refresh_for_paths([f"{directory}/B.strm"])
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, ["changed"])
                     self.assertEqual(recorder.refresh_all_calls, 0)
@@ -1055,9 +1107,10 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
     def test_item_index_preserves_path_style_case_and_component_boundaries(self):
         cases = (
-            ("/media", "/media/Film", "/media/Film/E01.strm", True),
-            ("/media", "/media/Film", "/media/film/E01.strm", False),
-            ("/media", "/media/Film", "/media/Film-extra/E01.strm", False),
+            # 根目录取本机不存在的路径，避免宿主机恰好有 /media 时被当作本机已删除。
+            ("/mf-absent-root", "/mf-absent-root/Film", "/mf-absent-root/Film/E01.strm", True),
+            ("/mf-absent-root", "/mf-absent-root/Film", "/mf-absent-root/film/E01.strm", False),
+            ("/mf-absent-root", "/mf-absent-root/Film", "/mf-absent-root/Film-extra/E01.strm", False),
             ("C:/", "C:/Media/Straße", r"c:\media\STRASSE\E01.strm", True),
             ("//NAS/Share", "//NAS/Share/Film", "//nas/share/FILM/E01.strm", True),
         )

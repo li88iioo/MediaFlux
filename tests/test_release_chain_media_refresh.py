@@ -16,8 +16,7 @@ from app.repositories.media_refresh_queue import (
 from tests.support import isolated_test_database
 
 
-def test_real_unmapped_refresh_is_ignored_without_retry_or_global_scan():
-    # 不属于任何媒体库的路径重试也不会变得可定位；确认出队，不能无限重试或全局扫描。
+def test_real_unmapped_refresh_result_is_retained_not_acknowledged():
     for client_type, provider in ((JellyfinClient, "jellyfin"), (EmbyClient, "emby")):
         with isolated_test_database():
             enqueue_media_refresh(provider, ["/not-mapped/Ultraman"], debounce_seconds=0, now_epoch=100)
@@ -31,9 +30,9 @@ def test_real_unmapped_refresh_is_ignored_without_retry_or_global_scan():
             with patch.object(coordinator, "_client_for", return_value=client):
                 coordinator._process_group(job)
             status = media_refresh_queue_status()
-            assert status["paths"] == 0, status
-            assert status["retry_wait"] == 0, status
-            assert coordinator._failed_session == 0
+            assert status["paths"] == 1, status
+            assert status["retry_wait"] == 1, status
+            assert coordinator._completed_session == 0
             client.refresh_all.assert_not_called()
 
 

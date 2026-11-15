@@ -22,14 +22,15 @@ from tests.test_deep_audit_media_chain import MediaEndpoint, Response
 
 
 class MediaRefreshHistoryAuditTests(unittest.TestCase):
-    def test_unmapped_path_is_settled_and_accepted_refresh_never_replays_after_restart(self):
+    def test_unmapped_path_does_not_replay_accepted_refresh_after_restart(self):
         with isolated_test_database("mediaflux.db"):
             for provider in ("jellyfin", "emby"):
                 with self.subTest(provider=provider):
                     queue.clear_media_refresh_queue()
-                    endpoint = MediaEndpoint("/media", series={"series-a": "/media/A"})
+                    # 媒体库根取本机不存在的路径：宿主机恰好有 /media 时，假单集会被当作本机已删除。
+                    endpoint = MediaEndpoint("/mf-absent-media", series={"series-a": "/mf-absent-media/A"})
                     queue.enqueue_media_refresh(
-                        provider, ["/media/A/S01E01.strm", "/unmapped/B"],
+                        provider, ["/mf-absent-media/A/S01E01.strm", "/unmapped/B"],
                         debounce_seconds=0, now_epoch=100,
                     )
                     worker = MediaRefreshCoordinator()
@@ -39,13 +40,18 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
                     ), patch("app.modules.media_refresh_coordinator._retry_seconds", return_value=960):
                         worker._process_group(first)
                     self.assertEqual(endpoint.posts, ["/Items/series-a/Refresh"])
-                    # 不属于任何媒体库的路径随本轮确认出队，不再无限重试。
-                    self.assertEqual(queue.media_refresh_queue_status(now_epoch=101)["paths"], 0)
+                    self.assertEqual(queue.media_refresh_queue_status(now_epoch=101)["paths"], 1)
 
                     db.init_db()
                     worker = MediaRefreshCoordinator()
-                    self.assertEqual(queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=1060), [])
+                    retry = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=1060)[0]
+                    self.assertEqual(retry["paths"], ["/unmapped/B"])
+                    with patch.object(worker, "_client_for", side_effect=endpoint.client), patch(
+                        "app.repositories.media_refresh_queue.time.time", return_value=1060,
+                    ):
+                        worker._process_group(retry)
                     self.assertEqual(endpoint.posts, ["/Items/series-a/Refresh"])
+                    self.assertEqual(queue.media_refresh_queue_status(now_epoch=1061)["paths"], 1)
 
     def test_bound_refresh_backup_restore_and_real_worker_restart_do_not_replay(self):
         with isolated_test_database("mediaflux.db") as database_path:

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import threading
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+from app import config
 from app import database as db
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.repositories.media_refresh_queue import (
@@ -523,44 +526,82 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                 self.assertEqual(client.refresh_for_paths.call_args.kwargs["skip_item_ids"], ())
                 self.assertEqual(media_refresh_queue_status(now_epoch=1061)["paths"], 0)
 
-    def test_paths_outside_every_library_are_settled_without_retry(self):
-        # 生产事故：旧布局已删除的 4463 个路径永远匹配不到媒体库，曾被每 16 分钟重放一次，
-        # 还把同批新入库单集的去重等待从 90 秒拖成失败退避。
-        cases = {
-            "全部不属于媒体库": ({"scope": "skipped"}, [], None),
-            "去重等待不被拖成失败退避": ({"scope": "deduplicated", "deduplicated": 1}, ["/media/new"], 190),
-            "可重试失败只保留可刷新路径": (
-                {"scope": "item", "retryable": True, "fallback": "1 个刷新请求失败，将重试"},
-                ["/media/new"], 1060,
-            ),
+    def _settle_unmatched(self, strm_root, outcome, *, paths, now=100):
+        enqueue_media_refresh("jellyfin", paths, debounce_seconds=0, now_epoch=now)
+        claimed = claim_due_media_refreshes(owner="worker", now_epoch=now)[0]
+        client = Mock(display_name="Jellyfin")
+        client.refresh_for_paths.return_value = {
+            "ok": False, "requested": len(paths), "retryable": False, "deduplicated": 0,
+            "succeeded_target_ids": [], "succeeded_paths": [], **outcome,
         }
-        for label, (fields, remaining, due_at) in cases.items():
-            with self.subTest(label):
-                clear_media_refresh_queue()
-                enqueue_media_refresh(
-                    "jellyfin", ["/old/A", "/old/B", "/media/new"], debounce_seconds=0, now_epoch=100,
-                )
-                claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-                client = Mock(display_name="Jellyfin")
-                client.refresh_for_paths.return_value = {
-                    "ok": False, "requested": 3, "retryable": False, "deduplicated": 0,
-                    "succeeded_target_ids": [], "succeeded_paths": [],
-                    "unmatched_paths": ["/old/A", "/old/B"], **fields,
-                }
-                coordinator = MediaRefreshCoordinator()
-                coordinator._owner = "worker"
-                with patch.object(coordinator, "_client_for", return_value=client), patch(
-                    "app.modules.media_refresh_coordinator._retry_seconds", return_value=960,
-                ), patch(
-                    "app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90,
-                ), patch("app.repositories.media_refresh_queue.time.time", return_value=100):
-                    coordinator._process_group(claimed)
+        coordinator = MediaRefreshCoordinator()
+        coordinator._owner = "worker"
+        original_get = config.get
+        with patch.object(coordinator, "_client_for", return_value=client), patch(
+            "app.modules.media_refresh_coordinator._retry_seconds", return_value=960,
+        ), patch(
+            "app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90,
+        ), patch(
+            "app.modules.media_refresh_coordinator.config.get",
+            side_effect=lambda key, default="": strm_root if key == "STRM_ROOT" else original_get(key, default),
+        ), patch("app.repositories.media_refresh_queue.time.time", return_value=now), patch(
+            "app.services.clear_dashboard_cache",
+        ):
+            coordinator._process_group(claimed)
+        groups = json.loads(db.kv_get("media_refresh_queue:v1"))["groups"]
+        return coordinator, list(groups.values())
 
-                groups = json.loads(db.kv_get("media_refresh_queue:v1"))["groups"]
-                self.assertEqual(
-                    [path for group in groups.values() for path in group["pending_paths"]], remaining,
-                )
-                self.assertEqual([group["due_at"] for group in groups.values()], [due_at] if due_at else [])
+    def test_unmatched_paths_drop_only_deleted_strm_paths_and_keep_missing_mappings(self):
+        # 生产事故：旧布局已删除的 4463 个路径永远匹配不到媒体库，曾被每 16 分钟重放；
+        # 但文件仍在、只是缺映射的路径（如未映射的综艺目录）必须保留，修好映射后自动刷新。
+        with tempfile.TemporaryDirectory() as root:
+            obsolete = f"{root}/光鸭云盘/NSFW/old"
+            unmapped = f"{root}/光鸭云盘/整理/综艺/节目/S01E01.strm"
+            Path(unmapped).parent.mkdir(parents=True)
+            Path(unmapped).write_text("x")
+            server_only = "/server-only/剧集/作品/E01.strm"
+            cases = {
+                "已删除的 STRM 旧路径确认出队": (
+                    {"scope": "skipped", "unmatched_paths": [obsolete]}, [obsolete], [], None, "",
+                ),
+                "文件仍在的缺映射路径保留并单列": (
+                    {"scope": "skipped", "unmatched_paths": [unmapped]}, [unmapped], [unmapped], 1060,
+                    "MediaRefreshUnmapped",
+                ),
+                "无法证明已删除的服务端路径保留": (
+                    {"scope": "skipped", "unmatched_paths": [server_only]}, [server_only], [server_only], 1060,
+                    "MediaRefreshUnmapped",
+                ),
+                "正常刷新照常确认不被缺映射拖住": (
+                    {"scope": "item", "succeeded_paths": ["/media/new"], "succeeded_target_ids": ["ep"],
+                     "unmatched_paths": [obsolete, unmapped]},
+                    ["/media/new", obsolete, unmapped], [unmapped], 1060, "MediaRefreshUnmapped",
+                ),
+                "去重等待不被拖成失败退避": (
+                    {"scope": "deduplicated", "deduplicated": 1, "unmatched_paths": [obsolete]},
+                    ["/media/new", obsolete], ["/media/new"], 190, "",
+                ),
+                "可重试失败只保留可刷新路径": (
+                    {"scope": "item", "retryable": True, "fallback": "1 个刷新请求失败，将重试",
+                     "unmatched_paths": [obsolete]},
+                    ["/media/new", obsolete], ["/media/new"], 1060, "MediaRefreshRetryable",
+                ),
+            }
+            for label, (outcome, paths, remaining, due_at, error_type) in cases.items():
+                with self.subTest(label):
+                    clear_media_refresh_queue()
+                    coordinator, groups = self._settle_unmatched(root, outcome, paths=paths)
+                    self.assertEqual([path for group in groups for path in group["pending_paths"]], remaining)
+                    self.assertEqual([group["due_at"] for group in groups], [due_at] if due_at else [])
+                    self.assertEqual(coordinator._last_error_type, error_type)
+
+            # 补上映射后，保留的路径在下一轮被正常刷新并出队。
+            clear_media_refresh_queue()
+            self._settle_unmatched(root, {"scope": "skipped", "unmatched_paths": [unmapped]}, paths=[unmapped])
+            _coordinator, groups = self._settle_unmatched(root, {
+                "ok": True, "scope": "item", "succeeded_paths": [unmapped], "succeeded_target_ids": ["ep"],
+            }, paths=[], now=1060)
+            self.assertEqual(groups, [])
 
     def test_disabled_provider_keeps_refresh_pending(self):
         enqueue_media_refresh(
