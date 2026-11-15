@@ -96,7 +96,6 @@ class SecretInputUIContractTests(unittest.TestCase):
                 re.S,
             ),
         )
-        self.assertIn('.secret-input-toggle:focus-visible', self.styles)
 
     def test_all_current_password_surfaces_load_shared_enhancement(self):
         expected = {

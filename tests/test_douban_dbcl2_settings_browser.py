@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from jinja2 import Environment
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import expect, sync_playwright
 except ImportError:  # pragma: no cover - 浏览器依赖可选
     sync_playwright = None
 
@@ -163,6 +163,31 @@ class DoubanDbcl2SettingsBrowserTests(unittest.TestCase):
                 self.assertEqual(status.text_content(), "· 未确认")
                 self.assertEqual(status.get_attribute("data-tone"), "unknown")
                 self.assertAlmostEqual(before["width"], self._rect(status)["width"], delta=0.5)
+
+                toggle = cookie.locator("..").locator(".secret-input-toggle")
+                controls = (cookie, toggle, status, page.locator('#settings-panel-discovery [data-save-settings]'))
+                cookie.evaluate("""input => {
+                    window.__secretFormSubmits = 0;
+                    input.form.addEventListener('submit', () => window.__secretFormSubmits++);
+                }""")
+                for key, input_type, pressed in (("Space", "text", "true"), ("Enter", "password", "false")):
+                    # 进入键盘模式，验证显隐按钮的公共焦点样式及原生键盘激活。
+                    page.keyboard.press("Tab")
+                    toggle.focus()
+                    expect(toggle).to_be_focused()
+                    self.assertTrue(toggle.evaluate('button => button.matches(":focus-visible")'))
+                    expect(toggle).not_to_have_css("outline-style", "none")
+                    self.assertGreater(float(toggle.evaluate('el => getComputedStyle(el).outlineWidth').removesuffix('px')), 0)
+                    geometry = [self._rect(control) for control in controls]
+                    page.keyboard.press(key)
+                    expect(cookie).to_have_attribute("type", input_type)
+                    expect(toggle).to_have_attribute("aria-pressed", pressed)
+                    expect(cookie).to_have_value("test-cookie-value")
+                    self.assertEqual(page.evaluate("window.__secretFormSubmits"), 0)
+                    self.assertEqual(page.evaluate("window.__settingsWrites"), [])
+                    for control, rect in zip(controls, geometry):
+                        for dimension, value in self._rect(control).items():
+                            self.assertAlmostEqual(rect[dimension], value, delta=0.5)
                 self.assertEqual(page.evaluate("window.__doubanStatusCalls.length"), 1)
                 self.assertEqual(errors, [])
 
