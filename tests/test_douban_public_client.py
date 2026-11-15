@@ -17,6 +17,7 @@ from app.discovery.models import (
     ProviderTimeout,
     ProviderUnavailable,
 )
+from app.discovery.providers.douban import DoubanProvider
 
 
 class FakeCookies:
@@ -557,7 +558,7 @@ class DoubanPublicClientTests(unittest.TestCase):
 
         self.assertEqual(session.calls[0][0], "https://movie.douban.com/cinema/nowplaying/")
         self.assertEqual(page.source, "public-html")
-        self.assertTrue(page.has_more)
+        self.assertFalse(page.has_more)
         self.assertEqual(page.items[0]["id"], "35267208")
         self.assertEqual(page.items[0]["title"], "流浪地球 2")
         self.assertEqual(page.items[0]["year"], "2023")
@@ -565,6 +566,28 @@ class DoubanPublicClientTests(unittest.TestCase):
         self.assertEqual(page.items[0]["overview"], "中国大陆 / 科幻")
         self.assertNotIn("evil", repr(page.items))
         self.assertNotIn("<", repr(page.items))
+
+    def test_html_list_pagination_preserves_every_reachable_card(self):
+        items = [f'<li data-subject="{i}" data-title="电影{i}"></li>' for i in range(1, 22)]
+        body = '<ul>' + ''.join([*items, items[0], '<li data-title="无效条目"></li>']) + '</ul>'
+        body += '<a class="next" href="?page=2">后页</a>'
+        for category in ("movie_showing", "movie_soon", "movie_top250"):
+            with self.subTest(category=category):
+                client, session = self.make_client(FakeResponse(body, content_type="text/html"))
+                provider = DoubanProvider(
+                    enabled=True, public_client=client, api_key="", api_secret="", dbcl2="",
+                )
+                self.addCleanup(provider.close)
+                page = provider.list_items(category, "movie", 1, {})
+                paginated = category == "movie_top250"
+                self.assertEqual([item.external_id for item in page.items],
+                                 [str(i) for i in range(1, 21 if paginated else 22)])
+                self.assertEqual(page.has_more, paginated)
+                self.assertEqual(page.provider.status, "healthy")
+                if not paginated:
+                    with self.assertRaisesRegex(ProviderInvalidResponse, "不支持分页"):
+                        client.list_items(category, "movie", 2, {})
+                self.assertEqual(len(session.calls), 1)
 
     def test_coming_and_top250_html_use_fixed_paths_and_extract_fields(self):
         client, session = self.make_client(

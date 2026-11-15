@@ -997,10 +997,9 @@ class DoubanPublicClient:
             deduplicated.append(normalized)
         if not deduplicated:
             raise ProviderInvalidResponse("豆瓣公共榜单结构无效")
-        has_more = parser.has_more or len(deduplicated) > self.page_size
         return DoubanPublicPage(
-            items=tuple(deduplicated[: self.page_size]),
-            has_more=has_more,
+            items=tuple(deduplicated[: self.page_size] if params is not None else deduplicated),
+            has_more=params is not None and (parser.has_more or len(deduplicated) > self.page_size),
             source="public-html",
         )
 
