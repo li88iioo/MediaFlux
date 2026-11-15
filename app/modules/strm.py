@@ -1794,10 +1794,8 @@ def _sync_strm_incremental_impl(
 
     video_key = f"guangya:{source_dir_id}"
     metadata_key = f"guangya-meta:{source_dir_id}"
-    video_by_id, video_by_path = _build_video_index_maps(strm_repo.list_strm_index(video_key))
-    metadata_by_id, metadata_by_path = _build_video_index_maps(
-        strm_repo.list_strm_index(metadata_key)
-    )
+    video_by_id: dict[str, Any] = {}
+    video_by_path: dict[str, dict[str, Any]] = {}
     upserts = [item for item in normalized.values() if item["action"] == "upsert"]
     total_work = len(normalized)
     completed = 0
@@ -1858,6 +1856,13 @@ def _sync_strm_incremental_impl(
                     change["action"] = "remove"
                     continue
                 expected = _strm_target(file, rel_dir, strm_root)
+                # 仅装载本项及目标冲突；保留本批已核验但尚未补写的指纹，
+                # 后续互相迁移/覆盖不能用数据库中的旧快照替换它。
+                for row in strm_repo.list_strm_installation_rows(video_key, file.file_id, str(expected)):
+                    owner_id = str(row["file_id"])
+                    if owner_id and owner_id not in video_by_id:
+                        video_by_id[owner_id] = row
+                        video_by_path.setdefault(str(row["strm_path"] or ""), {})[owner_id] = row
                 current = video_by_id.get(file_id)
                 expected_url = build_play_url(
                     base_url, file.file_id, file.etag, file.size, file.name
@@ -1911,7 +1916,7 @@ def _sync_strm_incremental_impl(
                 if ext not in metadata:
                     raise RuntimeError("精准增量对象不属于已配置伴随文件类型")
                 expected = _metadata_target(file, rel_dir, strm_root)
-                current = metadata_by_id.get(file_id)
+                current = next(iter(strm_repo.list_strm_index(metadata_key, only_file_ids={file_id})), None)
                 if current and _metadata_state_matches(current, file, expected):
                     stats["metadata_skipped"] += 1
                     pending_resolutions["metadata"][file_id] = (file, rel_dir)
@@ -1955,25 +1960,16 @@ def _sync_strm_incremental_impl(
             file_id = str(change["file_id"])
             try:
                 source_key = metadata_key if kind == "metadata" else video_key
-                by_id = metadata_by_id if kind == "metadata" else video_by_id
-                by_path = metadata_by_path if kind == "metadata" else video_by_path
                 if kind == "metadata":
                     strm_repo.cancel_strm_metadata_job(
                         source_dir_id, file_id,
                         reason="精准增量确认远端元数据已删除",
                     )
-                current = by_id.get(file_id)
-                cleanup = _remove_indexed_rows(source_key, [current] if current is not None else [],
+                rows = strm_repo.list_strm_index(source_key, only_file_ids={file_id})
+                cleanup = _remove_indexed_rows(source_key, rows,
                     strm_root, refresh_policy=refresh_policy)
                 if cleanup["errors"]:
                     raise cleanup["errors"][0][1]
-                if current is not None:
-                    by_id.pop(file_id, None)
-                    path_text = str(current["strm_path"] or "")
-                    bucket = by_path.get(path_text, {})
-                    bucket.pop(file_id, None)
-                    if not bucket:
-                        by_path.pop(path_text, None)
                 if kind == "metadata":
                     stats["metadata_cleaned"] += cleanup["cleaned"]
                 else:

@@ -6,6 +6,7 @@ from app.clients.guangya import GuangYaClient
 import hashlib
 import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,7 @@ from app.modules.strm import (
     sync_strm,
     sync_strm_incremental,
 )
-from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin
+from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin, isolated_test_database
 
 
 class _IncrementalClient(PagedDirectoryTestMixin):
@@ -207,6 +208,72 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(client.list_calls, 0)
         self.assertEqual(client.file_info_calls, 3)
         self.assertEqual(len(generated), 1)
+
+    def test_incremental_index_work_is_bounded_by_changes_not_source_size(self):
+        for kind, action in (("video", "upsert"), ("video", "remove"),
+                             ("metadata", "upsert"), ("metadata", "remove")):
+            with self.subTest(kind=kind, action=action):
+                costs = []
+                for background in (400, 4000):
+                    with isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                        source = "incremental-cost"
+                        namespace = f"guangya{'-meta' if kind == 'metadata' else ''}:{source}"
+                        file = GuangYaFile("changed", "Movie.mkv" if kind == "video" else "Movie.nfo",
+                                           False, 1024, "etag", source)
+                        if kind == "video":
+                            target = generate_strm(file, "", "http://media.invalid", root)
+                        else:
+                            target = Path(root) / STRM_SUBDIR / file.name
+                            target.parent.mkdir(parents=True)
+                            target.write_bytes(b"m" * file.size)
+                        strm_repo.upsert_strm_index(
+                            namespace, file.file_id, file.etag, file.size, file.name,
+                            str(target), self._fingerprint(target),
+                        )
+                        with db.get_conn() as conn:
+                            conn.executemany(
+                                "INSERT INTO strm_index(source,file_id,strm_path,created_at) VALUES(?,?,?,?)",
+                                ((f"{prefix}:{source}", f"background-{i}", str(Path(root) / f"unused-{i}"), db.now())
+                                 for prefix in ("guangya", "guangya-meta") for i in range(background)),
+                            )
+                        real_get_conn = db.get_conn
+                        steps = [0]
+
+                        @contextmanager
+                        def measured():
+                            with real_get_conn() as conn:
+                                # 排除每个新连接的 schema prepare，不改变业务查询计划。
+                                conn.execute("SELECT 1 FROM strm_index LIMIT 0").fetchall()
+
+                                def count():
+                                    steps[0] += 1
+                                    return 0
+
+                                conn.set_progress_handler(count, 1)
+                                yield conn
+
+                        client = _IncrementalClient({file.file_id: file})
+                        with patch.object(db, "get_conn", measured):
+                            stats = sync_strm_incremental(
+                                source, [{"source_id": source, "kind": kind, "action": action,
+                                          "file_id": file.file_id, "name": file.name, "parent_id": source}],
+                                "http://media.invalid", root, client=cast(GuangYaClient, client),
+                                metadata_exts={"nfo"},
+                            )
+                        self.assertFalse(stats["fallback_required"], stats)
+                        self.assertEqual(target.exists(), action == "upsert")
+                        self.assertEqual(stats["skipped" if kind == "video" else "metadata_skipped"],
+                                         int(action == "upsert"))
+                        self.assertEqual(stats["cleaned" if kind == "video" else "metadata_cleaned"],
+                                         int(action == "remove"))
+                        self.assertEqual(client.list_calls, 0)
+                        with db.get_conn() as conn:
+                            self.assertEqual(conn.execute(
+                                "SELECT COUNT(*) FROM strm_index WHERE file_id LIKE 'background-%'",
+                            ).fetchone()[0], 2 * background)
+                        costs.append(steps[0])
+                self.assertLessEqual(costs[1], costs[0] * 2 + 500,
+                                     f"相同单项变化不应随无关索引线性增长，SQLite steps={costs}")
 
     def test_incremental_threshold_retires_indexed_file_and_refreshes_old_path(self):
         source_id = "incremental-threshold-existing"
@@ -660,27 +727,65 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["failed"], 1)
         self.assertIn("名称已变化", stats["fallback_reason"])
 
-    def test_full_sync_deletes_every_index_conflict_for_same_target_path(self):
+    def test_sync_deletes_every_index_conflict_for_same_target_path(self):
         source_id = "multi-conflict"
         source_key = f"guangya:{source_id}"
         winner = GuangYaFile("winner", "Movie.mkv", False, 300, "winner", source_id)
-        with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / STRM_SUBDIR / "Movie.strm"
-            target.parent.mkdir(parents=True)
-            target.write_text("old", encoding="utf-8")
-            for file_id in ("old-a", "old-b"):
-                strm_repo.upsert_strm_index(
-                    source_key, file_id, "old", 1, "Movie.mkv", str(target),
-                    f"sha256:{hashlib.sha256(b'old').hexdigest()}",
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                target = Path(root) / STRM_SUBDIR / "Movie.strm"
+                target.parent.mkdir(parents=True)
+                target.write_text("old", encoding="utf-8")
+                for file_id in ("old-a", "old-b"):
+                    strm_repo.upsert_strm_index(
+                        source_key, file_id, "old", 1, "Movie.mkv", str(target),
+                        f"sha256:{hashlib.sha256(b'old').hexdigest()}",
+                    )
+                stats = sync_strm_incremental(
+                    source_id, [{"source_id": source_id, "file_id": winner.file_id}],
+                    "http://media.invalid", root,
+                    client=cast(GuangYaClient, _IncrementalClient({winner.file_id: winner})),
+                ) if incremental else sync_strm(
+                    source_id, "http://media.invalid", root,
+                    client=cast(GuangYaClient, _TreeClient({source_id: [winner]})),
                 )
-            stats = sync_strm(
-                source_id, "http://media.invalid", root,
-                client=cast(GuangYaClient, _TreeClient({source_id: [winner]})),
-            )
-            rows = strm_repo.list_strm_index(source_key)
+                rows = strm_repo.list_strm_index(source_key)
+                self.assertEqual(stats["generated"], 1)
+                self.assertEqual([row["file_id"] for row in rows], ["winner"])
 
-        self.assertEqual(stats["generated"], 1)
-        self.assertEqual([row["file_id"] for row in rows], ["winner"])
+    def test_incremental_mutual_rename_keeps_latest_owners_and_relative_old_paths(self):
+        source = "incremental-swap"
+        namespace = f"guangya:{source}"
+        old_files = [GuangYaFile("a", "A.mkv", False, 100, "a", source),
+                     GuangYaFile("b", "B.mkv", False, 100, "b", source)]
+        new_files = [GuangYaFile("a", "B.mkv", False, 100, "new-a", source),
+                     GuangYaFile("b", "A.mkv", False, 100, "new-b", source)]
+        client = _IncrementalClient({file.file_id: file for file in new_files})
+        with tempfile.TemporaryDirectory() as root:
+            for file in old_files:
+                target = generate_strm(file, "Movie", "http://media.invalid", root)
+                stored = str(target.relative_to(root)) if file.file_id == "a" else str(target)
+                strm_repo.upsert_strm_index(
+                    namespace, file.file_id, file.etag, file.size, file.name,
+                    stored, self._fingerprint(target),
+                )
+            stats = sync_strm_incremental(
+                source, [{"source_id": source, "file_id": f" {file.file_id} " if file.file_id == "a" else file.file_id,
+                          "rel_dir": "Movie"}
+                         for file in new_files],
+                "http://media.invalid", root, client=cast(GuangYaClient, client),
+            )
+            self.assertFalse(stats["fallback_required"], stats)
+            self.assertEqual(stats["generated"], 2)
+            self.assertEqual(stats["updated"], 1)
+            self.assertEqual(stats["created"], 1)
+            rows = {row["file_id"]: row for row in strm_repo.list_strm_index(namespace)}
+            self.assertEqual(set(rows), {"a", "b"})
+            for file in new_files:
+                target = Path(rows[file.file_id]["strm_path"])
+                expected = generate_strm(file, "Expected", "http://media.invalid", root)
+                self.assertEqual(target.read_bytes(), expected.read_bytes())
+                self.assertEqual(rows[file.file_id]["content_fingerprint"], self._fingerprint(target))
 
     def test_scheduler_routes_trusted_organize_changes_to_incremental(self):
         scheduler = self._new_scheduler()
