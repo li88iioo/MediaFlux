@@ -678,7 +678,10 @@ class GuangYaTokenClientTests(unittest.TestCase):
             token_file = self._token_file(directory, expires_at=time() - 1)
             with patch("app.clients.guangya._load_raw", return_value=SlowRefreshRaw):
                 client = GuangYaClient(token_file=token_file)
-            with patch.object(guangya_module, "monotonic", side_effect=lambda: clock[0]):
+            with (
+                patch.object(guangya_module, "monotonic", side_effect=lambda: clock[0]),
+                patch.dict(guangya_module._READ_CONGESTION, {}, clear=True),
+            ):
                 with self.assertRaises(TimeoutError):
                     client.get_download_url("file-id", timeout=1.0, raise_timeout=True)
             self.assertEqual(json.loads(token_file.read_text())["access_token"], "rotated-access-9999")

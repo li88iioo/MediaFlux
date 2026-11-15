@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 from app import database as db
 from app.repositories import strm as strm_repo
 from app.clients.guangya import GuangYaClient
@@ -42,9 +44,12 @@ class TokenRawClient:
         return {"code": 0, "data": {"fileId": file_id, "fileName": "Movie.nfo",
                                    "resType": 1, "size": 8, "etag": "v1", "parentId": "source"}}
 
-    def download_url(self, file_id):
+    def request(self, url, method="GET", **kwargs):
+        assert url == "https://api.guangyapan.com/nd.bizuserres.s/v1/get_res_download_url"
+        assert method == "POST"
+        assert kwargs["json"] == {"fileId": "meta"}
         self.download_calls += 1
-        return {"code": 0, "data": {"signedURL": "https://metadata.invalid/file"}}
+        return httpx.Response(200, json={"code": 0, "data": {"signedURL": "https://metadata.invalid/file"}})
 
     def close(self):
         self.closed += 1
