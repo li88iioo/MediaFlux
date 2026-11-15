@@ -580,7 +580,7 @@ class _QBSubmissionOptions(TypedDict, total=False):
     category: str
     runtime_config: dict[str, Any]
     task_id_hint: str
-    check_cancelled: Callable[[], None]
+    can_proceed: Callable[[], bool]
 
 
 class _GuangYaSubmissionOptions(TypedDict, total=False):
@@ -588,7 +588,7 @@ class _GuangYaSubmissionOptions(TypedDict, total=False):
     target_dir_id: str
     target_dir_name: str
     qb_runtime_config: dict[str, Any]
-    check_cancelled: Callable[[], None]
+    can_proceed: Callable[[], bool]
 
 
 def _qb_client_options(runtime_config: dict[str, Any] | None) -> dict[str, Any]:
@@ -1295,27 +1295,31 @@ def _dispatch_claimed_targets(
         qb_identity = ""
     qb_lease = qb_submission_write_lease([qb_identity]) if qb_identity else qb_control_write_lease()
 
-    def before_submission():
+    cancelled: asyncio.CancelledError | None = None
+
+    def before_submission() -> bool:
+        nonlocal cancelled
+        if cancelled is not None:
+            return False
         try:
             if check_cancelled is not None:
                 check_cancelled()
-        except asyncio.CancelledError:
-            # 只由已知的发出前检查收尾；后端自身取消仍按原未知结果处理。
-            for name in claimed_targets[index:]:
-                download_requests_repo.finalize_download_request_submission(request_id, (name,),
-                    **{("qb_status" if name == "qb" else "gy_status"): "failed"},
-                    error=f"{name}: 操作已取消，未提交下载后端")
-            raise
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            return False
+        return True
 
     if check_cancelled is not None:
-        qb_options["check_cancelled"] = guangya_options["check_cancelled"] = before_submission
-    for index, source in enumerate(claimed_targets):
+        qb_options["can_proceed"] = guangya_options["can_proceed"] = before_submission
+    for source in claimed_targets:
         # 远端任务从出现到身份落盘必须与用户移除串行；不能只保护 add，
         # 也不能为等待另一后端的回执长期占用 qB 控制 writer。
         with qb_lease if source == "qb" else nullcontext():
-            before_submission()
+            proceed = before_submission()
             try:
-                result: dict[str, Any] = submissions[source]()
+                result: dict[str, Any] = submissions[source]() if proceed else {
+                    "ok": False, "error": "操作已取消，未提交下载后端",
+                }
                 if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
                     raise ValueError("invalid backend submission receipt")
             except Exception as exc:
@@ -1331,7 +1335,10 @@ def _dispatch_claimed_targets(
             updates: dict[str, Any] = {
                 "error": "" if result.get("ok") else f"{source}: {result.get('error', '提交失败')}",
             }
-            if source == "qb":
+            if cancelled is not None and not (result.get("staging") or {}).get("id"):
+                # 未发出也未新建目录时只结算目标状态，保留已有任务/隔离身份。
+                updates["qb_status" if source == "qb" else "gy_status"] = "failed"
+            elif source == "qb":
                 updates["qb_status"] = _backend_submission_status(source, result)
                 updates["qb_task_id"] = result.get("task_id") or (
                     torrent_identity(row) if updates["qb_status"] == "outcome_unknown" else ""
@@ -1403,6 +1410,8 @@ def _dispatch_claimed_targets(
                 logger.warning("下载日志写入失败，保留已持久化请求 request=%s backend=%s type=%s",
                                request_id, source, type(exc).__name__)
 
+    if cancelled is not None:
+        raise cancelled
     succeeded = [name for name, result in results.items() if result.get("ok")]
     failed = [name for name, result in results.items() if not result.get("ok")]
     has_unknown = _submission_has_unknown(results)
@@ -1696,7 +1705,7 @@ def _submit_qb(
     category: str | None = None,
     runtime_config: dict[str, Any] | None = None,
     task_id_hint: str = "",
-    check_cancelled: Callable[[], None] | None = None,
+    can_proceed: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     runtime = runtime_config if isinstance(runtime_config, dict) else None
     options = _qb_client_options(runtime)
@@ -1723,8 +1732,8 @@ def _submit_qb(
     if not torrents and public_title is not None:
         urls = augment_public_magnet(urls, public_title)
     try:
-        if check_cancelled is not None:
-            check_cancelled()
+        if can_proceed is not None and not can_proceed():
+            return {"ok": False, "error": "操作已取消，未提交下载后端"}
         result = client.add_torrent_detailed(
             urls=urls,
             save_path=resolved_save_path,
@@ -1763,7 +1772,7 @@ def _submit_qb(
 def _submit_guangya(
     row, *, target_dir_id: str = "", target_dir_name: str = "",
     qb_runtime_config: dict[str, Any] | None = None,
-    check_cancelled: Callable[[], None] | None = None,
+    can_proceed: Callable[[], bool] | None = None,
     expected_credential_generation: int | None = None,
 ) -> dict[str, Any]:
     from app.modules.organize_sources import list_nsfw_download_sources
@@ -1793,8 +1802,8 @@ def _submit_guangya(
             display_title=str(row["display_title"] or ""),
         ), "guangya")
         torrent_data = item.torrent_data
-        if check_cancelled is not None:
-            check_cancelled()
+        if can_proceed is not None and not can_proceed():
+            return {"ok": False, "error": "操作已取消，未提交下载后端"}
         if torrent_data is not None:
             from app.repositories.download_requests import (
                 bind_verified_torrent_identity,
@@ -1810,6 +1819,9 @@ def _submit_guangya(
                     "error": f"相同BT内容已由请求 #{owner} 处理，未重复提交",
                 }
 
+    if can_proceed is not None and not can_proceed():
+        return {"ok": False, "error": "操作已取消，未提交下载后端"}
+
     def persist_staging(snapshot: dict) -> None:
         parent_name = str(snapshot.get("parent_name") or target_dir_name or "指定目标目录")
         staging_name = str(snapshot.get("name") or "")
@@ -1822,8 +1834,6 @@ def _submit_guangya(
         ):
             raise RuntimeError("下载请求已失效，拒绝绑定隔离目录")
 
-    if check_cancelled is not None:
-        check_cancelled()
     client = GuangYaClient() if expected_credential_generation is not None else None
     try:
         if client is not None and (
@@ -1843,6 +1853,7 @@ def _submit_guangya(
             torrent_data=torrent_data,
             on_staging_created=persist_staging,
             public_magnet_title=_public_magnet_title(row),
+            can_proceed=can_proceed,
         )
     finally:
         close_guangya_client(client)

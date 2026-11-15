@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -471,7 +471,8 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                    isolate_task: bool = False, task_key: str = "",
                    torrent_data: bytes | None = None,
                    public_magnet_title: str | None = None,
-                   on_staging_created: Callable[[dict], None] | None = None) -> dict:
+                   on_staging_created: Callable[[dict], None] | None = None,
+                   can_proceed: Callable[[], bool] | None = None) -> dict:
     """按正式离线规则提交任务。
 
     自动入口先解析文件树并强制应用仅视频扩展名、排除词和最小体积。
@@ -549,135 +550,93 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 "error": "资源中没有符合仅视频规则的文件" + (f"（{detail}）" if detail else ""),
             }
 
-        staging_id = ""
-        staging_name = ""
+        staging: dict[str, Any] = {"id": "", "parent_id": decision.target_dir_id or "0", "name": "", "isolated": False}
         effective = decision
-        if isolate_task:
+        error = "操作已取消，未提交下载后端" if can_proceed is not None and not can_proceed() else ""
+        if isolate_task and not error:
             staging_name = _offline_staging_name(title, task_key)
             try:
                 staging_id = (client.create_dir(staging_name, decision.target_dir_id) or "")
+                if not staging_id:
+                    return {"ok": False, "decision": decision.as_dict(), "error": "创建任务隔离目录失败"}
+                staging.update(id=staging_id, name=staging_name, isolated=True)
+                effective = OfflineDecision(
+                    True, decision.protocol, staging_id,
+                    f"{decision.target_dir_name} / {staging_name}",
+                    "使用任务隔离目录", decision.matched_keyword,
+                )
+                if on_staging_created is not None:
+                    on_staging_created({**staging, "parent_name": decision.target_dir_name or ""})
             except Exception as exc:
-                return {
-                    "ok": False, "decision": decision.as_dict(),
-                    "error": f"创建任务隔离目录失败: {exc}",
-                }
-            if not staging_id:
-                return {
-                    "ok": False, "decision": decision.as_dict(),
-                    "error": "创建任务隔离目录失败",
-                }
-            effective = OfflineDecision(
-                True, decision.protocol, staging_id,
-                f"{decision.target_dir_name} / {staging_name}",
-                "使用任务隔离目录", decision.matched_keyword,
-            )
-            if on_staging_created is not None:
-                staging_snapshot = {
-                    "id": staging_id,
-                    "parent_id": (decision.target_dir_id or "0"),
-                    "parent_name": (decision.target_dir_name or ""),
-                    "name": staging_name,
-                    "isolated": True,
-                }
-                try:
-                    on_staging_created(dict(staging_snapshot))
-                except Exception as exc:
-                    cleanup_status, cleanup_error = _remove_empty_staging(
-                        client,
-                        staging_id,
-                        expected_parent_id=(decision.target_dir_id or "0"),
-                        expected_name=staging_name,
-                    )
-                    logger.warning(
-                        "持久化光鸭隔离目录失败 task=%s type=%s",
-                        (task_key or ""),
-                        type(exc).__name__,
-                    )
-                    return {
-                        "ok": False,
-                        "decision": effective.as_dict(),
-                        "staging": {
-                            **staging_snapshot,
-                            "cleanup_status": cleanup_status,
-                            "cleanup_error": cleanup_error,
-                        },
-                        "error": "持久化任务隔离目录失败，未提交离线任务",
-                    }
+                if not staging["id"]:
+                    return {"ok": False, "decision": decision.as_dict(), "error": f"创建任务隔离目录失败: {exc}"}
+                logger.warning("持久化光鸭隔离目录失败 task=%s type=%s", task_key or "", type(exc).__name__)
+                staging["parent_name"] = decision.target_dir_name or ""
+                error = "持久化任务隔离目录失败，未提交离线任务"
 
         # 单文件根资源的0是本地规则筛选索引，不是服务端选集索引。
         # 只依据同一严格解析器确认根资源，不能把“多文件里只选一个”当成单文件。
         single_file = single_bt_root_file(resolution.response) is not None
         selection_mode = "single_file" if single_file else "files" if choices else "legacy"
-        try:
-            created = (
-                client.add_offline_selection(url, effective.target_dir_id, selected)
-                if selection_mode == "files"
-                else client.add_offline_task(
-                    url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
+        result: dict[str, Any] = {"ok": False, "error": error}
+        if not error and can_proceed is not None and not can_proceed():
+            result["error"] = "操作已取消，未提交下载后端"
+        elif not error:
+            try:
+                created = (
+                    client.add_offline_selection(url, effective.target_dir_id, selected)
+                    if selection_mode == "files"
+                    else client.add_offline_task(
+                        url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
+                    )
                 )
-            )
-            if isinstance(created, dict):
-                ok = bool(created.get("ok"))
-                task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
-                batch_count = int(created.get("batch_count") or (1 if ok else 0))
-                completed_batches = int(created.get("completed_batches") or (batch_count if ok else 0))
-                partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
-                outcome_unknown = bool(created.get("outcome_unknown"))
-                tracking_incomplete = bool(created.get("tracking_incomplete"))
-                create_error = str(created.get("error") or "")
+                if isinstance(created, dict):
+                    ok = bool(created.get("ok"))
+                    task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
+                    batch_count = int(created.get("batch_count") or (1 if ok else 0))
+                    completed_batches = int(created.get("completed_batches") or (batch_count if ok else 0))
+                    partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
+                    outcome_unknown = bool(created.get("outcome_unknown"))
+                    tracking_incomplete = bool(created.get("tracking_incomplete"))
+                    create_error = str(created.get("error") or "")
+                else:
+                    ok = bool(created)
+                    task_ids = []
+                    batch_count = completed_batches = 1 if ok else 0
+                    partial_success = outcome_unknown = tracking_incomplete = False
+                    create_error = ""
+                result = {
+                    "ok": ok,
+                    "selection_mode": selection_mode,
+                    "unverified_manifest": False,
+                    "resolve_attempts": resolution.attempts,
+                    "selected_count": len(selected), "excluded_count": len(choices) - len(selected),
+                    "task_ids": task_ids, "batch_count": batch_count,
+                    "completed_batches": completed_batches, "partial_success": partial_success,
+                    "outcome_unknown": outcome_unknown,
+                    "tracking_incomplete": tracking_incomplete,
+                    "error": "" if ok else (create_error or "光鸭任务创建失败"),
+                }
+            except Exception as exc:
+                # 请求异常无法证明服务端未受理；宁可保留空目录供后续核验，也不能
+                # 删除一个远端可能仍会异步写入的任务目标。
+                result = {
+                    "ok": False,
+                    "outcome_unknown": True,
+                    "error": f"光鸭任务创建失败: {exc}",
+                }
+        cleanup_status, cleanup_error = ("pending" if staging["id"] else ""), ""
+        # 取消、持久化失败和明确拒绝共用无受理收尾；accepted/unknown 目录不能回收。
+        if not result["ok"]:
+            if any(result.get(key) for key in ("partial_success", "outcome_unknown", "tracking_incomplete")):
+                cleanup_status = "retained" if staging["id"] else ""
+                cleanup_error = "提交结果待核对，已保留隔离目录" if staging["id"] else ""
             else:
-                ok = bool(created)
-                task_ids = []
-                batch_count = completed_batches = 1 if ok else 0
-                partial_success = outcome_unknown = tracking_incomplete = False
-                create_error = ""
-            staging_cleanup_status = "pending" if staging_id else ""
-            staging_cleanup_error = ""
-            # 三类提交共用受理判断。只要已有任务或回执不明，就不能删除可能仍会写入的目录。
-            if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
-                staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
-                    client,
-                    staging_id,
-                    expected_parent_id=(decision.target_dir_id or "0"),
-                    expected_name=staging_name,
+                cleanup_status, cleanup_error = _remove_empty_staging(
+                    client, staging["id"], expected_parent_id=staging["parent_id"], expected_name=staging["name"],
                 )
-            elif not ok and staging_id:
-                staging_cleanup_status = "retained"
-                staging_cleanup_error = "提交结果待核对，已保留隔离目录"
-            return {
-                "ok": ok, "decision": effective.as_dict(),
-                "selection_mode": selection_mode,
-                "unverified_manifest": False,
-                "resolve_attempts": resolution.attempts,
-                "selected_count": len(selected), "excluded_count": len(choices) - len(selected),
-                "task_ids": task_ids, "batch_count": batch_count,
-                "completed_batches": completed_batches, "partial_success": partial_success,
-                "outcome_unknown": outcome_unknown,
-                "tracking_incomplete": tracking_incomplete,
-                "staging": {"id": staging_id, "parent_id": (decision.target_dir_id or "0"),
-                            "name": staging_name, "isolated": bool(staging_id),
-                            "cleanup_status": staging_cleanup_status,
-                            "cleanup_error": staging_cleanup_error},
-                "error": "" if ok else (create_error or "光鸭任务创建失败"),
-            }
-        except Exception as exc:
-            # 请求异常无法证明服务端未受理；宁可保留空目录供后续核验，也不能
-            # 删除一个远端可能仍会异步写入的任务目标。
-            cleanup_status = "retained" if staging_id else ""
-            cleanup_error = "提交结果待核对，已保留隔离目录" if staging_id else ""
-            return {
-                "ok": False, "decision": effective.as_dict(),
-                "staging": {
-                    "id": staging_id,
-                    "parent_id": (decision.target_dir_id or "0"),
-                    "name": staging_name,
-                    "isolated": bool(staging_id),
-                    "cleanup_status": cleanup_status,
-                    "cleanup_error": cleanup_error,
-                },
-                "outcome_unknown": True,
-                "error": f"光鸭任务创建失败: {exc}",
-            }
+        staging.update(cleanup_status=cleanup_status, cleanup_error=cleanup_error)
+        return {**result, "decision": effective.as_dict(), "staging": staging}
     finally:
         if owned_client:
             close_guangya_client(client)

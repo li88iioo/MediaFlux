@@ -506,6 +506,53 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
             allowed_exts=("mkv", "mp4"),
         )
 
+    def test_prepared_submission_stop_blocks_files_single_root_and_http_without_creating_staging(self):
+        from tests.test_guangya_single_file_manifest import SINGLE
+
+        for url, payload in (
+            ("magnet:?xt=urn:btih:" + "a" * 40, RESOLVE_SUBFILES_FIXTURE),
+            ("magnet:?xt=urn:btih:" + "a" * 40, SINGLE),
+            ("https://fixture.invalid/Feature.mkv", {}),
+        ):
+            with self.subTest(url=url, single=payload is SINGLE):
+                client = FakeSelectionClient(payload)
+                client.create_dir = Mock()
+                with patch.object(offline.OfflineRules, "from_config", return_value=replace(self.rules, min_file_mb=50)):
+                    result = offline.submit_offline(
+                        url, client=cast(GuangYaClient, client), isolate_task=True,
+                        can_proceed=lambda: False,
+                    )
+                self.assertFalse(result["ok"])
+                self.assertIn("已取消", result["error"])
+                self.assertEqual(len(client.resolve_calls), 1)
+                client.create_dir.assert_not_called()
+                self.assertEqual(client.selection_calls, [])
+                self.assertEqual(client.legacy_calls, [])
+
+    def test_stop_after_staging_persistence_uses_the_same_rollback_once(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        client.create_dir = Mock(return_value="staging-stopped")
+        allowed = True
+
+        def persist(snapshot):
+            nonlocal allowed
+            self.assertEqual(snapshot["id"], "staging-stopped")
+            allowed = False
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules), \
+                patch.object(offline, "_remove_empty_staging", return_value=("retained", "目录非空")) as cleanup:
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:" + "a" * 40, client=cast(GuangYaClient, client),
+                isolate_task=True, on_staging_created=persist, can_proceed=lambda: allowed,
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("已取消", result["error"])
+        self.assertEqual(result["staging"]["cleanup_status"], "retained")
+        self.assertEqual(client.selection_calls, [])
+        cleanup.assert_called_once_with(
+            client, "staging-stopped", expected_parent_id="9001", expected_name=result["staging"]["name"],
+        )
+
     def test_automatic_submit_filters_files_and_uses_isolated_task_directory(self):
         client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
         client.create_dir = Mock(return_value="staging-7")

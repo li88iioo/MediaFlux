@@ -4,6 +4,7 @@ from __future__ import annotations
 import tests  # noqa: F401 - 应用导入前隔离运行路径与数据库
 
 from concurrent.futures import Future
+import asyncio
 import json
 import socket
 import sqlite3
@@ -18,12 +19,14 @@ from app.repositories import rss as rss_repo
 from app.clients.qbittorrent import TorrentAddResult, TorrentTask
 from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
+from app.modules import offline
 from app.modules.download_tracker import DownloadTracker
 from app.modules.process_lock import CrossProcessLock
 from app.modules.qb_control import qb_control_write_lease, remove_qb_tasks
 from app.modules.rss import RSSEngine
 from app.repositories.rss import bind_rss_entry_download
 from tests.support import isolated_test_database
+from tests.test_guangya_offline_selection import FakeSelectionClient, RESOLVE_SUBFILES_FIXTURE
 
 
 class DownloadSubmissionCancellationTests(unittest.TestCase):
@@ -79,7 +82,168 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
         self.client.add_torrent_detailed.return_value = TorrentAddResult(True, task_ids=(torrent_hash,))
         self.client.delete_torrents.side_effect = None
         self.client.delete_torrents.return_value = True
-        return request_id, item, torrent_hash, lambda: operation(request_id, selected)
+        return request_id, item, torrent_hash, lambda **options: operation(request_id, selected, **options)
+
+    def offline_case(self, stop_at, *, cleanup="completed"):
+        stopped = threading.Event()
+        cancellation = asyncio.CancelledError("用户停止了离线准备")
+        cloud = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        cloud.close = Mock(return_value=True)
+        cloud.file_info = Mock()
+        cloud.list_dir = Mock(return_value=[object()] if cleanup == "retained" else [])
+        cloud.supports_guarded_empty_directory_delete = True
+        cloud.delete_empty_directory = Mock(return_value=True)
+        if cleanup == "failed":
+            cloud.delete_empty_directory.side_effect = TimeoutError("回收结果未知")
+        resolve = cloud.resolve_url
+
+        def resolving(url):
+            result = resolve(url)
+            if stop_at == "resolve":
+                stopped.set()
+            return result
+
+        def creating(name, parent):
+            cloud.file_info.return_value = SimpleNamespace(
+                file_id="cancel-stage", parent_id=parent, name=name, is_dir=True,
+                size=0, etag="stage-v1", updated_at=100,
+            )
+            if stop_at == "create":
+                stopped.set()
+            return "cancel-stage"
+
+        cloud.resolve_url = Mock(side_effect=resolving)
+        cloud.create_dir = Mock(side_effect=creating)
+
+        def check_cancelled():
+            if stopped.is_set():
+                raise cancellation
+
+        return cloud, stopped, cancellation, check_cancelled
+
+    @staticmethod
+    def use_offline(cloud):
+        return patch.object(dispatcher, "submit_offline", side_effect=lambda *args, **kwargs: offline.submit_offline(
+            *args, client=cloud, **kwargs,
+        ))
+
+    def test_offline_resolve_cancellation_closes_each_admission_without_overwriting_qb(self):
+        for path in ("first", "supplement", "retry", "successor"):
+            with self.subTest(path=path):
+                _request_id, _item, torrent_hash, operation = self.prepare(path, target="both")
+                cloud, _stopped, cancellation, check = self.offline_case("resolve")
+                with self.use_offline(cloud), self.assertRaises(asyncio.CancelledError) as raised:
+                    operation(check_cancelled=check)
+                self.assertIs(raised.exception, cancellation)
+                cloud.create_dir.assert_not_called()
+                self.assertEqual(cloud.selection_calls, [])
+                self.assertEqual(cloud.legacy_calls, [])
+                with db.get_conn() as conn:
+                    row = conn.execute("SELECT * FROM download_requests ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual((row["qb_status"], row["qb_task_id"], row["gy_status"]),
+                                 ("submitted", torrent_hash, "failed"))
+                self.assertEqual(row["status"], "submitted")
+
+    def test_admission_guard_error_propagates_without_backend_or_unknown_receipt(self):
+        request_id, _item, _hash, operation = self.prepare("first")
+        failure = sqlite3.OperationalError("admission guard read failed")
+        checks = 0
+
+        def check():
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise failure
+
+        with self.assertRaises(sqlite3.OperationalError) as raised:
+            operation(check_cancelled=check)
+        self.assertIs(raised.exception, failure)
+        self.client.add_torrent_detailed.assert_not_called()
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual(row["qb_status"], "submitting")
+        self.assertEqual(download_requests_repo.list_download_logs(), [])
+
+    def test_offline_create_cancellation_persists_the_existing_rollback_receipt(self):
+        for cleanup in ("completed", "retained", "failed"):
+            with self.subTest(cleanup=cleanup):
+                request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+                cloud, _stopped, cancellation, check = self.offline_case("create", cleanup=cleanup)
+                with self.use_offline(cloud), self.assertRaises(asyncio.CancelledError) as raised:
+                    operation(check_cancelled=check)
+                self.assertIs(raised.exception, cancellation)
+                self.assertEqual(cloud.selection_calls, [])
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual((row["status"], row["gy_status"]), ("failed", "failed"))
+                self.assertEqual((row["gy_target_dir"], row["gy_staging_cleanup_status"]), ("cancel-stage", cleanup))
+                self.assertEqual(row["gy_task_ids"], "[]")
+                self.assertEqual(cloud.delete_empty_directory.call_count, int(cleanup != "retained"))
+                with self.use_offline(cloud):
+                    self.assertFalse(dispatcher.dispatch_request(request_id, "guangya")["ok"])
+                self.assertEqual(cloud.create_dir.call_count, 1)
+                self.assertEqual(cloud.delete_empty_directory.call_count, int(cleanup != "retained"))
+
+    def test_cancel_before_first_backend_settles_remaining_targets_without_submitting(self):
+        request_id, _item, _hash, operation = self.prepare("first", target="both")
+        cancellation = asyncio.CancelledError("停止全部未发出目标")
+        checks = 0
+
+        def check():
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise cancellation
+
+        with patch.object(dispatcher, "_submit_guangya") as cloud, self.assertRaises(asyncio.CancelledError) as raised:
+            operation(check_cancelled=check)
+        self.assertIs(raised.exception, cancellation)
+        self.client.add_torrent_detailed.assert_not_called()
+        cloud.assert_not_called()
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["status"], row["qb_status"], row["gy_status"]), ("failed", "failed", "failed"))
+        self.assertEqual((row["qb_task_id"], row["gy_task_id"]), ("", ""))
+
+    def test_offline_cancel_receipt_database_error_is_not_masked_by_cancellation(self):
+        request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+        cloud, _stopped, _cancellation, check = self.offline_case("create")
+        with db.get_conn() as conn:
+            conn.execute("CREATE TRIGGER reject_cancel_receipt BEFORE UPDATE ON download_requests "
+                         "WHEN NEW.gy_status='failed' BEGIN SELECT RAISE(ABORT,'cancel receipt fault'); END")
+        with self.use_offline(cloud), self.assertRaisesRegex(sqlite3.IntegrityError, "cancel receipt fault"):
+            operation(check_cancelled=check)
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual(row["gy_status"], "submitting")
+        self.assertEqual(cloud.selection_calls, [])
+
+    def test_offline_accepted_or_unknown_receipt_survives_late_stop_without_cleanup(self):
+        receipts = (
+            {"ok": True, "task_ids": ["accepted"]},
+            {"ok": False, "outcome_unknown": True, "error": "响应未知"},
+            {"ok": False, "partial_success": True, "task_ids": ["partial"], "error": "部分受理"},
+        )
+        for receipt in receipts:
+            with self.subTest(receipt=receipt):
+                request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+                cloud, stopped, _cancellation, check = self.offline_case("")
+                submit = cloud.add_offline_selection
+
+                def accepted(*args, **kwargs):
+                    submit(*args, **kwargs)
+                    stopped.set()
+                    return receipt
+
+                cloud.add_offline_selection = Mock(side_effect=accepted)
+                with self.use_offline(cloud):
+                    result = operation(check_cancelled=check)
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual(row["gy_status"], "submitted" if receipt["ok"] else "outcome_unknown")
+                self.assertEqual(row["gy_staging_cleanup_status"], "pending" if receipt["ok"] else "retained")
+                self.assertEqual(result["results"]["guangya"]["task_ids"], receipt.get("task_ids", []))
+                cloud.delete_empty_directory.assert_not_called()
 
     @staticmethod
     def start(operation):
