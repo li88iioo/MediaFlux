@@ -217,22 +217,22 @@ class AgentTurn:
                 if self.factory is None:
                     # 准入被撤销也属于取消；尚无发布权，不伪造会话事件。
                     raise asyncio.CancelledError(str(exc)) from exc
-                event = self.factory.create(
-                    AgentEventType.TURN_CANCELLED,
-                    {"reason": str(exc) or (self.token.reason if self.token else "cancelled"), **settlement, **await self.terminal_task("cancelled")},
-                )
-                assert self.lease is not None
-                if self.session.journal is not None:
+                async with self.publication_lock:
+                    event = self.factory.create(
+                        AgentEventType.TURN_CANCELLED,
+                        {"reason": str(exc) or (self.token.reason if self.token else "cancelled"), **settlement, **await self.terminal_task("cancelled")},
+                    )
+                    assert self.lease is not None
                     try:
-                        await self.session.journal.append_for_turn(event, self.lease)
+                        await self._journal_event(event, self.lease)
                     except StalePublicationError:
                         pass  # 旧消费者仍收取消终态，但不得写入新会话日志。
-                if self.lease is not None and self.lease.continuation_id:
-                    try:
-                        await self.record_continuation_event(event)
-                    except (StalePublicationError, SessionBusyError):
-                        pass  # A newer user owns the session; never publish an old delivery into it.
-                self.emit(event)
+                    if self.lease.continuation_id:
+                        try:
+                            await self.record_continuation_event(event)
+                        except (StalePublicationError, SessionBusyError):
+                            pass  # A newer user owns the session; never publish an old delivery into it.
+                    self.emit(event)
             except SelectionInvalidError as exc:
                 failure_factory = EventFactory(
                     session_id=self.agent_input.session_id,
@@ -748,33 +748,27 @@ class AgentTurn:
             )
             self.messages.append(ModelMessage(role="assistant", content=answer, effect_plan_id=self.plan_id or ""))
         await preserve_checkpoint(self)
-        if answer is not None:
-            event = failure_factory.create(AgentEventType.TURN_COMPLETED, {"status": "partial", "answer": answer, "finish_reason": code, **measurements, **await self.terminal_task("partial")})
-        else:
-            event = failure_factory.create(AgentEventType.TURN_FAILED, {"code": code, "message": message, **measurements, **await self.terminal_task("failed")})
-        if self.lease is not None and not await self.session.state_store.is_current(self.lease):
-            latest = await self.session.state_store.load(owner=self.lease.owner, session_id=self.lease.session_id)
-            marker = latest.metadata.get("active_publication") or {}
-            if self.resume_context is not None or (marker.get("status") == "cancelled" and marker.get("request_id") == self.lease.request_id):
-                return
-        try:
-            if self.session.journal is not None:
-                if self.lease is not None and self.token is not None and not self.confirming:
-                    await self.session.journal.append_for_turn(event, self.lease)
-                else:
-                    # Early admission/confirmation rejection has no executor
-                    # ownership, but must still return its failure display.
-                    await self.session.journal.append(event, owner=self.agent_input.owner)
-            if (self.lease is not None and self.token is not None and not self.confirming
-                    and not await self.session.state_store.is_current(self.lease)):
-                return
-            # finish 会关闭取消窗口；只能在 journal I/O 后核实发布权再登记。
-            await self.record_continuation_event(event, reason=code)
-        except StalePublicationError:
-            # Cancellation may win during the journal transaction itself.
-            # Do not replace the rejected failure with another late event.
-            return
-        self.emit(event)
+        async with self.publication_lock:
+            if answer is not None:
+                event = failure_factory.create(AgentEventType.TURN_COMPLETED, {"status": "partial", "answer": answer, "finish_reason": code, **measurements, **await self.terminal_task("partial")})
+            else:
+                event = failure_factory.create(AgentEventType.TURN_FAILED, {"code": code, "message": message, **measurements, **await self.terminal_task("failed")})
+            if self.lease is not None and not await self.session.state_store.is_current(self.lease):
+                latest = await self.session.state_store.load(owner=self.lease.owner, session_id=self.lease.session_id)
+                marker = latest.metadata.get("active_publication") or {}
+                if self.resume_context is not None or (marker.get("status") == "cancelled" and marker.get("request_id") == self.lease.request_id):
+                    return
+            lease = self.lease if self.token is not None and not self.confirming else None
+            try:
+                # 准入/确认拒绝没有执行者发布权，沿无 lease 的原回执路径返回。
+                await self._journal_event(event, lease)
+                if lease is not None and not await self.session.state_store.is_current(lease):
+                    return
+                # finish 会关闭取消窗口；只能在 journal I/O 后核实发布权再登记。
+                await self.record_continuation_event(event, reason=code)
+            except StalePublicationError:
+                return  # 取消或新请求已取得发布权，不补发迟到失败。
+            self.emit(event)
 
     async def terminal_task(self, status: str) -> dict[str, Any]:
         task = None
@@ -788,45 +782,50 @@ class AgentTurn:
         self.measurement.observe(event)
         self.queue.put_nowait(event)
 
+    async def _journal_event(self, event: AgentEvent, lease: PublicationLease | None) -> None:
+        """调用方持有 publication_lock；是否绑定执行 lease 由原发布路径明确决定。"""
+        if self.session.journal is not None:
+            if lease is None:
+                await self.session.journal.append(event, owner=self.agent_input.owner)
+            else:
+                await self.session.journal.append_for_turn(event, lease)
+
     async def publish(self,
         event_type: AgentEventType,
         payload: Mapping[str, Any] | None = None,
         **extra: Any,
     ) -> None:
-        assert self.lease is not None and self.token is not None and self.factory is not None
-        self.token.raise_if_cancelled()
-        if not await self.session.coordinator.is_current(self.lease, self.token):
-            raise asyncio.CancelledError("superseded")
-        if not self.confirming and not await self.session.state_store.is_current(self.lease):
-            raise asyncio.CancelledError("stale_generation")
-        if not self.confirming and not await self.session.turn_admission.is_current(
-            self.admission_token, self.agent_input
-        ):
-            raise asyncio.CancelledError("runtime_changed")
-        if event_type in {AgentEventType.TURN_COMPLETED, AgentEventType.TURN_FAILED, AgentEventType.TURN_CANCELLED}:
-            payload = {**(payload or {}), "turn_status": (payload or {}).get("status", "failed" if event_type is AgentEventType.TURN_FAILED else "cancelled"),
-                       "task": task_projection(self.state.metadata.get("task"))}
-        event = self.factory.create(event_type, payload, **extra)
-        if self.session.journal is not None:
-            if not self.confirming:
-                await self.session.journal.append_for_turn(event, self.lease)
-            else:
-                await self.session.journal.append(event, owner=self.agent_input.owner)
-        if (not self.confirming and event_type is not AgentEventType.TURN_STARTED
-                and not await self.session.state_store.is_current(self.lease)):
-            raise StalePublicationError("event revoked during journal I/O")
-        await self.record_continuation_event(event)
-        activity = public_activity(event.payload.get("activity"))
-        if event.type.value == "model.reasoning_summary.delta":
-            identity = f"reasoning:{event.payload.get('round', 1)}:{event.payload.get('summary_id', '')}"
-            previous = self.activities.get(identity, {}).get("text", "")
-            activity = {"id": identity, "kind": "reasoning",
-                        "text": (previous + str(event.payload.get("delta", "")))[:8000]}
-        if activity:
-            self.activities[activity["id"]] = activity
-            if len(self.activities) > 80:
-                del self.activities[next(iter(self.activities))]
-        self.emit(event)
+        async with self.publication_lock:
+            assert self.lease is not None and self.token is not None and self.factory is not None
+            self.token.raise_if_cancelled()
+            if not await self.session.coordinator.is_current(self.lease, self.token):
+                raise asyncio.CancelledError("superseded")
+            if not self.confirming and not await self.session.state_store.is_current(self.lease):
+                raise asyncio.CancelledError("stale_generation")
+            if not self.confirming and not await self.session.turn_admission.is_current(
+                self.admission_token, self.agent_input
+            ):
+                raise asyncio.CancelledError("runtime_changed")
+            if event_type in {AgentEventType.TURN_COMPLETED, AgentEventType.TURN_FAILED, AgentEventType.TURN_CANCELLED}:
+                payload = {**(payload or {}), "turn_status": (payload or {}).get("status", "failed" if event_type is AgentEventType.TURN_FAILED else "cancelled"),
+                           "task": task_projection(self.state.metadata.get("task"))}
+            event = self.factory.create(event_type, payload, **extra)
+            await self._journal_event(event, self.lease if not self.confirming else None)
+            if (not self.confirming and event_type is not AgentEventType.TURN_STARTED
+                    and not await self.session.state_store.is_current(self.lease)):
+                raise StalePublicationError("event revoked during journal I/O")
+            await self.record_continuation_event(event)
+            activity = public_activity(event.payload.get("activity"))
+            if event.type.value == "model.reasoning_summary.delta":
+                identity = f"reasoning:{event.payload.get('round', 1)}:{event.payload.get('summary_id', '')}"
+                previous = self.activities.get(identity, {}).get("text", "")
+                activity = {"id": identity, "kind": "reasoning",
+                            "text": (previous + str(event.payload.get("delta", "")))[:8000]}
+            if activity:
+                self.activities[activity["id"]] = activity
+                if len(self.activities) > 80:
+                    del self.activities[next(iter(self.activities))]
+            self.emit(event)
 
     async def report_progress(self, payload: Mapping[str, Any]) -> None:
         await self.publish(AgentEventType.TOOL_STARTED if payload.get("kind") == "confirmed_effect" else AgentEventType.TOOL_PROGRESS, payload)

@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from app.agent.errors import ToolPipelineError
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
+from app.agent.kernel.adapters import TurnViewBuilder
+from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.effects import InMemoryRateLimiter
 from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -29,7 +32,7 @@ def query_tool(handler, *, metadata=None, observe=None):
     )
 
 
-async def execute(tools, calls, *, limiter=None, limits=None):
+async def execute(tools, calls, *, limiter=None, limits=None, journal=None):
     catalog, state = ToolCatalog(tools), InMemorySessionStateStore()
     model = ScriptedModel([
         [*(ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=c) for c in calls),
@@ -39,10 +42,58 @@ async def execute(tools, calls, *, limiter=None, limits=None):
     ])
     session = AgentSession(model=model, catalog=catalog, state_store=state,
 
-        pipeline=ToolPipeline(catalog=catalog, state_store=state, rate_limiter=limiter), limits=limits)
+        pipeline=ToolPipeline(catalog=catalog, state_store=state, rate_limiter=limiter), limits=limits, journal=journal)
     events = [event async for event in session.run(AgentInput(
         owner="owner", session_id="batch", message="读取这些独立媒体的信息"))]
     return events, model, await state.load(owner="owner", session_id="batch")
+
+
+def test_parallel_progress_keeps_creation_journal_and_delivery_order():
+    async def scenario():
+        first_journal, release_first, both_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        appended = []
+
+        async def append(event, *, owner):
+            if event.type is AgentEventType.TOOL_PROGRESS and event.payload["marker"] == "first":
+                first_journal.set()
+                await release_first.wait()
+            appended.append(event)
+
+        async def append_for_turn(event, lease):
+            await append(event, owner=lease.owner)
+
+        async def read(arguments, context):
+            marker = arguments["query"]
+            if marker == "first":
+                await both_started.wait()
+            else:
+                both_started.set()
+                await first_journal.wait()
+                # 当前 task 先尝试第二次发布；等它真的让出执行权后才释放首个 journal。
+                # 内存仓储的准入无需 I/O；修复前第二条会越过首条，修复后在发布锁等待。
+                asyncio.get_running_loop().call_soon(release_first.set)
+            await context.report_progress({"marker": marker})
+            return {"ok": True, "data": {"query": marker}}
+
+        tool = query_tool(read)
+        try:
+            events, model, _ = await asyncio.wait_for(execute([tool], [
+                ModelToolCall(marker, tool.name, {"query": marker}) for marker in ("first", "second")
+            ], journal=SimpleNamespace(append=append, append_for_turn=append_for_turn)), 5)
+        finally:
+            release_first.set()
+        assert events[-1].payload["status"] == "success", events[-1].payload
+        assert [event.payload["marker"] for event in events if event.type is AgentEventType.TOOL_PROGRESS] == ["first", "second"]
+        assert [event.event_id for event in appended] == [event.event_id for event in events]
+        assert [event.sequence for event in events] == sorted({event.sequence for event in events})
+        replay = TurnViewBuilder()
+        for event in appended:
+            replay.apply(event)
+        assert replay.build().status == "success"
+        assert [json.loads(message.content)["data"]["query"] for message in model.requests[-1].messages
+                if message.role == "tool"] == ["first", "second"]
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("count", [2, 6])

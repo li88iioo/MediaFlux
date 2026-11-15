@@ -1,9 +1,14 @@
 """真实SQLite会话文件锁争用控制：网络/模型为脚本，不伪造引用写入结果。"""
 import asyncio
 import json
+import socket
 import threading
 from unittest.mock import patch
 
+from app import sdk
+from app.agent.kernel import sandbox
+from app.agent.kernel.adapters import TurnViewBuilder
+from app.agent.kernel.bootstrap import _capture_creation_binding
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
 from app.agent.kernel.persistence import SQLiteKernelStore
@@ -14,6 +19,66 @@ from app.agent.kernel.state_types import AgentInput, _CancelledReadInline
 from tests.support import isolated_test_database
 from tests.test_agent_kernel_core import ScriptedModel
 from tests.test_agent_parallel_reads import query_tool
+from tests.test_agent_session_result import native_workspace as native_workspace
+from tests.test_agent_task_cas import task_store as task_store
+from tests.test_agent_task_budget_selection import calls, final, old_task, OWNER, SID
+
+
+def test_four_native_sdk_reads_keep_event_order_and_provider_overlap(task_store, native_workspace, monkeypatch):
+    ready = threading.Barrier(4, timeout=5)
+    guard = threading.Lock()
+    invoked = []
+    active = peak = 0
+
+    def read(query: str):
+        nonlocal active, peak
+        with guard:
+            invoked.append(query)
+            active += 1
+            peak = max(peak, active)
+        try:
+            ready.wait()
+            return {"ok": True, "status": "success", "summary": "四路离线查询", "data": {"query": query}}
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setitem(sdk.METHODS, "media.search", read)
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: (_ for _ in ()).throw(AssertionError("禁止外联")))
+
+    async def scenario():
+        await old_task(task_store, exhaust=None)
+        catalog = ToolCatalog()
+        pipeline = ToolPipeline(catalog=catalog, state_store=task_store, reference_store=task_store)
+        catalog.register(sandbox.run_code_tool(pipeline))
+        code = '''import json
+from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=4) as pool:
+    values = list(pool.map(mf.media.search, ['0', '1', '2', '3']))
+print(json.dumps(values))'''
+        model = ScriptedModel([calls((sandbox.RUN_CODE_TOOL, {"code": code, "timeout_seconds": 10})), final()])
+        session = AgentSession(model=model, catalog=catalog, pipeline=pipeline, state_store=task_store,
+                               journal=task_store, model_tools=[sandbox.RUN_CODE_TOOL])
+        session.continuation_binding = _capture_creation_binding()
+        events = [event async for event in session.run(AgentInput(
+            owner=OWNER, session_id=SID, message="继续查询这四项", request_id="four-sdk-events"))]
+        assert events[-1].payload["status"] == "success", events[-1].payload
+        [workspace] = [event.payload["result"]["data"] for event in events if event.type.value == "tool.completed"]
+        assert workspace["exit_code"] == 0, workspace["stderr"]
+        assert [row["data"]["query"] for row in json.loads(workspace["stdout"])] == ["0", "1", "2", "3"]
+        assert sorted(invoked) == ["0", "1", "2", "3"] and peak == 4 and active == 0
+        assert len(workspace["sdk_calls"]) == 4 and all(call["ok"] for call in workspace["sdk_calls"])
+        stored = await task_store.list_events(owner=OWNER, session_id=SID)
+        assert [event.event_id for event in events] == [event["event_id"] for event in stored]
+        assert [event.sequence for event in events] == [event["sequence"] for event in stored] == sorted({event.sequence for event in events})
+        replay = TurnViewBuilder()
+        for event in events:
+            replay.apply(event)
+        assert replay.build().status == "success"
+        cold = await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(owner=OWNER, session_id=SID)
+        assert len(cold.metadata["task"]["verified_facts"]) == 4
+
+    asyncio.run(scenario())
 
 
 def test_parallel_reads_queue_real_reference_transactions_without_false_busy():
