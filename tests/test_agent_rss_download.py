@@ -506,6 +506,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             save_path="/private/subscription/path",
             category="rss-agent",
             torrents=None,
+            can_proceed=None,
         )
         get_rss_entry_result_6 = rss_repo.get_rss_entry(valid)
         assert get_rss_entry_result_6 is not None

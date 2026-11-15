@@ -579,32 +579,20 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
         single_file = single_bt_root_file(resolution.response) is not None
         selection_mode = "single_file" if single_file else "files" if choices else "legacy"
         result: dict[str, Any] = {"ok": False, "error": error}
-        if not error and can_proceed is not None and not can_proceed():
-            result["error"] = "操作已取消，未提交下载后端"
-        elif not error:
+        if not error:
             try:
                 created = (
-                    client.add_offline_selection(url, effective.target_dir_id, selected)
+                    client.add_offline_selection(url, effective.target_dir_id, selected, can_proceed=can_proceed)
                     if selection_mode == "files"
                     else client.add_offline_task(
                         url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
+                        can_proceed=can_proceed,
                     )
                 )
-                if isinstance(created, dict):
-                    ok = bool(created.get("ok"))
-                    task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
-                    batch_count = int(created.get("batch_count") or (1 if ok else 0))
-                    completed_batches = int(created.get("completed_batches") or (batch_count if ok else 0))
-                    partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
-                    outcome_unknown = bool(created.get("outcome_unknown"))
-                    tracking_incomplete = bool(created.get("tracking_incomplete"))
-                    create_error = str(created.get("error") or "")
-                else:
-                    ok = bool(created)
-                    task_ids = []
-                    batch_count = completed_batches = 1 if ok else 0
-                    partial_success = outcome_unknown = tracking_incomplete = False
-                    create_error = ""
+                ok = bool(created.get("ok"))
+                task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
+                batch_count = int(created.get("batch_count") or (1 if ok else 0))
+                completed_batches = int(created.get("completed_batches") or (batch_count if ok else 0))
                 result = {
                     "ok": ok,
                     "selection_mode": selection_mode,
@@ -612,10 +600,11 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                     "resolve_attempts": resolution.attempts,
                     "selected_count": len(selected), "excluded_count": len(choices) - len(selected),
                     "task_ids": task_ids, "batch_count": batch_count,
-                    "completed_batches": completed_batches, "partial_success": partial_success,
-                    "outcome_unknown": outcome_unknown,
-                    "tracking_incomplete": tracking_incomplete,
-                    "error": "" if ok else (create_error or "光鸭任务创建失败"),
+                    "completed_batches": completed_batches,
+                    "partial_success": bool(created.get("partial_success") or task_ids or completed_batches),
+                    "outcome_unknown": bool(created.get("outcome_unknown")),
+                    "tracking_incomplete": bool(created.get("tracking_incomplete")),
+                    "error": "" if ok else (str(created.get("error") or "") or "光鸭任务创建失败"),
                 }
             except Exception as exc:
                 # 请求异常无法证明服务端未受理；宁可保留空目录供后续核验，也不能

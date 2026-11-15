@@ -3025,14 +3025,19 @@ class GuangYaClient:
 
     # ===== 离线下载 =====
     def add_offline_task(self, url: str, target_dir_id: str = "0",
-                         task_type: str = "magnet") -> dict:
-        response = self.raw.cloud_create_task(
-            url=url,
-            parent_id=None if target_dir_id == "0" else target_dir_id,
-        )
-        payload = response.json() if callable(getattr(response, "json", None)) else response
-        payload = payload if isinstance(payload, dict) else {"raw": str(payload)}
-        error = _offline_create_error(payload)
+                         task_type: str = "magnet", *,
+                         can_proceed: Callable[[], bool] | None = None) -> dict:
+        raw = self.raw
+        payload: dict = {}
+        error = "操作已取消，未提交下载后端" if can_proceed is not None and not can_proceed() else ""
+        if not error:
+            response = raw.cloud_create_task(
+                url=url,
+                parent_id=None if target_dir_id == "0" else target_dir_id,
+            )
+            payload = response.json() if callable(getattr(response, "json", None)) else response
+            payload = payload if isinstance(payload, dict) else {"raw": str(payload)}
+            error = _offline_create_error(payload)
         task_ids = _offline_task_ids(payload)
         if error:
             return {
@@ -3046,7 +3051,8 @@ class GuangYaClient:
         }
 
     def add_offline_selection(self, url: str, target_dir_id: str,
-                              file_indexes: list[int]) -> dict:
+                              file_indexes: list[int], *,
+                              can_proceed: Callable[[], bool] | None = None) -> dict:
         """按光鸭接口上限分批创建带选集的离线任务。"""
         indexes: list[int] = []
         seen: set[int] = set()
@@ -3067,13 +3073,23 @@ class GuangYaClient:
         completed_indexes: list[int] = []
         parent_id = "" if (target_dir_id or "0") == "0" else target_dir_id
         batch_count = (len(indexes) + 499) // 500
+        error = ""
+        outcome_unknown = False
         for offset in range(0, len(indexes), 500):
             batch_indexes = indexes[offset:offset + 500]
-            batch_number = offset // 500 + 1
-            payload: dict = {}
-            outcome_unknown = False
             try:
-                response = self.raw.request(
+                raw = self.raw
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                outcome_unknown = True
+                break
+            # raw 可能阻塞刷新凭据；门禁之后直接使用本次取得的同一 raw。
+            if can_proceed is not None and not can_proceed():
+                error = "操作已取消，未提交下载后端"
+                break
+            payload: dict = {}
+            try:
+                response = raw.request(
                     OFFLINE_CREATE_TASK_URL,
                     method="POST",
                     json={
@@ -3089,60 +3105,40 @@ class GuangYaClient:
                 error = str(exc) or exc.__class__.__name__
                 outcome_unknown = True
             if error:
-                return {
-                    "ok": False,
-                    "partial_success": bool(completed_indexes),
-                    "outcome_unknown": outcome_unknown,
-                    "completed_batches": batch_number - 1,
-                    "task_ids": task_ids,
-                    "completed_indexes": completed_indexes,
-                    "remaining_indexes": indexes[offset:],
-                    "failed_batch": batch_number,
-                    "error": error,
-                    "selected_count": len(indexes),
-                    "batch_count": batch_count,
-                    "responses": responses,
-                }
+                break
             responses.append(payload)
             completed_indexes.extend(batch_indexes)
             task_ids.extend(_offline_task_ids(payload))
-        tracking_complete = len(task_ids) == batch_count
+        remaining_indexes = indexes[len(completed_indexes):]
+        tracking_incomplete = not remaining_indexes and len(task_ids) != batch_count and batch_count > 1
         # 单批旧版接口可能只返回成功状态而不返回任务 ID，仍可由 URL/标题
         # 兼容跟踪；多批任务缺 ID 则无法证明全部批次完成，必须阻止自动整理。
-        if not tracking_complete and batch_count > 1:
+        if tracking_incomplete:
             logger.error(
                 "光鸭选集任务已创建但任务 ID 不完整: files=%s batches=%s ids=%s",
                 len(indexes), batch_count, len(task_ids),
             )
-            return {
-                "ok": False,
-                "partial_success": True,
-                "tracking_incomplete": True,
-                "completed_batches": batch_count,
-                "task_ids": task_ids,
-                "completed_indexes": completed_indexes,
-                "remaining_indexes": [],
-                "failed_batch": None,
-                "error": "光鸭任务已创建，但返回的任务 ID 不完整，已停止自动整理，请人工核验",
-                "selected_count": len(indexes),
-                "batch_count": batch_count,
-                "responses": responses,
-            }
-        logger.info(f"光鸭选集任务已创建: {len(indexes)} 个文件 / {len(responses)} 批")
-        return {
-            "ok": True,
-            "tracking_incomplete": False,
-            "partial_success": False,
-            "completed_batches": batch_count,
+            error = "光鸭任务已创建，但返回的任务 ID 不完整，已停止自动整理，请人工核验"
+        elif not error:
+            logger.info(f"光鸭选集任务已创建: {len(indexes)} 个文件 / {len(responses)} 批")
+        result = {
+            "ok": not error,
+            "partial_success": bool(error and completed_indexes),
+            "completed_batches": len(responses),
             "task_ids": task_ids,
             "completed_indexes": completed_indexes,
-            "remaining_indexes": [],
-            "failed_batch": None,
-            "error": "",
+            "remaining_indexes": remaining_indexes,
+            "failed_batch": len(responses) + 1 if remaining_indexes else None,
+            "error": error,
             "selected_count": len(indexes),
             "batch_count": batch_count,
             "responses": responses,
         }
+        if remaining_indexes:
+            result["outcome_unknown"] = outcome_unknown
+        else:
+            result["tracking_incomplete"] = tracking_incomplete
+        return result
 
     def list_offline_tasks(self) -> list[dict]:
         """完整读取并归一化光鸭离线任务。

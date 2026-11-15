@@ -51,6 +51,41 @@ def _bencode(value) -> bytes:
 
 
 class QBittorrent523IdentityTests(unittest.TestCase):
+    def test_add_checks_cancellation_with_password_and_api_key(self):
+        for api_key in ("", "fake-token"):
+            with self.subTest(api_key=bool(api_key)):
+                client = QBittorrentClient("http://qb.invalid", username="probe", password="fake", api_key=api_key)
+                self.addCleanup(client.close)
+                stopped = bool(api_key)
+
+                def login(*args, **kwargs):
+                    nonlocal stopped
+                    stopped = True
+                    return _Response(200, "Ok.")
+
+                client._session.post = Mock(side_effect=login)
+                result = client.add_torrent_detailed(urls="magnet:?xt=test", can_proceed=lambda: not stopped)
+                self.assertEqual(result, TorrentAddResult(False))
+                self.assertEqual(client._session.post.call_count, 0 if api_key else 1)
+                if not api_key:
+                    self.assertTrue(client._session.post.call_args.args[0].endswith("/auth/login"))
+
+    def test_late_cancel_does_not_override_accepted_or_unknown_add_receipt(self):
+        for status, expected in ((200, TorrentAddResult(True)), (503, TorrentAddResult(False, "qb_outcome_unknown"))):
+            with self.subTest(status=status):
+                client = QBittorrentClient("http://qb.invalid", api_key="fake-token")
+                self.addCleanup(client.close)
+                gate = Mock(return_value=True)
+
+                def add(*args, **kwargs):
+                    gate.return_value = False
+                    return _Response(status, "Ok.")
+
+                client._session.post = Mock(side_effect=add)
+                self.assertEqual(client.add_torrent_detailed(urls="magnet:?xt=test", can_proceed=gate), expected)
+                gate.assert_called_once_with()
+                client._session.post.assert_called_once()
+
     def test_close_is_idempotent(self):
         client = QBittorrentClient("http://qb.invalid", api_key="token")
         close = Mock()

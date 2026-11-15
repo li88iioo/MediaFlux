@@ -256,7 +256,9 @@ class FixtureGuangYa:
         self.created_dirs.append((name, parent_id))
         return "fixture-staging"
 
-    def add_offline_selection(self, url, target_dir_id, file_indexes):
+    def add_offline_selection(self, url, target_dir_id, file_indexes, *, can_proceed=None):
+        if can_proceed is not None and not can_proceed():
+            return {"ok": False, "error": "操作已取消，未提交下载后端"}
         self.events.append("submit-selection")
         self.selections.append((url, target_dir_id, list(file_indexes)))
         return {"ok": True, "task_ids": ["fixture-offline-task"], "batch_count": 1}

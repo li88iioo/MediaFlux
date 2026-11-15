@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -186,7 +187,8 @@ class QBittorrentClient:
 
     def add_torrent_detailed(self, urls: str = "", save_path: str = "",
                              category: str = "",
-                             torrents: Optional[bytes] = None) -> TorrentAddResult:
+                             torrents: Optional[bytes] = None, *,
+                             can_proceed: Callable[[], bool] | None = None) -> TorrentAddResult:
         """添加下载任务并返回稳定、无敏感信息的失败分类。"""
         if not self.api_key:
             login_result = self._login_for_add()
@@ -200,6 +202,8 @@ class QBittorrentClient:
         files = {
             "torrents": ("upload.torrent", torrents, "application/x-bittorrent")
         } if torrents else None
+        if can_proceed is not None and not can_proceed():
+            return TorrentAddResult(False)
         try:
             resp = self._session.post(
                 f"{self.url}/api/v2/torrents/add",

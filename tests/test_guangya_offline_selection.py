@@ -110,16 +110,18 @@ class FakeResponse:
         return self._payload
 
 
+def client_with_raw(test_case: unittest.TestCase, raw) -> GuangYaClient:
+    temp_dir = tempfile.TemporaryDirectory()
+    test_case.addCleanup(temp_dir.cleanup)
+    client = GuangYaClient(token_file=Path(temp_dir.name) / "missing-token.json")
+    raw.token = ""
+    raw.refresh_token_value = ""
+    raw.token_expires_at = None
+    client._raw = raw
+    return client
+
+
 class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
-    def _client_with_raw(self, raw) -> GuangYaClient:
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        client = GuangYaClient(token_file=Path(temp_dir.name) / "missing-token.json")
-        raw.token = ""
-        raw.refresh_token_value = ""
-        raw.token_expires_at = None
-        client._raw = raw
-        return client
 
     def test_offline_rules_from_mapping_uses_current_fields(self):
         factory = getattr(offline.OfflineRules, "from_mapping", None)
@@ -307,7 +309,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             FakeResponse({"code": 0, "msg": "success", "data": {"taskId": "task-a"}}),
             FakeResponse({"code": 0, "msg": "success", "data": {"taskId": "task-b"}}),
         ]
-        client = self._client_with_raw(raw)
+        client = client_with_raw(self, raw)
         submit = getattr(client, "add_offline_selection", None)
         assert (submit) is not None, "GuangYaClient 应提供选集创建接口"
 
@@ -339,7 +341,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
     def test_torrent_resolution_uploads_original_bytes_through_sdk(self):
         raw = Mock()
         raw.cloud_resolve_torrent.return_value = RESOLVE_SUBFILES_FIXTURE
-        client = self._client_with_raw(raw)
+        client = client_with_raw(self, raw)
 
         result = client.resolve_torrent(b"private-torrent-bytes")
 
@@ -352,7 +354,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             FakeResponse({"code": 0, "msg": "success", "data": {"taskId": "task-a"}}),
             FakeResponse({"code": 503, "msg": "cloud capacity limited", "data": {}}),
         ]
-        client = self._client_with_raw(raw)
+        client = client_with_raw(self, raw)
 
         try:
             result = client.add_offline_selection(
@@ -373,6 +375,57 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
         self.assertEqual(result["failed_batch"], 2)
         self.assertEqual(result["error"], "cloud capacity limited")
 
+    def test_selection_cancellation_preserves_only_accepted_batches(self):
+        for accepted in (0, 1):
+            with self.subTest(accepted=accepted):
+                raw = Mock()
+                client = client_with_raw(self, raw)
+                self.addCleanup(client.close)
+                raw.request.return_value = FakeResponse({"code": 0, "data": {"taskId": "task-a"}})
+                result = client.add_offline_selection(
+                    "magnet:?xt=urn:btih:cancelled-selection", "target", list(range(501)),
+                    can_proceed=lambda: raw.request.call_count < accepted,
+                )
+                self.assertEqual(raw.request.call_count, accepted)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["partial_success"], bool(accepted))
+                self.assertFalse(result["outcome_unknown"])
+                self.assertEqual(result["completed_batches"], accepted)
+                self.assertEqual(result["task_ids"], ["task-a"] if accepted else [])
+                self.assertEqual(result["completed_indexes"], list(range(500)) if accepted else [])
+                self.assertEqual(result["remaining_indexes"], [500] if accepted else list(range(501)))
+                self.assertEqual(result["batch_count"], 2)
+                self.assertEqual(result["error"], "操作已取消，未提交下载后端")
+
+    def test_single_and_selection_check_cancellation_after_raw_refresh(self):
+        for selection in (False, True):
+            with self.subTest(selection=selection):
+                raw = Mock()
+                client = client_with_raw(self, raw)
+                self.addCleanup(client.close)
+                raw.token_expires_at = 1
+                stopped = False
+
+                def refresh():
+                    nonlocal stopped
+                    raw.token_expires_at = None
+                    stopped = True
+
+                raw.refresh_token.side_effect = refresh
+                result = (
+                    client.add_offline_selection("magnet:?xt=urn:btih:refresh-stop", "target", [0],
+                                                 can_proceed=lambda: not stopped)
+                    if selection else
+                    client.add_offline_task("magnet:?xt=urn:btih:refresh-stop", "target",
+                                            can_proceed=lambda: not stopped)
+                )
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["task_ids"], [])
+                self.assertIn("操作已取消，未提交下载后端", result["error"])
+                raw.refresh_token.assert_called_once_with()
+                raw.request.assert_not_called()
+                raw.cloud_create_task.assert_not_called()
+
     def test_selected_task_submission_rejects_explicit_and_ambiguous_failure_payloads(self):
         cases = [
             ({"error": "quota exceeded"}, "quota exceeded"),
@@ -389,7 +442,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 raw = Mock()
                 raw.request.return_value = FakeResponse(payload)
-                client = self._client_with_raw(raw)
+                client = client_with_raw(self, raw)
 
                 result = client.add_offline_selection(
                     "magnet:?xt=urn:btih:conservative-response",
@@ -420,7 +473,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 raw = Mock()
                 raw.request.return_value = FakeResponse(payload)
-                client = self._client_with_raw(raw)
+                client = client_with_raw(self, raw)
 
                 result = client.add_offline_selection(
                     "magnet:?xt=urn:btih:normalized-success",
@@ -460,7 +513,9 @@ class FakeSelectionClient:
         self.torrent_resolve_calls.append(torrent_data)
         return self.resolve_payload
 
-    def add_offline_selection(self, url: str, target_dir_id: str, file_indexes: list[int]) -> dict:
+    def add_offline_selection(self, url: str, target_dir_id: str, file_indexes: list[int], *, can_proceed=None) -> dict:
+        if can_proceed is not None and not can_proceed():
+            return {"ok": False, "error": "操作已取消，未提交下载后端"}
         self.selection_calls.append({
             "url": url,
             "target_dir_id": target_dir_id,
@@ -480,13 +535,15 @@ class FakeSelectionClient:
             "responses": [{"code": 0, "msg": "success", "data": {"taskId": "selected-task"}}],
         }
 
-    def add_offline_task(self, url: str, target_dir_id: str = "0", task_type: str = "magnet") -> bool:
+    def add_offline_task(self, url: str, target_dir_id: str = "0", task_type: str = "magnet", *, can_proceed=None) -> dict:
+        if can_proceed is not None and not can_proceed():
+            return {"ok": False, "error": "操作已取消，未提交下载后端"}
         self.legacy_calls.append({
             "url": url,
             "target_dir_id": target_dir_id,
             "task_type": task_type,
         })
-        return True
+        return {"ok": True, "task_ids": [], "batch_count": 1, "error": "", "response": {"code": 0}}
 
 
 class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):

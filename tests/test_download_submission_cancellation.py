@@ -5,6 +5,7 @@ import tests  # noqa: F401 - 应用导入前隔离运行路径与数据库
 
 from concurrent.futures import Future
 import asyncio
+import copy
 import json
 import socket
 import sqlite3
@@ -16,7 +17,7 @@ from unittest.mock import Mock, patch
 from app import database as db
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import rss as rss_repo
-from app.clients.qbittorrent import TorrentAddResult, TorrentTask
+from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult, TorrentTask
 from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
 from app.modules import offline
@@ -26,7 +27,12 @@ from app.modules.qb_control import qb_control_write_lease, remove_qb_tasks
 from app.modules.rss import RSSEngine
 from app.repositories.rss import bind_rss_entry_download
 from tests.support import isolated_test_database
-from tests.test_guangya_offline_selection import FakeSelectionClient, RESOLVE_SUBFILES_FIXTURE
+from tests import test_guangya_offline_selection as offline_test_fixtures
+from tests.test_guangya_offline_selection import (
+    FakeResponse, FakeSelectionClient, RESOLVE_SUBFILES_FIXTURE,
+)
+from tests.test_guangya_single_file_manifest import SINGLE
+from tests.test_qbittorrent_523_compat import _Response
 
 
 class DownloadSubmissionCancellationTests(unittest.TestCase):
@@ -126,6 +132,157 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
         return patch.object(dispatcher, "submit_offline", side_effect=lambda *args, **kwargs: offline.submit_offline(
             *args, client=cloud, **kwargs,
         ))
+
+    def real_cloud_case(self, *, refresh=False, unknown_at=0):
+        raw = Mock()
+        client = offline_test_fixtures.client_with_raw(self, raw)
+        self.addCleanup(client.close)
+        stopped = threading.Event()
+        cancellation = asyncio.CancelledError("真实光鸭写前取消")
+        tree: dict = copy.deepcopy(SINGLE if refresh else RESOLVE_SUBFILES_FIXTURE)
+        if not refresh:
+            tree["data"].update(excludeIndices=[], subfiles=[
+                {"fileIndex": i, "name": f"Episode.{i:03d}.mkv", "size": 1073741824}
+                for i in range(501)
+            ])
+        raw.cloud_resolve_url.return_value = tree
+        raw.fs_files.return_value = {"code": 0, "data": {"files": [], "total": 0}}
+        raw.fs_delete_empty.return_value = {"code": 0, "msg": "success"}
+
+        def create(**kwargs):
+            raw.fs_detail.return_value = {"code": 0, "data": {
+                "fileId": "real-stage", "fileName": kwargs["dir_name"],
+                "parentId": kwargs["parent_id"] or "0", "isDir": True, "etag": "stage-v1",
+            }}
+            if refresh:
+                raw.token_expires_at = 1
+            return {"code": 0, "data": {"fileId": "real-stage"}}
+
+        def refreshing():
+            raw.token_expires_at = None
+            stopped.set()
+
+        def submit(*args, **kwargs):
+            batch = raw.request.call_count
+            if batch == (unknown_at or 1):
+                stopped.set()
+            if batch == unknown_at:
+                raise TimeoutError("已发出但响应未知")
+            return FakeResponse({"code": 0, "data": {"taskId": f"task-{batch}"}})
+
+        def check():
+            if stopped.is_set():
+                raise cancellation
+
+        raw.fs_create_dir.side_effect = create
+        raw.refresh_token.side_effect = refreshing
+        raw.request.side_effect = submit
+        raw.cloud_create_task.return_value = {"code": 0, "data": {"taskId": "single-task"}}
+        return client, raw, cancellation, check
+
+    def test_real_qb_login_cancellation_prevents_add_and_keeps_original_exception(self):
+        for path in ("first", "supplement", "retry", "successor"):
+            with self.subTest(path=path):
+                _request_id, _item, torrent_hash, operation = self.prepare(path)
+                client = QBittorrentClient("http://qb.invalid", username="probe", password="fake")
+                self.addCleanup(client.close)
+                cancellation = asyncio.CancelledError("登录期间取消")
+                stopped = False
+
+                def post(url, **kwargs):
+                    nonlocal stopped
+                    if url.endswith("/auth/login"):
+                        stopped = True
+                        return _Response(200, "Ok.")
+                    return _Response(200, {"success_count": 1, "added_torrent_ids": [torrent_hash]})
+
+                def check():
+                    if stopped:
+                        raise cancellation
+
+                client._session.post = Mock(side_effect=post)
+                with patch.object(dispatcher, "QBittorrentClient", return_value=client):
+                    with self.assertRaises(asyncio.CancelledError) as raised:
+                        operation(check_cancelled=check)
+                self.assertIs(raised.exception, cancellation)
+                self.assertEqual([call.args[0] for call in client._session.post.call_args_list],
+                                 ["http://qb.invalid/api/v2/auth/login"])
+                with db.get_conn() as conn:
+                    row = conn.execute("SELECT * FROM download_requests ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual(row["qb_status"], "failed")
+                self.assertIn("操作已取消，未提交下载后端", row["error"])
+                self.assertFalse(dispatcher.dispatch_request(row["id"], "qb")["ok"])
+                self.assertEqual(client._session.post.call_count, 1)
+
+    def test_real_cloud_partial_is_persisted_before_original_cancellation(self):
+        for path in ("first", "supplement", "retry", "successor"):
+            with self.subTest(path=path):
+                _request_id, _item, torrent_hash, operation = self.prepare(path, target="both")
+                cloud, raw, cancellation, check = self.real_cloud_case()
+                with self.use_offline(cloud), self.assertRaises(asyncio.CancelledError) as raised:
+                    operation(check_cancelled=check)
+                self.assertIs(raised.exception, cancellation)
+                with db.get_conn() as conn:
+                    row = conn.execute("SELECT * FROM download_requests ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertEqual((row["qb_status"], row["qb_task_id"]), ("submitted", torrent_hash))
+                self.assertEqual((row["gy_status"], row["gy_task_id"]), ("outcome_unknown", "task-1"))
+                self.assertEqual((json.loads(row["gy_task_ids"]), row["gy_batch_count"]), (["task-1"], 2))
+                self.assertEqual((row["gy_target_dir"], row["gy_staging_cleanup_status"]),
+                                 ("real-stage", "retained"))
+                self.assertEqual(raw.request.call_count, 1)
+                self.assertEqual(raw.request.call_args.kwargs["json"]["fileIndexes"], list(range(500)))
+                raw.fs_detail.assert_not_called()
+                raw.fs_delete_empty.assert_not_called()
+                with self.use_offline(cloud):
+                    self.assertFalse(dispatcher.dispatch_request(row["id"], "both")["ok"])
+                self.assertEqual(raw.request.call_count, 1)
+
+    def test_real_cloud_partial_receipt_database_failure_precedes_cancellation(self):
+        request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+        cloud, raw, _cancellation, check = self.real_cloud_case()
+        with db.get_conn() as conn:
+            conn.execute("CREATE TRIGGER reject_partial_receipt BEFORE UPDATE ON download_requests "
+                         "WHEN NEW.gy_status='outcome_unknown' "
+                         "BEGIN SELECT RAISE(ABORT,'partial receipt fault'); END")
+        with self.use_offline(cloud), self.assertRaisesRegex(sqlite3.IntegrityError, "partial receipt fault"):
+            operation(check_cancelled=check)
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["gy_status"], row["gy_target_dir"]), ("submitting", "real-stage"))
+        self.assertEqual(raw.request.call_count, 1)
+        raw.fs_delete_empty.assert_not_called()
+
+    def test_real_single_file_refresh_cancellation_does_not_create_task(self):
+        request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+        cloud, raw, cancellation, check = self.real_cloud_case(refresh=True)
+        with self.use_offline(cloud), self.assertRaises(asyncio.CancelledError) as raised:
+            operation(check_cancelled=check)
+        self.assertIs(raised.exception, cancellation)
+        raw.refresh_token.assert_called_once_with()
+        raw.cloud_create_task.assert_not_called()
+        raw.request.assert_not_called()
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["gy_status"], row["gy_staging_cleanup_status"]), ("failed", "completed"),
+                         row["gy_staging_cleanup_error"])
+        self.assertIn("操作已取消，未提交下载后端", row["error"])
+        raw.fs_delete_empty.assert_called_once()
+
+    def test_real_cloud_unknown_receipt_survives_late_cancel_without_cleanup(self):
+        for batch in (1, 2):
+            with self.subTest(batch=batch):
+                request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+                cloud, raw, _cancellation, check = self.real_cloud_case(unknown_at=batch)
+                with self.use_offline(cloud):
+                    result = operation(check_cancelled=check)
+                self.assertFalse(result["ok"])
+                row = download_requests_repo.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual((row["gy_status"], row["gy_staging_cleanup_status"]),
+                                 ("outcome_unknown", "retained"))
+                self.assertEqual(json.loads(row["gy_task_ids"]), ["task-1"] if batch == 2 else [])
+                self.assertEqual(raw.request.call_count, batch)
+                raw.fs_delete_empty.assert_not_called()
 
     def test_offline_resolve_cancellation_closes_each_admission_without_overwriting_qb(self):
         for path in ("first", "supplement", "retry", "successor"):

@@ -1332,12 +1332,12 @@ def _dispatch_claimed_targets(
                     "error": "下载提交回执无法确认，请先核对下载器，勿重复提交",
                 }
             results[source] = result
-            updates: dict[str, Any] = {
-                "error": "" if result.get("ok") else f"{source}: {result.get('error', '提交失败')}",
-            }
-            if cancelled is not None and not (result.get("staging") or {}).get("id"):
+            updates: dict[str, Any] = {}
+            if (cancelled is not None and _backend_submission_status(source, result) == "failed"
+                    and not (result.get("staging") or {}).get("id")):
                 # 未发出也未新建目录时只结算目标状态，保留已有任务/隔离身份。
                 updates["qb_status" if source == "qb" else "gy_status"] = "failed"
+                result["error"] = "操作已取消，未提交下载后端"
             elif source == "qb":
                 updates["qb_status"] = _backend_submission_status(source, result)
                 updates["qb_task_id"] = result.get("task_id") or (
@@ -1374,6 +1374,7 @@ def _dispatch_claimed_targets(
                 updates["gy_settle_stable_count"] = 0
                 updates["gy_selection_mode"] = str(result.get("selection_mode") or "")
                 updates["gy_unverified_manifest"] = 1 if result.get("unverified_manifest") else 0
+            updates["error"] = "" if result.get("ok") else f"{source}: {result.get('error', '提交失败')}"
             try:
                 status, late_notice = _finalize_submission_state(request_id, (source,), updates)
             except Exception:
@@ -1732,13 +1733,12 @@ def _submit_qb(
     if not torrents and public_title is not None:
         urls = augment_public_magnet(urls, public_title)
     try:
-        if can_proceed is not None and not can_proceed():
-            return {"ok": False, "error": "操作已取消，未提交下载后端"}
         result = client.add_torrent_detailed(
             urls=urls,
             save_path=resolved_save_path,
             category=resolved_category,
             torrents=torrents,
+            can_proceed=can_proceed,
         )
         failure_code = (result.failure_code or "")
         error = ""
