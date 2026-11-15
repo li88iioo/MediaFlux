@@ -256,6 +256,7 @@ def use_runtime_config_snapshot(snapshot: RuntimeConfigSnapshot):
 @contextmanager
 def runtime_config_publication(updates: Mapping[str, str]):
     """Revoke before file publication; only the outer successful owner stabilizes."""
+    _validate_runtime_updates(updates, include_override_keys=True)
     from app import database as db
     from app.agent.feature_gate import (
         RuntimeFenceError,
@@ -983,6 +984,18 @@ def has_external_override(key: str) -> bool:
     return normalized in _STARTUP_ENV_OVERRIDES and bool(os.environ.get(normalized))
 
 
+def _validate_runtime_updates(updates: Mapping[str, str], *, include_override_keys: bool = False) -> None:
+    externally_managed = sorted(filter(has_external_override, updates))
+    if externally_managed and include_override_keys:
+        raise ExternalConfigOverrideError(
+            "目标配置由运行环境覆盖: " + ", ".join(externally_managed[:5])
+        )
+    for key, value in updates.items():
+        _validate_env_item(key, value)
+    if externally_managed:
+        raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
+
+
 def update_runtime_env_file(
     path: Path,
     updates: Mapping[str, str],
@@ -990,13 +1003,9 @@ def update_runtime_env_file(
     expected: bytes | None,
 ) -> EnvUpdateResult:
     """CAS 发布配置，并只把本次非部署覆盖项应用到当前进程。"""
-    global _cache
     normalized = dict(updates)
     target = Path(path)
-    for key, value in normalized.items():
-        _validate_env_item(key, value)
-    if any(has_external_override(key) for key in normalized):
-        raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
+    _validate_runtime_updates(normalized)
 
     def publish() -> EnvUpdateResult:
         global _cache
@@ -1036,19 +1045,12 @@ def reload_after_restore() -> None:
 
 def set_and_save(updates: dict[str, str]) -> None:
     """基于读取快照 CAS 更新当前 user.env，拒绝覆盖并发写入。"""
-    normalized = {key: value for key, value in updates.items()}
+    _validate_runtime_updates(updates, include_override_keys=True)
     with _lock:
-        externally_managed = sorted(
-            key for key in normalized if has_external_override(key)
-        )
-        if externally_managed:
-            raise ExternalConfigOverrideError(
-                "目标配置由运行环境覆盖: " + ", ".join(externally_managed[:5])
-            )
         expected, _current = read_env_snapshot(ENV_FILE)
     # 发布固定先取跨进程snapshot锁、再取_lock；不能持_lock反向等待。
     # 释放快照读取锁后若有并发写入，仍由同一CAS拒绝覆盖，运行时也不发布旧值。
-    update_runtime_env_file(ENV_FILE, normalized, expected=expected)
+    update_runtime_env_file(ENV_FILE, updates, expected=expected)
 
 
 def all_items() -> dict[str, str]:

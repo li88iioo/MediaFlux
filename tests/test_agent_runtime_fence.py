@@ -149,8 +149,14 @@ def test_rejected_publication_preserves_runtime_and_next_save(runtime_env, reaso
     overrides = frozenset({'AGENT_LLM_MODEL'}) if reason == 'override' else frozenset()
     with patch.object(config, '_STARTUP_ENV_OVERRIDES', overrides), patch.dict(
         os.environ, {'AGENT_LLM_MODEL': 'deployment'} if reason == 'override' else {},
-    ), pytest.raises((config.AtomicPublishError, ValueError)):
+    ), pytest.raises((config.AtomicPublishError, ValueError)) as rejected:
         config.update_runtime_env_file(config.ENV_FILE, changes, expected=expected)
+    if reason == 'override':
+        assert str(rejected.value) == '目标配置由运行环境覆盖'
+        with patch.object(config, '_STARTUP_ENV_OVERRIDES', overrides), patch.dict(
+            os.environ, {'AGENT_LLM_MODEL': 'deployment'},
+        ), pytest.raises(config.ExternalConfigOverrideError, match='^目标配置由运行环境覆盖: AGENT_LLM_MODEL$'):
+            config.set_and_save(changes)
     assert config.ENV_FILE.read_bytes() == raw
     assert read_record() == before
     gate.initialize_runtime_fence()
@@ -289,6 +295,59 @@ def test_real_strm_api_enters_fence_before_sqlite_writer(runtime_env):
     read_record_result_3 = read_record()
     assert read_record_result_3 is not None
     assert read_record_result_3['phase'] == 'stable'
+
+
+@pytest.mark.parametrize('reason', ['invalid', 'derived_override'])
+def test_rejected_strm_publication_preserves_state_and_allows_retry(runtime_env, reason):
+    from types import SimpleNamespace
+    from app.routes import api
+
+    request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(background_services_enabled=False))))
+
+    def source_state():
+        with db.get_conn() as conn:
+            return {
+                'snapshot': [dict(row) for row in conn.execute(
+                    "SELECT * FROM settings_kv WHERE key='strm.configured_sources.snapshot.v1'",
+                )],
+                'retired': [dict(row) for row in conn.execute('SELECT * FROM strm_retired_sources ORDER BY source_id')],
+            }
+
+    with patch.object(api, 'require_api_login'), patch.object(api, 'reload_runtime', return_value=([], False)):
+        assert api.save_config(request, {
+            'GY_STRM_SOURCE_DIRS': '[{"id":"11","name":"old"}]',
+            'GY_ORGANIZE_SOURCE_DIRS': '[{"id":"11","name":"old"}]',
+            'GY_ORGANIZE_NSFW_SOURCE_IDS': '["11"]',
+        }) == {'success': True}
+        old_runtime = bootstrap.get_agent_kernel_runtime()
+        before, before_sources, before_fence = config.ENV_FILE.read_bytes(), source_state(), read_record()
+        changes = {'GY_STRM_SOURCE_DIRS': '[{"id":"33","name":"new"}]'}
+        rejected = {**changes, 'QB_PASSWORD': 'bad\0value'}
+        overrides = config._STARTUP_ENV_OVERRIDES
+        environment = {}
+        if reason == 'derived_override':
+            changes['GY_ORGANIZE_SOURCE_DIRS'] = '[{"id":"22","name":"new"}]'
+            rejected = dict(changes)
+            overrides = overrides | {'GY_ORGANIZE_NSFW_SOURCE_IDS'}
+            environment = {'GY_ORGANIZE_NSFW_SOURCE_IDS': '["11"]'}
+        with patch.object(config, '_STARTUP_ENV_OVERRIDES', overrides), patch.dict(os.environ, environment):
+            response = api.save_config(request, rejected)
+        assert isinstance(response, JSONResponse)
+        assert response.status_code == (409 if reason == 'derived_override' else 500)
+        if reason == 'derived_override':
+            assert json.loads(bytes(response.body)) == {'error': '目标配置由运行环境覆盖: GY_ORGANIZE_NSFW_SOURCE_IDS'}
+        assert config.ENV_FILE.read_bytes() == before
+        assert source_state() == before_sources
+        assert read_record() == before_fence
+        gate.initialize_runtime_fence()
+        assert bootstrap.get_agent_kernel_runtime() is old_runtime
+        assert api.save_config(request, changes) == {'success': True}
+        assert json.loads(config.get('GY_STRM_SOURCE_DIRS'))[0]['id'] == '33'
+        after = read_record()
+        assert after is not None and after['phase'] == 'stable'
+        gate.initialize_runtime_fence()
+        cold = _run_cold_runtime(runtime_env, "assert json.loads(config.get('GY_STRM_SOURCE_DIRS'))[0]['id'] == '33'\nbootstrap.get_agent_kernel_runtime()\n")
+        assert cold.returncode == 0, cold.stderr
 
 
 def test_strm_database_failure_compensates_but_never_stabilizes(runtime_env):
