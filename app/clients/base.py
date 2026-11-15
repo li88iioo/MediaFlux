@@ -34,26 +34,12 @@ _RUNTIME_TICKS_PER_MINUTE = 600_000_000
 _MAX_RUNTIME_MINUTES = 525_600
 _MEDIA_ITEM_PAGE_SIZE = 5_000
 _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
-# 单集定位只查一个季/剧；超出时退回整季扫描而不是分页放大请求。
-_EPISODE_LOOKUP_LIMIT = 2_000
-
-
 _TV_TYPES = frozenset({"season", "series"})
 _LEAF_TYPES = frozenset({"movie", "episode"})
 
 
-def _item_id(item: Mapping[str, Any]) -> str:
-    return str(item.get("Id") or "").strip()
-
-
 def _item_type(item: Mapping[str, Any]) -> str:
     return str(item.get("Type") or "").strip().casefold()
-
-
-def _series_id(item: Mapping[str, Any]) -> str:
-    if _item_type(item) == "series":
-        return _item_id(item)
-    return str(item.get("SeriesId") or "").strip()
 
 
 # 只认字幕与 nfo 为附属文件；其他同名文件可能是新视频，必须交给父目录扫描发现。
@@ -1356,7 +1342,7 @@ class MediaServerClient:
                     "ParentId": library_id,
                     "Recursive": "true",
                     "IncludeItemTypes": "Series,Season,Movie,Folder,BoxSet",
-                    "Fields": "Path,SeriesId",
+                    "Fields": "Path",
                     "StartIndex": start_index,
                     "Limit": _MEDIA_ITEM_PAGE_SIZE,
                 },
@@ -1426,20 +1412,15 @@ class MediaServerClient:
         self, items: list[dict[str, Any]], targets: Iterable[str],
         presence: Mapping[str, tuple[str, int]],
     ) -> dict[str, dict[str, Any]]:
-        """单集变化刷新单集，同季多集刷新整季，同剧多季刷新整剧。
+        """剧集变化刷新所在作品，让扫描同时更新整剧最新单集日期。
 
-        新增文件只能由父目录扫描发现，落到所在季或剧；已删除的文件或目录从本机
-        仍存在的最深一层目录定位（季目录也删了就刷整剧），因为 Jellyfin 只在
-        父级校验子项时移除条目。不属于已有剧集的变化取最近的已有目录，找不到时
-        交给调用方按物理根处理。
+        只刷新单集/季不会向上更新 Series 的 DateLastMediaAdded。同剧所有变化
+        统一落到该剧，不枚举单集；缺少整剧条目时才使用已知季或目录。删除事件从
+        本机仍存在的父目录定位，避免刷新已删除条目；电影继续精确匹配自身。
         """
         by_path: dict[tuple[str, tuple[str, ...]], list[tuple[int, int, dict[str, Any]]]] = {}
         leaves_by_dir: dict[tuple[str, tuple[str, ...]], list[dict[str, Any]]] = {}
-        by_id: dict[str, dict[str, Any]] = {}
         for position, item in enumerate(items):
-            item_id = _item_id(item)
-            if item_id:
-                by_id[item_id] = item
             item_path = self._normalize_media_path(item.get("Path"))
             if not item_path:
                 continue
@@ -1455,7 +1436,6 @@ class MediaServerClient:
             )]
 
         resolved: dict[str, dict[str, Any]] = {}
-        tv_groups: dict[str, list[str]] = {}
         for target in targets:
             removed_depth = presence.get(target, ("unknown", 0))[1]
             anchor, parts = normalized_path_parts(self._media_path_key(target))
@@ -1469,12 +1449,13 @@ class MediaServerClient:
                 (item for item in exact if _item_type(item) in _LEAF_TYPES), None,
             )
             container = next((item for item in nearby if _item_type(item) in _TV_TYPES), None)
-            if leaf is not None:
+            series = next((item for item in nearby if _item_type(item) == "series"), None)
+            if series is not None:
+                resolved[target] = series
+            elif leaf is not None:
                 resolved[target] = leaf
-            elif container is not None and any(item is container for item in exact):
-                resolved[target] = container
             elif container is not None:
-                tv_groups.setdefault(_item_id(container), []).append(target)
+                resolved[target] = container
             else:
                 sidecar = None if removed_depth else self._leaf_for_file(
                     target, leaves_by_dir.get((anchor, parts[:-1]), ()),
@@ -1483,39 +1464,6 @@ class MediaServerClient:
                 if chosen is not None:
                     resolved[target] = chosen
 
-        selected_ids = {_item_id(item) for item in resolved.values()}
-        for container_id, members in tv_groups.items():
-            container = by_id[container_id]
-            episode = None
-            if (
-                len(members) == 1
-                and not {container_id, _series_id(container)} & selected_ids
-                and presence.get(members[0], ("unknown", 0))[0] in {"file", "unknown"}
-            ):
-                episode = self._episode_for_file(container, members[0])
-            if episode is not None:
-                episode.setdefault("SeriesId", _series_id(container))
-            for member in members:
-                resolved[member] = episode or container
-
-        # 同剧多季整季变化，或整剧本身已入选时，季与单集统一并入整剧一次。
-        whole_series: set[str] = set()
-        seasons_by_series: dict[str, set[str]] = {}
-        for item in resolved.values():
-            if _item_type(item) == "series":
-                whole_series.add(_item_id(item))
-            elif _item_type(item) == "season" and _series_id(item):
-                seasons_by_series.setdefault(_series_id(item), set()).add(_item_id(item))
-        whole_series.update(
-            series_id for series_id, seasons in seasons_by_series.items() if len(seasons) >= 2
-        )
-        for target, item in resolved.items():
-            series = by_id.get(_series_id(item))
-            if (
-                series is not None and series is not item
-                and _item_type(series) == "series" and _item_id(series) in whole_series
-            ):
-                resolved[target] = series
         return resolved
 
     def _leaf_for_file(
@@ -1541,29 +1489,6 @@ class MediaServerClient:
         best = [leaf for size, leaf in matches if size == longest]
         # E01.part2.zh.srt 属于 E01.part2.strm 而非 E01.strm；B.strm 与 B.mkv 同名时交给父目录。
         return best[0] if len(best) == 1 else None
-
-    def _episode_for_file(
-        self, container: dict[str, Any], target: str,
-    ) -> dict[str, Any] | None:
-        """在已有季/剧下定位单个变化文件对应的单集；查不到交给父目录扫描。"""
-        try:
-            data = self._request("/Items", params={
-                "ParentId": _item_id(container),
-                "Recursive": "true",
-                "IncludeItemTypes": "Episode",
-                "Fields": "Path",
-                "Limit": _EPISODE_LOOKUP_LIMIT,
-            })
-        except (requests.RequestException, ValueError) as exc:
-            logger.info(
-                "[%s] 单集定位失败，改为刷新所在季/剧 type=%s",
-                self.display_name, type(exc).__name__,
-            )
-            return None
-        rows = data.get("Items") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            return None
-        return self._leaf_for_file(target, [row for row in rows if isinstance(row, dict)])
 
     @staticmethod
     def _local_presence(path: str, local_root: str) -> tuple[str, int]:
@@ -1631,7 +1556,7 @@ class MediaServerClient:
     ) -> dict[str, Any]:
         """按变化路径执行最小范围刷新。
 
-        单集变化刷新单集，同季多集刷新整季，同剧多季刷新整剧；全新作品优先刷新
+        剧集变化按作品合并刷新，同时更新整剧汇总日期；电影按自身刷新。全新作品优先刷新
         对应物理根 Folder，只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方
         默认禁止全局 ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的
         原始输入路径；unmatched_paths 是不属于任何（或唯一）媒体库的输入路径。

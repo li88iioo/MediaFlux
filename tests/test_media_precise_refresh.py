@@ -1,10 +1,4 @@
-"""Jellyfin / Emby 精准局部刷新（Sprint 4）需求驱动测试。
-
-覆盖场景来自实施计划的验收条件：
-- Task 4.1 变化路径聚合出最小刷新目标
-- Task 4.2 Jellyfin 最深父 Item 刷新与降级
-- Task 4.3 Emby 与 Jellyfin 行为契约一致
-"""
+"""自动路径刷新：剧集汇总日期、电影精准定位、删除上溯与请求范围契约。"""
 from __future__ import annotations
 
 import tempfile
@@ -169,7 +163,7 @@ class RefreshTargetPlanningTests(unittest.TestCase):
 
         plan = plan_refresh_targets([*episodes, lone, *movies, lone], media_roots=[ROOT])
 
-        # 单个变化文件交给客户端刷新单集/电影；同目录多文件即整季，不再逐集交接。
+        # 规划器保留精确变化路径或同目录聚合；客户端按作品合并实际刷新。
         self.assertEqual(plan.targets, tuple(sorted([
             f"{ROOT}/剧集/作品 A/Season 01", lone, *movies,
         ])))
@@ -247,17 +241,16 @@ class RefreshTargetPlanningTests(unittest.TestCase):
 class _RefreshRecorder:
     """记录刷新调用的媒体服务器桩。"""
 
-    def __init__(self, client, folders, items, *, items_error: bool = False, episodes=None):
+    def __init__(self, client, folders, items, *, items_error: bool = False):
         self.client = client
         self.folders = folders
         self.items = items
         self.items_error = items_error
-        self.episodes = episodes or {}
-        self.episode_lookups: list[str] = []
         self.refreshed: list[str] = []
         self.refresh_all_calls = 0
+        self.unexpected_request = Mock(side_effect=AssertionError("不得逐季查询单集"))
         client.list_virtual_folders = lambda: self.folders
-        client._request = self._request
+        client._request = self.unexpected_request
         client._library_items_with_paths = self._library_items
         client._library_root_items_with_paths = self._library_roots
         client.refresh_library = self._refresh_library
@@ -280,16 +273,6 @@ class _RefreshRecorder:
                 or self.client._media_path_key(item.get("Path")) in wanted
             )
         ]
-
-    def _request(self, path: str, params=None):
-        params = params or {}
-        assert path == "/Items" and params.get("IncludeItemTypes") == "Episode", path
-        parent = params["ParentId"]
-        self.episode_lookups.append(parent)
-        rows = self.episodes.get(parent, [])
-        if isinstance(rows, Exception):
-            raise rows
-        return {"Items": rows, "TotalRecordCount": len(rows)}
 
     def _refresh_library(self, library_id: str) -> bool:
         self.refreshed.append(library_id)
@@ -322,8 +305,8 @@ def _folders() -> list[dict]:
 def _items() -> dict[str, list[dict]]:
     return {
         "lib-tv": [
-            {"Id": "series-a", "Path": f"{ROOT}/剧集/作品 A"},
-            {"Id": "season-a1", "Path": f"{ROOT}/剧集/作品 A/Season 01"},
+            {"Id": "series-a", "Type": "Series", "Path": f"{ROOT}/剧集/作品 A"},
+            {"Id": "season-a1", "Type": "Season", "SeriesId": "series-a", "Path": f"{ROOT}/剧集/作品 A/Season 01"},
         ],
         "lib-movie": [{"Id": "movie-b", "Path": f"{ROOT}/电影/作品 B"}],
     }
@@ -446,7 +429,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "重复或缺失"):
                 client._library_items_with_paths("lib-tv")
 
-    def test_deepest_existing_item_is_refreshed_for_both_servers(self):
+    def test_season_change_refreshes_parent_series_for_both_servers(self):
         for label, client in self._clients():
             with self.subTest(server=label):
                 recorder = _RefreshRecorder(client, _folders(), _items())
@@ -454,36 +437,36 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 result = client.refresh_for_paths([f"{ROOT}/剧集/作品 A/Season 01"])
 
                 self.assertTrue(result["ok"])
-                self.assertEqual(recorder.refreshed, ["season-a1"])
+                self.assertEqual(recorder.refreshed, ["series-a"])
                 self.assertEqual(recorder.refresh_all_calls, 0)
                 self.assertEqual(result["fallback"], "")
                 self.assertEqual(result["scope"], "item")
-                self.assertEqual(result["endpoints"], ["/Items/season-a1/Refresh"])
+                self.assertEqual(result["endpoints"], ["/Items/series-a/Refresh"])
 
-    def test_refresh_granularity_follows_the_scope_of_change(self):
-        # 单集→单集，同季多集→整季，同剧多季→整剧；新增/删除只能靠仍存在的父目录扫描发现。
+    def test_episode_and_season_changes_refresh_series_summary_once(self):
+        # 单集/季的刷新不会更新整剧最新添加日期；新增、更新与删除统一落到受影响的作品。
         s1, s2, s3 = "作品 A/Season 01", "作品 A/Season 02", "作品 A/Season 03"
         e11, e12, e21, e22 = f"{s1}/E01.strm", f"{s1}/E02.strm", f"{s2}/E01.strm", f"{s2}/E02.strm"
         cases = (
-            ("单集更新", [e11], [e11], ["ep-1-1"], ["season-1"]),
-            ("单集字幕", [e11, f"{s1}/E01.zh.srt"], [f"{s1}/E01.zh.srt"], ["ep-1-1"], ["season-1"]),
-            ("新增单集", [f"{s1}/E03.strm"], [f"{s1}/E03.strm"], ["season-1"], ["season-1"]),
-            ("删除单集", [f"{s1}/"], [e11], ["season-1"], []),
-            ("同季多集", [e11, e12], [e11, e12], ["season-1"], []),
-            ("跨季单集各自精准", [e11, e21], [e11, e21], ["ep-1-1", "ep-2-1"], ["season-1", "season-2"]),
-            ("同剧多季整季", [e11, e12, e21, e22], [e11, e12, e21, e22], ["series-a"], []),
-            ("季目录", [f"{s1}/"], [s1], ["season-1"], []),
-            ("多个季目录", [f"{s1}/", f"{s2}/"], [s1, s2], ["series-a"], []),
-            ("整剧目录吸收其下单集", [e11], ["作品 A", e11], ["series-a"], []),
-            ("新季", [f"{s3}/E01.strm"], [f"{s3}/E01.strm"], ["series-a"], ["series-a"]),
-            ("新剧", ["全新作品/Season 01/E01.strm"], ["全新作品/Season 01/E01.strm"], ["root-tv"], []),
+            ("单集更新", [e11], [e11], ["series-a"]),
+            ("单集字幕", [e11, f"{s1}/E01.zh.srt"], [f"{s1}/E01.zh.srt"], ["series-a"]),
+            ("新增单集", [f"{s1}/E03.strm"], [f"{s1}/E03.strm"], ["series-a"]),
+            ("删除单集", [f"{s1}/"], [e11], ["series-a"]),
+            ("同季多集", [e11, e12], [e11, e12], ["series-a"]),
+            ("跨季单集同剧合并", [e11, e21], [e11, e21], ["series-a"]),
+            ("同剧多季整季", [e11, e12, e21, e22], [e11, e12, e21, e22], ["series-a"]),
+            ("季目录", [f"{s1}/"], [s1], ["series-a"]),
+            ("多个季目录", [f"{s1}/", f"{s2}/"], [s1, s2], ["series-a"]),
+            ("整剧目录吸收其下单集", [e11], ["作品 A", e11], ["series-a"]),
+            ("新季", [f"{s3}/E01.strm"], [f"{s3}/E01.strm"], ["series-a"]),
+            ("新剧", ["全新作品/Season 01/E01.strm"], ["全新作品/Season 01/E01.strm"], ["root-tv"]),
             # Jellyfin 只在父级校验子项时移除条目：季目录已删就刷整剧，剧目录已删就刷物理根。
-            ("删除整季目录", ["作品 A/"], [s1], ["series-a"], []),
-            ("删除整季后的单集变化", ["作品 A/"], [e11], ["series-a"], []),
-            ("删除整剧目录", [], ["作品 A"], ["root-tv"], []),
+            ("删除整季目录", ["作品 A/"], [s1], ["series-a"]),
+            ("删除整季后的单集变化", ["作品 A/"], [e11], ["series-a"]),
+            ("删除整剧目录", [], ["作品 A"], ["root-tv"]),
         )
         for label, client in self._clients():
-            for case, existing, changed, expected, lookups in cases:
+            for case, existing, changed, expected in cases:
                 with self.subTest(server=label, case=case), tempfile.TemporaryDirectory() as root:
                     show_root = f"{root}/剧集"
                     _make_tree(show_root, existing)
@@ -494,21 +477,14 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                         {"Id": "series-a", "Type": "Series", "Path": f"{show_root}/作品 A"},
                         {"Id": "season-1", "Type": "Season", "SeriesId": "series-a", "Path": f"{show_root}/{s1}"},
                         {"Id": "season-2", "Type": "Season", "SeriesId": "series-a", "Path": f"{show_root}/{s2}"},
-                    ]}, episodes={
-                        "season-1": [
-                            {"Id": "ep-1-1", "Type": "Episode", "Path": f"{show_root}/{e11}"},
-                            {"Id": "ep-1-2", "Type": "Episode", "Path": f"{show_root}/{e12}"},
-                        ],
-                        "season-2": [{"Id": "ep-2-1", "Type": "Episode", "Path": f"{show_root}/{e21}"}],
-                        "series-a": [],
-                    })
+                    ]})
                     paths = [f"{show_root}/{name}" for name in changed]
 
                     result = client.refresh_for_paths(paths, allow_global_fallback=False)
 
                     self.assertTrue(result["ok"])
                     self.assertEqual(sorted(recorder.refreshed), expected)
-                    self.assertEqual(sorted(recorder.episode_lookups), lookups)
+                    recorder.unexpected_request.assert_not_called()
                     self.assertEqual(sorted(result["succeeded_paths"]), sorted(paths))
                     self.assertEqual(recorder.refresh_all_calls, 0)
 
@@ -543,7 +519,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, expected)
-                    self.assertEqual(recorder.episode_lookups, [])
+                    recorder.unexpected_request.assert_not_called()
 
     def test_deletion_is_only_judged_where_the_library_root_is_visible_locally(self):
         # 映射命中时按本地前缀判断；同路径空间按媒体库目录判断；只在服务端可见的路径保持精确。
@@ -582,23 +558,23 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, expected)
 
-    def test_episode_lookup_failure_falls_back_to_the_season(self):
+    def test_missing_series_keeps_known_season_without_guessing_another_show(self):
         for label, client in self._clients():
-            with self.subTest(server=label), tempfile.TemporaryDirectory() as root:
-                season = Path(root, "剧集/作品 A/Season 01")
-                season.mkdir(parents=True)
-                (season / "E01.strm").write_text("x")
-                recorder = _RefreshRecorder(client, [
-                    {"id": "lib-tv", "name": "剧集", "locations": [f"{root}/剧集"]},
-                ], {"lib-tv": [
-                    {"Id": "series-a", "Type": "Series", "Path": str(season.parent)},
-                    {"Id": "season-1", "Type": "Season", "SeriesId": "series-a", "Path": str(season)},
-                ]}, episodes={"season-1": requests.ConnectionError("down")})
+            with self.subTest(server=label):
+                directory = f"{ROOT}/剧集/作品 A/Season 01"
+                recorder = _RefreshRecorder(client, _folders(), {"lib-tv": [
+                    {"Id": "root-tv", "Type": "Folder", "Path": f"{ROOT}/剧集"},
+                    {"Id": "series-b", "Type": "Series", "Path": f"{ROOT}/剧集/作品 B"},
+                    # SeriesId 不能将路径范围扩大到另一部作品。
+                    {"Id": "season-1", "Type": "Season", "SeriesId": "series-b", "Path": directory},
+                ]})
 
-                result = client.refresh_for_paths([str(season / "E01.strm")])
+                result = client.refresh_for_paths([f"{directory}/E01.strm"])
 
                 self.assertTrue(result["ok"])
                 self.assertEqual(recorder.refreshed, ["season-1"])
+                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.unexpected_request.assert_not_called()
 
     def test_existing_series_wins_over_folder_at_same_season_path(self):
         items = {"lib-tv": [
@@ -724,7 +700,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                 result = client.refresh_for_paths(
                     [f"{ROOT}/剧集/作品 A/Season 01"],
-                    skip_item_ids=("season-a1",),
+                    skip_item_ids=("series-a",),
                 )
 
                 self.assertTrue(result["ok"])
@@ -742,7 +718,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     f"{ROOT}/剧集/作品 A/Season 01/Extras",
                 ])
 
-                self.assertEqual(recorder.refreshed, ["season-a1"])
+                self.assertEqual(recorder.refreshed, ["series-a"])
 
     def test_many_existing_targets_stay_precise_with_one_library_enumeration(self):
         items = [
@@ -788,16 +764,35 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(recorder.refreshed, [])
 
     def test_changes_in_different_libraries_refresh_their_own_items(self):
+        paths = [
+            f"{ROOT}/剧集/作品 A/Season 01/E01.strm",
+            f"{ROOT}/剧集/作品 A/Season 02/E02.strm",
+            f"{ROOT}/剧集/作品 B/Season 01/E01.strm",
+            f"{ROOT}/电影/作品 B",
+        ]
         for label, client in self._clients():
             with self.subTest(server=label):
-                recorder = _RefreshRecorder(client, _folders(), _items())
-
-                client.refresh_for_paths([
-                    f"{ROOT}/剧集/作品 A/Season 01", f"{ROOT}/电影/作品 B",
+                items = _items()
+                items["lib-tv"].extend([
+                    {"Id": "season-a2", "Type": "Season", "Path": f"{ROOT}/剧集/作品 A/Season 02"},
+                    {"Id": "series-b", "Type": "Series", "Path": f"{ROOT}/剧集/作品 B"},
                 ])
+                recorder = _RefreshRecorder(client, _folders(), items)
+                result = client.refresh_for_paths(paths)
 
-                self.assertEqual(sorted(recorder.refreshed), ["movie-b", "season-a1"])
+                self.assertTrue(result["ok"])
+                self.assertEqual(sorted(recorder.refreshed), ["movie-b", "series-a", "series-b"])
+                self.assertEqual(result["succeeded_paths"], paths)
+                self.assertEqual(result["folders"], [])
+                self.assertEqual(result["libraries"], [])
                 self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.unexpected_request.assert_not_called()
+
+                recorder.refreshed.clear()
+                deferred = client.refresh_for_paths(paths, skip_item_ids=("series-a",))
+                self.assertEqual(deferred["deferred_paths"], paths[:2])
+                self.assertEqual(deferred["succeeded_paths"], paths[2:])
+                self.assertEqual(sorted(recorder.refreshed), ["movie-b", "series-b"])
 
     def test_nested_library_uses_the_longest_matching_location(self):
         folders = [
@@ -1191,7 +1186,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     "/somewhere/else/A",
                 ])
 
-                self.assertEqual(recorder.refreshed, ["season-a1"])
+                self.assertEqual(recorder.refreshed, ["series-a"])
                 self.assertEqual(recorder.refresh_all_calls, 0)
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["scope"], "item")
@@ -1221,7 +1216,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                     self.assertFalse(result["ok"])
                     self.assertEqual(result["succeeded_paths"], paths[:2])
-                    self.assertEqual(result["succeeded_target_ids"], ["season-a1"])
+                    self.assertEqual(result["succeeded_target_ids"], ["series-a"])
                     self.assertEqual(result["retryable"], not deferred)
                     self.assertEqual(result["deduplicated"], int(deferred))
                     self.assertEqual(result["deferred_paths"], paths[2:3] if deferred else [])
@@ -1238,7 +1233,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     return _items()[library_id]
 
                 client._library_items_with_paths = listing
-                result = client.refresh_for_paths(paths, skip_item_ids=("season-a1",))
+                result = client.refresh_for_paths(paths, skip_item_ids=("series-a",))
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["retryable"])
                 self.assertEqual(result["deferred_paths"], paths[:1])
@@ -1260,7 +1255,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     "/somewhere/else/A",
                 ])
 
-                self.assertEqual(recorder.refreshed, ["season-a1"])
+                self.assertEqual(recorder.refreshed, ["series-a"])
                 self.assertEqual(recorder.refresh_all_calls, 0)
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["scope"], "item")
