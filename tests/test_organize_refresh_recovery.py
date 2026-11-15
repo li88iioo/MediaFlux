@@ -190,8 +190,7 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
                 assert len(claimed) == 1
                 coordinator._process_group(claimed[0])
             assert coordinator.status()["completed_session"] == 1
-            assert all(media_refresh_queue_status()[key] == 0
-                       for key in ("queued", "running", "retry_wait", "paths"))
+            assert media_refresh_queue_status() == {"queued": 0, "running": 0, "paths": 0, "recent": 0}
             assert api.refresh_for_paths.call_count == 1
             after_recovery = snapshot()
             assert after_recovery["route"] == {"chat_id": "100", "message_thread_id": 500}
