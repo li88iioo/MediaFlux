@@ -580,10 +580,10 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
         directory = f"{ROOT}/剧集/作品 A"
         items = {"lib-tv": [{"Id": "series", "Type": "Series", "Path": directory}]}
         for label, client in self._clients():
-            with self.subTest(server=label), patch("app.clients.base._MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY", 2):
+            with self.subTest(server=label):
                 recorder = _RefreshRecorder(client, _folders(), items)
                 result = client.refresh_for_paths(
-                    [f"{directory}/Season 1/E{i}.mkv" for i in range(3)],
+                    [f"{directory}/Season 1/E{i}.mkv" for i in range(128)],
                     allowed_library_ids=("lib-tv",), allow_library_fallback=False,
                 )
                 self.assertTrue(result["ok"])
@@ -618,24 +618,29 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                 self.assertEqual(recorder.refreshed, ["season-a1"])
 
-    def test_many_targets_in_one_library_coalesce_before_item_enumeration(self):
+    def test_many_existing_targets_stay_precise_with_one_library_enumeration(self):
+        items = [
+            {"Id": f"series-{index}", "Type": "Series", "Path": f"{ROOT}/剧集/作品 {index}"}
+            for index in range(128)
+        ]
+        paths = [f"{item['Path']}/Season 01/E01.strm" for item in items]
         for label, client in self._clients():
             with self.subTest(server=label):
-                recorder = _RefreshRecorder(client, _folders(), _items())
+                recorder = _RefreshRecorder(client, _folders(), {"lib-tv": items})
                 client._library_items_with_paths = Mock(
-                    side_effect=AssertionError("dense target set must not enumerate items")
+                    wraps=client._library_items_with_paths,
                 )
 
-                result = client.refresh_for_paths([
-                    f"{ROOT}/剧集/作品 {index}/Season 01"
-                    for index in range(65)
-                ])
+                result = client.refresh_for_paths(paths)
 
-                client._library_items_with_paths.assert_not_called()
+                client._library_items_with_paths.assert_called_once_with("lib-tv")
                 self.assertTrue(result["ok"])
-                self.assertEqual(recorder.refreshed, ["lib-tv"])
-                self.assertEqual(result["scope"], "library")
-                self.assertIn("多变更媒体库", result["fallback"])
+                self.assertEqual(recorder.refreshed, [item["Id"] for item in items])
+                self.assertEqual(result["scope"], "item")
+                self.assertEqual(result["succeeded_paths"], paths)
+                self.assertEqual(result["folders"], [])
+                self.assertEqual(result["libraries"], [])
+                self.assertEqual(recorder.refresh_all_calls, 0)
 
     def test_many_targets_strict_mode_skips_instead_of_library_refresh(self):
         for label, client in self._clients():
@@ -973,6 +978,40 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["matched"], 0)
                 self.assertEqual(recorder.refreshed, [])
                 self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_item_index_preserves_path_style_case_and_component_boundaries(self):
+        cases = (
+            ("/media", "/media/Film", "/media/Film/E01.strm", True),
+            ("/media", "/media/Film", "/media/film/E01.strm", False),
+            ("/media", "/media/Film", "/media/Film-extra/E01.strm", False),
+            ("C:/", "C:/Media/Straße", r"c:\media\STRASSE\E01.strm", True),
+            ("//NAS/Share", "//NAS/Share/Film", "//nas/share/FILM/E01.strm", True),
+        )
+        for label, client in self._clients():
+            for root, item_path, target, matched in cases:
+                with self.subTest(server=label, target=target):
+                    recorder = _RefreshRecorder(client, [
+                        {"id": "library", "name": "作品", "locations": [root]},
+                    ], {"library": [{"Id": "series", "Type": "Series", "Path": item_path}]})
+                    result = client.refresh_for_paths([target], allow_library_fallback=False)
+                    self.assertEqual(result["ok"], matched)
+                    self.assertEqual(recorder.refreshed, ["series"] if matched else [])
+                    self.assertEqual(result["succeeded_paths"], [target] if matched else [])
+                    self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_same_canonical_item_path_keeps_existing_candidate_priority(self):
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, [
+                    {"id": "library", "name": "作品", "locations": ["D:/Media"]},
+                ], {"library": [
+                    {"Id": "short", "Type": "Series", "Path": "D:/Media/Straße"},
+                    {"Id": "preferred", "Type": "Series", "Path": "D:/Media/STRASSE"},
+                    {"Id": "tie", "Type": "Series", "Path": "D:/Media/strasse"},
+                ]})
+                result = client.refresh_for_paths(["D:/Media/STRASSE/S01"], allow_library_fallback=False)
+                self.assertTrue(result["ok"])
+                self.assertEqual(recorder.refreshed, ["preferred"])
 
     def test_duplicate_direct_virtual_folder_location_is_safely_rejected(self):
         folders = [

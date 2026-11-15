@@ -18,6 +18,7 @@ from typing import Any, Optional
 import requests
 
 from app.logger import get_logger, log_throttled
+from app.modules.local_path_mapping import normalized_path_parts
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
     apply_media_server_path_mapping,
@@ -32,7 +33,6 @@ _RUNTIME_TICKS_PER_MINUTE = 600_000_000
 _MAX_RUNTIME_MINUTES = 525_600
 _MEDIA_ITEM_PAGE_SIZE = 5_000
 _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
-_MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY = 64
 
 
 class MediaLibraryEnumerationTooLarge(RuntimeError):
@@ -1386,52 +1386,45 @@ class MediaServerClient:
             f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
         )
 
-    def _preferred_item_for_path(
-        self, items: list[dict[str, Any]], target: str,
-    ) -> dict[str, Any] | None:
-        """只选能覆盖完整变化路径的 Item；目录不能缩小成某个子文件。"""
-        candidates: list[tuple[int, dict[str, Any]]] = []
+    def _preferred_items_for_paths(
+        self, items: list[dict[str, Any]], targets: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        """每批索引一次，只查询变化路径的祖先；目录不能缩小成某个子文件。"""
+        by_path: dict[tuple[str, tuple[str, ...]], list[tuple[int, int, dict[str, Any]]]] = {}
         by_id: dict[str, dict[str, Any]] = {}
-        for item in items:
+        for position, item in enumerate(items):
             item_id = str(item.get("Id") or "").strip()
             if item_id:
                 by_id[item_id] = item
             item_path = self._normalize_media_path(item.get("Path"))
-            if not item_path:
+            if item_path:
+                key = normalized_path_parts(self._media_path_key(item_path))
+                by_path.setdefault(key, []).append((len(item_path), position, item))
+
+        resolved: dict[str, dict[str, Any]] = {}
+        for target in targets:
+            anchor, parts = normalized_path_parts(self._media_path_key(target))
+            candidates = sorted((
+                entry
+                for depth in range(len(parts), -1, -1)
+                for entry in by_path.get((anchor, parts[:depth]), ())
+            ), key=lambda entry: (-entry[0], entry[1]))
+            if not candidates:
                 continue
-            if media_server_path_is_within(target, item_path):
-                candidates.append((len(item_path), item))
-        if not candidates:
-            return None
-
-        def typed_candidates(item_type: str) -> list[tuple[int, dict[str, Any]]]:
-            return [
-                (length, item)
-                for length, item in candidates
-                if str(item.get("Type") or "").strip().casefold() == item_type
-            ]
-
-        movie_candidates = typed_candidates("movie")
-        if movie_candidates:
-            return max(movie_candidates, key=lambda entry: entry[0])[1]
-
-        # 电视剧无论变化落在剧目录还是季目录，都只刷新一次 Series。
-        season_candidates = typed_candidates("season")
-        series_candidates = typed_candidates("series")
-        if season_candidates:
-            _length, season = max(season_candidates, key=lambda entry: entry[0])
+            # 沿用路径长度优先、同长按枚举顺序的规则，保留 Unicode 别名的选择行为。
+            by_type: dict[str, dict[str, Any]] = {}
+            for _length, _position, item in candidates:
+                by_type.setdefault(str(item.get("Type") or "").strip().casefold(), item)
+            season = by_type.get("season", {})
             series_id = str(season.get("SeriesId") or "").strip()
             linked = by_id.get(series_id)
-            if (
-                linked is not None
-                and str(linked.get("Type") or "").strip().casefold() == "series"
-            ):
-                return linked
-        if series_candidates:
-            return max(series_candidates, key=lambda entry: entry[0])[1]
-        if season_candidates:
-            return max(season_candidates, key=lambda entry: entry[0])[1]
-        return max(candidates, key=lambda entry: entry[0])[1]
+            if linked and str(linked.get("Type") or "").strip().casefold() != "series":
+                linked = None
+            resolved[target] = (
+                by_type.get("movie") or linked or by_type.get("series")
+                or season or candidates[0][2]
+            )
+        return resolved
 
     def _finish_unlocatable_refresh(
         self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
@@ -1626,40 +1619,9 @@ class MediaServerClient:
         library_targets: set[str] = set()
         failed_item_listings: set[str] = set()
         oversized_item_listings: set[str] = set()
-        dense_target_libraries: set[str] = set()
         target_ids: dict[str, str] = {}
 
         for library_id, library_targets_for_id in targets_by_library.items():
-            if allow_library_fallback and len(library_targets_for_id) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
-                dense_target_libraries.add(library_id)
-                try:
-                    root_rows = self._library_root_items_with_paths(
-                        library_id,
-                        locations=tuple(dict.fromkeys(
-                            location for _target, location in library_targets_for_id
-                        )),
-                    )
-                except Exception:
-                    root_rows = []
-                root_items = {
-                    self._media_path_key(item.get("Path")): item
-                    for item in root_rows
-                    if self._media_path_key(item.get("Path"))
-                }
-                for target, library_location in library_targets_for_id:
-                    root_item = root_items.get(self._media_path_key(library_location))
-                    root_id = str(
-                        root_item.get("Id") if isinstance(root_item, dict) else ""
-                    ).strip()
-                    if root_id:
-                        folder_targets[root_id] = {
-                            "library_id": library_id,
-                            "path": library_location,
-                        }
-                    else:
-                        library_targets.add(library_id)
-                    target_ids[target] = root_id or library_id
-                continue
             try:
                 items = self._library_items_with_paths(library_id)
             except MediaLibraryEnumerationTooLarge:
@@ -1713,8 +1675,11 @@ class MediaServerClient:
                 if item_path and item_id:
                     root_items[self._media_path_key(item_path)] = item
 
+            preferred_items = self._preferred_items_for_paths(
+                items, (target for target, _location in library_targets_for_id),
+            )
             for target, library_location in library_targets_for_id:
-                matched_item = self._preferred_item_for_path(items, target)
+                matched_item = preferred_items.get(target)
                 item_id = str(
                     matched_item.get("Id") if isinstance(matched_item, dict) else ""
                 ).strip()
@@ -1863,10 +1828,6 @@ class MediaServerClient:
             reasons.append("部分目标未找到物理根 Item，已按所属媒体库扫描")
         if oversized_item_listings:
             reasons.append(f"{len(oversized_item_listings)} 个大库已收敛为根目录或媒体库刷新")
-        if dense_target_libraries:
-            reasons.append(
-                f"{len(dense_target_libraries)} 个多变更媒体库已合并为根目录扫描"
-            )
         if failed_item_listings:
             reasons.append(f"{len(failed_item_listings)} 个媒体库条目读取失败，将重试")
         if deduplicated_ids:
