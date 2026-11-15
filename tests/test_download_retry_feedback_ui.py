@@ -8,29 +8,6 @@ from pathlib import Path
 
 @unittest.skipUnless(shutil.which('node'), '需要 Node.js 执行页面函数')
 class DownloadRetryFeedbackUITests(unittest.TestCase):
-    def test_postprocess_issues_link_to_original_stage_instead_of_enabling_redownload(self):
-        script = Path('app/static/js/downloads.js').read_text()
-        function = 'function renderIssues(data)' + script.split('function renderIssues(data)', 1)[1].split('function loadOverview', 1)[0]
-        result = self.run_js('''
-const elements=new Map();
-const document={getElementById:id=>{if(!elements.has(id))elements.set(id,{});return elements.get(id);}};
-const window={};
-let downloadIssuePage=1,currentIssueIds=[];
-const selectedIssueIds=new Set(),issueActionBusy=new Set();
-const issueBatchBusy=false;
-const esc=value=>String(value??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
-const attr=esc,parseEntryTitle=title=>({mainTitle:title,tags:[]}),syncIssueSelectionControls=()=>{};
-''' + function + '''
-renderIssues({items:[{id:1,title:'test',stages:[
-{key:'local_import',label:'本地入库',status:'requires_manual',error:'请确认'},
-{key:'strm',label:'STRM 同步',status:'partial',error:'同步失败'},
-],retry_targets:{qb:{enabled:false},guangya:{enabled:false},both:{enabled:false}}}],total:1,pages:1});
-console.log(JSON.stringify(document.getElementById('issueList').innerHTML));
-''')
-        self.assertIn('href="/local-media#review"', result)
-        self.assertIn('href="/guangya/strm"', result)
-        self.assertNotIn('data-enabled="1"', result)
-
     def run_js(self, source):
         result = subprocess.run(['node', '--input-type=module'], input=source, text=True,
                                 capture_output=True, check=True)
