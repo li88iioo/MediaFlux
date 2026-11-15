@@ -3671,6 +3671,34 @@ class HybridMediaProxyTests(unittest.TestCase):
                 headers={"X-Emby-Authorization": authorization},
                 follow_redirects=False,
             )
+            # 普通内网 HTTP 的原生 video 请求不发送 Sec-Fetch-* 或 Origin。
+            # 沿用同一份已核验直放合同，首次播放与拖动都应保持云盘 302。
+            for byte_range in ("bytes=0-", "bytes=4096-"):
+                lan_direct = client.get(
+                    direct_source["Path"],
+                    headers={
+                        "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                        "Accept": "*/*",
+                        "Range": byte_range,
+                    },
+                    follow_redirects=False,
+                )
+                self.assertEqual(lan_direct.status_code, 302)
+                self.assertEqual(
+                    lan_direct.headers["location"],
+                    "https://signed.invalid/web-direct-file",
+                )
+            _FakeAsyncClient.responses.append(_FakeUpstreamResponse(
+                status_code=206, body=b"needs-relay", content_type="video/x-matroska"
+            ))
+            lan_transcode = client.get(
+                transcode_source["DirectStreamUrl"],
+                headers={"User-Agent": "Mozilla/5.0 Jellyfin Web", "Range": "bytes=0-"},
+                follow_redirects=False,
+            )
+            self.assertEqual(lan_transcode.status_code, 206)
+            self.assertEqual(lan_transcode.content, b"needs-relay")
+            self.assertNotIn("location", lan_transcode.headers)
 
         self.assertEqual(playback.status_code, 200)
         self.assertTrue(direct_source["SupportsDirectPlay"])
@@ -3711,11 +3739,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             _FakeGuangYaClient.calls,
             ["web-direct-file", "web-transcode-file"],
         )
-        self.assertEqual(len(_FakeAsyncClient.requests), 3)
+        self.assertEqual(len(_FakeAsyncClient.requests), 4)
         self.assertEqual(
             [item.args[0] for item in pin_signed_target.call_args_list],
             [
                 "https://signed.invalid/web-direct-file",
+                "https://signed.invalid/web-transcode-file",
                 "https://signed.invalid/web-transcode-file",
             ],
         )
@@ -4001,6 +4030,28 @@ class HybridMediaProxyTests(unittest.TestCase):
                 },
                 follow_redirects=False,
             )
+
+            # HTTP 下没有 Fetch Metadata，显式 CORS/旧式 XHR 仍不能直跳 CDN。
+            for extra_headers in (
+                {"Origin": "http://testserver"},
+                {"X-Requested-With": "XMLHttpRequest"},
+            ):
+                with self.subTest(headers=extra_headers):
+                    _FakeAsyncClient.responses.append(_FakeUpstreamResponse(
+                        status_code=206, body=b"lan-relay", content_type="video/mp4"
+                    ))
+                    lan_xhr = client.get(
+                        source["Path"],
+                        headers={
+                            "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                            "Range": "bytes=0-8",
+                            **extra_headers,
+                        },
+                        follow_redirects=False,
+                    )
+                    self.assertEqual(lan_xhr.status_code, 206)
+                    self.assertEqual(lan_xhr.content, b"lan-relay")
+                    self.assertNotIn("location", lan_xhr.headers)
 
         self.assertEqual(playback.status_code, 200)
         self.assertTrue(source["SupportsDirectPlay"])

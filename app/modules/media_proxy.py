@@ -3355,18 +3355,22 @@ def _request_uses_browser_media_element(request: Any) -> bool:
 
 
 def _request_allows_browser_direct_redirect(request: Any) -> bool:
-    """只允许原生 HTMLMediaElement 的 no-cors GET 跟随跨域 signed URL。
+    """在已核验的直放 source 上排除需要同源响应的浏览器请求。
 
-    Jellyfin Web 的 hls.js 使用 XHR/fetch（cors）读取媒体；即使 source 已由
-    PlaybackInfo 判定为可 Direct Play，302 到未开放 CORS 的 CDN 仍会被浏览器
-    拦截。原生 video/audio 且 no-cors 的请求则可以安全保持真正的 302 数据链。
+    普通内网 HTTP 不发送 Fetch Metadata；此时沿用 PlaybackInfo 的远程
+    原生直放合同。明确的 CORS/XHR 请求仍须转发，避免 CDN 未开放 CORS
+    导致播放失败。本函数只补充请求类型判断，不授予媒体访问权限。
     """
     headers = request.headers
     destination = str(headers.get("Sec-Fetch-Dest") or "").strip().casefold()
     fetch_mode = str(headers.get("Sec-Fetch-Mode") or "").strip().casefold()
+    if destination or fetch_mode:
+        return destination in {"audio", "video"} and fetch_mode in {"", "no-cors"}
     return (
-        destination in {"audio", "video"}
-        and fetch_mode in {"", "no-cors"}
+        request.url.scheme == "http"
+        and _request_is_web_client(request)
+        and not headers.get("Origin")
+        and not headers.get("X-Requested-With")
     )
 
 
