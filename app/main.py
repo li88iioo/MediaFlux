@@ -229,8 +229,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                     response = PlainTextResponse("CSRF token invalid", status_code=403)
                 return self._headers(request, response)
         response = await call_next(request)
-        # 改密响应仍返回原结果，但不能把本次已失效的登录态继续留在浏览器。
-        is_web_authenticated(request)
+        # 写请求可能改密；只在这些响应复核，公共只读资源不能因读取会话失去共享缓存。
+        if request.method not in SAFE_METHODS:
+            is_web_authenticated(request)
         return self._headers(request, response)
 
     @staticmethod
