@@ -50,6 +50,8 @@ def test_web_explain_rejects_before_generation_or_model(case, monkeypatch):
                     "web_credentials",
                     lambda: ("another-account", "unused"),
                 )
+                # 重新签发第二个账户的会话，检验计划归属而非旧会话撤销。
+                client.get("/_test_login")
             elif case == "disabled":
                 monkeypatch.setattr(agent_api, "is_agent_enabled", lambda: False)
             elif case == "rate":
