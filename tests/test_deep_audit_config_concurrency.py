@@ -57,7 +57,7 @@ def simultaneous_configuration_writers(directory, output):
         os.environ.pop("POLICY_KEY", None)
         config.write_env_file(target, {"HISTORICAL_KEY": "preserved"}, replace=False)
         from app import database as db
-        from app.agent.feature_gate import initialize_runtime_fence
+        from app.agent.feature_gate import initialize_runtime_fence, read_runtime_fence
         db.configure_database(Path(directory) / "test.db", test_mode=True)
         db.init_db()
         initialize_runtime_fence()
@@ -86,13 +86,20 @@ def simultaneous_configuration_writers(directory, output):
         simple.join(2)
         policy.join(2)
         alive = [thread.name for thread in (simple, policy) if thread.is_alive()]
-        output.put({
+        result = {
             "alive": alive, "outcomes": outcomes,
             "file": target.read_text(),
             "policy_runtime": os.environ.get("POLICY_KEY"),
             "simple_runtime": os.environ.get("SIMPLE_KEY"),
             "cache": dict(config._cache or {}),
-        })
+        }
+        if not alive:
+            with db.get_conn() as conn:
+                result["fence_phase"] = read_runtime_fence(conn).phase
+            initialize_runtime_fence()
+            original_update(target, {"SIMPLE_KEY": "retried"}, expected=target.read_bytes())
+            result["retry_value"] = config.get("SIMPLE_KEY")
+        output.put(result)
 
 
 class ConfigLockOrderBusinessTests(unittest.TestCase):
@@ -197,6 +204,8 @@ class ConfigLockOrderBusinessTests(unittest.TestCase):
                 self.assertIn("HISTORICAL_KEY", result["file"])
                 self.assertIn("POLICY_KEY", result["file"])
                 self.assertNotIn("SIMPLE_KEY", result["file"])
+                self.assertEqual(result["fence_phase"], "stable")
+                self.assertEqual(result["retry_value"], "retried")
             finally:
                 if process.is_alive():
                     process.terminate()

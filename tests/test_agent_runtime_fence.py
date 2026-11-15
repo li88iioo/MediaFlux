@@ -139,11 +139,33 @@ print(json.dumps({'model': new.session.model.settings.model}), flush=True)
             gate.require_runtime_fence(conn, old.creation_binding.fence)
 
 
+@pytest.mark.parametrize('reason', ['stale', 'invalid', 'override'])
+def test_rejected_publication_preserves_runtime_and_next_save(runtime_env, reason):
+    old = bootstrap.get_agent_kernel_runtime()
+    before = read_record()
+    raw = config.ENV_FILE.read_bytes()
+    expected = b'stale=1\n' if reason == 'stale' else raw
+    changes = {'AGENT_LLM_MODEL': 'bad\nvalue' if reason == 'invalid' else 'new'}
+    overrides = frozenset({'AGENT_LLM_MODEL'}) if reason == 'override' else frozenset()
+    with patch.object(config, '_STARTUP_ENV_OVERRIDES', overrides), patch.dict(
+        os.environ, {'AGENT_LLM_MODEL': 'deployment'} if reason == 'override' else {},
+    ), pytest.raises((config.AtomicPublishError, ValueError)):
+        config.update_runtime_env_file(config.ENV_FILE, changes, expected=expected)
+    assert config.ENV_FILE.read_bytes() == raw
+    assert read_record() == before
+    gate.initialize_runtime_fence()
+    assert bootstrap.get_agent_kernel_runtime() is old
+    config.set_and_save({'AGENT_LLM_MODEL': 'next-valid-save'})
+    assert config.get('AGENT_LLM_MODEL') == 'next-valid-save'
+    after = read_record()
+    assert after is not None and after['phase'] == 'stable'
+
+
 def test_failed_publication_stays_changing_and_restart_cannot_revive(runtime_env):
     old = bootstrap.get_agent_kernel_runtime()
     before = config.ENV_FILE.read_bytes()
-    with pytest.raises(config.ConcurrentConfigUpdateError):
-        config.update_runtime_env_file(config.ENV_FILE, {'AGENT_LLM_MODEL': 'new'}, expected=b'stale=1\n')
+    with patch.object(config, '_publish_noreplace', side_effect=OSError('disk failure')), pytest.raises(OSError):
+        config.update_runtime_env_file(config.ENV_FILE, {'AGENT_LLM_MODEL': 'new'}, expected=before)
     assert config.ENV_FILE.read_bytes() == before
     read_record_result_2 = read_record()
     assert read_record_result_2 is not None
@@ -389,9 +411,9 @@ def test_restore_rejects_changing_backup_without_touching_existing_db_or_env(run
             'SELECT value,updated_at FROM settings_kv WHERE key=?', (gate.RUNTIME_FENCE_KEY,)
         ).fetchone()
 
-    with pytest.raises(config.ConcurrentConfigUpdateError):
+    with patch.object(config, '_publish_noreplace', side_effect=OSError('disk failure')), pytest.raises(OSError):
         config.update_runtime_env_file(
-            config.ENV_FILE, {'AGENT_LLM_MODEL': 'unpublished'}, expected=b'stale=1\n'
+            config.ENV_FILE, {'AGENT_LLM_MODEL': 'unpublished'}, expected=before_env
         )
     read_record_result_6 = read_record()
     assert read_record_result_6 is not None

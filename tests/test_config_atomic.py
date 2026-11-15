@@ -368,9 +368,12 @@ class ConfigAtomicWriteTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.errno, errno.EIO)
 
-    def test_apply_runtime_values_serializes_with_initial_cache_load(self):
+    def test_runtime_publication_serializes_with_initial_cache_load(self):
         started = threading.Event()
         release = threading.Event()
+        config.write_env_file(self.env_file, {"OLD": "preserved"}, replace=False)
+        self.initialize_publisher()
+        expected = self.env_file.read_bytes()
 
         def delayed_read(path):
             started.set()
@@ -383,16 +386,17 @@ class ConfigAtomicWriteTests(unittest.TestCase):
             loader.start()
             self.assertTrue(started.wait(timeout=2))
             applied = threading.Thread(
-                target=config._apply_runtime_values,
-                args=({"NEW": "fresh"},),
-                kwargs={"path": config.ENV_FILE},
+                target=config.update_runtime_env_file,
+                args=(self.env_file, {"NEW": "fresh"}),
+                kwargs={"expected": expected},
             )
             applied.start()
             release.set()
             loader.join(timeout=2)
             applied.join(timeout=2)
 
-        self.assertEqual(config.all_items(), {"NEW": "fresh"})
+        self.assertFalse(loader.is_alive() or applied.is_alive())
+        self.assertEqual(config.all_items(), {"OLD": "preserved", "NEW": "fresh"})
 
     def test_update_runtime_env_file_applies_only_changed_keys_after_cas_publish(self):
         config.write_env_file(
@@ -435,7 +439,7 @@ class ConfigAtomicWriteTests(unittest.TestCase):
                     config.update_runtime_env_file(
                         self.env_file,
                         {"DISCOVERY_ENABLED": "0"},
-                        expected=b"snapshot",
+                        expected=self.env_file.read_bytes(),
                     )
                 self.assertEqual(os.environ["DISCOVERY_ENABLED"], "1")
                 self.assertEqual(config._cache, original_cache)

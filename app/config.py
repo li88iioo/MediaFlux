@@ -977,16 +977,6 @@ def update_env_file(
         return EnvUpdateResult(dict(merged), payload)
 
 
-def _apply_runtime_values(values: Mapping[str, str], *, path: Path) -> None:
-    global _cache
-    normalized = {key: value for key, value in values.items()}
-    with _lock:
-        for key, value in normalized.items():
-            os.environ[key] = value
-        if Path(path) == Path(ENV_FILE):
-            _cache = dict(normalized)
-
-
 def has_external_override(key: str) -> bool:
     """判断配置项是否由进程启动环境显式覆盖；不返回覆盖值。"""
     normalized = (key or "")
@@ -1001,14 +991,16 @@ def update_runtime_env_file(
 ) -> EnvUpdateResult:
     """CAS 发布配置，并只把本次非部署覆盖项应用到当前进程。"""
     global _cache
-    normalized = {key: value for key, value in updates.items()}
+    normalized = dict(updates)
     target = Path(path)
+    for key, value in normalized.items():
+        _validate_env_item(key, value)
+    if any(has_external_override(key) for key in normalized):
+        raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
 
     def publish() -> EnvUpdateResult:
         global _cache
         with _lock:
-            if any(has_external_override(key) for key in normalized):
-                raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
             result = update_env_file(target, normalized, expected=expected)
             if target == Path(ENV_FILE):
                 _cache = dict(result.data)
@@ -1020,6 +1012,10 @@ def update_runtime_env_file(
         return publish()
     from app.agent.feature_gate import RuntimeFenceError
     with runtime_config_read_guard():
+        # 过期预览尚未进入发布，不能撤销正在使用的运行授权。
+        # 文件级 CAS 仍在实际发布时核验，保护不遵守应用锁的外部写入。
+        if read_env_snapshot(target)[0] != expected:
+            raise ConcurrentConfigUpdateError("配置已被其他写入修改")
         try:
             with runtime_config_publication(normalized):
                 return publish()
