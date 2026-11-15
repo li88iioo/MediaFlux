@@ -174,7 +174,7 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
                 first = claim_due_media_refreshes(owner="old", now_epoch=100)[0]
                 # A 在领取之后又有了新变化；确认旧 A 不能吞掉新 A。
                 enqueue_media_refresh(
-                    "jellyfin", ["/media/A", "/media/C"], debounce_seconds=0, now_epoch=101,
+                    "jellyfin", ["/media/A", "/media/C"], debounce_seconds=20, now_epoch=101,
                 )
                 self.assertTrue(settle_media_refresh(
                     queued["group_key"], owner="old", lease_generation=first["lease_generation"],
@@ -184,11 +184,14 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
                 stored = json.loads(db.kv_get("media_refresh_queue:v1"))
                 self.assertEqual(stored["version"], 1)
                 self.assertEqual(stored["groups"][queued["group_key"]]["inflight_paths"], [])
-                retry = claim_due_media_refreshes(owner="new", now_epoch=1062)[0]
+                self.assertEqual(stored["groups"][queued["group_key"]]["due_at"], 121)
+                db.init_db()
+                self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=120), [])
+                retry = claim_due_media_refreshes(owner="new", now_epoch=121)[0]
                 self.assertEqual(retry["paths"], ["/media/B", "/media/A", "/media/C"])
-                self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=1062), ())
-                self.assertEqual(recover_media_refresh_leases(now_epoch=1063), 1)
-                recovered = claim_due_media_refreshes(owner="restarted", now_epoch=1063)[0]
+                self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=121), ("series-a",))
+                self.assertEqual(recover_media_refresh_leases(now_epoch=122), 1)
+                recovered = claim_due_media_refreshes(owner="restarted", now_epoch=122)[0]
                 self.assertEqual(recovered["paths"], retry["paths"])
 
     def test_acknowledging_all_inflight_paths_leaves_no_empty_retry(self):
@@ -233,9 +236,9 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             ("series-a",),
         )
         self.assertEqual(
-            claim_due_media_refreshes(owner="worker", now_epoch=191), [],
+            claim_due_media_refreshes(owner="worker", now_epoch=120), [],
         )
-        retried = claim_due_media_refreshes(owner="worker", now_epoch=192)[0]
+        retried = claim_due_media_refreshes(owner="worker", now_epoch=121)[0]
         self.assertEqual(retried["paths"], ["/media/A", "/media/B"])
         self.assertEqual(retried["attempts"], 0)
 
@@ -280,7 +283,7 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
                     self.assertEqual(group["inflight_paths"], [])
                     self.assertEqual(group["status"], "queued" if outcome == "completed" else "retry_wait")
                     self.assertEqual(group["attempts"], {"completed": 0, "deferred": 1, "failed": 2}[outcome])
-                    self.assertEqual(group["due_at"], {"completed": 127, "deferred": 109, "failed": 113}[outcome])
+                    self.assertEqual(group["due_at"], 127 if pending else {"deferred": 109, "failed": 113}[outcome])
                     expected = [] if outcome == "completed" else ["/media/A"]
                     self.assertEqual(group["pending_paths"], expected + (["/media/B"] if pending else []))
                     self.assertEqual(group["last_error"], "" if outcome == "completed" else "fixture reason")

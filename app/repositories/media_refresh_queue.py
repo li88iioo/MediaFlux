@@ -302,7 +302,7 @@ def settle_media_refresh(
     recent_ttl_seconds: int = 90,
     now_epoch: float | None = None,
 ) -> bool:
-    """结算当前租约，只消费已完成的在途路径；租约期间新增的变化始终保留。"""
+    """只消费已完成的在途路径；租约期间新增的变化及其 quiet window 始终保留。"""
     if outcome not in {"completed", "deferred", "failed"}:
         raise ValueError("媒体库刷新结算结果无效")
     now_value = float(time.time() if now_epoch is None else now_epoch)
@@ -330,7 +330,8 @@ def settle_media_refresh(
             path for path in _normalized_paths(group.get("inflight_paths"))
             if path not in acknowledged
         ]
-        group["pending_paths"] = _merge_paths(remaining, group.get("pending_paths"))
+        pending = _normalized_paths(group.get("pending_paths"))
+        group["pending_paths"] = _merge_paths(remaining, pending)
         if not group["pending_paths"]:
             state["groups"].pop(group_key, None)
         else:
@@ -339,8 +340,11 @@ def settle_media_refresh(
             else:
                 if outcome == "failed":
                     group["attempts"] = max(0, int(group.get("attempts") or 0)) + 1
-                minimum = 5 if outcome == "failed" else 1
-                group["due_at"] = now_value + max(minimum, (delay_seconds or minimum))
+                # pending 的时间已由新变化入队时确定，旧批次退避不能推迟或提前它。
+                # 没有新变化时才按失败/去重窗口重试；目标去重仍由 recent 独立约束。
+                if not pending:
+                    minimum = 5 if outcome == "failed" else 1
+                    group["due_at"] = now_value + max(minimum, (delay_seconds or minimum))
             group.update(
                 inflight_paths=[],
                 status="queued" if completed else "retry_wait",

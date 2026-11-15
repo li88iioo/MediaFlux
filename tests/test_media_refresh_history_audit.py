@@ -25,6 +25,50 @@ from tests.test_deep_audit_media_chain import MediaEndpoint, Response
 
 
 class MediaRefreshHistoryAuditTests(unittest.TestCase):
+    def test_unmapped_retry_does_not_postpone_new_pending_refresh_after_restart(self):
+        with isolated_test_database("mediaflux.db"):
+            old, new = "/unmapped/B", "/mf-absent-media/A/new.strm"
+            queue.enqueue_media_refresh("jellyfin", [old], debounce_seconds=0, now_epoch=50)
+            # 保留实际的 v1 队列状态：历史失败已经达到 16 分钟退避。
+            for now in range(50, 100, 10):
+                lease = queue.claim_due_media_refreshes(owner="old", now_epoch=now)[0]
+                queue.settle_media_refresh(
+                    lease["group_key"], owner="old", lease_generation=lease["lease_generation"],
+                    outcome="failed", delay_seconds=5, now_epoch=now,
+                )
+            worker = MediaRefreshCoordinator()
+            lease = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=100)[0]
+            self.assertEqual(lease["attempts"], 5)
+            endpoint = MediaEndpoint("/mf-absent-media", series={"series-a": "/mf-absent-media/A"})
+            client = endpoint.client("jellyfin")
+            refresh = client.refresh_for_paths
+
+            def refresh_with_new_pending(*args, **kwargs):
+                queue.enqueue_media_refresh("jellyfin", [new], debounce_seconds=20, now_epoch=101)
+                return refresh(*args, **kwargs)
+
+            with patch.object(worker, "_client_for", return_value=client), patch.object(
+                client, "refresh_for_paths", side_effect=refresh_with_new_pending,
+            ), patch("app.repositories.media_refresh_queue.time.time", return_value=102), patch(
+                "app.modules.media_refresh_coordinator._retry_seconds", return_value=960,
+            ):
+                worker._process_group(lease)
+            self.assertEqual(endpoint.posts, [])
+
+            db.init_db()
+            worker = MediaRefreshCoordinator()
+            self.assertEqual(queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=120), [])
+            pending = queue.claim_due_media_refreshes(owner=worker._owner, now_epoch=121)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["paths"], [old, new])
+            with patch.object(worker, "_client_for", side_effect=endpoint.client), patch(
+                "app.repositories.media_refresh_queue.time.time", return_value=121,
+            ):
+                worker._process_group(pending[0])
+            self.assertEqual(endpoint.posts, ["/Items/series-a/Refresh"])
+            remaining = queue.claim_due_media_refreshes(owner=worker._owner, force=True, now_epoch=122)
+            self.assertEqual(remaining[0]["paths"], [old])
+
     def test_unmapped_deleted_or_inaccessible_file_recovers_after_mapping_and_restart(self):
         for provider in ("jellyfin", "emby"):
             for inaccessible in (False, True):
