@@ -1,11 +1,10 @@
-"""全链路复核：刷新未定位不能丢失持久意图，路径压缩不能二次方放大。"""
+"""全链路复核：失败刷新一次结束、新变化仍入队，路径压缩不能二次方放大。"""
 from __future__ import annotations
 
-import time
 from unittest.mock import Mock, patch
 
-from app.clients.jellyfin import JellyfinClient
 from app.clients.emby import EmbyClient
+from app.clients.jellyfin import JellyfinClient
 from app.modules import media_refresh
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.repositories.media_refresh_queue import (
@@ -16,7 +15,7 @@ from app.repositories.media_refresh_queue import (
 from tests.support import isolated_test_database
 
 
-def test_real_unmapped_refresh_result_is_retained_not_acknowledged():
+def test_real_unmapped_refresh_finishes_without_automatic_retry():
     for client_type, provider in ((JellyfinClient, "jellyfin"), (EmbyClient, "emby")):
         with isolated_test_database():
             enqueue_media_refresh(provider, ["/not-mapped/Ultraman"], debounce_seconds=0, now_epoch=100)
@@ -30,10 +29,10 @@ def test_real_unmapped_refresh_result_is_retained_not_acknowledged():
             with patch.object(coordinator, "_client_for", return_value=client):
                 coordinator._process_group(job)
             status = media_refresh_queue_status()
-            assert status["paths"] == 1, status
-            assert status["waiting_configuration"] == 1, status
+            assert status["paths"] == 0, status
             assert claim_due_media_refreshes(owner="later", force=True) == []
             assert coordinator._completed_session == 0
+            assert coordinator._failed_session == 1
             client.refresh_all.assert_not_called()
 
 
@@ -47,7 +46,7 @@ def test_no_target_refresh_is_an_explicit_successful_noop():
         client.close()
 
 
-def test_movie_directory_refresh_settles_only_after_covering_scan_succeeds():
+def test_movie_directory_refresh_failure_finishes_and_new_change_scans_covering_root():
     for client_type, provider in ((JellyfinClient, "jellyfin"), (EmbyClient, "emby")):
         with isolated_test_database():
             plan = media_refresh.plan_refresh_targets(changed_paths=["/media/flat/B.strm"])
@@ -66,11 +65,17 @@ def test_movie_directory_refresh_settles_only_after_covering_scan_succeeds():
             try:
                 with patch.object(worker, "_client_for", return_value=client):
                     worker._process_group(claim_due_media_refreshes(owner=worker._owner)[0])
-                    assert media_refresh_queue_status()["paths"] == 1
-                    assert media_refresh_queue_status()["retry_wait"] == 1
-                    job = claim_due_media_refreshes(owner=worker._owner, now_epoch=time.time() + 3600)[0]
+                    assert media_refresh_queue_status()["paths"] == 0
+                    assert worker._failed_session == 1
+                    assert claim_due_media_refreshes(owner=worker._owner, force=True) == []
+                    refresh.assert_called_once_with("root")
+                    # 服务恢复不会自行重试；下一次真实变化仍需扫描能覆盖新文件的根。
+                    enqueue_media_refresh(provider, ["/media/flat/C.strm"], debounce_seconds=0)
+                    job = claim_due_media_refreshes(owner=worker._owner)[0]
+                    assert job["paths"] == ["/media/flat/C.strm"]
                     worker._process_group(job)
                 assert media_refresh_queue_status()["paths"] == 0
+                assert worker._completed_session == 1
                 assert [call.args for call in refresh.call_args_list] == [("root",), ("root",)]
                 client.refresh_all.assert_not_called()
             finally:

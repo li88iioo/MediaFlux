@@ -109,15 +109,3 @@ class MediaLibrariesUIContractTests(unittest.TestCase):
         self.assertIn(".flatMap((row) => availableLocalSourceIds(row.sourceIds)", self.js)
         self.assertIn("requestAnimationFrame", self.js)
         self.assertNotIn("@keyframes", self.css)
-
-    def test_waiting_refresh_panel_explains_path_selection_and_file_preservation(self):
-        self.assertIn("等待配置的刷新", self.template)
-        self.assertIn("正常新入库继续处理", self.template)
-        self.assertIn("配置改动后自动核对", self.template)
-        self.assertIn("同路径部署可自动匹配", self.template)
-        self.assertIn("自动刷新不会全库兜底", self.template)
-        self.assertIn("展开详情可单独选择", self.template)
-        self.assertIn("不删除媒体、STRM 或刮削文件", self.template)
-        self.assertIn('aria-labelledby="mlRefreshQueueTitle"', self.template)
-        self.assertIn('data-resolve-waiting="retry"', self.template)
-        self.assertIn('data-resolve-waiting="clear"', self.template)

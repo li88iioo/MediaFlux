@@ -27,7 +27,7 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
         self.addCleanup(patch.stopall)
         patch("socket.socket.connect", side_effect=AssertionError("network forbidden")).start()
 
-    def test_bound_refresh_survives_folder_query_outage_and_worker_restart(self):
+    def test_bound_refresh_outage_ends_attempt_but_new_change_still_refreshes(self):
         client = Mock(display_name="Jellyfin")
         client.list_virtual_folders.side_effect = TimeoutError("fixture timeout")
         client.refresh_for_paths.return_value = {"ok": True}
@@ -49,12 +49,17 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
         group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
         with patch.object(worker, "_client_for", return_value=client):
             worker._process_group(group)
-        self.assertEqual(media_refresh_queue_status()["paths"], 1)
+        self.assertEqual(media_refresh_queue_status()["paths"], 0)
         client.refresh_for_paths.assert_not_called()
 
         client.list_virtual_folders.side_effect = None
         client.list_virtual_folders.return_value = [{"id": "movies", "name": "电影"}]
-        worker = MediaRefreshCoordinator()  # 只重试刷新，不重新整理或移动。
+        worker = MediaRefreshCoordinator()
+        self.assertEqual(claim_due_media_refreshes(owner=worker._owner, force=True), [])
+        enqueue_media_refresh(
+            "jellyfin", ["/media/Movies/Film"],
+            library_binding={"id": "movies", "name": "电影"},
+        )
         group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
         with patch.object(worker, "_client_for", return_value=client):
             worker._process_group(group)
@@ -135,12 +140,13 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
                     with patch.object(worker, "_client_for", return_value=client):
                         worker._process_group(group)
                     self.assertEqual(client.refresh_for_paths.call_count, int(accepted))
-                    self.assertEqual(media_refresh_queue_status()["paths"], int(not accepted))
+                    self.assertEqual(media_refresh_queue_status()["paths"], 0)
+                    self.assertEqual(worker.status()["failed_session"], int(not accepted))
                     client.refresh_all.assert_not_called()
                     if accepted:
                         self.assertEqual(client.refresh_for_paths.call_args.kwargs["allowed_library_ids"], ("movies",))
 
-    def test_distinct_bindings_do_not_merge_and_disabled_provider_keeps_intent(self):
+    def test_distinct_bindings_do_not_merge_and_disabled_provider_ends_attempts(self):
         for name in ("电影", "剧集"):
             enqueue_media_refresh("jellyfin", ["/media/Film"], library_binding={"id": "movies", "name": name})
         enqueue_media_refresh("jellyfin", ["/media/Film"])
@@ -151,7 +157,8 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
         with patch.object(worker, "_client_for", return_value=None):
             for group in groups:
                 worker._process_group(group)
-        self.assertEqual(media_refresh_queue_status()["paths"], 3)
+        self.assertEqual(media_refresh_queue_status()["paths"], 0)
+        self.assertEqual(worker.status()["failed_session"], 3)
 
     def test_ack_requires_token_and_supports_large_batches(self):
         entries = strm_repo.enqueue_strm_refresh_paths([f"/fixture/{i}" for i in range(1201)])

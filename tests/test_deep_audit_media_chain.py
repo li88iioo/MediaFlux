@@ -2,36 +2,33 @@
 
 from __future__ import annotations
 
-from requests import Session
-
-from typing import cast
-from app.clients.guangya import GuangYaClient
-from app.modules.scraper import TMDBScraper
-
-import tests  # noqa: F401 -- 应用导入前隔离 DB/config/log/cache
 import json
 import subprocess
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
 import pytest
+from requests import Session
 
+import tests  # noqa: F401 -- 应用导入前隔离 DB/config/log/cache
 from app import database as db
-from app.repositories import strm as strm_repo
-from app.repositories import local_media as local_media_repo
 from app.clients.emby import EmbyClient
-from app.clients.guangya import GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.clients.jellyfin import JellyfinClient
-from app.modules import media_probe, strm, strm_metadata_worker as metadata
+from app.modules import media_probe, strm
+from app.modules import media_refresh_coordinator as refresh
+from app.modules import strm_metadata_worker as metadata
 from app.modules.local_media_service import LocalMediaService, LocalMediaServiceError
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
-from app.modules import media_refresh_coordinator as refresh
 from app.modules.organize import OrganizeRules
-from app.modules.scraper import MatchResult, extract_recognition_context
+from app.modules.scraper import MatchResult, TMDBScraper, extract_recognition_context
+from app.repositories import local_media as local_media_repo
 from app.repositories import media_refresh_queue as queue
+from app.repositories import strm as strm_repo
 from app.repositories.strm import StrmRefreshPolicy
 from tests.support import isolated_test_database, release_parse_result
 from tests.test_strm_refresh_closure import _providers
@@ -570,7 +567,7 @@ def test_interrupt_cancel_restart_finishes_only_uncommitted_files(tmp_path):
             assert len(strm_repo.list_strm_index("guangya:audit")) == 4
 
 
-def test_interrupt_refresh_outbox_ack_and_media_failure_replay(tmp_path):
+def test_interrupt_refresh_outbox_ack_recovery_and_media_failure_finishes(tmp_path):
     with isolated_test_database():
         endpoint = MediaEndpoint(tmp_path)
         paths = [str(tmp_path / f"Series {n}" / "episode.strm") for n in range(3)]
@@ -601,14 +598,27 @@ def test_interrupt_refresh_outbox_ack_and_media_failure_replay(tmp_path):
         endpoint.fail = True
         failed, _ = drain_refresh(endpoint, owner="restart")
         assert failed._failed_session == 1
-        assert queue.media_refresh_queue_status()["retry_wait"] == 1
-        assert queue.media_refresh_queue_status()["paths"] == 3
+        assert queue.media_refresh_queue_status()["paths"] == 0
+        assert queue.claim_due_media_refreshes(owner="later", force=True) == []
+        assert endpoint.posts == []
         assert all(Path(p).is_file() for p in paths)
         endpoint.fail = False
-        complete, _ = drain_refresh(endpoint, owner="restart-2")
+        db.init_db()
+        assert queue.claim_due_media_refreshes(owner="restart-2", force=True) == []
+        # 新变化重新经过持久 outbox 交接；服务失败不能重跑已完成的 STRM。
+        changed = Path(paths[0])
+        changed.write_text("http://play.invalid/new-change")
+        strm_repo.enqueue_strm_refresh_paths([str(changed)])
+        with patch.object(refresh, "_configured_provider_names", return_value=("jellyfin",)):
+            restarted._flush_media_refresh(force=True)
+        assert strm_repo.count_strm_refresh_paths() == 0
+        assert queue.media_refresh_queue_status()["paths"] == 1
+        complete, claimed = drain_refresh(endpoint, owner="restart-2")
+        assert [group["paths"] for group in claimed] == [[str(changed)]]
         assert complete._completed_session == 1
         assert len(endpoint.posts) == 1
         assert queue.media_refresh_queue_status()["paths"] == 0
+        assert changed.read_text() == "http://play.invalid/new-change"
 
 
 def test_history_strm_index_backfill_and_old_path_recovery(tmp_path):

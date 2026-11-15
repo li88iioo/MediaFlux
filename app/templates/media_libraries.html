@@ -80,47 +80,6 @@
             </section>
         </div>
     </section>
-
-    <section class="card ml-section ml-mapping-studio ml-refresh-queue" id="mlRefreshQueue" aria-labelledby="mlRefreshQueueTitle">
-        <header class="panel-head ml-panel-head ml-studio-head">
-            <div class="ml-studio-title-group">
-                <div class="ml-studio-icon"><i data-lucide="circle-pause"></i></div>
-                <div>
-                    <h2 id="mlRefreshQueueTitle">等待配置的刷新</h2>
-                    <p>未匹配的路径已暂停重试，配置改动后自动核对；正常新入库继续处理。</p>
-                </div>
-            </div>
-            <button class="jump-btn ml-queue-button" type="button" data-refresh-waiting>
-                <i data-lucide="refresh-cw"></i><span data-button-label>更新列表</span>
-            </button>
-        </header>
-        <div class="ml-queue-help">
-            <p>同路径部署可自动匹配，无需额外配置映射；异路径部署请在上方配置。自动刷新不会全库兜底。</p>
-            <p>只修改了 Jellyfin / Emby 媒体库或已手工修复？选中记录后点击“重新核对”。</p>
-        </div>
-        <div class="ml-queue-toolbar">
-            <div class="ml-queue-selection">
-                <label class="ml-queue-check"><input type="checkbox" data-select-all-waiting disabled><span>全选等待组</span></label>
-                <span id="mlWaitingCount">— 组 · — 条等待路径</span>
-            </div>
-            <div class="ml-queue-actions">
-                <button class="jump-btn ml-queue-button" type="button" data-resolve-waiting="retry" disabled>
-                    <i data-lucide="refresh-cw"></i><span data-button-label>重新核对</span>
-                </button>
-                <button class="jump-btn ml-queue-button ml-queue-clear" type="button" data-resolve-waiting="clear" disabled>
-                    <i data-lucide="list-x"></i><span data-button-label>清除刷新请求</span>
-                </button>
-            </div>
-        </div>
-        <div class="ml-queue-scope">
-            <span id="mlWaitingSelection">已选 0 组 · 0 条路径</span>
-            <p>全选等待组会选中组内全部路径；展开详情可单独选择。清除刷新请求只移除所选路径的请求，不删除媒体、STRM 或刮削文件。</p>
-        </div>
-        <p class="ml-queue-notice" id="mlWaitingNotice" role="status" aria-live="polite"></p>
-        <div class="ml-mapping-list ml-queue-list" id="mlWaitingList" aria-busy="true">
-            <div class="ml-empty-row">正在读取等待刷新记录…</div>
-        </div>
-    </section>
 </div>
 {% endblock %}
 

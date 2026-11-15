@@ -1224,6 +1224,27 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertEqual(result["succeeded_target_ids"], ["season-a1"])
                     self.assertEqual(result["retryable"], not deferred)
                     self.assertEqual(result["deduplicated"], int(deferred))
+                    self.assertEqual(result["deferred_paths"], paths[2:3] if deferred else [])
+
+    def test_dedupe_receipt_survives_other_library_read_failure(self):
+        paths = [f"{ROOT}/剧集/作品 A/Season 01", f"{ROOT}/电影/作品 B", "/outside/unmapped"]
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), _items())
+
+                def listing(library_id):
+                    if library_id == "lib-movie":
+                        raise TimeoutError("movie listing unavailable")
+                    return _items()[library_id]
+
+                client._library_items_with_paths = listing
+                result = client.refresh_for_paths(paths, skip_item_ids=("season-a1",))
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["retryable"])
+                self.assertEqual(result["deferred_paths"], paths[:1])
+                self.assertEqual(result["unmatched_paths"], paths[2:])
+                self.assertEqual(recorder.refreshed, [])
+                self.assertEqual(recorder.refresh_all_calls, 0)
 
     def test_partial_match_never_uses_opt_in_global_fallback(self):
         clients = (

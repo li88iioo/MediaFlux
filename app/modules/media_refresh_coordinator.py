@@ -1,20 +1,17 @@
 """Jellyfin / Emby 刷新合并器。
 
 所有自动整理入口只登记变化路径；单一后台消费者在 quiet window 后合并执行，
-并将媒体服务器刷新失败留在持久队列中重试，而不会重新执行整理或 STRM 生成。
+失败记录原因后结束本次刷新，由用户在媒体服务器手动处理；不重新执行整理或 STRM 生成。
 """
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
 import threading
 import uuid
 from typing import Any
 
 from app import config
 from app.clients.base import close_media_server_client
-from app.logger import get_logger, log_throttled, redact_sensitive_text
+from app.logger import get_logger, redact_sensitive_text
 from app.modules.media_server_path_mapping import configured_media_server_refresh_options
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.process_lock import CrossProcessLock
@@ -26,35 +23,12 @@ from app.repositories.media_refresh_queue import (
     next_media_refresh_due_in,
     recent_media_refresh_target_ids,
     recover_media_refresh_leases,
-    reconcile_media_refresh_configuration,
 )
 
 logger = get_logger(__name__)
 
 _DEFAULT_DEBOUNCE_SECONDS = 20
 _DEFAULT_RECENT_TTL_SECONDS = 90
-_DEFAULT_RETRY_SECONDS = 30
-
-
-class _RefreshConfigurationError(ValueError):
-    """需要配置处理，时间退避无法解决的刷新条件。"""
-
-
-def _configuration_revisions() -> dict[str, str]:
-    from app.repositories.local_media import list_local_library_bindings
-
-    # 与映射页的组合保存/回滚共用读锁，避免把中间状态当作配置修复。
-    with config.runtime_config_read_guard():
-        bindings = [dict(row) for row in list_local_library_bindings()]
-        revisions = {}
-        for provider, secret in (("jellyfin", "API_KEY"), ("emby", "TOKEN")):
-            values = config.get_many(tuple(f"{provider.upper()}_{key}" for key in (
-                "URL", secret, "ENABLED", "PATH_MAPPINGS",
-            )))
-            snapshot = [values, [row for row in bindings if row["provider"] == provider]]
-            # 只保存摘要，不把地址中的令牌或媒体服务器密钥写进任务/页面。
-            revisions[provider] = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
-    return revisions
 
 
 def _debounce_seconds() -> int:
@@ -67,13 +41,6 @@ def _recent_ttl_seconds() -> int:
     return max(10, min(config.get_int(
         "MEDIA_REFRESH_DEDUPE_SECONDS", _DEFAULT_RECENT_TTL_SECONDS,
     ), 1800))
-
-
-def _retry_seconds(attempts: int) -> int:
-    base = max(10, min(config.get_int(
-        "MEDIA_REFRESH_RETRY_BASE_SECONDS", _DEFAULT_RETRY_SECONDS,
-    ), 600))
-    return min(1800, base * (2 ** min(max(0, attempts), 5)))
 
 
 def _configured_provider_names(*, allow_emby: bool = True) -> tuple[str, ...]:
@@ -194,8 +161,7 @@ class MediaRefreshCoordinator:
         try:
             queue = media_refresh_queue_status()
         except Exception:
-            queue = {"queued": 0, "running": 0, "retry_wait": 0, "paths": 0, "recent": 0,
-                     "waiting_configuration": 0, "waiting_paths": 0}
+            queue = {"queued": 0, "running": 0, "paths": 0, "recent": 0}
         with self._state_lock:
             return {
                 **queue,
@@ -228,7 +194,6 @@ class MediaRefreshCoordinator:
                         with self._state_lock:
                             self._consumer_active = True
                             self._last_error_type = ""
-                    reconcile_media_refresh_configuration(_configuration_revisions())
                     claimed = claim_due_media_refreshes(
                         owner=self._owner,
                         lease_seconds=300,
@@ -290,7 +255,7 @@ class MediaRefreshCoordinator:
 
     @staticmethod
     def _resolve_library_binding(client, group: dict[str, Any]) -> tuple[str, ...]:
-        """消费时校验历史绑定；失配等待配置，读取失败退避，绝不全库兜底。"""
+        """消费时校验历史绑定；失配或读取失败即结束本次刷新，绝不全库兜底。"""
         allowed_ids = tuple(group.get("allowed_library_ids") or ())
         binding = group.get("library_binding") or {}
         if not binding:
@@ -298,7 +263,7 @@ class MediaRefreshCoordinator:
         library_id = str(binding.get("id") or "").strip()
         library_name = str(binding.get("name") or "").strip()
         if not library_id and not library_name:
-            raise _RefreshConfigurationError("媒体库绑定为空，请重新绑定")
+            raise ValueError("媒体库绑定为空，请重新绑定")
         folders = client.list_virtual_folders()
         if library_id:
             matches = [
@@ -306,10 +271,10 @@ class MediaRefreshCoordinator:
                 if str(item.get("id") or "").strip() == library_id
             ]
             if len(matches) != 1:
-                raise _RefreshConfigurationError("媒体库绑定已失效；请核对原媒体库，或清除已弃用的刷新请求")
+                raise ValueError("媒体库绑定已失效，请核对原媒体库")
             actual_name = str(matches[0].get("name") or "").strip()
             if library_name and actual_name.casefold() != library_name.casefold():
-                raise _RefreshConfigurationError("媒体库名称与绑定 ID 不一致，请核对原媒体库")
+                raise ValueError("媒体库名称与绑定 ID 不一致，请核对原媒体库")
         else:
             matches = [
                 item for item in folders
@@ -317,118 +282,69 @@ class MediaRefreshCoordinator:
             ]
             if len(matches) != 1:
                 reason = "不存在" if not matches else "存在同名媒体库"
-                raise _RefreshConfigurationError(f"{reason}，请核对原媒体库: {library_name}")
+                raise ValueError(f"{reason}，请核对原媒体库: {library_name}")
         resolved_id = str(matches[0].get("id") or "").strip()
         if not resolved_id or (allowed_ids and resolved_id not in allowed_ids):
-            raise _RefreshConfigurationError("媒体库绑定与允许范围不一致，请核对原媒体库")
+            raise ValueError("媒体库绑定与允许范围不一致，请核对原媒体库")
         return (resolved_id,)
 
     def _process_group(self, group: dict[str, Any]) -> None:
         provider = str(group.get("provider") or "").strip().lower()
-        group_key = str(group.get("group_key") or "")
-        generation = int(group.get("lease_generation") or 0)
-        attempts = int(group.get("attempts") or 0)
+        paths = list(group.get("paths") or [])
+        label = {"jellyfin": "Jellyfin", "emby": "Emby"}.get(provider, provider)
+        # 本地存储故障不算一次上游刷新尝试，保留租约供消费者恢复。
+        recent_ids = recent_media_refresh_target_ids(provider)
         client = None
-        revision = ""
+        outcome: dict[str, Any]
         try:
-            revision = _configuration_revisions()[provider]
             client = self._client_for(provider)
             if client is None:
-                raise _RefreshConfigurationError("媒体服务器已停用或配置不完整")
+                raise ValueError("媒体服务器已停用或配置不完整")
             allowed_ids = self._resolve_library_binding(client, group)
-            recent_ids = recent_media_refresh_target_ids(provider)
             outcome = client.refresh_for_paths(
-                list(group.get("paths") or []),
-                allowed_library_ids=allowed_ids,
-                allow_global_fallback=False,
+                paths, allowed_library_ids=allowed_ids, allow_global_fallback=False,
                 skip_item_ids=recent_ids,
             )
-            scope = str(outcome.get("scope") or "unknown")
-            logger.info(
-                "%s 合并刷新完成 scope=%s ok=%s requested=%s items=%s folders=%s "
-                "libraries=%s deduplicated=%s retryable=%s reason=%s",
-                client.display_name,
-                scope,
-                bool(outcome.get("ok")),
-                int(outcome.get("requested") or 0),
-                len(outcome.get("items") or []),
-                len(outcome.get("folders") or []),
-                len(outcome.get("libraries") or []),
-                int(outcome.get("deduplicated") or 0),
-                bool(outcome.get("retryable")),
-                outcome.get("fallback") or "-",
-            )
-            unmapped = outcome.get("unmatched_paths") or ()
-            waiting_reason = "路径未匹配到唯一媒体库，请检查媒体库目录与路径映射"
-            if unmapped:
-                log_throttled(
-                    logger, logging.WARNING, f"media-refresh-unmapped:{provider}",
-                    "%s 有 %s 个变化路径等待配置，已暂停自动重试；请在媒体库与路径映射页处理 样例=%s",
-                    client.display_name, len(unmapped), "；".join(unmapped[:3]),
-                    interval_seconds=3600,
-                )
-            retryable = bool(outcome.get("retryable"))
-            deduplicated = int(outcome.get("deduplicated") or 0)
-            if retryable:
-                settlement, delay = "failed", _retry_seconds(attempts)
-                error = outcome.get("fallback") or "媒体服务器刷新失败"
-            elif deduplicated:
-                # 新变化需要在去重窗口后再校准；不能因为同组有缺映射路径而延长到失败退避。
-                settlement, delay = "deferred", _recent_ttl_seconds()
-                error = f"等待媒体库刷新去重窗口结束（{deduplicated} 项）"
-            else:
-                settlement, delay, error = "completed", 0, ""
-            settle_media_refresh(
-                group_key, outcome=settlement,
-                owner=self._owner, lease_generation=generation,
-                delay_seconds=delay, error=error,
-                acknowledged_paths=outcome.get("succeeded_paths") or (),
-                refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
-                waiting_paths=unmapped, waiting_reason=waiting_reason,
-                configuration_revision=revision,
-                recent_ttl_seconds=_recent_ttl_seconds(),
-            )
-            with self._state_lock:
-                self._failed_session += int(retryable)
-                self._completed_session += int(not retryable and not deduplicated and not unmapped)
-                self._last_error_type = (
-                    "MediaRefreshRetryable" if retryable else "MediaRefreshUnmapped" if unmapped else ""
-                )
-            if outcome.get("succeeded_target_ids"):
-                from app.services import clear_dashboard_cache
-
-                clear_dashboard_cache(keep_stale=True)
-        except _RefreshConfigurationError as exc:
-            settle_media_refresh(
-                group_key, outcome="completed", owner=self._owner, lease_generation=generation,
-                waiting_paths=group.get("paths") or (), waiting_reason=str(exc),
-                configuration_revision=revision,
-            )
-            with self._state_lock:
-                self._last_error_type = "MediaRefreshConfiguration"
-            logger.warning("媒体库刷新等待配置 provider=%s reason=%s", provider, str(exc))
         except Exception as exc:
-            safe_error = redact_sensitive_text(str(exc))[:300]
-            try:
-                settle_media_refresh(
-                    group_key, outcome="failed",
-                    owner=self._owner,
-                    lease_generation=generation,
-                    error=safe_error or type(exc).__name__,
-                    delay_seconds=_retry_seconds(attempts),
-                )
-            except Exception:
-                logger.exception("媒体库刷新失败后更新重试状态异常")
-            with self._state_lock:
-                self._failed_session += 1
-                self._last_error_type = type(exc).__name__
-            logger.warning(
-                "媒体库合并刷新失败 provider=%s type=%s，将仅重试刷新",
-                provider,
-                type(exc).__name__,
-            )
+            outcome = {"ok": False, "fallback": redact_sensitive_text(str(exc)) or type(exc).__name__}
         finally:
             close_media_server_client(client)
+
+        deferred = outcome.get("deferred_paths") or ()
+        # 数据库结算失败必须交回消费者恢复；不能当成媒体服务器失败再清空队列。
+        if not settle_media_refresh(
+            str(group.get("group_key") or ""), owner=self._owner,
+            lease_generation=int(group.get("lease_generation") or 0),
+            deferred_paths=deferred, delay_seconds=_recent_ttl_seconds(),
+            refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+            recent_ttl_seconds=_recent_ttl_seconds(),
+        ):
+            return
+        failed = bool(outcome.get("retryable") or outcome.get("unmatched_paths") or (
+            not outcome.get("ok") and not deferred
+        ))
+        with self._state_lock:
+            self._failed_session += int(failed)
+            self._completed_session += int(not failed and not deferred)
+            self._last_error_type = "MediaRefreshFailed" if failed else ""
+        if failed:
+            logger.warning(
+                "%s 媒体库刷新未完成，失败路径已结束自动处理；已完成的整理与 STRM 不受影响，"
+                "请在 %s 中手动刷新媒体库。原因=%s 路径数=%s 样例=%s",
+                label, label, redact_sensitive_text(str(outcome.get("fallback") or "路径未匹配媒体库或刷新失败"))[:300],
+                len(paths), "；".join(paths[:3]),
+            )
+        else:
+            logger.info(
+                "%s 合并刷新完成 scope=%s requested=%s items=%s folders=%s libraries=%s deferred=%s",
+                label, outcome.get("scope") or "unknown", len(paths),
+                len(outcome.get("items") or []), len(outcome.get("folders") or []),
+                len(outcome.get("libraries") or []), len(deferred),
+            )
+        if outcome.get("succeeded_target_ids"):
+            from app.services import clear_dashboard_cache
+
+            clear_dashboard_cache(keep_stale=True)
 
 
 _coordinator = MediaRefreshCoordinator()

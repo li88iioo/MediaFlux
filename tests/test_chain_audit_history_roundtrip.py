@@ -5,9 +5,9 @@ from __future__ import annotations
 import unittest
 
 from app import database as db
-from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.modules.backup import create_backup, recover_pending_restore, restore_backup
 from app.repositories import media_refresh_queue as queue
+from app.repositories import media_subscriptions as media_subscriptions_repo
 from app.runtime_paths import RuntimePaths
 from tests.support import isolated_test_database
 
@@ -98,7 +98,7 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
             )
             self.assertFalse(
                 queue.settle_media_refresh(
-                    group["group_key"], outcome="completed",
+                    group["group_key"],
                     owner="old-worker",
                     lease_generation=old_lease["lease_generation"],
                     now_epoch=103,
@@ -106,7 +106,7 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
             )
             self.assertTrue(
                 queue.settle_media_refresh(
-                    group["group_key"], outcome="completed",
+                    group["group_key"],
                     owner="new-worker",
                     lease_generation=new_lease["lease_generation"],
                     refreshed_target_ids=("series-1",),

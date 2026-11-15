@@ -108,7 +108,7 @@ class MediaBatchProjectionAuditTests(unittest.TestCase):
             ["partial", "ready"],
         )
 
-    def test_ambiguous_binding_keeps_retryable_path_and_never_refreshes_global_library(
+    def test_ambiguous_binding_ends_attempt_and_never_refreshes_global_library(
         self,
     ):
         queue.enqueue_media_refresh(
@@ -128,7 +128,6 @@ class MediaBatchProjectionAuditTests(unittest.TestCase):
             worker._process_group(group)
         client.refresh_for_paths.assert_not_called()
         client.close.assert_called_once()
-        self.assertEqual(queue.media_refresh_queue_status()["retry_wait"], 1)
-        retried = queue.claim_due_media_refreshes(owner=worker._owner, force=True)[0]
-        self.assertEqual(retried["paths"], ["/synthetic/Film.mkv"])
-        self.assertEqual(retried["library_binding"], {"id": "", "name": "Same"})
+        self.assertEqual(queue.media_refresh_queue_status()["paths"], 0)
+        self.assertEqual(queue.claim_due_media_refreshes(owner=worker._owner, force=True), [])
+        self.assertEqual(worker.status()["failed_session"], 1)

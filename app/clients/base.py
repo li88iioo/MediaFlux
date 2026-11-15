@@ -1635,7 +1635,8 @@ class MediaServerClient:
         对应物理根 Folder，只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方
         默认禁止全局 ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的
         原始输入路径；unmatched_paths 是不属于任何（或唯一）媒体库的输入路径。
-        二者供队列逐项结算，不表示服务端异步扫描已经完成。
+        deferred_paths 仅记录因短暂去重而尚未提交的原始路径，供队列延后提交；
+        这些回执不表示服务端异步扫描已经完成。
         """
         allowed_ids = {
             (item or "").strip() for item in allowed_library_ids or ()
@@ -1695,6 +1696,7 @@ class MediaServerClient:
             "deduplicated": 0,
             "succeeded_target_ids": [],
             "succeeded_paths": [],
+            "deferred_paths": [],
             "unmatched_paths": [],
             "allowed_libraries": sorted(allowed_ids),
         }
@@ -1832,7 +1834,7 @@ class MediaServerClient:
                 continue
             except Exception as exc:
                 logger.warning(
-                    "[%s] 读取媒体库 %s 条目失败，将保留刷新请求重试: %s",
+                    "[%s] 读取媒体库 %s 条目失败: %s",
                     self.display_name, library_id, exc,
                 )
                 failed_item_listings.add(library_id)
@@ -1948,6 +1950,10 @@ class MediaServerClient:
         requested_ids = [*item_ids, *folder_ids, *library_ids]
         deduplicated_ids = [item for item in requested_ids if item in skipped_ids]
         result["deduplicated"] = len(deduplicated_ids)
+        result["deferred_paths"] = _dedupe_texts([
+            source for target, item_id in target_ids.items() if item_id in skipped_ids
+            for source in sources_for_target[target]
+        ])
         item_ids = [item for item in item_ids if item not in skipped_ids]
         folder_ids = [item for item in folder_ids if item not in skipped_ids]
         library_ids = [item for item in library_ids if item not in skipped_ids]
@@ -1955,7 +1961,7 @@ class MediaServerClient:
         if not item_ids and not folder_ids and not library_ids:
             if failed_item_listings:
                 result["fallback"] = (
-                    f"{len(failed_item_listings)} 个媒体库条目读取失败，刷新请求将重试"
+                    f"{len(failed_item_listings)} 个媒体库条目读取失败"
                 )
                 result["scope"] = "skipped"
                 result["skipped"] = True
@@ -2014,7 +2020,7 @@ class MediaServerClient:
         if oversized_item_listings:
             reasons.append(f"{len(oversized_item_listings)} 个大库已收敛为根目录或媒体库刷新")
         if failed_item_listings:
-            reasons.append(f"{len(failed_item_listings)} 个媒体库条目读取失败，将重试")
+            reasons.append(f"{len(failed_item_listings)} 个媒体库条目读取失败")
         if deduplicated_ids:
             reasons.append(f"{len(deduplicated_ids)} 个目标已在去重窗口内跳过")
         if ambiguous_targets:
@@ -2026,7 +2032,7 @@ class MediaServerClient:
             )
         failed_endpoints = len(outcomes) - len(succeeded_ids)
         if failed_endpoints:
-            reasons.append(f"{failed_endpoints} 个刷新请求失败，将重试")
+            reasons.append(f"{failed_endpoints} 个刷新请求失败")
         result["fallback"] = "；".join(reasons)
         result["retryable"] = bool(failed_item_listings or failed_endpoints)
         result["ok"] = (

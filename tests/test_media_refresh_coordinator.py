@@ -5,10 +5,8 @@ import sqlite3
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
 from unittest.mock import Mock, patch
 
-from app import config
 from app import database as db
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.repositories.media_refresh_queue import (
@@ -19,10 +17,6 @@ from app.repositories.media_refresh_queue import (
     recent_media_refresh_target_ids,
     recover_media_refresh_leases,
     settle_media_refresh,
-    reconcile_media_refresh_configuration,
-    list_waiting_media_refreshes,
-    resolve_waiting_media_refreshes,
-    next_media_refresh_due_in,
 )
 from tests.support import IsolatedDatabaseTestCase
 
@@ -30,110 +24,6 @@ from tests.support import IsolatedDatabaseTestCase
 class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         clear_media_refresh_queue()
-
-    def test_waiting_paths_are_durable_and_resume_only_for_changed_provider(self):
-        for provider in ("jellyfin", "emby"):
-            enqueue_media_refresh(provider, ["/old/A"], debounce_seconds=0, now_epoch=100)
-        for lease in claim_due_media_refreshes(owner="worker", now_epoch=100):
-            settle_media_refresh(
-                lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
-                outcome="completed", waiting_paths=["/old/A"], waiting_reason="缺少映射",
-                configuration_revision="before", now_epoch=100,
-            )
-        db.init_db()
-        recover_media_refresh_leases(now_epoch=1000)
-        self.assertEqual(reconcile_media_refresh_configuration(
-            {"jellyfin": "before", "emby": "before"}, now_epoch=1000,
-        ), 0)
-        self.assertEqual(claim_due_media_refreshes(owner="later", force=True, now_epoch=1000), [])
-        self.assertIsNone(next_media_refresh_due_in(now_epoch=1000))
-        self.assertEqual(media_refresh_queue_status(now_epoch=1000)["waiting_paths"], 2)
-        self.assertEqual(reconcile_media_refresh_configuration(
-            {"jellyfin": "after", "emby": "before"}, now_epoch=1000,
-        ), 1)
-        lease = claim_due_media_refreshes(owner="later", now_epoch=1000)[0]
-        self.assertEqual((lease["provider"], lease["paths"]), ("jellyfin", ["/old/A"]))
-        self.assertEqual(list_waiting_media_refreshes()[0]["provider"], "emby")
-
-    def test_new_change_wins_over_inflight_waiting_result(self):
-        enqueue_media_refresh("jellyfin", ["/A", "/B"], debounce_seconds=0, now_epoch=100)
-        lease = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-        enqueue_media_refresh("jellyfin", ["/A"], debounce_seconds=20, now_epoch=101)
-        settle_media_refresh(
-            lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
-            outcome="completed", waiting_paths=["/A", "/B"], waiting_reason="缺少映射",
-            configuration_revision="before", now_epoch=102,
-        )
-        self.assertEqual(list_waiting_media_refreshes()[0]["paths"], ["/B"])
-        self.assertEqual(claim_due_media_refreshes(owner="worker", now_epoch=120), [])
-        self.assertEqual(claim_due_media_refreshes(owner="worker", now_epoch=121)[0]["paths"], ["/A"])
-        self.assertEqual(list_waiting_media_refreshes()[0]["paths"], ["/B"])
-
-    def test_resolve_selected_paths_keeps_other_waiting_intents(self):
-        for action in ("retry", "clear"):
-            with self.subTest(action=action):
-                clear_media_refresh_queue()
-                enqueue_media_refresh("jellyfin", ["/old/A", "/current/B"], debounce_seconds=0, now_epoch=100)
-                lease = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-                settle_media_refresh(
-                    lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
-                    outcome="completed", waiting_paths=lease["paths"], waiting_reason="缺少映射",
-                    configuration_revision="old", now_epoch=100,
-                )
-                selection = [{**list_waiting_media_refreshes()[0], "paths": ["/old/A"]}]
-                self.assertEqual(resolve_waiting_media_refreshes(selection, action, now_epoch=101)["processed_paths"], 1)
-                self.assertEqual(list_waiting_media_refreshes()[0]["paths"], ["/current/B"])
-                jobs = claim_due_media_refreshes(owner="worker", now_epoch=101)
-                self.assertEqual([job["paths"] for job in jobs], [["/old/A"]] if action == "retry" else [])
-
-    def test_resolution_preserves_active_paths_and_rejects_changed_snapshot(self):
-        for action in ("clear", "retry"):
-            with self.subTest(action=action):
-                clear_media_refresh_queue()
-                enqueue_media_refresh("jellyfin", ["/A", "/B"], debounce_seconds=0, now_epoch=100)
-                lease = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-                settle_media_refresh(
-                    lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
-                    outcome="completed", acknowledged_paths=["/A"], refreshed_target_ids=["item-a"],
-                    waiting_paths=["/B"], waiting_reason="缺少映射", configuration_revision="old", now_epoch=100,
-                )
-                stale = list_waiting_media_refreshes()
-                enqueue_media_refresh("jellyfin", ["/B"], debounce_seconds=0, now_epoch=101)
-                lease = claim_due_media_refreshes(owner="worker", now_epoch=101)[0]
-                settle_media_refresh(
-                    lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
-                    outcome="completed", waiting_paths=["/B"], waiting_reason="缺少映射",
-                    configuration_revision="old", now_epoch=101,
-                )
-                snapshot = db.kv_get("media_refresh_queue:v1")
-                with self.assertRaisesRegex(ValueError, "已变化"):
-                    resolve_waiting_media_refreshes(stale, action, now_epoch=102)
-                self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
-                enqueue_media_refresh("jellyfin", ["/C"], debounce_seconds=20, now_epoch=102)
-                result = resolve_waiting_media_refreshes(list_waiting_media_refreshes(), action, now_epoch=103)
-                self.assertEqual(result["processed_paths"], 1)
-                self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=103), ("item-a",))
-                self.assertEqual(claim_due_media_refreshes(owner="worker", now_epoch=121), [])
-                expected = ["/C", "/B"] if action == "retry" else ["/C"]
-                self.assertEqual(claim_due_media_refreshes(owner="worker", now_epoch=122)[0]["paths"], expected)
-
-    def test_cleared_group_recreation_does_not_accept_previous_selection(self):
-        previous = []
-        for now in (100, 101):
-            enqueue_media_refresh("jellyfin", ["/A"], debounce_seconds=0, now_epoch=now)
-            lease = claim_due_media_refreshes(owner="worker", now_epoch=now)[0]
-            settle_media_refresh(
-                lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
-                outcome="completed", waiting_paths=["/A"], waiting_reason="未匹配",
-                configuration_revision="same", now_epoch=now,
-            )
-            if not previous:
-                previous = list_waiting_media_refreshes()
-                resolve_waiting_media_refreshes(previous, "clear", now_epoch=now)
-        self.assertNotEqual(list_waiting_media_refreshes()[0]["token"], previous[0]["token"])
-        with self.assertRaisesRegex(ValueError, "已变化"):
-            resolve_waiting_media_refreshes(previous, "clear", now_epoch=102)
-        self.assertEqual(media_refresh_queue_status(now_epoch=102)["waiting_paths"], 1)
 
     def test_quiet_window_merges_paths_and_moves_due_time(self):
         enqueue_media_refresh(
@@ -162,7 +52,7 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         )
 
         self.assertTrue(settle_media_refresh(
-            first["group_key"], outcome="completed",
+            first["group_key"],
             owner="worker",
             lease_generation=claimed["lease_generation"],
             now_epoch=102,
@@ -187,7 +77,7 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         )
 
         self.assertTrue(settle_media_refresh(
-            queued["group_key"], outcome="completed",
+            queued["group_key"],
             owner="worker",
             lease_generation=claimed["lease_generation"],
             now_epoch=132,
@@ -226,38 +116,13 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(recovered["paths"], ["/media/A"])
 
-    def test_partial_success_enters_dedupe_window_before_retry(self):
-        queued = enqueue_media_refresh(
-            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
-        )
-        claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-
-        self.assertTrue(settle_media_refresh(
-            queued["group_key"], outcome="failed",
-            owner="worker",
-            lease_generation=claimed["lease_generation"],
-            error="one endpoint failed",
-            delay_seconds=30,
-            refreshed_target_ids=("series-a",),
-            recent_ttl_seconds=90,
-            now_epoch=100,
-        ))
-
-        self.assertEqual(
-            recent_media_refresh_target_ids("jellyfin", now_epoch=101),
-            ("series-a",),
-        )
-        status = media_refresh_queue_status(now_epoch=101)
-        self.assertEqual(status["retry_wait"], 1)
-        self.assertEqual(status["paths"], 1)
-
     def test_completed_targets_enter_persistent_dedupe_window(self):
         queued = enqueue_media_refresh(
             "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
         )
         claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
         settle_media_refresh(
-            queued["group_key"], outcome="completed",
+            queued["group_key"],
             owner="worker",
             lease_generation=claimed["lease_generation"],
             refreshed_target_ids=("series-a",),
@@ -273,22 +138,22 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             recent_media_refresh_target_ids("jellyfin", now_epoch=190), (),
         )
 
-    def test_partial_acknowledgement_preserves_new_changes_and_restart(self):
-        for outcome in ("failed", "deferred"):
-            with self.subTest(outcome=outcome):
+    def test_settlement_keeps_only_deferred_and_new_paths_after_restart(self):
+        for deferred in ([], ["/media/B"]):
+            with self.subTest(deferred=deferred):
                 clear_media_refresh_queue()
                 queued = enqueue_media_refresh(
                     "jellyfin", ["/media/A", "/media/B"], debounce_seconds=0, now_epoch=100,
                 )
                 first = claim_due_media_refreshes(owner="old", now_epoch=100)[0]
-                # A 在领取之后又有了新变化；确认旧 A 不能吞掉新 A。
+                # 同一路径在执行中又变化，结束旧请求不能吞掉新的 A。
                 enqueue_media_refresh(
                     "jellyfin", ["/media/A", "/media/C"], debounce_seconds=20, now_epoch=101,
                 )
                 self.assertTrue(settle_media_refresh(
                     queued["group_key"], owner="old", lease_generation=first["lease_generation"],
-                    outcome=outcome, acknowledged_paths=["/media/A"],
-                    refreshed_target_ids=["series-a"], delay_seconds=960, now_epoch=102,
+                    deferred_paths=deferred, refreshed_target_ids=["series-a"],
+                    delay_seconds=90, now_epoch=102,
                 ))
                 stored = json.loads(db.kv_get("media_refresh_queue:v1"))
                 self.assertEqual(stored["version"], 1)
@@ -296,125 +161,51 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
                 self.assertEqual(stored["groups"][queued["group_key"]]["due_at"], 121)
                 db.init_db()
                 self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=120), [])
-                retry = claim_due_media_refreshes(owner="new", now_epoch=121)[0]
-                self.assertEqual(retry["paths"], ["/media/B", "/media/A", "/media/C"])
+                next_group = claim_due_media_refreshes(owner="new", now_epoch=121)[0]
+                self.assertEqual(next_group["paths"], deferred + ["/media/A", "/media/C"])
                 self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=121), ("series-a",))
                 self.assertEqual(recover_media_refresh_leases(now_epoch=122), 1)
                 recovered = claim_due_media_refreshes(owner="restarted", now_epoch=122)[0]
-                self.assertEqual(recovered["paths"], retry["paths"])
+                self.assertEqual(recovered["paths"], next_group["paths"])
 
-    def test_acknowledging_all_inflight_paths_leaves_no_empty_retry(self):
-        for outcome in ("failed", "deferred"):
-            with self.subTest(outcome=outcome):
+    def test_settlement_is_idempotent_and_delays_only_deduplicated_paths(self):
+        for deferred in ([], ["/media/A"]):
+            with self.subTest(deferred=deferred):
+                clear_media_refresh_queue()
                 queued = enqueue_media_refresh(
                     "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
                 )
-                claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-                self.assertTrue(settle_media_refresh(
-                    queued["group_key"], owner="worker", lease_generation=claimed["lease_generation"],
-                    outcome=outcome, acknowledged_paths=["/media/A"], now_epoch=101,
-                ))
-                self.assertEqual(media_refresh_queue_status(now_epoch=102)["retry_wait"], 0)
-                self.assertEqual(claim_due_media_refreshes(owner="worker", now_epoch=2000), [])
+                lease = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
+                arguments = dict(
+                    owner="worker", lease_generation=lease["lease_generation"],
+                    deferred_paths=deferred, delay_seconds=90,
+                    refreshed_target_ids=["series-a"], now_epoch=101,
+                )
+                self.assertTrue(settle_media_refresh(queued["group_key"], **arguments))
+                snapshot = db.kv_get("media_refresh_queue:v1")
+                self.assertFalse(settle_media_refresh(queued["group_key"], **arguments))
+                self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
+                self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=102), ("series-a",))
+                self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=190), [])
+                claimed = claim_due_media_refreshes(owner="next", now_epoch=191)
+                self.assertEqual([path for group in claimed for path in group["paths"]], deferred)
 
-    def test_deferred_refresh_preserves_inflight_and_pending_paths(self):
-        queued = enqueue_media_refresh(
-            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
-        )
-        claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-        enqueue_media_refresh(
-            "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=101,
-        )
-
-        self.assertTrue(settle_media_refresh(
-            queued["group_key"], outcome="deferred",
-            owner="worker",
-            lease_generation=claimed["lease_generation"],
-            delay_seconds=90,
-            error="deduplicated",
-            refreshed_target_ids=("series-a",),
-            recent_ttl_seconds=90,
-            now_epoch=102,
-        ))
-
-        status = media_refresh_queue_status(now_epoch=102)
-        self.assertEqual(status["retry_wait"], 1)
-        self.assertEqual(status["paths"], 2)
-        self.assertEqual(
-            recent_media_refresh_target_ids("jellyfin", now_epoch=103),
-            ("series-a",),
-        )
-        self.assertEqual(
-            claim_due_media_refreshes(owner="worker", now_epoch=120), [],
-        )
-        retried = claim_due_media_refreshes(owner="worker", now_epoch=121)[0]
-        self.assertEqual(retried["paths"], ["/media/A", "/media/B"])
-        self.assertEqual(retried["attempts"], 0)
-
-    def test_settlement_preserves_paths_attempts_and_due_time_for_each_outcome(self):
-        for outcome in ("completed", "deferred", "failed"):
-            for pending in (False, True):
-                with self.subTest(outcome=outcome, pending=pending):
-                    clear_media_refresh_queue()
-                    queued = enqueue_media_refresh(
-                        "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
-                    )
-                    first = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-                    settle_media_refresh(
-                        queued["group_key"], owner="worker",
-                        lease_generation=first["lease_generation"], outcome="failed",
-                        error="第一次失败", delay_seconds=5, now_epoch=101,
-                    )
-                    lease = claim_due_media_refreshes(owner="worker", now_epoch=106)[0]
-                    if pending:
-                        enqueue_media_refresh(
-                            "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=107,
-                        )
-                    arguments: dict = dict(
-                        owner="worker", lease_generation=lease["lease_generation"],
-                        outcome=outcome, delay_seconds=0, error=" fixture\n reason ",
-                        refreshed_target_ids=["series-a"], now_epoch=108,
-                    )
-                    self.assertTrue(settle_media_refresh(queued["group_key"], **arguments))
-                    snapshot = db.kv_get("media_refresh_queue:v1")
-                    self.assertFalse(settle_media_refresh(queued["group_key"], **arguments))
-                    self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
-                    self.assertEqual(
-                        recent_media_refresh_target_ids("jellyfin", now_epoch=109),
-                        ("series-a",),
-                    )
-                    groups = json.loads(snapshot)["groups"]
-                    if outcome == "completed" and not pending:
-                        self.assertEqual(groups, {})
-                        continue
-                    group = groups[queued["group_key"]]
-                    self.assertEqual(group["lease_owner"], "")
-                    self.assertEqual(group["inflight_paths"], [])
-                    self.assertEqual(group["status"], "queued" if outcome == "completed" else "retry_wait")
-                    self.assertEqual(group["attempts"], {"completed": 0, "deferred": 1, "failed": 2}[outcome])
-                    self.assertEqual(group["due_at"], 127 if pending else {"deferred": 109, "failed": 113}[outcome])
-                    expected = [] if outcome == "completed" else ["/media/A"]
-                    self.assertEqual(group["pending_paths"], expected + (["/media/B"] if pending else []))
-                    self.assertEqual(group["last_error"], "" if outcome == "completed" else "fixture reason")
-
-    def test_every_settlement_rejects_superseded_lease_without_recording_success(self):
+    def test_superseded_lease_and_foreign_deferred_path_cannot_change_queue(self):
         queued = enqueue_media_refresh(
             "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
         )
         old = claim_due_media_refreshes(owner="worker", lease_seconds=30, now_epoch=100)[0]
-        claim_due_media_refreshes(owner="worker", now_epoch=131)
+        new = claim_due_media_refreshes(owner="worker", now_epoch=131)[0]
         snapshot = db.kv_get("media_refresh_queue:v1")
-        for outcome in ("completed", "deferred", "failed"):
-            with self.subTest(outcome=outcome):
-                self.assertFalse(settle_media_refresh(
-                    queued["group_key"], owner="worker",
-                    lease_generation=old["lease_generation"], outcome=outcome,
-                    refreshed_target_ids=["must-not-be-recorded"], now_epoch=132,
-                ))
-                self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
-        self.assertRaises(
-                ValueError, settle_media_refresh, queued["group_key"], owner="worker",
-                lease_generation=old["lease_generation"] + 1, outcome="invalid",
+        self.assertFalse(settle_media_refresh(
+            queued["group_key"], owner="worker", lease_generation=old["lease_generation"],
+            refreshed_target_ids=["must-not-be-recorded"], now_epoch=132,
+        ))
+        self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
+        with self.assertRaises(ValueError):
+            settle_media_refresh(
+                queued["group_key"], owner="worker", lease_generation=new["lease_generation"],
+                deferred_paths=["/media/foreign"], refreshed_target_ids=["must-not-be-recorded"], now_epoch=132,
             )
         self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
 
@@ -526,38 +317,51 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
         )
         self.assertTrue(queued["group_key"])
 
-    def test_retryable_result_keeps_only_refresh_work_pending(self):
-        enqueue_media_refresh(
-            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
-        )
-        claimed = claim_due_media_refreshes(
-            owner="media-refresh-test", now_epoch=100,
-        )[0]
-        client = Mock(display_name="Jellyfin")
-        client.refresh_for_paths.return_value = {
-            "ok": False,
-            "scope": "skipped",
-            "requested": 1,
-            "items": [],
-            "folders": [],
-            "libraries": [],
-            "deduplicated": 0,
-            "retryable": True,
-            "succeeded_target_ids": ["series-a"],
-            "fallback": "temporary",
-        }
-        coordinator = MediaRefreshCoordinator()
-        coordinator._owner = "media-refresh-test"
+    def test_server_failure_ends_attempt_and_records_reason(self):
+        for response in ({"ok": False, "retryable": True, "fallback": "HTTP 503"}, OSError("连接超时")):
+            with self.subTest(response=response):
+                clear_media_refresh_queue()
+                enqueue_media_refresh("jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100)
+                coordinator = MediaRefreshCoordinator()
+                claimed = claim_due_media_refreshes(owner=coordinator._owner, now_epoch=100)[0]
+                client = Mock(display_name="Jellyfin")
+                if isinstance(response, Exception):
+                    client.refresh_for_paths.side_effect = response
+                    reason = str(response)
+                else:
+                    client.refresh_for_paths.return_value = response
+                    reason = response["fallback"]
+                with patch.object(coordinator, "_client_for", return_value=client), self.assertLogs(
+                    "app.modules.media_refresh_coordinator", level="WARNING",
+                ) as logs:
+                    coordinator._process_group(claimed)
+                self.assertEqual(media_refresh_queue_status()["paths"], 0)
+                self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=10000), [])
+                self.assertIn(reason, logs.output[0])
+                self.assertIn("手动刷新", logs.output[0])
+                self.assertEqual(coordinator._failed_session, 1)
+                client.close.assert_called_once()
 
-        with patch.object(coordinator, "_client_for", return_value=client), patch(
-            "app.modules.media_refresh_coordinator._retry_seconds", return_value=30,
-        ):
-            coordinator._process_group(claimed)
-
-        status = media_refresh_queue_status()
-        self.assertEqual(status["retry_wait"], 1)
-        self.assertEqual(status["paths"], 1)
-        self.assertEqual(recent_media_refresh_target_ids("jellyfin"), ("series-a",))
+    def test_database_failure_does_not_consume_unsettled_work(self):
+        for operation in ("recent_media_refresh_target_ids", "settle_media_refresh"):
+            with self.subTest(operation=operation):
+                clear_media_refresh_queue()
+                enqueue_media_refresh("jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100)
+                coordinator = MediaRefreshCoordinator()
+                claimed = claim_due_media_refreshes(owner=coordinator._owner, now_epoch=100)[0]
+                client = Mock(display_name="Jellyfin")
+                client.refresh_for_paths.return_value = {"ok": True}
+                with patch.object(coordinator, "_client_for", return_value=client), patch(
+                    f"app.modules.media_refresh_coordinator.{operation}",
+                    side_effect=sqlite3.OperationalError("database is locked"),
+                ), self.assertRaises(sqlite3.OperationalError):
+                    coordinator._process_group(claimed)
+                self.assertEqual(media_refresh_queue_status(now_epoch=101)["running"], 1)
+                self.assertEqual(media_refresh_queue_status(now_epoch=101)["paths"], 1)
+                self.assertEqual(recover_media_refresh_leases(now_epoch=102), 1)
+                recovered = claim_due_media_refreshes(owner="next", now_epoch=102)[0]
+                self.assertEqual(recovered["paths"], ["/media/A"])
+                self.assertEqual(client.refresh_for_paths.call_count, int(operation == "settle_media_refresh"))
 
     def test_deduplicated_target_is_deferred_instead_of_dropped(self):
         enqueue_media_refresh(
@@ -575,6 +379,7 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
             "folders": [],
             "libraries": [],
             "deduplicated": 1,
+            "deferred_paths": ["/media/new-episode"],
             "retryable": False,
             "succeeded_target_ids": [],
             "fallback": "",
@@ -589,7 +394,7 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
             coordinator._process_group(claimed)
 
         status = media_refresh_queue_status()
-        self.assertEqual(status["retry_wait"], 1)
+        self.assertEqual(status["queued"], 1)
         self.assertEqual(status["paths"], 1)
         self.assertEqual(coordinator._completed_session, 0)
         self.assertEqual(coordinator._failed_session, 0)
@@ -607,19 +412,22 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                     "ok": deferred, "scope": "item", "requested": 2,
                     "items": ["series-a"], "retryable": not deferred,
                     "deduplicated": int(deferred),
+                    "deferred_paths": ["/media/B"] if deferred else [],
                     "succeeded_target_ids": ["series-a"], "succeeded_paths": ["/media/A"],
-                    "fallback": "等待去重窗口" if deferred else "1 个刷新请求失败，将重试",
+                    "fallback": "等待去重窗口" if deferred else "1 个刷新请求失败",
                 }
                 coordinator = MediaRefreshCoordinator()
                 coordinator._owner = "old"
                 with patch.object(coordinator, "_client_for", return_value=client), patch(
-                    "app.modules.media_refresh_coordinator._retry_seconds", return_value=960,
-                ), patch(
                     "app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90,
                 ), patch("app.repositories.media_refresh_queue.time.time", return_value=100):
                     coordinator._process_group(first)
 
-                self.assertEqual(media_refresh_queue_status(now_epoch=101)["paths"], 1)
+                self.assertEqual(media_refresh_queue_status(now_epoch=101)["paths"], int(deferred))
+                if not deferred:
+                    self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=1060), [])
+                    # 新的用户变化才产生下一次请求，失败不会自动重放。
+                    enqueue_media_refresh("jellyfin", ["/media/B"], debounce_seconds=0, now_epoch=1060)
                 # 换一个消费者并越过去重期，已接受的 A 不再靠临时去重防止重放。
                 second = claim_due_media_refreshes(owner="new", now_epoch=1060)[0]
                 coordinator = MediaRefreshCoordinator()
@@ -638,110 +446,45 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                 self.assertEqual(client.refresh_for_paths.call_args.kwargs["skip_item_ids"], ())
                 self.assertEqual(media_refresh_queue_status(now_epoch=1061)["paths"], 0)
 
-    def _settle_unmatched(self, strm_root, outcome, *, paths, now=100):
-        enqueue_media_refresh("jellyfin", paths, debounce_seconds=0, now_epoch=now)
-        claimed = claim_due_media_refreshes(owner="worker", now_epoch=now)[0]
-        client = Mock(display_name="Jellyfin")
-        client.refresh_for_paths.return_value = {
-            "ok": False, "requested": len(paths), "retryable": False, "deduplicated": 0,
-            "succeeded_target_ids": [], "succeeded_paths": [], **outcome,
-        }
-        coordinator = MediaRefreshCoordinator()
-        coordinator._owner = "worker"
-        original_get = config.get
-        with patch.object(coordinator, "_client_for", return_value=client), patch(
-            "app.modules.media_refresh_coordinator._retry_seconds", return_value=960,
-        ), patch(
-            "app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90,
-        ), patch(
-            "app.modules.media_refresh_coordinator.config.get",
-            side_effect=lambda key, default="": strm_root if key == "STRM_ROOT" else original_get(key, default),
-        ), patch("app.repositories.media_refresh_queue.time.time", return_value=now), patch(
-            "app.services.clear_dashboard_cache",
-        ):
-            coordinator._process_group(claimed)
-        groups = json.loads(db.kv_get("media_refresh_queue:v1"))["groups"]
-        return coordinator, list(groups.values())
-
-    def test_unmatched_paths_keep_refresh_intent_without_replaying_accepted_paths(self):
-        # 文件不在本机不能证明 Jellyfin 中没有旧条目；缺映射的删除事件也必须保留。
-        # 只确认上游已接受的路径，避免一次未匹配把同批已成功的刷新反复重放。
+    def test_mixed_batch_discards_failed_paths_and_keeps_only_known_dedupe(self):
         with tempfile.TemporaryDirectory() as root:
-            deleted = f"{root}/光鸭云盘/NSFW/old"
-            unmapped = f"{root}/光鸭云盘/整理/综艺/节目/S01E01.strm"
+            deleted = f"{root}/光鸭云盘/old.strm"
+            unmapped = f"{root}/光鸭云盘/整理/综艺/new.strm"
             Path(unmapped).parent.mkdir(parents=True)
-            Path(unmapped).write_text("x")
-            server_only = "/server-only/剧集/作品/E01.strm"
-            cases: dict[str, tuple[dict[str, Any], list[str], list[str], int, str]] = {
-                "已删除但未匹配的路径仍需清理媒体库旧条目": (
-                    {"scope": "skipped", "unmatched_paths": [deleted]}, [deleted], [deleted], 1060,
-                    "MediaRefreshUnmapped",
-                ),
-                "文件仍在的缺映射路径保留并单列": (
-                    {"scope": "skipped", "unmatched_paths": [unmapped]}, [unmapped], [unmapped], 1060,
-                    "MediaRefreshUnmapped",
-                ),
-                "无法证明已删除的服务端路径保留": (
-                    {"scope": "skipped", "unmatched_paths": [server_only]}, [server_only], [server_only], 1060,
-                    "MediaRefreshUnmapped",
-                ),
-                "正常刷新照常确认不被缺映射拖住": (
-                    {"scope": "item", "succeeded_paths": ["/media/new"], "succeeded_target_ids": ["ep"],
-                     "unmatched_paths": [deleted, unmapped]},
-                    ["/media/new", deleted, unmapped], [deleted, unmapped], 1060, "MediaRefreshUnmapped",
-                ),
-                "去重等待不被拖成失败退避": (
-                    {"scope": "deduplicated", "deduplicated": 1, "unmatched_paths": [deleted]},
-                    ["/media/new", deleted], ["/media/new", deleted], 190, "",
-                ),
-                "可重试失败保留所有尚未被接受的路径": (
-                    {"scope": "item", "retryable": True, "fallback": "1 个刷新请求失败，将重试",
-                     "unmatched_paths": [deleted]},
-                    ["/media/new", deleted], ["/media/new", deleted], 1060, "MediaRefreshRetryable",
-                ),
+            Path(unmapped).write_text("unchanged")
+            paths = ["/media/accepted", "/media/deduped", "/media/failed", deleted, unmapped, "/server-only/media"]
+            coordinator = MediaRefreshCoordinator()
+            enqueue_media_refresh("jellyfin", paths, debounce_seconds=0, now_epoch=100)
+            claimed = claim_due_media_refreshes(owner=coordinator._owner, now_epoch=100)[0]
+            client = Mock(display_name="Jellyfin")
+            client.refresh_for_paths.return_value = {
+                "ok": False, "retryable": True, "deduplicated": 1,
+                "deferred_paths": ["/media/deduped"], "succeeded_paths": ["/media/accepted"],
+                "succeeded_target_ids": ["accepted"], "unmatched_paths": paths[3:],
+                "fallback": "1 个刷新请求失败，3 个路径未匹配",
             }
-            for label, (outcome, paths, remaining, due_at, error_type) in cases.items():
-                with self.subTest(label):
-                    clear_media_refresh_queue()
-                    coordinator, groups = self._settle_unmatched(root, outcome, paths=paths)
-                    waiting = list(outcome.get("unmatched_paths", []))
-                    expected_pending = [path for path in remaining if path not in waiting]
-                    self.assertEqual([path for group in groups for path in group["pending_paths"]], expected_pending)
-                    self.assertCountEqual([path for group in groups for path in group["waiting_paths"]], waiting)
-                    if expected_pending:
-                        self.assertEqual(groups[0]["due_at"], due_at)
-                    else:
-                        self.assertEqual(groups[0]["status"], "waiting_configuration")
-                        self.assertIsNone(next_media_refresh_due_in(now_epoch=10000))
-                        self.assertEqual(claim_due_media_refreshes(owner="later", force=True, now_epoch=10000), [])
-                    self.assertEqual(coordinator._last_error_type, error_type or "MediaRefreshUnmapped")
+            with patch.object(coordinator, "_client_for", return_value=client), patch(
+                "app.repositories.media_refresh_queue.time.time", return_value=100,
+            ), patch("app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90), self.assertLogs(
+                "app.modules.media_refresh_coordinator", level="WARNING",
+            ) as logs:
+                coordinator._process_group(claimed)
+            self.assertIn("手动刷新", logs.output[0])
+            self.assertEqual(coordinator._failed_session, 1)
+            self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=189), [])
+            pending = claim_due_media_refreshes(owner="next", now_epoch=190)[0]
+            self.assertEqual(pending["paths"], ["/media/deduped"])
+            self.assertEqual(Path(unmapped).read_text(), "unchanged")
+            self.assertFalse(Path(deleted).exists())
 
-            # 补上映射后，保留的路径在下一轮被正常刷新并出队。
-            clear_media_refresh_queue()
-            self._settle_unmatched(root, {"scope": "skipped", "unmatched_paths": [unmapped]}, paths=[unmapped])
-            reconcile_media_refresh_configuration({"jellyfin": "repaired"}, now_epoch=1060)
-            _coordinator, groups = self._settle_unmatched(root, {
-                "ok": True, "scope": "item", "succeeded_paths": [unmapped], "succeeded_target_ids": ["ep"],
-            }, paths=[], now=1060)
-            self.assertEqual(groups, [])
-
-    def test_disabled_provider_keeps_refresh_pending(self):
-        enqueue_media_refresh(
-            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
-        )
-        claimed = claim_due_media_refreshes(
-            owner="media-refresh-test", now_epoch=100,
-        )[0]
+    def test_disabled_provider_ends_refresh(self):
+        enqueue_media_refresh("jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100)
         coordinator = MediaRefreshCoordinator()
-        coordinator._owner = "media-refresh-test"
-
-        with patch.object(coordinator, "_client_for", return_value=None), patch(
-            "app.modules.media_refresh_coordinator._retry_seconds", return_value=30,
-        ):
+        claimed = claim_due_media_refreshes(owner=coordinator._owner, now_epoch=100)[0]
+        with patch.object(coordinator, "_client_for", return_value=None), self.assertLogs(
+            "app.modules.media_refresh_coordinator", level="WARNING",
+        ) as logs:
             coordinator._process_group(claimed)
-
-        status = media_refresh_queue_status()
-        self.assertEqual(status["waiting_configuration"], 1)
-        self.assertEqual(status["paths"], 1)
-        self.assertEqual(coordinator._failed_session, 0)
-        self.assertEqual(coordinator._last_error_type, "MediaRefreshConfiguration")
+        self.assertEqual(media_refresh_queue_status()["paths"], 0)
+        self.assertIn("已停用或配置不完整", logs.output[0])
+        self.assertEqual(coordinator._failed_session, 1)

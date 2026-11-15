@@ -433,7 +433,7 @@ class STRMMetadataWorker:
                     "STRM 已落盘，但媒体库刷新未全部入队，将稍后重试"
                 )
                 continue
-            # 统一刷新队列已持久接管这些路径；后续媒体服务器失败只重试刷新，
+            # 统一刷新队列已持久接管这些路径；后续媒体服务器失败由刷新消费者收尾，
             # 不再让 STRM 或元数据 worker 重复提交同一文件变化。
             try:
                 strm_repo.acknowledge_strm_refresh_paths(batch)
