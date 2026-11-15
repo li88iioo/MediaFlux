@@ -1110,27 +1110,22 @@ def _collect_offline_files(value, output: list[dict], inherited_excluded: set[in
             missing[0]["index"] = 0
 
 
-def _offline_task_ids(payload: dict) -> list[str]:
-    """兼容不同光鸭响应形状提取离线任务 ID。"""
-    if not isinstance(payload, dict):
-        return []
+def _offline_create_result(response: Any) -> dict:
+    """创建 ACK 只解析一次；无明确受理/拒绝证据时保留未知结果。"""
+    payload = response.json() if callable(getattr(response, "json", None)) else response
+    payload = payload if isinstance(payload, dict) else {"raw": str(payload)}
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    values = [
-        data.get("taskId"), data.get("task_id"), data.get("id"),
-        payload.get("taskId"), payload.get("task_id"), payload.get("id"),
-    ]
-    task_ids: list[str] = []
-    for value in values:
-        if value in (None, ""):
-            continue
-        if isinstance(value, (list, tuple)):
-            task_ids.extend(str(item) for item in value if item not in (None, ""))
-        else:
-            task_ids.append(str(value))
-    return list(dict.fromkeys(task_ids))
+    task_ids = list(dict.fromkeys(
+        str(item)
+        for source in (data, payload)
+        for key in ("taskId", "taskID", "task_id", "id")
+        for value in (source.get(key),)
+        for item in (value if isinstance(value, (list, tuple)) else (value,))
+        if not isinstance(item, bool) and str(item).strip().lower() not in {"", "0", "none", "null"}
+    ))
+    message = str(payload.get("message") or payload.get("msg") or "").strip()
+    failure_message = message if message.lower() != "success" else ""
 
-
-def _offline_create_error(payload: dict) -> str:
     def error_text(value) -> str:
         if value is None or value is False or value == "":
             return ""
@@ -1140,68 +1135,40 @@ def _offline_create_error(payload: dict) -> str:
             return json.dumps(value, ensure_ascii=False, default=str) if value else ""
         return str(value).strip()
 
-    def failure_message(fallback: str) -> str:
-        message = str(payload.get("message") or payload.get("msg") or "").strip()
-        return message if message and message.lower() != "success" else fallback
-
     def normalized_flag(value) -> bool | None:
-        if isinstance(value, bool):
-            return value
         if isinstance(value, (int, float)):
-            if value == 0:
-                return False
-            if value == 1:
-                return True
-            return None
-        text = str(value).strip().lower()
-        if text in {"0", "false", "failed", "failure", "fail", "error", "errored"}:
-            return False
-        if text in {"1", "true", "success", "succeeded", "ok", "completed", "complete"}:
-            return True
-        return None
+            return bool(value) if value in (0, 1) else None
+        return {
+            "0": False, "false": False, "failed": False, "failure": False,
+            "fail": False, "error": False, "errored": False,
+            "1": True, "true": True, "success": True, "succeeded": True,
+            "ok": True, "completed": True, "complete": True,
+        }.get(str(value).strip().lower())
 
-    for key in ("error", "errors"):
-        detail = error_text(payload.get(key))
-        if detail:
-            return detail
-
-    explicit_success = False
+    error = next((detail for key in ("error", "errors") if (detail := error_text(payload.get(key)))), "")
+    rejected = bool(error)
+    accepted = bool(task_ids) or message.lower() == "success"
     code = payload.get("code")
-    if code is not None:
+    if not error and code is not None:
         try:
-            if int(code) not in (0, 200):
-                return failure_message(f"接口返回 code={code}")
-            explicit_success = True
+            rejected = int(code) not in (0, 200)
+            accepted = not rejected
         except (TypeError, ValueError):
-            return failure_message(f"接口返回 code={code}")
-    for key in ("success", "state"):
-        if key not in payload:
-            continue
-        flag = normalized_flag(payload[key])
-        if flag is False:
-            return failure_message("接口返回失败")
-        if flag is True:
-            explicit_success = True
-
-    message = str(payload.get("message") or payload.get("msg") or "").strip()
-    if message.lower() == "success":
-        explicit_success = True
-
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    task_id = next((
-        value
-        for source in (data, payload)
-        for key in ("taskId", "taskID", "task_id", "id")
-        if (value := source.get(key)) is not None
-        and not isinstance(value, bool)
-        and str(value).strip().lower() not in {"", "0", "none", "null"}
-    ), None)
-    if task_id is not None:
-        explicit_success = True
-
-    if explicit_success:
-        return ""
-    return message or "接口返回结果不明确"
+            accepted = False
+        if not accepted:
+            error = failure_message or f"接口返回 code={code}"
+    if not error:
+        flags = [normalized_flag(payload[key]) for key in ("success", "state") if key in payload]
+        rejected = False in flags
+        accepted = accepted or True in flags
+        if rejected:
+            error = failure_message or "接口返回失败"
+    ok = accepted and not error
+    return {
+        "ok": ok, "task_ids": task_ids, "response": payload,
+        "error": "" if ok else error or message or "接口返回结果不明确",
+        "outcome_unknown": not ok and not rejected,
+    }
 
 
 class GuangYaClient:
@@ -3028,27 +2995,17 @@ class GuangYaClient:
                          task_type: str = "magnet", *,
                          can_proceed: Callable[[], bool] | None = None) -> dict:
         raw = self.raw
-        payload: dict = {}
-        error = "操作已取消，未提交下载后端" if can_proceed is not None and not can_proceed() else ""
-        if not error:
-            response = raw.cloud_create_task(
-                url=url,
-                parent_id=None if target_dir_id == "0" else target_dir_id,
-            )
-            payload = response.json() if callable(getattr(response, "json", None)) else response
-            payload = payload if isinstance(payload, dict) else {"raw": str(payload)}
-            error = _offline_create_error(payload)
-        task_ids = _offline_task_ids(payload)
-        if error:
+        if can_proceed is not None and not can_proceed():
             return {
-                "ok": False, "task_ids": task_ids, "batch_count": 0,
-                "error": error, "response": payload,
+                "ok": False, "task_ids": [], "batch_count": 0,
+                "error": "操作已取消，未提交下载后端", "response": {},
             }
-        logger.info("光鸭离线任务已创建 type=%s target=%s", task_type, target_dir_id)
-        return {
-            "ok": True, "task_ids": task_ids, "batch_count": 1,
-            "error": "", "response": payload,
-        }
+        result = _offline_create_result(raw.cloud_create_task(
+            url=url, parent_id=None if target_dir_id == "0" else target_dir_id,
+        ))
+        if result["ok"]:
+            logger.info("光鸭离线任务已创建 type=%s target=%s", task_type, target_dir_id)
+        return {**result, "batch_count": int(result["ok"])}
 
     def add_offline_selection(self, url: str, target_dir_id: str,
                               file_indexes: list[int], *,
@@ -3087,9 +3044,8 @@ class GuangYaClient:
             if can_proceed is not None and not can_proceed():
                 error = "操作已取消，未提交下载后端"
                 break
-            payload: dict = {}
             try:
-                response = raw.request(
+                created = _offline_create_result(raw.request(
                     OFFLINE_CREATE_TASK_URL,
                     method="POST",
                     json={
@@ -3097,18 +3053,16 @@ class GuangYaClient:
                         "url": url,
                         "parentId": parent_id,
                     },
-                )
-                payload = response.json() if callable(getattr(response, "json", None)) else response
-                payload = payload if isinstance(payload, dict) else {"raw": str(payload)}
-                error = _offline_create_error(payload)
+                ))
+                error, outcome_unknown = created["error"], created["outcome_unknown"]
+                task_ids.extend(created["task_ids"])
             except Exception as exc:
                 error = str(exc) or exc.__class__.__name__
                 outcome_unknown = True
             if error:
                 break
-            responses.append(payload)
+            responses.append(created["response"])
             completed_indexes.extend(batch_indexes)
-            task_ids.extend(_offline_task_ids(payload))
         remaining_indexes = indexes[len(completed_indexes):]
         tracking_incomplete = not remaining_indexes and len(task_ids) != batch_count and batch_count > 1
         # 单批旧版接口可能只返回成功状态而不返回任务 ID，仍可由 URL/标题

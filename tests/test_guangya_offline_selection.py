@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 from dataclasses import replace
 import re
@@ -103,10 +103,10 @@ RESOLVE_EXCLUDED_ONLY_FIXTURE = {
 
 
 class FakeResponse:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: Any):
         self._payload = payload
 
-    def json(self) -> dict:
+    def json(self) -> Any:
         return self._payload
 
 
@@ -438,22 +438,38 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             ({"data": {}}, "接口返回结果不明确"),
         ]
 
-        for payload, expected_error in cases:
+        for selection in (False, True):
+            for payload, expected_error in cases:
+                with self.subTest(selection=selection, payload=payload):
+                    raw = Mock()
+                    raw.request.return_value = raw.cloud_create_task.return_value = FakeResponse(payload)
+                    client = client_with_raw(self, raw)
+                    self.addCleanup(client.close)
+                    result = (
+                        client.add_offline_selection("magnet:?xt=urn:btih:conservative-response", "target", [0])
+                        if selection else
+                        client.add_offline_task("magnet:?xt=urn:btih:conservative-response", "target")
+                    )
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result.get("outcome_unknown", False), payload == {"data": {}})
+                    self.assertEqual(result["task_ids"], [])
+                    self.assertIn(expected_error, result["error"])
+                    if selection:
+                        self.assertEqual(result["completed_batches"], 0)
+                        self.assertEqual(result["remaining_indexes"], [0])
+
+    def test_unrecognized_create_receipts_remain_unknown(self):
+        for payload in ([], {"code": "unrecognized"}, {"state": "pending"}):
             with self.subTest(payload=payload):
                 raw = Mock()
                 raw.request.return_value = FakeResponse(payload)
                 client = client_with_raw(self, raw)
-
-                result = client.add_offline_selection(
-                    "magnet:?xt=urn:btih:conservative-response",
-                    "1927445875113771071",
-                    [0],
-                )
-
+                self.addCleanup(client.close)
+                result = client.add_offline_selection("magnet:?xt=urn:btih:unknown-ack", "target", [0])
                 self.assertFalse(result["ok"])
-                self.assertEqual(result["completed_batches"], 0)
-                self.assertEqual(result["remaining_indexes"], [0])
-                self.assertIn(expected_error, result["error"])
+                self.assertTrue(result["outcome_unknown"])
+                self.assertFalse(result["partial_success"])
+                self.assertEqual(result["task_ids"], [])
 
     def test_selected_task_submission_accepts_normalized_success_payloads(self):
         cases = [
@@ -467,6 +483,7 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             {"msg": "success"},
             {"message": "SUCCESS"},
             {"data": {"taskId": "task-normalized"}},
+            {"data": {"taskID": ["task-a", "task-b"]}, "task_id": "task-a"},
         ]
 
         for payload in cases:
@@ -484,6 +501,8 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["completed_batches"], 1)
                 self.assertEqual(result["remaining_indexes"], [])
+                if "task_id" in payload:
+                    self.assertEqual(result["task_ids"], ["task-a", "task-b"])
 
 
 

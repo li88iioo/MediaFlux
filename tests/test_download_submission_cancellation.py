@@ -133,14 +133,14 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
             *args, client=cloud, **kwargs,
         ))
 
-    def real_cloud_case(self, *, refresh=False, unknown_at=0):
+    def real_cloud_case(self, *, refresh=False, single=False, unknown_at=0):
         raw = Mock()
         client = offline_test_fixtures.client_with_raw(self, raw)
         self.addCleanup(client.close)
         stopped = threading.Event()
         cancellation = asyncio.CancelledError("真实光鸭写前取消")
-        tree: dict = copy.deepcopy(SINGLE if refresh else RESOLVE_SUBFILES_FIXTURE)
-        if not refresh:
+        tree: dict = copy.deepcopy(SINGLE if refresh or single else RESOLVE_SUBFILES_FIXTURE)
+        if not (refresh or single):
             tree["data"].update(excludeIndices=[], subfiles=[
                 {"fileIndex": i, "name": f"Episode.{i:03d}.mkv", "size": 1073741824}
                 for i in range(501)
@@ -283,6 +283,59 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 self.assertEqual(json.loads(row["gy_task_ids"]), ["task-1"] if batch == 2 else [])
                 self.assertEqual(raw.request.call_count, batch)
                 raw.fs_delete_empty.assert_not_called()
+
+    def test_real_cloud_ack_controls_rss_cleanup_and_deduplication(self):
+        for single in (False, True):
+            for unknown in (False, True):
+                with self.subTest(single=single, unknown=unknown):
+                    request_id, item, _hash, _operation = self.prepare("first", target="guangya")
+                    cloud, raw, _cancellation, _check = self.real_cloud_case(single=single)
+                    receipt = FakeResponse({"data": {}} if unknown else {"code": 403, "msg": "quota exceeded"})
+                    raw.request.side_effect = None
+                    raw.request.return_value = raw.cloud_create_task.return_value = receipt
+                    sid = rss_repo.add_rss_subscription("ACK", "https://rss.invalid/ack", download_method="guangya")
+                    eid = rss_repo.add_rss_entry_with_media(
+                        sid, "ACK", str(request_id), payload=json.dumps({"torrent_url": item.source_value}),
+                    )["id"]
+                    with self.use_offline(cloud):
+                        result = RSSEngine().download(eid)
+                        row = download_requests_repo.get_download_request(request_id)
+                        assert row is not None
+                        self.assertFalse(result["ok"])
+                        self.assertEqual(bool(result.get("review_required")), unknown)
+                        self.assertEqual((row["gy_status"], row["gy_staging_cleanup_status"]),
+                                         ("outcome_unknown", "retained") if unknown else ("failed", "completed"))
+                        entry = rss_repo.get_rss_entry(eid)
+                        assert entry is not None
+                        self.assertEqual(entry["processed"], 0)
+                        if unknown:
+                            self.assertEqual(entry["failure_code"], "guangya_outcome_unknown")
+                            replay = submit_download_input(item, "guangya", origin="ack-replay")
+                            self.assertEqual(replay["request_id"], request_id)
+                            raw.fs_delete_empty.assert_not_called()
+                        else:
+                            raw.fs_delete_empty.assert_called_once()
+                            self.assertTrue(dispatcher.download_resubmit_capabilities(row)["guangya"]["enabled"])
+                    self.assertEqual(raw.cloud_create_task.call_count if single else raw.request.call_count, 1)
+
+    def test_real_cloud_later_unclear_ack_retains_prior_batch_identity(self):
+        request_id, _item, _hash, operation = self.prepare("first", target="guangya")
+        cloud, raw, _cancellation, _check = self.real_cloud_case()
+        raw.request.side_effect = [
+            FakeResponse({"code": 0, "data": {"taskId": "accepted-batch"}}),
+            FakeResponse({"data": {}}),
+        ]
+        with self.use_offline(cloud):
+            result = operation()
+        backend = result["results"]["guangya"]
+        self.assertTrue(backend["outcome_unknown"])
+        self.assertTrue(backend["partial_success"])
+        row = download_requests_repo.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["gy_status"], row["gy_staging_cleanup_status"]), ("outcome_unknown", "retained"))
+        self.assertEqual((json.loads(row["gy_task_ids"]), row["gy_batch_count"]), (["accepted-batch"], 2))
+        self.assertEqual(raw.request.call_count, 2)
+        raw.fs_delete_empty.assert_not_called()
 
     def test_offline_resolve_cancellation_closes_each_admission_without_overwriting_qb(self):
         for path in ("first", "supplement", "retry", "successor"):
