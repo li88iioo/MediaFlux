@@ -194,6 +194,7 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
                 ...snapshot,
             }};
             window.__sessionStopCalls = [];
+            window.__sessionStopResolvers = [];
             window.__stopResult = {ok: true, status: 'stopped', stopped: true, model_turn: 'not_running'};
             window.__stopHttpStatus = 200;
             const original = window.fetch;
@@ -203,11 +204,12 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
                 window.__sessionStopCalls.push(body);
                 return new Promise(resolve => {
                     window.__completeSessionStop = () => {
-                        Object.assign(window.__kernelConfig.sessionDetails[body.session_id], window.__stopSnapshot || {});
+                        Object.assign(window.__kernelConfig.sessionDetails[body.session_id] ||= {}, window.__stopSnapshot || {});
                         resolve(new Response(JSON.stringify(window.__stopResult), {
                             status: window.__stopHttpStatus, headers: {'Content-Type': 'application/json'},
                         }));
                     };
+                    window.__sessionStopResolvers.push(window.__completeSessionStop);
                 });
             };
         }""", snapshot or {})
@@ -218,6 +220,124 @@ class AgentSessionStopBrowserTests(AgentShellBrowserCase):
         self.assertEqual(page.locator('#agentStopSession').count(), 1)
         self.assertEqual(page.locator('#agentStop').count(), 0)
         return page, unexpected, errors
+
+    def test_pending_stop_does_not_block_another_session_or_apply_its_late_receipt(self):
+        for width in (1280, 390):
+            for status in (200, 503):
+                with self.subTest(width=width, status=status):
+                    page, unexpected, errors = self.session_stop_shell({'width': width, 'height': 844})
+                    page.locator('#agentStopSession').click()
+                    browser_support.open_sessions(page)
+                    page.locator('#agentNewSession').click()
+                    page.locator('#agentPrompt').fill('B的新消息')
+                    send = page.locator('#agentSend')
+                    self.assertTrue(send.is_visible(), 'A 的 stop 挂起不得遮住 B 的发送入口')
+                    self.assertTrue(send.is_enabled())
+                    page.evaluate('window.__kernelConfig.holdQueryOpen = true')
+                    page.locator('#agentPrompt').press('Enter')
+                    page.wait_for_function("window.__kernelCalls.filter(c => c.url === '/api/agent/query').length === 1")
+                    query = page.evaluate("JSON.parse(window.__kernelCalls.find(c => c.url === '/api/agent/query').body)")
+                    self.assertNotEqual(query['session_id'], 'session_shell_0000000001')
+                    page.locator('#agentPrompt').fill('B保留的草稿')
+                    before = page.locator('#agentTranscript').inner_text()
+                    page.evaluate("""status => {
+                        window.__stopHttpStatus = status;
+                        window.__stopResult = status === 200 ? {ok: true, status: 'stopped', stopped: true} : {error: 'A停止失败'};
+                        window.__sessionStopResolvers[0]();
+                    }""", status)
+                    page.wait_for_timeout(100)
+                    self.assertEqual(page.locator('#agentTranscript').inner_text(), before)
+                    self.assertEqual(page.locator('#agentPrompt').input_value(), 'B保留的草稿')
+                    self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.url === '/api/agent/query').length"), 1)
+                    self.assertNotIn('停止', page.locator('#agentResponseStatus').inner_text())
+                    self.assertEqual(len(page.evaluate('window.__sessionStopCalls')), 1)
+                    self.assertEqual((unexpected, errors), ([], []))
+
+    def test_late_stop_cannot_release_another_sessions_pending_stop(self):
+        for width in (1280, 390):
+            for status in (200, 503):
+                with self.subTest(width=width, status=status):
+                    page, unexpected, errors = self.session_stop_shell({'width': width, 'height': 844})
+                    button = page.locator('#agentStopSession')
+                    button.click()
+                    browser_support.open_sessions(page)
+                    page.locator('#agentNewSession').click()
+                    page.evaluate('window.__kernelConfig.holdQueryOpen = true')
+                    page.locator('#agentPrompt').fill('B自己的任务')
+                    page.locator('#agentPrompt').press('Enter')
+                    page.wait_for_function("window.__kernelCalls.some(c => c.url === '/api/agent/query')")
+                    query = page.evaluate("JSON.parse(window.__kernelCalls.find(c => c.url === '/api/agent/query').body)")
+                    button.click()
+                    button.evaluate("node => node.dispatchEvent(new MouseEvent('click', {bubbles: true}))")
+                    page.locator('#agentPrompt').fill('B自己的草稿')
+                    page.locator('#agentPrompt').press('Enter')
+                    status_before = page.locator('#agentResponseStatus').inner_text()
+                    page.evaluate("""status => {
+                        window.__stopHttpStatus = status;
+                        window.__sessionStopResolvers[0]();
+                    }""", status)
+                    page.wait_for_timeout(100)
+                    self.assertTrue(button.is_disabled(), 'A 的迟到释放不得解锁 B 的 stop')
+                    self.assertEqual(button.get_attribute('aria-busy'), 'true')
+                    self.assertEqual(page.locator('#agentResponseStatus').inner_text(), status_before)
+                    self.assertEqual(page.locator('#agentPrompt').input_value(), 'B自己的草稿')
+                    self.assertEqual(page.evaluate('window.__sessionStopCalls'), [
+                        {'session_id': 'session_shell_0000000001'}, {'session_id': query['session_id']},
+                    ])
+                    page.evaluate("""query => {
+                        window.__stopHttpStatus = 200;
+                        window.__stopSnapshot = {active_turn: null, pending_effect_count: 0,
+                            messages: [{role: 'user', content: query.message}],
+                            last_turn: {request_id: query.request_id, turn_id: `turn-${query.request_id}`,
+                                status: 'cancelled', message: 'B已核实停止'}};
+                        window.__sessionStopResolvers[1]();
+                    }""", query)
+                    button.wait_for(state='hidden')
+                    self.assertTrue(page.locator('#agentSend').is_enabled())
+                    self.assertEqual(page.locator('#agentPrompt').input_value(), 'B自己的草稿')
+                    self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.url === '/api/agent/query').length"), 1)
+                    self.assertEqual((unexpected, errors), ([], []))
+
+    def test_returning_to_completed_session_waits_for_its_pending_stop_before_query(self):
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                page, unexpected, errors = self.session_stop_shell({'width': width, 'height': 844})
+                page.locator('#agentStopSession').click()
+                browser_support.open_sessions(page)
+                page.locator('#agentNewSession').click()
+                page.evaluate('window.__kernelConfig.holdQueryOpen = true')
+                page.locator('#agentPrompt').fill('B任务')
+                page.locator('#agentPrompt').press('Enter')
+                page.wait_for_function("window.__kernelCalls.some(c => c.url === '/api/agent/query')")
+                page.locator('#agentStopSession').click()
+                page.evaluate("""() => {
+                    Object.assign(window.__kernelConfig.sessionDetails.session_shell_0000000001, {
+                        active_turn: null, messages: [{role: 'assistant', content: 'A原轮次已完成'}],
+                        last_turn: {request_id: 'shell-request', turn_id: 'shell-turn', status: 'completed'},
+                    });
+                }""")
+                browser_support.open_sessions(page)
+                page.locator('[data-session-open="session_shell_0000000001"]').click()
+                page.get_by_text('A原轮次已完成', exact=True).wait_for()
+                page.locator('#agentPrompt').fill('A新任务必须等旧停止回执')
+                self.assertTrue(page.locator('#agentSend').is_disabled(), '旧 stop 按 session_id 生效，不能先发新轮次')
+                self.assertTrue(page.locator('#agentStopSession').is_disabled())
+                self.assertEqual(page.locator('[data-agent-action-key]').count(), 3)
+                self.assertTrue(page.locator('[data-agent-action-key]').evaluate_all('buttons => buttons.every(button => button.disabled)'))
+                page.locator('#agentPrompt').press('Enter')
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.url === '/api/agent/query').length"), 1)
+                self.assertEqual(len(page.evaluate('window.__sessionStopCalls')), 2)
+                status_before = page.locator('#agentResponseStatus').inner_text()
+                page.evaluate('window.__sessionStopResolvers[0]()')
+                page.wait_for_function("!document.querySelector('#agentSend').disabled")
+                self.assertEqual(page.locator('#agentResponseStatus').inner_text(), status_before)
+                self.assertEqual(page.locator('#appToastContainer').inner_text(), '')
+                page.locator('#agentPrompt').press('Enter')
+                page.wait_for_function("window.__kernelCalls.filter(c => c.url === '/api/agent/query').length === 2")
+                self.assertEqual(page.evaluate("JSON.parse(window.__kernelCalls.filter(c => c.url === '/api/agent/query')[1].body).session_id"),
+                                 'session_shell_0000000001')
+                self.assertEqual(len(page.evaluate('window.__sessionStopCalls')), 2)
+                self.assertEqual((unexpected, errors), ([], []))
 
     def test_send_stop_share_rightmost_slot_without_layout_shift(self):
         for width, height in ((320, 667), (390, 844), (1280, 800)):

@@ -89,7 +89,7 @@
     let historyController = null;
     let sessionLoadGeneration = 0;
     let busy = false;
-    let sessionStopPending = false;
+    const sessionStopOwners = new Map();
     let initialRestore = consoleNode?.dataset.initialRestore === 'true';
     let startupAttempt = 0;
     let startupController = null;
@@ -2003,10 +2003,12 @@
         return payload;
     }
 
+    function isCurrentSessionOwner(owner) {
+        return Boolean(owner && owner.sessionId === sessionId && owner.sessionGeneration === sessionLoadGeneration);
+    }
+
     function isCurrentActiveRequest(active) {
-        return Boolean(active && activeRequest === active
-            && active.sessionId === sessionId
-            && active.sessionGeneration === sessionLoadGeneration);
+        return activeRequest === active && isCurrentSessionOwner(active);
     }
 
     function clearActiveObservation(active) {
@@ -2385,7 +2387,8 @@
     }
 
     function syncSend() {
-        const showStop = busy || sessionStopPending;
+        const stopping = sessionStopOwners.has(sessionId);
+        const showStop = busy || stopping;
         if (sendButton) {
             // 有内容才出现发送按钮；任务进行中由停止按钮占位。
             sendButton.hidden = showStop || !promptInput?.value.trim();
@@ -2393,9 +2396,10 @@
         }
         if (sessionStopButton) {
             sessionStopButton.hidden = !showStop;
-            sessionStopButton.disabled = initialRestore || sessionStopPending;
+            sessionStopButton.disabled = initialRestore || stopping;
+            sessionStopButton.setAttribute('aria-busy', String(stopping));
         }
-        nextActions?.querySelectorAll('[data-agent-action-key]').forEach(button => { button.disabled = busy || initialRestore; });
+        nextActions?.querySelectorAll('[data-agent-action-key]').forEach(button => { button.disabled = showStop || initialRestore; });
     }
 
     function resizePrompt() {
@@ -2417,7 +2421,7 @@
     }
 
     async function sendQuery(text, actionKey = '') {
-        if (busy || sessionStopPending || initialRestore || !text.trim()) return;
+        if (busy || sessionStopOwners.has(sessionId) || initialRestore || !text.trim()) return;
         clearReceiptObserverForNewRequest();
         const message = text.trim();
         const replyTo = actionKey ? '' : replyDraft;
@@ -2487,46 +2491,37 @@
     }
 
     async function stopSessionTasks() {
-        if (initialRestore || sessionStopPending) return;
-        const targetSessionId = sessionId;
-        const generation = sessionLoadGeneration;
+        if (initialRestore || sessionStopOwners.has(sessionId)) return;
+        const owner = {sessionId, sessionGeneration: sessionLoadGeneration};
+        sessionStopOwners.set(owner.sessionId, owner);
         const active = activeRequest;
-        sessionStopPending = true;
-        sessionStopButton?.setAttribute('aria-busy', 'true');
         syncSend();
-        try {
-            const payload = await fetchJSON('/api/agent/session/stop', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({session_id: targetSessionId}),
-            });
-            if (sessionId !== targetSessionId || generation !== sessionLoadGeneration) return;
-            const message = SESSION_STOP_MESSAGES[payload.status] || SESSION_STOP_MESSAGES.stop_unconfirmed;
-            announce(responseStatus, message);
-            window.showToast?.(message, payload.stopped === true ? 'success' : 'warning', 6500);
-            // 只撤销尚未进入执行轮次的失败确认恢复；已确认写入继续观察终态回执。
-            if (isCurrentActiveRequest(active) && active.kind === 'confirm' && !active.receiptOnly
-                && active.turn?.failed && !active.turnId && payload.model_turn === 'not_running'
-                && ['revoked', 'cleared'].includes(payload.confirmation)) {
-                invalidateActiveRequest();
-                setBusy(false);
-            }
-            if (isCurrentActiveRequest(active)) active.cancelNotice = message;
-            if (isCurrentActiveRequest(active) && !active.receiptOnly
-                && ['stop_requested', 'already_cancelling'].includes(payload.model_turn)) {
-                active.cancelAccepted = true;
-                setBusy(true);
-            }
-            await loadSession(targetSessionId, {closeHistory: false, preserveScroll: true});
-            if (isCurrentActiveRequest(active) && !active.receiptOnly && !active.observing) startActiveObservation(active);
-        } catch (_) {
-            if (sessionId !== targetSessionId || generation !== sessionLoadGeneration) return;
-            announce(responseStatus, SESSION_STOP_MESSAGES.stop_unconfirmed);
-            window.showToast?.(SESSION_STOP_MESSAGES.stop_unconfirmed, 'warning', 6500);
-        } finally {
-            sessionStopPending = false;
-            sessionStopButton?.setAttribute('aria-busy', 'false');
-            syncSend();
+        const payload = await fetchJSON('/api/agent/session/stop', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({session_id: owner.sessionId}),
+        }).catch(() => null);
+        if (sessionStopOwners.get(owner.sessionId) === owner) sessionStopOwners.delete(owner.sessionId);
+        if (owner.sessionId === sessionId) syncSend();
+        if (!isCurrentSessionOwner(owner)) return;
+        const message = SESSION_STOP_MESSAGES[payload?.status] || SESSION_STOP_MESSAGES.stop_unconfirmed;
+        announce(responseStatus, message);
+        window.showToast?.(message, payload?.stopped === true ? 'success' : 'warning', 6500);
+        if (!payload) return;
+        // 只撤销尚未进入执行轮次的失败确认恢复；已确认写入继续观察终态回执。
+        if (isCurrentActiveRequest(active) && active.kind === 'confirm' && !active.receiptOnly
+            && active.turn?.failed && !active.turnId && payload.model_turn === 'not_running'
+            && ['revoked', 'cleared'].includes(payload.confirmation)) {
+            invalidateActiveRequest();
+            setBusy(false);
         }
+        if (isCurrentActiveRequest(active)) active.cancelNotice = message;
+        if (isCurrentActiveRequest(active) && !active.receiptOnly
+            && ['stop_requested', 'already_cancelling'].includes(payload.model_turn)) {
+            active.cancelAccepted = true;
+            setBusy(true);
+        }
+        await loadSession(owner.sessionId, {closeHistory: false, preserveScroll: true});
+        if (isCurrentActiveRequest(active) && !active.receiptOnly && !active.observing) startActiveObservation(active);
     }
 
     async function explainEffect(button) {
