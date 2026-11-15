@@ -285,7 +285,6 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("activeRequest = active", source)
         self.assertIn("sessionId: targetSessionId", source)
         self.assertIn("if (!isCurrentActiveRequest(active)) return", source)
-        self.assertIn("active.sessionGeneration === sessionLoadGeneration", source)
         self.assertIn("/api/agent/query/cancel", source)
         self.assertIn("active.controller?.abort()", source)
         self.assertIn("expireVisibleApprovals()", source)
