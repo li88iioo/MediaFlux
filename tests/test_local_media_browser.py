@@ -2,12 +2,22 @@
 from __future__ import annotations
 
 import re
+import mimetypes
+import unittest
 from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlsplit
+
+from jinja2 import Environment, FileSystemLoader
 
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
+from tests import test_agent_kernel_browser as browser_support
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser
 
 
 class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
@@ -110,7 +120,6 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             "positionControls.payload(mediaType",
             "appliedPreviewContext = Object.freeze",
             "preview_digest: confirmedPreview.preview_digest",
-            "if (result.repreview_required) invalidatePreview()",
             "const firstLoad = !hasLoadedLocalMedia",
             "hasLoadedLocalMedia = Object.values(loadedResources).some(Boolean)",
             "await settleInitialLoading()",
@@ -202,3 +211,254 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn("scrapeLifecycle.open(trigger, {initialFocus: $('lmScrapeCloseBtn')})", js)
         self.assertIn("scrapeLifecycle.close()", js)
         self.assertNotIn("else if (!$('lmScrapeModal').hidden) closeScrape()", js)
+
+
+@unittest.skipIf(browser_support.sync_playwright is None, '系统环境未安装 Playwright')
+class LocalMediaExecutionBrowserTests(unittest.TestCase):
+    browser: Browser
+
+    @classmethod
+    def setUpClass(cls):
+        browser_support.AgentKernelBrowserTests.setUpClass.__func__(cls)
+        env = Environment(loader=FileSystemLoader(browser_support.ROOT / 'app/templates'), autoescape=True)
+        cls.html = env.get_template('local_media.html').render(
+            active='local_media', app_version='offline-execute-test', discovery_enabled=False,
+            agent_enabled=False, csrf_token=lambda: 'fake', static_url=lambda value: '/static/' + value,
+            url_for=lambda name: '/' + name.split('.')[-1],
+        )
+
+    def make_page(self, width):
+        context = self.browser.new_context(viewport={'width': width, 'height': 844},
+                                           reduced_motion='reduce', service_workers='block')
+        self.addCleanup(context.close)
+        errors, unexpected = [], []
+
+        def route(request):
+            url = urlsplit(request.request.url)
+            path = unquote(url.path)
+            if url.netloc == 'local-media.test' and path == '/local-media':
+                request.fulfill(body=self.html, content_type='text/html')
+                return
+            if url.netloc == 'local-media.test' and path.startswith('/static/'):
+                asset = (browser_support.ROOT / 'app' / path.lstrip('/')).resolve()
+                if asset.is_relative_to(browser_support.ROOT / 'app/static') and asset.is_file():
+                    request.fulfill(body=asset.read_bytes(), content_type=mimetypes.guess_type(str(asset))[0] or 'application/octet-stream')
+                    return
+            unexpected.append(request.request.url)
+            request.abort()
+
+        context.route('**/*', route)
+        context.route_web_socket('**/*', lambda websocket: websocket.close())
+        context.add_init_script(r"""(() => {
+            const fixture = window.__lmFixture = {
+                calls: [], executes: [], refreshes: [], holdRefresh: false, failResources: [], previewSerial: 0,
+                previews: [], holdPreview: false,
+            };
+            const json = (body, status = 200) => new Response(JSON.stringify(body), {
+                status, headers: {'Content-Type': 'application/json'},
+            });
+            const items = ['A', 'B'].map(name => ({
+                source_id: 1, source_name: '离线来源', name: name + '.mp4', path: '/fixture/' + name + '.mp4',
+                kind: 'video', size: 1024, organize_ready: true, deletable: true, identity: {size: 1024, mtime_ns: 1},
+            }));
+            const resources = {
+                sources: {sources: [{id: 1, name: '离线来源', enabled: true, media_type: 'movie', local_root: '/fixture',
+                    targets: [{path: '/archive', category: 'movie'}]}]},
+                tasks: {tasks: [], has_more: false}, items: {items, sources: []},
+            };
+            window.fetch = async (url, options = {}) => {
+                const path = new URL(String(url), location.href).pathname;
+                const body = JSON.parse(options.body || '{}');
+                fixture.calls.push({path, body});
+                const resource = path.split('/').pop();
+                if (path.startsWith('/api/local-media/') && resource in resources) {
+                    const reply = () => fixture.failResources.includes(resource)
+                        ? json({error: resource + '刷新失败'}, 503) : json(resources[resource]);
+                    return fixture.holdRefresh ? new Promise(resolve => fixture.refreshes.push(() => resolve(reply()))) : reply();
+                }
+                if (path === '/api/local-media/inspect') return json({
+                    inspection_id: body.path, selected_name: body.path.split('/').pop(), selected_kind: 'file',
+                    video_count: 1, file_count: 1, suggested_query: body.path,
+                });
+                if (path === '/api/local-media/preview') {
+                    const result = json({status: 'planned',
+                        preview_digest: `digest:${body.inspection_id}:${++fixture.previewSerial}`,
+                        plans: [{target_path: `/archive/${body.inspection_id.split('/').pop()}.${fixture.previewSerial}`,
+                            target_name: body.inspection_id.split('/').pop(), action: 'move', role: 'video'}],
+                    });
+                    return fixture.holdPreview ? new Promise(resolve => fixture.previews.push(() => resolve(result))) : result;
+                }
+                if (path === '/api/local-media/execute') return new Promise(resolve => fixture.executes.push(
+                    (result, status = 200) => resolve(json(result, status)),
+                ));
+                throw new Error('unexpected fake request: ' + path);
+            };
+        })();""")
+        page = context.new_page()
+        page.set_default_timeout(3000)
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        page.goto('http://local-media.test/local-media#manual')
+        page.locator('[data-open-item-menu]').first.wait_for()
+        page.evaluate('() => document.fonts.ready')
+        return page, unexpected, errors
+
+    @staticmethod
+    def open_plan(page, index):
+        page.locator('[data-open-item-menu]').nth(index).click()
+        page.locator('[data-item-action="auto"]').click()
+        page.wait_for_function("!document.querySelector('#lmExecuteBtn').disabled && document.querySelector('#lmScrapeStatus').textContent === '计划已就绪'")
+
+    @staticmethod
+    def start_execute(page, count=1):
+        page.locator('#lmExecuteBtn').click()
+        page.locator('#appConfirmSubmit').click()
+        page.wait_for_function('count => window.__lmFixture.executes.length === count', arg=count)
+
+    @staticmethod
+    def plan_snapshot(page):
+        return page.evaluate("""() => ({
+            detail: document.querySelector('#lmScrapeDetail').innerHTML,
+            path: document.querySelector('#lmScrapeItemPath').textContent,
+            summary: document.querySelector('#lmPlanSummary').textContent,
+            target: document.querySelector('#lmScrapeTarget').textContent,
+            label: document.querySelector('#lmExecuteBtn').textContent,
+            disabled: document.querySelector('#lmExecuteBtn').disabled,
+            hasPlan: document.querySelector('.lm-scrape-dialog').classList.contains('has-plan'),
+            bounds: document.querySelector('#lmScrapeDetail').getBoundingClientRect().toJSON(),
+        })""")
+
+    @staticmethod
+    def release_execute(page, outcome, index=0):
+        page.evaluate("""({outcome, index}) => {
+            const result = outcome === 'error' ? {error: '执行请求失败'} : outcome === 'repreview'
+                ? {status: 'requires_manual', repreview_required: true, preview: {reason: '原计划需重新确认'}}
+                : {status: 'completed', moved: ['media.mp4'], deleted_junk: []};
+            window.__lmFixture.executes[index](result, outcome === 'error' ? 503 : 200);
+        }""", {'outcome': outcome, 'index': index})
+        page.locator('.app-toast-message').last.wait_for()
+
+    def assert_plan_unchanged(self, page, before):
+        self.assertTrue(page.locator('#lmScrapeModal').is_visible())
+        self.assertEqual(self.plan_snapshot(page), before)
+        self.assertTrue(page.locator('#lmScrapeCloseBtn').evaluate('node => document.activeElement === node'))
+        self.assertTrue(page.locator('.app-toast-message').last.evaluate("""node => {
+            const rect = node.getBoundingClientRect();
+            return node.closest('.app-toast').contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+        }"""), '真实 toast 必须显示在新刮削弹窗上方')
+
+    def test_late_execution_receipts_keep_new_plan_and_focus(self):
+        for width in (1280, 390):
+            for outcome in ('completed', 'error', 'repreview'):
+                with self.subTest(width=width, outcome=outcome):
+                    page, unexpected, errors = self.make_page(width)
+                    self.open_plan(page, 0)
+                    self.start_execute(page)
+                    page.locator('#lmScrapeCloseBtn').click()
+                    self.open_plan(page, 1)
+                    page.locator('#lmScrapeCloseBtn').focus()
+                    before = self.plan_snapshot(page)
+                    self.release_execute(page, outcome)
+                    if outcome != 'error':
+                        page.wait_for_function("window.__lmFixture.calls.filter(c => c.path === '/api/local-media/items').length > 1")
+                    self.assert_plan_unchanged(page, before)
+                    toast = page.locator('.app-toast-message').last.inner_text()
+                    self.assertIn('A.mp4', toast)
+                    self.assertIn({'completed': '已移动 1 项', 'error': '整理失败', 'repreview': '原计划需重新确认'}[outcome], toast)
+                    self.assertEqual(page.evaluate("window.__lmFixture.calls.filter(c => c.path === '/api/local-media/execute').map(c => c.body)"),
+                                     [{'inspection_id': '/fixture/A.mp4', 'preview_digest': 'digest:/fixture/A.mp4:1'}])
+                    self.assertEqual((unexpected, errors), ([], []))
+
+    def test_old_receipt_cannot_release_another_plan_execution(self):
+        for width in (1280, 390):
+            for outcome in ('completed', 'error', 'repreview'):
+                with self.subTest(width=width, outcome=outcome):
+                    page, unexpected, errors = self.make_page(width)
+                    self.open_plan(page, 0)
+                    self.start_execute(page)
+                    page.locator('#lmScrapeCloseBtn').click()
+                    self.open_plan(page, 1)
+                    self.start_execute(page, 2)
+                    page.locator('#lmScrapeCloseBtn').focus()
+                    before = self.plan_snapshot(page)
+                    self.assertTrue(before['disabled'])
+                    self.assertIn('整理中', before['label'])
+                    self.release_execute(page, outcome)
+                    self.assert_plan_unchanged(page, before)
+                    self.assertEqual(page.evaluate('window.__lmFixture.executes.length'), 2)
+                    self.release_execute(page, 'completed', 1)
+                    page.locator('#lmScrapeModal').wait_for(state='hidden')
+                    self.assertIn('B.mp4', page.locator('.app-toast-message').last.inner_text())
+                    self.assertEqual(page.evaluate('window.__lmFixture.executes.length'), 2)
+                    self.assertEqual((unexpected, errors), ([], []))
+
+    def test_same_file_reopen_and_new_preview_keep_their_own_plan(self):
+        for width in (1280, 390):
+            for change in ('reopen', 'preview'):
+                with self.subTest(width=width, change=change):
+                    page, unexpected, errors = self.make_page(width)
+                    self.open_plan(page, 0)
+                    self.start_execute(page)
+                    if change == 'reopen':
+                        page.locator('#lmScrapeCloseBtn').click()
+                        self.open_plan(page, 0)
+                    else:
+                        bounds = page.locator('#lmScrapeDetail').bounding_box()
+                        page.evaluate('window.__lmFixture.holdPreview = true')
+                        page.locator('#lmAutoPreviewBtn').click()
+                        page.wait_for_function('window.__lmFixture.previews.length === 1')
+                        self.assertIn('has-plan', page.locator('.lm-scrape-dialog').get_attribute('class') or '')
+                        self.assertEqual(page.locator('#lmScrapeDetail').bounding_box(), bounds)
+                        page.evaluate('window.__lmFixture.previews[0]()')
+                        page.wait_for_function("!document.querySelector('#lmExecuteBtn').disabled")
+                    page.locator('#lmScrapeCloseBtn').focus()
+                    before = self.plan_snapshot(page)
+                    self.assertIn('.2', before['target'])
+                    self.assertIn('确认并开始整理', before['label'])
+                    self.release_execute(page, 'completed')
+                    self.assert_plan_unchanged(page, before)
+                    self.assertEqual(page.evaluate('window.__lmFixture.executes.length'), 1)
+                    self.assertEqual((unexpected, errors), ([], []))
+
+    def test_success_refresh_delay_and_resource_failure_keep_new_plan(self):
+        for width in (1280, 390):
+            for failed in ([], ['sources'], ['sources', 'tasks', 'items']):
+                with self.subTest(width=width, failed=failed):
+                    page, unexpected, errors = self.make_page(width)
+                    self.open_plan(page, 0)
+                    self.start_execute(page)
+                    page.evaluate('window.__lmFixture.holdRefresh = true')
+                    self.release_execute(page, 'completed')
+                    page.wait_for_function('window.__lmFixture.refreshes.length === 3')
+                    page.locator('#lmScrapeModal').wait_for(state='hidden')
+                    self.open_plan(page, 1)
+                    page.locator('#lmScrapeCloseBtn').focus()
+                    before = self.plan_snapshot(page)
+                    page.evaluate("""failed => {
+                        window.__lmFixture.failResources = failed;
+                        window.__lmFixture.holdRefresh = false;
+                        window.__lmFixture.refreshes.splice(0).forEach(release => release());
+                    }""", failed)
+                    page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
+                    self.assert_plan_unchanged(page, before)
+                    messages = page.locator('.app-toast-message').all_text_contents()
+                    self.assertTrue(any('A.mp4' in text and '整理完成' in text and '已移动 1 项' in text for text in messages))
+                    self.assertFalse(any('整理失败' in text for text in messages))
+                    if failed:
+                        self.assertIn('刷新失败', page.locator('#lmRefreshBtn').get_attribute('title') or '')
+                    self.assertEqual(page.evaluate('window.__lmFixture.executes.length'), 1)
+                    self.assertEqual((unexpected, errors), ([], []))
+
+    def test_current_repreview_invalidates_plan_and_current_error_restores_retry(self):
+        for width in (1280, 390):
+            for outcome in ('repreview', 'error'):
+                with self.subTest(width=width, outcome=outcome):
+                    page, unexpected, errors = self.make_page(width)
+                    self.open_plan(page, 0)
+                    self.start_execute(page)
+                    self.release_execute(page, outcome)
+                    self.assertTrue(page.locator('#lmScrapeModal').is_visible())
+                    self.assertEqual(page.locator('#lmExecuteBtn').is_disabled(), outcome == 'repreview')
+                    self.assertIn('确认并开始整理', page.locator('#lmExecuteBtn').inner_text())
+                    self.assertEqual('has-plan' in (page.locator('.lm-scrape-dialog').get_attribute('class') or ''), outcome != 'repreview')
+                    self.assertEqual(page.evaluate('window.__lmFixture.executes.length'), 1)
+                    self.assertEqual((unexpected, errors), ([], []))

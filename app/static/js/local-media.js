@@ -56,7 +56,6 @@
     };
     let mediaBrowseRequestSerial = 0;
     let inspection = null;
-    let selectedCandidate = null;
     let lastPreview = null;
     let appliedPreviewContext = null;
     let previewRequestSerial = 0;
@@ -151,11 +150,10 @@
 
     function invalidatePreview() {
         previewRequestSerial += 1;
-        selectedCandidate = null;
         lastPreview = null;
         appliedPreviewContext = null;
         $('lmScrapeModal')?.querySelector('.lm-scrape-dialog')?.classList.remove('has-plan');
-        if ($('lmExecuteBtn')) $('lmExecuteBtn').disabled = true;
+        setBusy($('lmExecuteBtn'), true, '确认并开始整理');
     }
 
     function setPreviewControlsBusy(busy) {
@@ -1102,7 +1100,6 @@
 
     function applyInspection(result) {
         inspection = result;
-        selectedCandidate = null;
         lastPreview = null;
         appliedPreviewContext = null;
         $('lmSearchQuery').value = inspection.suggested_query || inspection.selected_name || activeMediaItem?.name || '';
@@ -1507,10 +1504,9 @@
             episode: positionPayload.episode ?? null,
             numberingMode: positionPayload.numbering_mode || 'auto',
         });
-        selectedCandidate = null;
         lastPreview = null;
         appliedPreviewContext = null;
-        $('lmExecuteBtn').disabled = true;
+        setBusy($('lmExecuteBtn'), true, '确认并开始整理');
         $('lmScrapeStatus').textContent = '正在生成计划';
         setPreviewControlsBusy(true);
         try {
@@ -1532,7 +1528,6 @@
                 icons($('lmScrapeDetail'));
                 return false;
             }
-            selectedCandidate = candidate;
             lastPreview = previewResult;
             const effectivePosition = previewResult.position_overrides || {};
             appliedPreviewContext = Object.freeze({
@@ -1599,7 +1594,10 @@
         if (!inspection || !lastPreview || !appliedPreviewContext) return;
         const confirmedContext = appliedPreviewContext;
         const confirmedPreview = lastPreview;
-        if (confirmedContext.inspectionId !== inspection.inspection_id) return;
+        const ownsPreview = () => inspection?.inspection_id === confirmedContext.inspectionId
+            && appliedPreviewContext === confirmedContext && lastPreview === confirmedPreview;
+        if (!ownsPreview()) return;
+        const mediaName = inspection.selected_name || activeMediaItem?.name || '所选媒体';
         const replacements = (confirmedPreview.plans || []).filter((item) => item.action === 'replace').length;
         const ok = await appConfirm({
             title: '执行本地媒体整理',
@@ -1607,34 +1605,34 @@
             confirmText: '开始整理',
         });
         if (!ok) return;
-        if (appliedPreviewContext !== confirmedContext || lastPreview !== confirmedPreview) {
+        if (!ownsPreview()) {
             return appAlert({type: 'warning', title: '计划已变化', message: '候选或执行计划已更新，请重新确认。'});
         }
         setBusy($('lmExecuteBtn'), true, '整理中');
+        let result;
         try {
-            const result = await api('/api/local-media/execute', {
+            result = await api('/api/local-media/execute', {
                 method: 'POST',
                 body: JSON.stringify({
                     inspection_id: confirmedContext.inspectionId,
                     preview_digest: confirmedPreview.preview_digest,
                 }),
             });
-            appAlert({
-                type: result.status === 'completed' ? 'success' : 'warning',
-                title: result.status === 'completed' ? '整理完成' : '任务已进入待确认',
-                message: result.status === 'completed'
-                    ? `已移动 ${result.moved?.length || 0} 项，清理 ${result.deleted_junk?.length || 0} 项。`
-                    : (result.preview?.reason || '请在待确认任务中继续处理。'),
-            });
-            if (result.repreview_required) invalidatePreview();
-            if (result.status === 'completed') closeScrape();
-            await loadAll(false, {includeItems: true});
+            window.showToast?.(`${mediaName}：${result.status === 'completed'
+                ? `整理完成，已移动 ${result.moved?.length || 0} 项，清理 ${result.deleted_junk?.length || 0} 项。`
+                : `任务已进入待确认：${result.preview?.reason || '请在待确认任务中继续处理。'}`}`,
+                result.status === 'completed' ? 'success' : 'warning', 6500);
         } catch (error) {
-            appAlert({type: 'error', title: '整理失败', message: error.message});
+            window.showToast?.(`${mediaName}：整理失败，${error.message}`, 'error', 6500);
         } finally {
-            setBusy($('lmExecuteBtn'), false, '确认并开始整理');
-            $('lmExecuteBtn').disabled = !appliedPreviewContext;
+            if (ownsPreview()) {
+                setBusy($('lmExecuteBtn'), false, '确认并开始整理');
+                if (result?.status === 'completed') closeScrape();
+                else if (result?.repreview_required) invalidatePreview();
+            }
         }
+        if (result) await loadAll(false, {includeItems: true}).catch(error =>
+            window.showToast?.(`${mediaName}：列表刷新失败，${error.message}`, 'warning', 6500));
     }
 
     function closeItemContextMenu({restoreFocus = false} = {}) {
