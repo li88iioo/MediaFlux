@@ -247,6 +247,7 @@ class _SDKRequests:
     async def dispatch(self, name):
         method = ""
         arguments = {}
+        read_result = None
         activity_id = f"{self.context.call_id}:{name.removesuffix('.json')}"
         current_task = self.context.current_task
         observation: dict[str, Any] = {}
@@ -351,16 +352,7 @@ class _SDKRequests:
             if observation:
                 call.update({key: result[key] for key in ("cached", "partial", "truncated", "has_more") if key in result})
             self.calls.append(call)
-            observations = {} if method.startswith("session.") or identity(current_task) != identity(self.context.current_task) else read_observations(
-                current_task, method, bound.arguments,
-                {**result, "ok": ok, "status": status, "summary": result.get("summary") or method},
-            )
-            patch = observation_patch(
-                current_task, owner=self.context.owner, session_id=self.context.session_id,
-                tool=method, call_id=f"{self.context.call_id}:{len(self.calls)}", observations=observations,
-            )
-            if patch is not None:
-                self.patches.append(patch)
+            read_result = {**result, "ok": ok, "status": status, "summary": result.get("summary") or method}
         except asyncio.CancelledError:
             stopped.set()
             if checkpoint is not None:
@@ -371,12 +363,6 @@ class _SDKRequests:
                 self.completed_reads.append((name, call))
             raise
         except Exception as exc:
-            if observation:
-                patch = observation_patch(current_task, owner=self.context.owner, session_id=self.context.session_id,
-                    tool=method, call_id=f"{self.context.call_id}:{len(self.calls) + 1}",
-                    observations={} if method.startswith("session.") or identity(current_task) != identity(self.context.current_task) else read_observations(current_task, method, observation["arguments"], None))
-                if patch is not None:
-                    self.patches.append(patch)
             message = redact_sensitive_text(getattr(exc, "public_message", None) or str(exc))
             code = str(getattr(exc, "code", None) or type(exc).__name__)
             call = {"method": str(method), "ok": False, "status": code}
@@ -399,6 +385,12 @@ class _SDKRequests:
                     await self.context.report_progress({"activity": activity})
         if observation:
             call["called_at"] = observation["called_at"]
+            patch = observation_patch(current_task, owner=self.context.owner, session_id=self.context.session_id,
+                tool=method, call_id=f"{self.context.call_id}:{len(self.calls)}",
+                observations={} if identity(current_task) != identity(self.context.current_task) else read_observations(
+                    current_task, method, observation["arguments"], read_result))
+            if patch is not None:
+                self.patches.append(patch)
         self.write(name, encoded)
         if observation:
             self.completed_reads.append((name, call))

@@ -1,14 +1,20 @@
 """原生会话任务：真实root工作区、SQLite发布和原验收证据。"""
 import asyncio
 import json
+import socket
+from hashlib import sha256
+
+import pytest
 
 from app import sdk
 from app.agent.feature_gate import initialize_runtime_fence
+from app.agent.kernel import sandbox
 from app.agent.kernel.bootstrap import (
     _capture_creation_binding,
     build_agent_kernel_runtime,
 )
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
+from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from tests import test_agent_session_result as native_tests
 from tests import test_agent_task_cas as cas_tests
@@ -29,14 +35,18 @@ def final():
             ModelEvent(ModelEventType.FINISH, finish_reason="stop")]
 
 
-def test_same_script_start_read_checkpoint_and_cli(task_store, native_workspace, monkeypatch):
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_same_script_start_read_checkpoint_and_cli(task_store, native_workspace, monkeypatch, fail_first):
     real_calls = []
     def component(component):
         real_calls.append(component)
+        if fail_first and len(real_calls) == 1:
+            raise ValueError("离线配置读取失败")
         return {"ok": True, "status": "not_configured", "data": {
             "component": component, "status": "not_configured", "enabled": False,
             "probe_mode": "configuration_only", "network_accessed": False}}
     monkeypatch.setitem(sdk.METHODS, "diagnostics.component", component)
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: pytest.fail("禁止外联"))
     args = declaration()
     args.pop("operation")
     code = f'''import json
@@ -44,6 +54,15 @@ from mf import session, diagnostics
 t = session.start_task(**{args!r})['data']['task']
 assert t['revision'] == 1 and t['status'] == 'partial'
 assert session.task()['data']['task'] == t
+if {fail_first!r}:
+    try:
+        diagnostics.component('tmdb')
+    except mf.Error:
+        pass
+    else:
+        raise AssertionError('必须保留真实失败')
+    failed = session.task()['data']['task']
+    assert failed['status'] == 'blocked' and not failed['verified_facts']
 for c in ('tmdb', 'qbittorrent'):
     assert diagnostics.component(c)['ok']
 t = session.task()['data']['task']
@@ -64,7 +83,7 @@ print(json.dumps(done))'''
         result = next(e.payload["result"] for e in events if e.type.value == "tool.completed")
         assert result["data"]["exit_code"] == 0, result['data']['stderr']
         assert events[-1].payload["task"]["status"] == stored.metadata["task"]["status"] == "complete"
-        assert real_calls == ["tmdb", "qbittorrent"]
+        assert real_calls == (["tmdb"] if fail_first else []) + ["tmdb", "qbittorrent"]
         assert stored.metadata['read_wait']['budget']['model_spent'] == 2
         assert stored.metadata['read_wait']['budget']['tool_spent'] == 1
         cold_model = ScriptedModel([code_round("mf session.task\nmf session.start_task --help", language="shell"), final()])
@@ -75,4 +94,121 @@ print(json.dumps(done))'''
         assert readback['exit_code'] == 0, readback
         assert 'root_goal' in readback['stdout'] and 'constraints' in readback['stdout']
         assert json.JSONDecoder().raw_decode(readback['stdout'])[0]['data']['task']['task_id'] == stored.metadata['task']['task_id']
+    asyncio.run(run())
+
+
+def test_only_business_reads_earn_native_task_evidence(task_store, native_workspace, monkeypatch):
+    queried = []
+
+    def search(query: str):
+        queried.append(query)
+        return {"ok": True, "status": "success", "summary": "真实离线查询", "items": []}
+
+    monkeypatch.setitem(sdk.METHODS, "media.search", search)
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: pytest.fail("禁止外联"))
+    goal = "核对媒体数据，可保存方法笔记和调整展示，仅观察业务。"
+    args = declaration()
+    args.pop("operation")
+    args.update(source=goal, root_goal=goal, obligations=[{
+        "id": "media", "description": "取得本次查询", "required": True,
+        "acceptance": {"kind": "observed_read", "criterion": "取得真实媒体查询结果"},
+    }])
+    code = f'''import json
+from mf import session, skills, resources, media
+session.start_task(**{args!r})
+first = skills.save('research', '已验证的方法', '# 第一版方法')['item']
+second = skills.save('research', '已验证的方法', '# 第二版方法', first['revision'])['item']
+restored = skills.restore('research', first['revision'], second['revision'])['item']
+resources.present([])
+session.pending_plan()
+before = session.task()['data']['task']
+media.search('sample')
+observed = session.task()['data']['task']
+[fact] = [f for f in observed['verified_facts'] if f['tool'] == 'media.search']
+done = session.checkpoint_task([], [], read_evidence={{'media': fact['evidence_id']}})
+print(json.dumps({{'before': before, 'observed': observed, 'done': done,
+                  'restored': restored, 'first': first}}, ensure_ascii=False))'''
+
+    async def run():
+        initialize_runtime_fence()
+        runtime = build_agent_kernel_runtime(model=ScriptedModel([code_round(code), final()]), store=task_store)
+        events = [event async for event in runtime.session.run(AgentInput(
+            message=goal, owner=OWNER, session_id="native-read-evidence"))]
+        [result] = [event.payload["result"]["data"] for event in events if event.type.value == "tool.completed"]
+        assert result["exit_code"] == 0, result["stderr"]
+        payload = json.loads(result["stdout"])
+        assert payload["before"]["status"] == "partial" and payload["before"]["verified_facts"] == []
+        assert [fact["tool"] for fact in payload["observed"]["verified_facts"]] == ["media.search"]
+        assert payload["restored"]["content"] == payload["first"]["content"]
+        assert payload["restored"]["revision"] > payload["first"]["revision"]
+        assert payload["done"]["data"]["task"]["status"] == events[-1].payload["task"]["status"] == "complete"
+        cold = await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(
+            owner=OWNER, session_id="native-read-evidence")
+        assert [fact["tool"] for fact in cold.metadata["task"]["verified_facts"]] == ["media.search"]
+        assert queried == ["sample"]
+        assert [call["method"] for call in result["sdk_calls"]] == [
+            "session.start_task", "skills.save", "skills.save", "skills.restore", "resources.present",
+            "session.pending_plan", "session.task", "media.search", "session.task", "session.checkpoint_task",
+        ]
+
+    asyncio.run(run())
+
+
+def test_real_recommend_signature_omits_sentinels_but_keeps_explicit_empty_zero_false(
+    task_store, native_workspace, monkeypatch,
+):
+    received = []
+
+    def recommend(**arguments):
+        received.append(arguments)
+        return {"ok": True, "status": "success", "summary": "真实离线推荐", "items": []}
+
+    monkeypatch.setattr("app.modules.media_library.recommend", recommend)
+    monkeypatch.setattr(socket.socket, "connect", lambda *_: pytest.fail("禁止外联"))
+    goal = "只读核对本地推荐，分别沿用偏好和显式清空过滤条件。"
+    args = declaration()
+    args.pop("operation")
+    args.update(source=goal, root_goal=goal, obligations=[{
+        "id": "recommend", "description": "读取真实推荐", "required": True,
+        "acceptance": {"kind": "observed_read", "criterion": "取得推荐回执"},
+    }])
+    explicit = {"must_match": [], "prefer": [], "exclude": [], "min_rating": 0, "exclude_played": False}
+    code = f'''import json
+from mf import session, library
+session.start_task(**{args!r})
+library.recommend()
+library.recommend(**{explicit!r})
+observed = session.task()['data']['task']
+done = session.checkpoint_task([], [], read_evidence={{'recommend': observed['verified_facts'][-1]['evidence_id']}})
+print(json.dumps({{'observed': observed, 'done': done}}, ensure_ascii=False))'''
+
+    async def run():
+        initialize_runtime_fence()
+        runtime = build_agent_kernel_runtime(model=ScriptedModel([code_round(code), final()]), store=task_store)
+        events = [event async for event in runtime.session.run(AgentInput(
+            message=goal, owner=OWNER, session_id="native-recommend-evidence"))]
+        [result] = [event.payload["result"]["data"] for event in events if event.type.value == "tool.completed"]
+        assert result["exit_code"] == 0, result["stderr"]
+        payload = json.loads(result["stdout"])
+        expected = [{"server": "auto", "media_type": "any", "limit": 8},
+                    {"server": "auto", "media_type": "any", "limit": 8, **explicit}]
+        assert [{key: value for key, value in call.items() if key not in {"preferences", "cancelled"}}
+                for call in received] == expected
+        assert all(isinstance(call["preferences"], dict) for call in received)
+        facts = payload["observed"]["verified_facts"]
+        assert [fact["tool"] for fact in facts] == ["library.recommend", "library.recommend"]
+        assert [fact["query_key"] for fact in facts] == ["read:" + sha256(json.dumps(
+            ["library.recommend", arguments], sort_keys=True, ensure_ascii=False,
+            separators=(",", ":")).encode()).hexdigest() for arguments in expected]
+        workspace, _ = sandbox._workspace_location(OWNER, "native-recommend-evidence")
+        archived = [json.loads((workspace / call["response_path"].lstrip("/")).read_text())
+                    for call in result["sdk_calls"] if call["method"] == "library.recommend"]
+        assert [receipt["arguments"] for receipt in archived] == expected
+        assert all(receipt["result"]["ok"] is True for receipt in archived)
+        assert payload["done"]["data"]["task"]["status"] == events[-1].payload["task"]["status"] == "complete"
+        cold = await SQLiteKernelStore(secret_provider=lambda: "task-test-only").load(
+            owner=OWNER, session_id="native-recommend-evidence")
+        assert [fact["query_key"] for fact in cold.metadata["task"]["verified_facts"]] == [
+            fact["query_key"] for fact in facts]
+
     asyncio.run(run())

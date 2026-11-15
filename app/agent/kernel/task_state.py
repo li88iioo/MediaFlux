@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.sensitive_data import contains_sensitive_credential
+from app.sdk import METHOD_EFFECTS
 
 COMPONENTS = frozenset({"tmdb", "qbittorrent"})
 IDENTITY = ("task_id", "epoch", "revision")
@@ -185,9 +186,13 @@ def proposal(arguments: dict, context: Any) -> TaskPatch:
     )
 
 
+def _read_source(tool: str) -> bool:
+    return not tool.startswith(("agent.", "session.")) and METHOD_EFFECTS.get(tool, "read") == "read"
+
+
 def tracks_read(task: dict | None, tool: str) -> bool:
     return bool(task and task["status"] not in {"complete", "cancelled"}
-                and not tool.startswith("agent.") and any(
+                and _read_source(tool) and any(
                     o["acceptance"]["kind"] == "observed_read" and o["state"] != "verified"
                     for o in task["obligations"]))
 
@@ -300,7 +305,7 @@ def valid_fact(fact: dict, task: dict, *, owner: str, session_id: str) -> bool:
                          and fact["probe_mode"] == "configuration_only")
     else:
         valid_payload = (_read_key(fact["query_key"]) and fact["status"] == "success"
-                         and not fact["tool"].startswith("agent.")
+                         and _read_source(fact["tool"])
                          and type(fact["summary"]) is str and 0 < len(fact["summary"]) <= 240)
     return (valid_payload and type(fact["observed_at"]) in (float, int)
             and type(fact["epoch"]) is int and fact["epoch"] == task["epoch"]

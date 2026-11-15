@@ -7,11 +7,13 @@ import json
 import socket
 from copy import deepcopy
 from dataclasses import asdict, replace
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from app import database as db
 from app.agent.kernel import bootstrap, task_state
 from app.agent.kernel.bootstrap import build_agent_kernel_runtime, build_tool_catalog
 from app.agent.kernel.capabilities import ToolCatalog
@@ -291,6 +293,61 @@ def test_sqlite_read_receipts_keep_same_cas_and_revision_epoch_fences(task_store
         with pytest.raises(ValueError):
             checkpoint(current, {"libraries": old_id}, evidence_ids=[old_id])
         assert (await task_store.load(owner=OWNER, session_id="cas")).metadata["task"] == current
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("method,accepted", [
+    ("skills.save", False), ("skills.restore", False), ("resources.present", False),
+    ("library.refresh", False), ("session.result", False),
+    ("media.search", True), ("retired.library_read", True),
+])
+@pytest.mark.parametrize("linked", [False, True])
+def test_signed_historical_read_sources_remain_readable_but_nonreads_cannot_earn_acceptance(
+    task_store, method, accepted, linked,
+):
+    async def run():
+        initial = await seed(task_store, declared())
+        legacy = read(initial.metadata["task"])
+        [fact] = reads(legacy)
+        # 构造修复前已签名保存的快照，不能用修复后的新证据入口制造旧坏事实。
+        key = "read:" + sha256(json.dumps([method, ARGS], sort_keys=True, ensure_ascii=False,
+                                         separators=(",", ":")).encode()).hexdigest()
+        fact.update(tool=method, query_key=key)
+        fact["scope"]["query_key"] = key
+        if linked:
+            legacy["obligations"][0].update(state="verified", evidence_ids=[fact["evidence_id"]])
+            legacy["status"] = "complete"
+        initial.metadata["task"] = legacy
+        initial.conversation = [{"role": "user", "content": GOAL}, {
+            "role": "assistant", "content": json.dumps({"historical_receipt": fact}, ensure_ascii=False),
+        }]
+        with db.get_conn() as conn:
+            task_store._write_state(conn, initial)
+        cold_store = SQLiteKernelStore(secret_provider=lambda: "task-test-only")
+        cold = await cold_store.load(owner=OWNER, session_id="cas")
+        assert cold.to_payload() == initial.to_payload()
+        patch = control({"operation": "checkpoint", "evidence_ids": [], "blockers": [],
+                         "read_evidence": {} if linked else {"libraries": fact["evidence_id"]}}, legacy)
+        # 沿实际当前 lease 提交，保留仓储 CAS/发布身份，不伪造一个新的用户回合。
+        lease, current = await cold_store.begin_turn(owner=OWNER, session_id="cas", request_id="accept-history")
+        if accepted:
+            saved = await cold_store.commit(lease, task_patch=patch)
+            assert saved.metadata["task"]["status"] == "complete"
+            assert saved.metadata["task"]["verified_facts"] == [fact]
+            assert saved.conversation == initial.conversation
+        else:
+            with pytest.raises(ValueError, match="invalid (linked evidence|evidence scope)"):
+                await cold_store.commit(lease, task_patch=patch)
+            assert (await cold_store.load(owner=OWNER, session_id="cas")).to_payload() == current.to_payload()
+            # 已有显式 revise 可以恢复任务；新 epoch 不能沿用旧错误证据。
+            revised = await cold_store.commit(lease, task_patch=control(
+                {**declared(), "operation": "revise"}, legacy))
+            assert revised.metadata["task"]["task_id"] == legacy["task_id"]
+            assert revised.metadata["task"]["epoch"] == legacy["epoch"] + 1
+            assert revised.metadata["task"]["verified_facts"] == []
+            readback = await cold_store.load(owner=OWNER, session_id="cas")
+            assert readback.conversation == initial.conversation
+
     asyncio.run(run())
 
 
