@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import asyncio
 import json
 import socket
@@ -45,7 +47,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
 
     def seed(self, *, episode=1, root="incoming", isolated=False):
         key = f"tmdb:991:tv:S01E{episode:03d}"
-        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate = seed_media_subscription_candidates(
             self.subscription,
             key,
             season=1,
@@ -185,7 +187,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
 
     def assert_missing(self, key):
         service = MediaSubscriptionService()
-        search = AsyncMock(return_value=(0, 0, None))
+        search = AsyncMock(return_value=None)
         with (
             patch(
                 "app.modules.media_subscriptions._tmdb_detail",
@@ -213,7 +215,9 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             patch(
                 "app.modules.media_subscription_notifications.drain_media_subscription_notifications"
             ),
-            patch.object(service, "_search_missing_tv", new=search),
+            patch("app.modules.media_subscriptions.config.get_bool", return_value=True),
+            patch("app.modules.media_subscriptions.get_indexer_service", return_value=object()),
+            patch.object(service, "_search_resources", new=search),
         ):
             result = asyncio.run(service.check_subscription(self.subscription))[
                 "result"

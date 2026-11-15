@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 from typing import cast
 from app.clients.guangya import GuangYaClient
 
@@ -95,7 +97,7 @@ class STRMRequestOwnershipRecoveryTests(unittest.TestCase):
 
     def seed(self, episode=1):
         key = f"tmdb:991:tv:S01E{episode:03d}"
-        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate = seed_media_subscription_candidates(
             self.sub,
             key,
             season=1,
@@ -443,7 +445,7 @@ class STRMRequestOwnershipRecoveryTests(unittest.TestCase):
         self.assertEqual(get_download_request_result_5["strm_status"], "failed")
         self.assertEqual(self.admission(admission)["status"], "failed")
 
-        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate = seed_media_subscription_candidates(
             self.sub,
             key,
             season=1,

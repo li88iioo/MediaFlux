@@ -1,9 +1,12 @@
 """媒体订阅数据一致性、检查失效与安全下载准入测试。"""
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import asyncio
 import threading
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import database as db
@@ -17,6 +20,19 @@ from app.modules.media_subscriptions import (
     _tmdb_detail,
 )
 from tests.support import IsolatedDatabaseTestCase
+
+
+async def check_resource_candidates(service, row, detail, targets):
+    """给真实检查编排提供库存事实，检索、发布、取消与终结仍执行生产链。"""
+    result: dict[str, Any] = {"status": "missing", "candidate_count": 0, "auto_submitted": 0, "missing": []}
+    tv = row["media_type"] == "tv"
+    if tv:
+        result["_search_rotation"] = None
+    with patch.object(
+        service, "_check_tv" if tv else "_check_movie",
+        new=AsyncMock(return_value=(result, detail, targets)),
+    ), patch("app.modules.media_subscription_notifications.drain_media_subscription_notifications", return_value=0):
+        return (await service.check_subscription(int(row["id"])))["result"]
 
 
 class MediaSubscriptionTests(IsolatedDatabaseTestCase):
@@ -99,7 +115,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                     patch.object(media_subscriptions_repo, "list_active_media_download_admissions", return_value=admissions),
                     patch.object(service, "_sync_admissions", new=AsyncMock()) as sync,
                     patch.object(service, "_preview_search_movie", new=AsyncMock(return_value=service._empty_preview_search("empty"))),
-                    patch.object(service, "_search_movie", new=AsyncMock(return_value=(0, 0))) as search,
+                    patch.object(service, "_search_resources", new=AsyncMock(return_value=None)) as search,
                     patch("app.modules.media_subscription_notifications.drain_media_subscription_notifications", return_value=0),
                 ):
                     preview = asyncio.run(service.preview_subscription_updates(sid))
@@ -119,7 +135,6 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
     def test_search_cancellation_keeps_preview_and_live_exception_contracts(self):
         service = MediaSubscriptionService()
         subscription_id = self._seed_subscription(tmdb_id="7", media_type="movie")
-        assert (media_subscriptions_repo.claim_media_subscription_check_run(subscription_id, "manual")) is not None
         row = media_subscriptions_repo.get_media_subscription(subscription_id)
         async def run(awaitable):
             return await awaitable
@@ -134,7 +149,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                         "app.modules.media_subscriptions", level="INFO"
                     ) as logs:
                         coroutine = (service._preview_search_movie(row, {}, limit_per_media=3) if preview
-                                     else service._search_movie(row, {}, "tmdb:7:movie"))
+                                     else check_resource_candidates(service, row, {}, [_ExpectedMedia("tmdb:7:movie")]))
                         propagated = isinstance(failure, asyncio.CancelledError) or (not preview and isinstance(failure, MediaSubscriptionError))
                         if propagated:
                             with self.assertRaises(type(failure)) as caught:
@@ -146,7 +161,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                                 assert isinstance(result, dict)
                                 self.assertEqual(result["status"], "unavailable")
                             else:
-                                self.assertEqual(result, (0, 0))
+                                self.assertEqual((result["candidate_count"], result["auto_submitted"]), (0, 0))
                     event = next(record.media_subscription_search for record in logs.records if hasattr(record, "media_subscription_search"))
                     expected = ("cancelled" if isinstance(failure, asyncio.CancelledError) or (not preview and getattr(failure, "code", "") == "cancelled")
                                 else "rejected" if propagated else "unavailable")
@@ -170,7 +185,6 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             return await awaitable
         for media_type in ("tv", "movie"):
             subscription_id = self._seed_subscription(tmdb_id="7", media_type=media_type)
-            assert (media_subscriptions_repo.claim_media_subscription_check_run(subscription_id, "manual")) is not None
             row = media_subscriptions_repo.get_media_subscription(subscription_id)
             target = _ExpectedMedia("tmdb:7:tv:S01E002", season=1, episode=2)
             for preview in (True, False):
@@ -188,14 +202,13 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                 ), patch("app.modules.media_subscriptions.run_indexer_awaitable", new=run):
                     if media_type == "tv":
                         coroutine = (service._preview_search_missing_tv(row, detail, [target], max_search_episodes=3, limit_per_media=3)
-                                     if preview else service._search_missing_tv(row, detail, [target]))
+                                     if preview else check_resource_candidates(service, row, detail, [target]))
                     else:
                         coroutine = (service._preview_search_movie(row, detail, limit_per_media=3)
-                                     if preview else service._search_movie(row, detail, "tmdb:7:movie"))
+                                     if preview else check_resource_candidates(service, row, detail, [_ExpectedMedia("tmdb:7:movie")]))
                     result = asyncio.run(coroutine)
                 if media_type == "tv":
-                    self.assertEqual(isinstance(result, dict), preview)
-                    self.assertEqual(result["candidate_count"] if isinstance(result, dict) else result[0], 1)
+                    self.assertEqual(result["candidate_count"], 1)
                 request, sites = indexer.search_media.call_args.args
                 assert row is not None
                 original = detail["original_name" if media_type == "tv" else "original_title"]
@@ -225,7 +238,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _add_candidates(subscription_id: int, *, media_key: str, result_ids: tuple[str, ...]) -> list[int]:
-        return media_subscriptions_repo.replace_media_subscription_candidates(
+        return seed_media_subscription_candidates(
             subscription_id,
             media_key,
             season=1,
@@ -254,7 +267,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         key = "tmdb:86034:tv:S01E001"
         historical = self._add_candidates(subscription_id, media_key=key,
             result_ids=tuple(f"history-{i}" for i in range(500)))
-        current = media_subscriptions_repo.replace_media_subscription_candidates(
+        current = seed_media_subscription_candidates(
             subscription_id, key, season=1, episode=1,
             candidates=[{"result_id": value, "site_id": "mikan", "title": value,
                          "relevance_score": 90, "download_state": "ready"}
@@ -355,7 +368,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         media_subscriptions_repo.update_media_subscription_config(active_id, status="missing")
         media_subscriptions_repo.update_media_subscription_config(disabled_id, enabled=0, status="missing")
         media_subscriptions_repo.update_media_subscription_config(inconclusive_id, status="inconclusive")
-        media_subscriptions_repo.replace_media_subscription_candidates(
+        seed_media_subscription_candidates(
             active_id,
             "tmdb:100:tv:S01E001",
             season=1,
@@ -369,6 +382,9 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             }],
             expires_at="2099-01-01 00:00:00",
         )
+        # 候选夹具通过真实 claim/cancel 后回到 new；这里准备聚合所需的历史巡检状态。
+        with db.get_conn() as conn:
+            conn.execute("UPDATE media_subscriptions SET status='missing' WHERE id=?", (active_id,))
 
         with patch(
             "app.repositories.media_subscriptions.list_media_subscriptions",
@@ -386,7 +402,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
 
     def test_stats_ignore_residual_candidates_from_soft_deleted_subscriptions(self) -> None:
         subscription_id = self._seed_subscription(tmdb_id="deleted")
-        media_subscriptions_repo.replace_media_subscription_candidates(
+        seed_media_subscription_candidates(
             subscription_id,
             "tmdb:deleted:tv:S01E001",
             season=1,
@@ -688,7 +704,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(media_subscriptions_repo.list_active_media_download_admissions(subscription_id)), 1)
 
         other_key = "tmdb:86034:tv:S01E002"
-        failed_candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        failed_candidate = seed_media_subscription_candidates(
             subscription_id,
             other_key,
             season=1,
@@ -719,7 +735,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         self.assertEqual(failure["error"], "下载器拒绝")
 
         detailed_key = "tmdb:86034:tv:S01E003"
-        detailed_candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        detailed_candidate = seed_media_subscription_candidates(
             subscription_id,
             detailed_key,
             season=1,
@@ -1236,7 +1252,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
     def test_movie_auto_search_skips_refreshed_submitted_candidate(self) -> None:
         service = MediaSubscriptionService()
         subscription_id, row = self._seed_auto_subscription("movie")
-        submitted_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        submitted_id = seed_media_subscription_candidates(
             subscription_id,
             "tmdb:7:movie",
             season=None,
@@ -1251,7 +1267,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
         ], sites_attempted=("site",), sites_succeeded=("site",), errors=[], partial=False, cached=False)
         download = AsyncMock(return_value={"ok": True})
 
-        async def scenario() -> tuple[int, int]:
+        async def scenario() -> dict:
             with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
                 "app.modules.media_subscriptions.get_indexer_service",
                 return_value=SimpleNamespace(search_media=lambda *_args, **_kwargs: object()),
@@ -1261,9 +1277,10 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
             ), patch.object(service, "_ensure_active_check"), patch.object(
                 service, "download_candidate", new=download
             ):
-                return await service._search_movie(row, {}, "tmdb:7:movie")
+                return await check_resource_candidates(service, row, {}, [_ExpectedMedia("tmdb:7:movie")])
 
-        _candidate_total, auto_submitted = asyncio.run(scenario())
+        checked = asyncio.run(scenario())
+        auto_submitted = checked["auto_submitted"]
         rows = media_subscriptions_repo.list_media_subscription_candidates(subscription_id, statuses=(), limit=20)
         by_result = {str(item["result_id"]): int(item["id"]) for item in rows}
         self.assertEqual(auto_submitted, 1)
@@ -1284,7 +1301,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
         service = MediaSubscriptionService()
         subscription_id, row = self._seed_auto_subscription("tv")
         media_key = "tmdb:7:tv:S01E001"
-        submitted_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        submitted_id = seed_media_subscription_candidates(
             subscription_id,
             media_key,
             season=1,
@@ -1308,7 +1325,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
         ], sites_attempted=("site",), sites_succeeded=("site",), errors=[], partial=False, cached=False)
         download = AsyncMock(return_value={"ok": True})
 
-        async def scenario() -> tuple[int, int, dict[str, int] | None]:
+        async def scenario() -> dict:
             with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
                 "app.modules.media_subscriptions.get_indexer_service",
                 return_value=SimpleNamespace(search_media=lambda *_args, **_kwargs: object()),
@@ -1320,13 +1337,12 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
             ), patch.object(service, "_ensure_active_check"), patch.object(
                 service, "download_candidate", new=download
             ):
-                return await service._search_missing_tv(
-                    row,
-                    {},
-                    [_ExpectedMedia(media_key=media_key, season=1, episode=1)],
+                return await check_resource_candidates(
+                    service, row, {}, [_ExpectedMedia(media_key=media_key, season=1, episode=1)],
                 )
 
-        _candidate_total, auto_submitted, _rotation = asyncio.run(scenario())
+        checked = asyncio.run(scenario())
+        auto_submitted = checked["auto_submitted"]
         rows = media_subscriptions_repo.list_media_subscription_candidates(subscription_id, statuses=(), limit=20)
         by_result = {str(item["result_id"]): int(item["id"]) for item in rows}
         self.assertEqual(auto_submitted, 1)
@@ -1346,7 +1362,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
             {"ok": True},
         ])
 
-        async def scenario() -> tuple[int, int]:
+        async def scenario() -> dict:
             with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
                 "app.modules.media_subscriptions.get_indexer_service",
                 return_value=SimpleNamespace(search_media=lambda *_args, **_kwargs: object()),
@@ -1356,9 +1372,10 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
             ), patch.object(service, "_ensure_active_check"), patch.object(
                 service, "download_candidate", new=download
             ):
-                return await service._search_movie(row, {}, "tmdb:7:movie")
+                return await check_resource_candidates(service, row, {}, [_ExpectedMedia("tmdb:7:movie")])
 
-        _candidate_total, auto_submitted = asyncio.run(scenario())
+        checked = asyncio.run(scenario())
+        auto_submitted = checked["auto_submitted"]
         self.assertEqual(auto_submitted, 1)
         self.assertEqual(download.await_count, 2)
 
@@ -1405,46 +1422,26 @@ class MediaSubscriptionCancellationBoundaryTests(IsolatedDatabaseTestCase):
 
     def test_movie_search_propagates_revision_cancellation(self) -> None:
         service = MediaSubscriptionService()
-        cancelled = MediaSubscriptionError("检查已取消", code="cancelled")
-        row = {
-            "id": 7,
-            "revision": 1,
-            "title": "Movie",
-            "original_title": "",
-            "year": "2026",
-            "sites_json": "[]",
-            "action": "confirm",
-            "download_target": "qb",
-        }
-        aggregated = type("Aggregated", (), {"items": []})()
-        indexer = type(
-            "Indexer",
-            (),
-            {"search_media": staticmethod(lambda *_args, **_kwargs: object())},
-        )()
+        sid = MediaSubscriptionTests._seed_subscription(tmdb_id="7", media_type="movie")
+        row = media_subscriptions_repo.get_media_subscription(sid)
 
+        async def search(*_args):
+            service.update_subscription(sid, {"action": "notify"})
+            return SimpleNamespace(items=[])
+
+        indexer = SimpleNamespace(search_media=AsyncMock(side_effect=search))
         async def scenario():
-            with (
-                patch("app.modules.media_subscriptions.config.get_bool", return_value=True),
-                patch(
-                    "app.modules.media_subscriptions.get_indexer_service",
-                    return_value=indexer,
-                ),
-                patch(
-                    "app.modules.media_subscriptions.run_indexer_awaitable",
-                    new=AsyncMock(return_value=aggregated),
-                ),
-                patch.object(
-                    service,
-                    "_ensure_active_check",
-                    side_effect=[None, cancelled],
-                ),
-            ):
-                await service._search_movie(row, {}, "tmdb:7:movie")
+            with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
+                "app.modules.media_subscriptions.get_indexer_service", return_value=indexer,
+            ), patch("app.modules.media_subscriptions.run_indexer_awaitable", new=lambda awaitable: awaitable):
+                await check_resource_candidates(service, row, {}, [_ExpectedMedia("tmdb:7:movie")])
 
         with self.assertRaises(MediaSubscriptionError) as ctx:
             asyncio.run(scenario())
-        self.assertIs(ctx.exception, cancelled)
+        self.assertEqual((ctx.exception.code, ctx.exception.status_code), ("cancelled", 409))
+        indexer.search_media.assert_awaited_once()
+        self.assertEqual(media_subscriptions_repo.list_media_subscription_candidates(sid, statuses=()), [])
+
 
 
 class MediaSubscriptionTMDBLifecycleTests(IsolatedDatabaseTestCase):

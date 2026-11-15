@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock, PropertyMock, patch
@@ -31,7 +33,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             title="闭环测试", monitor_mode="missing", action="confirm",
             download_target="both", check_interval_minutes=60,
         )
-        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate_id = seed_media_subscription_candidates(
             subscription_id, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{"result_id":"result-1","title":"闭环资源","download_state":"ready","relevance_score":99}],
             expires_at="2099-01-01 00:00:00",
@@ -65,7 +67,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             title="重试准入闭环", monitor_mode="missing", action="confirm",
             download_target="qb", check_interval_minutes=4320,
         )
-        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate_id = seed_media_subscription_candidates(
             subscription_id, media_key, season=1, episode=1,
             candidates=[{
                 "result_id": f"retry-{suffix}", "title": "同集旧资源",
@@ -105,7 +107,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         subscription, _old_candidate, old_admission, old_request, media_key = (
             self._seed_failed_subscription_request(86080)
         )
-        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate = seed_media_subscription_candidates(
             subscription, media_key, season=1, episode=1,
             candidates=[{
                 "result_id": "retry-new-candidate", "title": "同 hash 新候选",
@@ -263,7 +265,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             title="闭环测试 2", monitor_mode="missing", action="confirm",
             download_target="both", check_interval_minutes=60,
         )
-        second_candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        second_candidate = seed_media_subscription_candidates(
             second_subscription, "tmdb:2:tv:S01E001", season=1, episode=1,
             candidates=[{"result_id":"result-2","title":"闭环资源 2","download_state":"ready"}],
             expires_at="2099-01-01 00:00:00",
@@ -500,7 +502,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             admission_id, status="submitted", request_id=request_id
         )
 
-        refreshed_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        refreshed_id = seed_media_subscription_candidates(
             subscription_id, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{
                 "result_id": "result-1", "title": "闭环资源（刷新）",
@@ -730,7 +732,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         assert get_download_request_result is not None
         self.assertEqual(get_download_request_result["status"], "submitted")
 
-        second_candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        second_candidate_id = seed_media_subscription_candidates(
             subscription_id, media_key, season=1, episode=1,
             candidates=[{
                 "result_id": "retry-different-hash", "title": "同集新资源",
@@ -791,7 +793,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                     ).fetchone()
                 self.assertEqual(int(admission["request_id"]), successor_id)
                 self.assertEqual(admission["status"], admission_status)
-                replacement_candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+                replacement_candidate = seed_media_subscription_candidates(
                     _subscription, _media_key, season=1, episode=1,
                     candidates=[{
                         "result_id": f"retry-alternate-{offset}",
@@ -1085,7 +1087,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         media_subscriptions_repo.update_media_download_admission(
             first_admission_id, status="failed", request_id=first_request_id, error="下载失败"
         )
-        second_candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        second_candidate_id = seed_media_subscription_candidates(
             subscription_id, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{
                 "result_id": "result-2", "title": "替代候选",

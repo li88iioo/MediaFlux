@@ -1,6 +1,8 @@
 """A 域取消/配置有效性：只使用临时文件数据库和内存 provider。"""
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 from typing import cast
 from app.indexers.providers.base import IndexerAdapter
 
@@ -42,7 +44,7 @@ class AdmissionCancellationTests(unittest.IsolatedAsyncioTestCase):
             site_id="memory", site_name="Memory", title="Cancel S01E01",
             download_state="ready", magnet=MAGNET, download_kinds=("magnet",),
         ))
-        self.cid = media_subscriptions_repo.replace_media_subscription_candidates(
+        self.cid = seed_media_subscription_candidates(
             self.sid, "tmdb:1:tv:S01E001", season=1, episode=1,
             candidates=[{"result_id": self.result_id, "title": "Cancel S01E01", "download_state": "ready"}],
             expires_at="2099-01-01 00:00:00",

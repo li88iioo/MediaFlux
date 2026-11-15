@@ -38,8 +38,10 @@ class SeasonCompletenessTests(unittest.IsolatedAsyncioTestCase):
             return_value=[{"status": "ready", "truncated": False, "episodes": [(i, 1) for i in range(1, 31)]}],
         ))
         self.enterContext(patch("app.modules.media_subscription_notifications.drain_media_subscription_notifications"))
+        self.enterContext(patch("app.modules.media_subscriptions.config.get_bool", return_value=True))
+        self.enterContext(patch("app.modules.media_subscriptions.get_indexer_service", return_value=object()))
         self.search = self.enterContext(patch.object(
-            MediaSubscriptionService, "_search_missing_tv", new=AsyncMock(return_value=(0, 0, None)),
+            MediaSubscriptionService, "_search_resources", new=AsyncMock(return_value=None),
         ))
 
     async def test_31st_season_is_included_on_repeated_checks(self):

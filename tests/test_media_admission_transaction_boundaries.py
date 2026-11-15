@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -38,7 +40,7 @@ class MediaAdmissionTransactionBoundaryTests(unittest.TestCase):
         existing_request=None,
     ):
         key = f"tmdb:1:tv:S01E{episode:03d}"
-        candidate = repository.replace_media_subscription_candidates(
+        candidate = seed_media_subscription_candidates(
             self.subscription,
             key,
             season=1,

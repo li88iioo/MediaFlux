@@ -163,6 +163,33 @@ def isolated_test_database(filename: str = "test.db") -> Generator[Path, None, N
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
 
+def seed_media_subscription_candidates(
+    subscription_id: int, media_key: str, *, season: int | None, episode: int | None,
+    candidates, expires_at: str,
+) -> list[int]:
+    """通过真实检查租约发布测试候选；不提供免校验生产入口。"""
+    from app.repositories import media_subscriptions as repo
+
+    run_id = repo.claim_media_subscription_check_run(subscription_id)
+    claimed = run_id is not None
+    row = repo.get_media_subscription(subscription_id)
+    assert row is not None
+    if run_id is None:
+        runs = repo.list_media_subscription_runs(subscription_id=subscription_id)
+        run_id = next(run["id"] for run in runs if run["status"] == "running" and run["subscription_revision"] == row["revision"])
+    try:
+        return [int(saved["id"]) for saved in repo.replace_media_subscription_candidates(
+            subscription_id, media_key, revision=int(row["revision"]), run_id=run_id,
+            season=season, episode=episode, candidates=candidates, expires_at=expires_at,
+        )]
+    finally:
+        if claimed:
+            repo.cancel_media_subscription_run(
+                run_id, subscription_id=subscription_id, subscription_revision=int(row["revision"]),
+                reason="测试候选已建立，结束夹具检查",
+            )
+
+
 @contextmanager
 def initialized_web_runtime(paths=None):
     """Opt-in real installation for ordinary, already-installed Web controls.

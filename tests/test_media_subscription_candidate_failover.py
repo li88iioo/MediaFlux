@@ -1,6 +1,8 @@
 """SUB-02：真实订阅服务 / 选源 / 下载准入链路的离线换源回归。"""
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import asyncio
 import json
 import threading
@@ -481,7 +483,7 @@ class MediaSubscriptionCandidateFailoverTests(IsolatedDatabaseTestCase):
     def test_manual_candidate_keeps_error_contract_and_can_be_explicitly_retried(self):
         subscription_id, source, indexer, backend = self.scenario()
         result_id = indexer.result_store.put(replace(source.items[0], result_id=None))
-        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate_id = seed_media_subscription_candidates(
             subscription_id, "tmdb:86034:movie", season=None, episode=None,
             candidates=[{**source.items[0].to_public_dict(), "result_id": result_id}],
             expires_at="2099-01-01 00:00:00",

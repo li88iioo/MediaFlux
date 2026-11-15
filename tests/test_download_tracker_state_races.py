@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import json
 import socket
 import unittest
@@ -87,7 +89,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
             download_target="guangya",
             check_interval_minutes=60,
         )
-        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate_id = seed_media_subscription_candidates(
             subscription_id,
             "tmdb:1:tv:S01E001",
             season=1,

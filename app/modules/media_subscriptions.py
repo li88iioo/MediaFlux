@@ -880,10 +880,50 @@ class MediaSubscriptionService:
         run_token = _ACTIVE_CHECK_RUN_ID.set(run_id)
         try:
             self._ensure_active_check(subscription_id, revision, cancel_event)
-            if str(row["media_type"]) == "tv":
-                result = await self._check_tv(row, cancel_event=cancel_event, identity_batch=identity_batch)
+            tv = str(row["media_type"]) == "tv"
+            if tv:
+                result, detail, targets = await self._check_tv(row, cancel_event=cancel_event, identity_batch=identity_batch)
             else:
-                result = await self._check_movie(row, cancel_event=cancel_event, identity_batch=identity_batch)
+                result, detail, targets = await self._check_movie(row, cancel_event=cancel_event, identity_batch=identity_batch)
+            if targets and str(row["action"]) != "notify" and config.get_bool("INDEXER_SEARCH_ENABLED"):
+                service = get_indexer_service()
+                sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service) if tv else None
+                if tv:
+                    targets, result["_search_rotation"] = _rotated_missing_targets(
+                        targets, result["_search_rotation"], revision=revision, limit=_MAX_SEARCH_EPISODES,
+                    )
+                for target in targets:
+                    self._ensure_active_check(subscription_id, revision, cancel_event)
+                    aggregated = await self._search_resources(
+                        row, detail, service, sites=sites, target=target if tv else None,
+                        revision=revision, cancel_event=cancel_event,
+                    )
+                    if aggregated is None:
+                        continue
+                    candidates = self._select_candidates(aggregated, target)
+                    published = media_subscriptions_repo.replace_media_subscription_candidates(
+                        subscription_id, target.media_key, revision=revision, run_id=run_id,
+                        season=target.season, episode=target.episode,
+                        candidates=candidates, expires_at=self._candidate_expiry(),
+                    )
+                    result["candidate_count"] += len(published)
+                    if str(row["action"]) != "auto":
+                        continue
+                    for saved, candidate in zip(published, candidates):
+                        if saved["status"] != "available" or not candidate["_auto_eligible"]:
+                            continue
+                        try:
+                            downloaded = await self.download_candidate(
+                                int(saved["id"]), str(row["download_target"]),
+                                require_active_check=True, cancel_event=cancel_event,
+                            )
+                        except MediaSubscriptionError as exc:
+                            if exc.code == "unavailable" or exc.can_try_next_candidate:
+                                self._ensure_active_check(subscription_id, revision, cancel_event)
+                                continue
+                            raise
+                        result["auto_submitted"] += int(bool(downloaded.get("ok") or downloaded.get("duplicate")))
+                        break
             stored_result = dict(result)
             public_result = dict(result)
             public_result.pop("_search_rotation", None)
@@ -995,7 +1035,7 @@ class MediaSubscriptionService:
     async def _check_tv(
         self, row: Any, *, cancel_event: threading.Event | None = None,
         identity_batch: MediaIdentityBatch | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any], list[_ExpectedMedia]]:
         tmdb_id = str(row["tmdb_id"])
         title = str(row["title"])
         include_specials = bool(row["include_specials"])
@@ -1068,32 +1108,20 @@ class MediaSubscriptionService:
                 "status": "inconclusive",
                 "summary": inventory_reason,
                 "_search_rotation": search_rotation,
-            }
+            }, detail, []
         if not missing_items:
             return {
                 **base,
                 "status": "satisfied",
                 "summary": "已播剧集均已收录或正在下载",
                 "_search_rotation": None,
-            }
-        candidates = 0
-        auto_submitted = 0
-        if str(row["action"]) != "notify":
-            candidates, auto_submitted, search_rotation = await self._search_missing_tv(
-                row,
-                detail,
-                missing_items,
-                search_rotation=search_rotation,
-                cancel_event=cancel_event,
-            )
+            }, detail, []
         return {
             **base,
             "status": "missing",
             "summary": f"发现 {len(missing_items)} 集已播但尚未收录",
-            "candidate_count": candidates,
-            "auto_submitted": auto_submitted,
             "_search_rotation": search_rotation,
-        }
+        }, detail, missing_items
 
     async def _expected_tv(
         self,
@@ -1372,7 +1400,7 @@ class MediaSubscriptionService:
     async def _check_movie(
         self, row: Any, *, cancel_event: threading.Event | None = None,
         identity_batch: MediaIdentityBatch | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any], list[_ExpectedMedia]]:
         tmdb_id = str(row["tmdb_id"])
         revision = int(row["revision"] or 1)
         try:
@@ -1405,18 +1433,7 @@ class MediaSubscriptionService:
             "inventory_complete": complete, "inventory_reason": reason,
             "sources": self._public_sources(sources), "candidate_count": 0, "auto_submitted": 0,
         }
-        if facts["status"] != "missing":
-            return base
-        candidates = 0
-        auto_submitted = 0
-        if str(row["action"]) != "notify":
-            candidates, auto_submitted = await self._search_movie(
-                row, detail, key, cancel_event=cancel_event
-            )
-        return {
-            **base,
-            "candidate_count": candidates, "auto_submitted": auto_submitted,
-        }
+        return base, detail, [_ExpectedMedia(key)] if facts["status"] == "missing" else []
 
     @staticmethod
     def _inventory_complete(sources: list[dict[str, Any]], *, identity: bool = False) -> tuple[bool, str]:
@@ -1741,152 +1758,39 @@ class MediaSubscriptionService:
         )
 
     @staticmethod
-    def _available_candidate_pairs(
-        candidate_ids: list[int],
-        candidates: list[dict[str, Any]],
-    ) -> list[tuple[int, dict[str, Any]]]:
-        """按持久化状态筛选候选，避免刷新后重试 submitted/dismissed 行。"""
-        rows = media_subscriptions_repo.list_media_subscription_candidates_by_ids(candidate_ids)
-        available = {
-            int(row["id"]): str(row["result_id"] or "")
-            for row in rows
-            if str(row["status"] or "") == "available"
-        }
-        return [
-            (candidate_id, candidate)
-            for candidate_id, candidate in zip(candidate_ids, candidates)
-            if available.get(candidate_id) == str(candidate.get("result_id") or "")
-        ]
-
-
-    async def _search_missing_tv(
-        self,
-        row: Any,
-        detail: dict[str, Any],
-        missing: list[_ExpectedMedia],
-        *,
-        search_rotation: dict[str, int] | None = None,
-        cancel_event: threading.Event | None = None,
-    ) -> tuple[int, int, dict[str, int] | None]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
-            return 0, 0, search_rotation
-        revision = int(row["revision"] or 1)
-        self._ensure_active_check(int(row["id"]), revision, cancel_event)
-        service = get_indexer_service()
-        sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service)
-        candidate_total = 0
-        auto_submitted = 0
-        targets, next_rotation = _rotated_missing_targets(
-            missing,
-            search_rotation,
-            revision=revision,
-            limit=_MAX_SEARCH_EPISODES,
+    def _select_candidates(
+        aggregated: AggregatedIndexerResult, target: _ExpectedMedia,
+    ) -> list[dict[str, Any]]:
+        if target.episode is None:
+            return [
+                {**item.to_public_dict(), "_auto_eligible": (item.relevance_score or 0) >= _AUTO_RELEVANCE_THRESHOLD}
+                for item in aggregated.items
+                if item.download_state in {"ready", "resolvable"} and (item.relevance_score or 0) >= 60
+            ][:_MAX_CANDIDATES_PER_MEDIA]
+        assert target.season is not None
+        ranked = rank_episode_search(
+            {"items": [item.to_public_dict() for item in aggregated.items]},
+            season=target.season, episode=target.episode,
         )
-        for target in targets:
-            self._ensure_active_check(int(row["id"]), revision, cancel_event)
-            assert target.season is not None and target.episode is not None
-            aggregated = await self._search_resources(
-                row, detail, service, sites=sites, target=target, revision=revision, cancel_event=cancel_event,
-            )
-            if aggregated is None:
+        candidates = []
+        for item in ranked.get("items", []):
+            quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+            if not quality.get("eligible") or quality.get("match") == "conflict":
                 continue
-            public = {"items": [item.to_public_dict() for item in aggregated.items]}
-            ranked = rank_episode_search(public, season=target.season, episode=target.episode)
-            candidates = []
-            for item in ranked.get("items", []):
-                quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
-                if not quality.get("eligible") or quality.get("match") == "conflict":
-                    continue
-                candidates.append({
-                    **item,
-                    "relevance_score": item.get("relevance_score"),
-                    "match_reasons": list(quality.get("reasons") or []) + [
-                        f"季集匹配：{quality.get('match', 'unknown')}"
-                    ],
-                    "_quality": quality,
-                })
-                if len(candidates) >= _MAX_CANDIDATES_PER_MEDIA:
-                    break
-            ids = media_subscriptions_repo.replace_media_subscription_candidates(
-                int(row["id"]), target.media_key,
-                season=target.season, episode=target.episode,
-                candidates=candidates, expires_at=self._candidate_expiry(),
-            )
-            candidate_total += len(ids)
-            if str(row["action"]) == "auto" and ids and candidates:
-                for candidate_id, candidate in self._available_candidate_pairs(ids, candidates):
-                    quality = candidate.get("_quality", {})
-                    relevance = int(candidate.get("relevance_score") or 0)
-                    if not (
-                        quality.get("match") == "exact_episode"
-                        and quality.get("confidence") == "high"
-                        and relevance >= _AUTO_RELEVANCE_THRESHOLD
-                        and candidate.get("download_state") in {"ready", "resolvable"}
-                    ):
-                        continue
-                    try:
-                        result = await self.download_candidate(
-                            candidate_id,
-                            str(row["download_target"]),
-                            require_active_check=True,
-                            cancel_event=cancel_event,
-                        )
-                    except MediaSubscriptionError as exc:
-                        if exc.code == "unavailable" or exc.can_try_next_candidate:
-                            self._ensure_active_check(int(row["id"]), revision, cancel_event)
-                            continue
-                        raise
-                    auto_submitted += int(bool(result.get("ok") or result.get("duplicate")))
-                    break
-        return candidate_total, auto_submitted, next_rotation
-
-    async def _search_movie(
-        self,
-        row: Any,
-        detail: dict[str, Any],
-        media_key: str,
-        *,
-        cancel_event: threading.Event | None = None,
-    ) -> tuple[int, int]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
-            return 0, 0
-        revision = int(row["revision"] or 1)
-        self._ensure_active_check(int(row["id"]), revision, cancel_event)
-        service = get_indexer_service()
-        aggregated = await self._search_resources(
-            row, detail, service, revision=revision, cancel_event=cancel_event,
-        )
-        if aggregated is None:
-            return 0, 0
-        candidates = [
-            item.to_public_dict() for item in aggregated.items
-            if item.download_state in {"ready", "resolvable"}
-            and (item.relevance_score or 0) >= 60
-        ][:_MAX_CANDIDATES_PER_MEDIA]
-        ids = media_subscriptions_repo.replace_media_subscription_candidates(
-            int(row["id"]), media_key, season=None, episode=None,
-            candidates=candidates, expires_at=self._candidate_expiry(),
-        )
-        auto_submitted = 0
-        if str(row["action"]) == "auto" and ids and candidates:
-            for candidate_id, candidate in self._available_candidate_pairs(ids, candidates):
-                if int(candidate.get("relevance_score") or 0) < _AUTO_RELEVANCE_THRESHOLD:
-                    continue
-                try:
-                    result = await self.download_candidate(
-                        candidate_id,
-                        str(row["download_target"]),
-                        require_active_check=True,
-                        cancel_event=cancel_event,
-                    )
-                except MediaSubscriptionError as exc:
-                    if exc.code == "unavailable" or exc.can_try_next_candidate:
-                        self._ensure_active_check(int(row["id"]), revision, cancel_event)
-                        continue
-                    raise
-                auto_submitted = int(bool(result.get("ok") or result.get("duplicate")))
+            candidates.append({
+                **item,
+                "match_reasons": list(quality.get("reasons") or []) + [
+                    f"季集匹配：{quality.get('match', 'unknown')}"
+                ],
+                "_auto_eligible": (
+                    quality.get("match") == "exact_episode" and quality.get("confidence") == "high"
+                    and int(item.get("relevance_score") or 0) >= _AUTO_RELEVANCE_THRESHOLD
+                    and item.get("download_state") in {"ready", "resolvable"}
+                ),
+            })
+            if len(candidates) >= _MAX_CANDIDATES_PER_MEDIA:
                 break
-        return len(ids), auto_submitted
+        return candidates
 
     @staticmethod
     def _candidate_expiry() -> str:

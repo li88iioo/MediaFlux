@@ -1,6 +1,8 @@
 """真实 pending 取消必须释放媒体准入，提交/未知结果仍保持防重。"""
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import asyncio
 import socket
 import subprocess
@@ -36,7 +38,7 @@ class CancelledDownloadAdmissionTests(unittest.TestCase):
             download_target="guangya", check_interval_minutes=60,
         )
         self.key = "tmdb:86034:tv:S01E001"
-        self.candidate = repository.replace_media_subscription_candidates(
+        self.candidate = seed_media_subscription_candidates(
             self.subscription, self.key, season=1, episode=1,
             candidates=[{"result_id": "fixture", "title": "取消准入测试"}],
             expires_at="2099-01-01 00:00:00",
@@ -55,7 +57,7 @@ class CancelledDownloadAdmissionTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in active], [admission_id])
         self.assertIsNone(self.admission(admission_id)["completed_at"])
         # 原候选已 submitted；用另一条 available 候选验证锁，而非被候选失效拦截。
-        alternative = repository.replace_media_subscription_candidates(
+        alternative = seed_media_subscription_candidates(
             self.subscription, self.key, season=1, episode=1,
             candidates=[{"result_id": "alternative", "title": "同集另一个候选"}],
             expires_at="2099-01-01 00:00:00",

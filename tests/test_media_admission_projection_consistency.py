@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 import unittest
 from unittest.mock import patch
 
@@ -60,7 +62,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                 self.assertEqual(workflow["manual_review_count"], 1)
                 self.assertEqual(workflow["processing_count"], 0)
                 self.assertIn(reason, "；".join(workflow["attention_reasons"]))
-                alternative = media_subscriptions_repo.replace_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
+                alternative = seed_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
                     candidates=[{"result_id": f"alternative-{episode}", "title": key}], expires_at="2099-01-01 00:00:00")[0]
                 self.assertIsNone(media_subscriptions_repo.claim_media_download_admission(media_key=key, tmdb_id="1", media_type="tv",
                     subscription_id=self.subscription, candidate_id=alternative, season=1, episode=episode, subscription_revision=1))
@@ -89,7 +91,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
 
     def seed(self, episode=1, **fields):
         key = f"tmdb:1:tv:S01E{episode:03d}"
-        candidate = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate = seed_media_subscription_candidates(
             self.subscription,
             key,
             season=1,
@@ -204,7 +206,7 @@ class MediaAdmissionProjectionConsistencyTests(unittest.TestCase):
                 workflow = media_subscriptions_repo.list_media_subscription_workflows([self.subscription])[self.subscription]
                 self.assertEqual(workflow['manual_review_count'], 1)
                 self.assertEqual(workflow['processing_count'], 0)
-                alternative = media_subscriptions_repo.replace_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
+                alternative = seed_media_subscription_candidates(self.subscription, key, season=1, episode=episode,
                     candidates=[{'result_id':f'alternative-{episode}', 'title':key}], expires_at='2099-01-01 00:00:00')[0]
                 self.assertIsNone(media_subscriptions_repo.claim_media_download_admission(media_key=key, tmdb_id='1', media_type='tv',
                     subscription_id=self.subscription, candidate_id=alternative, season=1, episode=episode, subscription_revision=1))

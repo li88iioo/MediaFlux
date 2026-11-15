@@ -1,6 +1,8 @@
 """统一订阅中心 API 与页面契约测试。"""
 from __future__ import annotations
 
+from tests.support import seed_media_subscription_candidates
+
 from typing import cast
 from starlette.requests import Request
 
@@ -167,7 +169,7 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
             provider="tmdb", external_id="127532", tmdb_id="127532", media_type="tv",
             title="我独自升级",
         )
-        candidate_id = media_subscriptions_repo.replace_media_subscription_candidates(
+        candidate_id = seed_media_subscription_candidates(
             other_id,
             "tmdb:127532:tv:S01E001",
             season=1,

@@ -965,14 +965,28 @@ def replace_media_subscription_candidates(
     subscription_id: int,
     media_key: str,
     *,
+    revision: int,
+    run_id: int,
     season: int | None,
     episode: int | None,
     candidates: Iterable[dict[str, Any]],
     expires_at: str,
-) -> list[int]:
+) -> list[sqlite3.Row]:
     stamp = now()
-    ids: list[int] = []
+    published: list[sqlite3.Row] = []
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            "SELECT 1 FROM media_subscriptions s JOIN media_subscription_runs r "
+            "ON r.subscription_id=s.id AND r.subscription_revision=s.revision "
+            "WHERE s.id=? AND s.deleted_at IS NULL AND s.enabled=1 "
+            "AND s.status='checking' AND s.revision=? AND r.id=? AND r.status='running'",
+            (subscription_id, revision, run_id),
+        ).fetchone()
+        if active is None:
+            raise MediaSubscriptionError(
+                "订阅已暂停或检查状态已变化", status_code=409, code="cancelled"
+            )
         conn.execute(
             "UPDATE media_subscription_candidates SET status='expired',updated_at=? "
             "WHERE subscription_id=? AND media_key=? AND status='available'",
@@ -1006,31 +1020,13 @@ def replace_media_subscription_candidates(
                 ),
             )
             row = conn.execute(
-                "SELECT id FROM media_subscription_candidates "
+                "SELECT id,result_id,status FROM media_subscription_candidates "
                 "WHERE subscription_id=? AND media_key=? AND result_id=?",
                 (subscription_id, media_key, result_id),
             ).fetchone()
             if row is not None:
-                ids.append(int(row["id"]))
-    return ids
-
-
-def list_media_subscription_candidates_by_ids(
-    candidate_ids: Iterable[int],
-) -> list[sqlite3.Row]:
-    """批量读取候选当前状态，保持自动选择与刷新结果的身份对应。"""
-    normalized = list(dict.fromkeys(
-        candidate_id for candidate_id in candidate_ids if candidate_id > 0
-    ))[:200]
-    if not normalized:
-        return []
-    placeholders = ",".join("?" for _ in normalized)
-    with get_conn() as conn:
-        return conn.execute(
-            "SELECT id,result_id,status FROM media_subscription_candidates "
-            f"WHERE id IN ({placeholders})",
-            normalized,
-        ).fetchall()
+                published.append(row)
+    return published
 
 
 def get_media_subscription_candidate(candidate_id: int) -> sqlite3.Row | None:
