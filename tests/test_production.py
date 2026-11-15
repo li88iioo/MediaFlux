@@ -2979,7 +2979,7 @@ class MediaRefreshTests(unittest.TestCase):
             call.kwargs["params"],
             {
                 "metadataRefreshMode": "Default",
-                "imageRefreshMode": "None",
+                "imageRefreshMode": "Default",
                 "replaceAllMetadata": "false",
                 "replaceAllImages": "false",
                 "regenerateTrickplay": "false",

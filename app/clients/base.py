@@ -149,9 +149,11 @@ def media_refresh_parameters(
     if mode == "scan" and (replace_images or regenerate_trickplay):
         raise ValueError("scan 模式不支持 replace_images 或 regenerate_trickplay")
 
+    # scan 与 Jellyfin「扫描新增和更新的文件」一致：新条目补齐元数据和缺失图片，
+    # 不覆盖已有图片；imageRefreshMode=None 会让新入库作品永远没有海报。
     params = {
         "metadataRefreshMode": "Default" if mode == "scan" else "FullRefresh",
-        "imageRefreshMode": "None" if mode == "scan" else "FullRefresh",
+        "imageRefreshMode": "Default" if mode == "scan" else "FullRefresh",
         "replaceAllMetadata": "true" if mode == "replace" else "false",
         "replaceAllImages": "true" if replace_images else "false",
         "regenerateTrickplay": "true" if regenerate_trickplay else "false",

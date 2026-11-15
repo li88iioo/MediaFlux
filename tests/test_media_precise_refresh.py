@@ -61,16 +61,16 @@ class MediaLibraryRefreshRequestTests(unittest.TestCase):
                 headers.assert_not_called()
                 post.assert_not_called()
 
-    def test_default_scan_preserves_existing_requests(self):
+    def test_default_scan_fills_missing_metadata_and_images_without_replacing(self):
         expected = {
             "jellyfin": {
-                "metadataRefreshMode": "Default", "imageRefreshMode": "None",
+                "metadataRefreshMode": "Default", "imageRefreshMode": "Default",
                 "replaceAllMetadata": "false", "replaceAllImages": "false",
                 "regenerateTrickplay": "false",
             },
             "emby": {
                 "Recursive": "true", "MetadataRefreshMode": "Default",
-                "ImageRefreshMode": "None", "ReplaceAllMetadata": "false",
+                "ImageRefreshMode": "Default", "ReplaceAllMetadata": "false",
                 "ReplaceAllImages": "false",
             },
         }
@@ -134,7 +134,7 @@ class MediaLibraryRefreshRequestTests(unittest.TestCase):
 
     def test_parameter_helper_defaults_to_jellyfin_and_rejects_unknown_server(self):
         self.assertEqual(media_refresh_parameters("scan", False, False), {
-            "metadataRefreshMode": "Default", "imageRefreshMode": "None",
+            "metadataRefreshMode": "Default", "imageRefreshMode": "Default",
             "replaceAllMetadata": "false", "replaceAllImages": "false",
             "regenerateTrickplay": "false",
         })
