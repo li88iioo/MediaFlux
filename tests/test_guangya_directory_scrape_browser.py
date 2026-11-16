@@ -380,6 +380,22 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.assertFalse(self.page.locator('#gyScrapeRunBtn').is_disabled())
         self.assertEqual(self.page.locator('.gy-scrape-map-row').count(), 1)
 
+    def test_candidate_meta_appears_once_and_original_title_only_when_distinct(self):
+        self.page.evaluate("""() => { window.__candidates = [
+            {tmdb_id: '1', media_type: 'movie', title: '嗜血破晓', original_title: 'Daybreakers', year: 2010},
+            {tmdb_id: '2', media_type: 'tv', title: 'Daybreakers', original_title: 'Daybreakers', year: 2019},
+            {tmdb_id: '3', media_type: 'movie', title: '破晓时分'},
+        ]; }""")
+        self._open_manual_directory()
+        lines = self.page.locator('.gy-scrape-candidate-copy').evaluate_all(
+            "nodes => nodes.map(node => [...node.children].map(child => child.textContent))"
+        )
+        self.assertEqual(lines, [
+            ['嗜血破晓', 'Daybreakers', '电影 · 2010 · TMDB 1'],
+            ['Daybreakers', '剧集 · 2019 · TMDB 2'],
+            ['破晓时分', '电影 · 年份未知 · TMDB 3'],
+        ])
+
     def test_switching_candidates_keeps_current_loading_when_old_preview_fails(self):
         self.page.evaluate("""() => { window.__candidates = [
             {tmdb_id: '1', media_type: 'tv', title: '候选甲'},

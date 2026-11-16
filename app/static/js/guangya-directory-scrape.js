@@ -509,11 +509,13 @@
             button.setAttribute('aria-pressed', 'false');
             button.appendChild(poster(candidate.poster_url, 'gy-scrape-candidate-poster'));
             const copy = node('span', 'gy-scrape-candidate-copy');
-            copy.append(
-                node('strong', '', candidate.title || candidateFallbackTitle(candidate)),
-                node('span', '', candidate.original_title || candidateMeta(candidate)),
-                node('span', '', candidateMeta(candidate)),
-            );
+            const title = candidate.title || candidateFallbackTitle(candidate);
+            copy.appendChild(node('strong', '', title));
+            // 没有不同的原名时不再用元信息补位，避免同一行重复两次。
+            if (candidate.original_title && candidate.original_title !== title) {
+                copy.appendChild(node('span', '', candidate.original_title));
+            }
+            copy.appendChild(node('span', '', candidateMeta(candidate)));
             const score = node(
                 'span',
                 'gy-scrape-score',

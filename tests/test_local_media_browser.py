@@ -346,6 +346,19 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
             return node.closest('.app-toast').contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
         }"""), '真实 toast 必须显示在新刮削弹窗上方')
 
+    def test_desktop_movie_searchbar_collapses_hidden_episode_column(self):
+        page, unexpected, errors = self.make_page(1440)
+        self.open_plan(page, 0)
+        self.assertTrue(page.locator('#lmScrapeEpisodeFields').is_hidden())
+        bar = page.locator('.lm-scrape-searchbar')
+        box, search, auto = bar.bounding_box(), page.locator('#lmSearchBtn').bounding_box(), page.locator('#lmAutoPreviewBtn').bounding_box()
+        assert box and search and auto
+        padding = bar.evaluate('node => parseFloat(getComputedStyle(node).paddingRight)')
+        # 隐藏的季集列曾把“自动匹配”拉到 300px 以上，并在搜索按钮右侧留出空列。
+        self.assertAlmostEqual(box['x'] + box['width'] - padding, search['x'] + search['width'], delta=1)
+        self.assertLessEqual(auto['width'], 140)
+        self.assertEqual((unexpected, errors), ([], []))
+
     def test_late_execution_receipts_keep_new_plan_and_focus(self):
         for width in (1280, 390):
             for outcome in ('completed', 'error', 'repreview'):
