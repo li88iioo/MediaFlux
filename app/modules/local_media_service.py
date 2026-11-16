@@ -951,10 +951,9 @@ class LocalMediaService:
         prefix = canonical_local_media_content_path(media_root).rstrip("/") + "/"
         with db.get_conn() as conn:
             rows = conn.execute(
-                "SELECT step.source_path,step.target_path,i.media_group,t.content_path,s.local_root "
+                "SELECT step.source_path,step.target_path,i.media_group "
                 "FROM local_media_operation_steps step "
                 "JOIN local_media_tasks t ON t.id=step.task_id "
-                "JOIN local_media_sources s ON s.id=t.source_id AND s.owner=t.owner "
                 "LEFT JOIN local_media_task_items i ON i.task_id=t.id AND i.owner=t.owner "
                 "AND step.operation_token=t.operation_token "
                 "AND step.source_path=i.source_path AND step.target_path=i.target_path "
@@ -972,34 +971,32 @@ class LocalMediaService:
                 raise LocalMediaServiceError(
                     "目标目录存在已完成的本地移动记录，但身份快照已缺失，请人工核验"
                 )
-            # media_group 保留来源身份；目录比较只补充该文件已提交的归档名。
-            # 先还原确定的源组后缀再移除，避免切断 MetaTube ID 或目录中的冒号。
-            source_path = Path(row["source_path"])
-            selected_path = Path(row["content_path"])
-            source_root = (
-                Path(row["local_root"]).expanduser().resolve(strict=False)
-                if source_path == selected_path else selected_path
-            )
-            try:
-                relative_parent = source_path.parent.relative_to(source_root).as_posix()
-            except ValueError as exc:
-                raise LocalMediaServiceError(
-                    "本地历史执行记录的来源范围已变化，无法核验目录媒体身份，请人工核验"
-                ) from exc
-            suffix = ":" + (relative_parent if relative_parent != "." else "__root__")
+            # 来源组必为写入时源父目录相对某个祖先的路径；只匹配已持久化
+            # 路径与完整组后缀，不再从可变来源根反推，也不按冒号拆外部 ID。
+            source_parent = Path(row["source_path"]).parent
+            scopes = {"__root__"} | {
+                source_parent.relative_to(ancestor).as_posix()
+                for ancestor in source_parent.parents
+            }
             group = str(row["media_group"] or "")
-            identity = group[:-len(suffix)] if group.endswith(suffix) else ""
-            media_type, _, identity_key = identity.partition(":")
-            provider, _, external_id = identity_key.partition(":")
-            if media_type not in {"movie", "tv"} or provider not in {
-                "tmdb", "metatube", "clean_title",
-            } or not external_id:
+            candidates: set[tuple[str, str]] = set()
+            for scope in scopes:
+                suffix = ":" + scope
+                if not group.endswith(suffix):
+                    continue
+                media_type, _, identity_key = group[:-len(suffix)].partition(":")
+                provider, _, external_id = identity_key.partition(":")
+                if media_type in {"movie", "tv"} and provider in {
+                    "tmdb", "metatube", "clean_title",
+                } and external_id:
+                    candidates.add((media_type, Organizer._directory_identity_key(
+                        provider, external_id, Path(row["target_path"]).name,
+                    )))
+            if len(candidates) != 1:
                 raise LocalMediaServiceError(
                     "本地历史执行记录缺少可验证的媒体身份，请人工核验目标目录"
                 )
-            identities.add((media_type, Organizer._directory_identity_key(
-                provider, external_id, Path(row["target_path"]).name,
-            )))
+            identities.update(candidates)
         return identities
 
     @staticmethod
