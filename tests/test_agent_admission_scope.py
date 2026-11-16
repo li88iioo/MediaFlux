@@ -14,10 +14,11 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import public_conversation_messages
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, offline as offline, store as store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_read_handoff_rejects_write_without_false_success_in_cold_history(protocol, store):
+def test_read_handoff_rejects_write_without_false_success_in_cold_history(agent_llm_enabled, protocol, store):
     async def scenario():
         reads = []
         claim = "队列已全部删除，操作完成。"

@@ -20,6 +20,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.rate_limit import RateLimitDecision
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def build_wait_runtime(**kwargs):
@@ -78,7 +79,7 @@ class Quota:
 
 
 @pytest.mark.parametrize("cancel_entry", ["native", "stop"])
-def test_native_quota_park_and_cold_cancel(cancel_entry):
+def test_native_quota_park_and_cold_cancel(agent_llm_enabled, cancel_entry):
     async def run():
         db.init_db()
         initialize_runtime_fence()
@@ -122,7 +123,7 @@ def test_native_quota_park_and_cold_cancel(cancel_entry):
     asyncio.run(run())
 
 
-def test_scheduler_cold_native_resume_uses_new_id_and_one_read():
+def test_scheduler_cold_native_resume_uses_new_id_and_one_read(agent_llm_enabled):
     from app.modules.agent_jobs_scheduler import AgentJobsScheduler
     timer = [100]
     async def park():
@@ -171,7 +172,7 @@ def test_scheduler_cold_native_resume_uses_new_id_and_one_read():
     assert scheduler._run_due_continuation_once() == 0
 
 
-def test_restored_read_runs_before_model_without_regenerating_arguments():
+def test_restored_read_runs_before_model_without_regenerating_arguments(agent_llm_enabled):
     async def run():
         timer = [100]
         _, candidate = await parked_runtime(timer)
@@ -198,7 +199,7 @@ def test_restored_read_runs_before_model_without_regenerating_arguments():
 
 
 @pytest.mark.parametrize('advance', [180, 301, -1])
-def test_cold_wait_expiry_or_clock_reversal_never_requests_model(advance):
+def test_cold_wait_expiry_or_clock_reversal_never_requests_model(agent_llm_enabled, advance):
     async def run():
         timer = [100]
         _, candidate = await parked_runtime(timer)
@@ -213,7 +214,7 @@ def test_cold_wait_expiry_or_clock_reversal_never_requests_model(advance):
     asyncio.run(run())
 
 
-def test_claim_exclusion_running_never_replays_after_lease():
+def test_claim_exclusion_running_never_replays_after_lease(agent_llm_enabled):
     from contextlib import suppress
 
     from app.agent.kernel.model import ModelEvent, ModelEventType
@@ -248,7 +249,7 @@ def test_claim_exclusion_running_never_replays_after_lease():
     asyncio.run(run())
 
 
-def test_repark_segments_and_task_budgets_survive_cold_runtimes():
+def test_repark_segments_and_task_budgets_survive_cold_runtimes(agent_llm_enabled):
     async def run():
         timer = [100]
         runtime, candidate = await parked_runtime(timer)
@@ -275,7 +276,7 @@ def test_repark_segments_and_task_budgets_survive_cold_runtimes():
 
 
 @pytest.mark.parametrize('change', ['foreground', 'fence'])
-def test_new_turn_or_durable_epoch_revokes_old_wait(change):
+def test_new_turn_or_durable_epoch_revokes_old_wait(agent_llm_enabled, change):
     from app.agent.feature_gate import begin_runtime_change, read_runtime_fence
     async def run():
         timer = [100]
@@ -330,7 +331,7 @@ def test_scheduler_fault_branch_does_not_block_jobs_or_receipts():
     assert scheduler._thread is None
 
 
-def test_cancel_during_journal_io_cannot_publish_late_tool_event():
+def test_cancel_during_journal_io_cannot_publish_late_tool_event(agent_llm_enabled):
     import threading
     from contextlib import suppress
     async def run():
@@ -386,7 +387,7 @@ async def parked_runtime(timer, session_id='wait-control'):
 
 
 @pytest.mark.parametrize('phase', ['acquire', 'handler'])
-def test_cold_cancel_blocks_handler_start_and_late_reference(phase):
+def test_cold_cancel_blocks_handler_start_and_late_reference(agent_llm_enabled, phase):
     from contextlib import suppress
 
     from app.agent.kernel.projection import ReferenceValue, ToolOutcome

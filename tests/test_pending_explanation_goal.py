@@ -13,6 +13,7 @@ from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.state_types import AgentInput
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 GOAL = "改名一个对象，然后处理第二个对象"
 REPLY = {"text": "原引用：对象甲和对象乙"}
@@ -20,7 +21,7 @@ REPLY = {"text": "原引用：对象甲和对象乙"}
 
 @pytest.mark.parametrize("goal", [GOAL, "把 /source/test.txt 改名后继续处理第二个对象"])
 @pytest.mark.parametrize("explain", [False, True])
-def test_continuation_plan_keeps_original_goal_after_explanation(explain, goal):
+def test_continuation_plan_keeps_original_goal_after_explanation(agent_llm_enabled, explain, goal):
     async def run():
         runtime = NativeRuntime()
         owner, sid = "owner", "goal-chain"
@@ -60,7 +61,7 @@ def test_continuation_plan_keeps_original_goal_after_explanation(explain, goal):
         asyncio.run(run())
 
 
-def test_stale_reobservation_keeps_original_goal_and_reply():
+def test_stale_reobservation_keeps_original_goal_and_reply(agent_llm_enabled):
     async def run():
         runtime = NativeRuntime()
         owner, sid = "owner", "goal-stale"
@@ -125,7 +126,7 @@ def test_stale_reobservation_keeps_original_goal_and_reply():
         asyncio.run(run())
 
 
-def test_ordinary_new_request_uses_its_own_goal_and_reply():
+def test_ordinary_new_request_uses_its_own_goal_and_reply(agent_llm_enabled):
     async def run():
         runtime = NativeRuntime()
         owner, sid = "owner", "goal-replace"

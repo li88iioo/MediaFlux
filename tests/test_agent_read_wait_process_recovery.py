@@ -19,6 +19,7 @@ from app.agent.kernel.state_types import PublicationLease
 from tests.support import isolated_test_database
 from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import OWNER, parked_runtime
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 SESSION = "read-process-recovery"
 
@@ -112,7 +113,7 @@ async def _park():
 
 @pytest.mark.parametrize("phase", ["acquire", "handler", "model"])
 @pytest.mark.parametrize("termination", ["kill", "exit"])
-def test_dead_read_worker_is_retired_without_replaying_started_work(phase, termination):
+def test_dead_read_worker_is_retired_without_replaying_started_work(agent_llm_enabled, phase, termination):
     with isolated_test_database() as path:
         candidate = asyncio.run(_park())
         worker, release = _start_worker(path, candidate, phase, termination)
@@ -171,7 +172,7 @@ def test_dead_read_worker_is_retired_without_replaying_started_work(phase, termi
             worker.join(10)
 
 
-def test_cold_cancel_revokes_live_worker_without_waiting_for_its_execution_lock():
+def test_cold_cancel_revokes_live_worker_without_waiting_for_its_execution_lock(agent_llm_enabled):
     with isolated_test_database() as path:
         candidate = asyncio.run(_park())
         worker, release = _start_worker(path, candidate, "handler", "kill")

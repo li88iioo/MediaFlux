@@ -19,6 +19,7 @@ from app.agent.kernel.projection import ToolOutcome
 from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import public_conversation_messages
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import Wire, encode
 
 A, B, C = "library.lookup", "library.health", "library.inspect"
@@ -143,7 +144,7 @@ async def scenario(store, good, *, ending="answer", mixed=True):
     ("answer", "stop"), ("model-fault", "model_provider_error"),
     ("round-empty", "provider_timeout"), ("tool-empty", "provider_timeout"),
 ])
-def test_operational_failure_remains_disclosed_after_read_schema_correction(store, other, ending, reason):
+def test_operational_failure_remains_disclosed_after_read_schema_correction(agent_llm_enabled, store, other, ending, reason):
     final, answers = asyncio.run(scenario(store, other, ending=ending))
     assert final["status"] == "partial"
     assert final["finish_reason"] == reason
@@ -160,7 +161,7 @@ def test_operational_failure_remains_disclosed_after_read_schema_correction(stor
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_direct_read_correction_retains_wire_history_and_does_not_hide_operational_failures(store, mixed):
+def test_direct_read_correction_retains_wire_history_and_does_not_hide_operational_failures(agent_llm_enabled, store, mixed):
     final, answers = asyncio.run(scenario(store, {**X, "limit": 1}, mixed=mixed))
     assert final["status"] == ("partial" if mixed else "success")
     assert final["finish_reason"] == "stop"

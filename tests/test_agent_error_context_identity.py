@@ -23,6 +23,7 @@ from tests.test_agent_invalid_argument_progress import store as store
 
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 A, B, C = "library.lookup", "library.health", "library.inspect"
 X = {"ref": "object-x"}
@@ -146,7 +147,7 @@ def assert_partial(final, answers, *, reason="invalid_arguments", titles=()):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("code", ["invalid_arguments", "provider_timeout", "rate_limited"])
-def test_read_retry_settles_only_syntax_across_business_context(store, protocol, code):
+def test_read_retry_settles_only_syntax_across_business_context(agent_llm_enabled, store, protocol, code):
     steps = [(A, {}, code), (B, {}, "健康检查独有资料"), (A, {}, "切换后对象独有资料")]
     final, answers = asyncio.run(observe(store, steps, protocol=protocol))
     if code == "invalid_arguments":
@@ -157,7 +158,7 @@ def test_read_retry_settles_only_syntax_across_business_context(store, protocol,
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("schema", [False, True], ids=["handler", "schema"])
-def test_immediate_empty_read_to_direct_retry_keeps_success(store, protocol, schema):
+def test_immediate_empty_read_to_direct_retry_keeps_success(agent_llm_enabled, store, protocol, schema):
     steps = [(A, {}, "schema" if schema else "invalid_arguments"), (A, X, "原对象修参独有资料")]
     final, _ = asyncio.run(observe(store, steps, protocol=protocol, schema=schema))
     assert final["status"] == "success"
@@ -167,7 +168,7 @@ def test_immediate_empty_read_to_direct_retry_keeps_success(store, protocol, sch
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("schema", [False, True], ids=["handler", "schema"])
-def test_direct_read_retry_settles_old_syntax_after_context_switch(store, protocol, schema):
+def test_direct_read_retry_settles_old_syntax_after_context_switch(agent_llm_enabled, store, protocol, schema):
     steps = [(A, {}, "schema" if schema else "invalid_arguments"),
              (B, {}, "中间健康检查资料"), (A, X, "新上下文显式对象资料")]
     final, _ = asyncio.run(observe(store, steps, protocol=protocol, schema=schema))
@@ -176,7 +177,7 @@ def test_direct_read_retry_settles_old_syntax_after_context_switch(store, protoc
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("case", ["empty-retry", "explicit-across-switch", "new-failure-after-switch"])
-def test_existing_context_and_explicit_identity_controls(store, protocol, case):
+def test_existing_context_and_explicit_identity_controls(agent_llm_enabled, store, protocol, case):
     steps = [(A, {}, "invalid_arguments"), (A, {}, "当前对象重试资料")]
     if case == "explicit-across-switch":
         steps = [(A, X, "invalid_arguments"), (B, {}, "独立健康资料"), (A, X, "原显式对象资料")]
@@ -189,7 +190,7 @@ def test_existing_context_and_explicit_identity_controls(store, protocol, case):
 
 @pytest.mark.parametrize("schema", [False, True], ids=["handler", "schema"])
 @pytest.mark.parametrize("case", ["new-failure-after-switch", "discovery", "repeated-failure"])
-def test_direct_read_retry_uses_current_business_context(store, schema, case):
+def test_direct_read_retry_uses_current_business_context(agent_llm_enabled, store, schema, case):
     bad = (A, {}, "schema" if schema else "invalid_arguments")
     steps = [bad, (A, X, "立即修参对象资料")]
     if case == "new-failure-after-switch":
@@ -203,7 +204,7 @@ def test_direct_read_retry_uses_current_business_context(store, schema, case):
 
 @pytest.mark.parametrize("case", ["old-and-current-failures", "two-failed-tools", "multiple-switches"])
 @pytest.mark.parametrize("code", ["invalid_arguments", "provider_timeout"])
-def test_multiple_read_failures_preserve_business_not_syntax_blockers(store, case, code):
+def test_multiple_read_failures_preserve_business_not_syntax_blockers(agent_llm_enabled, store, case, code):
     steps = [(A, {}, code), (B, {}, "独立健康检查资料")]
     titles = ("独立健康检查资料", "最近对象资料")
     if case == "old-and-current-failures":
@@ -229,7 +230,7 @@ def test_multiple_read_failures_preserve_business_not_syntax_blockers(store, cas
     ("round-empty", "model_round_budget_exceeded"), ("tool-empty", "tool_budget_exceeded"),
 ])
 @pytest.mark.parametrize("mixed", [False, True], ids=["only-old-context", "unrecovered-z"])
-def test_context_failure_and_independent_success_survive_terminal_paths(store, ending, reason, mixed):
+def test_context_failure_and_independent_success_survive_terminal_paths(agent_llm_enabled, store, ending, reason, mixed):
     steps = [(A, {}, "invalid_arguments")]
     if mixed:
         steps.append((C, {"ref": "object-z"}, "provider_timeout"))

@@ -7,6 +7,7 @@ import pytest
 from app.routes import agent_api
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime, api_client
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize(
@@ -22,7 +23,7 @@ from tests.test_pending_explanation_transports import NativeRuntime, api_client
         "fields",
     ],
 )
-def test_web_explain_rejects_before_generation_or_model(case, monkeypatch):
+def test_web_explain_rejects_before_generation_or_model(agent_llm_enabled, case, monkeypatch):
     with isolated_test_database("explain-security.db"):
         runtime = NativeRuntime()
         with api_client(runtime, monkeypatch) as (client, owner):

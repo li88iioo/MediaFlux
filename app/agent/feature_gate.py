@@ -149,6 +149,12 @@ def is_agent_enabled() -> bool:
     return config.get_bool(AGENT_ENABLED_KEY, False)
 
 
+def is_agent_llm_enabled() -> bool:
+    """每次发送读取最新有效模型开关，不继承调用者的旧配置快照。"""
+    with config.use_runtime_config_snapshot(config.capture_runtime_config_snapshot()):
+        return config.get_bool("AGENT_LLM_ENABLED", False)
+
+
 def recognition_review_enabled() -> bool:
     """整理候选的 Agent 只读复核是否可用；配置异常时按关闭处理，人工链路不受影响。"""
     try:

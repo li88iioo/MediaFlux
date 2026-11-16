@@ -914,24 +914,41 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.requests, [])
 
     async def test_summary_failure_after_confirm_preserves_successful_write(self):
-        writes = []
-        tool = KernelToolSpec(name="cloud.change", domain="cloud", description="云盘变更",
-            input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
-            prepare=lambda _a, _c: PreparedEffect(preview={"summary": "变更"}, snapshot_fingerprint="snapshot"),
-            execute_confirmed=lambda _a, _s, _c: writes.append(1) or {"ok": True, "summary": "目录移动已完成"})
-        model = ScriptedModel([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("write", tool.name, {})),
-                                ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]])
-        catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
-        session = AgentSession(model=model, catalog=catalog,
-            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
-        preview = await consume_events(session.run(AgentInput(message="帮我移动目录", owner="owner", session_id="session")))
-        assert preview.approval is not None
-        final = await consume_events(session.confirm(owner="owner", session_id="session", plan_id=preview.approval.plan_id))
-        self.assertEqual(writes, [1])
-        self.assertEqual(final.status, "partial")
-        self.assertTrue(final.effect_result["ok"])
-        self.assertIn("目录移动已完成", final.answer)
-        self.assertNotIn("执行失败", final.answer)
+        from unittest.mock import patch
+
+        from app import config
+        from app.agent.kernel.provider_model import (
+            OpenAICompatibleModelAdapter,
+            ProviderSettings,
+        )
+        from tests.test_agent_generation_profiles import Wire
+
+        for disabled in (False, True):
+            with self.subTest(disabled=disabled), patch.dict(config._SYSTEM_ENV_SNAPSHOT, {'AGENT_LLM_ENABLED': '0'}):
+                writes = []
+                tool = KernelToolSpec(name="cloud.change", domain="cloud", description="云盘变更",
+                    input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+                    prepare=lambda _a, _c: PreparedEffect(preview={"summary": "变更"}, snapshot_fingerprint="snapshot"),
+                    execute_confirmed=lambda _a, _s, _c, writes=writes: writes.append(1) or {"ok": True, "summary": "目录移动已完成"})
+                model = ScriptedModel([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("write", tool.name, {})),
+                                        ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]])
+                catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
+                session = AgentSession(model=model, catalog=catalog,
+                    pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+                preview = await consume_events(session.run(AgentInput(message="帮我移动目录", owner="owner", session_id="session")))
+                assert preview.approval is not None
+                wire = Wire()
+                if disabled:
+                    session.model = OpenAICompatibleModelAdapter(ProviderSettings(
+                        api_url='https://api.example.com/v1', model='offline'), client_factory=wire.factory)
+                final = await consume_events(session.confirm(owner="owner", session_id="session", plan_id=preview.approval.plan_id))
+                self.assertEqual(final.status, "success" if disabled else "partial")
+                self.assertTrue(final.effect_result["ok"])
+                self.assertIn("目录移动已完成", final.answer)
+                self.assertNotIn("执行失败", final.answer)
+                await consume_events(session.confirm(owner="owner", session_id="session", plan_id=preview.approval.plan_id))
+                self.assertEqual(writes, [1])
+                self.assertEqual(wire.requests, [])
 
     async def test_receipt_failure_stops_followup_without_repeating_successful_write(self):
         writes = []

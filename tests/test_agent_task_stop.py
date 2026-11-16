@@ -44,6 +44,7 @@ from app.agent.kernel.state_types import (
 )
 from app.agent.models import ToolContext, ToolResult
 from app.agent.task_stop import stop_agent_session
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 
 
@@ -908,7 +909,7 @@ class SQLiteAgentTaskStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.metadata["effect_waits"][plan_id]["continuation"]["state"], "pending")
 
 
-def test_native_completed_effect_stop_prevents_original_goal_resume(tmp_path):
+def test_native_completed_effect_stop_prevents_original_goal_resume(agent_llm_enabled, tmp_path):
     """真实模型 wire -> 签名确认 -> 原生 worker -> 冷 /stop，不能仅靠伪造 metadata。"""
     from app import database as db
     from app.repositories import organize_operation_jobs as jobs
@@ -946,7 +947,7 @@ def test_native_completed_effect_stop_prevents_original_goal_resume(tmp_path):
     asyncio.run(run())
 
 
-def test_native_stop_revokes_delivery_approval_then_tg_sends_buttonless_facts(tmp_path):
+def test_native_stop_revokes_delivery_approval_then_tg_sends_buttonless_facts(agent_llm_enabled, tmp_path):
     """终态的 delivery 不再规划；取消新票据后由真实发送层去掉过期按钮。"""
     from app import database as db
     from app.bot import agent_adapter as adapter

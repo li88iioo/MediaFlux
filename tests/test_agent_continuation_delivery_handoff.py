@@ -34,6 +34,7 @@ from app.modules import telegram_notification_center as notifications
 from tests import test_agent_effect_continuation as effect_cases
 from tests import test_agent_waiting_delivery as read_cases
 from tests.agent_task_native_helpers import task_function
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_read_wait_contract_repair import resumed
 from tests.test_agent_read_wait_entry_exclusions import tg_config
 from tests.test_agent_read_wait_lifecycle import WaitScript, isolated_database
@@ -180,7 +181,7 @@ def _stored_payload(store):
         return json.loads(row["state_json"])
 
 
-def test_completed_read_answer_survives_next_task_seed(tg_config):
+def test_completed_read_answer_survives_next_task_seed(agent_llm_enabled, tg_config):
     async def run():
         clock = [100]
         runtime, before, script, reads = await _completed_read(clock)
@@ -200,7 +201,7 @@ def test_completed_read_answer_survives_next_task_seed(tg_config):
     asyncio.run(run())
 
 
-def test_two_completed_reads_keep_both_pending_answers(tg_config):
+def test_two_completed_reads_keep_both_pending_answers(agent_llm_enabled, tg_config):
     async def run():
         clock = [100]
         _, first, first_script, first_reads = await _completed_read(clock)
@@ -227,7 +228,7 @@ def test_two_completed_reads_keep_both_pending_answers(tg_config):
 
 
 @pytest.mark.parametrize("interruption", ["partial_enqueue", "before_ack"])
-def test_interrupted_handoff_survives_new_task_and_cold_retry(tg_config, interruption):
+def test_interrupted_handoff_survives_new_task_and_cold_retry(agent_llm_enabled, tg_config, interruption):
     async def run():
         clock = [100]
         answer = "查询回执：" + "完整事实需要保留。" * 600
@@ -272,7 +273,7 @@ def test_interrupted_handoff_survives_new_task_and_cold_retry(tg_config, interru
     asyncio.run(run())
 
 
-def test_effect_and_read_handoffs_survive_receipt_consumption_and_next_task_seed(tmp_path, tg_config):
+def test_effect_and_read_handoffs_survive_receipt_consumption_and_next_task_seed(agent_llm_enabled, tmp_path, tg_config):
     async def run():
         clock = [100]
         async with _completed_effect(tmp_path, clock) as (store, follow, effect_reads):
@@ -343,7 +344,7 @@ async def _check_legacy_delivery(store, clock, *, source, tamper):
 
 
 @pytest.mark.parametrize("tamper", [False, True])
-def test_old_signed_read_pending_is_normalized_before_due_scan(tg_config, tamper):
+def test_old_signed_read_pending_is_normalized_before_due_scan(agent_llm_enabled, tg_config, tamper):
     async def run():
         clock = [100]
         runtime, _, script, reads = await _completed_read(clock)
@@ -353,7 +354,7 @@ def test_old_signed_read_pending_is_normalized_before_due_scan(tg_config, tamper
 
 
 @pytest.mark.parametrize("tamper", [False, True])
-def test_old_signed_effect_pending_is_normalized_before_due_scan(tmp_path, tamper):
+def test_old_signed_effect_pending_is_normalized_before_due_scan(agent_llm_enabled, tmp_path, tamper):
     async def run():
         clock = [100]
         async with _completed_effect(tmp_path, clock) as (store, script, reads):
@@ -362,7 +363,7 @@ def test_old_signed_effect_pending_is_normalized_before_due_scan(tmp_path, tampe
     asyncio.run(run())
 
 
-def test_delivery_namespace_and_ack_cannot_clear_other_answers(tg_config):
+def test_delivery_namespace_and_ack_cannot_clear_other_answers(agent_llm_enabled, tg_config):
     async def run():
         clock = [100]
         await _completed_read(clock)
@@ -390,7 +391,7 @@ def test_delivery_namespace_and_ack_cannot_clear_other_answers(tg_config):
     asyncio.run(run())
 
 
-def test_old_large_terminal_moves_without_duplicate_view_or_answer_truncation(tg_config):
+def test_old_large_terminal_moves_without_duplicate_view_or_answer_truncation(agent_llm_enabled, tg_config):
     async def run():
         clock = [100]
         answer = "完整回执" + "a" * 40_000

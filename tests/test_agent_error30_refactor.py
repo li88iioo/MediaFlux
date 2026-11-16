@@ -26,6 +26,7 @@ from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire
 from tests.test_agent_tool_argument_ingress import offline as offline
 from tests.test_agent_tool_argument_ingress import store as store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 async def _context(state, *, owner="owner", session_id="direct"):
@@ -90,7 +91,7 @@ def test_invalid_arguments_returns_schema_and_retry_rechecks_business_gates(stag
     (ToolEffect.READ, False), (ToolEffect.WRITE, False), (ToolEffect.DANGER, False),
     (ToolEffect.WRITE, True), (ToolEffect.DANGER, True),
 ])
-def test_direct_retries_preserve_wire_history_and_only_preview_writes(store, protocol, effect, preview):
+def test_direct_retries_preserve_wire_history_and_only_preview_writes(agent_llm_enabled, store, protocol, effect, preview):
     async def run():
         invoked = []
         schema = {"type": "object", "required": ["target", "limit"], "properties": {

@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
+from app.agent.feature_gate import is_agent_llm_enabled
 from app.agent.kernel.conversation_state import historical_user_sources
 from app.agent.kernel.session_state import (
     CandidateSelectionGuard,
@@ -61,7 +62,7 @@ from .model import (
     ModelToolCall,
     ProviderState,
 )
-from .provider_model import ModelProviderError, UncommittableModelTurn
+from .provider_model import ModelProviderError, OpenAICompatibleModelAdapter, UncommittableModelTurn
 from .session_guard import foreground_execution_guard, session_scope_guard
 from .task_state import TaskPatch, task_projection
 
@@ -580,7 +581,10 @@ class AgentTurn:
             })
             return False
         result_state = public_result_state(public_result)
-        if not self.last_user or stopped:
+        if not self.last_user or stopped or (
+            isinstance(self.session.model, OpenAICompatibleModelAdapter)
+            and not await asyncio.to_thread(is_agent_llm_enabled)
+        ):
             await self.publish(AgentEventType.TURN_COMPLETED, {
                 "status": "partial" if not stopped and result_state in {"failed", "warning"} else "success",
                 "answer": format_public_result(public_result),

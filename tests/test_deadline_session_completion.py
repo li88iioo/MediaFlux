@@ -16,6 +16,7 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.session import SessionLimits
 from tests.agent_model_tools_test_harness import request, session_for
 from tests.test_agent_kernel_core import collect, read_tool
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def run_native(batches, *, rounds=6, max_calls=1):
@@ -68,7 +69,7 @@ READ = ("alpha__inspect", {})
 
 
 
-def test_explicit_business_tool_budget_rejects_crossing_batch_atomically():
+def test_explicit_business_tool_budget_rejects_crossing_batch_atomically(agent_llm_enabled):
     seen, executed, events = run_native([[READ, READ]], max_calls=1)
     assert len(seen) == 1 and executed == []
     failed = [e for e in events if e.type is AgentEventType.TOOL_FAILED]

@@ -21,6 +21,7 @@ from tests.test_indexer_service import FakeAdapter
 from tests.test_agent_tool_argument_ingress import Wire
 from tests.test_agent_tool_argument_ingress import offline as offline
 from tests.test_agent_tool_argument_ingress import store as store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 CLAIM = "本轮已响应来源未找到资源；未响应来源不能据此判断。"
 
@@ -40,7 +41,7 @@ def reply(protocol, name=None):
 
 @pytest.mark.parametrize("protocol", ["chat_completions", "responses", "anthropic_messages"])
 @pytest.mark.parametrize("mode", ["all-failed", "mixed", "successful-empty-control"])
-def test_service_failure_is_not_completed(protocol, mode, store):
+def test_service_failure_is_not_completed(agent_llm_enabled, protocol, mode, store):
     async def scenario():
         failed = mode != "successful-empty-control"
         provider = FakeAdapter("nyaa", error=IndexerUnavailable() if failed else None)

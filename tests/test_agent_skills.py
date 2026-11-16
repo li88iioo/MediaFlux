@@ -23,6 +23,7 @@ from app.agent.kernel.references import ReferenceError
 from app.agent.kernel.state_types import StalePublicationError, StateUpdate
 from app.repositories import agent_skills as skills
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_code_sandbox import make_context
 
 
@@ -247,6 +248,7 @@ class AgentSkillsTests(IsolatedDatabaseTestCase):
             self.assertEqual(skills.get_skill(owner=self.owner, name="research"), first)
             self.assertEqual(asyncio.run(store.load(owner=self.owner, session_id="a")).summary, "")
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_continuation_publication_reuses_claim_and_runtime_fence_checks(self):
         from app.agent.feature_gate import RuntimeFenceError, begin_runtime_change, read_runtime_fence
         from tests.test_agent_read_wait_lifecycle import parked_runtime

@@ -21,6 +21,7 @@ from tests.test_agent_parallel_reads import query_tool
 from tests.test_agent_tool_argument_ingress import Wire
 from tests.test_agent_tool_argument_ingress import offline as offline
 from tests.test_agent_tool_argument_ingress import store as store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 TRANSPORTS = [(protocol, mode) for protocol in ("chat_completions", "responses")
               for mode in ("json", "sse")]
@@ -114,7 +115,7 @@ def assert_rejected(result):
 
 @pytest.mark.parametrize("protocol,mode", TRANSPORTS)
 @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
-def test_http_duplicate_ids_reject_entire_batch_before_execution(protocol, mode, parallel, store):
+def test_http_duplicate_ids_reject_entire_batch_before_execution(agent_llm_enabled, protocol, mode, parallel, store):
     async def scenario():
         calls = [ModelToolCall("repeated", "library__lookup", {"query": value})
                  for value in ("first", "second")]
@@ -138,7 +139,7 @@ def test_custom_adapter_cannot_bypass_batch_identity_admission(identity, store):
 
 
 @pytest.mark.parametrize("write_first", [False, True])
-def test_mixed_write_batch_has_no_preview_ticket_or_read_on_duplicate_id(write_first, store):
+def test_mixed_write_batch_has_no_preview_ticket_or_read_on_duplicate_id(agent_llm_enabled, write_first, store):
     async def scenario():
         calls = [ModelToolCall("same", "library__lookup", {"query": "first"}),
                  ModelToolCall("same", "files__change", {})]
@@ -152,7 +153,7 @@ def test_mixed_write_batch_has_no_preview_ticket_or_read_on_duplicate_id(write_f
 
 
 @pytest.mark.parametrize("protocol,mode", TRANSPORTS)
-def test_valid_http_batch_retains_native_identity_and_results(protocol, mode, store):
+def test_valid_http_batch_retains_native_identity_and_results(agent_llm_enabled, protocol, mode, store):
     async def scenario():
         ids = ["调用-é-😀", "second"]
         calls = [ModelToolCall(cid, "library__lookup", {"query": value})

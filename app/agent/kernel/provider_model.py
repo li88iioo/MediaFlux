@@ -11,6 +11,8 @@ from typing import Any, Literal, NoReturn
 
 import httpx
 
+from app.agent.errors import ToolPipelineError
+from app.agent.feature_gate import is_agent_llm_enabled
 from app.agent.model_catalog import provider_channel_fingerprint
 from app.agent.model_context_budget import conservative_tokens
 from app.clients.http import FixedHostHttpClient
@@ -891,6 +893,8 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                             phase = "retry_wait"
                             await asyncio.sleep(_MODEL_RETRY_DELAY_SECONDS)
                         cancellation.raise_if_cancelled()
+                        if not await asyncio.to_thread(is_agent_llm_enabled):
+                            raise ToolPipelineError("Agent 模型已关闭", code="model_disabled")
                         phase = "request"
                         http_status = None
                         last_fault = None

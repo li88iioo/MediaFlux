@@ -26,6 +26,8 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import public_conversation_messages
 from tests.test_agent_kernel_core import read_tool
 from tests.test_agent_kernel_provider_model import chunks
+import pytest
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 THINKING = "private-thought-do-not-publish"
 SIGNATURE = "signature/opaque+unchanged=="
@@ -128,6 +130,7 @@ class WireClient:
         pass
 
 
+@pytest.mark.usefixtures("agent_llm_enabled")
 class ProviderStateSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()

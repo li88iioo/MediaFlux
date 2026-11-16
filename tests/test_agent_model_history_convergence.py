@@ -26,6 +26,7 @@ from tests.support import isolated_test_database
 from tests.test_agent_kernel_core import read_tool
 from tests.test_agent_provider_state import REDACTED, THINKING, WireClient
 from tests.test_cancelled_read_inline import sqlite_store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize("count", [12, 13, 25])
@@ -154,7 +155,7 @@ def test_id_without_order_and_without_original_row_stays_unknown():
     assert type(memory["requests"][1]["history_order"]) is int
 
 
-def test_model_request_keeps_original_event_order_after_collision_then_budget_eviction():
+def test_model_request_keeps_original_event_order_after_collision_then_budget_eviction(agent_llm_enabled):
     async def run():
         def answer(text):
             return {"status": "completed", "output": [{"type": "message", "role": "assistant",

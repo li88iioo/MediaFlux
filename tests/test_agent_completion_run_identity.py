@@ -50,6 +50,8 @@ from app.modules.scraper import MatchResult, TMDBScraper
 from tests.support import isolated_test_database
 from tests.test_agent_task_first_slice import NativeScript
 from tests.test_local_media_service import FakeScraper
+import pytest
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 class CompletionScript(NativeScript):
     def __init__(self, calls):
@@ -431,21 +433,25 @@ async def assert_local_file_outcome(root: Path, mode: str):
 
 
 class AgentCompletionIdentityTests(unittest.TestCase):
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_strm_failed_run_survives_later_runs_and_cold_receipt(self):
         for later_count, later_source in ((0, "a"), (19, "a"), (20, "a"), (20, "b")):
             with self.subTest(later_count=later_count, later_source=later_source):
                 asyncio.run(assert_strm_identity(later_count, later_source))
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_patrol_cycle_is_exact_when_same_second_or_overwritten(self):
         for case in ("same-second", "separate-second", "overwritten-cycle"):
             with self.subTest(case=case):
                 asyncio.run(assert_patrol_identity(case))
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_patrol_completion_reports_business_outcome(self):
         for status in ("not_configured", "unavailable", "failed", "inconclusive", "up_to_date", "updates_available"):
             with self.subTest(status=status):
                 asyncio.run(assert_patrol_outcome(status))
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_organize_result_survives_process_restart_and_history_eviction(self):
         for status, later_count in (("failed", 0), ("completed", 0), ("failed", 33)):
             with self.subTest(status=status, later_count=later_count):
@@ -477,6 +483,7 @@ class AgentCompletionIdentityTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.data["task"]["status"], "failed")
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_local_preview_and_actual_move_receipts_match_real_files(self):
         for mode in ("preview_only", "move"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:

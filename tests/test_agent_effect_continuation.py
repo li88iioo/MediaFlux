@@ -24,6 +24,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolContext, ToolResult
 from app.modules import organize_tasks
 from app.repositories import organize_operation_jobs as jobs
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import initialized_web_runtime, isolated_test_database
 from tests.test_agent_effect_admission import (
     _domain_arguments,
@@ -142,7 +143,7 @@ async def _ready_case(tmp_path, *, channel='web', route=None, fail_write=False, 
         yield cold, candidates[0], client, reads, stack, source_users
 
 
-def test_native_effect_wait_resumes_original_cloud_goal_without_a_synthetic_user(tmp_path):
+def test_native_effect_wait_resumes_original_cloud_goal_without_a_synthetic_user(agent_llm_enabled, tmp_path):
     async def run():
         async with _ready_case(tmp_path) as (cold, candidate, client, reads, stack, source_users):
             follow = FollowScript(resume=True)
@@ -177,7 +178,7 @@ class NextWriteScript(FollowScript):
         }]}, 'finish_reason': 'tool_calls'}]})
 
 
-def test_new_implicit_plan_after_completion_requires_fresh_confirmation(tmp_path):
+def test_new_implicit_plan_after_completion_requires_fresh_confirmation(agent_llm_enabled, tmp_path):
     async def run():
         async with _ready_case(tmp_path) as (store, candidate, client, reads, stack, source_users):
             script = NextWriteScript()
@@ -197,7 +198,7 @@ def test_new_implicit_plan_after_completion_requires_fresh_confirmation(tmp_path
     asyncio.run(run())
 
 
-def test_deleted_session_is_not_resurrected_by_old_scan(tmp_path):
+def test_deleted_session_is_not_resurrected_by_old_scan(agent_llm_enabled, tmp_path):
     async def run():
         async with _ready_case(tmp_path) as (store, candidate, *_):
             assert await store.delete_session(owner=OWNER, session_id=SID)
@@ -208,7 +209,7 @@ def test_deleted_session_is_not_resurrected_by_old_scan(tmp_path):
 
 
 @pytest.mark.parametrize("request_identity", ["new", "source"])
-def test_active_new_turn_defers_original_goal_instead_of_overwriting_it(tmp_path, request_identity):
+def test_active_new_turn_defers_original_goal_instead_of_overwriting_it(agent_llm_enabled, tmp_path, request_identity):
     async def run():
         from app.agent.kernel.model import ModelEvent, ModelEventType
 
@@ -250,7 +251,7 @@ def test_active_new_turn_defers_original_goal_instead_of_overwriting_it(tmp_path
 
 
 @pytest.mark.parametrize('mutation', ['binding', 'origin', 'expired'])
-def test_retired_or_corrupt_original_goal_never_calls_model(tmp_path, mutation):
+def test_retired_or_corrupt_original_goal_never_calls_model(agent_llm_enabled, tmp_path, mutation):
     async def run():
         async with _ready_case(tmp_path) as (store, candidate, client, reads, stack, _users):
             if mutation == 'binding':
@@ -270,7 +271,7 @@ def test_retired_or_corrupt_original_goal_never_calls_model(tmp_path, mutation):
     asyncio.run(run())
 
 
-def test_competing_claims_and_superseding_user_revoke_old_lease(tmp_path):
+def test_competing_claims_and_superseding_user_revoke_old_lease(agent_llm_enabled, tmp_path):
     async def run():
         from app.agent.kernel.state_types import _PublicationFinished
         async with _ready_case(tmp_path) as (store, candidate, *_):
@@ -287,7 +288,7 @@ def test_competing_claims_and_superseding_user_revoke_old_lease(tmp_path):
     asyncio.run(run())
 
 
-def test_model_budget_is_durable_across_worker_restart(tmp_path):
+def test_model_budget_is_durable_across_worker_restart(agent_llm_enabled, tmp_path):
     async def run():
         from app.agent.kernel.continuation import _ContinuationAction
         script = FollowScript()
@@ -323,7 +324,7 @@ def test_model_budget_is_durable_across_worker_restart(tmp_path):
     asyncio.run(run())
 
 
-def test_expired_running_lease_can_resume_without_replaying_confirmed_write(tmp_path):
+def test_expired_running_lease_can_resume_without_replaying_confirmed_write(agent_llm_enabled, tmp_path):
     async def run():
         from app.agent.kernel.continuation import (
             CLAIM_SECONDS,
@@ -353,7 +354,7 @@ def test_expired_running_lease_can_resume_without_replaying_confirmed_write(tmp_
     asyncio.run(run())
 
 
-def test_background_tg_terminal_persists_native_view_for_delivery_before_stream_ends(tmp_path):
+def test_background_tg_terminal_persists_native_view_for_delivery_before_stream_ends(agent_llm_enabled, tmp_path):
     async def run():
         route = {'chat_id': '12345', 'message_thread_id': 17}
         async with _ready_case(tmp_path, channel='telegram', route=route) as (store, candidate, client, reads, stack, _users):
@@ -370,7 +371,7 @@ def test_background_tg_terminal_persists_native_view_for_delivery_before_stream_
     asyncio.run(run())
 
 
-def test_new_tg_approval_is_durable_without_executing_it(tmp_path):
+def test_new_tg_approval_is_durable_without_executing_it(agent_llm_enabled, tmp_path):
     async def run():
         async with _ready_case(tmp_path, channel='telegram', route={'chat_id': '12345'}) as (store, candidate, client, reads, stack, _users):
             session = _session(store, NextWriteScript(), client, reads, stack=stack)
@@ -387,7 +388,7 @@ def test_new_tg_approval_is_durable_without_executing_it(tmp_path):
     asyncio.run(run())
 
 
-def test_failed_prior_effect_requires_read_before_new_write_prepare(tmp_path):
+def test_failed_prior_effect_requires_read_before_new_write_prepare(agent_llm_enabled, tmp_path):
     async def run():
         async with _ready_case(tmp_path, fail_write=True) as (store, candidate, client, reads, stack, _users):
             state = await store.load(owner=OWNER, session_id=SID)
@@ -414,7 +415,7 @@ def test_failed_prior_effect_requires_read_before_new_write_prepare(tmp_path):
 
 
 @pytest.mark.parametrize("fail_write", [False, True])
-def test_foreground_completion_consumes_same_goal_without_background_double_run(tmp_path, fail_write):
+def test_foreground_completion_consumes_same_goal_without_background_double_run(agent_llm_enabled, tmp_path, fail_write):
     class RefusingClient(_OfflineClient):
         def rename(self, *_args, **_kwargs):
             raise RuntimeError("offline provider rejected rename")
@@ -445,7 +446,7 @@ def test_foreground_completion_consumes_same_goal_without_background_double_run(
     asyncio.run(run())
 
 
-def test_local_read_quota_parks_effect_followup_without_asking_user_again(tmp_path):
+def test_local_read_quota_parks_effect_followup_without_asking_user_again(agent_llm_enabled, tmp_path):
     async def run():
         from app.agent.errors import ToolRateLimitError
         from app.agent.rate_limit import RateLimitDecision
@@ -474,7 +475,7 @@ def test_local_read_quota_parks_effect_followup_without_asking_user_again(tmp_pa
     asyncio.run(run())
 
 
-def test_real_outbox_handoff_survives_crash_before_delivery_ack_without_new_model(tmp_path):
+def test_real_outbox_handoff_survives_crash_before_delivery_ack_without_new_model(agent_llm_enabled, tmp_path):
     async def run():
         from app.agent.kernel.continuation import deliver_continuation_result
         from app.bot.agent_adapter import (
@@ -555,7 +556,7 @@ def test_slow_continuation_does_not_block_receipts_or_start_a_second_worker():
 
 
 @pytest.mark.parametrize('batch_size', [1, 2])
-def test_new_user_read_uses_native_batch_position_after_old_receipt_merge(tmp_path, batch_size):
+def test_new_user_read_uses_native_batch_position_after_old_receipt_merge(agent_llm_enabled, tmp_path, batch_size):
     class NewReadScript(FollowScript):
         def __init__(self):
             super().__init__()

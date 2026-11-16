@@ -8,12 +8,14 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_ux_shell_browser import AgentShellBrowserCase
 from tests.test_pending_explanation_transports import NativeRuntime, api_client
 
 
 class PendingExplanationBrowserTests(AgentShellBrowserCase):
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_real_click_sqlite_cold_same_card_confirm(self):
         with (
             isolated_test_database("explain-browser.db") as database_path,

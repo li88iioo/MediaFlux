@@ -19,6 +19,7 @@ from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.session_guard import continuation_execution_guard
 from app.agent.kernel.state_types import AgentInput, SessionBusyError
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_confirmation_edit import OWNER, SESSION, EditRig
 from tests.test_agent_kernel_core import collect
 from tests.test_agent_recovered_progress import reply
@@ -79,7 +80,7 @@ async def manage(session, rig, plan_id, operation):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("operation", ["edit", "grant"])
-def test_cold_management_rejects_live_direct_confirmation_tail_without_losing_card(rig, protocol, operation):
+def test_cold_management_rejects_live_direct_confirmation_tail_without_losing_card(agent_llm_enabled, rig, protocol, operation):
     async def run():
         wire = Wire(protocol, [native_call(protocol, rig, "A"), native_call(protocol, rig, "B", index=1)])
         journal = PausedJournal(rig.store, E.EFFECT_APPROVAL_REQUIRED)
@@ -117,7 +118,7 @@ def test_cold_management_rejects_live_direct_confirmation_tail_without_losing_ca
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_scoped_confirmation_keeps_ordinary_foreground_live_and_revoke_available(rig, protocol):
+def test_scoped_confirmation_keeps_ordinary_foreground_live_and_revoke_available(agent_llm_enabled, rig, protocol):
     async def run():
         initial_wire = Wire(protocol, [native_call(protocol, rig, "A")])
         source = native_session(rig, initial_wire)
@@ -160,7 +161,7 @@ def test_scoped_confirmation_keeps_ordinary_foreground_live_and_revoke_available
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("cold", [False, True], ids=["same-runtime", "cold-runtime"])
 @pytest.mark.parametrize("origin", ["ordinary", "confirmation"])
-def test_published_next_card_can_be_confirmed_before_previous_executor_finally(rig, protocol, cold, origin):
+def test_published_next_card_can_be_confirmed_before_previous_executor_finally(agent_llm_enabled, rig, protocol, cold, origin):
     async def run():
         replies = [native_call(protocol, rig, "A")]
         if origin == "confirmation":
@@ -202,7 +203,7 @@ def test_published_next_card_can_be_confirmed_before_previous_executor_finally(r
 
 
 @pytest.mark.parametrize("operation", ["edit", "grant"])
-def test_management_holds_idle_check_and_actual_mutation_against_new_turn_and_continuation(rig, operation):
+def test_management_holds_idle_check_and_actual_mutation_against_new_turn_and_continuation(agent_llm_enabled, rig, operation):
     async def run():
         first_wire = Wire("chat_completions", [native_call("chat_completions", rig, "B")])
         source = native_session(rig, first_wire)
@@ -242,7 +243,7 @@ def test_management_holds_idle_check_and_actual_mutation_against_new_turn_and_co
 
 
 @pytest.mark.parametrize("cold", [False, True], ids=["same-runtime", "cold-runtime"])
-def test_native_resume_next_card_can_be_confirmed_before_previous_continuation_finally(tmp_path, cold):
+def test_native_resume_next_card_can_be_confirmed_before_previous_continuation_finally(agent_llm_enabled, tmp_path, cold):
     from tests.test_agent_effect_continuation import (
         OWNER,
         SID,

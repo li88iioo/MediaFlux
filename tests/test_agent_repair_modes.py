@@ -19,6 +19,7 @@ from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import Wire
 from tests.test_agent_tool_argument_ingress import offline as offline
 from tests.test_agent_tool_argument_ingress import store as store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 _PROTOCOL = 'anthropic_messages'
 _OWNER = 'repair-modes-owner'
@@ -81,7 +82,7 @@ def _write_catalog(previews, writes, *, schema=None, authorize=None, effect=Tool
         prepare=prepare, execute_confirmed=write)])
 
 
-def test_ordinary_read_max_properties_modes_are_independent_without_name_exception(store):
+def test_ordinary_read_max_properties_modes_are_independent_without_name_exception(agent_llm_enabled, store):
     async def run():
         executed = []
         schema: dict[str, Any] = {'type': 'object', 'maxProperties': 1, 'additionalProperties': False, 'properties': {
@@ -100,7 +101,7 @@ def test_ordinary_read_max_properties_modes_are_independent_without_name_excepti
 
 @pytest.mark.parametrize('corrected', [{'id': 'A', 'limit': 3}, {'id': 'B'}],
                          ids=['drop-optional', 'change-required-selector'])
-def test_read_can_change_selector_and_drop_optional_filter(corrected, store):
+def test_read_can_change_selector_and_drop_optional_filter(agent_llm_enabled, corrected, store):
     async def run():
         executed = []
         catalog = _read_catalog(_IDENTITY_SCHEMA, executed)
@@ -117,7 +118,7 @@ def test_read_can_change_selector_and_drop_optional_filter(corrected, store):
 
 @pytest.mark.parametrize('effect', [ToolEffect.WRITE, ToolEffect.DANGER])
 @pytest.mark.parametrize('period', ['invalid', False, 0, []], ids=['string', 'false', 'zero', 'empty-list'])
-def test_invalid_optional_period_can_be_omitted_but_only_creates_preview(period, effect, store):
+def test_invalid_optional_period_can_be_omitted_but_only_creates_preview(agent_llm_enabled, period, effect, store):
     async def run():
         previews, writes = [], []
         catalog = _write_catalog(previews, writes, effect=effect)
@@ -136,7 +137,7 @@ def test_invalid_optional_period_can_be_omitted_but_only_creates_preview(period,
 
 @pytest.mark.parametrize('composition', ['not', 'oneOf'])
 @pytest.mark.parametrize('replacement', [{}, {'period': 60}], ids=['drop-both', 'keep-one'])
-def test_direct_write_retry_uses_current_mutual_exclusion_schema(composition, replacement, store):
+def test_direct_write_retry_uses_current_mutual_exclusion_schema(agent_llm_enabled, composition, replacement, store):
     async def run():
         previews, writes = [], []
         schema: dict[str, Any] = deepcopy(_WRITE_SCHEMA)
@@ -162,7 +163,7 @@ def test_direct_write_retry_uses_current_mutual_exclusion_schema(composition, re
 
 
 @pytest.mark.parametrize('effect', [ToolEffect.WRITE, ToolEffect.DANGER])
-def test_direct_retry_does_not_bypass_revoked_write_permission(store, effect):
+def test_direct_retry_does_not_bypass_revoked_write_permission(agent_llm_enabled, store, effect):
     async def run():
         previews, writes = [], []
         allowed = [True]
@@ -193,7 +194,7 @@ def test_direct_retry_does_not_bypass_revoked_write_permission(store, effect):
 
 
 @pytest.mark.parametrize('shape', ['multiple-modes', 'single-filter-property'])
-def test_empty_read_retry_uses_current_schema_not_old_fields(shape, store):
+def test_empty_read_retry_uses_current_schema_not_old_fields(agent_llm_enabled, shape, store):
     async def run():
         executed = []
         if shape == 'multiple-modes':

@@ -12,6 +12,7 @@ from app.agent.kernel.provider_model import (
 )
 from app.agent.kernel.state_types import CancellationToken
 from tests import test_deadline_budget as support
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_generation_profiles import BASE, Wire
 from tests.test_deadline_budget import publish, row, turn
 
@@ -21,7 +22,7 @@ local_config = support.local_config
 
 
 @pytest.mark.parametrize('protocol', ['chat_completions', 'responses', 'anthropic_messages'])
-def test_final_native_body_rejected_before_http(protocol):
+def test_final_native_body_rejected_before_http(agent_llm_enabled, protocol):
     wire = Wire()
     settings = ProviderSettings(api_url=BASE, model='small', protocol=protocol,
         budget_profiles_json=json.dumps([row('small', context=1024, output=127)]))

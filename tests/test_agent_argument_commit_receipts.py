@@ -11,6 +11,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.projection import ToolOutcome
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import StateUpdate
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_capacity_recovery import (
     OWNER,
@@ -34,7 +35,7 @@ def ids(state):
 @pytest.mark.parametrize('protocol',PROTOCOLS)
 @pytest.mark.parametrize('mode',['commit_boundary','callback','state_updates'])
 @pytest.mark.parametrize('pressure',[False,True])
-def test_receipt_merge_preserves_executed_call_group(protocol,mode,pressure,store_kind):
+def test_receipt_merge_preserves_executed_call_group(agent_llm_enabled, protocol,mode,pressure,store_kind):
     async def exercise():
         calls=[(f'work-{i}','inspect_args',{'literal':chr(65+i)*31000,'ordinal':i}) for i in range(5)]
         receipts={f'legal-plan-{i}':{'state':'terminal','delivered':False,'receipt_message':{

@@ -15,6 +15,7 @@ from tests.test_agent_argument_fidelity import declaration, text_reply
 from tests.test_agent_capacity_recovery import (
     PROTOCOLS, assert_native_wire, batch, collect, make_wire, reopened, session,
 )
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def nested(value: object, depth: int, *, lists: bool = False) -> object:
@@ -26,7 +27,7 @@ def nested(value: object, depth: int, *, lists: bool = False) -> object:
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("shape", ["original", "mixed", "private", "depth-limit"])
-def test_deep_arguments_survive_started_cold_and_next_wire(protocol, shape):
+def test_deep_arguments_survive_started_cold_and_next_wire(agent_llm_enabled, protocol, shape):
     async def exercise():
         leaf: dict[str, Any] = {"must_match": ["动画"], "exclude_played": True}
         expected_leaf = deepcopy(leaf)
@@ -78,7 +79,7 @@ def test_deep_arguments_survive_started_cold_and_next_wire(protocol, shape):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_excessive_depth_rejected_before_handler(protocol):
+def test_excessive_depth_rejected_before_handler(agent_llm_enabled, protocol):
     async def exercise():
         handled = []
         args = nested({"must_match": ["动画"]}, 80)

@@ -9,6 +9,7 @@ from app import database as db
 from app.agent.errors import ToolRateLimitError
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.rate_limit import RateLimitDecision
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_read_wait_contract_repair import resumed
 from tests.test_agent_read_wait_lifecycle import (
     GOAL,
@@ -21,7 +22,7 @@ from tests.test_agent_read_wait_lifecycle import (
 
 
 @pytest.mark.parametrize('mode', ['stale_resume', 'stale_effect_cleanup', 'stale_binding_control', 'fresh_control'])
-def test_same_wait_id_repark_preserves_current_authority(mode, tmp_path):
+def test_same_wait_id_repark_preserves_current_authority(agent_llm_enabled, mode, tmp_path):
     async def run():
         clock = [100]
         _, stale = await parked_runtime(clock)

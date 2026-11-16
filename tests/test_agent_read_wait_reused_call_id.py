@@ -16,6 +16,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.agent.rate_limit import RateLimitDecision
 from tests.agent_task_native_helpers import task_call
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import isolated_database as isolated_database
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
@@ -60,7 +61,7 @@ def read_results(conversation):
 
 
 @pytest.mark.parametrize("repeated", [False, True], ids=["unique-ids", "reused-id"])
-def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(repeated):
+def test_cross_round_read_id_parks_and_cold_resume_uses_original_second_query(agent_llm_enabled, repeated):
     async def run():
         db.init_db()
         initialize_runtime_fence()

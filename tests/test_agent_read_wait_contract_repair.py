@@ -32,6 +32,7 @@ from tests.test_agent_read_wait_lifecycle import (
 from tests.test_agent_read_wait_lifecycle import (
     isolated_database as isolated_database,
 )
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def resumed(clock, script=None):
@@ -51,7 +52,7 @@ def resumed(clock, script=None):
 
 
 @pytest.mark.parametrize('limit', [3, 4])
-def test_tool_budget_precedes_model_without_precharging(limit):
+def test_tool_budget_precedes_model_without_precharging(agent_llm_enabled, limit):
     async def run():
         clock = [100]
         _, candidate = await parked_runtime(clock)
@@ -88,7 +89,7 @@ def test_tool_budget_precedes_model_without_precharging(limit):
 
 
 @pytest.mark.parametrize('changed', [False, True])
-def test_telegram_issued_model_policy_is_not_rerouted(changed):
+def test_telegram_issued_model_policy_is_not_rerouted(agent_llm_enabled, changed):
     from app.modules import telegram_model_preferences as prefs
 
     async def run():
@@ -129,7 +130,7 @@ def test_telegram_issued_model_policy_is_not_rerouted(changed):
     asyncio.run(run())
 
 
-def test_scheduler_retires_revoked_epoch_without_factory():
+def test_scheduler_retires_revoked_epoch_without_factory(agent_llm_enabled):
     clock = [100]
     asyncio.run(parked_runtime(clock))
     with db.get_conn() as conn:
@@ -156,7 +157,7 @@ def test_scheduler_retires_revoked_epoch_without_factory():
 
 
 @pytest.mark.parametrize('missing', [False, True, 'nonunique'])
-def test_history_anchor_validation_is_durable(missing):
+def test_history_anchor_validation_is_durable(agent_llm_enabled, missing):
     async def run():
         clock = [100]
         runtime, candidate = await parked_runtime(clock)
@@ -181,7 +182,7 @@ def test_history_anchor_validation_is_durable(missing):
 
 
 @pytest.mark.parametrize('winner', ['cancel', 'task', 'new_wait'])
-def test_stale_cleanup_preserves_newer_authority(winner):
+def test_stale_cleanup_preserves_newer_authority(agent_llm_enabled, winner):
     from app.agent.kernel.task_state import TaskPatch, identity
 
     async def run():

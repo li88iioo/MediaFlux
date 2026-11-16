@@ -21,11 +21,12 @@ from tests.test_agent_read_wait_lifecycle import (
 from tests.test_agent_read_wait_lifecycle import (
     isolated_database as isolated_database,
 )
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize("phase", ["before_append", "after_append", "not_cancelled"])
 @pytest.mark.parametrize("terminal", ["turn.failed", "turn.completed"])
-def test_cold_cancel_blocks_late_terminal_failure(phase, terminal):
+def test_cold_cancel_blocks_late_terminal_failure(agent_llm_enabled, phase, terminal):
     async def run():
         clock = [100]
         _, candidate = await parked_runtime(clock)

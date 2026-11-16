@@ -17,6 +17,7 @@ from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput, CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests.test_agent_tool_argument_ingress import Wire, encode, wire
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def array_schema():
@@ -114,7 +115,7 @@ def test_existing_item_error_order_and_fitting_capacity_are_unchanged():
     assert asyncio.run(execute(schema, {"values": values}, [])).arguments == {"values": values}
 
 
-def test_native_invalid_array_direct_retry_keeps_valid_parameters():
+def test_native_invalid_array_direct_retry_keeps_valid_parameters(agent_llm_enabled):
     async def run():
         executed = []
         tool = KernelToolSpec(name="lookup", domain="library", description="offline schema contract",

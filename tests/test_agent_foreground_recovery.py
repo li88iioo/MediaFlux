@@ -25,6 +25,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
 from tests import test_agent_effect_continuation as cases
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_effect_admission import _offline_runtime, _OfflineClient
 
@@ -78,7 +79,7 @@ class _ResumeScript(cases.FollowScript):
 
 
 @pytest.mark.parametrize('termination', ['kill', 'exit', 'finish'])
-def test_cold_scheduler_recovers_after_foreground_exit_without_replaying_write(tmp_path, termination):
+def test_cold_scheduler_recovers_after_foreground_exit_without_replaying_write(agent_llm_enabled, tmp_path, termination):
     async def run():
         writes = []
         rename = cases._OfflineClient.rename

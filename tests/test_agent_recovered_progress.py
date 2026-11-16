@@ -18,6 +18,7 @@ from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state_types import AgentInput
 from app.agent.public_view import format_partial_progress, public_conversation_messages
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 A, B, C = "library.search", "library.health", "library.inspect"
 X = {"ref": "object-x", "scope": "owner-a"}
@@ -145,7 +146,7 @@ def unfinished(answer):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_recovered_request_not_unfinished_in_public_or_reopened_sqlite(store, protocol):
+def test_recovered_request_not_unfinished_in_public_or_reopened_sqlite(agent_llm_enabled, store, protocol):
     steps = [(A, X, "rate_limited"), (C, Z, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, saved, wire, _ = asyncio.run(run_scenario(store, steps, protocol=protocol))
     assert final["status"] == "partial"
@@ -160,7 +161,7 @@ def test_recovered_request_not_unfinished_in_public_or_reopened_sqlite(store, pr
 @pytest.mark.parametrize("case", [
     "single", "all", "repeated", "reordered", "empty-same", "unrelated", "other-ref", "other-scope", "empty-switched",
 ])
-def test_existing_identity_recovery_controls(store, case):
+def test_existing_identity_recovery_controls(agent_llm_enabled, store, case):
     steps = [(A, X, "rate_limited"), (B, {}, None)]
     if case == "single":
         steps = [(A, X, "rate_limited"), (A, X, None)]
@@ -191,7 +192,7 @@ def test_existing_identity_recovery_controls(store, case):
     ("tool-empty", "tool_budget_exceeded"), ("round-blocked", "tool_budget_exceeded"),
 ])
 @pytest.mark.parametrize("unresolved", [False, True])
-def test_fallback_entries_prioritize_current_errors_over_budget_status(store, ending, reason, unresolved):
+def test_fallback_entries_prioritize_current_errors_over_budget_status(agent_llm_enabled, store, ending, reason, unresolved):
     steps = [(A, X, "rate_limited")]
     if unresolved:
         steps.append((C, Z, "provider_timeout"))
@@ -207,7 +208,7 @@ def test_fallback_entries_prioritize_current_errors_over_budget_status(store, en
 
 
 @pytest.mark.parametrize("recover_between", [False, True])
-def test_repeated_failure_uses_latest_message_and_ledger_order(store, recover_between):
+def test_repeated_failure_uses_latest_message_and_ledger_order(agent_llm_enabled, store, recover_between):
     steps = [(A, X, "rate_limited"), (C, Z, "provider_timeout"), (B, {}, None)]
     if recover_between:
         steps.append((A, X, None))
@@ -226,7 +227,7 @@ def test_repeated_failure_uses_latest_message_and_ledger_order(store, recover_be
 
 
 @pytest.mark.parametrize("other", [{**X, "ref": "object-y"}, {**X, "scope": "owner-b"}])
-def test_identical_summaries_do_not_infer_recovery_for_another_identity(store, other):
+def test_identical_summaries_do_not_infer_recovery_for_another_identity(agent_llm_enabled, store, other):
     steps = [(A, X, "rate_limited"), (A, other, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, _, wire, _ = asyncio.run(run_scenario(store, steps, ending="round-empty", summaries={0: "对象检查未完成", 1: "对象检查未完成"}))
     assert final["status"] == "partial"
@@ -236,7 +237,7 @@ def test_identical_summaries_do_not_infer_recovery_for_another_identity(store, o
 
 
 @pytest.mark.parametrize("ok", [False, True])
-def test_returned_rate_limit_is_covered_by_existing_ledger(store, ok):
+def test_returned_rate_limit_is_covered_by_existing_ledger(agent_llm_enabled, store, ok):
     steps = [(A, X, {"ok": ok, "status": "rate_limited", "summary": "旧限制"}),
              (C, Z, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, _, _, _ = asyncio.run(run_scenario(store, steps, ending="round-empty"))
@@ -247,7 +248,7 @@ def test_returned_rate_limit_is_covered_by_existing_ledger(store, ok):
 
 
 @pytest.mark.parametrize("status", ["failed", "error", "not_found"])
-def test_failed_public_results_without_ledger_entry_remain_visible(store, status):
+def test_failed_public_results_without_ledger_entry_remain_visible(agent_llm_enabled, store, status):
     # 真实中断仍展示尚未恢复的公开失败，不丢失原始 DTO。
     steps = [(A, X, "rate_limited"), (C, Z, {"ok": False, "status": status, "summary": "历史公开失败"}),
              (B, {}, None), (A, X, None)]
@@ -261,7 +262,7 @@ def test_failed_public_results_without_ledger_entry_remain_visible(store, status
     "检查不可用 library.search provider_state", "检查不可用 /srv/private/error",
     "检查不可用 access_token=SYNTHETICSECRETVALUE",
 ])
-def test_current_error_redaction_and_parameter_identity_never_escape_to_answers(store, error_text):
+def test_current_error_redaction_and_parameter_identity_never_escape_to_answers(agent_llm_enabled, store, error_text):
     private_args = {"ref": "object-z", "scope": "PRIVATEIDENTITY", "absolute_path": "/srv/private/identity"}
     steps = [(A, X, "rate_limited"), (C, private_args, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, saved, _, events = asyncio.run(run_scenario(
@@ -288,7 +289,7 @@ def test_current_error_redaction_and_parameter_identity_never_escape_to_answers(
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_projection_leaves_native_tool_state_intact_and_private(store, protocol):
+def test_projection_leaves_native_tool_state_intact_and_private(agent_llm_enabled, store, protocol):
     steps = [(A, X, "rate_limited"), (C, Z, "provider_timeout"), (B, {}, None), (A, X, None)]
     final, saved, wire, events = asyncio.run(run_scenario(store, steps, protocol=protocol, private=True))
     assert final["status"] == "partial"
@@ -331,7 +332,7 @@ def test_formatter_without_current_errors_keeps_historical_contract(options):
 @pytest.mark.parametrize("receipt_status,ending", [
     ("submitted", "answer"), ("success", "answer"), ("success", "model-fault"), ("submitted", "round-empty"),
 ])
-def test_confirmed_history_is_not_filtered_or_replayed(store, receipt_status, ending):
+def test_confirmed_history_is_not_filtered_or_replayed(agent_llm_enabled, store, receipt_status, ending):
     async def run():
         executed = []
         attempts = []

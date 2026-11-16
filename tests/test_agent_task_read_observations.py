@@ -31,6 +31,7 @@ from tests.test_agent_task_cas import command, observe
 from tests.test_agent_task_cas import task_store as isolated_store
 from tests.test_agent_task_first_slice import OWNER, declaration, configuration_call
 from tests.test_agent_tool_argument_ingress import Wire
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 GOAL = "观察 TMDB 配置，读取 Jellyfin 库名和类型；仅观察、不修改。"
 TOOL = "fixture.library_read"
@@ -415,7 +416,7 @@ def test_forty_read_observations_are_count_and_byte_bounded_preserving_linked_re
 
 
 @pytest.mark.parametrize("tracked", [False, True])
-def test_short_model_data_survives_task_receipt_through_native_wire_and_cold_sqlite(task_store, tracked):
+def test_short_model_data_survives_task_receipt_through_native_wire_and_cold_sqlite(agent_llm_enabled, task_store, tracked):
     async def run():
         if tracked:
             await seed(task_store, declared())

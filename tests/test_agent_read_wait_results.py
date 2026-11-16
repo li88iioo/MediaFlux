@@ -18,6 +18,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.kernel.task_state import identity
 from app.agent.rate_limit import RateLimitDecision
 from tests.agent_task_native_helpers import task_call
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_read_wait_lifecycle import build_wait_runtime
 from tests.test_agent_read_wait_lifecycle import isolated_database as isolated_database
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript, declaration
@@ -79,7 +80,7 @@ async def park(clock, tool):
 
 
 @pytest.mark.parametrize('mode', ['observation', 'plain', 'handler_failure', 'observation_failure', 'invalid_observation', 'handler_rate_limited'])
-def test_resumed_read_result_branches(mode, tmp_path):
+def test_resumed_read_result_branches(agent_llm_enabled, mode, tmp_path):
     async def run():
         clock = [100]
         observing = mode in {'observation', 'observation_failure', 'invalid_observation'}
@@ -150,7 +151,7 @@ def test_resumed_read_result_branches(mode, tmp_path):
 
 
 @pytest.mark.parametrize('tool_name', ['fixture.lookup', 'fixture.configuration'])
-def test_foreground_error_still_allows_model_repair(tool_name):
+def test_foreground_error_still_allows_model_repair(agent_llm_enabled, tool_name):
     async def run():
         clock = [100]
         await park(clock, tool_name)
@@ -178,7 +179,7 @@ def test_foreground_error_still_allows_model_repair(tool_name):
     asyncio.run(run())
 
 
-def test_interrupted_synthesis_does_not_repeat_completed_resumed_read():
+def test_interrupted_synthesis_does_not_repeat_completed_resumed_read(agent_llm_enabled):
     async def run():
         clock = [100]
         candidate, parked = await park(clock, 'fixture.lookup')

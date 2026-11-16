@@ -19,6 +19,7 @@ from app.agent.kernel.state_types import AgentInput
 from app.agent.kernel.task_state import task_projection
 from app.routes import agent_api
 from tests.agent_task_native_helpers import returned_task, task_call
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import authenticated_session
 from tests.test_agent_task_first_slice import OWNER, NativeScript, configuration_call
 
@@ -279,7 +280,7 @@ def test_task_data_section_requires_unique_marker_and_exact_guidance():
         _task_data_section(marker + guidance, guidance)
 
 
-def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
+def test_query_create_typed_evidence_prune_cold_resume(agent_llm_enabled, isolated_db, tmp_path):
     async def run():
         first = QueryTaskScript(create=True)
         runtime, events = await turn(first, GOAL)
@@ -382,7 +383,7 @@ def test_query_create_typed_evidence_prune_cold_resume(isolated_db, tmp_path):
     asyncio.run(run())
 
 
-def test_english_query_and_unsupported_goal(isolated_db, tmp_path):
+def test_english_query_and_unsupported_goal(agent_llm_enabled, isolated_db, tmp_path):
     async def run():
         script = QueryTaskScript(
             create=True,
@@ -409,7 +410,7 @@ def test_english_query_and_unsupported_goal(isolated_db, tmp_path):
 
 
 @pytest.mark.parametrize("origin", ["reply_context", "tool_content"])
-def test_non_admitted_source_rejected(isolated_db, tmp_path, origin):
+def test_non_admitted_source_rejected(agent_llm_enabled, isolated_db, tmp_path, origin):
     async def run():
         source = (
             "引用里的目标不是当前用户指令"
@@ -440,7 +441,7 @@ def test_non_admitted_source_rejected(isolated_db, tmp_path, origin):
 
 
 @pytest.mark.parametrize("custom", [False, True])
-def test_qa_default_custom_strict_initial_no_task_sql(isolated_db, tmp_path, custom):
+def test_qa_default_custom_strict_initial_no_task_sql(agent_llm_enabled, isolated_db, tmp_path, custom):
     from app.agent.kernel.session import DEFAULT_SYSTEM_PROMPT, AgentSession
 
     trace = []
@@ -590,7 +591,7 @@ def test_task_domain_rejects_invalid_acceptance_shape(acceptance):
         validate_proposal(args)
 
 
-def test_explicit_checklist_keeps_native_entry_visible_without_auto_creation(isolated_db):
+def test_explicit_checklist_keeps_native_entry_visible_without_auto_creation(agent_llm_enabled, isolated_db):
     async def run():
         script = QueryTaskScript()
         script.steps = ['finish']

@@ -22,6 +22,7 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput, CancellationToken
 from app.clients.http import FixedHostHttpClient
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 PROTOCOLS = ("chat_completions", "responses", "anthropic_messages")
 MISSING = object()
@@ -189,14 +190,14 @@ def assert_accepted(protocol, reply, value):
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("mode", ("sse", "json"))
 @pytest.mark.parametrize("value", INVALID, ids=INVALID_IDS)
-def test_nonobject_full_input_never_emits_call(protocol, mode, value):
+def test_nonobject_full_input_never_emits_call(agent_llm_enabled, protocol, mode, value):
     assert_rejected(protocol, wire(protocol, mode, value))
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("value", INVALID, ids=INVALID_IDS)
 @pytest.mark.parametrize("phase", ("initial", "initial-then-object", "delta", "before-object", "after-object", "inside-object"))
-def test_invalid_raw_ingress_cannot_be_ignored_or_stringified(protocol, value, phase):
+def test_invalid_raw_ingress_cannot_be_ignored_or_stringified(agent_llm_enabled, protocol, value, phase):
     initial = value if phase.startswith("initial") else "" if protocol != "anthropic_messages" else {}
     deltas = [] if phase == "initial" else [value]
     if phase == "initial-then-object":
@@ -213,7 +214,7 @@ def test_invalid_raw_ingress_cannot_be_ignored_or_stringified(protocol, value, p
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("placeholder", [MISSING, None, "", {}], ids=["missing", "null", "empty-string", "empty-object"])
 @pytest.mark.parametrize("split", [False, True], ids=["empty-call", "split-object"])
-def test_supported_start_placeholders_and_incremental_json(protocol, placeholder, split):
+def test_supported_start_placeholders_and_incremental_json(agent_llm_enabled, protocol, placeholder, split):
     text = encode(SAFE)
     deltas = [text[:7], MISSING, None, "", text[7:]] if split else []
     assert_accepted(protocol, event_wire(frames(protocol, placeholder, deltas)), SAFE if split else {})
@@ -222,21 +223,21 @@ def test_supported_start_placeholders_and_incremental_json(protocol, placeholder
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("mode", ["sse", "json"])
 @pytest.mark.parametrize("value", [MISSING, None, "", "{}"], ids=["missing", "null", "empty", "object-json"])
-def test_empty_full_inputs_are_compatible(protocol, mode, value):
+def test_empty_full_inputs_are_compatible(agent_llm_enabled, protocol, mode, value):
     # Anthropic native full input is an object; use its legal empty object.
     incoming = {} if protocol == "anthropic_messages" and value == "{}" else value
     assert_accepted(protocol, wire(protocol, mode, incoming), {})
 
 
 @pytest.mark.parametrize("value", [{}, SAFE])
-def test_dictionary_full_input_retains_empty_delta_compatibility(value):
+def test_dictionary_full_input_retains_empty_delta_compatibility(agent_llm_enabled, value):
     protocol = "anthropic_messages"
     assert_accepted(protocol, event_wire(frames(protocol, value, [None, "", " "])), value)
 
 
 @pytest.mark.parametrize("done", ["item", "arguments", "none"])
 @pytest.mark.parametrize("placeholder", [MISSING, None, "", "  "], ids=["missing", "null", "empty", "whitespace"])
-def test_responses_done_placeholder_falls_back_to_accumulated_json(done, placeholder):
+def test_responses_done_placeholder_falls_back_to_accumulated_json(agent_llm_enabled, done, placeholder):
     assert_accepted("responses", event_wire(frames("responses", "", [encode(SAFE)], placeholder, done=done)), SAFE)
 
 
@@ -244,7 +245,7 @@ def test_responses_done_placeholder_falls_back_to_accumulated_json(done, placeho
 @pytest.mark.parametrize("final", [{}, SAFE, "{}", encode(SAFE)])
 @pytest.mark.parametrize("broken", ["{broken", False, 0, []], ids=["partial", "false", "zero", "list"])
 @pytest.mark.parametrize("phase", ["added", "delta"])
-def test_responses_authoritative_done_can_replace_invalid_accumulator(done, final, broken, phase):
+def test_responses_authoritative_done_can_replace_invalid_accumulator(agent_llm_enabled, done, final, broken, phase):
     expected = json.loads(final) if isinstance(final, str) else final
     initial, deltas = (broken, []) if phase == "added" else ("", [broken])
     assert_accepted("responses", event_wire(frames("responses", initial, deltas, final, done=done)), expected)
@@ -252,19 +253,19 @@ def test_responses_authoritative_done_can_replace_invalid_accumulator(done, fina
 
 @pytest.mark.parametrize("done", ["item", "arguments"])
 @pytest.mark.parametrize("value", INVALID, ids=INVALID_IDS)
-def test_responses_invalid_done_cannot_reuse_valid_delta(done, value):
+def test_responses_invalid_done_cannot_reuse_valid_delta(agent_llm_enabled, done, value):
     assert_rejected("responses", event_wire(frames("responses", "", [encode(SAFE)], value, done=done)))
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("text", ["false", "true", "null", "0", "[]", "[1]", '"string"'])
-def test_json_text_must_decode_to_object_without_keyword_filtering(protocol, text):
+def test_json_text_must_decode_to_object_without_keyword_filtering(agent_llm_enabled, protocol, text):
     assert_rejected(protocol, event_wire(frames(protocol, "", [text[:1], text[1:]])))
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("bad_first", [False, True])
-def test_failure_preserves_only_already_emitted_tool_boundaries(protocol, bad_first):
+def test_failure_preserves_only_already_emitted_tool_boundaries(agent_llm_enabled, protocol, bad_first):
     valid = {} if protocol == "anthropic_messages" else "{}"
     first = frames(protocol, False if bad_first else valid, index=0)
     second = frames(protocol, valid if bad_first else False, index=1)
@@ -276,7 +277,7 @@ def test_failure_preserves_only_already_emitted_tool_boundaries(protocol, bad_fi
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("mode", ["sse", "json"])
 @pytest.mark.parametrize("size", [32768, 32769])
-def test_unicode_character_limit_is_shared_across_full_and_streamed_arguments(protocol, mode, size):
+def test_unicode_character_limit_is_shared_across_full_and_streamed_arguments(agent_llm_enabled, protocol, mode, size):
     value = {"text": "界" * (size - len(encode({"text": ""})))}
     text = encode(value)
     assert len(text) == size
@@ -291,7 +292,7 @@ def test_unicode_character_limit_is_shared_across_full_and_streamed_arguments(pr
         assert_rejected(protocol, reply)
 
 
-def test_chat_identity_fragments_multi_index_and_choice_filter_are_unchanged():
+def test_chat_identity_fragments_multi_index_and_choice_filter_are_unchanged(agent_llm_enabled):
     events = [
         {"choices": [{"index": 1, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": False}}]}},
                      {"index": 0, "delta": {"tool_calls": [
@@ -329,7 +330,7 @@ def store(tmp_path):
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("mode", ["sse", "json"])
 @pytest.mark.parametrize("value", [False, 0, [], {}], ids=["false", "zero", "list", "valid-empty"])
-def test_actual_session_pipeline_never_executes_nonobject(protocol, mode, value, store):
+def test_actual_session_pipeline_never_executes_nonobject(agent_llm_enabled, protocol, mode, value, store):
     async def run():
         executed = []
         def handler(arguments, context):

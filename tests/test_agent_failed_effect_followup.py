@@ -46,6 +46,7 @@ from app.agent.models import ToolResult
 from app.agent.public_view import public_result_state
 from tests.support import initialized_web_runtime
 from tests.test_agent_task_first_slice import OWNER, NativeScript
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 WRITE = "library.fixture_rename"
 READ = "library.fixture_inspect"
@@ -420,7 +421,7 @@ def case(tmp_path, monkeypatch, request):
 
 
 @pytest.mark.parametrize("fault", FAULTS)
-def test_failed_confirm_automatically_diagnoses_in_same_drive_and_stays_partial(case, fault):
+def test_failed_confirm_automatically_diagnoses_in_same_drive_and_stays_partial(agent_llm_enabled, case, fault):
     async def run():
         case.media.fault = fault
         case.build(["read_a", "finish"])
@@ -440,7 +441,7 @@ def test_failed_confirm_automatically_diagnoses_in_same_drive_and_stays_partial(
 
 
 @pytest.mark.parametrize("fault", FAULTS)
-def test_successful_business_read_unlocks_only_new_b_confirmation_not_execution(case, fault):
+def test_successful_business_read_unlocks_only_new_b_confirmation_not_execution(agent_llm_enabled, case, fault):
     async def run():
         case.media.fault = fault
         case.build(["read_a", "preview_b"])
@@ -469,7 +470,7 @@ def test_successful_business_read_unlocks_only_new_b_confirmation_not_execution(
 
 
 @pytest.mark.parametrize("direct_write", ["retry_a", "preview_b"])
-def test_direct_write_before_diagnosis_is_rejected_before_prepare_or_replay(case, direct_write):
+def test_direct_write_before_diagnosis_is_rejected_before_prepare_or_replay(agent_llm_enabled, case, direct_write):
     async def run():
         case.build([direct_write, "read_a", "finish"])
         plan_id, source_users = await case.preview()
@@ -485,7 +486,7 @@ def test_direct_write_before_diagnosis_is_rejected_before_prepare_or_replay(case
 
 
 @pytest.mark.parametrize("diagnostic", ["failed_business_read"])
-def test_failed_business_read_does_not_unlock_new_write(case, diagnostic):
+def test_failed_business_read_does_not_unlock_new_write(agent_llm_enabled, case, diagnostic):
     async def run():
         step = "read_a"
         case.media.read_ok = diagnostic != "failed_business_read"
@@ -507,7 +508,7 @@ def test_failed_business_read_does_not_unlock_new_write(case, diagnostic):
     asyncio.run(run())
 
 
-def test_successful_real_core_task_does_not_unlock_new_write(case):
+def test_successful_real_core_task_does_not_unlock_new_write(agent_llm_enabled, case):
     async def run():
         case.build(["core_task", "preview_b", "finish"])
         plan_id, source_users = await case.preview()
@@ -534,7 +535,7 @@ def test_successful_real_core_task_does_not_unlock_new_write(case):
 
 
 @pytest.mark.parametrize("fault", FAULTS)
-def test_absent_original_user_source_persists_failure_but_never_starts_model(case, fault):
+def test_absent_original_user_source_persists_failure_but_never_starts_model(agent_llm_enabled, case, fault):
     async def run():
         case.media.fault = fault
         case.build(["read_a", "finish"])
@@ -567,7 +568,7 @@ def test_absent_original_user_source_persists_failure_but_never_starts_model(cas
 
 
 @pytest.mark.parametrize("denial", ["expired", "permission_revoked", "agent_disabled", "damaged_ticket"])
-def test_invalid_or_disallowed_confirmation_never_executes_or_starts_followup_model(case, denial):
+def test_invalid_or_disallowed_confirmation_never_executes_or_starts_followup_model(agent_llm_enabled, case, denial):
     async def run():
         if denial == "permission_revoked":
             case.owner = "tg:v1:12345\x1f67890"
@@ -594,7 +595,7 @@ def test_invalid_or_disallowed_confirmation_never_executes_or_starts_followup_mo
     asyncio.run(run())
 
 
-def test_duplicate_confirmation_after_failed_write_never_replays_or_restarts_model(case):
+def test_duplicate_confirmation_after_failed_write_never_replays_or_restarts_model(agent_llm_enabled, case):
     async def run():
         case.build(["read_a", "finish"])
         plan_id, source_users = await case.preview()
@@ -609,7 +610,7 @@ def test_duplicate_confirmation_after_failed_write_never_replays_or_restarts_mod
     asyncio.run(run())
 
 
-def test_successful_business_read_tool_outcome_without_ok_unlocks_new_b_card(case):
+def test_successful_business_read_tool_outcome_without_ok_unlocks_new_b_card(agent_llm_enabled, case):
     async def run():
         case.media.omit_read_ok = True
         case.build(["read_a", "preview_b"])
@@ -636,7 +637,7 @@ def test_successful_business_read_tool_outcome_without_ok_unlocks_new_b_card(cas
     pytest.param("partial", "warning", id="partial"),
     pytest.param("pending", "pending", id="pending"),
 ])
-def test_business_read_ok_true_with_non_success_state_does_not_unlock_b(case, status, semantic_state):
+def test_business_read_ok_true_with_non_success_state_does_not_unlock_b(agent_llm_enabled, case, status, semantic_state):
     async def run():
         # 覆盖要求的字面状态；使用统一分类器，不在测试里另造成功语义。
         case.media.read_status = status
@@ -662,7 +663,7 @@ def test_business_read_ok_true_with_non_success_state_does_not_unlock_b(case, st
     asyncio.run(run())
 
 
-def test_stop_during_actual_failed_write_persists_stop_and_cancelled_publication(case):
+def test_stop_during_actual_failed_write_persists_stop_and_cancelled_publication(agent_llm_enabled, case):
     async def run():
         case.media = PausedMutationMedia(case.media.root)
         case.build(["read_a", "finish"])
@@ -703,7 +704,7 @@ def test_stop_during_actual_failed_write_persists_stop_and_cancelled_publication
 
 
 @pytest.mark.parametrize("cancel_new_publication", [False, True], ids=["new-user", "new-user-then-cancel"])
-def test_new_user_supersedes_failed_diagnosis_and_preserves_publication_facts(case, cancel_new_publication):
+def test_new_user_supersedes_failed_diagnosis_and_preserves_publication_facts(agent_llm_enabled, case, cancel_new_publication):
     async def run():
         case.build(["read_a", "finish"])
         case.script = PausedProviderScript(["preview_a", "read_a", "finish"], pause_step="read_a")

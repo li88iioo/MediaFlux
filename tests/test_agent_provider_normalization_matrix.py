@@ -15,6 +15,7 @@ from app.agent.kernel.state_types import CancellationToken
 from app.agent.public_view import public_conversation_messages
 from tests import test_agent_provider_state as fixtures
 from tests.test_agent_provider_text_authority import native_reply
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def anthropic_frames(reply, delta_width) -> list[dict[str, Any]]:
@@ -138,7 +139,7 @@ TEXT_CASES = [
         ("sse", 7, 19),
     ],
 )
-def test_normalization_matrix_tool_loop_and_sqlite_restore(
+def test_normalization_matrix_tool_loop_and_sqlite_restore(agent_llm_enabled,
     raw,
     sse_text,
     json_text,
@@ -275,7 +276,7 @@ def test_normalization_matrix_tool_loop_and_sqlite_restore(
     ],
 )
 @pytest.mark.parametrize("mode", ["json", "sse-start", "sse-delta"])
-def test_invalid_private_fields_stay_provider_errors_without_tools(
+def test_invalid_private_fields_stay_provider_errors_without_tools(agent_llm_enabled,
     field, invalid, mode, caplog
 ):
     async def scenario():

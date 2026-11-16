@@ -27,6 +27,7 @@ from tests.test_agent_tool_argument_ingress import (
 )
 from tests.test_agent_tool_argument_ingress import offline as offline
 from tests.test_agent_tool_argument_ingress import store as store
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 RAW = '  {"query":"私有原串-SENTINEL", \n'
 OPAQUE = ' opaque\nPRIVATE-SENTINEL  '
@@ -82,7 +83,7 @@ def make_session(model, store, executed, limits=None):
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('mode', ['json','sse'])
-def test_real_cold_restore_next_wire_and_one_correction(protocol, mode, store):
+def test_real_cold_restore_next_wire_and_one_correction(agent_llm_enabled, protocol, mode, store):
     async def run():
         executed = []
         first = Wire(protocol, [payload(protocol, mode)])
@@ -172,7 +173,7 @@ def mixed_payload(protocol, bad_first, spaced):
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('bad_first', [True, False])
 @pytest.mark.parametrize('spaced', [True, False])
-def test_mixed_sse_cold_next_wire_exact_or_safe_rejection(protocol, bad_first, spaced, store):
+def test_mixed_sse_cold_next_wire_exact_or_safe_rejection(agent_llm_enabled, protocol, bad_first, spaced, store):
     async def run():
         response, items = mixed_payload(protocol, bad_first, spaced)
         observed, error = await observe(protocol, response)
@@ -229,7 +230,7 @@ def test_mixed_sse_cold_next_wire_exact_or_safe_rejection(protocol, bad_first, s
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('bad_first', [True, False])
 @pytest.mark.parametrize('field,value', [('name', 123), ('call_id', 123), ('call_id', '\ud800')])
-def test_mixed_invalid_success_identity_rejects_whole_turn(protocol, bad_first, field, value, store):
+def test_mixed_invalid_success_identity_rejects_whole_turn(agent_llm_enabled, protocol, bad_first, field, value, store):
     async def run():
         response, _ = mixed_payload(protocol, bad_first, False)
         frames = [json.loads(line[6:]) if line[6:] != '[DONE]' else '[DONE]'
@@ -266,7 +267,7 @@ def test_mixed_invalid_success_identity_rejects_whole_turn(protocol, bad_first, 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('mode', ['json','sse'])
 @pytest.mark.parametrize('cid', [None, '', '   '])
-def test_missing_identity_stays_provider_error(protocol, mode, cid):
+def test_missing_identity_stays_provider_error(agent_llm_enabled, protocol, mode, cid):
     events, error = asyncio.run(observe(protocol, payload(protocol,mode,cid=cid)))
     assert error is not None
     assert not any(e.type is ModelEventType.FINISH for e in events)
@@ -289,7 +290,7 @@ def test_strict_shared_parser_unchanged(protocol):
 
 
 @pytest.mark.parametrize('raw', [' ' * 32768 + '{', '中' * 11000 + '{', '\ud800{'])
-def test_invalid_raw_utf8_and_capacity_fail_closed(raw):
+def test_invalid_raw_utf8_and_capacity_fail_closed(agent_llm_enabled, raw):
     # ASCII escaping permits the invalid scalar to reach decoded JSON validation.
     value = {'choices':[{'message':{'tool_calls':[{'type':'function','id':'real','function':{'name':'lookup','arguments':raw}}]},'finish_reason':'tool_calls'}]}
     events, error = asyncio.run(observe('chat_completions',(json.dumps(value).encode(),'application/json')))
@@ -297,7 +298,7 @@ def test_invalid_raw_utf8_and_capacity_fail_closed(raw):
     assert not any(e.type is ModelEventType.FINISH for e in events)
 
 
-def test_anthropic_malformed_signed_input_stays_rejected():
+def test_anthropic_malformed_signed_input_stays_rejected(agent_llm_enabled):
     events = frames('anthropic_messages', {}, [RAW])
     events[:0] = [{'type':'content_block_start','index':2,'content_block':{'type':'thinking','thinking':OPAQUE,'signature':'signed-opaque'}}, {'type':'content_block_stop','index':2}]
     seen,error = asyncio.run(observe('anthropic_messages',event_wire(events)))
@@ -306,7 +307,7 @@ def test_anthropic_malformed_signed_input_stays_rejected():
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('mode', ['json', 'sse'])
-def test_exact_opaque_identity_is_not_trimmed(protocol, mode):
+def test_exact_opaque_identity_is_not_trimmed(agent_llm_enabled, protocol, mode):
     events, error = asyncio.run(observe(protocol, payload(protocol, mode, cid='  native-id  ')))
     assert error is None
     call = next(e.tool_call for e in events if e.tool_call)
@@ -316,7 +317,7 @@ def test_exact_opaque_identity_is_not_trimmed(protocol, mode):
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
-def test_duplicate_native_identity_and_invalid_private_reject(protocol):
+def test_duplicate_native_identity_and_invalid_private_reject(agent_llm_enabled, protocol):
     data, kind = payload(protocol, 'json')
     value = json.loads(data)
     if protocol == 'chat_completions':
@@ -337,7 +338,7 @@ def test_duplicate_native_identity_and_invalid_private_reject(protocol):
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
 @pytest.mark.parametrize('reasoning', [None, ''])
-def test_chat_nullable_reasoning_does_not_block_argument_repair(mode, reasoning):
+def test_chat_nullable_reasoning_does_not_block_argument_repair(agent_llm_enabled, mode, reasoning):
     if mode == 'json':
         data, kind = payload('chat_completions', mode)
         value = json.loads(data)
@@ -358,7 +359,7 @@ def test_chat_nullable_reasoning_does_not_block_argument_repair(mode, reasoning)
     assert call is not None and call.argument_error == 'invalid_json'
 
 
-def test_unknown_tool_precedes_syntax_repair(store):
+def test_unknown_tool_precedes_syntax_repair(agent_llm_enabled, store):
     async def run():
         executed=[]
         transport=Wire('chat_completions',[payload('chat_completions','json',name='not_loaded'), final('chat_completions')])
@@ -397,7 +398,7 @@ def test_unknown_tool_precedes_syntax_repair(store):
     asyncio.run(run())
 
 
-def test_actual_raw_storage_capacity_rejects_whole_batch(store):
+def test_actual_raw_storage_capacity_rejects_whole_batch(agent_llm_enabled, store):
     async def run():
         executed=[]
         raw='{' + 'x' * 32000
@@ -416,7 +417,7 @@ def test_actual_raw_storage_capacity_rejects_whole_batch(store):
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
-def test_malformed_native_binding_cannot_be_dropped(protocol):
+def test_malformed_native_binding_cannot_be_dropped(agent_llm_enabled, protocol):
     async def run():
         transport=Wire(protocol,[payload(protocol,'json')])
         events=[e async for e in transport.adapter.stream(ModelRequest(system_prompt='',messages=(),tools=()),cancellation=CancellationToken())]
@@ -431,7 +432,7 @@ def test_malformed_native_binding_cannot_be_dropped(protocol):
     asyncio.run(run())
 
 
-def test_second_batch_repair_does_not_replay_first_result(store):
+def test_second_batch_repair_does_not_replay_first_result(agent_llm_enabled, store):
     async def run():
         executed=[]
         transport=Wire('chat_completions',[payload('chat_completions','json','{"query":"first"}','call-first'),payload('chat_completions','json',cid='call-bad'),payload('chat_completions','json','{"query":"corrected"}','call-corrected'),final('chat_completions')])
@@ -443,7 +444,7 @@ def test_second_batch_repair_does_not_replay_first_result(store):
     asyncio.run(run())
 
 
-def test_repeated_errors_exhaust_normal_budget(store):
+def test_repeated_errors_exhaust_normal_budget(agent_llm_enabled, store):
     async def run():
         executed=[]
         transport=Wire('chat_completions',[payload('chat_completions','json',cid=f'call-{i}') for i in range(3)])
@@ -597,7 +598,7 @@ async def _seed_original_native_history(mode, store, executed):
 @pytest.mark.parametrize('mode', ['sse', 'json'])
 @pytest.mark.parametrize('thinking', [False, True], ids=['plain', 'signed'])
 @pytest.mark.parametrize('mixed', [False, True], ids=['single', 'mixed'])
-def test_anthropic_bounded_invalid_json_rebuilds_original_history_once(mode, thinking, mixed, store):
+def test_anthropic_bounded_invalid_json_rebuilds_original_history_once(agent_llm_enabled, mode, thinking, mixed, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
@@ -661,7 +662,7 @@ def test_anthropic_bounded_invalid_json_rebuilds_original_history_once(mode, thi
 
 
 @pytest.mark.parametrize('mode', ['sse', 'json'])
-def test_anthropic_repeated_invalid_json_recovers_only_once(mode, store):
+def test_anthropic_repeated_invalid_json_recovers_only_once(agent_llm_enabled, mode, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
@@ -696,7 +697,7 @@ def test_anthropic_repeated_invalid_json_recovers_only_once(mode, store):
 @pytest.mark.parametrize('defect', ['too-large', 'too-large-utf8', 'nonobject', 'nonobject-json', 'numeric-id', 'empty-id',
                                   'unicode-id', 'duplicate-id', 'signature-type', 'signature-empty',
                                   'signature-missing', 'redacted-type'])
-def test_anthropic_known_invalid_native_group_never_recovers(mode, defect, store):
+def test_anthropic_known_invalid_native_group_never_recovers(agent_llm_enabled, mode, defect, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
@@ -741,7 +742,7 @@ def test_anthropic_known_invalid_native_group_never_recovers(mode, defect, store
     asyncio.run(run())
 
 
-def test_anthropic_open_private_block_with_invalid_json_never_recovers(store):
+def test_anthropic_open_private_block_with_invalid_json_never_recovers(agent_llm_enabled, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history('sse', store, executed)
@@ -778,7 +779,7 @@ def test_anthropic_shared_parser_invalid_json_remains_strict(allow_argument_erro
 
 
 @pytest.mark.parametrize('mode', ['sse', 'json'])
-def test_anthropic_valid_object_missing_schema_directly_retries_read(mode, store):
+def test_anthropic_valid_object_missing_schema_directly_retries_read(agent_llm_enabled, mode, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
@@ -813,7 +814,7 @@ def test_anthropic_valid_object_missing_schema_directly_retries_read(mode, store
 
 @pytest.mark.parametrize('mode', ['sse', 'json'])
 @pytest.mark.parametrize('round_budget', [1, 2])
-def test_anthropic_invalid_json_rebuild_uses_normal_model_budget(mode, round_budget, store):
+def test_anthropic_invalid_json_rebuild_uses_normal_model_budget(agent_llm_enabled, mode, round_budget, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
@@ -843,7 +844,7 @@ def test_anthropic_invalid_json_rebuild_uses_normal_model_budget(mode, round_bud
 
 
 @pytest.mark.parametrize('mode', ['sse', 'json'])
-def test_anthropic_cancel_at_rebuild_does_not_execute_or_commit_bad_group(mode, store):
+def test_anthropic_cancel_at_rebuild_does_not_execute_or_commit_bad_group(agent_llm_enabled, mode, store):
     async def run():
         executed = []
         cold, original = await _seed_original_native_history(mode, store, executed)
@@ -885,7 +886,7 @@ def test_anthropic_cancel_at_rebuild_does_not_execute_or_commit_bad_group(mode, 
 
 @pytest.mark.parametrize('mode', ['sse', 'json'])
 @pytest.mark.parametrize('decision', ['confirm', 'cancel'])
-def test_anthropic_recovered_new_write_still_requires_its_own_confirmation(mode, decision, store):
+def test_anthropic_recovered_new_write_still_requires_its_own_confirmation(agent_llm_enabled, mode, decision, store):
     async def run():
         executed, previews, writes = [], [], []
         cold, original = await _seed_original_native_history(mode, store, executed)

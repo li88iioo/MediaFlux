@@ -23,6 +23,7 @@ from app.modules import rss_delivery
 from tests.support import isolated_test_database
 from tests.test_agent_sdk_effects import context_for, executor
 from tests.test_agent_tool_argument_ingress import Wire, encode, wire
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def catalog_schema(name):
@@ -169,7 +170,7 @@ def test_composition_keeps_root_mapping(mapping):
      {"operations": [{"op": "batch_relocate", "items": [], "target_path": "test"}]},
      {"operations": [{"op": "copy", "file_id": "Case-sensitive-file-ID", "target_path": "/test"}]}),
 ])
-def test_native_composed_schema_invalid_arguments_corrected_call(name, invalid, valid):
+def test_native_composed_schema_invalid_arguments_corrected_call(agent_llm_enabled, name, invalid, valid):
     async def run():
         executed = []
         schema = catalog_schema(name)

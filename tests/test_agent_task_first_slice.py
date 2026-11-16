@@ -29,6 +29,7 @@ from app.agent.owner_routes import web_kernel_owner
 from app.clients.http import FixedHostHttpClient
 from app.routes import agent_api
 from tests.support import authenticated_session
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 GOAL = "观察 TMDB 和 qBittorrent 当前配置状态，仅观察、不修改。"
 OWNER = web_kernel_owner("admin")
@@ -178,7 +179,7 @@ class NativeScript:
 
 
 @pytest.mark.parametrize("budget", [False, True])
-def test_observe_checkpoint_prune_reopen_continue(tmp_path, budget):
+def test_observe_checkpoint_prune_reopen_continue(agent_llm_enabled, tmp_path, budget):
     previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
     db.configure_database(tmp_path / "task.db", test_mode=True)
     db.init_db()
@@ -298,7 +299,7 @@ def test_observe_checkpoint_prune_reopen_continue(tmp_path, budget):
         db.configure_database(previous[0], test_mode=previous[1])
 
 
-def test_no_task_qa_transaction_trace(tmp_path):
+def test_no_task_qa_transaction_trace(agent_llm_enabled, tmp_path):
     previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
     db.configure_database(tmp_path / "qa.db", test_mode=True)
     db.init_db()
@@ -357,7 +358,7 @@ def test_no_task_qa_transaction_trace(tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["invalid", "exception", "commit"])
-def test_native_failed_observation_is_atomic_and_object_scoped(tmp_path, failure):
+def test_native_failed_observation_is_atomic_and_object_scoped(agent_llm_enabled, tmp_path, failure):
     from app.modules import diagnostics as domain
 
     previous = db.DB_PATH, bool(getattr(db, "_configured_test_mode", False))
@@ -455,7 +456,7 @@ def test_native_failed_observation_is_atomic_and_object_scoped(tmp_path, failure
 
 
 @pytest.mark.parametrize("checkpoint", [False, True])
-def test_native_snapshot_capacity_failure_and_cold_recovery(tmp_path, checkpoint):
+def test_native_snapshot_capacity_failure_and_cold_recovery(agent_llm_enabled, tmp_path, checkpoint):
     from app.modules import diagnostics as domain
     from app.agent.rate_limit import AgentRateLimiter
 
@@ -527,7 +528,7 @@ def test_native_snapshot_capacity_failure_and_cold_recovery(tmp_path, checkpoint
 
 
 @pytest.mark.parametrize("qb_state", ["ready", "incomplete", "invalid", "error"])
-def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_path, qb_state):
+def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(agent_llm_enabled, tmp_path, qb_state):
     from app.modules import diagnostics as diagnosis
     from app.modules import diagnostics as explain
 
@@ -616,7 +617,7 @@ def test_native_diagnose_batch_attention_to_explicit_checkpoint_and_sqlite(tmp_p
         db.configure_database(previous[0], test_mode=previous[1])
 
 
-def test_caught_diagnostic_error_preserves_script_result_and_task_evidence(tmp_path, monkeypatch):
+def test_caught_diagnostic_error_preserves_script_result_and_task_evidence(agent_llm_enabled, tmp_path, monkeypatch):
     from app.modules import diagnostics
 
     original_call = configuration_call

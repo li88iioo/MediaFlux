@@ -31,6 +31,7 @@ from tests.support import isolated_test_database
 from tests.test_agent_provider_state import REDACTED, SIGNATURE, THINKING
 from tests.test_agent_provider_text_authority import native_reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 OWNER, SESSION = "checkpoint-owner", "checkpoint-session"
 ASSISTANT = "逐项核对库存，不执行未经确认的写操作。"
@@ -217,7 +218,7 @@ def assert_native_wire(protocol, payload, calls):
     assert results == [cid for cid, _, _ in calls]
 
 
-def test_two_real_turns_preserve_supported_small_read_after_large_storable_result():
+def test_two_real_turns_preserve_supported_small_read_after_large_storable_result(agent_llm_enabled):
 
     async def exercise():
         handled = []
@@ -377,7 +378,7 @@ def active(catalog, wire, store):
 @pytest.mark.parametrize("kind", ["sqlite", "memory"])
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("large_metadata", [True])
-def test_cold_explanation_preserves_unknown_across_generations_and_new_read(
+def test_cold_explanation_preserves_unknown_across_generations_and_new_read(agent_llm_enabled,
     kind, protocol, large_metadata
 ):
     from app.agent.kernel.conversation_codec import PendingText
@@ -906,7 +907,7 @@ def test_signed_invalid_phase_rejected_without_rewrite(phase):
 
 
 @pytest.mark.parametrize("result_status,diagnostic_length", [("running", 0), ("partial", 180_000)])
-def test_unfinished_confirmation_preserves_capacity_and_receipt_without_replay(
+def test_unfinished_confirmation_preserves_capacity_and_receipt_without_replay(agent_llm_enabled,
     result_status, diagnostic_length,
 ):
     """Real Session read -> preview -> explicit confirm, inspect terminal paths."""
@@ -1052,7 +1053,7 @@ def test_diagnostic_retention_preserves_full_receipt_and_pending_calls(kind):
         asyncio.run(exercise())
 
 
-def test_joint_high_entropy_old_metadata_is_deleted_only_by_handler():
+def test_joint_high_entropy_old_metadata_is_deleted_only_by_handler(agent_llm_enabled):
     def text(seed, length):
         rng = random.Random(seed)
         return "".join(

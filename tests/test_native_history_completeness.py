@@ -37,6 +37,7 @@ from app.agent.model_context_budget import (
     estimated_tokens,
 )
 from app.clients.http import FixedHostHttpClient
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_kernel_core import ScriptedModel, read_tool
 from tests.test_agent_provider_state import (
@@ -61,7 +62,7 @@ CALENDAR_HELP_OUTPUT = (
 
 
 @pytest.mark.parametrize("protocol", ["responses", "anthropic_messages", "chat_completions"])
-def test_native_same_id_distinct_facts_real_wire_and_cold_store(protocol):
+def test_native_same_id_distinct_facts_real_wire_and_cold_store(agent_llm_enabled, protocol):
     async def run():
         calls = []
         def handler(arguments, context):
@@ -339,7 +340,7 @@ def test_budget_pressure_keeps_unread_file_and_write_protections(tmp_path, prote
 
 @pytest.mark.parametrize("protocol", ["responses", "anthropic_messages", "chat_completions"])
 @pytest.mark.parametrize("pressure", [False, True], ids=["ample-budget", "budget-pressure"])
-def test_large_historical_output_is_readable_without_retransmitting_on_every_turn(protocol, pressure, tmp_path):
+def test_large_historical_output_is_readable_without_retransmitting_on_every_turn(agent_llm_enabled, protocol, pressure, tmp_path):
     async def run():
         receipt = terminal_receipt(7)
         receipt["data"]["stdout"] = "OLD_OUTPUT_" * 8000

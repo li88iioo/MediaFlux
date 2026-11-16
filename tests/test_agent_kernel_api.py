@@ -19,6 +19,8 @@ from app.agent.kernel.adapters import TurnView
 from app.agent.kernel.session_state import SessionState
 from app.agent.kernel.state_types import SessionBusyError
 from app.routes import agent_api as agent_kernel_api
+import pytest
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class FakeCatalog:
@@ -840,6 +842,7 @@ class AgentKernelApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.json(), result)
         stop.assert_awaited_once()
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_session_stop_cancels_parked_read_once_and_isolates_owner_and_session(self):
         from app import database as db
         from app.agent.feature_gate import initialize_runtime_fence

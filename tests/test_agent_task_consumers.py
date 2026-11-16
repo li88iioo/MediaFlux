@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 from starlette.requests import Request
 
+from app import config
 from app.agent.kernel.adapters import TurnViewBuilder
 from app.agent.kernel.bootstrap import build_agent_kernel_runtime
 from app.agent.kernel.metrics import KernelMetrics
@@ -20,6 +21,7 @@ from app.bot.telegram_markdown import render_telegram_markdown
 from app.routes import agent_api
 from tests.support import authenticated_session, isolated_test_database
 from tests.test_agent_task_first_slice import GOAL, OWNER, NativeScript
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.fixture(scope="module")
@@ -84,7 +86,7 @@ def native_snapshots():
             )
         return results
 
-    with isolated_test_database("consumer.db"):
+    with isolated_test_database("consumer.db"), patch.dict(config._SYSTEM_ENV_SNAPSHOT, {'AGENT_LLM_ENABLED': '1'}):
         result = asyncio.run(run())
     evidence = os.environ.get("CONSUMER_EVIDENCE")
     if evidence:
@@ -193,7 +195,7 @@ def test_telegram_approval_callers_preserve_buttons_and_html(native_snapshots, t
         assert all(telegram_html_text_length(b) <= 3900 for b in bodies)
 
 
-def test_native_untracked_qa_keeps_turn_success():
+def test_native_untracked_qa_keeps_turn_success(agent_llm_enabled):
     from contextlib import contextmanager
 
     from app import database as db

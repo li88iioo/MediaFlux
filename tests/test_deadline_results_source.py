@@ -24,6 +24,7 @@ from app.agent.kernel.state_types import AgentInput, CancellationToken
 from app.agent.kernel.tool_calls import ToolCallContext
 from app.clients.http import FixedHostHttpClient
 from tests import test_agent_session_result as session_result_tests
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 
 native_workspace = session_result_tests.native_workspace
@@ -69,7 +70,7 @@ async def run(session, request):
     assert events[-1].payload["status"] == "success", events[-3:]
 
 
-def test_two_below_threshold_results_recover_dependency_tails_on_native_wire(native_workspace):
+def test_two_below_threshold_results_recover_dependency_tails_on_native_wire(agent_llm_enabled, native_workspace):
     async def exercise():
         handled = []
         sources = ["甲" * 11000 + "TAIL_ONE", "乙" * 11000 + "TAIL_TWO"]

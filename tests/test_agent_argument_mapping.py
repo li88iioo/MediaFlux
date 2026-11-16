@@ -19,6 +19,7 @@ from tests.test_agent_argument_fidelity import declaration, text_reply
 from tests.test_agent_capacity_recovery import (
     PROTOCOLS, collect, make_wire, reopened, session,
 )
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class MappingModel:
@@ -67,7 +68,7 @@ def assert_mapping_wire(protocol, payload, expected):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("factory", [dict, MappingProxyType, UserDict])
-def test_public_root_mapping_survives_execution_cold_and_wire(protocol, factory):
+def test_public_root_mapping_survives_execution_cold_and_wire(agent_llm_enabled, protocol, factory):
     expected = {"must_match": ["动画"], "exclude_played": True,
                 "zero": 0, "optional": None, "flag": False}
 

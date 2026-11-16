@@ -18,6 +18,7 @@ from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire
 from tests.test_agent_tool_argument_ingress import offline as offline  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import store as store  # noqa: PLC0414
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class TrackedWire(Wire):
@@ -78,7 +79,7 @@ async def confirm_new_b(rig, peer, protocol):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("mode", ["complete", "consumer", "producer", "repeated"])
-def test_cancelled_freeze_is_drained_and_cannot_revoke_the_next_card(rig, protocol, mode):
+def test_cancelled_freeze_is_drained_and_cannot_revoke_the_next_card(agent_llm_enabled, rig, protocol, mode):
     async def run():
         entered, release, done = threading.Event(), threading.Event(), threading.Event()
         freeze, cancel = rig.pipeline.effect_store.freeze, rig.pipeline.effect_store.cancel
@@ -152,7 +153,7 @@ def test_cancelled_freeze_is_drained_and_cannot_revoke_the_next_card(rig, protoc
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("failure", ["runtime-error", "worker-cancel"])
 @pytest.mark.parametrize("cancel_producer", [False, True], ids=["worker-only", "also-task-cancel"])
-def test_failed_freeze_worker_is_not_treated_as_a_created_plan(rig, protocol, failure, cancel_producer):
+def test_failed_freeze_worker_is_not_treated_as_a_created_plan(agent_llm_enabled, rig, protocol, failure, cancel_producer):
     async def run():
         entered, release = threading.Event(), threading.Event()
 
@@ -197,7 +198,7 @@ def test_failed_freeze_worker_is_not_treated_as_a_created_plan(rig, protocol, fa
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("origin", ["freeze-cancel", "pending-commit-failure"])
-def test_exact_ticket_discard_is_drained_before_unlocking_even_on_repeated_cancel(rig, protocol, origin):
+def test_exact_ticket_discard_is_drained_before_unlocking_even_on_repeated_cancel(agent_llm_enabled, rig, protocol, origin):
     async def run():
         freeze_entered, freeze_release = threading.Event(), threading.Event()
         cancel_entered, cancel_release, cancel_done = threading.Event(), threading.Event(), threading.Event()

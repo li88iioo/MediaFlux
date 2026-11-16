@@ -38,6 +38,7 @@ from app.agent.models import ToolResult
 from app.modules import organize_tasks
 from app.repositories import organize_operation_jobs as jobs
 from tests import test_agent_session_result as session_result_tests
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_batch_confirmation import batch_quota as shared_batch_quota
 from tests.test_agent_batch_confirmation import capture, register_sdk_fixture
@@ -246,7 +247,7 @@ def rig(tmp_path, monkeypatch, native_workspace):
 
 
 @pytest.mark.parametrize("foreground", [False, True])
-def test_tracked_and_tail_use_last_confirmed_permit_once_across_resume(rig, batch_quota, foreground):
+def test_tracked_and_tail_use_last_confirmed_permit_once_across_resume(agent_llm_enabled, rig, batch_quota, foreground):
     rig.rate_limiter, debits = batch_quota
     for name in (FIRST, TAIL):
         _, limit, cost = rates.tool_rate_limit_policy(name)
@@ -285,7 +286,7 @@ def test_tracked_and_tail_use_last_confirmed_permit_once_across_resume(rig, batc
 
 
 @pytest.mark.parametrize("change", ["snapshot", "authorization"])
-def test_tail_preflight_failure_never_submits_tracked_first_or_consumes_child_permits(rig, batch_quota, change):
+def test_tail_preflight_failure_never_submits_tracked_first_or_consumes_child_permits(agent_llm_enabled, rig, batch_quota, change):
     rig.rate_limiter, debits = batch_quota
 
     async def run():
@@ -307,7 +308,7 @@ def test_tail_preflight_failure_never_submits_tracked_first_or_consumes_child_pe
 
 
 @pytest.mark.parametrize("risk,legacy", [(ToolEffect.WRITE, False), (ToolEffect.DANGER, False), (ToolEffect.WRITE, True)])
-def test_pending_poll_cold_resume_preserves_frozen_parent_and_never_replays(rig, risk, legacy):
+def test_pending_poll_cold_resume_preserves_frozen_parent_and_never_replays(agent_llm_enabled, rig, risk, legacy):
     async def run():
         rig.tail_effect = risk
         preview, events = await rig.start()
@@ -372,7 +373,7 @@ def test_pending_poll_cold_resume_preserves_frozen_parent_and_never_replays(rig,
     asyncio.run(run())
 
 
-def test_foreground_fast_completion_executes_each_step_once_without_background_replay(rig):
+def test_foreground_fast_completion_executes_each_step_once_without_background_replay(agent_llm_enabled, rig):
     async def run():
         await rig.start(foreground=True)
         final, events = await rig.confirm(foreground=True)
@@ -392,7 +393,7 @@ def test_foreground_fast_completion_executes_each_step_once_without_background_r
 
 @pytest.mark.parametrize("interruption", ["stop", "new_user"])
 @pytest.mark.parametrize("phase", ["pending", "ready"])
-def test_stop_or_new_user_never_executes_old_remaining_write(rig, interruption, phase):
+def test_stop_or_new_user_never_executes_old_remaining_write(agent_llm_enabled, rig, interruption, phase):
     async def run():
         candidate = None
         if phase == "ready":
@@ -423,7 +424,7 @@ def test_stop_or_new_user_never_executes_old_remaining_write(rig, interruption, 
 
 
 @pytest.mark.parametrize("stop", [False, True])
-def test_durable_executing_marker_is_unknown_after_restart_and_never_replayed(rig, stop):
+def test_durable_executing_marker_is_unknown_after_restart_and_never_replayed(agent_llm_enabled, rig, stop):
     async def run():
         candidate = await rig.ready()
         claimed = await rig.store.claim_continuation(candidate, _capture_creation_binding())
@@ -460,7 +461,7 @@ def test_durable_executing_marker_is_unknown_after_restart_and_never_replayed(ri
     asyncio.run(run())
 
 
-def test_late_tail_snapshot_drift_keeps_first_terminal_receipt_and_refuses_tail(rig):
+def test_late_tail_snapshot_drift_keeps_first_terminal_receipt_and_refuses_tail(agent_llm_enabled, rig):
     async def run():
         candidate = await rig.ready()
         _, ready = await rig.row()
@@ -481,7 +482,7 @@ def test_late_tail_snapshot_drift_keeps_first_terminal_receipt_and_refuses_tail(
 
 
 @pytest.mark.parametrize("invalid", ["trailing", "multiple"])
-def test_tracked_must_be_unique_and_first_before_any_child_prepares(rig, invalid):
+def test_tracked_must_be_unique_and_first_before_any_child_prepares(agent_llm_enabled, rig, invalid):
     async def run():
         view, events = await rig.start(invalid=invalid)
         assert view.approval is None
@@ -490,7 +491,7 @@ def test_tracked_must_be_unique_and_first_before_any_child_prepares(rig, invalid
     asyncio.run(run())
 
 
-def test_old_poll_rebuilds_from_new_checkpoints_after_three_real_kernel_steps(rig):
+def test_old_poll_rebuilds_from_new_checkpoints_after_three_real_kernel_steps(agent_llm_enabled, rig):
     async def run():
         third_calls, verified, stale = [], [], []
         async def third_execute(_args, expected, context):
@@ -554,7 +555,7 @@ def test_old_poll_rebuilds_from_new_checkpoints_after_three_real_kernel_steps(ri
 
 
 @pytest.mark.parametrize("reason", ["expired", "cancelled"])
-def test_retired_batch_continuation_poll_has_no_running_or_followup_promise(rig, reason):
+def test_retired_batch_continuation_poll_has_no_running_or_followup_promise(agent_llm_enabled, rig, reason):
     async def run():
         candidate = await rig.ready()
         state, row = await rig.row()
@@ -582,7 +583,7 @@ def test_retired_batch_continuation_poll_has_no_running_or_followup_promise(rig,
     asyncio.run(run())
 
 
-def test_post_write_checkpoint_failure_is_durably_unknown_and_never_replayed(rig):
+def test_post_write_checkpoint_failure_is_durably_unknown_and_never_replayed(agent_llm_enabled, rig):
     async def run():
         candidate = await rig.ready()
         _, ready = await rig.row()
@@ -626,7 +627,7 @@ def test_post_write_checkpoint_failure_is_durably_unknown_and_never_replayed(rig
     asyncio.run(run())
 
 
-def test_stop_while_unprotecting_batch_prevents_any_model_call(rig):
+def test_stop_while_unprotecting_batch_prevents_any_model_call(agent_llm_enabled, rig):
     async def run():
         candidate = await rig.ready()
         cold, script, injected = SQLiteKernelStore(), BatchScript(), []
@@ -656,7 +657,7 @@ def test_stop_while_unprotecting_batch_prevents_any_model_call(rig):
 
 
 @pytest.mark.parametrize("operation,risk", [("rename", ToolEffect.WRITE), ("trash", ToolEffect.DANGER)])
-def test_cloud_parameter_risk_reaches_parent_child_and_receipt(rig, operation, risk):
+def test_cloud_parameter_risk_reaches_parent_child_and_receipt(agent_llm_enabled, rig, operation, risk):
     async def run():
         preview, _ = await rig.start(operation=operation)
         assert rig.plan.effect is risk and preview.approval.effect == risk.value

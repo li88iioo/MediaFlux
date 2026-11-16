@@ -17,6 +17,7 @@ from app.agent.kernel.session_service import SessionService
 from app.agent.kernel.state_types import AgentInput, CancellationToken, StateUpdate
 from app.agent.kernel.tool_calls import ToolCallContext
 from tests import test_agent_kernel_telegram_reference as o
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_argument_fidelity import declaration, text_reply
 from tests.test_agent_capacity_recovery import (
@@ -47,7 +48,7 @@ def send(store, message, window=128000):
 
 
 @pytest.mark.parametrize('elapsed', [0, 901])
-def test_unrelated_turn_after_reader_roundtrip_and_expiry(store, elapsed):
+def test_unrelated_turn_after_reader_roundtrip_and_expiry(agent_llm_enabled, store, elapsed):
     first, _, owner, sid = o.ingress(store)
     assert first.status == 'success'
     before = asyncio.run(store.load(owner=owner, session_id=sid)).conversation[0]['reply_context']
@@ -83,7 +84,7 @@ def test_unrelated_turn_after_reader_roundtrip_and_expiry(store, elapsed):
 
 
 @pytest.mark.parametrize('window', [128000, 16384])
-def test_normal_old_group_pruning_does_not_freeze_new_turn(store, window):
+def test_normal_old_group_pruning_does_not_freeze_new_turn(agent_llm_enabled, store, window):
     first = o.Message('旧任务背景' + '文' * 11000, chat_id=-987654, user_id=92, message_id=100)
     first.reply_to_message = NS(text='字' * 2100, caption='', message_id=89, chat=first.chat)
     assert send(store, first)[0].status == 'success'
@@ -105,7 +106,7 @@ def test_normal_old_group_pruning_does_not_freeze_new_turn(store, window):
 
 
 @pytest.mark.parametrize('reference', [False, True])
-def test_late_unknown_capacity_failure_preserves_publication_facts(reference):
+def test_late_unknown_capacity_failure_preserves_publication_facts(agent_llm_enabled, reference):
     async def scenario():
         handled = []
         def read(arguments, context):

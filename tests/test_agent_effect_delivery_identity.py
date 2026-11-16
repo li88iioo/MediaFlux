@@ -18,6 +18,7 @@ from app.agent.kernel.session_guard import session_scope_guard
 from app.modules import telegram_notification_center as center
 from app.notifier import TelegramSendResult
 from app.repositories import telegram_notifications as notifications
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_continuation_delivery_handoff import (
     OWNER,
     ROUTE,
@@ -70,7 +71,7 @@ async def _case(tmp_path, *, legacy=False):
             yield store, row, delivery, script, reads
 
 
-def test_signed_legacy_receipt_is_bound_in_place_without_resetting_delivery_state(tmp_path):
+def test_signed_legacy_receipt_is_bound_in_place_without_resetting_delivery_state(agent_llm_enabled, tmp_path):
     async def run():
         async with _case(tmp_path, legacy=True) as (_store, row, delivery, _script, _reads):
             with db.get_conn() as conn:
@@ -102,7 +103,7 @@ def test_signed_legacy_receipt_is_bound_in_place_without_resetting_delivery_stat
 
 
 @pytest.mark.parametrize('changed', ['lease', 'revision', 'event_json', 'status'])
-def test_legacy_identity_cas_rejects_a_stale_claim_without_mutating_the_row(tmp_path, changed):
+def test_legacy_identity_cas_rejects_a_stale_claim_without_mutating_the_row(agent_llm_enabled, tmp_path, changed):
     async def run():
         async with _case(tmp_path, legacy=True) as (_store, row, delivery, _script, _reads):
             claimed, = notifications.claim_due_notifications(limit=1, event_key=row['event_key'])
@@ -127,7 +128,7 @@ def test_legacy_identity_cas_rejects_a_stale_claim_without_mutating_the_row(tmp_
 
 
 @pytest.mark.parametrize('damage', ['missing_seed', 'bad_cipher', 'seed_owner', 'seed_session', 'seed_plan', 'missing_route', 'signed_state', 'route'])
-def test_legacy_receipt_without_a_matching_trusted_seed_is_suppressed(tmp_path, damage):
+def test_legacy_receipt_without_a_matching_trusted_seed_is_suppressed(agent_llm_enabled, tmp_path, damage):
     async def run():
         async with _case(tmp_path, legacy=True) as (store, row, delivery, _script, _reads):
             if damage == 'signed_state':
@@ -170,7 +171,7 @@ def test_legacy_receipt_without_a_matching_trusted_seed_is_suppressed(tmp_path, 
     asyncio.run(run())
 
 
-def test_legacy_chat_only_seed_recovers_only_its_signed_owner_chat(tmp_path):
+def test_legacy_chat_only_seed_recovers_only_its_signed_owner_chat(agent_llm_enabled, tmp_path):
     async def run():
         async with _case(tmp_path, legacy=True) as (store, row, delivery, _script, _reads):
             def omit_old_origin_route(state):
@@ -198,7 +199,7 @@ def test_legacy_chat_only_seed_recovers_only_its_signed_owner_chat(tmp_path):
 
 
 @pytest.mark.parametrize('failure', ['database', 'session_lock'])
-def test_temporary_identity_check_failure_retries_without_sending_or_quarantining(tmp_path, failure):
+def test_temporary_identity_check_failure_retries_without_sending_or_quarantining(agent_llm_enabled, tmp_path, failure):
     async def run():
         async with _case(tmp_path) as (_store, row, _delivery, _script, _reads):
             with patch.object(center, 'send_event_result', return_value=TelegramSendResult(ok=True, message_id=883)) as sender:
@@ -220,7 +221,7 @@ def test_temporary_identity_check_failure_retries_without_sending_or_quarantinin
     asyncio.run(run())
 
 
-def test_unknown_first_effect_send_is_not_replayed_by_publish_or_recovery(tmp_path):
+def test_unknown_first_effect_send_is_not_replayed_by_publish_or_recovery(agent_llm_enabled, tmp_path):
     async def run():
         async with _case(tmp_path) as (_store, row, delivery, _script, _reads):
             event = center.deserialize_notification_event(row['event_json'])
@@ -241,7 +242,7 @@ def test_unknown_first_effect_send_is_not_replayed_by_publish_or_recovery(tmp_pa
     asyncio.run(run())
 
 
-def test_effect_outbox_ack_retry_preserves_one_row_and_sends_once(tmp_path):
+def test_effect_outbox_ack_retry_preserves_one_row_and_sends_once(agent_llm_enabled, tmp_path):
     async def run():
         async with _case(tmp_path) as (store, row, delivery, script, reads):
             def due(state):

@@ -9,10 +9,11 @@ from dataclasses import replace
 import pytest
 
 from app.agent.kernel.state_types import AgentInput
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_failed_effect_followup import case as case
 
 
-def test_confirmed_observation_source_is_private_scoped_and_not_a_new_user_default(case):
+def test_confirmed_observation_source_is_private_scoped_and_not_a_new_user_default(agent_llm_enabled, case):
     async def run():
         source = {
             "version": 1, "kind": "fixture_files", "owner": case.owner,
@@ -65,7 +66,7 @@ def test_confirmed_observation_source_is_private_scoped_and_not_a_new_user_defau
 
 
 @pytest.mark.parametrize("policy", ["availability", "authorize"])
-def test_saved_source_does_not_reexpose_a_hidden_or_unauthorized_read(case, policy):
+def test_saved_source_does_not_reexpose_a_hidden_or_unauthorized_read(agent_llm_enabled, case, policy):
     async def run():
         from app.agent.kernel.events import AgentEventType
         from tests.test_agent_failed_effect_followup import READ

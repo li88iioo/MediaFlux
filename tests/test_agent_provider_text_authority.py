@@ -28,6 +28,7 @@ from app.agent.public_view import (
 )
 from tests import test_agent_provider_state as fixtures
 from tests.test_agent_provider_state import REDACTED, SIGNATURE, THINKING, WireClient
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 FALSE_CLAIM = "文件已全部归档完成，可以删除源文件。"
 
@@ -132,7 +133,7 @@ def native_reply(protocol, text="", *, call_name="", private=True, state_tag="")
 @pytest.mark.parametrize(
     "protocol", ["anthropic_messages", "responses", "chat_completions"]
 )
-def test_confirmed_receipt_is_authoritative_after_sqlite_restore(protocol):
+def test_confirmed_receipt_is_authoritative_after_sqlite_restore(agent_llm_enabled, protocol):
     import asyncio
 
     async def scenario():
@@ -331,7 +332,7 @@ def stream_reply(protocol, reply):
 
 @pytest.mark.parametrize("protocol", ["anthropic_messages", "responses"])
 @pytest.mark.parametrize("streamed", [False, True])
-def test_unchanged_multiblock_tool_order_survives_sqlite_restore(protocol, streamed):
+def test_unchanged_multiblock_tool_order_survives_sqlite_restore(agent_llm_enabled, protocol, streamed):
     import asyncio
 
     async def scenario():
@@ -445,7 +446,7 @@ def test_final_text_projection_never_uses_a_stale_slot(protocol, trusted, origin
 
 @pytest.mark.parametrize("protocol", ["anthropic_messages", "responses"])
 @pytest.mark.parametrize("correction", ["redaction", "submitted", "partial"])
-def test_changed_native_tool_text_fails_closed_without_touching_opaque(protocol, correction):
+def test_changed_native_tool_text_fails_closed_without_touching_opaque(agent_llm_enabled, protocol, correction):
     import asyncio
 
     async def scenario():
@@ -506,7 +507,7 @@ def test_changed_native_tool_text_fails_closed_without_touching_opaque(protocol,
 
 @pytest.mark.parametrize("protocol", ["anthropic_messages", "responses"])
 @pytest.mark.parametrize("status", ["submitted", "partial"])
-def test_legacy_checkpoint_replays_trusted_receipt_not_layout_copy(protocol, status):
+def test_legacy_checkpoint_replays_trusted_receipt_not_layout_copy(agent_llm_enabled, protocol, status):
     """Old-format checkpoint from a real adapter, not a hand-built private state.
 
     Partial confirmation currently short-circuits without calling the model.

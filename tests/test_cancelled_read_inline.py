@@ -21,6 +21,7 @@ from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput, StalePublicationError
 from tests.support import isolated_test_database
 from tests.test_agent_kernel_core import ScriptedModel
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 READ_TOOL = KernelToolSpec(name="library.inspect", domain="library", description="inspect",
     effect=ToolEffect.READ, input_schema={"type": "object"}, read=lambda arguments: arguments)
@@ -183,7 +184,7 @@ def test_small_cancelled_fact_real_consumer():
         asyncio.run(run())
 
 
-def test_native_cold_followup():
+def test_native_cold_followup(agent_llm_enabled):
     from tests.test_agent_started_checkpoint import (
         OWNER,
         SESSION,

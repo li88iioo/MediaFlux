@@ -14,13 +14,14 @@ from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolResult
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_returned_limit_progress import A, X, scenario, store  # noqa: F401
 from tests.test_agent_tool_argument_ingress import Wire
 
 
 @pytest.mark.parametrize("private", [False, True])
-def test_session_cold_audit_and_public_consumers(store, private):  # noqa: F811 - imported pytest fixture injection
+def test_session_cold_audit_and_public_consumers(agent_llm_enabled, store, private):  # noqa: F811 - imported pytest fixture injection
     async def exercise():
         detail = "/srv/private/audit-file" if private else "safe-detail"
         value = ToolResult(True, "success", detail, data={**({"internal_id": "private-row"} if private else {}), "title": "safe-title"})
@@ -48,7 +49,7 @@ def test_session_cold_audit_and_public_consumers(store, private):  # noqa: F811 
     asyncio.run(exercise())
 
 
-def test_credentials_redacted_in_cold_audit_and_all_result_views(store):  # noqa: F811 - imported pytest fixture injection
+def test_credentials_redacted_in_cold_audit_and_all_result_views(agent_llm_enabled, store):  # noqa: F811 - imported pytest fixture injection
     async def exercise():
         raw = {"ok": True, "status": "success", "summary": "safe-summary", "data": {
             "title": "safe-title", "path": "/srv/private/audit-file", "internal_id": "private-row",

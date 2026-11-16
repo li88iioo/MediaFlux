@@ -18,6 +18,7 @@ from tests.test_agent_tool_argument_ingress import Wire, observe
 from tests.test_agent_tool_argument_ingress import offline as offline
 from tests.test_agent_tool_argument_ingress import store as store
 from tests.test_agent_tool_argument_repair_replay import make_session
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 P = 'anthropic_messages'
 PRIVATE = {'type': 'thinking', 'thinking': ' synthetic-private-STUDY\n',
@@ -59,7 +60,7 @@ def payload(mode, blocks):
 @pytest.mark.parametrize('value', [MISSING, None, '', '   ', 123, '\ud800'],
                          ids=['missing', 'null', 'empty', 'blank', 'number', 'surrogate'])
 @pytest.mark.parametrize('bad_first', [True, False])
-def test_invalid_original_identity_rejects_complete_batch(mode, field, value, bad_first):
+def test_invalid_original_identity_rejects_complete_batch(agent_llm_enabled, mode, field, value, bad_first):
     bad = block(cid=value) if field == 'id' else block(name=value)
     good = block('call-good', value={'query': 'safe'})
     seen, error = asyncio.run(observe(P, payload(mode, [bad, good] if bad_first else [good, bad])))
@@ -80,7 +81,7 @@ def test_invalid_original_identity_rejects_complete_batch(mode, field, value, ba
 
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
-def test_duplicate_native_ids_with_distinct_arguments_never_finish(mode):
+def test_duplicate_native_ids_with_distinct_arguments_never_finish(agent_llm_enabled, mode):
     seen, error = asyncio.run(observe(P, payload(mode, [
         block('same', value={'query': 'first'}), block('same', value={'query': 'different'})])))
     assert isinstance(error, ModelProviderError)
@@ -97,7 +98,7 @@ def test_duplicate_native_ids_with_distinct_arguments_never_finish(mode):
         assert not any(event.tool_call for event in seen)
 
 
-def test_repeated_sse_block_index_cannot_replace_original_identity():
+def test_repeated_sse_block_index_cannot_replace_original_identity(agent_llm_enabled):
     data, kind = payload('sse', [block('same', value={'query': 'first'}),
                                  block('same', value={'query': 'different'})])
     frames = [json.loads(line[6:]) for line in data.decode().splitlines() if line.startswith('data: ')]
@@ -118,7 +119,7 @@ def test_repeated_sse_block_index_cannot_replace_original_identity():
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
 @pytest.mark.parametrize('cid,name', [('调用-原始', '查找'), ('  native-id  ', '  lookup  ')])
-def test_valid_identity_and_private_layout_are_exact(mode, cid, name):
+def test_valid_identity_and_private_layout_are_exact(agent_llm_enabled, mode, cid, name):
     seen, error = asyncio.run(observe(P, payload(mode, [block(cid, name)])))
     assert error is None
     call = next(event.tool_call for event in seen if event.tool_call)
@@ -132,7 +133,7 @@ def test_valid_identity_and_private_layout_are_exact(mode, cid, name):
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
 @pytest.mark.parametrize('kind', ['invalid-late', 'surrogate-name', 'duplicate'])
-def test_real_session_buffers_rejected_batch_without_history_or_execution(mode, kind, store, tmp_path):
+def test_real_session_buffers_rejected_batch_without_history_or_execution(agent_llm_enabled, mode, kind, store, tmp_path):
     async def run():
         good = block('first', value={'query': 'safe'})
         bad = (block(None) if kind == 'invalid-late' else block('second', '\ud800')
@@ -153,7 +154,7 @@ def test_real_session_buffers_rejected_batch_without_history_or_execution(mode, 
 
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
-def test_schema_error_cold_repair_preserves_native(mode, store, tmp_path):
+def test_schema_error_cold_repair_preserves_native(agent_llm_enabled, mode, store, tmp_path):
     async def run():
         executed = []
         first = Wire(P, [payload(mode, [block()])])
@@ -213,7 +214,7 @@ def test_schema_error_cold_repair_preserves_native(mode, store, tmp_path):
 
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
-def test_schema_errors_obey_existing_tool_budget(mode, store):
+def test_schema_errors_obey_existing_tool_budget(agent_llm_enabled, mode, store):
     async def run():
         executed = []
         wire = Wire(P, [payload(mode, [block(f'call-{index}')]) for index in range(3)])
@@ -242,7 +243,7 @@ def test_schema_errors_obey_existing_tool_budget(mode, store):
 
 
 @pytest.mark.parametrize('mode', ['json', 'sse'])
-def test_unknown_tool_keeps_availability_boundary_without_schema_disclosure(mode, store):
+def test_unknown_tool_keeps_availability_boundary_without_schema_disclosure(agent_llm_enabled, mode, store):
     async def run():
         executed = []
         wire = Wire(P, [payload(mode, [block(name='not_loaded')]), FINAL])

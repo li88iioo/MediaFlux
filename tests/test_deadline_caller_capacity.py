@@ -2,6 +2,7 @@
 import asyncio
 
 from tests.test_deadline_answer_evidence import EXPLANATION, SUMMARY, AgentInput, AgentSession, InMemorySessionStateStore, KernelToolSpec, ModelEvent, ModelEventType, ModelToolCall, PreparedEffect, ScriptedModel, ToolCatalog, ToolEffect, ToolPipeline, consume_events
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def test_normal_submitted_read_answer_preserves_trusted_scope_once():
@@ -46,7 +47,7 @@ def test_normal_submitted_read_answer_preserves_trusted_scope_once():
     asyncio.run(scenario())
 
 
-def test_memory_unknown_checkpoint_with_supported_no_journal(monkeypatch):
+def test_memory_unknown_checkpoint_with_supported_no_journal(agent_llm_enabled, monkeypatch):
     from tests import test_agent_capacity_recovery as cases
     original = cases.active
 
@@ -58,5 +59,5 @@ def test_memory_unknown_checkpoint_with_supported_no_journal(monkeypatch):
 
     monkeypatch.setattr(cases, "active", active)
     cases.test_cold_explanation_preserves_unknown_across_generations_and_new_read(
-        "memory", "chat_completions", True,
+        agent_llm_enabled, "memory", "chat_completions", True,
     )

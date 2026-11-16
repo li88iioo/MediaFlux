@@ -7,6 +7,7 @@ import pytest
 
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.session import SessionLimits
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_capacity_recovery import (
     assert_native_wire,
@@ -30,7 +31,7 @@ def catalog_for(handled):
     return ToolCatalog([replace(spec('inspect_args',handler),input_schema={'type':'object','additionalProperties':True})])
 
 @pytest.mark.parametrize('prefix',[False,True])
-def test_native_capacity_rejection_does_not_execute_or_erase_prefix(prefix):
+def test_native_capacity_rejection_does_not_execute_or_erase_prefix(agent_llm_enabled, prefix):
     async def run():
         handled=[]; cat=catalog_for(handled)
         prior=[('prior','inspect_args',{'ordinal':0})] if prefix else []
@@ -54,7 +55,7 @@ def test_native_capacity_rejection_does_not_execute_or_erase_prefix(prefix):
     with isolated_test_database(): asyncio.run(run())
 
 
-def test_large_native_signature_is_exact_when_admitted_and_old_group_drops_whole():
+def test_large_native_signature_is_exact_when_admitted_and_old_group_drops_whole(agent_llm_enabled):
     async def run():
         from app.agent.kernel.conversation_state import retain_conversation
         handled=[]; cat=catalog_for(handled)
@@ -73,7 +74,7 @@ def test_large_native_signature_is_exact_when_admitted_and_old_group_drops_whole
     with isolated_test_database(): asyncio.run(run())
 
 
-def test_duplicate_native_batch_rejected_before_append_preserves_valid_pair():
+def test_duplicate_native_batch_rejected_before_append_preserves_valid_pair(agent_llm_enabled):
     async def run():
         handled=[]; cat=catalog_for(handled)
         prior=[('duplicate','inspect_args',{'ordinal':0})]

@@ -29,6 +29,7 @@ from tests.test_agent_continuation_delivery_lifecycle import (
 )
 from tests.test_agent_continuation_telegram import NativeBotFixture
 from tests.test_agent_waiting_delivery import OWNER, ROUTE, SID
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 pytestmark = pytest.mark.usefixtures("tg_config")
 
@@ -154,7 +155,7 @@ def test_present_invalid_signed_lifecycle_is_rejected_instead_of_legacy_fallback
 
 
 @pytest.mark.parametrize("field", ["delivery_id", "lifecycle_id", "version"])
-def test_new_unbound_identity_suppresses_entire_group_without_legacy_fallback(bot, field):
+def test_new_unbound_identity_suppresses_entire_group_without_legacy_fallback(agent_llm_enabled, bot, field):
     async def exercise():
         await _enqueue([100], "分段核验事实。" * 1800)
         before = _rows()
@@ -170,7 +171,7 @@ def test_new_unbound_identity_suppresses_entire_group_without_legacy_fallback(bo
     asyncio.run(exercise())
 
 
-def test_tampered_signed_lifecycle_suppresses_every_unsent_part(bot):
+def test_tampered_signed_lifecycle_suppresses_every_unsent_part(agent_llm_enabled, bot):
     async def exercise():
         await _enqueue([100], "签名边界核验事实。" * 1400)
         with db.get_conn() as conn:
@@ -182,7 +183,7 @@ def test_tampered_signed_lifecycle_suppresses_every_unsent_part(bot):
     asyncio.run(exercise())
 
 
-def test_temporary_signed_read_failure_retries_and_does_not_starve_other_group(bot):
+def test_temporary_signed_read_failure_retries_and_does_not_starve_other_group(agent_llm_enabled, bot):
     async def exercise():
         await _enqueue([100], "第一份事实。")
         with patch("tests.test_agent_waiting_delivery.SID", "independent-delivery"):
@@ -209,7 +210,7 @@ def test_temporary_signed_read_failure_retries_and_does_not_starve_other_group(b
     asyncio.run(exercise())
 
 
-def test_legacy_group_is_bound_from_retained_signed_source_and_preserves_sent_prefix(bot):
+def test_legacy_group_is_bound_from_retained_signed_source_and_preserves_sent_prefix(agent_llm_enabled, bot):
     async def exercise():
         runtime, _, _ = await _enqueue([100], "旧格式中的完整媒体事实。" * 1400)
         assert await asyncio.to_thread(center.drain_telegram_notifications, limit=1)
@@ -254,7 +255,7 @@ def test_legacy_group_is_bound_from_retained_signed_source_and_preserves_sent_pr
 
 
 @pytest.mark.parametrize("failure", ["temporary_db", "snapshot_changed"])
-def test_legacy_normalization_not_completed_retries_without_blocking_other_groups(bot, failure):
+def test_legacy_normalization_not_completed_retries_without_blocking_other_groups(agent_llm_enabled, bot, failure):
     async def exercise():
         await _enqueue([100], "待归一的真实事实。")
         _change_parts(_legacy_parts)
@@ -290,7 +291,7 @@ def test_legacy_normalization_not_completed_retries_without_blocking_other_group
     asyncio.run(exercise())
 
 
-def test_actual_session_lock_busy_is_retryable_before_any_bot_call(bot):
+def test_actual_session_lock_busy_is_retryable_before_any_bot_call(agent_llm_enabled, bot):
     async def exercise():
         await _enqueue([100], "被同会话操作暂时阻挡的事实。")
         with patch("tests.test_agent_waiting_delivery.SID", "independent-delivery"):
@@ -309,7 +310,7 @@ def test_actual_session_lock_busy_is_retryable_before_any_bot_call(bot):
     asyncio.run(exercise())
 
 
-def test_legacy_group_can_bind_from_canonical_delivery_after_original_task_is_replaced(bot):
+def test_legacy_group_can_bind_from_canonical_delivery_after_original_task_is_replaced(agent_llm_enabled, bot):
     from tests.test_agent_continuation_delivery_handoff import _completed_read, _handoff, _next_task
 
     async def exercise():
@@ -331,7 +332,7 @@ def test_legacy_group_can_bind_from_canonical_delivery_after_original_task_is_re
     asyncio.run(exercise())
 
 
-def test_real_effect_legacy_group_binds_from_signed_sealed_origin(tmp_path, bot):
+def test_real_effect_legacy_group_binds_from_signed_sealed_origin(agent_llm_enabled, tmp_path, bot):
     from tests.test_agent_continuation_delivery_handoff import _completed_effect, _handoff
 
     async def exercise():
@@ -359,7 +360,7 @@ def test_real_effect_legacy_group_binds_from_signed_sealed_origin(tmp_path, bot)
     asyncio.run(exercise())
 
 
-def test_legacy_group_without_retained_source_is_isolated_without_rebinding(bot):
+def test_legacy_group_without_retained_source_is_isolated_without_rebinding(agent_llm_enabled, bot):
     from tests.test_agent_continuation_delivery_handoff import _completed_read, _handoff, _next_task
 
     async def exercise():
@@ -379,7 +380,7 @@ def test_legacy_group_without_retained_source_is_isolated_without_rebinding(bot)
 
 
 @pytest.mark.parametrize("changed", ["lease", "revision"])
-def test_stale_claim_cannot_suppress_or_rebind_group(changed, bot):
+def test_stale_claim_cannot_suppress_or_rebind_group(agent_llm_enabled, changed, bot):
     async def exercise():
         await _enqueue([100], "并发分段事实。" * 1800)
         claim, = notifications.claim_due_notifications(limit=1)
@@ -397,7 +398,7 @@ def test_stale_claim_cannot_suppress_or_rebind_group(changed, bot):
     asyncio.run(exercise())
 
 
-def test_group_suppression_preserves_unknown_sent_and_other_sender(bot):
+def test_group_suppression_preserves_unknown_sent_and_other_sender(agent_llm_enabled, bot):
     async def exercise():
         await _enqueue([100], "独立回执和结果未知都要保留。" * 1800)
         rows = _rows()
@@ -445,7 +446,7 @@ def _process_drain(db_path, secret, pipe):
 
 @pytest.mark.parametrize("operation", ["reset", "delete"])
 @pytest.mark.parametrize("first", ["send", "lifecycle"])
-def test_cross_process_actual_send_and_lifecycle_have_one_lock_boundary(bot, operation, first):
+def test_cross_process_actual_send_and_lifecycle_have_one_lock_boundary(agent_llm_enabled, bot, operation, first):
     async def exercise():
         runtime, _, _ = await _enqueue([100])
         if first == "lifecycle":
@@ -484,7 +485,7 @@ def test_cross_process_actual_send_and_lifecycle_have_one_lock_boundary(bot, ope
     asyncio.run(exercise())
 
 
-def test_event_journal_eviction_does_not_revoke_queued_fact(bot):
+def test_event_journal_eviction_does_not_revoke_queued_fact(agent_llm_enabled, bot):
     async def exercise():
         runtime, _, _ = await _enqueue([100])
         before = await runtime.store.load(owner=OWNER, session_id=SID)

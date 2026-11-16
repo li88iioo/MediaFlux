@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app import config
 from app.agent.kernel.model import ModelEvent, ModelEventType
 from app.agent.kernel.provider_model import ProviderSettings
 from app.modules import telegram_topic_routing as routing
@@ -71,6 +72,7 @@ class TelegramTopicNamingTests(IsolatedDatabaseTestCase):
 
     def setUp(self):
         super().setUp()
+        self.enterContext(patch.dict(config._SYSTEM_ENV_SNAPSHOT, {'AGENT_LLM_ENABLED': '1'}))
         set_topic_mode(self.owner, True)
 
     def _record_implicit(self, thread_id=901):

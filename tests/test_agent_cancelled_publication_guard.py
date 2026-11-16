@@ -24,6 +24,7 @@ from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire
 from tests.test_agent_tool_argument_ingress import offline as offline  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import store as store  # noqa: PLC0414
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class HeldWire(Wire):
@@ -96,7 +97,7 @@ async def last_turn(session):
 @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
 @pytest.mark.parametrize("operation", ["reset", "delete", "new-user"])
 @pytest.mark.parametrize("kind", ["ordinary", "confirmation"])
-def test_old_cancellation_cannot_replace_new_public_terminal(rig, protocol, cold, operation, kind):
+def test_old_cancellation_cannot_replace_new_public_terminal(agent_llm_enabled, rig, protocol, cold, operation, kind):
     async def run():
         source, wire, task, _ = await held_turn(rig, protocol, kind, defer_cancel=True)
         try:
@@ -124,7 +125,7 @@ def test_old_cancellation_cannot_replace_new_public_terminal(rig, protocol, cold
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("kind", ["ordinary", "confirmation"])
 @pytest.mark.parametrize("mode", ["complete", "user-cancel", "task-cancel", "other-reset"])
-def test_current_completion_and_real_cancellation_keep_their_journal(rig, protocol, kind, mode):
+def test_current_completion_and_real_cancellation_keep_their_journal(agent_llm_enabled, rig, protocol, kind, mode):
     async def run():
         source, wire, task, request_id = await held_turn(rig, protocol, kind)
         try:
@@ -155,7 +156,7 @@ def test_current_completion_and_real_cancellation_keep_their_journal(rig, protoc
 @pytest.mark.parametrize("phase", ["before-transaction", "after-transaction"])
 @pytest.mark.parametrize("operation", ["reset", "delete", "new-user"])
 @pytest.mark.parametrize("kind", ["ordinary", "confirmation"])
-def test_cancel_journal_rechecks_authority_at_the_sqlite_transaction(rig, phase, operation, kind):
+def test_cancel_journal_rechecks_authority_at_the_sqlite_transaction(agent_llm_enabled, rig, phase, operation, kind):
     async def run():
         source, wire, task, request_id = await held_turn(rig, "chat_completions", kind)
         entered, release = threading.Event(), threading.Event()

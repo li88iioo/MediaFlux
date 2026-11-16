@@ -12,13 +12,15 @@ import telebot
 
 from app import config
 from app import database as db
-from app.agent.model_catalog import provider_channel_fingerprint
+from app.agent.errors import ToolPipelineError
 from app.agent.kernel import bootstrap
+from app.agent.kernel.model import ModelRequest
 from app.agent.kernel.provider_model import (
     OpenAICompatibleModelAdapter,
     ProviderSettings,
 )
-from app.agent.kernel.state_types import AgentInput
+from app.agent.kernel.state_types import AgentInput, CancellationToken
+from app.agent.model_catalog import provider_channel_fingerprint
 from app.bot import agent_adapter
 from app.modules import telegram_model_preferences as prefs
 from tests import test_agent_generation_profiles as profile_support
@@ -31,6 +33,96 @@ Wire = profile_support.Wire
 BASE = profile_support.BASE
 
 MODEL = 'tenant/opaque-alias'
+
+
+@pytest.mark.parametrize('protocol', profile_support.PROTOCOLS)
+def test_model_switch_is_fresh_inside_retained_snapshot(local_config, monkeypatch, protocol):
+    config.set_and_save({'AGENT_LLM_PROTOCOL': protocol})
+    wire = Wire()
+    handler = wire.handler
+    async def close_in_flight(request):
+        response = await handler(request)
+        config.set_and_save({'AGENT_LLM_ENABLED': '0'})
+        return response
+    wire.handler = close_in_flight
+    adapter = OpenAICompatibleModelAdapter(ProviderSettings.from_config(), client_factory=wire.factory)
+    snapshot = config.capture_runtime_config_snapshot()
+
+    async def request():
+        return [e async for e in adapter.stream(
+            ModelRequest(system_prompt='offline', messages=(), tools=()), cancellation=CancellationToken())]
+
+    events = asyncio.run(request())
+    assert events[-1].type.value == 'finish'  # 已发出的请求正常收尾。
+    with config.use_runtime_config_snapshot(snapshot):
+        assert config.get_bool('AGENT_LLM_ENABLED') is True
+        with pytest.raises(ToolPipelineError) as denied:
+            asyncio.run(request())
+        assert denied.value.code == 'model_disabled'
+        assert len(wire.requests) == 1
+        # Deployment overrides remain authoritative even inside an old context.
+        monkeypatch.setitem(config._SYSTEM_ENV_SNAPSHOT, 'AGENT_LLM_ENABLED', '1')
+        asyncio.run(request())
+        assert len(wire.requests) == 2
+    assert all(c._client.is_closed for c in wire.clients)
+
+
+@pytest.mark.parametrize('boundary', ['default', 'first', 'retry', 'fallback'])
+def test_model_switch_blocks_next_http_attempt(local_config, boundary):
+    from tests import test_agent_protocol_fallback as protocol
+
+    async def close_during_retry(_delay):
+        config.set_and_save({'AGENT_LLM_ENABLED': '0'})
+
+    close = protocol.Body.aclose
+    async def close_after_response(body):
+        await close(body)
+        config.set_and_save({'AGENT_LLM_ENABLED': '0'})
+
+    if boundary == 'default':
+        config.write_env_file(local_config, {}, replace=True)
+        result = protocol.wire([])
+    elif boundary == 'first':
+        config.set_and_save({'AGENT_LLM_ENABLED': '0'})
+        result = protocol.wire([])
+    elif boundary == 'retry':
+        result = protocol.wire([protocol.http_error(503, 'unavailable'), None], sleep=close_during_retry)
+    else:
+        with patch.object(protocol.Body, 'aclose', close_after_response):
+            result = protocol.wire([protocol.http_error(), None])
+    assert isinstance(result['error'], ToolPipelineError)
+    assert result['error'].code == 'model_disabled'
+    assert len(result['requests']) == (0 if boundary in {'default', 'first'} else 1)
+
+
+def test_disabled_model_preserves_default_topic_and_naming_eligibility(local_config):
+    from app.modules import telegram_topic_routing as routing
+    from tests.test_telegram_topic_naming import _FakeBot, _event_message
+
+    owner = 'tg:v1:501\x1f501'
+    routing.set_topic_mode(owner, True)
+    routing.record_private_topic_service_message(owner, _event_message(
+        created=SimpleNamespace(is_name_implicit=True)))
+    key = routing._topic_naming_key(owner, 501, 901)
+    bot, wire = _FakeBot(), Wire('电影推荐')
+    snapshot = config.capture_runtime_config_snapshot()
+
+    def name():
+        return asyncio.run(routing.auto_name_private_topic(bot, owner=owner, session_id='topic',
+            chat_id=501, chat_type='private', thread_id=901, topic_open=True, first_user_message='推荐电影'))
+
+    config.set_and_save({'AGENT_LLM_ENABLED': '0'})
+    with patch.dict(OpenAICompatibleModelAdapter.__init__.__kwdefaults__, client_factory=wire.factory):
+        with config.use_runtime_config_snapshot(snapshot), patch.object(ProviderSettings, 'from_config') as settings:
+            assert name() is False
+            settings.assert_not_called()
+        assert wire.requests == bot.edits == []
+        assert routing._topic_naming_status(key) == 'eligible'
+        config.set_and_save({'AGENT_LLM_ENABLED': '1'})
+        assert name() is True
+    assert len(wire.requests) == len(bot.edits) == 1
+    assert bot.edits[0]['name'] == '电影推荐'
+    assert routing._topic_naming_status(key) == 'auto'
 
 
 @pytest.fixture

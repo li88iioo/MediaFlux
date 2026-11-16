@@ -41,6 +41,7 @@ from app.agent.models import ToolResult
 from app.agent.owner_routes import web_kernel_owner
 from tests.support import initialized_web_runtime
 from tests.test_agent_task_first_slice import OWNER, NativeScript
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 READ = "library.observe_fixture"
 WRITE = "library.rename_observed_fixture"
@@ -348,7 +349,7 @@ def case(tmp_path, monkeypatch, request):
 
 @pytest.mark.parametrize("mode", ["snapshot_changed", "reference_ttl"])
 @pytest.mark.parametrize("direct_write_first", [False, True], ids=["read-first", "reject-direct-write"])
-def test_stale_confirmation_reobserves_then_requires_new_card_and_new_confirmation(case, mode, direct_write_first):
+def test_stale_confirmation_reobserves_then_requires_new_card_and_new_confirmation(agent_llm_enabled, case, mode, direct_write_first):
     async def run():
         followup = (["preview_old"] if direct_write_first else []) + ["read_new", "preview_new", "finish"]
         case.build(followup)
@@ -395,7 +396,7 @@ def test_stale_confirmation_reobserves_then_requires_new_card_and_new_confirmati
 
 
 @pytest.mark.parametrize("mode", ["snapshot_changed", "reference_ttl"])
-def test_failed_reobservation_does_not_unlock_new_preview(case, mode):
+def test_failed_reobservation_does_not_unlock_new_preview(agent_llm_enabled, case, mode):
     async def run():
         case.build(["read_new", "preview_old", "finish"])
         old = await case.preview()
@@ -416,7 +417,7 @@ def test_failed_reobservation_does_not_unlock_new_preview(case, mode):
 
 
 @pytest.mark.parametrize("mode", ["snapshot_changed", "reference_ttl"])
-def test_stale_confirmation_without_original_user_never_fabricates_goal(case, mode):
+def test_stale_confirmation_without_original_user_never_fabricates_goal(agent_llm_enabled, case, mode):
     async def run():
         case.build(["read_new", "preview_new"])
         case.script.steps = ["read_new", "preview_new"]
@@ -445,7 +446,7 @@ def test_stale_confirmation_without_original_user_never_fabricates_goal(case, mo
 
 
 @pytest.mark.parametrize("boundary", ["foreign_owner", "credential_rotated", "cancelled", "permission_revoked", "agent_disabled"])
-def test_security_or_cancelled_ticket_never_starts_reobservation(case, boundary):
+def test_security_or_cancelled_ticket_never_starts_reobservation(agent_llm_enabled, case, boundary):
     async def run():
         if boundary == "permission_revoked":
             case.owner = "tg:v1:12345\x1f67890"

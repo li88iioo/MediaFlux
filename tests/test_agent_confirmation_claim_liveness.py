@@ -12,9 +12,10 @@ from tests.test_agent_effect_continuation import FollowScript, OWNER, SID, _read
 from tests.test_agent_kernel_core import collect
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import Wire
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
-def test_pending_effect_wait_cannot_claim_a_live_direct_confirmation_tail(tmp_path):
+def test_pending_effect_wait_cannot_claim_a_live_direct_confirmation_tail(agent_llm_enabled, tmp_path):
     async def scenario():
         async with _ready_case(tmp_path) as (store, original, client, reads, stack, _users):
             held, release = asyncio.Event(), asyncio.Event()

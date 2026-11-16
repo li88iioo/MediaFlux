@@ -23,6 +23,7 @@ from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.state_types import AgentInput, CancellationToken
 from app.clients.http import FixedHostHttpClient
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_protocol_fallback import (
     PROTOCOL_PATHS,
     SECRET,
@@ -163,7 +164,7 @@ def session_wire(actions, *, protocol='responses', deadline=60):
 
 @pytest.mark.parametrize('fault_type', [httpx.ReadTimeout, httpx.ReadError])
 @pytest.mark.parametrize('protocol', PROTOCOLS)
-def test_text_delta_transport_failure_is_model_error_and_never_retried(protocol, fault_type, caplog):
+def test_text_delta_transport_failure_is_model_error_and_never_retried(agent_llm_enabled, protocol, fault_type, caplog):
     fault = fault_type(FAULT_TEXT)
     result = wire([partial_sse(protocol, fault=fault), None], configured=protocol, api_url=RAW_URL)
     assert protocols(result) == [protocol]
@@ -181,7 +182,7 @@ def test_text_delta_transport_failure_is_model_error_and_never_retried(protocol,
     (httpx.WriteTimeout, 'write_timeout'), (httpx.PoolTimeout, 'pool_timeout'),
     (httpx.ConnectError, 'connection_error'), (httpx.ReadError, 'transport_error'),
 ])
-def test_failure_before_headers_retains_retry_budget_and_has_diagnostic(fault_type, kind):
+def test_failure_before_headers_retains_retry_budget_and_has_diagnostic(agent_llm_enabled, fault_type, kind):
     fault = fault_type(FAULT_TEXT)
     result = wire([fault], api_url=RAW_URL)
     assert protocols(result) == ['responses', 'responses'] and not result['events']
@@ -195,7 +196,7 @@ def test_failure_before_headers_retains_retry_budget_and_has_diagnostic(fault_ty
         assert timeout.read == timeout.write == timeout.pool == 30
 
 
-def test_error_response_body_read_timeout_retains_http_status_and_transport_kind():
+def test_error_response_body_read_timeout_retains_http_status_and_transport_kind(agent_llm_enabled):
     result = wire([http_error(404, fault=httpx.ReadTimeout(FAULT_TEXT)), None], api_url=RAW_URL)
     assert protocols(result) == ['responses'] and not result['events']
     assert_failure(result, kind='read_timeout', phase='response', protocol='responses',
@@ -204,7 +205,7 @@ def test_error_response_body_read_timeout_retains_http_status_and_transport_kind
 
 @pytest.mark.parametrize('data', [b'{"output":', b'\xff'], ids=['malformed_json', 'invalid_utf8'])
 @pytest.mark.parametrize('configured', [*PROTOCOLS, 'auto'])
-def test_nonstream_decode_failure_retains_invalid_format_error(configured, data):
+def test_nonstream_decode_failure_retains_invalid_format_error(agent_llm_enabled, configured, data):
     prefix = [http_error(404)] if configured == 'auto' else []
     expected_protocols = ['responses', 'chat_completions'] if prefix else [configured]
     result = wire([*prefix, {'status': 200, 'data': data}], configured=configured, api_url=RAW_URL)
@@ -222,7 +223,7 @@ def test_nonstream_decode_failure_retains_invalid_format_error(configured, data)
 
 
 @pytest.mark.parametrize('fault_type', [httpx.ReadTimeout, httpx.ReadError])
-def test_real_session_partial_stream_has_model_provider_error_public_final(fault_type, caplog):
+def test_real_session_partial_stream_has_model_provider_error_public_final(agent_llm_enabled, fault_type, caplog):
     result = session_wire([partial_sse('responses', fault=fault_type(FAULT_TEXT)), None])
     assert protocols(result) == ['responses']
     assert any(event.type is AgentEventType.MODEL_DELTA and event.payload['delta'] == VISIBLE
@@ -238,7 +239,7 @@ def test_real_session_partial_stream_has_model_provider_error_public_final(fault
     assert_safe(json.dumps(result['public_events'], ensure_ascii=False), json.dumps(final, ensure_ascii=False), caplog.text)
 
 
-def test_failure_contract_is_frozen_safe_fields_and_local_errors_default_to_none():
+def test_failure_contract_is_frozen_safe_fields_and_local_errors_default_to_none(agent_llm_enabled):
     assert pm.ModelProviderError('本地校验失败').failure is None
     result = wire([httpx.ReadTimeout(FAULT_TEXT)])
     failure = assert_failure(result, kind='read_timeout', phase='request', protocol='responses',
@@ -248,7 +249,7 @@ def test_failure_contract_is_frozen_safe_fields_and_local_errors_default_to_none
 
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
-def test_read_timeout_after_headers_before_output_retries_same_native_request(protocol):
+def test_read_timeout_after_headers_before_output_retries_same_native_request(agent_llm_enabled, protocol):
     result = wire([
         {'status': 200, 'data': b'', 'headers': {'content-type': 'text/event-stream'},
              'fault': httpx.ReadTimeout(FAULT_TEXT)},
@@ -262,7 +263,7 @@ def test_read_timeout_after_headers_before_output_retries_same_native_request(pr
 @pytest.mark.parametrize('prefix', [
     [http_error(404)], [http_error(503), http_error(404)],
 ], ids=['fallback', 'retry_then_fallback'])
-def test_failure_attempts_count_all_real_http_requests_across_fallback(prefix):
+def test_failure_attempts_count_all_real_http_requests_across_fallback(agent_llm_enabled, prefix):
     result = wire([*prefix, httpx.ReadTimeout(FAULT_TEXT)], api_url=RAW_URL)
     assert protocols(result) == ['responses'] * len(prefix) + ['chat_completions'] * 2
     assert result['requests'][-1]['body'] == result['requests'][-2]['body']
@@ -271,7 +272,7 @@ def test_failure_attempts_count_all_real_http_requests_across_fallback(prefix):
                    attempts=len(prefix) + 2, emitted=False)
 
 
-def test_partial_chat_timeout_after_fallback_cannot_replay_or_add_a_request():
+def test_partial_chat_timeout_after_fallback_cannot_replay_or_add_a_request(agent_llm_enabled):
     result = wire([http_error(404), partial_sse('chat_completions', fault=httpx.ReadTimeout(FAULT_TEXT)), None],
                   api_url=RAW_URL)
     assert protocols(result) == ['responses', 'chat_completions']
@@ -280,7 +281,7 @@ def test_partial_chat_timeout_after_fallback_cannot_replay_or_add_a_request():
                    attempts=2, emitted=True, http_status=200)
 
 
-def test_pre_output_transport_retry_can_still_recover_without_diagnostic_failure():
+def test_pre_output_transport_retry_can_still_recover_without_diagnostic_failure(agent_llm_enabled):
     result = wire([httpx.ReadTimeout(FAULT_TEXT), None], api_url=RAW_URL)
     assert protocols(result) == ['responses', 'responses']
     assert result['requests'][0]['body'] == result['requests'][1]['body']
@@ -290,7 +291,7 @@ def test_pre_output_transport_retry_can_still_recover_without_diagnostic_failure
 
 
 @pytest.mark.parametrize('emitted', [False, True], ids=['before_text', 'after_text'])
-def test_real_stream_deadline_is_distinct_from_read_timeout_and_never_retried(emitted):
+def test_real_stream_deadline_is_distinct_from_read_timeout_and_never_retried(agent_llm_enabled, emitted):
     action = partial_sse('responses', hanging=True) if emitted else {
         'status': 200, 'data': b'', 'headers': {'content-type': 'text/event-stream'}, 'hanging': True,
     }
@@ -304,7 +305,7 @@ def test_real_stream_deadline_is_distinct_from_read_timeout_and_never_retried(em
 
 
 @pytest.mark.parametrize('fallback', [False, True], ids=['responses', 'fallback_chat'])
-def test_real_retry_wait_deadline_reports_only_requests_actually_sent(fallback):
+def test_real_retry_wait_deadline_reports_only_requests_actually_sent(agent_llm_enabled, fallback):
     result = real_retry_wire('deadline', None, fallback)
     expected = ['responses', 'chat_completions'] if fallback else ['responses']
     assert protocols(result) == expected and not result['events']
@@ -314,7 +315,7 @@ def test_real_retry_wait_deadline_reports_only_requests_actually_sent(fallback):
 
 
 @pytest.mark.parametrize('mode', ['before_request', 'request', 'body', 'partial_body', 'task_cancel', 'retry_wait'])
-def test_cancellation_stays_cancellation_without_failure_diagnostic(mode, caplog):
+def test_cancellation_stays_cancellation_without_failure_diagnostic(agent_llm_enabled, mode, caplog):
     token = CancellationToken()
     if mode == 'before_request':
         token.cancel()
@@ -349,7 +350,7 @@ def test_cancellation_stays_cancellation_without_failure_diagnostic(mode, caplog
     (httpx.ConnectTimeout, '无法连接模型服务，请检查网络或模型路由后重试。'),
     (httpx.ConnectError, '无法连接模型服务，请检查网络或模型路由后重试。'),
 ])
-def test_real_session_pre_output_failure_has_classified_safe_public_final(fault_type, expected_message, caplog):
+def test_real_session_pre_output_failure_has_classified_safe_public_final(agent_llm_enabled, fault_type, expected_message, caplog):
     result = session_wire([fault_type(FAULT_TEXT)])
     assert protocols(result) == ['responses', 'responses']
     assert not any(event.type is AgentEventType.MODEL_DELTA for event in result['events'])
@@ -359,7 +360,7 @@ def test_real_session_pre_output_failure_has_classified_safe_public_final(fault_
     assert_safe(json.dumps(result['public_events'], ensure_ascii=False), json.dumps(final, ensure_ascii=False), caplog.text)
 
 
-def test_real_session_error_body_timeout_has_safe_timeout_public_final(caplog):
+def test_real_session_error_body_timeout_has_safe_timeout_public_final(agent_llm_enabled, caplog):
     result = session_wire([http_error(404, FAULT_TEXT, fault=httpx.ReadTimeout(FAULT_TEXT)), None], protocol='auto')
     assert protocols(result) == ['responses']
     assert result['final']['error'] == {
@@ -369,7 +370,7 @@ def test_real_session_error_body_timeout_has_safe_timeout_public_final(caplog):
 
 
 @pytest.mark.parametrize('emitted', [False, True], ids=['before_text', 'after_text'])
-def test_real_session_task_cancellation_emits_cancelled_not_diagnostic_failure(emitted, caplog):
+def test_real_session_task_cancellation_emits_cancelled_not_diagnostic_failure(agent_llm_enabled, emitted, caplog):
     action = partial_sse('responses', task_cancel=True) if emitted else {
         'status': 200, 'data': b'', 'headers': {'content-type': 'text/event-stream'}, 'task_cancel': True,
     }
@@ -384,7 +385,7 @@ def test_real_session_task_cancellation_emits_cancelled_not_diagnostic_failure(e
     assert_safe(json.dumps(result['public_events'], ensure_ascii=False), result['final'], caplog.text)
 
 
-def test_request_construction_type_error_remains_programming_error_not_provider_failure():
+def test_request_construction_type_error_remains_programming_error_not_provider_failure(agent_llm_enabled):
     error = TypeError('request construction regression')
     with patch.object(pm, 'native_tool_request_body', side_effect=error):
         result = wire([None])
@@ -394,7 +395,7 @@ def test_request_construction_type_error_remains_programming_error_not_provider_
     assert getattr(error, 'failure', None) is None
 
 
-def test_unreplayable_native_arguments_have_safe_classified_diagnostic(caplog):
+def test_unreplayable_native_arguments_have_safe_classified_diagnostic(agent_llm_enabled, caplog):
     envelope = {'content': [{'type': 'tool_use', 'id': 'bad-args', 'name': 'lookup',
                             'input': '{"query":"' + FAULT_TEXT}], 'stop_reason': 'tool_use'}
     result = wire([{'status': 200, 'data': json.dumps(envelope).encode()}],

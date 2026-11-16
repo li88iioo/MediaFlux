@@ -16,6 +16,7 @@ from app.agent.kernel.state_types import AgentInput, SessionBusyError
 from app.agent.task_stop import stop_agent_session
 from app.agent.transports import WebKernelTransport
 from app.routes import agent_api
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_confirmation_edit import OWNER, SESSION
 from tests.test_agent_confirmation_liveness import native_call, native_session
 from tests.test_agent_confirmation_liveness import rig as rig  # noqa: PLC0414
@@ -30,7 +31,7 @@ from tests.test_agent_tool_argument_ingress import store as store  # noqa: PLC04
 @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
 @pytest.mark.parametrize("followup_read", [False, True], ids=["model-tail", "next-read"])
 @pytest.mark.parametrize("operation", ["cancel", "stop"])
-def test_direct_confirmation_tail_can_be_observed_and_stopped(rig, protocol, cold, followup_read, operation):
+def test_direct_confirmation_tail_can_be_observed_and_stopped(agent_llm_enabled, rig, protocol, cold, followup_read, operation):
     async def run():
         ready, release = asyncio.Event(), asyncio.Event()
 
@@ -111,7 +112,7 @@ def test_direct_confirmation_tail_can_be_observed_and_stopped(rig, protocol, col
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
 @pytest.mark.parametrize("operation", ["cancel", "stop"])
-def test_direct_confirmation_write_stays_protected_until_receipt(rig, protocol, cold, operation):
+def test_direct_confirmation_write_stays_protected_until_receipt(agent_llm_enabled, rig, protocol, cold, operation):
     async def run():
         ready, release = asyncio.Event(), asyncio.Event()
         execute = rig.tool.execute_confirmed

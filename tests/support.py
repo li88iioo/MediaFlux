@@ -14,11 +14,21 @@ from types import SimpleNamespace
 from typing import Any, Generator, NotRequired, TypedDict, TypeVar
 from unittest.mock import Mock, patch
 
+import pytest
+
 from app import database as db
 from app.clients.guangya import GuangYaFile
 from app.modules.scraper import Candidate, MatchResult
 
 _TEST_DATABASE_LOCK = threading.RLock()
+
+
+@pytest.fixture
+def agent_llm_enabled(monkeypatch):
+    """真实 adapter 的离线协议测试显式启用；开关行为测试自行发布配置。"""
+    from app import config
+
+    monkeypatch.setitem(config._SYSTEM_ENV_SNAPSHOT, "AGENT_LLM_ENABLED", "1")
 
 
 def authenticated_session(**extra: Any) -> dict[str, Any]:

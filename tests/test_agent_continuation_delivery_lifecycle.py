@@ -26,6 +26,7 @@ from tests.test_agent_read_wait_entry_exclusions import tg_config as tg_config
 from tests.test_agent_read_wait_lifecycle import WaitScript
 from tests.test_agent_read_wait_lifecycle import isolated_database as isolated_database
 from tests.test_agent_waiting_delivery import OWNER, ROUTE, SID, park
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class DeliveryScript(WaitScript):
@@ -87,7 +88,7 @@ async def _enqueue(clock, answer="已取得真实查询结果。"):
 
 
 @pytest.mark.parametrize("operation", ["reset", "delete"])
-def test_queued_continuation_is_suppressed_after_real_session_lifecycle(bot, operation):
+def test_queued_continuation_is_suppressed_after_real_session_lifecycle(agent_llm_enabled, bot, operation):
     async def exercise():
         clock = [100]
         runtime, script, reads = await _enqueue(clock)
@@ -105,7 +106,7 @@ def test_queued_continuation_is_suppressed_after_real_session_lifecycle(bot, ope
     asyncio.run(exercise())
 
 
-def test_deleted_session_recreation_does_not_rebind_old_queued_result(bot):
+def test_deleted_session_recreation_does_not_rebind_old_queued_result(agent_llm_enabled, bot):
     async def exercise():
         clock = [100]
         first, old_script, old_reads = await _enqueue(clock, "旧生命周期事实：原查询已完成。")
@@ -127,7 +128,7 @@ def test_deleted_session_recreation_does_not_rebind_old_queued_result(bot):
     asyncio.run(exercise())
 
 
-def test_ordinary_new_turn_keeps_completed_fact_deliverable(bot):
+def test_ordinary_new_turn_keeps_completed_fact_deliverable(agent_llm_enabled, bot):
     async def exercise():
         clock = [100]
         runtime, old_script, reads = await _enqueue(clock, "前一轮已核验的事实。")
@@ -151,7 +152,7 @@ def test_ordinary_new_turn_keeps_completed_fact_deliverable(bot):
 
 
 @pytest.mark.parametrize("operation", ["reset", "delete"])
-def test_multipart_sent_prefix_survives_and_all_unsent_parts_are_suppressed(bot, operation):
+def test_multipart_sent_prefix_survives_and_all_unsent_parts_are_suppressed(agent_llm_enabled, bot, operation):
     async def exercise():
         clock = [100]
         answer = "\n".join(["已经核验的媒体事实，等待续行结果。"] * 700)

@@ -23,6 +23,8 @@ from app.agent.kernel.provider_model import (
 )
 from app.agent.kernel.state_types import CancellationToken
 from app.clients.openai_compatible import ProviderStreamError, iter_provider_text_deltas
+import pytest
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 async def chunks(events: Sequence[dict[str, Any] | str], *, split: int = 0) -> AsyncIterator[bytes]:
@@ -101,6 +103,7 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([event.text for event in summaries], [] if terminal == "incomplete" else [summary])
                 self.assertTrue(all(event.summary_id == "" for event in summaries))
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     def test_summary_after_completion_blocks_retry_and_protocol_fallback(self):
         from tests.test_agent_protocol_fallback import protocols, sse, wire
 
@@ -120,6 +123,7 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(result["error"])
                     self.assertEqual(result["events"][-1].type, ModelEventType.FINISH)
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_summary_opt_in_only_extends_existing_responses_reasoning_configuration(self):
         from tests.test_agent_provider_state import WireClient
 
@@ -225,6 +229,7 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
                 calls = [e.tool_call for e in events if e.type is ModelEventType.TOOL_CALL_COMPLETED]
                 self.assertEqual(dict(calls[0].arguments), expected)
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_per_request_model_does_not_mutate_shared_provider_settings(self):
         seen = []
         class Response:
@@ -248,6 +253,7 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0][0], seen[1][0])
         self.assertEqual(settings.model, "global")
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_responses_failure_before_output_keeps_original_bounded_retry(self):
         class Response:
             status_code = 200
@@ -316,6 +322,7 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "message_stop"},
             ]), protocol="anthropic_messages"))
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_adapter_retries_one_transient_http_failure_before_output(
         self,
     ) -> None:
@@ -376,6 +383,7 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0].text, "ok")
         self.assertEqual(events[-1].type, ModelEventType.FINISH)
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_adapter_retries_incomplete_stream_before_any_output(self) -> None:
         class Response:
             def __init__(self, body: bytes):
@@ -783,6 +791,7 @@ class CompleteTurnContractTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(protocol=protocol, events=events), self.assertRaises(ModelProviderError):
                 await collect(iter_protocol_model_events(chunks(events), protocol=protocol))
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_json_fallback_validates_finish_before_exposing_calls(self):
         class Response:
             status_code = 200
@@ -891,6 +900,7 @@ class NativeAnswerCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('mf_answer_end_', json.dumps(client.request_body))
         return events, error
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_normal_native_completion_needs_no_extra_model_text_marker(self):
         for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
             for streamed in (True, False):
@@ -901,6 +911,7 @@ class NativeAnswerCompletionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(events[-1].type, ModelEventType.FINISH)
                     self.assertEqual(''.join(e.text for e in events), text)
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_native_truncation_is_still_incomplete_even_with_complete_looking_text(self):
         from app.agent.kernel.provider_model import UncommittableModelTurn
         for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
@@ -910,6 +921,7 @@ class NativeAnswerCompletionTests(unittest.IsolatedAsyncioTestCase):
                     assert isinstance(error, UncommittableModelTurn)
                     self.assertNotIn(ModelEventType.FINISH, [e.type for e in events])
 
+    @pytest.mark.usefixtures("agent_llm_enabled")
     async def test_complete_native_tool_rounds_preserve_tool_calls(self):
         for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
             for streamed in (True, False):
@@ -931,6 +943,7 @@ class NativeAnswerCompletionTests(unittest.IsolatedAsyncioTestCase):
                 await collect(iter_protocol_model_events(chunks(events, split=3), protocol=protocol))
 
 
+@pytest.mark.usefixtures("agent_llm_enabled")
 class ParallelToolCallPermissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_adapter_forwards_only_explicit_parallel_permission_with_tools(self):
         from tests import test_agent_provider_state as nativefixtures

@@ -25,6 +25,7 @@ from app.agent.public_safety import (
     sanitize_resource_title,
 )
 from app.agent.public_view import public_conversation_messages
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
 
 SUMMARY = "稍后重试即可"
@@ -196,7 +197,7 @@ async def observe(store, error, protocol, mixed):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("kind", PRIVATE)
-def test_original_s1_raw_terminal_consumers(store, protocol, kind):
+def test_original_s1_raw_terminal_consumers(agent_llm_enabled, store, protocol, kind):
     final, view, terminal = asyncio.run(observe(store, escaped(PRIVATE[kind], 1), protocol, False))
     assert final["code"] == "rate_limited"
     # Only final public fields: historical tool DTOs are a different boundary.
@@ -207,7 +208,7 @@ def test_original_s1_raw_terminal_consumers(store, protocol, kind):
 @pytest.mark.parametrize("mixed", [False, True], ids=["raw-failed", "mixed-partial"])
 @pytest.mark.parametrize("kind", PRIVATE)
 @pytest.mark.parametrize("depth,interleaved", [(0, False), (1, False), (2, False), (4, False), (8, False), (9, False), (64, False), (3, True), (8, True), (9, True)])
-def test_nested_private_errors_never_fall_back_to_summary(store, protocol, mixed, kind, depth, interleaved):
+def test_nested_private_errors_never_fall_back_to_summary(agent_llm_enabled, store, protocol, mixed, kind, depth, interleaved):
     error = escaped(PRIVATE[kind], depth, interleaved=interleaved)
     final, view, terminal = asyncio.run(observe(store, error, protocol, mixed))
     text = final["answer"] if mixed else final["message"]
@@ -221,7 +222,7 @@ def test_nested_private_errors_never_fall_back_to_summary(store, protocol, mixed
 
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("length", [599, 600, 601, 65535, 65536, 65537])
-def test_full_input_is_checked_before_terminal_truncation(store, mixed, length):
+def test_full_input_is_checked_before_terminal_truncation(agent_llm_enabled, store, mixed, length):
     # ASCII keeps the 64K-character boundary below the independent 128K-byte journal cap.
     error = "a" * length + " " + escaped(PRIVATE["credential"], 1)
     final, _, _ = asyncio.run(observe(store, error, "chat_completions", mixed))
@@ -250,7 +251,7 @@ def test_safe_text_decodes_fully_and_stays_idempotent(raw, expected):
 
 @pytest.mark.parametrize("raw,expected", SAFE)
 @pytest.mark.parametrize("mixed", [False, True])
-def test_safe_terminal_controls(store, raw, expected, mixed):
+def test_safe_terminal_controls(agent_llm_enabled, store, raw, expected, mixed):
     final, _, _ = asyncio.run(observe(store, raw, "chat_completions", mixed))
     if mixed:
         assert "未完成的查询：" + expected in final["answer"]

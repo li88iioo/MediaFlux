@@ -23,6 +23,7 @@ from app.agent.kernel.model import (
 from app.agent.kernel.state_types import CancellationToken
 from app.clients import openai_compatible as oc
 from app.clients.http import FixedHostHttpClient
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize('status,text', [
@@ -261,7 +262,7 @@ BUSINESS = [
 
 
 @pytest.mark.parametrize('status,text', BUSINESS, ids=[f'business-{i}' for i in range(len(BUSINESS))])
-def test_http_business_or_unknown_stops(status, text, caplog):
+def test_http_business_or_unknown_stops(agent_llm_enabled, status, text, caplog):
     result = wire([http_error(status, text), None])
     if (status, text) == BUSINESS[6]:
         assert protocols(result) == ['responses', 'responses']
@@ -290,7 +291,7 @@ def test_http_business_or_unknown_stops(status, text, caplog):
     '{"error":"responses api is not supported","type":"mystery_error"}',
     '{"error":"responses api is not supported","metadata":{"hint":"unreviewed"}}',
 ])
-def test_structured_conflicting_or_unknown_reasons_stop_at_responses(text):
+def test_structured_conflicting_or_unknown_reasons_stop_at_responses(agent_llm_enabled, text):
     result = wire([http_error(404, text), None])
     assert protocols(result) == ['responses']
     assert isinstance(result['error'], pm.ModelProviderError) and not result['events']
@@ -304,7 +305,7 @@ def test_structured_conflicting_or_unknown_reasons_stop_at_responses(text):
     (400, UNSUPPORTED), (404, UNSUPPORTED), (422, "unknown parameter 'input'"),
     (400, UNSUPPORTED.ljust(8192)),
 ])
-def test_http_complete_explicit_evidence_allows_one_fallback(status, text):
+def test_http_complete_explicit_evidence_allows_one_fallback(agent_llm_enabled, status, text):
     result = wire([http_error(status, text), None])
     assert protocols(result) == ['responses', 'chat_completions']
     assert result['error'] is None and str(result['events'][-1].type) == 'finish'
@@ -324,7 +325,7 @@ def test_http_complete_explicit_evidence_allows_one_fallback(status, text):
     (http_error(hanging=True), {'deadline': 0.02, 'deadline_in_body': True}),
     (http_error(fault=asyncio.CancelledError()), {}),
 ])
-def test_http_error_read_must_finish_within_bounds(action, options, caplog):
+def test_http_error_read_must_finish_within_bounds(agent_llm_enabled, action, options, caplog):
     result = wire([action, None], **options)
     assert protocols(result) == ['responses']
     assert result['error'] is not None and not result['events']
@@ -336,7 +337,7 @@ def test_http_error_read_must_finish_within_bounds(action, options, caplog):
 
 @pytest.mark.parametrize('mode', ['read', 'synthetic_cancel', 'task_cancel', 'deadline'])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError, ValueError])
-def test_error_read_terminal_state_survives_real_stream_cleanup(mode, close_fault):
+def test_error_read_terminal_state_survives_real_stream_cleanup(agent_llm_enabled, mode, close_fault):
     options = {
         'read': {'fault': httpx.ReadError(SECRET)},
         'synthetic_cancel': {'fault': asyncio.CancelledError(SECRET)},
@@ -388,7 +389,7 @@ def stream_action(*events):
     (ValueError('offline unexpected'), 1),
     (dict(status=200, data=b'{'), 1),
 ])
-def test_nonnegotiation_exhaustion_stays_on_original_protocol(action, count):
+def test_nonnegotiation_exhaustion_stays_on_original_protocol(agent_llm_enabled, action, count):
     result = wire([action])
     assert protocols(result) == ['responses'] * count
     assert result['error'] and not result['events']
@@ -403,7 +404,7 @@ def test_nonnegotiation_exhaustion_stays_on_original_protocol(action, count):
     httpx.ConnectError('offline connect'), httpx.ReadTimeout('offline timeout'),
     stream_action(), stream_action({'type': 'response.failed'}), http_error(503, 'temporary'),
 ])
-def test_original_same_protocol_retry_can_recover(action):
+def test_original_same_protocol_retry_can_recover(agent_llm_enabled, action):
     result = wire([action, None])
     assert protocols(result) == ['responses', 'responses']
     assert result['error'] is None
@@ -495,7 +496,7 @@ def real_retry_wire(mode, close_fault, fallback, *, header_delay=0):
 @pytest.mark.parametrize('fallback', [False, True], ids=['responses', 'fallback_chat'])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError], ids=['clean', 'ReadError'])
 @pytest.mark.parametrize('mode', ['cancel', 'deadline'])
-def test_real_retry_terminal_cause_survives_response_cleanup(mode, close_fault, fallback):
+def test_real_retry_terminal_cause_survives_response_cleanup(agent_llm_enabled, mode, close_fault, fallback):
     result = real_retry_wire(mode, close_fault, fallback)
     assert protocols(result) == (['responses', 'chat_completions'] if fallback else ['responses'])
     assert not result['events']
@@ -518,7 +519,7 @@ def test_real_retry_terminal_cause_survives_response_cleanup(mode, close_fault, 
 @pytest.mark.parametrize('fallback', [False, True], ids=['responses', 'fallback_chat'])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError], ids=['clean', 'ReadError'])
 @pytest.mark.parametrize('mode', ['recover', 'exhaust'])
-def test_real_retry_wait_preserves_attempt_budget_and_recovery(mode, close_fault, fallback):
+def test_real_retry_wait_preserves_attempt_budget_and_recovery(agent_llm_enabled, mode, close_fault, fallback):
     result = real_retry_wire(mode, close_fault, fallback)
     protocol = 'chat_completions' if fallback else 'responses'
     assert protocols(result) == (['responses'] if fallback else []) + [protocol, protocol]
@@ -537,7 +538,7 @@ def test_real_retry_wait_preserves_attempt_budget_and_recovery(mode, close_fault
 
 
 @pytest.mark.parametrize('fallback', [False, True], ids=['responses', 'fallback_chat'])
-def test_real_retry_value_error_cleanup_stops_before_wait(fallback):
+def test_real_retry_value_error_cleanup_stops_before_wait(agent_llm_enabled, fallback):
     # Non-transient cleanup failure ends the attempt before retry waiting;
     # no task cancellation is requested after that terminal failure.
     result = real_retry_wire('recover', ValueError, fallback)
@@ -552,7 +553,7 @@ def test_real_retry_value_error_cleanup_stops_before_wait(fallback):
 
 @pytest.mark.parametrize('fallback', [False, True], ids=['responses', 'fallback_chat'])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError], ids=['clean', 'ReadError'])
-def test_real_retry_token_cancel_is_not_task_cancel(close_fault, fallback):
+def test_real_retry_token_cancel_is_not_task_cancel(agent_llm_enabled, close_fault, fallback):
     result = real_retry_wire('token', close_fault, fallback)
     assert protocols(result) == (['responses', 'chat_completions'] if fallback else ['responses'])
     assert isinstance(result['error'], asyncio.CancelledError) and not result['events']
@@ -561,7 +562,7 @@ def test_real_retry_token_cancel_is_not_task_cancel(close_fault, fallback):
 
 
 @pytest.mark.parametrize('action', [http_error(503), httpx.ConnectError('offline')])
-def test_cancel_during_retry_delay_prevents_second_post(action):
+def test_cancel_during_retry_delay_prevents_second_post(agent_llm_enabled, action):
     token = CancellationToken()
 
     async def cancel_sleep(delay):
@@ -572,7 +573,7 @@ def test_cancel_during_retry_delay_prevents_second_post(action):
     assert isinstance(result['error'], asyncio.CancelledError)
 
 
-def test_cancel_before_call_and_during_transport():
+def test_cancel_before_call_and_during_transport(agent_llm_enabled):
     token = CancellationToken()
     token.cancel()
     result = wire([None], token=token)
@@ -586,20 +587,20 @@ def test_cancel_before_call_and_during_transport():
     {'type': 'response.output_item.done', 'output_index': 0, 'item': {
         'type': 'function_call', 'id': 'i1', 'call_id': 'c1', 'name': 'inspect', 'arguments': '{}'}},
 ])
-def test_emitted_text_or_tool_prevents_replay(event):
+def test_emitted_text_or_tool_prevents_replay(agent_llm_enabled, event):
     result = wire([stream_action(event, {'type': 'response.failed'})])
     assert protocols(result) == ['responses']
     assert result['events'] and result['error']
 
 
-def test_emitted_usage_prevents_retry():
+def test_emitted_usage_prevents_retry(agent_llm_enabled):
     result = wire([stream_action({'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}})],
                   configured='chat_completions')
     assert protocols(result) == ['chat_completions']
     assert [str(e.type) for e in result['events']] == ['usage'] and result['error']
 
 
-def test_json_usage_and_finish_prevent_replay_on_context_exit():
+def test_json_usage_and_finish_prevent_replay_on_context_exit(agent_llm_enabled):
     payload = dict(status='completed', output=[], usage={'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2})
     result = wire([dict(status=200, data=json.dumps(payload).encode())],
                   exit_error=httpx.ReadError('offline exit'))
@@ -610,7 +611,7 @@ def test_json_usage_and_finish_prevent_replay_on_context_exit():
 @pytest.mark.parametrize('failure', [
     http_error(403, 'permission denied'), ValueError(SECRET), dict(status=200, data=b'{'),
 ])
-def test_fallback_failure_preserves_safe_original_http_cause(failure):
+def test_fallback_failure_preserves_safe_original_http_cause(agent_llm_enabled, failure):
     result = wire([http_error(404), failure])
     assert protocols(result) == ['responses', 'chat_completions']
     chain = error_chain(result['error'])
@@ -622,7 +623,7 @@ def test_fallback_failure_preserves_safe_original_http_cause(failure):
     assert all(SECRET not in str(exc) for exc in chain)
 
 
-def test_context_exit_failure_revokes_classified_fallback():
+def test_context_exit_failure_revokes_classified_fallback(agent_llm_enabled):
     failure = ValueError(SECRET)
     result = wire([http_error(404)], exit_error=failure)
     assert protocols(result) == ['responses']
@@ -633,7 +634,7 @@ def test_context_exit_failure_revokes_classified_fallback():
 
 
 @pytest.mark.parametrize('mode', ['read', 'classified', 'chat', 'partial_chat', 'prior_transport'])
-def test_negotiation_error_graph_keeps_only_safe_diagnostics(mode, caplog):
+def test_negotiation_error_graph_keeps_only_safe_diagnostics(agent_llm_enabled, mode, caplog):
     body = json.dumps({'error': UNSUPPORTED})
     failure = ValueError(SECRET)
     failure.__cause__ = OSError(SECRET)
@@ -659,7 +660,7 @@ def test_negotiation_error_graph_keeps_only_safe_diagnostics(mode, caplog):
 
 
 @pytest.mark.parametrize('protocol', list(PROTOCOL_PATHS))
-def test_explicit_protocol_or_endpoint_never_negotiates(protocol):
+def test_explicit_protocol_or_endpoint_never_negotiates(agent_llm_enabled, protocol):
     result = wire([http_error(404)], configured=protocol)
     assert protocols(result) == [protocol] and result['error']
     result = wire([http_error(404)], api_url='https://api.example.com' + PROTOCOL_PATHS[protocol])
@@ -707,7 +708,7 @@ def assert_native_payload(protocol, body):
 
 
 @pytest.mark.parametrize('protocol', list(PROTOCOL_PATHS))
-def test_auto_native_binding_selects_exact_protocol(protocol, caplog):
+def test_auto_native_binding_selects_exact_protocol(agent_llm_enabled, protocol, caplog):
     messages = native_messages(protocol)
     assert messages[0].provider_state is not None
     before = messages[0].provider_state.layout_json
@@ -720,7 +721,7 @@ def test_auto_native_binding_selects_exact_protocol(protocol, caplog):
 
 
 @pytest.mark.parametrize('protocol', list(PROTOCOL_PATHS))
-def test_bound_native_unsupported_never_strips_state_to_negotiate(protocol):
+def test_bound_native_unsupported_never_strips_state_to_negotiate(agent_llm_enabled, protocol):
     result = wire([http_error(404), None], messages=native_messages(protocol))
     assert protocols(result) == [protocol] and result['error']
     assert_native_payload(protocol, result['requests'][0]['body'])
@@ -729,7 +730,7 @@ def test_bound_native_unsupported_never_strips_state_to_negotiate(protocol):
 
 @pytest.mark.parametrize('protocol', list(PROTOCOL_PATHS))
 @pytest.mark.parametrize('action', [http_error(503), httpx.ConnectError('offline native')])
-def test_native_same_protocol_retry_keeps_full_identical_payload(protocol, action):
+def test_native_same_protocol_retry_keeps_full_identical_payload(agent_llm_enabled, protocol, action):
     result = wire([action, None], messages=native_messages(protocol))
     assert protocols(result) == [protocol, protocol] and result['error'] is None
     assert result['requests'][0]['body'] == result['requests'][1]['body']
@@ -737,7 +738,7 @@ def test_native_same_protocol_retry_keeps_full_identical_payload(protocol, actio
         assert_native_payload(protocol, request['body'])
 
 
-def test_conflicting_bound_protocols_fail_before_client_creation():
+def test_conflicting_bound_protocols_fail_before_client_creation(agent_llm_enabled):
     messages = native_messages('responses') + native_messages('chat_completions')
     result = wire([None], messages=messages)
     assert protocols(result) == [] and result['clients'] == []
@@ -746,7 +747,7 @@ def test_conflicting_bound_protocols_fail_before_client_creation():
 
 
 @pytest.mark.parametrize('change', ['model', 'endpoint', 'user_role', 'unknown_protocol'])
-def test_unbound_or_user_state_does_not_lock_or_leak(change):
+def test_unbound_or_user_state_does_not_lock_or_leak(agent_llm_enabled, change):
     assistant, tool = native_messages('anthropic_messages')
     state = assistant.provider_state
     assert state is not None
@@ -765,7 +766,7 @@ def test_unbound_or_user_state_does_not_lock_or_leak(change):
         assert 'signature-fixture' not in serialized and 'private-fixture' not in serialized
 
 
-def test_request_model_override_is_native_binding_authority():
+def test_request_model_override_is_native_binding_authority(agent_llm_enabled):
     assistant, tool = native_messages('chat_completions')
     assert assistant.provider_state is not None
     assistant = replace(assistant, provider_state=replace(assistant.provider_state, model='override'))
@@ -778,7 +779,7 @@ def test_request_model_override_is_native_binding_authority():
     assert 'private-fixture' not in json.dumps(result['requests'][0]['body'])
 
 
-def test_explicit_configuration_retains_existing_native_isolation():
+def test_explicit_configuration_retains_existing_native_isolation(agent_llm_enabled):
     result = wire([None], configured='responses', messages=native_messages('anthropic_messages'))
     assert protocols(result) == ['responses'] and result['error'] is None
     assert 'signature-fixture' not in json.dumps(result['requests'][0]['body'])
@@ -796,7 +797,7 @@ def test_classifier_ambiguous_duplicate_or_overdeep_json_is_closed(text):
     assert oc.is_protocol_fallback_error(400, text, protocol='responses') is False
 
 
-def test_error_body_timeout_preserves_safe_http_diagnostic():
+def test_error_body_timeout_preserves_safe_http_diagnostic(agent_llm_enabled):
     result = wire([http_error(404, hanging=True)], deadline=0.02, deadline_in_body=True)
     assert protocols(result) == ['responses']
     assert isinstance(result['error'], pm.ModelProviderError)
@@ -804,7 +805,7 @@ def test_error_body_timeout_preserves_safe_http_diagnostic():
     assert any('HTTP 404' in str(exc) for exc in error_chain(result['error']))
 
 
-def test_empty_json_finish_is_already_emitted_on_exit_failure():
+def test_empty_json_finish_is_already_emitted_on_exit_failure(agent_llm_enabled):
     result = wire([dict(status=200, data=b'{"status":"completed","output":[]}')],
                   exit_error=httpx.ReadError('offline exit'))
     assert protocols(result) == ['responses']
@@ -812,7 +813,7 @@ def test_empty_json_finish_is_already_emitted_on_exit_failure():
     assert result['error']
 
 
-def test_fallback_then_partial_chat_failure_keeps_both_diagnostics():
+def test_fallback_then_partial_chat_failure_keeps_both_diagnostics(agent_llm_enabled):
     action = stream_action({'choices': [{'delta': {'content': 'visible'}}]})
     result = wire([http_error(404), action])
     assert protocols(result) == ['responses', 'chat_completions']
@@ -823,13 +824,13 @@ def test_fallback_then_partial_chat_failure_keeps_both_diagnostics():
 
 
 @pytest.mark.parametrize('maximum,declared', [(2 * 1024 * 1024, '8193'), (128, '129')])
-def test_declared_error_length_above_effective_cap_is_not_read(maximum, declared):
+def test_declared_error_length_above_effective_cap_is_not_read(agent_llm_enabled, maximum, declared):
     result = wire([http_error(headers={'content-length': declared}), None], maximum=maximum)
     assert protocols(result) == ['responses'] and result['error']
     assert result['streams'][0].yielded == 0
 
 
-def test_raw_error_text_never_enters_diagnostics_or_logs(caplog):
+def test_raw_error_text_never_enters_diagnostics_or_logs(agent_llm_enabled, caplog):
     result = wire([http_error(400, json.dumps({'error': {'code': 'insufficient_quota', 'message': SECRET}}))])
     assert protocols(result) == ['responses'] and result['error']
     assert SECRET not in caplog.text
@@ -837,20 +838,20 @@ def test_raw_error_text_never_enters_diagnostics_or_logs(caplog):
 
 
 @pytest.mark.parametrize('protocol', ['chat_completions', 'anthropic_messages'])
-def test_multiple_matching_states_are_not_a_conflict(protocol):
+def test_multiple_matching_states_are_not_a_conflict(agent_llm_enabled, protocol):
     messages = native_messages(protocol)
     result = wire([None], messages=messages + messages)
     assert protocols(result) == [protocol] and result['error'] is None
 
 
-def test_transport_fault_after_classification_revokes_permission_when_exhausted():
+def test_transport_fault_after_classification_revokes_permission_when_exhausted(agent_llm_enabled):
     result = wire([http_error(404)], exit_error=httpx.ReadError('offline repeated exit'))
     assert protocols(result) == ['responses', 'responses']
     assert result['error']
     assert any('HTTP 404' in str(exc) for exc in error_chain(result['error']))
 
 
-def test_fallback_chat_keeps_its_original_retry_budget():
+def test_fallback_chat_keeps_its_original_retry_budget(agent_llm_enabled):
     result = wire([http_error(404), http_error(503)])
     assert protocols(result) == ['responses', 'chat_completions', 'chat_completions']
     chain = error_chain(result['error'])
@@ -979,7 +980,7 @@ def real_success_body_wire(mode, close_fault, fallback, encoding, *, header_dela
 @pytest.mark.parametrize('encoding', ['sse', 'json', 'emitted_sse'])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError, ValueError], ids=['clean', 'ReadError', 'ValueError'])
 @pytest.mark.parametrize('mode', ['cancel', 'deadline', 'synthetic'])
-def test_success_body_terminal_survives_real_cleanup(mode, close_fault, fallback, encoding):
+def test_success_body_terminal_survives_real_cleanup(agent_llm_enabled, mode, close_fault, fallback, encoding):
     result = real_success_body_wire(mode, close_fault, fallback, encoding)
     assert protocols(result) == (['responses', 'chat_completions'] if fallback else ['responses'])
     assert [str(event.type) for event in result['events']] == (['text_delta'] if encoding == 'emitted_sse' else [])
@@ -1000,7 +1001,7 @@ def test_success_body_terminal_survives_real_cleanup(mode, close_fault, fallback
 @pytest.mark.parametrize('fallback', [False, True], ids=['responses', 'fallback_chat'])
 @pytest.mark.parametrize('encoding', ['sse', 'json', 'emitted_sse'])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError, ValueError], ids=['clean', 'ReadError', 'ValueError'])
-def test_success_body_read_timeout_preserves_normal_retry(close_fault, fallback, encoding):
+def test_success_body_read_timeout_preserves_normal_retry(agent_llm_enabled, close_fault, fallback, encoding):
     result = real_success_body_wire('recover', close_fault, fallback, encoding)
     prefix = ['responses', 'chat_completions'] if fallback else ['responses']
     should_retry = close_fault is not ValueError and encoding != 'emitted_sse'
@@ -1021,7 +1022,7 @@ def test_success_body_read_timeout_preserves_normal_retry(close_fault, fallback,
             assert any('HTTP 404' in str(exc) for exc in chain)
 
 
-def test_success_stream_total_deadline_never_starts_another_request():
+def test_success_stream_total_deadline_never_starts_another_request(agent_llm_enabled):
     action = dict(status=200, data=b'', hanging=True, headers={'content-type': 'text/event-stream'})
     result = wire([action, None], deadline=0.02, deadline_in_body=True)
     assert protocols(result) == ['responses'] and not result['events']
@@ -1030,7 +1031,7 @@ def test_success_stream_total_deadline_never_starts_another_request():
     assert isinstance(result['error'].__cause__, TimeoutError)
 
 
-def test_success_body_deadline_is_triggered_after_slow_headers_not_during_setup():
+def test_success_body_deadline_is_triggered_after_slow_headers_not_during_setup(agent_llm_enabled):
     # 两次响应头均超过旧40ms全轮期限；本用例要验证的是body清理而非建连超时。
     result = real_success_body_wire('deadline', httpx.ReadError, True, 'sse', header_delay=0.06)
     assert protocols(result) == ['responses', 'chat_completions']
@@ -1041,7 +1042,7 @@ def test_success_body_deadline_is_triggered_after_slow_headers_not_during_setup(
     assert all(SECRET not in str(exc) for exc in error_chain(result['error']))
 
 
-def test_error_body_deadline_waits_for_slow_headers_and_keeps_http_evidence():
+def test_error_body_deadline_waits_for_slow_headers_and_keeps_http_evidence(agent_llm_enabled):
     result = wire([http_error(404, hanging=True)], deadline=0.02,
                   deadline_in_body=True, header_delay=0.06)
     assert protocols(result) == ['responses'] and not result['events']
@@ -1050,7 +1051,7 @@ def test_error_body_deadline_waits_for_slow_headers_and_keeps_http_evidence():
     assert any('HTTP 404' in str(exc) for exc in error_chain(result['error']))
 
 
-def test_retry_deadline_waits_for_real_retry_sleep_after_slow_headers():
+def test_retry_deadline_waits_for_real_retry_sleep_after_slow_headers(agent_llm_enabled):
     result = real_retry_wire('deadline', httpx.ReadError, True, header_delay=0.06)
     assert protocols(result) == ['responses', 'chat_completions']
     assert result['error'] is not None
@@ -1064,7 +1065,7 @@ def test_retry_deadline_waits_for_real_retry_sleep_after_slow_headers():
     assert any('HTTP 404' in str(exc) for exc in chain)
 
 
-def test_real_total_deadline_before_headers_still_stops_without_retry():
+def test_real_total_deadline_before_headers_still_stops_without_retry(agent_llm_enabled):
     # 不控制目标阶段：仍直接使用真正的短整轮deadline，证明请求前等待照常受限。
     result = wire([None], deadline=0.01, header_delay=0.06)
     assert len(result['requests']) <= 1 and not result['events']
@@ -1080,7 +1081,7 @@ def test_real_total_deadline_before_headers_still_stops_without_retry():
 
 
 @pytest.mark.parametrize('prior_budget_rejection', [False, True])
-def test_anthropic_unreplayable_arguments_keep_reason_without_adapter_resend(prior_budget_rejection):
+def test_anthropic_unreplayable_arguments_keep_reason_without_adapter_resend(agent_llm_enabled, prior_budget_rejection):
     malformed = {
         'content': [
             {'type': 'thinking', 'thinking': 'private thought', 'signature': 'signed-private'},

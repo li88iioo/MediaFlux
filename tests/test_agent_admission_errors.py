@@ -24,6 +24,7 @@ from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
 from tests.test_agent_tool_argument_ingress import offline as offline  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import store as store  # noqa: PLC0414
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 OWNER, SID = "admission-owner", "admission-errors"
 LOOKUP, HEALTH = "library.lookup", "library.health"
@@ -100,7 +101,7 @@ def assert_unfinished(events, state, *, partial=False, code="tool_not_available"
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("kind", ["unauthorized", "unknown"])
-def test_rejected_native_call_cannot_persist_a_zero_query_success(store, protocol, kind):
+def test_rejected_native_call_cannot_persist_a_zero_query_success(agent_llm_enabled, store, protocol, kind):
     async def run():
         calls = []
         target = replace(reader(LOOKUP, calls), authorize=lambda _context: False)
@@ -119,7 +120,7 @@ def test_rejected_native_call_cannot_persist_a_zero_query_success(store, protoco
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("arguments", [{}, X], ids=["implicit-object", "explicit-object"])
 @pytest.mark.parametrize("alias", [True, False], ids=["wire-alias", "canonical"])
-def test_direct_call_of_visible_read_tool_executes_without_discovery_round(
+def test_direct_call_of_visible_read_tool_executes_without_discovery_round(agent_llm_enabled,
     store, protocol, arguments, alias,
 ):
     async def run():
@@ -146,7 +147,7 @@ def test_direct_call_of_visible_read_tool_executes_without_discovery_round(
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("case", ["health-only", "other-object", "other-tool", "implicit-context", "different-raw-default"])
-def test_discovery_or_a_different_call_cannot_clear_the_original_admission_error(store, protocol, case):
+def test_discovery_or_a_different_call_cannot_clear_the_original_admission_error(agent_llm_enabled, store, protocol, case):
     async def run():
         calls = []
         target = replace(reader(LOOKUP, calls), validator=lambda raw: {"limit": 20, **raw})
@@ -178,7 +179,7 @@ def test_discovery_or_a_different_call_cannot_clear_the_original_admission_error
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("dto", [False, True], ids=["exception", "dto"])
-def test_a_failed_same_object_retry_does_not_become_success(store, protocol, dto):
+def test_a_failed_same_object_retry_does_not_become_success(agent_llm_enabled, store, protocol, dto):
     async def run():
         calls = []
 
@@ -199,7 +200,7 @@ def test_a_failed_same_object_retry_does_not_become_success(store, protocol, dto
 
 
 @pytest.mark.parametrize("protocol", ["chat_completions", "responses"])
-def test_an_unparsed_unavailable_call_cannot_be_reinterpreted_as_an_empty_object(store, protocol):
+def test_an_unparsed_unavailable_call_cannot_be_reinterpreted_as_an_empty_object(agent_llm_enabled, store, protocol):
     async def run():
         calls = []
         target = reader(LOOKUP, calls)
@@ -218,7 +219,7 @@ def test_an_unparsed_unavailable_call_cannot_be_reinterpreted_as_an_empty_object
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("rejected_arguments", [X, Y, {**X, "enabled": False}],
                          ids=["same-attempt", "other-object", "other-options"])
-def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(store, protocol, rejected_arguments):
+def test_scoped_confirmation_completion_uses_the_original_admitted_arguments(agent_llm_enabled, store, protocol, rejected_arguments):
     async def run():
         writes = []
         tool = KernelToolSpec(name="library.change", domain="library", description="变更指定对象", effect=ToolEffect.WRITE,

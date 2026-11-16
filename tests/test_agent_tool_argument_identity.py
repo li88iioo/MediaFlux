@@ -8,6 +8,7 @@ from app.agent.kernel.model import ModelEventType
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.provider_model import ModelProviderError
 from app.agent.kernel.state_types import AgentInput
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import (
     Wire,
     observe,
@@ -23,7 +24,7 @@ from tests.test_agent_tool_argument_repair_replay import RAW, make_session, payl
 
 @pytest.mark.parametrize('protocol', ['chat_completions', 'responses'])
 @pytest.mark.parametrize('field', ['call_id', 'name'])
-def test_json_error_identity_invalid_utf8_rejected_before_finish(protocol, field):
+def test_json_error_identity_invalid_utf8_rejected_before_finish(agent_llm_enabled, protocol, field):
     data, kind = payload(protocol, 'json')
     value = json.loads(data)
     if protocol == 'chat_completions':
@@ -39,7 +40,7 @@ def test_json_error_identity_invalid_utf8_rejected_before_finish(protocol, field
     assert not any(e.type is ModelEventType.FINISH for e in events)
 
 
-def test_json_surrogate_identity_is_provider_failure_not_capacity_error(store):
+def test_json_surrogate_identity_is_provider_failure_not_capacity_error(agent_llm_enabled, store):
     async def run():
         data, kind = payload('chat_completions', 'json')
         value = json.loads(data)
@@ -59,7 +60,7 @@ def test_json_surrogate_identity_is_provider_failure_not_capacity_error(store):
 
 @pytest.mark.parametrize('protocol', ['chat_completions', 'responses'])
 @pytest.mark.parametrize('mode', ['json', 'sse'])
-def test_repair_identity_preserves_valid_non_ascii(protocol, mode):
+def test_repair_identity_preserves_valid_non_ascii(agent_llm_enabled, protocol, mode):
     events, error = asyncio.run(observe(protocol, payload(
         protocol, mode, cid='调用-é-😀', name='查询-é')))
     assert error is None
@@ -73,7 +74,7 @@ def test_repair_identity_preserves_valid_non_ascii(protocol, mode):
 @pytest.mark.parametrize('protocol', ['chat_completions', 'responses'])
 @pytest.mark.parametrize('field', ['call_id', 'name'])
 @pytest.mark.parametrize('bad_first', [True, False])
-def test_json_repair_batch_checks_ordinary_neighbor_identity(protocol, field, bad_first):
+def test_json_repair_batch_checks_ordinary_neighbor_identity(agent_llm_enabled, protocol, field, bad_first):
     data, kind = payload(protocol, 'json')
     value = json.loads(data)
     if protocol == 'chat_completions':

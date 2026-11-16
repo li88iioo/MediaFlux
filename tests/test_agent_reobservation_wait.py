@@ -42,6 +42,7 @@ from tests.test_agent_effect_admission import (
 )
 from tests.test_agent_failed_effect_followup import GOAL, READ, A, NativeCase
 from tests.test_agent_task_first_slice import NativeScript
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 WRITE = "cloud.change"
 PRIVATE = "PRIVATE-REOBSERVATION-WAIT-ENTITY-2734"
@@ -115,7 +116,7 @@ def assert_private(case, scripts, state):
 
 
 @pytest.mark.parametrize("tracked_task", [False, True])
-def test_synchronous_failed_confirm_uses_effect_wait_with_or_without_task(native_case, tracked_task):
+def test_synchronous_failed_confirm_uses_effect_wait_with_or_without_task(agent_llm_enabled, native_case, tracked_task):
     """普通用户也能恢复确认后的诊断，不要求手工先建任务清单。"""
     case = native_case
     source = source_for(case)
@@ -408,7 +409,7 @@ def assert_one_write(case, prepared, client, plan_id, state, users):
 
 
 @pytest.mark.parametrize("quota_segments", [1, 2])
-def test_failed_effect_quota_cold_resume_preserves_private_source_and_original_receipt(
+def test_failed_effect_quota_cold_resume_preserves_private_source_and_original_receipt(agent_llm_enabled,
     background_case, quota_segments,
 ):
     case, mutable_source, observed, prepared, client = background_case
@@ -471,7 +472,7 @@ def test_failed_effect_quota_cold_resume_preserves_private_source_and_original_r
 
 
 @pytest.mark.parametrize("cancel_entry", ["request", "session"])
-def test_cancelled_failed_effect_quota_wait_never_restores_source_or_replays_write(background_case, cancel_entry):
+def test_cancelled_failed_effect_quota_wait_never_restores_source_or_replays_write(agent_llm_enabled, background_case, cancel_entry):
     case, _source, observed, prepared, client = background_case
     scripts = []
 

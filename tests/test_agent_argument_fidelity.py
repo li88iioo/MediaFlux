@@ -16,6 +16,7 @@ from tests.test_agent_capacity_recovery import (
     result_rows, session, spec,
 )
 from tests.test_agent_provider_text_authority import native_reply
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def text_reply(protocol):
@@ -42,7 +43,7 @@ def arguments():
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("pressure", ["storage", "model"])
-def test_retained_arguments_are_exact_after_cold_read(protocol, pressure):
+def test_retained_arguments_are_exact_after_cold_read(agent_llm_enabled, protocol, pressure):
     async def exercise():
         handled = []
         args = arguments()
@@ -74,7 +75,7 @@ def test_retained_arguments_are_exact_after_cold_read(protocol, pressure):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("prefix", [False, True])
-def test_nonfitting_request_is_rejected_without_losing_prefix(protocol, prefix):
+def test_nonfitting_request_is_rejected_without_losing_prefix(agent_llm_enabled, protocol, prefix):
     async def exercise():
         handled, snapshots = [], []
         async def handler(value, context):
@@ -113,7 +114,7 @@ def test_nonfitting_request_is_rejected_without_losing_prefix(protocol, prefix):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_result_growth_preserves_started_checkpoint_and_completed_prefix(protocol):
+def test_result_growth_preserves_started_checkpoint_and_completed_prefix(agent_llm_enabled, protocol):
     async def exercise():
         handled = []
         calls = [(f"grow-{i}", "inspect_args", {"literal": chr(65+i)*30000, "ordinal": i}) for i in range(5)]

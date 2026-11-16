@@ -17,6 +17,7 @@ from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state_types import AgentInput
 from app.agent.models import ToolResult
 from app.agent.public_view import public_conversation_messages
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_recovered_progress import reply, unfinished
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
 
@@ -133,7 +134,7 @@ def mixed(outcome):
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("summary", [SUMMARY, PRIVATE], ids=["safe-summary", "private-summary"])
 @pytest.mark.parametrize("ending,reason", ENDINGS)
-def test_unrecovered_returned_error_priority_survives_every_projection(store, protocol, ok, summary, ending, reason):
+def test_unrecovered_returned_error_priority_survives_every_projection(agent_llm_enabled, store, protocol, ok, summary, ending, reason):
     outcome = ToolResult(ok, "rate_limited", summary, error=DETAIL)
     final, tools, wire, _ = asyncio.run(scenario(store, mixed(outcome), ending=ending, protocol=protocol))
     assert final["status"] == "partial"
@@ -149,7 +150,7 @@ def test_unrecovered_returned_error_priority_survives_every_projection(store, pr
     assert unfinished(final["answer"]) == "未完成的查询：" + DETAIL
 
 
-def test_primary_returned_limit_detail_survives_more_than_three_errors(store):
+def test_primary_returned_limit_detail_survives_more_than_three_errors(agent_llm_enabled, store):
     errors = [DETAIL, "对象丁被限流", "对象戊被限流", "对象己被限流"]
     steps = [(C, {"ref": f"object-{index}"}, ToolResult(False, "rate_limited", SUMMARY, error=error))
              for index, error in enumerate(errors)] + [(B, {}, None)]
@@ -166,7 +167,7 @@ def test_primary_returned_limit_detail_survives_more_than_three_errors(store):
 @pytest.mark.parametrize("kind", ["absent", "empty", "unsafe"])
 @pytest.mark.parametrize("summary", [SUMMARY, PRIVATE], ids=["safe-summary", "private-summary"])
 @pytest.mark.parametrize("ending,reason", ENDINGS)
-def test_missing_empty_and_unsafe_errors_do_not_bypass_safe_filter(store, ok, kind, summary, ending, reason):
+def test_missing_empty_and_unsafe_errors_do_not_bypass_safe_filter(agent_llm_enabled, store, ok, kind, summary, ending, reason):
     outcome = ToolResult(ok, "rate_limited", summary, error=PRIVATE if kind == "unsafe" else "")
     if kind == "absent":
         outcome = outcome.to_dict()
@@ -187,7 +188,7 @@ def test_missing_empty_and_unsafe_errors_do_not_bypass_safe_filter(store, ok, ki
 
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("ending,reason", ENDINGS)
-def test_returned_error_recovery_removes_only_current_request(store, ok, ending, reason):
+def test_returned_error_recovery_removes_only_current_request(agent_llm_enabled, store, ok, ending, reason):
     outcome = ToolResult(ok, "rate_limited", SUMMARY, error="对象甲旧限流详情")
     steps = [(A, X, outcome), (C, Z, ToolResult(False, "rate_limited", SUMMARY, error=DETAIL)),
              (B, {}, None), (A, X, None)]
@@ -203,7 +204,7 @@ def test_returned_error_recovery_removes_only_current_request(store, ok, ending,
 
 
 @pytest.mark.parametrize("recover_between", [False, True])
-def test_repeated_returned_error_uses_latest_detail_in_ledger_order(store, recover_between):
+def test_repeated_returned_error_uses_latest_detail_in_ledger_order(agent_llm_enabled, store, recover_between):
     steps = [(A, X, ToolResult(False, "rate_limited", SUMMARY, error="第一版限流详情")),
              (C, Z, ToolResult(False, "rate_limited", SUMMARY, error=DETAIL)), (B, {}, None)]
     if recover_between:
@@ -218,7 +219,7 @@ def test_repeated_returned_error_uses_latest_detail_in_ledger_order(store, recov
 
 
 @pytest.mark.parametrize("other", [{"ref": "object-y", "scope": "scope-a"}, {"ref": "object-x", "scope": "scope-b"}])
-def test_same_summary_different_request_never_infers_recovery(store, other):
+def test_same_summary_different_request_never_infers_recovery(agent_llm_enabled, store, other):
     original = {**X, "scope": "scope-a"}
     steps = [(A, original, ToolResult(False, "rate_limited", SUMMARY, error="仅对象甲旧详情")),
              (A, other, ToolResult(False, "rate_limited", SUMMARY, error=DETAIL)),
@@ -233,7 +234,7 @@ def test_same_summary_different_request_never_infers_recovery(store, other):
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("error", [DETAIL, PRIVATE], ids=["safe-error", "unsafe-error"])
 @pytest.mark.parametrize("ending", ["answer", "round-empty"])
-def test_returned_limit_without_success_keeps_observation_or_interrupted_fallback(store, ok, error, ending):
+def test_returned_limit_without_success_keeps_observation_or_interrupted_fallback(agent_llm_enabled, store, ok, error, ending):
     final, tools, wire, events = asyncio.run(scenario(store, [(C, Z, ToolResult(ok, "rate_limited", SUMMARY, error=error))], ending=ending))
     assert "已有工具返回真实频率限制" not in encode(wire.requests[-1])
     assert json.loads(tools[0]["content"])["status"] == "rate_limited"

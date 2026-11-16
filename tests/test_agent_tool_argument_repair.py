@@ -9,6 +9,7 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_tool_argument_ingress import (
  PROTOCOLS,
  Wire,
@@ -32,7 +33,7 @@ def reply(protocol,mode,malformed):
  return wire(protocol,mode,value)
 
 @pytest.mark.parametrize('protocol,mode',CASES)
-def test_identifiable_malformed_call_is_repairable_not_provider_fault(protocol,mode):
+def test_identifiable_malformed_call_is_repairable_not_provider_fault(agent_llm_enabled, protocol,mode):
  events,error=asyncio.run(observe(protocol,reply(protocol,mode,True)))
  assert error is None, 'Identified malformed JSON must reach bounded validation repair, not Provider fault'
  calls=[e.tool_call for e in events if e.tool_call]
@@ -41,7 +42,7 @@ def test_identifiable_malformed_call_is_repairable_not_provider_fault(protocol,m
 
 @pytest.mark.parametrize('protocol',PROTOCOLS)
 @pytest.mark.parametrize('mode',['json','sse'])
-def test_native_valid_control(protocol,mode):
+def test_native_valid_control(agent_llm_enabled, protocol,mode):
  events,error=asyncio.run(observe(protocol,reply(protocol,mode,False)))
  assert error is None
  actual_calls = []
@@ -53,13 +54,13 @@ def test_native_valid_control(protocol,mode):
  assert events[-1].type is ModelEventType.FINISH
 
 @pytest.mark.parametrize('mode',['json','sse'])
-def test_broken_outer_remains_provider_fault(mode):
+def test_broken_outer_remains_provider_fault(agent_llm_enabled, mode):
  body=b'{broken' if mode=='json' else b'data: {broken\n\n'
  events,error=asyncio.run(observe('responses',(body,'application/json' if mode=='json' else 'text/event-stream')))
  assert error is not None
  assert not [e for e in events if e.tool_call]
 
-def test_real_session_malformed_then_correction_reaches_model(store):
+def test_real_session_malformed_then_correction_reaches_model(agent_llm_enabled, store):
  async def run():
   executed=[]
   def handler(arguments,context):

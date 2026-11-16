@@ -23,6 +23,7 @@ from tests.test_agent_invalid_argument_progress import store as store
 from tests.test_agent_kernel_core import collect, read_tool
 from tests.test_agent_recovered_progress import reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def native_calls(protocol, request):
@@ -36,7 +37,7 @@ def native_calls(protocol, request):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("mixed", [False, True], ids=["separate-native-groups", "mixed-native-group"])
-def test_retired_native_groups_become_runtime_data_without_changing_saved_facts(store, protocol, mixed):
+def test_retired_native_groups_become_runtime_data_without_changing_saved_facts(agent_llm_enabled, store, protocol, mixed):
     async def run():
         read_hidden = Mock(return_value={
             "ok": True, "status": "success", "summary": "旧对象已读取", "data": {"ref": "old-object"},
@@ -94,7 +95,7 @@ def test_retired_native_groups_become_runtime_data_without_changing_saved_facts(
 @pytest.mark.parametrize("case", [
     "corrected", "no-correction", "new-rejection", "budget-after-correction", "business-failure", "business-result-failure", "started-entry-error",
 ])
-def test_entry_recovery_preserves_rejections_and_operational_failures(store, protocol, case):
+def test_entry_recovery_preserves_rejections_and_operational_failures(agent_llm_enabled, store, protocol, case):
     async def run():
         prepare_hidden, execute_hidden = Mock(), Mock()
         hidden = replace(read_tool("private.change"), effect=ToolEffect.WRITE, read=None,
@@ -157,7 +158,7 @@ def test_entry_recovery_preserves_rejections_and_operational_failures(store, pro
 
 
 @pytest.mark.parametrize("followup", ["help", "unrelated-query"])
-def test_entry_correction_and_terminal_success_never_upgrade_failed_write_receipt(store, followup):
+def test_entry_correction_and_terminal_success_never_upgrade_failed_write_receipt(agent_llm_enabled, store, followup):
     async def run():
         failure = {"ok": False, "status": "business_failed", "summary": "文件保存失败，目标仍未写入"}
         execute_write = Mock(return_value=failure)

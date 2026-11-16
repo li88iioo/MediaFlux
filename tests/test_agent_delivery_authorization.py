@@ -19,6 +19,7 @@ from tests.test_agent_continuation_delivery_handoff import (
     _completed_effect,
     _handoff,
 )
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class BotFixture:
@@ -43,7 +44,7 @@ def _row(kind):
 
 @pytest.mark.parametrize("kind", ["effect", "continuation"])
 @pytest.mark.parametrize("change", [None, "TG_AGENT_ALLOWED_USER_IDS", "TG_CHAT_ID"])
-def test_completed_native_receipt_rechecks_current_authorization_before_bot(tmp_path, kind, change):
+def test_completed_native_receipt_rechecks_current_authorization_before_bot(agent_llm_enabled, tmp_path, kind, change):
     async def run():
         bot = BotFixture()
         with patch.object(center, "wake_telegram_notification_dispatcher", return_value=False), patch(
@@ -87,7 +88,7 @@ def test_completed_native_receipt_rechecks_current_authorization_before_bot(tmp_
     ("TG_AGENT_ENABLED", "0", 503),
     ("AGENT_ENABLED", "0", 503),
 ])
-def test_direct_native_continuation_sender_retains_live_authorization_contract(tmp_path, setting, value, status):
+def test_direct_native_continuation_sender_retains_live_authorization_contract(agent_llm_enabled, tmp_path, setting, value, status):
     async def run():
         bot = BotFixture()
         with patch.object(center, "wake_telegram_notification_dispatcher", return_value=False):

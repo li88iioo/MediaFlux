@@ -30,6 +30,7 @@ from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from app.agent.transports import TelegramKernelTransport, WebKernelTransport
 from tests.support import authenticated_session, initialized_web_runtime, isolated_test_database
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 class NativeRuntime:
@@ -183,7 +184,7 @@ def api_client(runtime, monkeypatch, csrf="explain-csrf"):
             yield client, agent_api.web_kernel_owner("explain-account")
 
 
-def test_confirm_rate_limit_preserves_pending_ticket_for_readonly_recovery(monkeypatch):
+def test_confirm_rate_limit_preserves_pending_ticket_for_readonly_recovery(agent_llm_enabled, monkeypatch):
     from app.routes import agent_api
 
     with isolated_test_database("confirm-rate-limit.db"):
@@ -217,7 +218,7 @@ def test_confirm_rate_limit_preserves_pending_ticket_for_readonly_recovery(monke
             assert runtime.writes == [] and len(runtime.prepares) == 1 and len(runtime.wires) == 1
 
 
-def test_web_security_cold_confirm_and_tool_rejection(monkeypatch):
+def test_web_security_cold_confirm_and_tool_rejection(agent_llm_enabled, monkeypatch):
     with isolated_test_database("explain-web.db"):
         runtime = NativeRuntime()
         with api_client(runtime, monkeypatch) as (client, owner):
@@ -295,7 +296,7 @@ def test_web_security_cold_confirm_and_tool_rejection(monkeypatch):
             assert '原任务目标（后续解释问题不是新任务）："改名一个对象"' in final_system
 
 
-def test_telegram_actual_callback_preserves_card(monkeypatch):
+def test_telegram_actual_callback_preserves_card(agent_llm_enabled, monkeypatch):
     from app.bot import agent_adapter
     from tests.test_agent_kernel_telegram_adapter import TELEBOT
 

@@ -30,10 +30,11 @@ from tests.test_agent_read_wait_lifecycle import (
 )
 
 from .test_agent_read_wait_contract_repair import resumed
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize('mode', ['pending', 'confirmed', 'unknown', 'explain'])
-def test_wait_bearing_effect_entry_excludes_auto_execution(mode):
+def test_wait_bearing_effect_entry_excludes_auto_execution(agent_llm_enabled, mode):
     async def run():
         clock = [100]
         runtime, candidate = await parked_runtime(clock)
@@ -106,7 +107,7 @@ def tg_config(tmp_path, monkeypatch):
         config.write_env_file(config.ENV_FILE, {}, replace=False)
         db.init_db()
         initialize_runtime_fence()
-        config.set_and_save({'AGENT_ENABLED': '1', 'AGENT_LLM_ENABLED': '0'})
+        config.set_and_save({'AGENT_ENABLED': '1', 'AGENT_LLM_ENABLED': '1'})
         yield
 
 

@@ -17,6 +17,7 @@ from app.agent.kernel.provider_model import (
     ProviderSettings,
 )
 from app.agent.kernel.state_types import CancellationToken
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_generation_profiles import (
     BASE,
     PATHS,
@@ -65,7 +66,7 @@ def run(wire, *, private=False, output=2048, context=8192, content='full fact ta
 
 
 @pytest.mark.parametrize('private', [False, True])
-def test_explicit_window_feedback_reduces_only_output_and_preserves_native(private):
+def test_explicit_window_feedback_reduces_only_output_and_preserves_native(agent_llm_enabled, private):
     wire = FeedbackWire([window_error()])
     events = run(wire, private=private)
     assert ''.join(event.text for event in events) == 'ok'
@@ -89,7 +90,7 @@ def test_explicit_window_feedback_reduces_only_output_and_preserves_native(priva
     httpx.Response(400, json={'error': {'message': 'context_length_exceeded'}}),
     httpx.Response(400, content=b'{"error":{"code":"context_length_exceeded","code":"invalid"}}'),
 ])
-def test_other_failures_are_not_feedback_or_protocol_fallback(reply):
+def test_other_failures_are_not_feedback_or_protocol_fallback(agent_llm_enabled, reply):
     wire = FeedbackWire([reply])
     with pytest.raises(ModelProviderError) as caught:
         run(wire, protocol='auto')
@@ -97,7 +98,7 @@ def test_other_failures_are_not_feedback_or_protocol_fallback(reply):
     assert_safe_error(caught.value)
 
 
-def test_feedback_is_at_most_once_even_for_private_native():
+def test_feedback_is_at_most_once_even_for_private_native(agent_llm_enabled):
     wire = FeedbackWire([window_error(), window_error()])
     with pytest.raises(ModelProviderError) as caught:
         run(wire, private=True)
@@ -107,14 +108,14 @@ def test_feedback_is_at_most_once_even_for_private_native():
 
 
 @pytest.mark.parametrize('output,context,content', [(255,8192,'fact'), (2048,1024,'fact' * 400)])
-def test_feedback_refuses_when_safe_output_or_full_body_cannot_fit(output, context, content):
+def test_feedback_refuses_when_safe_output_or_full_body_cannot_fit(agent_llm_enabled, output, context, content):
     wire = FeedbackWire([window_error()])
     with pytest.raises(ModelProviderError):
         run(wire, output=output, context=context, content=content)
     assert len(wire.requests) == 1
 
 
-def test_feedback_never_unlocks_auto_protocol_fallback():
+def test_feedback_never_unlocks_auto_protocol_fallback(agent_llm_enabled):
     wire = FeedbackWire([window_error(), httpx.Response(404, json={
         'error': {'code': 'unsupported_endpoint', 'message': 'responses endpoint is not supported'}})])
     with pytest.raises(ModelProviderError):
@@ -130,7 +131,7 @@ def test_feedback_never_unlocks_auto_protocol_fallback():
     {'tool_calls': [{'index': 0, 'id': 'c1', 'type': 'function',
                      'function': {'name': 'inspect', 'arguments': '{"q":"keep"}'}}]},
 ])
-def test_stream_window_error_never_replays_partial_output(delta):
+def test_stream_window_error_never_replays_partial_output(agent_llm_enabled, delta):
     frames = [ {'choices': [{'delta': delta}]},
         {'error': {'code': 'context_length_exceeded', 'message': 'secret-sentinel'}} ]
     wire = FeedbackWire([httpx.Response(200, headers={'content-type': 'text/event-stream'},
@@ -141,7 +142,7 @@ def test_stream_window_error_never_replays_partial_output(delta):
     assert_safe_error(caught.value)
 
 
-def test_oversized_feedback_is_not_retried():
+def test_oversized_feedback_is_not_retried(agent_llm_enabled):
     wire = FeedbackWire([httpx.Response(400, content=b'{"error":{"code":"context_length_exceeded","message":"' + b'x' * 65536 + b'"}}')])
     with pytest.raises(ModelProviderError) as caught:
         run(wire)

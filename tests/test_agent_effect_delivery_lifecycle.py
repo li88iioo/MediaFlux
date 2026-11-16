@@ -19,6 +19,7 @@ from app.modules import telegram_notification_center as center
 from app.notifier import TelegramSendResult
 from tests.test_agent_continuation_delivery_handoff import OWNER, ROUTE, SID, _completed_effect
 from tests.test_agent_continuation_delivery_identity import _process_drain
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 def _rows():
@@ -55,7 +56,7 @@ class _AnswerModel:
         yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
 
 
-def test_completed_effect_delivery_uses_stable_identity_and_frozen_route(tmp_path):
+def test_completed_effect_delivery_uses_stable_identity_and_frozen_route(agent_llm_enabled, tmp_path):
     async def run():
         with _transport() as sent:
             async with _completed_effect(tmp_path, [100]) as (store, follow, reads):
@@ -78,7 +79,7 @@ def test_completed_effect_delivery_uses_stable_identity_and_frozen_route(tmp_pat
     asyncio.run(run())
 
 
-def test_normal_history_retention_does_not_revoke_queued_effect_receipt(tmp_path):
+def test_normal_history_retention_does_not_revoke_queued_effect_receipt(agent_llm_enabled, tmp_path):
     async def run():
         with _transport() as sent:
             async with _completed_effect(tmp_path, [100]) as (store, _, _):
@@ -102,7 +103,7 @@ def test_normal_history_retention_does_not_revoke_queued_effect_receipt(tmp_path
 
 
 @pytest.mark.parametrize("operation", ["reset", "delete"])
-def test_successful_lifecycle_change_prevents_old_receipt_send(tmp_path, operation):
+def test_successful_lifecycle_change_prevents_old_receipt_send(agent_llm_enabled, tmp_path, operation):
     async def run():
         with _transport() as sent:
             async with _completed_effect(tmp_path, [100]) as (store, _, _):
@@ -125,7 +126,7 @@ def test_successful_lifecycle_change_prevents_old_receipt_send(tmp_path, operati
 
 
 @pytest.mark.parametrize("operation", ["reset", "delete"])
-def test_session_mutation_cannot_complete_between_receipt_check_and_send(tmp_path, operation):
+def test_session_mutation_cannot_complete_between_receipt_check_and_send(agent_llm_enabled, tmp_path, operation):
     async def run():
         entered, release = threading.Event(), threading.Event()
 
@@ -154,7 +155,7 @@ def test_session_mutation_cannot_complete_between_receipt_check_and_send(tmp_pat
     asyncio.run(run())
 
 
-def test_ordinary_new_turn_preserves_queued_completed_effect_receipt(tmp_path):
+def test_ordinary_new_turn_preserves_queued_completed_effect_receipt(agent_llm_enabled, tmp_path):
     async def run():
         with _transport() as sent:
             async with _completed_effect(tmp_path, [100]) as (store, _, _):
@@ -174,7 +175,7 @@ def test_ordinary_new_turn_preserves_queued_completed_effect_receipt(tmp_path):
 
 @pytest.mark.parametrize("operation", ["reset", "delete"])
 @pytest.mark.parametrize("first", ["send", "lifecycle"])
-def test_effect_delivery_and_lifecycle_share_lock_across_processes(tmp_path, operation, first):
+def test_effect_delivery_and_lifecycle_share_lock_across_processes(agent_llm_enabled, tmp_path, operation, first):
     async def run():
         with _transport() as sent:
             async with _completed_effect(tmp_path, [100]) as (store, _, _):

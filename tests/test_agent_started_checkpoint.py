@@ -23,6 +23,7 @@ from tests.support import isolated_test_database
 from tests.test_agent_provider_state import REDACTED, SIGNATURE, THINKING
 from tests.test_agent_provider_text_authority import native_reply
 from tests.test_agent_tool_argument_ingress import PROTOCOLS, Wire, encode
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 OWNER, SESSION = "checkpoint-owner", "checkpoint-session"
 FIRST_FACT = "FIRST_FACT: inventory independently observed"
@@ -151,7 +152,7 @@ def assert_native_wire(protocol, payload, calls):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("blocked", [False, True])
-def test_batch_activation_characterization(protocol, blocked):
+def test_batch_activation_characterization(agent_llm_enabled, protocol, blocked):
     async def exercise():
         handled = []
         calls = [(key, "inspect_batch", {"selector": key, "exclude_played": True}) for key in ("a", "b")]
@@ -182,7 +183,7 @@ def test_batch_activation_characterization(protocol, blocked):
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("kind", ["outcome", "error"])
-def test_future_unbounded_result_cannot_erase_completed_prefix(protocol, kind):
+def test_future_unbounded_result_cannot_erase_completed_prefix(agent_llm_enabled, protocol, kind):
     """Kernel-legal passthrough values, not a claim about any real media service."""
     async def exercise():
         handled, entered = [], []
@@ -231,7 +232,7 @@ def test_future_unbounded_result_cannot_erase_completed_prefix(protocol, kind):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_checkpoint_is_committed_at_each_handler_entry_and_replaced_on_success(protocol):
+def test_checkpoint_is_committed_at_each_handler_entry_and_replaced_on_success(agent_llm_enabled, protocol):
     async def exercise():
         handled, snapshots = [], []
         async def read(arguments, context):
@@ -263,7 +264,7 @@ def test_checkpoint_is_committed_at_each_handler_entry_and_replaced_on_success(p
 
 
 @pytest.mark.parametrize("failure", ["io", "cancel", "stale"])
-def test_preexecution_checkpoint_failure_never_runs_handler_or_erases_prior_fact(failure):
+def test_preexecution_checkpoint_failure_never_runs_handler_or_erases_prior_fact(agent_llm_enabled, failure):
     async def exercise():
         handled, intercepted, cancelled_leases, prior_native = [], [], [], []
         calls = [(key, "inspect_batch", {"selector": key}) for key in ("good", "blocked", "later")]
@@ -335,7 +336,7 @@ def test_preexecution_checkpoint_failure_never_runs_handler_or_erases_prior_fact
 
 
 @pytest.mark.parametrize("unknown", [False, True])
-def test_read_preview_confirmation_and_duplicate_keep_receipt_without_replay(unknown):
+def test_read_preview_confirmation_and_duplicate_keep_receipt_without_replay(agent_llm_enabled, unknown):
     """Normal-capacity control, not a guarantee for oversized confirmed receipts."""
     async def exercise():
         reads, preparations, writes = [], [], []
@@ -392,7 +393,7 @@ def test_read_preview_confirmation_and_duplicate_keep_receipt_without_replay(unk
         asyncio.run(exercise())
 
 
-def test_cancellation_after_handler_entry_preserves_completed_and_unknown():
+def test_cancellation_after_handler_entry_preserves_completed_and_unknown(agent_llm_enabled):
     async def exercise():
         started = asyncio.Event()
         handled = []

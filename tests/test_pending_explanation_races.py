@@ -8,12 +8,13 @@ from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state import TurnCoordinator
 from app.agent.kernel.state_types import AgentInput
 from app.agent.kernel.turn import AgentTurn
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime
 
 
 @pytest.mark.parametrize("action", ["stop", "read", "cancel_plan", "expire"])
-def test_explanation_does_not_own_or_refresh_plan(action):
+def test_explanation_does_not_own_or_refresh_plan(agent_llm_enabled, action):
     async def run():
         runtime = NativeRuntime()
         owner, sid = "owner", "explain-race"
@@ -96,7 +97,7 @@ def test_explanation_does_not_own_or_refresh_plan(action):
 
 
 @pytest.mark.parametrize("cleanup", ["checkpoint", "finish", "ownership_check"])
-def test_superseded_explanation_cleanup_cannot_cancel_current_read(monkeypatch, cleanup):
+def test_superseded_explanation_cleanup_cannot_cancel_current_read(agent_llm_enabled, monkeypatch, cleanup):
     """旧收尾与新回答提交重叠；暂停真实提交worker，不替换CAS或放宽原断言。"""
     new_commit_ready, old_ready = asyncio.Event(), asyncio.Event()
     new_committed, old_finished = asyncio.Event(), asyncio.Event()
@@ -178,7 +179,7 @@ def test_superseded_explanation_cleanup_cannot_cancel_current_read(monkeypatch, 
     monkeypatch.setattr(TurnCoordinator, "finish", finish)
     try:
         # 原测试继续检查冻结计划不变、无提前写、冷SQLite读取与确认仅一次。
-        test_explanation_does_not_own_or_refresh_plan("read")
+        test_explanation_does_not_own_or_refresh_plan(agent_llm_enabled, "read")
         assert checked
     finally:
         release_worker.set()
@@ -227,7 +228,7 @@ def test_superseded_read_settlement_cannot_cancel_current_commit(monkeypatch):
         asyncio.run(run())
 
 
-def test_confirmed_parent_can_commit_but_inherited_child_cannot():
+def test_confirmed_parent_can_commit_but_inherited_child_cannot(agent_llm_enabled):
     from dataclasses import replace
     from app.agent.kernel.capabilities import ToolCatalog
     from app.agent.kernel.state_types import StalePublicationError, StateUpdate

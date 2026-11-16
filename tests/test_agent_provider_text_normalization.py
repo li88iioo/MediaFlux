@@ -8,10 +8,11 @@ import json
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.public_view import public_conversation_messages
 from tests import test_agent_provider_state as fixtures
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_provider_text_authority import native_reply, stream_reply
 
 
-def test_literal_closing_tag_survives_private_sse_tool_loop_and_restart():
+def test_literal_closing_tag_survives_private_sse_tool_loop_and_restart(agent_llm_enabled):
     async def scenario():
         fixture = fixtures.ProviderStateSessionTests()
         await fixture.asyncSetUp()
@@ -56,7 +57,7 @@ def test_literal_closing_tag_survives_private_sse_tool_loop_and_restart():
     asyncio.run(scenario())
 
 
-def test_empty_private_signature_is_a_provider_error_before_tool_execution():
+def test_empty_private_signature_is_a_provider_error_before_tool_execution(agent_llm_enabled):
     async def scenario():
         fixture = fixtures.ProviderStateSessionTests()
         await fixture.asyncSetUp()

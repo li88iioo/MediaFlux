@@ -7,10 +7,11 @@ from app.agent.kernel.tool_calls import PreparedEffect
 from app.agent.kernel.state_types import StateUpdate
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize("cross_generation", [False, True])
-def test_legacy_ticket_adopts_binding_only_in_issuing_generation(cross_generation):
+def test_legacy_ticket_adopts_binding_only_in_issuing_generation(agent_llm_enabled, cross_generation):
     async def run():
         runtime = NativeRuntime()
         lease, _ = await runtime.store.begin_turn(

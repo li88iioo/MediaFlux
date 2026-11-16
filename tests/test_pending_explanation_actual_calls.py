@@ -4,13 +4,14 @@ import pytest
 
 from app.agent.kernel.adapters import consume_events
 from app.agent.kernel.state_types import AgentInput
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime
 
 
 @pytest.mark.parametrize("name", [None, "tools_search", "refs_read", "task_update"])
 @pytest.mark.parametrize("arguments", ['{"step":1}', '{"step":'])
-def test_any_actual_call_is_rejected_without_repair_or_dispatch(name, arguments):
+def test_any_actual_call_is_rejected_without_repair_or_dispatch(agent_llm_enabled, name, arguments):
     async def run():
         runtime = NativeRuntime()
         preview = await consume_events(

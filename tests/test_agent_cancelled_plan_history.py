@@ -24,6 +24,7 @@ from app.agent.kernel.model import ModelEvent, ModelToolCall
 from app.agent.kernel.model import ModelEventType as M
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.state_types import AgentInput, SessionBusyError
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime
 
@@ -31,7 +32,7 @@ OWNER, SID = "cancel-history-owner", "cancel-history-session"
 
 
 @pytest.fixture
-def runtime(monkeypatch):
+def runtime(monkeypatch, agent_llm_enabled):
     def no_network(*args, **kwargs):
         raise AssertionError("本测试仅用 mock/脚本模型，禁止真实网络连接")
 

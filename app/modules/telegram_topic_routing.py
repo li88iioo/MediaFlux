@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app import database as db
+from app.agent.feature_gate import is_agent_llm_enabled
 from app.sensitive_data import contains_sensitive_credential, redact_sensitive_text
 
 _THREAD_RE = re.compile(r"^[1-9][0-9]{0,18}$")
@@ -434,7 +435,7 @@ async def auto_name_private_topic(
     if not key:
         return False
     try:
-        if _topic_naming_status(key) != "eligible":
+        if _topic_naming_status(key) != "eligible" or not await asyncio.to_thread(is_agent_llm_enabled):
             return False
         if not _set_topic_naming_status(key, "naming", only_if="eligible"):
             return False

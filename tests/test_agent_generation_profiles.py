@@ -22,6 +22,7 @@ from app.agent.kernel.state_types import CancellationToken
 from app.clients.ai_recognition import AIRecognitionClient
 from app.clients.http import FixedHostHttpClient
 from tests.support import authenticated_session
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 BASE = 'https://api.example.com/v1'
 KEY = 'AGENT_LLM_GENERATION_PROFILES'
@@ -37,7 +38,7 @@ def profiles(model, protocol='chat_completions'):
 
 @contextmanager
 def settings(model='o3', protocol='chat_completions', profile='', effort=''):
-    values = {'AGENT_LLM_API_URL': BASE, 'AGENT_LLM_MODEL': model,
+    values = {'AGENT_LLM_ENABLED': '1', 'AGENT_LLM_API_URL': BASE, 'AGENT_LLM_MODEL': model,
               'AGENT_LLM_API_KEY': 'offline-fixture-only', 'AGENT_LLM_PROTOCOL': protocol,
               'AGENT_LLM_CONTEXT_WINDOW_TOKENS': '128000', KEY: profile,
               'AGENT_LLM_REASONING_EFFORT': effort}
@@ -600,7 +601,7 @@ def test_telegram_callback_real_kv_next_turn_title_and_web_isolation():
 
 @pytest.mark.parametrize('protocol', PROTOCOLS)
 @pytest.mark.parametrize('unsupported', [False, True])
-def test_explicit_profile_preserves_bound_native_auto(protocol, unsupported):
+def test_explicit_profile_preserves_bound_native_auto(agent_llm_enabled, protocol, unsupported):
     from tests.test_agent_protocol_fallback import (
         assert_native_payload,
         http_error,
@@ -630,7 +631,7 @@ def test_explicit_profile_preserves_bound_native_auto(protocol, unsupported):
     (400, 'responses api is not supported' + ' ' * 8192 + ' insufficient quota', 1),
     (503, 'temporary', 2),
 ])
-def test_profiles_do_not_grant_business_or_exhausted_fallback(status, text, attempts):
+def test_profiles_do_not_grant_business_or_exhausted_fallback(agent_llm_enabled, status, text, attempts):
     from tests.test_agent_protocol_fallback import http_error, wire
 
     raw = json.dumps([json.loads(profiles('fixture', p))[0] for p in PROTOCOLS])
@@ -643,7 +644,7 @@ def test_profiles_do_not_grant_business_or_exhausted_fallback(status, text, atte
 @pytest.mark.parametrize('mode', ['cancel', 'deadline'])
 @pytest.mark.parametrize('fallback', [False, True])
 @pytest.mark.parametrize('close_fault', [None, httpx.ReadError, ValueError])
-def test_profile_cancel_deadline_with_real_cleanup(mode, fallback, close_fault):
+def test_profile_cancel_deadline_with_real_cleanup(agent_llm_enabled, mode, fallback, close_fault):
     from app.agent.kernel.provider_model import ModelProviderError
     from tests.test_agent_protocol_fallback import SECRET, error_chain, http_error, wire
 

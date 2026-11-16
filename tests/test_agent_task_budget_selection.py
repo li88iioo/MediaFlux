@@ -26,6 +26,7 @@ from tests.agent_task_native_helpers import task_call
 from tests.test_agent_kernel_core import ScriptedModel, collect, read_tool
 from tests.test_agent_task_cas import task_store as task_store
 from tests.test_agent_session_result import native_workspace as native_workspace
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 OWNER, SID, GOAL = "budget-selection-owner", "budget-selection", "检查旧媒体库状态"
 READ = "library.inspect"
@@ -500,7 +501,7 @@ def test_initial_read_followup_stays_independent_and_seed_uses_actual_model_call
     asyncio.run(run())
 
 
-def test_real_park_resume_terminal_does_not_charge_twenty_nine_new_topics(task_store):
+def test_real_park_resume_terminal_does_not_charge_twenty_nine_new_topics(agent_llm_enabled, task_store):
     from app.agent.kernel.persistence import SQLiteKernelStore
     from tests.test_agent_read_wait_lifecycle import OWNER as wait_owner
     from tests.test_agent_read_wait_lifecycle import (

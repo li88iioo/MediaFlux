@@ -20,6 +20,7 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state_types import AgentInput
 from app.clients.http import FixedHostHttpClient
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.support import isolated_test_database
 from tests.test_agent_provider_state import (
     REDACTED,
@@ -159,7 +160,7 @@ def phases(events):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_first_planning_text_truncation_keeps_read_tools_and_completes(protocol):
+def test_first_planning_text_truncation_keeps_read_tools_and_completes(agent_llm_enabled, protocol):
     async def scenario():
         reads = []
         wire = NativeWire(protocol, [
@@ -224,7 +225,7 @@ def truncated_call(protocol, *, complete_arguments=False):
     )
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_partial_native_arguments_are_not_replayed_or_persisted(protocol):
+def test_partial_native_arguments_are_not_replayed_or_persisted(agent_llm_enabled, protocol):
     async def scenario():
         reads = []
         wire = NativeWire(protocol, [
@@ -251,7 +252,7 @@ def test_partial_native_arguments_are_not_replayed_or_persisted(protocol):
     asyncio.run(scenario())
 
 
-def test_responses_completed_call_event_before_eof_is_not_executed_or_charged():
+def test_responses_completed_call_event_before_eof_is_not_executed_or_charged(agent_llm_enabled):
     async def scenario():
         reads = []
         wire = NativeWire("responses", [
@@ -345,7 +346,7 @@ def system_text(protocol, request):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_completed_read_and_native_private_group_survive_but_current_truncated_group_does_not(protocol):
+def test_completed_read_and_native_private_group_survive_but_current_truncated_group_does_not(agent_llm_enabled, protocol):
     async def scenario():
         reads = []
         wire = NativeWire(protocol, [
@@ -406,7 +407,7 @@ def test_completed_read_and_native_private_group_survive_but_current_truncated_g
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("recovery_read_succeeds", [False, True], ids=["recovery-itself-truncates", "later-round-truncates"])
-def test_only_one_reconstruction_is_allowed_per_turn(protocol, recovery_read_succeeds):
+def test_only_one_reconstruction_is_allowed_per_turn(agent_llm_enabled, protocol, recovery_read_succeeds):
     async def scenario():
         reads = []
         responses = [truncated_text(protocol)]
@@ -455,7 +456,7 @@ class BlockedRecoveryBody(httpx.AsyncByteStream):
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_user_can_cancel_during_native_reconstruction_without_a_third_request(protocol):
+def test_user_can_cancel_during_native_reconstruction_without_a_third_request(agent_llm_enabled, protocol):
     async def scenario():
         reads = []
         body = BlockedRecoveryBody(truncated_text(protocol).content)
@@ -488,7 +489,7 @@ def test_user_can_cancel_during_native_reconstruction_without_a_third_request(pr
 
 
 @pytest.mark.parametrize("boundary", ["no-model-round", "last-read-round", "last-round-keeps-tools", "tool-quota"])
-def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(boundary):
+def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(agent_llm_enabled, boundary):
     async def scenario():
         protocol = "responses"
         reads = []
@@ -541,7 +542,7 @@ def test_reconstruction_obeys_remaining_model_and_business_tool_budgets(boundary
     asyncio.run(scenario())
 
 
-def test_auto_protocol_fallback_preserves_incomplete_turn_reconstruction():
+def test_auto_protocol_fallback_preserves_incomplete_turn_reconstruction(agent_llm_enabled):
     async def scenario():
         def unsupported():
             return httpx.Response(404, json={'error': 'responses api is not supported'})

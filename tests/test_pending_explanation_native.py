@@ -23,13 +23,14 @@ from app.agent.kernel.provider_model import (
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state_types import AgentInput
 from tests.support import isolated_test_database
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 
 
 @pytest.mark.parametrize(
     "mode",
     ["explain", "direct", "cancel", "scope", "expiry", "permission", "replacement"],
 )
-def test_lifecycle(mode):
+def test_lifecycle(agent_llm_enabled, mode):
     import asyncio
 
     asyncio.run(lifecycle(mode))

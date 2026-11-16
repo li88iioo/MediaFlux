@@ -18,6 +18,7 @@ from app.agent.model_catalog import provider_channel_fingerprint
 from app.agent.transports import QueryEnvelope
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
 from tests.agent_task_native_helpers import task_function
+from tests.support import agent_llm_enabled as agent_llm_enabled  # noqa: PLC0414
 from tests.test_agent_read_wait_contract_repair import resumed
 from tests.test_agent_read_wait_entry_exclusions import tg_config as tg_config
 from tests.test_agent_read_wait_lifecycle import (
@@ -49,7 +50,7 @@ async def park(clock, route):
 
 
 @pytest.mark.parametrize('policy_changed', [False, True])
-def test_cold_read_terminal_uses_same_outbox_and_ack_retry_without_reexecution(tg_config, policy_changed):
+def test_cold_read_terminal_uses_same_outbox_and_ack_retry_without_reexecution(agent_llm_enabled, tg_config, policy_changed):
     async def run():
         clock = [100]
         candidate = await park(clock, ROUTE)
@@ -121,7 +122,7 @@ def test_cold_read_terminal_uses_same_outbox_and_ack_retry_without_reexecution(t
     asyncio.run(run())
 
 
-def test_historical_read_wait_without_route_never_guesses_topic(tg_config):
+def test_historical_read_wait_without_route_never_guesses_topic(agent_llm_enabled, tg_config):
     async def run():
         clock = [100]
         candidate = await park(clock, {})
@@ -138,7 +139,7 @@ def test_historical_read_wait_without_route_never_guesses_topic(tg_config):
     asyncio.run(run())
 
 
-def test_read_checkpoint_complete_keeps_claim_until_public_terminal(tg_config):
+def test_read_checkpoint_complete_keeps_claim_until_public_terminal(agent_llm_enabled, tg_config):
     class CheckpointScript(WaitScript):
         async def respond(self, request):
             if self.requests:
