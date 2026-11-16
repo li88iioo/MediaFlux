@@ -10,7 +10,7 @@ from fastapi.responses import RedirectResponse
 
 from app import config
 from app.agent.feature_gate import is_agent_enabled
-from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB, DEFAULT_STRM_VIDEO_EXTS
+from app.defaults import DEFAULT_OFFLINE_MIN_FILE_MB, DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
 from app.discovery.models import normalize_search_query
 from app.modules.global_search import build_global_search
 from app.services import (
@@ -172,6 +172,7 @@ def guangya(request: Request):
 
 def _offline_transfer_defaults() -> dict[str, Any]:
     """返回离线转存页首帧配置，避免异步回填时控件和标签横向跳动。"""
+    from app.modules.offline import DEFAULT_VIDEO_EXTS_CSV, normalize_video_extensions
 
     def split_tags(key: str) -> list[str]:
         raw = (config.get(key, "") or "")
@@ -190,7 +191,7 @@ def _offline_transfer_defaults() -> dict[str, Any]:
             "secondary_keywords": split_tags("OFFLINE_SECONDARY_KEYWORDS"),
             "exclude_keywords": split_tags("OFFLINE_EXCLUDE_KEYWORDS"),
             "min_file_mb": max(0, config.get_int("OFFLINE_MIN_FILE_MB", DEFAULT_OFFLINE_MIN_FILE_MB)),
-            "allowed_exts": split_tags("OFFLINE_ALLOWED_EXTS"),
+            "allowed_exts": normalize_video_extensions(config.get("OFFLINE_ALLOWED_EXTS", "")) or DEFAULT_VIDEO_EXTS_CSV.split(","),
         }
     }
 
@@ -210,6 +211,7 @@ def guangya_strm(request: Request):
     return _page(
         request, "guangya_strm.html", "guangya_strm",
         strm_full_video_exts=",".join(DEFAULT_STRM_VIDEO_EXTS),
+        strm_full_metadata_exts=",".join(DEFAULT_STRM_METADATA_EXTS),
     )
 
 
@@ -255,7 +257,7 @@ def _organize_execute_defaults() -> dict[str, Any]:
 
 
 def _organize_extension_defaults() -> dict[str, Any]:
-    from app.modules.organize import (
+    from app.modules.organize_rules import (
         DEFAULT_ORGANIZE_METADATA_EXTS,
         DEFAULT_ORGANIZE_VIDEO_EXTS,
     )
@@ -272,6 +274,8 @@ def _organize_extension_defaults() -> dict[str, Any]:
         return values or list(defaults)
 
     return {
+        "organize_recommended_video_exts": DEFAULT_ORGANIZE_VIDEO_EXTS,
+        "organize_recommended_metadata_exts": DEFAULT_ORGANIZE_METADATA_EXTS,
         "organize_video_exts": current_extensions(
             "GY_ORGANIZE_VIDEO_EXTS", DEFAULT_ORGANIZE_VIDEO_EXTS
         ),

@@ -820,7 +820,7 @@
 
         // Init Tag Inputs
         videoTagInput.setTagsFromString(cfg.STRM_VIDEO_EXTS || '');
-        metadataTagInput.setTagsFromString(cfg.STRM_METADATA_EXTS || 'nfo,srt,ass,jpg,png');
+        metadataTagInput.setTagsFromString(cfg.STRM_METADATA_EXTS || '');
 
         const canonical=String(cfg.GY_STRM_SOURCE_DIRS??'').trim();
         try{sources=canonical?JSON.parse(canonical):[];}catch(_){sources=[];}

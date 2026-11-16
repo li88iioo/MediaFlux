@@ -27,7 +27,7 @@ from app.repositories import strm as strm_repo
 from app.repositories import organize_probe as organize_probe_repo
 from app.repositories import strm_request_ownership as strm_request_ownership_repo
 from app.config import get, get_bool, get_int
-from app.defaults import DEFAULT_SCHEDULE_CRON
+from app.defaults import DEFAULT_SCHEDULE_CRON, DEFAULT_STRM_SKIP_THRESHOLD_MB
 from app.logger import get_logger, log_throttled
 from app.modules.media_refresh import plan_refresh_targets
 from app.modules.organize_probe_notifications import (
@@ -1775,7 +1775,7 @@ class STRMScheduler:
             strm_root = get("STRM_ROOT").strip()
             exts = self._video_exts()
             metadata_exts = self._metadata_exts()
-            threshold = get_int("STRM_SKIP_THRESHOLD_MB", 0)
+            threshold = get_int("STRM_SKIP_THRESHOLD_MB", DEFAULT_STRM_SKIP_THRESHOLD_MB)
             logger.info(
                 "STRM 任务开始 trigger=%s sources=%s scoped=%s root=%s retirements=%s",
                 trigger_type, len(sources), scoped_sources, strm_root,

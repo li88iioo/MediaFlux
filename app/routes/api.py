@@ -23,6 +23,8 @@ from app.defaults import (
     DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
     DEFAULT_OFFLINE_MIN_FILE_MB,
     DEFAULT_SCHEDULE_CRON,
+    DEFAULT_STRM_METADATA_EXTS,
+    DEFAULT_STRM_SKIP_THRESHOLD_MB,
     DEFAULT_STRM_VIDEO_EXTS,
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
@@ -953,6 +955,10 @@ def dashboard_data(request: Request, refresh: bool = False):
 
 def _ui_defaults() -> dict[str, str]:
     """页面字段的唯一默认值表；后加入的来源优先级更高且不得与先前来源冲突。"""
+    from app.modules.organize_rules import (
+        DEFAULT_ORGANIZE_METADATA_EXTS, DEFAULT_ORGANIZE_VIDEO_EXTS, OrganizeRules,
+    )
+
     defaults = {key: "1" if value else "0" for key, value in DEFAULT_BOOL_CONFIG_VALUES.items()}
     defaults.update({key: "1" if default else "0" for key, _, default in FEATURES.values()})
     defaults.update({key: str(policy.default) for key, policy in POLICY_BY_KEY.items()})
@@ -963,6 +969,12 @@ def _ui_defaults() -> dict[str, str]:
     defaults["RSS_DOWNLOAD_METHOD"] = "qb"
     defaults["OFFLINE_MIN_FILE_MB"] = str(DEFAULT_OFFLINE_MIN_FILE_MB)
     defaults["STRM_VIDEO_EXTS"] = ",".join(DEFAULT_STRM_VIDEO_EXTS)
+    defaults["STRM_METADATA_EXTS"] = ",".join(DEFAULT_STRM_METADATA_EXTS)
+    defaults["STRM_SKIP_THRESHOLD_MB"] = str(DEFAULT_STRM_SKIP_THRESHOLD_MB)
+    defaults["GY_ORGANIZE_VIDEO_EXTS"] = ",".join(DEFAULT_ORGANIZE_VIDEO_EXTS)
+    defaults["GY_ORGANIZE_METADATA_EXTS"] = ",".join(DEFAULT_ORGANIZE_METADATA_EXTS)
+    for field in ("small_file_mb", "conflict_strategy", "nsfw_category_name", "nsfw_timeout_seconds", "automatic_match_preset"):
+        defaults[f"GY_ORGANIZE_{field.upper()}"] = str(getattr(OrganizeRules, field))
     defaults.update(dict.fromkeys(_CRON_KEYS, DEFAULT_SCHEDULE_CRON))
     return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
 

@@ -51,15 +51,9 @@
         .filter(Boolean);
     configFieldLocks.forEach(({field})=>{field.disabled=true;});
 
-    function readExtensionDefaults(kind){
-        return Array.from(
-            document.querySelectorAll(`[data-extension-editor="${kind}"] [data-extension-value]`),
-            node=>node.dataset.extensionValue||'',
-        ).filter(Boolean);
-    }
     const extensionDefaults={
-        video:readExtensionDefaults('video'),
-        metadata:readExtensionDefaults('metadata'),
+        video:normalizeExtensionTokens(document.querySelector('[data-extension-editor="video"]')?.dataset.recommendedExtensions),
+        metadata:normalizeExtensionTokens(document.querySelector('[data-extension-editor="metadata"]')?.dataset.recommendedExtensions),
     };
     function normalizeExtensionTokens(raw){
         const values=[];String(raw||'').split(/[,，\s]+/).forEach(token=>{const value=token.trim().toLowerCase().replace(/^\.+/,'');if(/^[a-z0-9]{1,10}$/.test(value)&&!values.includes(value))values.push(value);});return values;
@@ -74,7 +68,7 @@
         input.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===','||event.key==='，'){event.preventDefault();add(input.value);}else if(event.key==='Backspace'&&!input.value&&values.length){values.pop();sync();}});
         input.addEventListener('blur',()=>add(input.value));input.addEventListener('paste',event=>{const text=event.clipboardData?.getData('text')||'';if(/[,，\s]/.test(text)){event.preventDefault();add(text);}});
         reset.addEventListener('click',()=>set(extensionDefaults[kind].join(',')));
-        set(extensionDefaults[kind].join(','));
+        set(hidden.value);
         return {set,ensure(){if(!values.length)set(extensionDefaults[kind].join(','));}};
     }
     const extensionEditors=isRules?{video:createExtensionEditor('video','r_video_exts'),metadata:createExtensionEditor('metadata','r_metadata_exts')}:{};
@@ -966,13 +960,8 @@
         sources=parseSources(config.GY_ORGANIZE_SOURCE_DIRS);
         nsfwSourceIds=parseSourceIds(config.GY_ORGANIZE_NSFW_SOURCE_IDS);
         renderNsfwSources();
-        extensionEditors.video?.set(config.GY_ORGANIZE_VIDEO_EXTS||extensionDefaults.video.join(','));
-        extensionEditors.metadata?.set(config.GY_ORGANIZE_METADATA_EXTS||extensionDefaults.metadata.join(','));
-        if(!config.GY_ORGANIZE_SMALL_FILE_MB)document.getElementById('r_small').value='10';
-        if(!config.GY_ORGANIZE_NSFW_CATEGORY_NAME)document.getElementById('r_nsfw_category').value='成人内容';
-        if(!config.GY_ORGANIZE_NSFW_TIMEOUT_SECONDS)document.getElementById('r_nsfw_timeout').value='8';
-        if(!config.GY_ORGANIZE_CONFLICT_STRATEGY)document.getElementById('r_conflict').value='1';
-        if(!config.GY_ORGANIZE_AUTOMATIC_MATCH_PRESET)document.getElementById('r_automatic_match_preset').value='balanced';
+        extensionEditors.video?.set(config.GY_ORGANIZE_VIDEO_EXTS);
+        extensionEditors.metadata?.set(config.GY_ORGANIZE_METADATA_EXTS);
         finishConfigLoad(true);updateDependencies();syncNsfwPanel({collapseWhenDisabled:true});
     }).catch(()=>{updateDependencies();syncNsfwPanel({collapseWhenDisabled:true});finishConfigLoad(false);});
     startPolling();

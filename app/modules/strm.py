@@ -45,7 +45,7 @@ from app.clients.guangya import (
     close_guangya_client,
 )
 from app.config import get, get_int
-from app.defaults import DEFAULT_STRM_VIDEO_EXTS
+from app.defaults import DEFAULT_STRM_METADATA_EXTS, DEFAULT_STRM_VIDEO_EXTS
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
@@ -283,10 +283,7 @@ def finalize_changed_paths(stats: dict) -> dict:
 
 DEFAULT_VIDEO_EXTS = set(DEFAULT_STRM_VIDEO_EXTS)
 
-DEFAULT_METADATA_EXTS = {
-    "nfo", "srt", "ass", "ssa", "sub", "idx",
-    "jpg", "jpeg", "png", "webp",
-}
+DEFAULT_METADATA_EXTS = set(DEFAULT_STRM_METADATA_EXTS)
 
 STRM_SUBDIR = "光鸭云盘"
 MAX_PATH_COMPONENT_BYTES = 255

@@ -123,7 +123,7 @@
                         <div class="strm-field-control">
                             <div class="strm-threshold-row">
                                 <div class="strm-size-unit-wrap">
-                                    <input type="number" min="0" class="form-input strm-size-input" data-key="STRM_SKIP_THRESHOLD_MB" value="0">
+                                    <input type="number" min="0" class="form-input strm-size-input" data-key="STRM_SKIP_THRESHOLD_MB">
                                     <span class="strm-size-unit">MB</span>
                                 </div>
                                 <span class="strm-threshold-hint">小于该体积的文件将跳过生成 (0 表示不限制)</span>
@@ -183,7 +183,7 @@
                                 <label class="strm-field-label">元数据扩展名</label>
                                 <div class="strm-preset-group">
                                     <button type="button" class="strm-preset-chip" data-ext-preset="nfo,srt,ass,ssa,sub,idx">NFO+字幕</button>
-                                    <button type="button" class="strm-preset-chip" data-ext-preset="nfo,srt,ass,ssa,sub,idx,jpg,jpeg,png,webp">全量元数据</button>
+                                    <button type="button" class="strm-preset-chip" data-ext-preset="{{ strm_full_metadata_exts }}">全量元数据</button>
                                 </div>
                             </div>
                             <div class="strm-field-control">

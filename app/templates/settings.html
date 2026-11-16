@@ -141,10 +141,10 @@
                         <section class="settings-section settings-surface-card telegram-notify-card" aria-labelledby="telegram-notify-heading">
                             <div class="settings-surface-card-heading">
                                 <h3 id="telegram-notify-heading"><i data-lucide="bell-ring"></i><span>主动通知</span><span class="agent-card-badge">消息推送</span></h3>
-                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="TG_NOTIFICATION_ENABLED" data-bool="1" checked aria-label="启用主动通知"><span class="toggle-slider"></span></label>
+                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="TG_NOTIFICATION_ENABLED" data-bool="1" aria-label="启用主动通知"><span class="toggle-slider"></span></label>
                             </div>
                             <p class="desc">下载、整理、STRM、订阅、RSS 与 Agent 后台任务的推送；总开关关闭时全部暂停，命令回复不受影响。分类可单独开关，父项关闭时子项暂停。</p>
-                            <div class="form-row"><div class="field-label"><div class="name">通知详细程度</div><div class="hint">标准模式合并事务结果；精简仅保留人工操作与异常；详细会额外发送文件明细</div></div><div class="field-control"><select class="form-select" data-key="TG_NOTIFICATION_LEVEL" data-requires="TG_NOTIFICATION_ENABLED"><option value="essential">精简 · 仅操作与异常</option><option value="standard" selected>标准 · 合并关键结果</option><option value="detailed">详细 · 包含技术明细</option></select></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">通知详细程度</div><div class="hint">标准模式合并事务结果；精简仅保留人工操作与异常；详细会额外发送文件明细</div></div><div class="field-control"><select class="form-select" data-key="TG_NOTIFICATION_LEVEL" data-requires="TG_NOTIFICATION_ENABLED"><option value="essential">精简 · 仅操作与异常</option><option value="standard">标准 · 合并关键结果</option><option value="detailed">详细 · 包含技术明细</option></select></div></div>
                             <div class="settings-option-grid" role="group" aria-label="通知分类">
                                 <div class="agent-settings-option"><span><strong>整理通知</strong><small>整理结果、本地整理与下载进度</small></span><label class="toggle"><input type="checkbox" data-key="GY_ORGANIZE_NOTIFY_ENABLED" data-requires="TG_NOTIFICATION_ENABLED" data-bool="1" aria-label="整理通知"><span class="toggle-slider"></span></label></div>
                                 <div class="agent-settings-option"><span><strong>整理入库结果</strong><small>结果、失败与待确认</small></span><label class="toggle"><input type="checkbox" data-key="GY_ORGANIZE_LIBRARY_NOTIFY" data-requires="GY_ORGANIZE_NOTIFY_ENABLED" data-bool="1" aria-label="整理入库结果"><span class="toggle-slider"></span></label></div>
@@ -254,7 +254,7 @@
                                 <label class="agent-field"><span>接口协议</span><select class="form-select" data-key="AGENT_LLM_PROTOCOL" aria-label="Agent LLM 接口协议"><option value="auto">自动（Responses → Chat Completions）</option><option value="responses">OpenAI Responses API</option><option value="chat_completions">OpenAI Chat Completions API</option><option value="anthropic_messages">Anthropic Messages API</option></select></label>
                                 <label class="agent-field agent-field-wide agent-model-field"><span>模型</span><span class="agent-model-control"><input type="text" class="form-input" data-key="AGENT_LLM_MODEL" id="agentLlmModel" list="agentLlmModelOptions" aria-label="Agent LLM 模型" placeholder="输入或获取模型" maxlength="200" autocomplete="off"><span class="agent-model-actions"><button type="button" class="jump-btn agent-model-icon-btn" id="openAgentModelPickerBtn" aria-label="选择模型" title="选择模型"><i data-lucide="list"></i></button><button type="button" class="jump-btn agent-model-icon-btn" id="fetchAgentModelsBtn" aria-label="获取模型列表" title="获取模型列表" aria-describedby="agentModelState" aria-busy="false"><i data-lucide="refresh-cw" aria-hidden="true"></i></button><button type="button" class="jump-btn agent-model-icon-btn agent-model-test-btn" id="testAgentModelBtn" aria-label="测试模型连接" title="测试模型连接" aria-describedby="agentModelState" aria-busy="false"><i data-lucide="plug-zap" aria-hidden="true"></i></button></span></span><datalist id="agentLlmModelOptions"></datalist><small class="agent-model-hint" id="agentModelState" role="status" aria-live="polite" data-tone="idle">获取列表只读取 /models；测试会发送不含业务数据的最小能力探测</small><div class="agent-model-capabilities" id="agentModelCapabilities" data-visible="false" aria-hidden="true" aria-label="模型能力矩阵"><span data-capability="structured_output" data-supported="pending">结构化输出</span><span data-capability="tool_calling" data-supported="pending">工具调用</span><span data-capability="streaming" data-supported="pending">流式输出</span></div></label>
                                 <label class="agent-field agent-timeout-field"><span title="控制模型网络等待和连接测试超时；Agent 流式调用的网络空闲等待至少 30 秒，整轮另有独立 deadline，最长 300 秒。">请求超时（2–120 秒）</span><span class="agent-input-unit"><input type="number" min="2" max="120" step="1" class="form-input" data-key="AGENT_LLM_TIMEOUT_SECONDS" aria-label="Agent LLM 请求超时（秒）"><b>秒</b></span></label>
-                                <label class="agent-field agent-context-field"><span>上下文窗口（16K–2M Token）</span><span class="agent-input-unit"><input type="number" min="16384" max="2000000" step="1024" value="128000" inputmode="numeric" class="form-input" data-key="AGENT_LLM_CONTEXT_WINDOW_TOKENS" aria-label="Agent LLM 上下文窗口（Token）"><b>Token</b></span></label>
+                                <label class="agent-field agent-context-field"><span>上下文窗口（16K–2M Token）</span><span class="agent-input-unit"><input type="number" min="16384" max="2000000" step="1024" inputmode="numeric" class="form-input" data-key="AGENT_LLM_CONTEXT_WINDOW_TOKENS" aria-label="Agent LLM 上下文窗口（Token）"><b>Token</b></span></label>
                                 <label class="agent-field agent-reasoning-field"><span title="开启后 Agent 工具循环会请求模型深度推理（Anthropic adaptive thinking / OpenAI reasoning effort），输出额度随之放宽；模型或网关不支持时请求会失败，保存前请先测试连接。">推理强度</span><select class="form-select" data-key="AGENT_LLM_REASONING_EFFORT" aria-label="Agent LLM 推理强度"><option value="">服务商默认（不发送）</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
                             </div>
                         </section>
@@ -278,10 +278,10 @@
                             <div class="agent-settings-fields">
                                 <label class="agent-field agent-field-wide"><span>Tavily API Key</span><span class="field-control-with-action"><span class="field-control field-control-password"><input type="password" autocomplete="new-password" class="form-input" data-key="TAVILY_API_KEY" id="tavilyApiKeyInput" aria-label="Tavily API Key" placeholder="********"></span><button type="button" class="jump-btn tavily-test-btn" id="testTavilyBtn" disabled aria-label="测试 Tavily 密钥" aria-describedby="tavilyConnectionState" aria-busy="false"><i data-lucide="plug-zap" aria-hidden="true"></i><span>测试</span></button></span><small class="agent-model-hint tavily-connection-state" id="tavilyConnectionState" role="status" aria-live="polite" data-tone="idle">仅验证密钥，不保存、不搜索</small></label>
                                 <label class="agent-field"><span>搜索深度（Advanced 消耗 2 额度）</span><select class="form-select" data-key="TAVILY_SEARCH_DEPTH" aria-label="Tavily 搜索深度"><option value="basic">Basic</option><option value="advanced">Advanced</option></select></label>
-                                <label class="agent-field"><span>结果上限（每次返回 1–10 条）</span><span class="agent-input-unit"><input type="number" min="1" max="10" step="1" value="5" class="form-input" data-key="TAVILY_MAX_RESULTS" aria-label="Tavily 单次结果上限"><b>条</b></span></label>
-                                <label class="agent-field agent-field-wide agent-credit-field"><span>每日额度（防止失效调用）</span><span class="agent-input-unit"><input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="TAVILY_DAILY_CREDIT_LIMIT" aria-label="Tavily 每日额度"><b>额度</b></span><small class="agent-field-subhint">按本机自然日统计Tavily 搜索消耗；达到上限后当日自动熔断</small></label>
-                                <label class="agent-field"><span>搜索缓存时间</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" value="900" class="form-input" data-key="TAVILY_CACHE_TTL_SECONDS" aria-label="Tavily 搜索缓存时间（秒）"><b>秒</b></span></label>
-                                <label class="agent-field"><span>请求超时（2–30 秒）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" value="10" class="form-input" data-key="TAVILY_TIMEOUT_SECONDS" aria-label="Tavily 请求超时（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>结果上限（每次返回 1–10 条）</span><span class="agent-input-unit"><input type="number" min="1" max="10" step="1" class="form-input" data-key="TAVILY_MAX_RESULTS" aria-label="Tavily 单次结果上限"><b>条</b></span></label>
+                                <label class="agent-field agent-field-wide agent-credit-field"><span>每日额度（防止失效调用）</span><span class="agent-input-unit"><input type="number" min="1" max="100000" step="1" class="form-input" data-key="TAVILY_DAILY_CREDIT_LIMIT" aria-label="Tavily 每日额度"><b>额度</b></span><small class="agent-field-subhint">按本机自然日统计Tavily 搜索消耗；达到上限后当日自动熔断</small></label>
+                                <label class="agent-field"><span>搜索缓存时间</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" class="form-input" data-key="TAVILY_CACHE_TTL_SECONDS" aria-label="Tavily 搜索缓存时间（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>请求超时（2–30 秒）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" class="form-input" data-key="TAVILY_TIMEOUT_SECONDS" aria-label="Tavily 请求超时（秒）"><b>秒</b></span></label>
                             </div>
                         </section>
 
@@ -301,8 +301,8 @@
                             </header>
                             <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="WEB_READ_ENABLED,WEB_READ_TIMEOUT_SECONDS,WEB_READ_CACHE_TTL_SECONDS" hidden></p>
                             <div class="agent-settings-fields">
-                                <label class="agent-field"><span>读取缓存时间</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" value="900" class="form-input" data-key="WEB_READ_CACHE_TTL_SECONDS" data-requires="WEB_READ_ENABLED" aria-label="本地网页读取缓存时间（秒）"><b>秒</b></span></label>
-                                <label class="agent-field"><span>读取总超时（含跳转）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" value="10" class="form-input" data-key="WEB_READ_TIMEOUT_SECONDS" data-requires="WEB_READ_ENABLED" aria-label="本地网页读取超时（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>读取缓存时间</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" class="form-input" data-key="WEB_READ_CACHE_TTL_SECONDS" data-requires="WEB_READ_ENABLED" aria-label="本地网页读取缓存时间（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>读取总超时（含跳转）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" class="form-input" data-key="WEB_READ_TIMEOUT_SECONDS" data-requires="WEB_READ_ENABLED" aria-label="本地网页读取超时（秒）"><b>秒</b></span></label>
                             </div>
                         </section>
 
@@ -322,8 +322,8 @@
                             </header>
                             <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="AGENT_LIBRARY_PATROL_ENABLED,AGENT_LIBRARY_PATROL_INTERVAL_HOURS,AGENT_LIBRARY_PATROL_MAX_SERIES" hidden></p>
                             <div class="agent-settings-fields agent-settings-fields-patrol">
-                                <label class="agent-field"><span>巡检间隔（1–168 小时）</span><span class="agent-input-unit"><input type="number" min="1" max="168" step="1" value="24" class="form-input" data-key="AGENT_LIBRARY_PATROL_INTERVAL_HOURS" data-requires="AGENT_LIBRARY_PATROL_ENABLED" aria-label="巡检间隔（小时）"><b>小时</b></span></label>
-                                <label class="agent-field"><span>单次剧集上限</span><span class="agent-input-unit"><input type="number" min="1" max="100" step="1" value="50" class="form-input" data-key="AGENT_LIBRARY_PATROL_MAX_SERIES" data-requires="AGENT_LIBRARY_PATROL_ENABLED" aria-label="单次巡检剧集上限"><b>部</b></span></label>
+                                <label class="agent-field"><span>巡检间隔（1–168 小时）</span><span class="agent-input-unit"><input type="number" min="1" max="168" step="1" class="form-input" data-key="AGENT_LIBRARY_PATROL_INTERVAL_HOURS" data-requires="AGENT_LIBRARY_PATROL_ENABLED" aria-label="巡检间隔（小时）"><b>小时</b></span></label>
+                                <label class="agent-field"><span>单次剧集上限</span><span class="agent-input-unit"><input type="number" min="1" max="100" step="1" class="form-input" data-key="AGENT_LIBRARY_PATROL_MAX_SERIES" data-requires="AGENT_LIBRARY_PATROL_ENABLED" aria-label="单次巡检剧集上限"><b>部</b></span></label>
                             </div>
                         </section>
 
@@ -425,7 +425,7 @@
                                             <span class="hint">与 Agent 日常网页搜索额度分开计数；默认关闭且最多每次扣 1 额度</span>
                                         </span>
                                         <span class="field-control">
-                                            <input type="number" min="1" max="100000" step="1" value="20" class="form-input" data-key="ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT">
+                                            <input type="number" min="1" max="100000" step="1" class="form-input" data-key="ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT">
                                         </span>
                                     </label>
 
@@ -476,7 +476,7 @@
                                         </span>
                                         <span class="field-control">
                                             <div class="ai-threshold-wrap">
-                                                <input type="number" min="0.5" max="0.99" step="0.01" value="0.8" class="form-input ai-threshold-input" data-key="AI_RECOGNITION_CONFIDENCE_THRESHOLD" data-requires="AI_RECOGNITION_ENABLED" id="aiThresholdInput">
+                                                <input type="number" min="0.5" max="0.99" step="0.01" class="form-input ai-threshold-input" data-key="AI_RECOGNITION_CONFIDENCE_THRESHOLD" data-requires="AI_RECOGNITION_ENABLED" id="aiThresholdInput">
                                                 <span class="ai-threshold-guide">推荐 0.80（兼顾准确与召回）</span>
                                             </div>
                                         </span>
@@ -494,7 +494,7 @@
                                                     <span>每分钟请求</span>
                                                 </div>
                                                 <div class="gauge-input-wrap">
-                                                    <input type="number" min="1" max="30" step="1" value="6" class="form-input" data-key="AI_RECOGNITION_REQUESTS_PER_MINUTE" data-requires="AI_RECOGNITION_ENABLED">
+                                                    <input type="number" min="1" max="30" step="1" class="form-input" data-key="AI_RECOGNITION_REQUESTS_PER_MINUTE" data-requires="AI_RECOGNITION_ENABLED">
                                                     <span class="unit">次/分</span>
                                                 </div>
                                                 <small class="gauge-hint">1–30 次</small>
@@ -506,7 +506,7 @@
                                                     <span>每日请求上限</span>
                                                 </div>
                                                 <div class="gauge-input-wrap">
-                                                    <input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="AI_RECOGNITION_DAILY_REQUEST_LIMIT" data-requires="AI_RECOGNITION_ENABLED">
+                                                    <input type="number" min="1" max="100000" step="1" class="form-input" data-key="AI_RECOGNITION_DAILY_REQUEST_LIMIT" data-requires="AI_RECOGNITION_ENABLED">
                                                     <span class="unit">次/天</span>
                                                 </div>
                                                 <small class="gauge-hint">按真实 Provider 计数</small>
@@ -518,7 +518,7 @@
                                                     <span>最大并发</span>
                                                 </div>
                                                 <div class="gauge-input-wrap">
-                                                    <input type="number" min="1" max="8" step="1" value="2" class="form-input" data-key="AI_RECOGNITION_MAX_CONCURRENCY" data-requires="AI_RECOGNITION_ENABLED">
+                                                    <input type="number" min="1" max="8" step="1" class="form-input" data-key="AI_RECOGNITION_MAX_CONCURRENCY" data-requires="AI_RECOGNITION_ENABLED">
                                                     <span class="unit">任务</span>
                                                 </div>
                                                 <small class="gauge-hint">1–8 个并发</small>
@@ -530,7 +530,7 @@
                                                     <span>熔断时间</span>
                                                 </div>
                                                 <div class="gauge-input-wrap">
-                                                    <input type="number" min="10" max="600" step="1" value="60" class="form-input" data-key="AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS" data-requires="AI_RECOGNITION_ENABLED">
+                                                    <input type="number" min="10" max="600" step="1" class="form-input" data-key="AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS" data-requires="AI_RECOGNITION_ENABLED">
                                                     <span class="unit">秒</span>
                                                 </div>
                                                 <small class="gauge-hint">连续故障暂停</small>
@@ -606,7 +606,7 @@
                                             <span class="hint" id="episodeResearchLimitDescription">默认 10 次，范围 1–100；达到上限仍待确认，不增加 Tavily 额度</span>
                                         </span>
                                         <span class="field-control">
-                                            <input type="number" min="1" max="100" step="1" value="10" class="form-input" data-key="AGENT_EPISODE_RESEARCH_DAILY_LIMIT" data-requires="AGENT_EPISODE_RESEARCH_ENABLED" aria-label="每日季集研究上限" aria-describedby="episodeResearchLimitDescription episodeResearchDependency" disabled>
+                                            <input type="number" min="1" max="100" step="1" class="form-input" data-key="AGENT_EPISODE_RESEARCH_DAILY_LIMIT" data-requires="AGENT_EPISODE_RESEARCH_ENABLED" aria-label="每日季集研究上限" aria-describedby="episodeResearchLimitDescription episodeResearchDependency" disabled>
                                         </span>
                                     </label>
                                 </div>
@@ -641,12 +641,12 @@
                                     </div>
                                     <div class="field-control"><label class="toggle"><input type="checkbox" data-key="INDEXER_SEARCH_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div>
                                 </div>
-                                <div class="form-row"><div class="field-label"><div class="name">显示豆瓣来源</div><div class="hint">关闭后探索页与全局搜索不显示豆瓣；Agent 与整理的豆瓣辅助识别不受影响</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="DISCOVERY_DOUBAN_ENABLED" data-bool="1" checked><span class="toggle-slider"></span></label></div></div>
+                                <div class="form-row"><div class="field-label"><div class="name">显示豆瓣来源</div><div class="hint">关闭后探索页与全局搜索不显示豆瓣；Agent 与整理的豆瓣辅助识别不受影响</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="DISCOVERY_DOUBAN_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div></div>
                             </div>
                         </article>
 
                         <div class="indexer-site-box" data-indexer-site-box>
-                            <input type="hidden" data-key="INDEXER_ENABLED_SITES" value="nyaa,mikan,btbtla,tpb">
+                            <input type="hidden" data-key="INDEXER_ENABLED_SITES">
                             <div class="discovery-card-head">
                                 <span class="discovery-card-icon"><i data-lucide="archive"></i></span>
                                 <div class="discovery-card-head-copy">
@@ -668,7 +668,7 @@
                                         <label class="indexer-site-option is-sensitive" title="成人内容，默认关闭"><input type="checkbox" data-indexer-site="sukebei"><span data-indexer-site-chip><strong>Sukebei</strong><small>成人</small></span></label>
                                     </div>
                                 </div>
-                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">综合站点最小请求间隔</div><div class="hint">0–60 秒；默认 5 秒，避免高频检索触发临时封禁</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="0" max="60" step="1" value="5" class="form-input" data-key="INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">综合站点最小请求间隔</div><div class="hint">0–60 秒；默认 5 秒，避免高频检索触发临时封禁</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="0" max="60" step="1" class="form-input" data-key="INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"><span>秒</span></div></div></div>
                             </div>
                         </div>
 
@@ -685,8 +685,8 @@
                                 </div>
                             </div>
                             <div class="discovery-card-body">
-                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">通用缓存 TTL <span class="field-default">默认 6 小时</span></div><div class="hint">探索接口返回结果在本地的生命周期，区间：60–604800 秒</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="60" max="604800" step="1" value="21600" class="form-input" data-key="DISCOVERY_CACHE_TTL_SECONDS"><span>秒</span></div></div></div>
-                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">旧缓存保留 TTL <span class="field-default">默认 7 天</span></div><div class="hint">过期数据的保留时长；上游超时或限流时回退读取旧缓存，保证探索页秒开</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="300" max="2592000" step="1" value="604800" class="form-input" data-key="DISCOVERY_STALE_TTL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">通用缓存 TTL <span class="field-default">默认 6 小时</span></div><div class="hint">探索接口返回结果在本地的生命周期，区间：60–604800 秒</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="60" max="604800" step="1" class="form-input" data-key="DISCOVERY_CACHE_TTL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">旧缓存保留 TTL <span class="field-default">默认 7 天</span></div><div class="hint">过期数据的保留时长；上游超时或限流时回退读取旧缓存，保证探索页秒开</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="300" max="2592000" step="1" class="form-input" data-key="DISCOVERY_STALE_TTL_SECONDS"><span>秒</span></div></div></div>
                             </div>
                         </article>
                         <div class="naming-template-box discovery-card discovery-card-douban">
@@ -701,7 +701,7 @@
                                 </div>
                             </div>
                             <div class="discovery-card-body">
-                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">豆瓣独立缓存 TTL</div><div class="hint">300–604800 秒；默认 21600（6 小时）</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="300" max="604800" step="1" value="21600" class="form-input" data-key="DOUBAN_CACHE_TTL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">豆瓣独立缓存 TTL</div><div class="hint">300–604800 秒；默认 21600（6 小时）</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="300" max="604800" step="1" class="form-input" data-key="DOUBAN_CACHE_TTL_SECONDS"><span>秒</span></div></div></div>
                                 <div class="form-row discovery-input-row"><div class="field-label"><div class="name">豆瓣 dbcl2 Cookie <span class="douban-dbcl2-status" data-douban-dbcl2-status data-tone="unknown" role="status" aria-live="polite" aria-atomic="true">· 未确认</span></div><div class="hint">可粘贴单独值或完整 Cookie；系统会自动解析并保留该密钥值</div></div><div class="field-control field-control-password"><input type="password" autocomplete="new-password" class="form-input" data-key="DOUBAN_DBCL2" placeholder="留空则不启用登录态回退"></div></div>
                             </div>
                         </div>

@@ -178,7 +178,7 @@
         <!-- 4. Clean Empty Checkbox & secondary buttons -->
         <div class="organize-option-row">
             <label class="organize-checkbox-label">
-                <input type="checkbox" id="r_clean" data-key="GY_ORGANIZE_CLEAN_EMPTY" checked>
+                <input type="checkbox" id="r_clean" data-key="GY_ORGANIZE_CLEAN_EMPTY">
                 <span>整理完成后自动清理空目录</span>
             </label>
             <div class="organize-secondary-actions">
@@ -221,7 +221,7 @@
                     <div class="field-control">
                         <select class="form-select" id="r_automatic_match_preset" data-key="GY_ORGANIZE_AUTOMATIC_MATCH_PRESET">
                             <option value="conservative">保守 · 严格匹配 ≥ 93%</option>
-                            <option value="balanced" selected>均衡 · 严格匹配 ≥ 90%</option>
+                            <option value="balanced">均衡 · 严格匹配 ≥ 90%</option>
                             <option value="aggressive">积极 · 强证据匹配 ≥ 86%</option>
                         </select>
                     </div>
@@ -234,8 +234,8 @@
                             <div class="hint">参与整理的视频扩展名；回车或逗号添加，点击标签可移除</div>
                         </div>
                         <div class="field-control">
-                            <input type="hidden" id="r_video_exts" data-key="GY_ORGANIZE_VIDEO_EXTS">
-                            <div class="organize-ext-editor" data-extension-editor="video">
+                            <input type="hidden" id="r_video_exts" data-key="GY_ORGANIZE_VIDEO_EXTS" value="{{ organize_video_exts | join(',') }}">
+                            <div class="organize-ext-editor" data-extension-editor="video" data-recommended-extensions="{{ organize_recommended_video_exts | join(',') }}">
                                 <div class="organize-ext-list" aria-live="polite">{% for ext in organize_video_exts %}<span class="organize-ext-chip" data-extension-value="{{ ext }}">{{ ext }}<button type="button" title="移除 {{ ext }}" aria-label="移除 {{ ext }}">×</button></span>{% endfor %}</div>
                                 <input type="text" class="organize-ext-input" aria-label="添加视频扩展名" placeholder="输入扩展名">
                                 <button type="button" class="organize-ext-reset" title="恢复推荐值">恢复推荐</button>
@@ -249,8 +249,8 @@
                             <div class="hint">与视频同目录、同基础名称时一起归档的字幕、NFO 与图片</div>
                         </div>
                         <div class="field-control">
-                            <input type="hidden" id="r_metadata_exts" data-key="GY_ORGANIZE_METADATA_EXTS">
-                            <div class="organize-ext-editor" data-extension-editor="metadata">
+                            <input type="hidden" id="r_metadata_exts" data-key="GY_ORGANIZE_METADATA_EXTS" value="{{ organize_metadata_exts | join(',') }}">
+                            <div class="organize-ext-editor" data-extension-editor="metadata" data-recommended-extensions="{{ organize_recommended_metadata_exts | join(',') }}">
                                 <div class="organize-ext-list" aria-live="polite">{% for ext in organize_metadata_exts %}<span class="organize-ext-chip" data-extension-value="{{ ext }}">{{ ext }}<button type="button" title="移除 {{ ext }}" aria-label="移除 {{ ext }}">×</button></span>{% endfor %}</div>
                                 <input type="text" class="organize-ext-input" aria-label="添加伴随文件扩展名" placeholder="输入扩展名">
                                 <button type="button" class="organize-ext-reset" title="恢复推荐值">恢复推荐</button>
@@ -303,8 +303,8 @@
                         <div class="nsfw-provider-fields">
                             <label class="is-wide"><span>MetaTube 服务地址</span><input type="url" class="form-input nsfw-dependent" id="r_nsfw_endpoint" data-key="GY_ORGANIZE_NSFW_METATUBE_ENDPOINT" placeholder="http://192.168.1.10:8080" autocomplete="url"></label>
                             <label class="is-wide"><span>Bearer Token（可选）</span><input type="password" class="form-input nsfw-dependent" id="r_nsfw_token" data-key="GY_ORGANIZE_NSFW_METATUBE_TOKEN" placeholder="服务未设置 Token 可留空" autocomplete="new-password"></label>
-                            <label><span>归档分类目录</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_category" data-key="GY_ORGANIZE_NSFW_CATEGORY_NAME" value="成人内容" maxlength="40"></label>
-                            <label><span>请求超时（秒）</span><input type="number" class="form-input nsfw-dependent" id="r_nsfw_timeout" data-key="GY_ORGANIZE_NSFW_TIMEOUT_SECONDS" value="8" min="2" max="30"></label>
+                            <label><span>归档分类目录</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_category" data-key="GY_ORGANIZE_NSFW_CATEGORY_NAME" maxlength="40"></label>
+                            <label><span>请求超时（秒）</span><input type="number" class="form-input nsfw-dependent" id="r_nsfw_timeout" data-key="GY_ORGANIZE_NSFW_TIMEOUT_SECONDS" min="2" max="30"></label>
                             <label class="is-wide"><span>额外清理域名</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_domains" data-key="GY_ORGANIZE_NSFW_STRIP_DOMAINS" placeholder="例如：example.com, example.tv"></label>
                             <div class="nsfw-source-scope is-wide">
                                 <div class="nsfw-source-scope-head">
@@ -365,7 +365,7 @@
                                 <label for="r_region">地区二次分类</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_region" data-key="GY_ORGANIZE_REGION_SPLIT" data-bool="1" checked>
+                                <input type="checkbox" id="r_region" data-key="GY_ORGANIZE_REGION_SPLIT" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -379,7 +379,7 @@
                                 <label for="r_year">年份三次分类</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_year" data-key="GY_ORGANIZE_YEAR_SPLIT" data-bool="1" checked>
+                                <input type="checkbox" id="r_year" data-key="GY_ORGANIZE_YEAR_SPLIT" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -439,7 +439,7 @@
                                 <label for="r_small">小文件过滤 (MB)</label>
                             </div>
                         </div>
-                        <input type="number" min="0" class="form-input" id="r_small" data-key="GY_ORGANIZE_SMALL_FILE_MB" value="10">
+                        <input type="number" min="0" class="form-input" id="r_small" data-key="GY_ORGANIZE_SMALL_FILE_MB">
                         <span class="organize-toggle-hint">小于该值的视频自动跳过（默认 10 MB）</span>
                     </div>
 
@@ -450,7 +450,7 @@
                                 <label for="r_clean">执行后清理空目录</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_clean" data-key="GY_ORGANIZE_CLEAN_EMPTY" data-bool="1" checked>
+                                <input type="checkbox" id="r_clean" data-key="GY_ORGANIZE_CLEAN_EMPTY" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -476,7 +476,7 @@
                                 <label for="r_remux">Remux / 蓝光优先</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_remux" data-key="GY_ORGANIZE_REMUX_FIRST" data-bool="1" checked>
+                                <input type="checkbox" id="r_remux" data-key="GY_ORGANIZE_REMUX_FIRST" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -490,7 +490,7 @@
                                 <label for="r_res">大分辨率优先</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_res" data-key="GY_ORGANIZE_RESOLUTION_FIRST" data-bool="1" checked>
+                                <input type="checkbox" id="r_res" data-key="GY_ORGANIZE_RESOLUTION_FIRST" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -504,7 +504,7 @@
                                 <label for="r_dolby">杜比优先</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_dolby" data-key="GY_ORGANIZE_DOLBY_FIRST" data-bool="1" checked>
+                                <input type="checkbox" id="r_dolby" data-key="GY_ORGANIZE_DOLBY_FIRST" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -546,7 +546,7 @@
                                 <label for="r_recycle_duplicates">自动回收同版本落选文件</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_recycle_duplicates" data-key="GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED" data-bool="1" aria-describedby="recycleDuplicatesHint" checked>
+                                <input type="checkbox" id="r_recycle_duplicates" data-key="GY_ORGANIZE_RECYCLE_DUPLICATES_ENABLED" data-bool="1" aria-describedby="recycleDuplicatesHint">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -635,7 +635,7 @@
                                 <label for="r_strm">联动生成 STRM</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_strm" data-key="GY_ORGANIZE_LINK_STRM" data-bool="1" checked>
+                                <input type="checkbox" id="r_strm" data-key="GY_ORGANIZE_LINK_STRM" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -649,7 +649,7 @@
                                 <label for="r_emby">通知Emby&amp;Jellyfin 入库</label>
                             </div>
                             <label class="toggle">
-                                <input type="checkbox" id="r_emby" data-key="GY_ORGANIZE_EMBY_REFRESH" data-bool="1" checked>
+                                <input type="checkbox" id="r_emby" data-key="GY_ORGANIZE_EMBY_REFRESH" data-bool="1">
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>

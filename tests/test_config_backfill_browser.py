@@ -138,6 +138,46 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(self.config_posts, [], "仅加载页面不能写配置")
         self.assertIn("GY_ORGANIZE_EMBY_REFRESH=''", config.ENV_FILE.read_text(encoding="utf-8"))
 
+    def test_defaults_are_api_owned_and_recommended_extensions_do_not_use_saved_values(self):
+        from app.modules.organize_rules import DEFAULT_ORGANIZE_VIDEO_EXTS
+
+        pages = (
+            ("/settings", "#settingsForm", ("AGENT_LLM_CONTEXT_WINDOW_TOKENS", "TAVILY_MAX_RESULTS", "AGENT_LLM_TIMEOUT_SECONDS")),
+            ("/guangya/strm", "#strmForm", ("STRM_METADATA_EXTS", "STRM_VIDEO_EXTS", "STRM_SKIP_THRESHOLD_MB")),
+            ("/organize-rules", "#organizeWorkspace", (
+                "GY_ORGANIZE_VIDEO_EXTS", "GY_ORGANIZE_METADATA_EXTS", "GY_ORGANIZE_SMALL_FILE_MB",
+                "GY_ORGANIZE_NSFW_CATEGORY_NAME", "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS",
+                "GY_ORGANIZE_CONFLICT_STRATEGY", "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET",
+            )),
+        )
+        custom = {
+            "GY_ORGANIZE_VIDEO_EXTS": "mp4", "GY_ORGANIZE_SMALL_FILE_MB": "0",
+            "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET": "aggressive", "STRM_METADATA_EXTS": "nfo,webp",
+            "AGENT_LLM_TIMEOUT_SECONDS": "60", "OFFLINE_ALLOWED_EXTS": "mp4,mkv,exe",
+        }
+        for width, updates in ((1280, {}), (390, custom)):
+            with self.subTest(width=width):
+                self._write(**updates)
+                before = config.ENV_FILE.read_bytes()
+                expected = self.client.get("/api/config").json()
+                for path, form, keys in pages:
+                    page = self._open(path)
+                    page.set_viewport_size({"width": width, "height": 900})
+                    for key in keys:
+                        self.assertEqual(page.locator(f'[data-key="{key}"]').input_value(), expected[key], key)
+                    dirty = page.locator(form).evaluate("node => collectConfigFields(node)")
+                    self.assertFalse(set(keys) & set(dirty), dirty)
+                    if path == "/organize-rules" and updates:
+                        page.locator('[data-extension-editor="video"] .organize-ext-reset').click()
+                        self.assertEqual(page.locator('#r_video_exts').input_value(), ','.join(DEFAULT_ORGANIZE_VIDEO_EXTS))
+                    page.close()
+                # SSR 与 JS 使用同一组扩展名，首帧不先显示空标签再跳成全量。
+                response = self.client.get("/guangya/offline")
+                for ext in expected["OFFLINE_ALLOWED_EXTS"].split(","):
+                    self.assertIn(f'aria-label="删除 {ext}"', response.text)
+                self.assertEqual(config.ENV_FILE.read_bytes(), before)
+        self.assertEqual(self.config_posts, [], "回填及恢复推荐仅修改草稿")
+
     def test_organize_rules_rejects_clearing_cron_and_keeps_draft(self):
         self._write(GY_ORGANIZE_SCHEDULE_ENABLED="1")  # Cron 输入只在启用定时后可编辑
         rules = self._open("/organize-rules")

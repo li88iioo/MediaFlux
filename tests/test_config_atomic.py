@@ -62,7 +62,7 @@ class ConfigAtomicWriteTests(unittest.TestCase):
             os.environ[key] = ""
 
         self.assertFalse(config.get_bool("DISCOVERY_ENABLED"))
-        self.assertTrue(config.get_bool("INDEXER_SEARCH_ENABLED"))
+        self.assertFalse(config.get_bool("INDEXER_SEARCH_ENABLED"))
         self.assertFalse(config.get_bool("AGENT_LLM_ENABLED"))
         # 非登记键继续保持历史默认 False，显式默认仍可由调用方覆盖。
         self.assertFalse(config.get_bool("UNREGISTERED_FEATURE"))

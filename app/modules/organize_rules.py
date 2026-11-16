@@ -15,7 +15,7 @@ from app.modules.naming import (
     SHOW_DIR_DEFAULT,
     TV_DEFAULT,
 )
-from app.modules.recognition_policy import normalize_automatic_match_preset
+from app.modules.recognition_policy import DEFAULT_AUTOMATIC_MATCH_PRESET, normalize_automatic_match_preset
 from app.modules.scraper import MatchResult
 
 DEFAULT_ORGANIZE_VIDEO_EXTS = (
@@ -139,7 +139,7 @@ class OrganizeRules:
     nsfw_category_name: str = "成人内容"
     nsfw_strip_domains: str = ""
     nsfw_timeout_seconds: int = 8
-    automatic_match_preset: str = "balanced"
+    automatic_match_preset: str = DEFAULT_AUTOMATIC_MATCH_PRESET
 
     @classmethod
     def from_config(cls, target_dir_id: str = "") -> "OrganizeRules":
@@ -150,9 +150,9 @@ class OrganizeRules:
             add_concert=get_bool("GY_ORGANIZE_ADD_CONCERT", False),
             region_split=get_bool("GY_ORGANIZE_REGION_SPLIT"),
             year_split=get_bool("GY_ORGANIZE_YEAR_SPLIT"),
-            small_file_mb=max(0, get_int("GY_ORGANIZE_SMALL_FILE_MB", 10)),
+            small_file_mb=max(0, get_int("GY_ORGANIZE_SMALL_FILE_MB", cls.small_file_mb)),
             clean_empty=get_bool("GY_ORGANIZE_CLEAN_EMPTY"),
-            conflict_strategy=max(1, min(get_int("GY_ORGANIZE_CONFLICT_STRATEGY", 1), 3)),
+            conflict_strategy=max(1, min(get_int("GY_ORGANIZE_CONFLICT_STRATEGY", cls.conflict_strategy), 3)),
             remux_first=get_bool("GY_ORGANIZE_REMUX_FIRST"),
             resolution_first=get_bool("GY_ORGANIZE_RESOLUTION_FIRST"),
             dolby_first=get_bool("GY_ORGANIZE_DOLBY_FIRST"),
@@ -183,11 +183,11 @@ class OrganizeRules:
             nsfw_exclusive=False,
             nsfw_metatube_endpoint=get("GY_ORGANIZE_NSFW_METATUBE_ENDPOINT", ""),
             nsfw_metatube_token=get("GY_ORGANIZE_NSFW_METATUBE_TOKEN", ""),
-            nsfw_category_name=get("GY_ORGANIZE_NSFW_CATEGORY_NAME", "成人内容") or "成人内容",
+            nsfw_category_name=get("GY_ORGANIZE_NSFW_CATEGORY_NAME", cls.nsfw_category_name) or cls.nsfw_category_name,
             nsfw_strip_domains=get("GY_ORGANIZE_NSFW_STRIP_DOMAINS", ""),
-            nsfw_timeout_seconds=max(2, min(get_int("GY_ORGANIZE_NSFW_TIMEOUT_SECONDS", 8), 30)),
+            nsfw_timeout_seconds=max(2, min(get_int("GY_ORGANIZE_NSFW_TIMEOUT_SECONDS", cls.nsfw_timeout_seconds), 30)),
             automatic_match_preset=normalize_automatic_match_preset(
-                get("GY_ORGANIZE_AUTOMATIC_MATCH_PRESET", "balanced")
+                get("GY_ORGANIZE_AUTOMATIC_MATCH_PRESET", cls.automatic_match_preset)
             ),
         )
 

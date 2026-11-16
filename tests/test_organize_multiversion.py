@@ -1752,7 +1752,7 @@ class MultiVersionConfigApiTests(IsolatedDatabaseTestCase):
         self.assertIn('width:min(760px,64%)', organize_css)
         self.assertIn("GY_ORGANIZE_CONFLICT_STRATEGY", html)
         self.assertIn('data-key="GY_ORGANIZE_AUTOMATIC_MATCH_PRESET"', html)
-        self.assertIn('value="balanced" selected', html)
+        self.assertEqual(self.client.get("/api/config").json()["GY_ORGANIZE_AUTOMATIC_MATCH_PRESET"], "balanced")
         self.assertNotIn('placeholder="mkv,mp4,ts,m2ts,avi"', html)
 
 

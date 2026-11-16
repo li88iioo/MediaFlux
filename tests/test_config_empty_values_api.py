@@ -117,6 +117,42 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         self.client.cookies.clear()
         self.assertEqual(self.client.get("/api/config").status_code, 401)
 
+    def test_organize_and_strm_form_defaults_match_runtime_and_keep_saved_values(self):
+        from app.modules.organize_rules import (
+            DEFAULT_ORGANIZE_METADATA_EXTS, DEFAULT_ORGANIZE_VIDEO_EXTS, OrganizeRules,
+        )
+        from app.modules.scheduler import STRMScheduler
+
+        self._write_raw(STRM_METADATA_ENABLED="1")
+
+        defaults = {
+            "STRM_SKIP_THRESHOLD_MB": "0",
+            "STRM_METADATA_EXTS": "nfo,srt,ass,ssa,sub,idx,jpg,jpeg,png,webp",
+            "GY_ORGANIZE_VIDEO_EXTS": ",".join(DEFAULT_ORGANIZE_VIDEO_EXTS),
+            "GY_ORGANIZE_METADATA_EXTS": ",".join(DEFAULT_ORGANIZE_METADATA_EXTS),
+            "GY_ORGANIZE_SMALL_FILE_MB": "10", "GY_ORGANIZE_CONFLICT_STRATEGY": "1",
+            "GY_ORGANIZE_NSFW_CATEGORY_NAME": "成人内容", "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS": "8",
+            "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET": "balanced",
+        }
+        custom = {
+            "STRM_SKIP_THRESHOLD_MB": "0", "STRM_METADATA_EXTS": "nfo,webp",
+            "GY_ORGANIZE_VIDEO_EXTS": "mp4", "GY_ORGANIZE_METADATA_EXTS": "nfo",
+            "GY_ORGANIZE_SMALL_FILE_MB": "0", "GY_ORGANIZE_CONFLICT_STRATEGY": "3",
+            "GY_ORGANIZE_NSFW_CATEGORY_NAME": "收藏", "GY_ORGANIZE_NSFW_TIMEOUT_SECONDS": "20",
+            "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET": "conservative",
+        }
+        for updates, expected in (({}, defaults), (dict.fromkeys(defaults, ""), defaults), (custom, custom)):
+            with self.subTest(updates=updates):
+                self._write_raw(**updates)
+                before = config.ENV_FILE.read_bytes()
+                payload = self._config()
+                self.assertEqual({key: payload[key] for key in expected}, expected)
+                rules = OrganizeRules.from_config()
+                for field in ("small_file_mb", "conflict_strategy", "nsfw_category_name", "nsfw_timeout_seconds", "automatic_match_preset"):
+                    self.assertEqual(str(getattr(rules, field)), payload[f"GY_ORGANIZE_{field.upper()}"])
+                self.assertEqual(STRMScheduler._metadata_exts(), set(payload["STRM_METADATA_EXTS"].split(",")))
+                self.assertEqual(config.ENV_FILE.read_bytes(), before)
+
     def test_missing_defaults_fill_while_explicit_empty_switches_and_cron_stay_empty(self):
         from app.modules.organize_rules import OrganizeRules
         from app.modules.schedule_policy import current_policy
