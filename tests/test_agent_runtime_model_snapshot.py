@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import telebot
+from starlette.requests import Request
 
 from app import config
 from app import database as db
@@ -396,7 +397,7 @@ def test_timeout_shares_one_default_and_range_at_every_model_client(local_config
             return SimpleNamespace(status_code=401, text='{}')
         async def aclose(self):
             pass
-    request = SimpleNamespace(session={}, client=SimpleNamespace(host='127.0.0.1'), headers={})
+    request = Request({'type': 'http', 'session': {}, 'headers': [], 'client': ('127.0.0.1', 0)})
     with patch.object(tools_api, 'require_api_login', return_value=None), patch.object(
         tools_api.agent_rate_limiter, 'allow', return_value=True), patch.object(
         tools_api, 'FixedHostHttpClient', FakeClient):
