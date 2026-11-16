@@ -5,7 +5,7 @@ import json
 import secrets
 import sqlite3
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 
@@ -135,6 +135,7 @@ def initialize_runtime_fence(*, defer_initial_setup: bool = False) -> RuntimeFen
 _runtime_generation_lock = threading.Lock()
 _runtime_admission_lock = threading.RLock()
 _runtime_generation = 0
+_telegram_runtime_generation = 0
 
 
 def is_agent_enabled() -> bool:
@@ -166,26 +167,30 @@ def recognition_review_enabled() -> bool:
         return False
 
 
-def current_agent_runtime_generation() -> int:
+def current_agent_runtime_generation(*, channel: str = "") -> int:
     """返回当前进程内 Agent 运行代次，用于隔离开关切换前的旧任务。"""
     with _runtime_generation_lock:
-        return _runtime_generation
+        return _runtime_generation + (_telegram_runtime_generation if channel == "telegram" else 0)
 
 
-def invalidate_agent_runtime_generation() -> int:
-    """递增运行代次，使已开始但尚未发布结果的旧任务立即失效。"""
-    global _runtime_generation
+def invalidate_agent_runtime_generation(*, changed_keys: Iterable[str] | None = None) -> int:
+    """配置发布只撤销受影响渠道；不带配置范围的撤销仍作用于整个 Agent。"""
+    global _runtime_generation, _telegram_runtime_generation
+    keys = set(changed_keys) if changed_keys is not None else None
     with _runtime_generation_lock:
-        _runtime_generation += 1
+        if keys is None or keys - {"AGENT_STREAM_DISPLAY_ENABLED", "TG_AGENT_ENABLED"}:
+            _runtime_generation += 1
+        elif "TG_AGENT_ENABLED" in keys:
+            _telegram_runtime_generation += 1
         return _runtime_generation
 
 
-def agent_runtime_generation_is_current(generation: int) -> bool:
+def agent_runtime_generation_is_current(generation: int, *, channel: str = "") -> bool:
     """仅严格整数代次与当前值一致时允许继续发布副作用。"""
     if not isinstance(generation, int) or isinstance(generation, bool):
         return False
     with _runtime_generation_lock:
-        return generation == _runtime_generation
+        return generation == _runtime_generation + (_telegram_runtime_generation if channel == "telegram" else 0)
 
 
 class AgentRuntimeDisabled(RuntimeError):

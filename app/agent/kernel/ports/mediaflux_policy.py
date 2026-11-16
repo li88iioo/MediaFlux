@@ -64,12 +64,13 @@ class MediaFluxTurnAdmission:
             raise ToolPipelineError("Agent 身份无效", code="authorization_denied")
         if self.workspace_error:
             raise ToolPipelineError(self.workspace_error, code="workspace_unavailable")
-        return current_agent_runtime_generation()
+        return current_agent_runtime_generation(channel="telegram" if agent_input.owner.startswith("tg:v1:") else "")
 
     async def is_current(self, token: Any, agent_input: AgentInput) -> bool:
         if not isinstance(token, int) or isinstance(token, bool):
             return False
-        if not is_agent_enabled() or not agent_runtime_generation_is_current(token):
+        channel = "telegram" if agent_input.owner.startswith("tg:v1:") else ""
+        if not is_agent_enabled() or not agent_runtime_generation_is_current(token, channel=channel):
             return False
         if agent_input.owner.startswith("tg:v1:"):
             return telegram_owner_route_is_currently_authorized(agent_input.owner)

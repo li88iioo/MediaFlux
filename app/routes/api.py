@@ -1489,7 +1489,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
                             config_persisted = True
                             # 代次切换也属于发布；失败时来源事务与配置一起补偿。
                             if changed_keys - {"AGENT_STREAM_DISPLAY_ENABLED"}:
-                                invalidate_agent_runtime_generation()
+                                invalidate_agent_runtime_generation(changed_keys=changed_keys)
                             if _AGENT_LLM_KEYS & changed_keys:
                                 from app.agent.kernel.bootstrap import invalidate_agent_kernel_runtime
 

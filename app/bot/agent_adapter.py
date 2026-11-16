@@ -1482,7 +1482,7 @@ def _apply_agent_control_action(action_name: str) -> str:
         raise ValueError("不支持的 Agent 控制操作") from exc
     with agent_runtime_transition():
         config.set_and_save(updates)
-        invalidate_agent_runtime_generation()
+        invalidate_agent_runtime_generation(changed_keys=updates)
     with suppress(Exception):
         from app.modules.agent_runtime import request_agent_runtime_reconcile
 

@@ -463,7 +463,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         restart.assert_not_called()
         reconcile.assert_not_called()
         refresh_menu.assert_not_called()
-        invalidate.assert_called_once_with()
+        invalidate.assert_called_once_with(changed_keys={"AGENT_LLM_MODEL", "AGENT_LLM_TIMEOUT_SECONDS"})
         invalidate_kernel.assert_called_once_with()
 
     def test_stream_display_only_save_does_not_invalidate_agent_runtime(self):
@@ -517,7 +517,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                 "AGENT_LLM_MODEL": "new-model",
             }
         )
-        invalidate_generation.assert_called_once_with()
+        invalidate_generation.assert_called_once_with(changed_keys={"AGENT_STREAM_DISPLAY_ENABLED", "AGENT_LLM_MODEL"})
         invalidate_kernel.assert_called_once_with()
 
     def test_agent_stream_display_boolean_validation(self):
@@ -592,7 +592,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         restart.assert_not_called()
         reconcile.assert_called_once_with()
         refresh_menu.assert_called_once_with()
-        invalidate.assert_called_once_with()
+        invalidate.assert_called_once_with(changed_keys={"AGENT_LLM_ENABLED"})
 
     def test_agent_toggle_publishes_config_and_generation_in_one_transition(self):
         events: list[str] = []
@@ -616,7 +616,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             side_effect=transition,
         ), patch(
             "app.agent.feature_gate.invalidate_agent_runtime_generation",
-            side_effect=lambda: events.append("invalidate") or 1,
+            side_effect=lambda **_scope: events.append("invalidate") or 1,
         ), patch("app.services.clear_dashboard_cache"):
             response = save_config(self._request(), {"AGENT_LLM_ENABLED": "0"})
 
@@ -645,7 +645,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         restart.assert_not_called()
         reconcile.assert_not_called()
         refresh_menu.assert_called_once_with()
-        invalidate.assert_called_once_with()
+        invalidate.assert_called_once_with(changed_keys={"TG_AGENT_ENABLED"})
 
     def test_telegram_identity_changes_advance_runtime_generation(self):
         cases = (
@@ -678,7 +678,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
                 self.assertEqual(response, {"success": True})
                 persist.assert_called_once_with({key: new_value})
-                invalidate.assert_called_once_with()
+                invalidate.assert_called_once_with(changed_keys={key})
 
     def test_download_verification_notification_toggle_reloads_scheduler(self):
         request = self._request()
