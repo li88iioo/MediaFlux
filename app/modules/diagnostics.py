@@ -268,11 +268,10 @@ _CONFIG_COMPONENTS: dict[str, tuple[str, str, tuple[tuple[str, str], ...]]] = {'
           '把光鸭云盘目录同步为本地 STRM 索引，并维护调度与失败账本。',
           (('__strm_source__', '光鸭源目录'), ('GY_STRM_BASE_URL', '播放服务地址'), ('STRM_ROOT', '本地 STRM 输出目录'))),
  'ai_recognition': ('AI 识别回退', '在确定性规则无法识别媒体时，调用受控的 AI 服务提供候选结果。', (('__shared_ai_provider__', 'Media Agent 模型连接配置'),))}
-_FEATURE_DETAILS: dict[str, dict[str, Any]] = {'discovery': {'purpose': '统一浏览放映排期、豆瓣、TMDB 与 Bangumi 榜单。',
-               'blocked_capabilities': ('媒体探索页面', '豆瓣与 TMDB 榜单', 'Bangumi 放送内容')},
- 'douban': {'purpose': '在媒体探索中读取豆瓣电影与电视剧榜单。', 'blocked_capabilities': ('豆瓣电影榜单', '豆瓣电视剧榜单')},
- 'resource_results': {'purpose': '在媒体档案中展示多站资源检索结果和安全下载入口。', 'blocked_capabilities': ('媒体档案站点资源结果', '资源结果下载入口')},
- 'indexer_search': {'purpose': '跨已启用站点搜索公开资源，并返回可确认提交的临时结果。', 'blocked_capabilities': ('多站资源搜索', '缺集资源定向搜索', '资源提交预检')}}
+_FEATURE_DETAILS: dict[str, dict[str, Any]] = {'discovery': {'purpose': 'Web 媒体探索页面：浏览放映排期、豆瓣、TMDB 与 Bangumi 榜单；不影响 Agent 查询影视资料。',
+               'blocked_capabilities': ('媒体探索页面',)},
+ 'douban': {'purpose': '在 Web 探索页与全局搜索中显示豆瓣榜单和条目；Agent 查询不受影响。', 'blocked_capabilities': ('探索页豆瓣榜单与条目',)},
+ 'indexer_search': {'purpose': '在媒体档案中展示多站资源结果和下载入口；Agent、Telegram 与订阅的资源检索只受站点选择控制。', 'blocked_capabilities': ('媒体档案站点资源结果', '资源结果下载入口')}}
 _CONFIG_SWITCHES = {"jellyfin": "JELLYFIN_ENABLED", "emby": "EMBY_ENABLED", "ai_recognition": "AI_RECOGNITION_ENABLED", "strm": "STRM_SCHEDULE_ENABLED"}
 _FIELD_KEYS = {"__qb_auth__": ("QB_API_KEY", "QB_USERNAME", "QB_PASSWORD"), "__strm_source__": ("GY_STRM_SOURCE_DIRS",),
                "__shared_ai_provider__": ("AGENT_LLM_API_URL", "AGENT_LLM_API_KEY", "AGENT_LLM_MODEL")}

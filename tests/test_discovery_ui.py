@@ -122,7 +122,7 @@ class DiscoveryPageTests(InitializedWebTestCase):
         with patch("app.routes.pages.config.get_bool") as get_bool:
             get_bool.side_effect = lambda key, default=False: {
                 "DISCOVERY_ENABLED": True,
-                "DISCOVERY_RESOURCE_RESULTS_ENABLED": False,
+                "INDEXER_SEARCH_ENABLED": False,
             }.get(key, default)
             response = self.client.get("/discovery")
 
@@ -135,14 +135,14 @@ class DiscoveryPageTests(InitializedWebTestCase):
         response = self.client.get("/settings")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("豆瓣公共探索", response.text)
+        self.assertIn("豆瓣数据源", response.text)
         self.assertIn("服务端兼容回退", response.text)
-        self.assertIn('data-key="DISCOVERY_RESOURCE_RESULTS_ENABLED"', response.text)
+        self.assertIn('data-key="INDEXER_SEARCH_ENABLED"', response.text)
         self.assertNotIn("可选 dbcl2 回退", response.text)
         self.assertRegex(
             response.text,
             re.compile(
-                r'豆瓣公共探索[\s\S]+data-key="DOUBAN_DBCL2"'
+                r'豆瓣数据源[\s\S]+data-key="DOUBAN_DBCL2"'
             ),
         )
         self.assertNotIn("DOUBAN_FRODO_API_KEY", response.text)
@@ -229,7 +229,6 @@ class DiscoveryPageTests(InitializedWebTestCase):
         self.assertIn("tmdb_year: candidate.year", source)
         self.assertNotIn("confirmed_tmdb_id", source)
         self.assertIn("loadMappingCandidates", source)
-        self.assertIn("section.enabled === false", source)
         self.assertIn("tmdb: 'discover'", source)
         self.assertIn("SKELETON_MIN_VISIBLE_MS = 300", source)
         self.assertIn("keepSkeletonVisible", source)
@@ -287,54 +286,17 @@ class DiscoveryPageTests(InitializedWebTestCase):
         self.assertIn("RESOURCE_MANUAL_REVIEW_MESSAGE", source)
         self.assertNotIn(".innerHTML", source)
 
-    def test_settings_server_renders_resource_site_visibility_without_flash(self):
+    def test_settings_server_keeps_site_configuration_visible_for_both_page_switch_states(self):
         self._login()
-
-        with patch("app.routes.pages.config.get_bool") as get_bool:
-            get_bool.side_effect = lambda key, default=False: {
-                "DISCOVERY_ENABLED": True,
-                "DISCOVERY_RESOURCE_RESULTS_ENABLED": False,
-            }.get(key, default)
-            disabled = self.client.get("/settings")
-
-        self.assertEqual(disabled.status_code, 200)
-        self.assertRegex(
-            disabled.text,
-            re.compile(
-                r'<input[^>]+data-key="DISCOVERY_RESOURCE_RESULTS_ENABLED"(?![^>]*checked)[^>]*>',
-                re.S,
-            ),
-        )
-        self.assertRegex(
-            disabled.text,
-            re.compile(
-                r'<div class="indexer-site-box"[^>]+data-indexer-site-box[^>]+hidden[^>]+aria-hidden="true"',
-                re.S,
-            ),
-        )
-
-        with patch("app.routes.pages.config.get_bool") as get_bool:
-            get_bool.side_effect = lambda key, default=False: {
-                "DISCOVERY_ENABLED": True,
-                "DISCOVERY_RESOURCE_RESULTS_ENABLED": True,
-            }.get(key, default)
-            enabled = self.client.get("/settings")
-
-        self.assertRegex(
-            enabled.text,
-            re.compile(
-                r'<input[^>]+data-key="DISCOVERY_RESOURCE_RESULTS_ENABLED"[^>]+checked[^>]*>',
-                re.S,
-            ),
-        )
-        indexer_box = re.search(
-            r'<div class="indexer-site-box"[^>]+data-indexer-site-box[^>]*>',
-            enabled.text,
-            re.S,
-        )
-        assert (indexer_box) is not None
-        self.assertNotIn(" hidden", indexer_box.group(0))
-        self.assertIn('aria-hidden="false"', indexer_box.group(0))
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch("app.routes.pages.config.get_bool", side_effect=lambda key, default=False: enabled if key == "INDEXER_SEARCH_ENABLED" else default):
+                response = self.client.get("/settings")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.text.count('data-key="INDEXER_SEARCH_ENABLED"'), 1)
+            box = re.search(r'<div class="indexer-site-box"[^>]+data-indexer-site-box[^>]*>', response.text)
+            assert box is not None
+            self.assertNotIn(" hidden", box.group(0))
+            self.assertNotIn('aria-hidden="true"', box.group(0))
 
     def test_settings_exposes_persistent_indexer_site_selector(self):
         html = SETTINGS_TEMPLATE.read_text(encoding="utf-8") + (ROOT / "app/static/js/settings.js").read_text(encoding="utf-8")
@@ -350,8 +312,6 @@ class DiscoveryPageTests(InitializedWebTestCase):
             'const INDEXER_SITE_ORDER=',
             'function syncIndexerSiteSelection',
             'function loadIndexerSiteSelection',
-            'indexerSiteBox.hidden=!enabled',
-            "indexerSiteBox.setAttribute('aria-hidden',enabled?'false':'true')",
         ):
             self.assertIn(contract, html)
         for site in ("aipan", "dygang", "ys5266", "kpkuang"):

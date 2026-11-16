@@ -195,7 +195,6 @@ def test_multi_work_search_keeps_full_candidates_and_every_real_download_target(
         return _search_result(query=f"{name} S01", items=items)
 
     with patch("app.modules.missing_resources.get_indexer_service", return_value=provider), \
-         patch("app.modules.missing_resources.config.get_bool", return_value=True), \
          patch("app.modules.missing_resources.audit_series_episodes", side_effect=audit) as audits, \
          patch.object(provider, "search_media", new_callable=AsyncMock, side_effect=search) as searches:
         result = search_missing(items, owner="capacity-owner", as_of="2026-10-15")

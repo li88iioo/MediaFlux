@@ -112,10 +112,9 @@ def telegram_owner_route_access(
     persisted_chat = str(chat_id or "").strip()
     if persisted_chat and persisted_chat != route.chat_id:
         return "unauthorized"
-    enabled = not require_enabled or (
-        config.get_bool("AGENT_ENABLED", False)
-        and config.get_bool("TG_AGENT_ENABLED", False)
-    )
+    from app.agent.feature_gate import is_agent_enabled
+
+    enabled = not require_enabled or (is_agent_enabled() and config.get_bool("TG_AGENT_ENABLED", False))
     if ((config.get("TG_CHAT_ID", "") or "").strip() != route.chat_id
             or route.user_id not in configured_telegram_user_ids()):
         return "unauthorized"

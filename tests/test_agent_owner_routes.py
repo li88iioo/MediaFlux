@@ -58,7 +58,7 @@ class AgentOwnerRouteTests(unittest.TestCase):
             allowed = telegram_owner_route_is_currently_authorized("tg:v1:100\x1f200")
 
         self.assertFalse(allowed)
-        get_bool.assert_called_once_with("AGENT_ENABLED", False)
+        get_bool.assert_called_once_with("AGENT_LLM_ENABLED", False)
 
     def test_web_owner_is_stable_across_browser_sessions_and_irreversible(self) -> None:
         identity = "admin"

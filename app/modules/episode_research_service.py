@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from app import config
+from app.agent.feature_gate import is_agent_enabled
 from app.concurrency import ensure_sync_bridge_available
 from app.concurrency import KeyedSingleFlight
 from app.modules.episode_research import (
@@ -52,8 +53,7 @@ def episode_research_enabled(*, explicit_approval: bool = False) -> bool:
     return bool(
         config.get_bool("AGENT_EPISODE_RESEARCH_ENABLED", False)
         and (explicit_approval is True or config.get_bool("AGENT_RECOGNITION_REVIEW_ENABLED", False))
-        and config.get_bool("AGENT_ENABLED", False)
-        and config.get_bool("AGENT_LLM_ENABLED", False)
+        and is_agent_enabled()
         and (config.get("AGENT_LLM_API_URL", "") or "").strip()
         and (config.get("AGENT_LLM_MODEL", "") or "").strip()
     )

@@ -195,7 +195,7 @@ def local_config(tmp_path, monkeypatch):
     }), isolated_test_database():
         config.write_env_file(config.ENV_FILE, {}, replace=False)
         feature_gate.initialize_runtime_fence()
-        config.set_and_save({'AGENT_ENABLED': '1', 'AGENT_LLM_ENABLED': '1',
+        config.set_and_save({'AGENT_LLM_ENABLED': '1',
                              'AGENT_LLM_API_URL': BASE + '/chat/completions',
                              'AGENT_LLM_MODEL': 'tenant/opaque-alias',
                              'AGENT_LLM_PROTOCOL': 'chat_completions',
@@ -554,7 +554,7 @@ def test_telegram_callback_real_kv_next_turn_title_and_web_isolation():
     owner = agent_adapter.telegram_agent_owner('-100123', '7')
     raw = json.dumps([json.loads(profiles(model))[0] for model in ('alias-one', 'alias-two')])
     with isolated_test_database(), settings('gpt-5', 'chat_completions', raw) as values:
-        values.update({'AGENT_ENABLED': '1', 'TG_AGENT_ENABLED': '1', 'TG_CHAT_ID': '-100123',
+        values.update({'AGENT_LLM_ENABLED': '1', 'TG_AGENT_ENABLED': '1', 'TG_CHAT_ID': '-100123',
                        'TG_AGENT_ALLOWED_USER_IDS': '7'})
         bot = Mock()
         bot.edit_message_text.return_value = True

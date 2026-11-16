@@ -575,7 +575,7 @@ class DoubanPublicClientTests(unittest.TestCase):
             with self.subTest(category=category):
                 client, session = self.make_client(FakeResponse(body, content_type="text/html"))
                 provider = DoubanProvider(
-                    enabled=True, public_client=client, api_key="", api_secret="", dbcl2="",
+                    public_client=client, api_key="", api_secret="", dbcl2="",
                 )
                 self.addCleanup(provider.close)
                 page = provider.list_items(category, "movie", 1, {})

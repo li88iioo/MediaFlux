@@ -5725,7 +5725,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn('id="stopOrganizeBtn"', organize.text)
         self.assertIn('id="cleanEmptyBtn"', organize.text)
         self.assertIn('value="10"', organize_rules.text)
-        self.assertIn('id="r_strm_notify"', organize_rules.text)
+        self.assertIn('data-key="GY_ORGANIZE_STRM_DETAIL_NOTIFY"', self.client.get("/settings").text)
         self.assertIn('id="collapseSidebar"', organize.text)
         self.assertIn('class="organize-flow-tabs"', organize_rules.text)
         self.assertNotIn('data-tab-target="source"', organize.text)

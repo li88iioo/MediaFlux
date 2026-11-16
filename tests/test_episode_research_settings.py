@@ -5,8 +5,6 @@ import ast
 import json
 import logging
 import re
-import shutil
-import subprocess
 import sys
 import time
 import unittest
@@ -130,7 +128,7 @@ class EpisodeResearchSettingsTests(unittest.TestCase):
     def test_shared_defaults_and_missing_config_are_independently_off(self):
         self.assertIs(self.api["DEFAULT_BOOL_CONFIG_VALUES"].get(ENABLED), False)
         self.assertEqual(self.api.get("DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT"), 10)
-        self.config.values.update({PARENT: "1", "AGENT_ENABLED": "1", "AGENT_LLM_ENABLED": "1"})
+        self.config.values.update({PARENT: "1", "AGENT_LLM_ENABLED": "1"})
         self.assertEqual(self.get().get(ENABLED), "0")
         self.assertEqual(self.get().get(LIMIT), "10")
         self.assertNotIn(ENABLED, self.config.values)
@@ -252,85 +250,14 @@ class EpisodeResearchSettingsUiTests(unittest.TestCase):
         for text in ("默认关闭", "光鸭待确认剧集", "冻结案例", "无冲突新归档", "不自动覆盖或删除目标", "本地媒体继续旧复核", "首版不执行本地文件映射", "TMDB 剧集组", "唯一", "可验证", "歧义", "待确认", "Tavily", "可选", "现有额度", "Agent 主动复核", "模型地址", "模型名"):
             self.assertIn(text, option)
 
-    def test_javascript_defaults_and_readiness_hooks(self):
-        script = (ROOT / "app/static/js/settings.js").read_text("utf-8")
-        from app.routes.api import _UI_DEFAULTS
 
-        # 未配置时由 /api/config 回填后端唯一默认值；前端不得另写一份。
-        self.assertEqual((_UI_DEFAULTS[ENABLED], _UI_DEFAULTS[LIMIT]), ("0", "10"))
-        self.assertNotIn(f"{ENABLED}:", script)
-        ready = script.split("function setConfigReady(){", 1)[1].split("function setConfigLoadError", 1)[0]
-        self.assertLess(ready.index("syncEpisodeResearchAvailability()"), ready.index("revealConfigFields()"))
-        # 开关值由共享 fillConfigFields 按 get_bool 真值集合回填，页面不再预先改写 config。
-        before_fill = script.split("loadAppConfig().then(config=>{", 1)[1].split("fillConfigFields(form,config)", 1)[0]
-        self.assertEqual(before_fill.strip(), "")
-
-    @unittest.skipUnless(shutil.which("node"), "静态依赖状态验证需要 Node.js")
-    def test_dependency_events_preserve_values_and_dom_in_node(self):
-        script = (ROOT / "app/static/js/settings.js").read_text("utf-8")
-        start = script.index("    const episodeResearchToggle=")
-        end = script.index("    function revealConfigFields", start)
-        snippet = script[start:end]
-        # 状态同步不能重建、隐藏或改写提示，确保移动端换行和设置行占位不变。
-        for forbidden in ("innerHTML", "hidden", "style.", "textContent", "replaceChildren", ".checked=", ".value="):
-            self.assertNotIn(forbidden, snippet)
-        harness = r'''
-const assert=require('node:assert/strict');
-const enabled='AGENT_EPISODE_RESEARCH_ENABLED', limit='AGENT_EPISODE_RESEARCH_DAILY_LIMIT';
-const keys=[enabled,limit,'AGENT_ENABLED','AGENT_LLM_ENABLED','AGENT_RECOGNITION_REVIEW_ENABLED','AGENT_LLM_API_URL','AGENT_LLM_MODEL'];
-const fields=Object.fromEntries(keys.map(key=>[key,{
-  type:key.endsWith('_ENABLED')?'checkbox':'text',checked:false,value:'',disabled:true,dataset:{},events:{},
-  addEventListener(type,handler){(this.events[type]??=[]).push(handler);},
-  fire(type){for(const handler of this.events[type]||[])handler();}
-}]));
-const form={querySelector(selector){return fields[selector.match(/data-key="([^"]+)"/)[1]]||null;}};
-let configReady=false;
-__SNIPPET__
-const toggle=fields[enabled], quota=fields[limit];
-toggle.checked=true;quota.value='17';
-for(const key of keys.slice(2)){fields[key].checked=true;fields[key].value='configured';}
-syncEpisodeResearchAvailability();assert.equal(toggle.disabled,true);assert.equal(quota.disabled,true);
-configReady=true;syncEpisodeResearchAvailability();assert.equal(toggle.disabled,false);assert.equal(quota.disabled,false);
-for(const key of keys.slice(2)){
- const field=fields[key];
- for(const event of ['input','change']){
-  field.checked=false;field.value='  ';field.fire(event);
-  assert.equal(toggle.disabled,true,key);assert.equal(quota.disabled,true,key);
-  assert.equal(toggle.checked,true);assert.equal(quota.value,'17');
-  field.checked=true;field.value='configured';field.fire(event);
-  assert.equal(toggle.disabled,false,key);assert.equal(quota.disabled,false,key);
- }
-}
-toggle.checked=false;toggle.fire('change');assert.equal(quota.disabled,true);assert.equal(toggle.disabled,false);
-toggle.checked=true;toggle.fire('change');assert.equal(quota.disabled,false);
-for(const field of [toggle,quota]){
- field.dataset.managedByEnvironment='true';syncEpisodeResearchAvailability();assert.equal(field.disabled,true);
- field.dataset.managedByEnvironment='false';syncEpisodeResearchAvailability();assert.equal(field.disabled,false);
-}
-// 重复同步不应修改授权/限额；缺少 DOM 依赖或重新等待配置时必须禁用。
-for(let i=0;i<10;i++)syncEpisodeResearchAvailability();
-assert.equal(toggle.checked,true);assert.equal(quota.value,'17');
-episodeResearchDependencies[4]=null;syncEpisodeResearchAvailability();
-assert.equal(toggle.disabled,true);assert.equal(quota.disabled,true);
-episodeResearchDependencies[4]=fields['AGENT_LLM_MODEL'];
-configReady=false;syncEpisodeResearchAvailability();
-assert.equal(toggle.disabled,true);assert.equal(quota.disabled,true);
-console.log('dependency state matrix passed (no browser/network/DB)');
-'''
-        node = shutil.which("node")
-        assert node is not None
-        completed = subprocess.run(
-            [node, "-e", harness.replace("__SNIPPET__", snippet)],
-            cwd=ROOT, capture_output=True, text=True, timeout=15,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_formal_configuration_guide_explains_authorization_and_shared_search_budget(self):
         guide = (ROOT / "docs/配置参考.md").read_text("utf-8")
         self.assertIn(f"| `{ENABLED}` | `0` |", guide)
         self.assertIn(f"| `{LIMIT}` | `10` |", guide)
         section = guide.split(f"| `{ENABLED}`", 1)[1].split("光鸭 NSFW 子授权位于", 1)[0]
-        for text in ("1–100", "默认关闭", "光鸭待确认剧集", "冻结案例", "无冲突新归档", "不自动覆盖或删除目标", "local_media", "继续旧复核", "首版未实现本地文件映射执行", "AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_ENABLED", "AGENT_LLM_ENABLED", "模型地址", "模型名", "TMDB 剧集组", "唯一", "稳定 episode ID", "Tavily", "可选", "TAVILY_DAILY_CREDIT_LIMIT", "待确认", "网页"):
+        for text in ("1–100", "默认关闭", "光鸭待确认剧集", "冻结案例", "无冲突新归档", "不自动覆盖或删除目标", "local_media", "继续旧复核", "首版未实现本地文件映射执行", "AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_LLM_ENABLED", "模型地址", "模型名", "TMDB 剧集组", "唯一", "稳定 episode ID", "Tavily", "可选", "TAVILY_DAILY_CREDIT_LIMIT", "待确认", "网页"):
             self.assertIn(text, section)
 
 

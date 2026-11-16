@@ -663,8 +663,8 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         rss_repo.update_rss_subscription(sid, {"qb_save_path": "/synthetic/subscription"})
         values = {
             "QB_URL": "http://synthetic.invalid",
-            "RSS_QB_CATEGORY": "rss-category",
             "RSS_QB_SAVE_PATH": "/synthetic/rss-default",
+            "RSS_QB_CATEGORY": "rss-category",
             "TG_QB_CATEGORY": "tg-category",
             "TG_QB_SAVE_PATH": "/synthetic/tg-default",
         }
@@ -686,13 +686,13 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         assert routes == [("/synthetic/subscription", "rss-category")] * 2, routes
 
     def test_qb_inherits_rss_default_path_on_live_and_frozen_entries(self):
-        """订阅未指定路径时，普通 / 批量 / 定时入口与冻结确认入口一样使用 RSS 全局路径和分类，不借 TG 默认。"""
+        """订阅未指定路径时，普通 / 批量 / 定时与冻结确认入口一致：路径与分类用 RSS 默认，不借 TG 默认。"""
         from app.modules.rss import capture_rss_qb_runtime_config
 
         values = {
             "QB_URL": "http://synthetic.invalid",
-            "RSS_QB_CATEGORY": "rss-category",
             "RSS_QB_SAVE_PATH": "/synthetic/rss-default",
+            "RSS_QB_CATEGORY": "rss-category",
             "TG_QB_CATEGORY": "tg-category",
             "TG_QB_SAVE_PATH": "/synthetic/tg-default",
         }

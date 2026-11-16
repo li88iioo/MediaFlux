@@ -1269,7 +1269,9 @@ def _start_organize_all(bot, telebot, source_message) -> bool:
 
 
 def _telegram_agent_available() -> bool:
-    return get_bool("AGENT_ENABLED", False) and get_bool("TG_AGENT_ENABLED", False)
+    from app.agent.feature_gate import is_agent_enabled
+
+    return is_agent_enabled() and get_bool("TG_AGENT_ENABLED", False)
 
 
 def _command_menu_specs() -> list[tuple[str, str]]:

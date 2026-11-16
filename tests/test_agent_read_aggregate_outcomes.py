@@ -58,11 +58,9 @@ def test_service_failure_is_not_completed(agent_llm_enabled, protocol, mode, sto
         wire = Wire(protocol, [reply(protocol, tool.model_name), reply(protocol)])
         session = AgentSession(model=wire.adapter, catalog=catalog, state_store=store, journal=store,
             pipeline=ToolPipeline(catalog=catalog, state_store=store))
-        original = actions.config.get_bool
         audit = _audit_result(missing=[{"season": 1, "episode": 1}], target_missing=True)
         audit.data["title"] = "Demo"
-        with patch.object(actions, "audit_series_episodes", return_value=audit), patch.object(actions, "get_indexer_service", return_value=service), patch.object(
-            actions.config, "get_bool", side_effect=lambda key, *a, **kw: True if key == "INDEXER_SEARCH_ENABLED" else original(key, *a, **kw)):
+        with patch.object(actions, "audit_series_episodes", return_value=audit), patch.object(actions, "get_indexer_service", return_value=service):
             events = [e async for e in session.run(AgentInput(owner="owner", session_id="audit-partial", message="请查完所有来源，确认是否有资源"))]
         wire.verify(posts=2)
         assert provider.calls >= 1

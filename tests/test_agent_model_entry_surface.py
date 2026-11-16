@@ -117,7 +117,7 @@ def test_explicit_tool_set_still_checks_availability_and_authorization():
 
 
 def test_production_bootstrap_explicitly_exposes_only_workspace(monkeypatch):
-    monkeypatch.setenv("AGENT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_LLM_ENABLED", "1")
     from unittest.mock import patch
     from app.agent.kernel.bootstrap import build_agent_kernel_runtime
     async def run():

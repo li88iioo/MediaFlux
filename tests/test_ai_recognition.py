@@ -573,6 +573,11 @@ class ScraperCacheBoundsTests(unittest.TestCase):
 
 
 class AIFallbackPipelineTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # 本组验证 AI 回退本身；其父开关“模型运行”按已开启处理，关闭场景单独覆盖。
+        self.enterContext(patch("app.modules.scraper.is_agent_llm_enabled", return_value=True))
+
     @staticmethod
     def _ai_result(confidence: float = 0.95):
         from app.clients.ai_recognition import AIRecognitionResult
@@ -603,6 +608,33 @@ class AIFallbackPipelineTests(IsolatedDatabaseTestCase):
             result = scraper.match("Deterministic.2024.mkv")
 
         self.assertIs(result, matched)
+        ai_client.assert_not_called()
+
+    def test_model_switch_off_stops_ai_fallback_even_when_ai_fallback_is_on(self):
+        from app.modules.scraper import TMDBScraper
+
+        scraper = TMDBScraper(client=cast(TMDBClient, _TMDBClient()))
+        failed = RecognitionResult(
+            media_type="movie", confidence=0.0, status="no_result",
+            need_confirm=True, matched_by="search", error="TMDB 无搜索结果",
+        )
+        connection = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+        }
+        with patch.object(scraper, "deterministic_recognize", return_value=failed), patch(
+            "app.modules.scraper.get_bool", return_value=True,
+        ), patch(
+            "app.modules.scraper.get", side_effect=lambda key, default="": connection.get(key, default),
+        ), patch("app.modules.scraper.is_agent_llm_enabled", return_value=False), patch(
+            "app.modules.scraper.AIRecognitionClient",
+        ) as ai_client:
+            result = scraper.match("Unknown.Release.2024.mkv")
+            unknown_group = scraper._release_group_fallback("[NewGroup] Unknown Show - 01.mkv", "", failed)
+
+        self.assertIs(result, failed)
+        self.assertEqual(result.ai_diagnostic, {"attempted": False, "reason": "model_disabled"})
+        self.assertIs(unknown_group, failed)
         ai_client.assert_not_called()
 
     def test_ai_disabled_keeps_deterministic_failure(self):

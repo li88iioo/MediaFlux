@@ -838,7 +838,6 @@
         const meta = node('div', 'discovery-shelf-meta');
         meta.append(node('span', '', providerLabel(section.provider)));
         if (section.loading) meta.append(statusBadge('LOADING', 'cache'));
-        if (section.enabled === false) meta.append(statusBadge('DISABLED', 'stale'));
         if (section.cached) meta.append(statusBadge('CACHE', 'cache'));
         if (section.stale) meta.append(statusBadge('STALE', 'stale'));
         head.append(heading, meta);
@@ -851,10 +850,7 @@
             rail.setAttribute('aria-label', `${section.title || '媒体栏目'}正在加载`);
             for (let index = 0; index < 6; index += 1) rail.append(skeletonCard());
         } else {
-            const message = section.enabled === false
-                ? `${providerLabel(section.provider)} 数据源未启用，可在设置中配置后使用。`
-                : (section.error || '此栏目暂时没有条目。');
-            rail.append(emptyPanel(message));
+            rail.append(emptyPanel(section.error || '此栏目暂时没有条目。'));
         }
         shelf.append(head, rail);
         renderedSections.set(shelf, section);
@@ -1020,8 +1016,7 @@
     function prepareSections(definitions, previousSections, preserveContent) {
         const previousByKey = new Map(asArray(previousSections).map((section) => [sectionIdentity(section), section]));
         return asArray(definitions).map((section) => {
-            const hydratable = section.enabled !== false
-                && section.available !== false
+            const hydratable = section.available !== false
                 && !section.error
                 && Boolean(section.provider)
                 && Boolean(section.media_type || section.mediaType)

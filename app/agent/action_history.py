@@ -700,7 +700,6 @@ _ENUM_FIELDS = {
     "feature": {
         "discovery",
         "douban",
-        "resource_results",
         "indexer_search",
         "web_search",
         "offline_magnet",

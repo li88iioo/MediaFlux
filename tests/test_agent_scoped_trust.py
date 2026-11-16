@@ -86,7 +86,6 @@ class TrustRig:
 @pytest.fixture
 def rig(task_store, monkeypatch):
     monkeypatch.setattr("app.modules.web_secret.get_web_secret", lambda: "scoped-trust-test-only")
-    monkeypatch.setattr("app.agent.kernel.ports.sdk_effects.config.get_bool", lambda *_args, **_kwargs: True)
     monkeypatch.setattr("app.discovery.service.DiscoveryService.get_detail",
         lambda self, provider, media_type, external_id: MediaCard(
             provider=provider, external_id=external_id, media_type=media_type,

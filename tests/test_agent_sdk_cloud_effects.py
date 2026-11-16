@@ -608,7 +608,7 @@ def test_production_confirmation_runtime_and_authority_are_frozen(cloud_backend,
             config.set_and_save({"TG_QB_SAVE_PATH": "/different"})
             config.set_and_save({"TG_QB_SAVE_PATH": original})
         elif change == "disabled":
-            config.set_and_save({"AGENT_ENABLED": "0"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         if change == "unchanged":
             accepted = await effects.execute_confirmed(plan.plan_id, context=context)
             assert accepted.outcome.public_content["status"] == "accepted" and _job_count() == 1

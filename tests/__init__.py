@@ -35,7 +35,8 @@ for _directory in (_TEST_DATA, _TEST_CONFIG, _TEST_CACHE, _TEST_LOGS, _TEST_STRM
     "ENV_WEB_PASSPORT='admin' # mediaflux-literal\n"
     "ENV_WEB_PASSWORD='123456' # mediaflux-literal\n"
     "WEB_SECRET_KEY='mediaflux-unit-test-secret' # mediaflux-literal\n"
-    "AGENT_ENABLED='1' # mediaflux-literal\n",
+    # Media Agent 总开关（AGENT_LLM_ENABLED）测试基线开启；需要关闭的用例显式设置。
+    "AGENT_LLM_ENABLED='1' # mediaflux-literal\n",
     encoding="utf-8",
 )
 
@@ -52,8 +53,6 @@ os.environ["MEDIAFLUX_STRM_DIR"] = str(_TEST_STRM)
 os.environ["MEDIAFLUX_DISABLE_FILE_LOGGING"] = "1"
 
 from app import config as _config  # noqa: F401  # capture startup overrides first
-
-os.environ["AGENT_LLM_ENABLED"] = "0"
 
 
 def _cleanup_test_runtime() -> None:

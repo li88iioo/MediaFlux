@@ -177,7 +177,6 @@ def test_receiving_directory_change_invalidates_frozen_plan_without_any_download
              patch("app.indexers.downloads.preview_indexer_download_batch", side_effect=preview), \
              patch("app.indexers.downloads.download_target_readiness", return_value={"qb": True, "guangya": True}), \
              patch("app.indexers.downloads.guangya_download_credential_generation", return_value=1), \
-             patch("app.modules.missing_resources.config.get_bool", return_value=True), \
              patch("app.modules.offline.OfflineRules.from_config", return_value=rules) as config, \
              patch("app.indexers.downloads.submit_download_input") as execute:
             positions = [1] if invalidation == "retired_single_snapshot" else [1, 2]
@@ -214,7 +213,7 @@ def test_telegram_in_place_multiselect_previews_and_finishes_once(store, monkeyp
     monkeypatch.setattr(agent_adapter, "get_agent_kernel_runtime", lambda: runtime)
     monkeypatch.setattr(agent_adapter, "telegram_agent_access", lambda *a: "allowed")
     from app import config
-    config.set_and_save({"AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1",
+    config.set_and_save({"AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "1",
                          "TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "7"})
     monkeypatch.setattr(agent_adapter.agent_rate_limiter, "allow", lambda *a, **k: True)
     view, _ = asyncio.run(_publish_candidates(pipeline, states, owner=owner, session_id=session_id))

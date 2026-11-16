@@ -15,7 +15,7 @@ def _call(payload, **kwargs):
     session = _Session(payload)
     client = TMDBClient(api_key="private-secret", base_url="https://api.themoviedb.org/3", proxy_url="", session=session)
     arguments: dict[str, Any] = {"person_id": "525", **kwargs}
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         result = sdk.media.filmography(**arguments)
     assert session.closed
     return result, session
@@ -125,7 +125,7 @@ def test_people_full_source_pages_keep_same_name_identity_without_popularity_sel
               "known_for": [{"id": 157336, "media_type": "movie", "title": "星际穿越"}]}
     session = _Session(page1)
     client = TMDBClient(api_key="private", proxy_url="", session=session)
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         first = sdk.media.people(" 诺兰 ")
     assert session.closed
     assert first["items"] == page1["results"] and first["returned"] == 25 and first["total"] == 26
@@ -135,7 +135,7 @@ def test_people_full_source_pages_keep_same_name_identity_without_popularity_sel
     assert session.calls[0][1]["params"]["query"] == "诺兰" and session.calls[0][1]["params"]["page"] == 1
     session = _Session({"page": 2, "total_pages": 2, "total_results": 26, "results": [target]})
     client = TMDBClient(api_key="private", proxy_url="", session=session)
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         second = sdk.media.people("诺兰", page=first["next_page"])
     assert session.closed and second["items"] == [target] and second["total"] == 26
     assert second["page"] == 2 and not second["has_more"] and second["next_page"] is None
@@ -148,7 +148,7 @@ def test_people_full_source_pages_keep_same_name_identity_without_popularity_sel
 def test_people_missing_pagination_or_wrong_page_fails_not_empty(payload):
     session = _Session(payload)
     client = TMDBClient(api_key="private", proxy_url="", session=session)
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         result = sdk.media.people("诺兰")
     assert session.closed and result["status"] == "invalid_response" and result["query_state"] == "failed"
     assert "items" not in result and "total" not in result
@@ -157,7 +157,7 @@ def test_people_missing_pagination_or_wrong_page_fails_not_empty(payload):
 def test_people_empty_source_page_preserves_known_zero_total():
     session = _Session({"page": 1, "total_pages": 0, "total_results": 0, "results": []})
     client = TMDBClient(api_key="private", proxy_url="", session=session)
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         result = sdk.media.people("不存在人物")
     assert session.closed and result["ok"] and result["query_state"] == "empty"
     assert result["items"] == [] and result["total"] == result["total_pages"] == 0 and result["next_page"] is None

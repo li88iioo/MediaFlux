@@ -468,20 +468,23 @@ def _release_discovery_search_service(service: DiscoverySearchService) -> None:
 def discovery_provider_names(
     requested: list[str] | tuple[str, ...] | None = None,
 ) -> list[str] | tuple[str, ...] | None:
-    """探索用途（页面、公开 API、Agent、全局搜索、评分）的来源许可。
+    """Web 页面（探索页接口、全局搜索）展示的来源：豆瓣开关关闭时去掉豆瓣。
 
-    探索豆瓣开关只约束探索用途；整理的豆瓣/Bangumi 辅助识别由整理规则自行选择来源，
-    不经过这里。请求格式交给共享搜索服务统一校验，这里只拦截已关闭的来源；未指定
-    来源且没有被关闭的来源时返回 None，沿用共享服务的默认选择。
+    只影响页面；Agent 查询与整理的豆瓣/Bangumi 辅助识别都不经过这里。混合来源静默去掉豆瓣，
+    只剩豆瓣时拒绝；请求格式仍交给共享搜索服务统一校验，未指定来源且无需过滤时返回 None。
     """
-    douban_enabled = app_config.get_bool("DISCOVERY_DOUBAN_ENABLED", True)
+    if app_config.get_bool("DISCOVERY_DOUBAN_ENABLED", True):
+        return requested
     if requested is None:
-        return None if douban_enabled else [name for name in DISCOVERY_PROVIDERS if name != "douban"]
-    if not douban_enabled and isinstance(requested, (list, tuple)) and any(
-        isinstance(name, str) and name.strip().lower() == "douban" for name in requested
-    ):
-        raise ValueError("搜索来源已关闭")
-    return requested
+        names = DISCOVERY_PROVIDERS
+    elif isinstance(requested, (list, tuple)):
+        names = requested
+    else:
+        return requested
+    kept = [name for name in names if not (isinstance(name, str) and name.strip().lower() == "douban")]
+    if not kept:
+        raise ValueError("豆瓣来源已在设置中隐藏")
+    return kept
 
 
 def get_discovery_search_service() -> DiscoverySearchService:

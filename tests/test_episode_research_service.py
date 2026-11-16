@@ -28,7 +28,7 @@ class EpisodeResearchServiceTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM episode_research_cache")
             conn.execute("DELETE FROM agent_web_search_daily_usage WHERE provider='episode_research'")
         self.values = {
-            "AGENT_ENABLED": "1", "AGENT_LLM_ENABLED": "1", "AGENT_RECOGNITION_REVIEW_ENABLED": "1",
+            "AGENT_LLM_ENABLED": "1", "AGENT_RECOGNITION_REVIEW_ENABLED": "1",
             "AGENT_EPISODE_RESEARCH_ENABLED": "1", "AGENT_LLM_API_URL": "https://model.invalid",
             "AGENT_LLM_MODEL": "fixture", "AGENT_EPISODE_RESEARCH_DAILY_LIMIT": "10",
         }
@@ -94,8 +94,7 @@ class EpisodeResearchServiceTests(IsolatedDatabaseTestCase):
         result = self.research()
         self.values["AGENT_RECOGNITION_REVIEW_ENABLED"] = "0"
         before = len(self.clients)
-        for key, value in (("AGENT_EPISODE_RESEARCH_ENABLED", "0"), ("AGENT_ENABLED", "0"),
-                           ("AGENT_LLM_ENABLED", "0"), ("AGENT_LLM_API_URL", ""), ("AGENT_LLM_MODEL", "")):
+        for key, value in (("AGENT_EPISODE_RESEARCH_ENABLED", "0"), ("AGENT_LLM_ENABLED", "0"), ("AGENT_LLM_API_URL", ""), ("AGENT_LLM_MODEL", "")):
             with self.subTest(key=key), patch.dict(self.values, {key: value}):
                 self.assertFalse(service.episode_research_enabled(explicit_approval=True))
                 with self.assertRaises(EpisodeResearchError) as raised:
@@ -166,7 +165,7 @@ class EpisodeResearchServiceTests(IsolatedDatabaseTestCase):
     def test_explicit_approval_rechecks_runtime_guards_after_metadata_validation(self):
         result = self.research()
         original = EpisodeEvidenceReader.validate
-        for key in ("AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_EPISODE_RESEARCH_ENABLED", "AGENT_ENABLED"):
+        for key in ("AGENT_RECOGNITION_REVIEW_ENABLED", "AGENT_EPISODE_RESEARCH_ENABLED", "AGENT_LLM_ENABLED"):
             with self.subTest(key=key), patch.dict(self.values):
                 def validate_then_disable(reader, index, group_id, *, key=key):
                     current = original(reader, index, group_id)

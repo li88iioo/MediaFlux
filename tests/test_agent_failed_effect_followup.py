@@ -580,7 +580,7 @@ def test_invalid_or_disallowed_confirmation_never_executes_or_starts_followup_mo
         elif denial == "permission_revoked":
             config.set_and_save({"TG_AGENT_ALLOWED_USER_IDS": "99999"})
         elif denial == "agent_disabled":
-            config.set_and_save({"AGENT_ENABLED": "0"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         else:
             # 实际破坏临时 SQLite 的签名票据，不 mock claim/get_active_plan。
             with db.get_conn() as conn:

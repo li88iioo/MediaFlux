@@ -39,8 +39,6 @@
     const indexerSiteBox=form.querySelector('[data-indexer-site-box]');
     const indexerSiteField=indexerSiteBox?.querySelector('[data-key="INDEXER_ENABLED_SITES"]');
     const indexerSiteInputs=[...(indexerSiteBox?.querySelectorAll('[data-indexer-site]')||[])];
-    const resourceResultsToggle=form.querySelector('[data-key="DISCOVERY_RESOURCE_RESULTS_ENABLED"]');
-    const indexerSearchToggle=form.querySelector('[data-key="INDEXER_SEARCH_ENABLED"]');
     const doubanDbcl2Input=form.querySelector('[data-key="DOUBAN_DBCL2"]');
     const doubanDbcl2Status=form.querySelector('[data-douban-dbcl2-status]');
     let doubanDbcl2StatusGeneration=0;
@@ -74,25 +72,14 @@
         });
         indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
     }
-    function syncIndexerSiteAvailability(){
-        const enabled=Boolean(resourceResultsToggle?.checked&&indexerSearchToggle?.checked);
-        if(indexerSiteBox){
-            indexerSiteBox.hidden=!enabled;
-            indexerSiteBox.setAttribute('aria-hidden',enabled?'false':'true');
-        }
-        indexerSiteInputs.forEach(input=>{input.disabled=!enabled;});
-    }
     function loadIndexerSiteSelection(config){
         const selected=new Set(String(config.INDEXER_ENABLED_SITES||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean));
         if(indexerSiteField)indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
         indexerSiteInputs.forEach(input=>{
             input.checked=selected.has(input.dataset.indexerSite);
         });
-        syncIndexerSiteAvailability();
     }
     indexerSiteInputs.forEach(input=>input.addEventListener('change',syncIndexerSiteSelection));
-    resourceResultsToggle?.addEventListener('change',syncIndexerSiteAvailability);
-    indexerSearchToggle?.addEventListener('change',syncIndexerSiteAvailability);
 
     function activate(target){
         let activeTab=null;
@@ -123,35 +110,25 @@
     let configReady=false;
     form.setAttribute('aria-busy','true');
 
-    const recognitionReviewToggle=form.querySelector('[data-key="AGENT_RECOGNITION_REVIEW_ENABLED"]');
-    const nsfwCleanReviewToggle=form.querySelector('[data-key="AGENT_NSFW_CLEAN_REVIEW_ENABLED"]');
-    function syncNsfwCleanReviewAvailability(){
-        if(!nsfwCleanReviewToggle)return;
-        // 只更新可操作状态，保留已保存授权与整行占位，主开关关闭时由执行端阻断。
-        nsfwCleanReviewToggle.disabled=!configReady||!recognitionReviewToggle?.checked
-            ||nsfwCleanReviewToggle.dataset.managedByEnvironment==='true';
+    // 开关树：字段的 data-requires 列出父级键；父级（递归）未满足时只禁用，保留已存值与整行占位，
+    // 运行时同样不生效。勾选框以勾选为满足，文本字段以非空为满足。
+    const dependentFields=[...form.querySelectorAll('[data-requires]')];
+    function requirementMet(key,path=new Set()){
+        const field=form.querySelector(`[data-key="${key}"]`);
+        if(!field||path.has(key))return false;
+        const own=field.type==='checkbox'?field.checked:Boolean(field.value.trim());
+        const next=new Set(path).add(key);
+        return own&&(field.dataset.requires||'').split(/\s+/).filter(Boolean).every(parent=>requirementMet(parent,next));
     }
-    recognitionReviewToggle?.addEventListener('change',syncNsfwCleanReviewAvailability);
-
-    const episodeResearchToggle=form.querySelector('[data-key="AGENT_EPISODE_RESEARCH_ENABLED"]');
-    const episodeResearchLimit=form.querySelector('[data-key="AGENT_EPISODE_RESEARCH_DAILY_LIMIT"]');
-    const episodeResearchDependencies=[
-        'AGENT_ENABLED','AGENT_LLM_ENABLED','AGENT_RECOGNITION_REVIEW_ENABLED',
-        'AGENT_LLM_API_URL','AGENT_LLM_MODEL',
-    ].map(key=>form.querySelector(`[data-key="${key}"]`));
-    function syncEpisodeResearchAvailability(){
-        const dependenciesReady=configReady&&episodeResearchDependencies.every(field=>
-            field?.type==='checkbox'?field.checked:Boolean(field?.value.trim()));
-        // 只改禁用状态，保留独立授权、限额与整行占位；Tavily 不是前置依赖。
-        if(episodeResearchToggle)episodeResearchToggle.disabled=!dependenciesReady
-            ||episodeResearchToggle.dataset.managedByEnvironment==='true';
-        if(episodeResearchLimit)episodeResearchLimit.disabled=!dependenciesReady||!episodeResearchToggle?.checked
-            ||episodeResearchLimit.dataset.managedByEnvironment==='true';
+    function syncDependentFields(){
+        dependentFields.forEach(field=>{
+            const parents=field.dataset.requires.split(/\s+/).filter(Boolean);
+            field.disabled=!configReady||field.dataset.managedByEnvironment==='true'
+                ||!parents.every(parent=>requirementMet(parent));
+        });
     }
-    [...episodeResearchDependencies,episodeResearchToggle].filter(Boolean).forEach(field=>{
-        field.addEventListener('input',syncEpisodeResearchAvailability);
-        field.addEventListener('change',syncEpisodeResearchAvailability);
-    });
+    form.addEventListener('input',syncDependentFields);
+    form.addEventListener('change',syncDependentFields);
 
     function revealConfigFields(){
         delete document.documentElement.dataset.settingsConfig;
@@ -160,8 +137,7 @@
     function setConfigReady(){
         configReady=true;
         if(testTavilyBtn)testTavilyBtn.disabled=false;
-        syncNsfwCleanReviewAvailability();
-        syncEpisodeResearchAvailability();
+        syncDependentFields();
         form.setAttribute('aria-busy','false');
         revealConfigFields();
         saveButtons.forEach(button=>{
@@ -558,7 +534,8 @@
         const tgChatPreview=document.getElementById('tgChatIdPreview');
         if(tgChatPreview)tgChatPreview.textContent=tgChatId?`ID: ${tgChatId}`:'未配置';
 
-        const tgAgentEnabled=form.querySelector('[data-key="TG_AGENT_ENABLED"]')?.checked;
+        const tgAgentToggle=form.querySelector('[data-key="TG_AGENT_ENABLED"]');
+        const tgAgentEnabled=Boolean(tgAgentToggle?.checked&&!tgAgentToggle.disabled);
         const tgAgentPreview=document.getElementById('tgAgentRoutePreview');
         if(tgAgentPreview)tgAgentPreview.textContent=tgAgentEnabled?'已启用':'未开启';
 

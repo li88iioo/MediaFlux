@@ -78,7 +78,7 @@ def test_confirmed_restart_does_not_block_concurrent_web_runtime_lookup():
 
     async def scenario():
         with initialized_web_runtime():
-            config.set_and_save({"AGENT_ENABLED": "1", "AGENT_LLM_API_URL": "http://model.invalid/v1", "AGENT_LLM_MODEL": "test-model"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "1", "AGENT_LLM_API_URL": "http://model.invalid/v1", "AGENT_LLM_MODEL": "test-model"})
             invalidate_agent_kernel_runtime()
             current = await asyncio.to_thread(get_agent_kernel_runtime)
             instance_id = media_proxy_repo.add_media_proxy_instance(

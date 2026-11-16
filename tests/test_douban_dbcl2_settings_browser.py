@@ -126,7 +126,6 @@ class DoubanDbcl2SettingsBrowserTests(unittest.TestCase):
             "config": {
                 "DISCOVERY_ENABLED": "1",
                 "DISCOVERY_DOUBAN_ENABLED": "1",
-                "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
                 "DOUBAN_CACHE_TTL_SECONDS": "21600",
                 "DOUBAN_DBCL2": "",
             },

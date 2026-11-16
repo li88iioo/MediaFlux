@@ -75,21 +75,16 @@ def qb_session(monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_media_resolve_respects_discovery_switch_before_service_creation(monkeypatch, enabled):
+def test_media_resolve_is_not_gated_by_the_discovery_page_switch(monkeypatch, enabled):
+    # 用户决定（2026-11-16）：媒体探索开关只管 Web 页面，Agent 查询影视资料不受影响。
     monkeypatch.setenv("DISCOVERY_ENABLED", "1" if enabled else "0")
     service = Mock()
     service.lookup_tmdb_mapping.return_value = {"tmdb_id": "90101", "confirmed": True, "candidates": []}
     with patch("app.discovery.service.get_discovery_service", return_value=service) as factory:
-        if enabled:
-            result = sdk.media.resolve("douban", "101", "movie", "示例影片", "2026")
-            assert result == {"tmdb_id": "90101", "confirmed": True, "candidates": []}
-            factory.assert_called_once_with()
-            service.lookup_tmdb_mapping.assert_called_once_with("douban", "101", "movie", "示例影片", "2026")
-        else:
-            with pytest.raises(ValueError, match="影视探索功能当前已关闭"):
-                sdk.media.resolve("douban", "101", "movie", "示例影片", "2026")
-            factory.assert_not_called()
-            service.lookup_tmdb_mapping.assert_not_called()
+        result = sdk.media.resolve("douban", "101", "movie", "示例影片", "2026")
+    assert result == {"tmdb_id": "90101", "confirmed": True, "candidates": []}
+    factory.assert_called_once_with()
+    service.lookup_tmdb_mapping.assert_called_once_with("douban", "101", "movie", "示例影片", "2026")
 
 
 def test_watchlist_cursor_preserves_all_provider_identities():
@@ -967,7 +962,6 @@ def test_sdk_help_examples_read_real_response_paths(sdk_client):
               patch("app.modules.episode_audit.inspect_series_episode_sources", return_value=[_ready(inventory.episodes)]),
               patch("app.modules.episode_audit.TMDBClient", side_effect=_FakeTMDB),
               patch("app.modules.media_library._client", return_value=nullcontext((SimpleNamespace(server_type="jellyfin"), client))),
-              patch("app.discovery.service.require_discovery_enabled"),
               patch("app.discovery.service.get_discovery_service", return_value=discovery)):
             discovery_repo.add_media_watchlist("tmdb", "12345", "tv", "目标剧", "2026")
             runner = doctest.DocTestRunner()

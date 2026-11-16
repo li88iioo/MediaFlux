@@ -324,17 +324,23 @@ class DiscoverySearchUnitTests(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"DISCOVERY_ENABLED": "1", "DISCOVERY_DOUBAN_ENABLED": "0"}), \
                     patch(targets[0], return_value=service), patch(targets[1], return_value=service), \
-                    patch(targets[2], return_value=service):
-                self.assertEqual(list(sdk.media.search("电影")["providers_attempted"]), ["tmdb", "bangumi"])
-                with self.assertRaisesRegex(ValueError, "已关闭"):
-                    sdk.media.search("电影", providers=["Douban"])
+                    patch(targets[2], return_value=service), \
+                    patch("app.discovery.service.discovery_repo.list_media_external_ids", return_value={}):
+                self.assertEqual(list(sdk.media.search("电影")["providers_attempted"]), ["tmdb", "douban", "bangumi"])
+                direct = sdk.media.search("电影", providers=["Douban"])
+                self.assertEqual([item["external_id"] for item in direct["items"]], ["1"])
+                self.assertEqual(douban.calls, [("电影", 1)] * 2)
                 _discovery_section("电影")
+                self.assertEqual(douban.calls, [("电影", 1)] * 2, "页面搜索必须隐藏豆瓣")
+                self.assertEqual(discovery_provider_names(["tmdb", "Douban"]), ["tmdb"])
+                with self.assertRaisesRegex(ValueError, "隐藏"):
+                    discovery_provider_names(["douban"])
                 rating = lookup_rating("电影", allow_web_fallback=False)
-                self.assertEqual(rating["evidence"][0]["status"], "unavailable")
-                self.assertEqual(douban.calls, [])
+                self.assertTrue(rating["ok"])
+                self.assertEqual(rating["data"]["rating"], 8.0)
                 # 共享执行层不读取用途开关：整理辅助识别显式选择豆瓣仍会真实请求。
                 service.search("电影", 1, ["douban"])
-                self.assertEqual(douban.calls, [("电影", 1)])
+                self.assertEqual(douban.calls, [("电影", 1)] * 4)
             with patch.dict(os.environ, {"DISCOVERY_DOUBAN_ENABLED": "1"}):
                 self.assertIsNone(discovery_provider_names())
                 self.assertEqual(discovery_provider_names(["douban"]), ["douban"])
@@ -486,7 +492,7 @@ class DiscoverySearchAPITests(InitializedWebTestCase):
         finally:
             service.shutdown()
         self.assertEqual(rejected.status_code, 400)
-        self.assertIn("已关闭", rejected.json()["error"])
+        self.assertIn("隐藏", rejected.json()["error"])
         self.assertEqual(default.status_code, 200)
         self.assertEqual(default.json()["providers_attempted"], ["tmdb", "bangumi"])
         self.assertEqual(douban.calls, [])

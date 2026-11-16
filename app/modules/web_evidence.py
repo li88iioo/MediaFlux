@@ -27,7 +27,7 @@ from app.concurrency import (
     AsyncBridgeUnavailable, KeyedSingleFlight,
     ensure_sync_bridge_available, run_awaitable_sync,
 )
-from app.config import get
+from app.config import get, get_bool
 from app.modules.policy_config import policy_int
 from app.logger import get_logger
 from app.sensitive_data import contains_sensitive_credential, is_sensitive_key, redact_sensitive_text
@@ -103,21 +103,11 @@ def clear_web_cache() -> None:
 
 
 def _search_enabled() -> bool:
-    return (get("WEB_SEARCH_ENABLED", "0") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return get_bool("WEB_SEARCH_ENABLED", False)
 
 
 def _read_enabled() -> bool:
-    return (get("WEB_READ_ENABLED", "1") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return get_bool("WEB_READ_ENABLED", True)
 
 
 def normalize_search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:

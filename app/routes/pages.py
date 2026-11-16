@@ -85,10 +85,7 @@ def global_search(request: Request):
         result=result,
         search_error=error,
         discovery_enabled=config.get_bool("DISCOVERY_ENABLED"),
-        resource_results_enabled=config.get_bool(
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
-            True,
-        ),
+        resource_results_enabled=config.get_bool("INDEXER_SEARCH_ENABLED"),
     )
 
 
@@ -316,10 +313,7 @@ def rss(request: Request):
         request,
         "rss.html",
         "rss",
-        resource_results_enabled=config.get_bool(
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
-            True,
-        ),
+        resource_results_enabled=config.get_bool("INDEXER_SEARCH_ENABLED"),
         rss_inherited_dir_name=(offline["target_dir_name"] or inherited_dir) if inherited_dir else "",
     )
 
@@ -347,7 +341,7 @@ def free_calendar(request: Request):
     return _page(
         request, "free_calendar.html", "discovery",
         calendar_today=today, calendar_week_start=week_start,
-        resource_results_enabled=config.get_bool("DISCOVERY_RESOURCE_RESULTS_ENABLED", True),
+        resource_results_enabled=config.get_bool("INDEXER_SEARCH_ENABLED"),
     )
 
 
@@ -359,10 +353,8 @@ def discovery(request: Request):
         request,
         "discovery.html",
         "discovery",
-        resource_results_enabled=config.get_bool(
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
-            True,
-        ),
+        resource_results_enabled=config.get_bool("INDEXER_SEARCH_ENABLED"),
+        douban_enabled=config.get_bool("DISCOVERY_DOUBAN_ENABLED", True),
     )
 
 
@@ -382,12 +374,4 @@ def logs(request: Request):
 
 @router.get("/settings", name="pages.settings")
 def settings(request: Request):
-    return _page(
-        request,
-        "settings.html",
-        "settings",
-        resource_results_enabled=config.get_bool(
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
-            True,
-        ),
-    )
+    return _page(request, "settings.html", "settings")

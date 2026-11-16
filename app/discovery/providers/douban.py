@@ -25,7 +25,6 @@ from app.discovery.models import (
     ProviderError,
     ProviderHealth,
     ProviderInvalidResponse,
-    ProviderNotConfigured,
     ProviderRateLimited,
     ProviderTimeout,
     ProviderUnavailable,
@@ -71,7 +70,6 @@ _FALLBACK_ERRORS = (
 )
 _EXTERNAL_ID_RE = re.compile(r"^[0-9]+$")
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
-_TRUE_VALUES = {"1", "true", "yes", "on", "y"}
 
 
 def _frodo_credential_identity(client: Any) -> str:
@@ -122,20 +120,6 @@ def _config_get(config: Mapping[str, Any] | None, key: str, default: str = "") -
     return str(config.get(key, default) or "")
 
 
-def _bool_value(value: Any, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in _TRUE_VALUES
-
-
-def _config_bool(config: Mapping[str, Any] | None, key: str, default: bool) -> bool:
-    if config is None:
-        return app_config.get_bool(key, default)
-    return _bool_value(config.get(key), default)
-
-
 def _image_key(value: Any) -> str:
     if isinstance(value, Mapping):
         value = value.get("large") or value.get("normal") or value.get("small")
@@ -180,7 +164,6 @@ class DoubanProvider(DiscoveryProvider):
     def __init__(
         self,
         *,
-        enabled: bool | str | int | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
         dbcl2: str | None = None,
@@ -196,11 +179,6 @@ class DoubanProvider(DiscoveryProvider):
         authenticated_client: Any | None = None,
         authenticated_client_factory: Callable[[], Any] | None = None,
     ):
-        self.enabled = (
-            _config_bool(config, "DISCOVERY_DOUBAN_ENABLED", True)
-            if enabled is None
-            else _bool_value(enabled, True)
-        )
         self._config = config
         self.api_key = None if api_key is None else (api_key or "").strip()
         self.api_secret = None if api_secret is None else (api_secret or "").strip()
@@ -401,8 +379,6 @@ class DoubanProvider(DiscoveryProvider):
         with self._close_lock:
             if self._closed or self._closing:
                 raise ProviderUnavailable("豆瓣数据源已关闭")
-        if not self.enabled:
-            raise ProviderNotConfigured("豆瓣探索 Provider 未启用")
 
     def _public_circuit_error(self) -> ProviderUnavailable | None:
         now = float(self.clock())

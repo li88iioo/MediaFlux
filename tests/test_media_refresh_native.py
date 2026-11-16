@@ -255,7 +255,7 @@ def test_refresh_scope_changes_and_cancellation_are_zero_write(
         elif change == "type":
             backend.item["Type"] = "Series"
         else:
-            monkeypatch.setenv("AGENT_ENABLED", "false")
+            monkeypatch.setenv("AGENT_LLM_ENABLED", "false")
         with pytest.raises((ToolPipelineError, asyncio.CancelledError)):
             await effects(SQLiteKernelStore()).execute_confirmed(
                 plan.plan_id, context=ctx

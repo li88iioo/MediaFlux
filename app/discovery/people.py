@@ -5,7 +5,6 @@ import time
 from datetime import date, datetime
 from typing import Any
 
-from app import config
 from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.discovery.models import ProviderError, ProviderNotConfigured
 from app.modules.media_identity import normalize_tmdb_id
@@ -30,8 +29,6 @@ def _page(items: list, limit: int | None, offset: int) -> dict:
 
 
 def _fetch(method: str, *args, **kwargs) -> tuple[dict | None, dict]:
-    if not config.get_bool("DISCOVERY_ENABLED"):
-        return None, {"ok": False, "status": "disabled", "query_state": "not_queried", "source": "tmdb"}
     client = None
     try:
         client = TMDBClient()

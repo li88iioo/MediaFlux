@@ -38,7 +38,7 @@ class EpisodeResearchConfirmationTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM organize_confirmations")
             conn.execute("DELETE FROM episode_research_cache")
             conn.execute("DELETE FROM agent_web_search_daily_usage WHERE provider='episode_research'")
-        self.values = {"AGENT_ENABLED": "1", "AGENT_LLM_ENABLED": "1", "AGENT_RECOGNITION_REVIEW_ENABLED": "1",
+        self.values = {"AGENT_LLM_ENABLED": "1", "AGENT_RECOGNITION_REVIEW_ENABLED": "1",
                        "AGENT_EPISODE_RESEARCH_ENABLED": "1", "AGENT_LLM_API_URL": "https://model.invalid",
                        "AGENT_LLM_MODEL": "fixture", "AGENT_EPISODE_RESEARCH_DAILY_LIMIT": "10"}
         self.enterContext(patch.object(config, "get", side_effect=lambda k, default="": self.values.get(k, default)))

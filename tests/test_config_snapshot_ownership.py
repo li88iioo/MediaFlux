@@ -179,7 +179,7 @@ def test_publication_scope_restores_across_paths_and_keeps_failure(tmp_path):
                                 raise ValueError('swallowed')
                 assert config._runtime_guard.scope is outer
                 with pytest.raises(RuntimeFenceError, match='runtime_publication_scope_changed'):
-                    with config.runtime_config_publication({'AGENT_ENABLED': '1'}):
+                    with config.runtime_config_publication({'AGENT_LLM_ENABLED': '1'}):
                         pass
         with config.runtime_config_publication(display):
             pass

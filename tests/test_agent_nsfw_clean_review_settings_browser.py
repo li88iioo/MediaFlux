@@ -100,6 +100,9 @@ class NsfwCleanReviewSettingsBrowserTests(unittest.TestCase):
         page.route("**/*", route_request)
         page.goto("http://settings.test/settings")
         page.evaluate(MOCK_FETCH, {
+            "AGENT_LLM_ENABLED": "1",
+            "AGENT_LLM_API_URL": "https://model.invalid/v1",
+            "AGENT_LLM_MODEL": "fixture-model",
             "TMDB_MATCH_MODE": "strict",
             "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT": "20",
             "AI_RECOGNITION_CONFIDENCE_THRESHOLD": "0.8",
@@ -250,6 +253,69 @@ class NsfwCleanReviewSettingsBrowserTests(unittest.TestCase):
         self.assertEqual(page.evaluate("collectConfigFields(document.getElementById('settings-panel-metadata'))"), {})
         self.assertEqual(errors, [])
 
+
+    def test_episode_research_dependencies_preserve_saved_authorization_and_quota(self):
+        enabled, limit = "AGENT_EPISODE_RESEARCH_ENABLED", "AGENT_EPISODE_RESEARCH_DAILY_LIMIT"
+        for width in (390, 1280):
+            with self.subTest(width=width):
+                page, errors = self._page(width, {PARENT_KEY: "1", enabled: "1", limit: "17"})
+                page.set_default_timeout(5000)
+                toggle = page.locator(f'[data-key="{enabled}"]')
+                quota = page.locator(f'[data-key="{limit}"]')
+                self.assertTrue(toggle.is_disabled())
+                self.assertTrue(quota.is_disabled())
+                self._resolve_config(page)
+                option = page.locator('.metadata-episode-research')
+                before = self._rect(option)
+                for key, panel in (("AGENT_LLM_ENABLED", "agent"), ("AGENT_LLM_API_URL", "agent"),
+                                   ("AGENT_LLM_MODEL", "agent"), (PARENT_KEY, "metadata")):
+                    page.locator(f'[data-settings-target="{panel}"]').click()
+                    parent = page.locator(f'[data-key="{key}"]')
+                    checkbox = parent.get_attribute('type') == 'checkbox'
+                    saved = "" if checkbox else parent.input_value()
+                    if checkbox:
+                        parent.locator('..').click()
+                    else:
+                        parent.fill('')
+                    page.locator('[data-settings-target="metadata"]').click()
+                    self.assertTrue(toggle.is_disabled(), key)
+                    self.assertTrue(quota.is_disabled(), key)
+                    self.assertTrue(toggle.is_checked())
+                    self.assertEqual(quota.input_value(), '17')
+                    self._assert_same_rect(before, self._rect(option))
+                    page.locator(f'[data-settings-target="{panel}"]').click()
+                    if checkbox:
+                        parent.locator('..').click()
+                    else:
+                        parent.fill(saved)
+                    page.locator('[data-settings-target="metadata"]').click()
+                    self.assertFalse(toggle.is_disabled(), key)
+                    self.assertFalse(quota.is_disabled(), key)
+                toggle.locator('..').click()
+                self.assertTrue(quota.is_disabled())
+                self.assertEqual(quota.input_value(), '17')
+                toggle.locator('..').click()
+                quota.fill('19')
+                page.locator('#settings-panel-metadata [data-save-settings]').click()
+                page.wait_for_function("typeof window.__resolveSettingsSave === 'function'")
+                self.assertEqual(page.evaluate('window.__settingsWrites'), [{limit: '19'}])
+                page.evaluate('window.__resolveSettingsSave()')
+                page.wait_for_function("!document.querySelector('#settings-panel-metadata [data-save-settings]').disabled")
+                self.assertEqual(page.evaluate("collectConfigFields(document.getElementById('settings-panel-metadata'))"), {})
+                self.assertEqual(errors, [])
+                page.close()
+        for managed in (enabled, limit):
+            page, errors = self._page(390, {PARENT_KEY: "1", enabled: "1", limit: "17", "__managed_fields": [managed]})
+            self._resolve_config(page)
+            parent = page.locator(f'[data-key="{PARENT_KEY}"]')
+            parent.locator('..').click()
+            parent.locator('..').click()
+            self.assertTrue(page.locator(f'[data-key="{managed}"]').is_disabled())
+            self.assertTrue(page.locator(f'[data-key="{enabled}"]').is_checked())
+            self.assertEqual(page.locator(f'[data-key="{limit}"]').input_value(), '17')
+            self.assertEqual(page.evaluate("collectConfigFields(document.getElementById('settings-panel-metadata'))"), {})
+            self.assertEqual(errors, [])
+            page.close()
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import socket
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
@@ -17,7 +18,7 @@ from fastapi.testclient import TestClient
 from app import config
 from app.defaults import DEFAULT_BOOL_CONFIG_VALUES
 from app.main import create_app
-from tests.support import initialized_web_runtime
+from tests.support import FakeTelegramBot, initialized_web_runtime
 
 try:
     from .test_agent_kernel_browser import _chromium_executable, sync_playwright
@@ -121,15 +122,14 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
     def test_organize_both_views_show_missing_defaults_explicit_empty_and_truthy_text(self):
         self._write(
             GY_ORGANIZE_EMBY_REFRESH="", GY_ORGANIZE_CLEAN_EMPTY="", GY_ORGANIZE_SCHEDULE_CRON="",
-            GY_ORGANIZE_REGION_SPLIT=" y ", GY_ORGANIZE_NOTIFY_ENABLED="On",
+            GY_ORGANIZE_REGION_SPLIT=" y ",
         )
         rules = self._open("/organize-rules")
         self.assertFalse(self._checked(rules, "GY_ORGANIZE_EMBY_REFRESH"))
         self.assertFalse(self._checked(rules, "GY_ORGANIZE_CLEAN_EMPTY"))
         self.assertTrue(self._checked(rules, "GY_ORGANIZE_REGION_SPLIT"))
-        self.assertTrue(self._checked(rules, "GY_ORGANIZE_NOTIFY_ENABLED"))
         # 缺失键由 GET 回填后端唯一默认（开启），页面不再自行补勾选。
-        for key in ("GY_ORGANIZE_YEAR_SPLIT", "GY_ORGANIZE_LINK_STRM", "GY_ORGANIZE_STRM_DETAIL_NOTIFY"):
+        for key in ("GY_ORGANIZE_YEAR_SPLIT", "GY_ORGANIZE_LINK_STRM"):
             self.assertTrue(self._checked(rules, key), key)
         self.assertEqual(rules.locator('[data-key="GY_ORGANIZE_SCHEDULE_CRON"]').input_value(), "")
 
@@ -164,9 +164,8 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertEqual(config.get("GY_ORGANIZE_SCHEDULE_CRON"), "30 5 * * *")
 
     def test_strm_page_keeps_explicit_empty_and_rejects_clearing_cron(self):
-        self._write(STRM_NOTIFY_ENABLED="", STRM_SCHEDULE_CRON="")
+        self._write(STRM_SCHEDULE_CRON="")
         page = self._open("/guangya/strm")
-        self.assertFalse(self._checked(page, "STRM_NOTIFY_ENABLED"))
         cron = page.locator('[data-key="STRM_SCHEDULE_CRON"]')
         self.assertEqual(cron.input_value(), "", "历史空 Cron 保持可见，不自动补值")
         self.assertEqual(self.config_posts, [])
@@ -186,6 +185,7 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self._write(
             OFFLINE_MAGNET_ENABLED="", AGENT_STREAM_DISPLAY_ENABLED=" YES ",
             WEB_READ_ENABLED="", WEB_SEARCH_ENABLED="y",
+            GY_ORGANIZE_NOTIFY_ENABLED="On", STRM_NOTIFY_ENABLED="",
         )
         offline = self._open("/guangya/offline")
         self.assertFalse(self._checked(offline, "OFFLINE_MAGNET_ENABLED"), "显式空值不能被页面重新勾选")
@@ -194,6 +194,9 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertTrue(self._checked(settings, "AGENT_STREAM_DISPLAY_ENABLED"))
         self.assertFalse(self._checked(settings, "WEB_READ_ENABLED"))
         self.assertTrue(self._checked(settings, "WEB_SEARCH_ENABLED"))
+        self.assertTrue(self._checked(settings, "GY_ORGANIZE_NOTIFY_ENABLED"))
+        self.assertTrue(self._checked(settings, "GY_ORGANIZE_STRM_DETAIL_NOTIFY"), "缺失通知键使用后端默认")
+        self.assertFalse(self._checked(settings, "STRM_NOTIFY_ENABLED"), "通知移至设置页，显式空仍为关闭")
         self.assertEqual(self.config_posts, [])
 
     def test_rss_inherited_guangya_directory_matches_offline_default(self):
@@ -217,6 +220,79 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
                 page.close()
         self.assertEqual(self.config_posts, [])
 
+    def test_media_agent_switch_greys_dependents_and_keeps_their_values(self):
+        self._write(
+            AGENT_LLM_ENABLED="0", AGENT_LIBRARY_PATROL_ENABLED="1", AGENT_RECOGNITION_REVIEW_ENABLED="1",
+            AI_RECOGNITION_ENABLED="1", TG_AGENT_ENABLED="1", TG_NOTIFICATION_ENABLED="1",
+            AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED="1",
+            AGENT_LLM_API_URL="https://model.invalid/v1", AGENT_LLM_MODEL="fixture-model",
+        )
+        page = self._open("/settings#agent")
+        dependents = ("AGENT_LIBRARY_PATROL_ENABLED", "AGENT_RECOGNITION_REVIEW_ENABLED", "AI_RECOGNITION_ENABLED",
+                      "TG_AGENT_ENABLED", "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED")
+
+        def state(key):
+            field = page.locator(f'[data-key="{key}"]').first
+            return field.is_checked(), field.is_disabled()
+
+        # 总开关关闭：跨分区的依赖项都变灰但保留已存值；连接配置、Tavily 与总开关本身仍可编辑。
+        for key in dependents:
+            self.assertEqual(state(key), (True, True), key)
+        for key in ("AGENT_LLM_API_URL", "TAVILY_API_KEY", "AGENT_LLM_ENABLED"):
+            self.assertFalse(page.locator(f'[data-key="{key}"]').first.is_disabled(), key)
+
+        page.locator('label.toggle:has([data-key="AGENT_LLM_ENABLED"])').click()
+        for key in dependents:
+            self.assertEqual(state(key), (True, False), key)
+        # 清空模型名后，依赖模型连接的复核与 AI 回退重新变灰，其余 Agent 功能不受影响。
+        page.locator('[data-key="AGENT_LLM_MODEL"]').fill("")
+        self.assertEqual(state("AGENT_RECOGNITION_REVIEW_ENABLED"), (True, True))
+        self.assertEqual(state("AI_RECOGNITION_ENABLED"), (True, True))
+        self.assertEqual(state("AGENT_LIBRARY_PATROL_ENABLED"), (True, False))
+        page.locator('[data-key="AGENT_LLM_MODEL"]').fill("fixture-model")
+
+        page.locator("#settings-panel-agent [data-save-settings]").click()
+        page.wait_for_function(
+            "document.querySelector('#settings-panel-agent [data-settings-state]')?.classList.contains('is-success')"
+        )
+        self.assertEqual(self.config_posts, [(200, {"AGENT_LLM_ENABLED": "1"})])
+        self.assertEqual(config.get("AGENT_LIBRARY_PATROL_ENABLED"), "1")
+
+    def test_shared_telegram_allowlist_can_be_saved_and_revoked_with_agent_off(self):
+        from app.bot.handlers import _reject_unauthorized_group_write, _reject_unauthorized_resource_search
+
+        key = "TG_AGENT_ALLOWED_USER_IDS"
+        message = SimpleNamespace(chat=SimpleNamespace(id=-100), from_user=SimpleNamespace(id=9))
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                self._write(AGENT_LLM_ENABLED="0", TG_AGENT_ENABLED="0", TG_CHAT_ID="-100", TG_AGENT_ALLOWED_USER_IDS="")
+                page = self._open("/settings#telegram")
+                page.set_viewport_size({"width": width, "height": 900})
+                page.locator('[data-settings-target="telegram"]').click()
+                field = page.locator(f'[data-key="{key}"]')
+                field.wait_for(state="visible")
+                self.assertTrue(field.is_visible())
+                self.assertFalse(field.is_disabled())
+                for value, rejected in (("9", False), ("", True)):
+                    field.fill(value)
+                    before = len(self.config_posts)
+                    page.locator('#settings-panel-telegram [data-save-settings]').click()
+                    page.wait_for_function("document.querySelector('#settings-panel-telegram [data-settings-state]')?.classList.contains('is-success')")
+                    self.assertEqual(self.config_posts[before:], [(200, {key: value})])
+                    self.assertEqual(config.get(key), value)
+                    self.assertEqual(config.get("AGENT_LLM_ENABLED"), "0")
+                    self.assertEqual(config.get("TG_AGENT_ENABLED"), "0")
+                    self.assertEqual(_reject_unauthorized_resource_search(FakeTelegramBot(), message), rejected, f"effective chat={config.get('TG_CHAT_ID')} allowlist={config.get(key)}")
+                    self.assertEqual(_reject_unauthorized_group_write(FakeTelegramBot(), message), rejected)
+                    page.reload()
+                    page.wait_for_function(READY["/settings"])
+                    self.assertEqual(field.input_value(), value)
+                    self.assertFalse(field.is_disabled())
+                page.close()
+        with patch.object(config, "has_external_override", side_effect=lambda field: field == key):
+            page = self._open("/settings#telegram")
+        self.assertTrue(page.locator(f'[data-key="{key}"]').is_disabled(), "移除父依赖不能解除环境托管")
+        self.assertEqual(page.evaluate("collectConfigFields(document.getElementById('settings-panel-telegram'))"), {})
 
 if __name__ == "__main__":
     unittest.main()

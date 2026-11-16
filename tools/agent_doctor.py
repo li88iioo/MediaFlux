@@ -45,7 +45,7 @@ _MIN_SCRAPE_KEY_LENGTH = 24
 
 
 def _agent_config_check() -> DiagnosticCheck:
-    if not config.get_bool("AGENT_ENABLED", False):
+    if not config.get_bool("AGENT_LLM_ENABLED", False):
         return DiagnosticCheck(
             "agent.config",
             "warning",

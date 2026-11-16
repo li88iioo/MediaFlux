@@ -183,12 +183,11 @@ def validate_filters(provider: str, category: str, media_type: str,
 
 
 def list_section_definitions(*, douban_enabled: bool | int | None = None) -> list[dict[str, Any]]:
+    """探索首页栏目布局；“显示豆瓣来源”关闭时不展示豆瓣栏目。"""
     if douban_enabled is None:
         douban_enabled = config.get_bool("DISCOVERY_DOUBAN_ENABLED", True)
-    sections = deepcopy(list(_SECTION_DEFINITIONS))
-    for section in sections:
-        section["enabled"] = bool(douban_enabled) if section["provider"] == "douban" else True
-    return sections
+    return [deepcopy(section) for section in _SECTION_DEFINITIONS
+            if douban_enabled or section["provider"] != "douban"]
 
 
 def _filter_options(values: dict[str, str]) -> list[dict[str, str]]:
@@ -201,9 +200,7 @@ def _plain_options(values: set[str]) -> list[dict[str, str]]:
 
 def list_catalog_definitions() -> list[dict[str, Any]]:
     """全部可查询栏目来自实际请求注册表；首页栏目只决定页面布局。"""
-    douban_enabled = config.get_bool("DISCOVERY_DOUBAN_ENABLED", True)
     return [{"provider": provider, "category": category, "media_types": sorted(media_types),
-             "enabled": douban_enabled if provider == "douban" else True,
              "supports_collection": COLLECTION_CATEGORIES.get(provider) == category}
             for provider, categories in _CATEGORY_MEDIA.items()
             for category, media_types in categories.items()]

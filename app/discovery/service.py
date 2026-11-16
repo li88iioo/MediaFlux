@@ -57,12 +57,6 @@ _ERROR_TYPES = {
 }
 
 
-def require_discovery_enabled() -> None:
-    """公开探索入口的总开关；本地收藏读取不受此开关限制。"""
-    if not config.get_bool("DISCOVERY_ENABLED"):
-        raise ValueError("影视探索功能当前已关闭")
-
-
 def watchlist_identity(provider: str, media_type: str, external_id: str) -> tuple[str, str, str]:
     """收藏写入共用的来源身份校验；不截断目标 ID。"""
     if not all(isinstance(value, str) for value in (provider, media_type, external_id)):

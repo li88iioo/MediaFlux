@@ -184,6 +184,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     width: 100%;
     display: flex;
     flex-direction: column;
+    gap: 18px;
 }
 .settings-main-col > .settings-surface-card {
     flex: 1;
@@ -191,6 +192,20 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     flex-direction: column;
     height: 100%;
 }
+/* 同一列叠放多张卡时，后续卡片按内容高度排列，由首张卡片吸收剩余高度。 */
+.settings-main-col > .settings-surface-card + .settings-surface-card {
+    flex: 0 0 auto;
+    height: auto;
+}
+/* 分类开关网格：沿用 agent-settings-option 卡片，与表单行左右内边距对齐。 */
+.settings-option-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    padding: 14px 24px 22px;
+}
+.settings-option-grid > .agent-settings-option { margin: 0; }
+.agent-settings-option:has(input:disabled) > span:first-child { opacity: .6; }
 .settings-surface-card .form-row {
     display: grid;
     grid-template-columns: minmax(130px, 190px) minmax(0, 1fr);
@@ -221,6 +236,10 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     gap: 16px;
     height: 100%;
 }
+/* 主列较长时：前面的侧栏卡按内容高度，最后一张卡吸收剩余高度，与主列底边对齐。 */
+.settings-side-col.is-fill-last > .settings-telemetry-card { flex: 0 0 auto; }
+.settings-side-col.is-fill-last > .settings-telemetry-card:last-child { flex: 1 1 auto; }
+.settings-side-col.is-fill-last > .settings-telemetry-card:last-child > .telemetry-data-list:last-child { margin-top: auto; }
 .settings-telemetry-card {
     flex: 1 1 auto;
     min-height: min-content;
@@ -419,6 +438,20 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 6px;
+}
+.telemetry-command-group {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 6px;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 650;
+}
+.telemetry-command-group small {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 500;
 }
 .telemetry-command-item {
     display: flex;
@@ -841,7 +874,6 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 .metadata-option-title { display: flex; align-items: center; gap: 2px; min-width: 0; }
 .metadata-nsfw-clean-review .toggle { width: 44px; height: 44px; }
 .metadata-nsfw-clean-review .toggle-slider { inset: 11px 2px; }
-.metadata-nsfw-clean-review input:disabled + .toggle-slider { opacity: .55; cursor: not-allowed; }
 
 .metadata-card-body > :last-child { border-bottom: 0; }
 .metadata-tavily-meta-grid {
@@ -1355,18 +1387,17 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     grid-template-areas:
-        "global global"
-        "model search"
-        "patrol notify";
+        "model model"
+        "search read"
+        "search patrol";
     align-items: stretch;
     gap: 18px 22px;
     padding-top: 18px;
 }
-.agent-settings-card-global { grid-area: global; }
 .agent-settings-card-model { grid-area: model; }
 .agent-settings-card-search { grid-area: search; }
 .agent-settings-card-patrol { grid-area: patrol; }
-.agent-settings-card-notify { grid-area: notify; }
+.agent-settings-card-read { grid-area: read; }
 .agent-settings-card {
     min-width: 0;
     display: flex;
@@ -1510,6 +1541,10 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     gap: 6px;
 }
 .agent-field-wide { grid-column: 1 / -1; }
+/* 模型运行通栏：连接字段三列排布（地址/协议/模型跨两列）。 */
+.agent-settings-fields-model { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.agent-settings-fields-model > .agent-field-wide { grid-column: span 2; }
+.agent-settings-card > .agent-settings-option:last-child { margin-bottom: 18px; }
 .agent-field > span:first-child {
     color: var(--text-primary);
     font-size: 12px;
@@ -1930,7 +1965,6 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     font-size: 10.5px;
     line-height: 1.4;
 }
-.agent-settings-card-notify .agent-settings-boundary { margin-top: 14px; }
 .agent-settings-card .is-managed { opacity: .66; }
 .agent-settings-card .is-managed .toggle-slider { cursor: not-allowed; }
 .settings-panel > .settings-savebar,
@@ -2027,10 +2061,11 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
 @media (max-width: 1280px) {
     .agent-settings-stack {
         grid-template-columns: minmax(0, 1fr);
-        grid-template-areas: "global" "model" "search" "patrol" "notify";
+        grid-template-areas: "model" "search" "read" "patrol";
     }
 }
 @media (max-width: 860px) {
+    .settings-option-grid { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 18px; }
     .settings-network-card .network-config-grid {
         grid-template-columns: 1fr;
         gap: 12px;
@@ -2184,6 +2219,7 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     .agent-settings-fields { grid-template-columns: 1fr; gap: 14px; padding: 14px 16px 0; }
     .agent-settings-card > .agent-settings-fields:last-child { padding-bottom: 18px; }
     .agent-field-wide { grid-column: 1; }
+    .agent-settings-fields-model > .agent-field-wide { grid-column: 1; }
     .agent-settings-boundary { margin: 14px 16px 18px; }
     .agent-settings-option { margin: 14px 16px 0; padding: 12px 14px; min-height: 0; }
     .agent-notify-meta-grid { grid-template-columns: 1fr; gap: 10px; padding: 14px 16px 18px; }
@@ -2313,8 +2349,6 @@ html[data-settings-config="pending"] .settings-page #settingsForm {
     .agent-field > .agent-model-hint[data-tone="testing"]::before { animation: none; }
 }
 
-.agent-settings-card-global .agent-settings-card-head { min-height: 0; }
-.agent-settings-card-global .agent-settings-boundary { margin-top: 14px; }
 
 /* 豆瓣 dbcl2 状态：固定占位，避免异步探测改变设置行高度。 */
 .settings-page .douban-dbcl2-status {

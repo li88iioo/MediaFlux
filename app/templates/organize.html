@@ -23,7 +23,7 @@
         <div class="organize-flow-tabs" role="tablist" aria-label="整理规则分类">
             <button type="button" class="organize-flow-tab active" role="tab" data-tab-target="naming" aria-selected="true"><i data-lucide="scan-search"></i><span>识别与命名</span></button>
             <button type="button" class="organize-flow-tab" role="tab" data-tab-target="policy" aria-selected="false" tabindex="-1"><i data-lucide="layers-3"></i><span>分类与覆盖</span></button>
-            <button type="button" class="organize-flow-tab" role="tab" data-tab-target="delivery" aria-selected="false" tabindex="-1"><i data-lucide="send"></i><span>通知与入库</span></button>
+            <button type="button" class="organize-flow-tab" role="tab" data-tab-target="delivery" aria-selected="false" tabindex="-1"><i data-lucide="send"></i><span>同步与入库</span></button>
         </div>
     </nav>
     {% endif %}
@@ -570,7 +570,7 @@
             </div>
         </section>
 
-        <section class="organize-config-panel" data-tab-panel="delivery" data-panel-step="STEP 04 / DELIVERY CHAIN" data-panel-title="决定整理完成后如何通知、同步与入库" data-panel-description="STRM 统一经过调度器执行；没有实际增量时不会触发媒体库刷新。" hidden>
+        <section class="organize-config-panel" data-tab-panel="delivery" data-panel-step="STEP 04 / DELIVERY CHAIN" data-panel-title="决定整理完成后如何同步与入库" data-panel-description="STRM 统一经过调度器执行；没有实际增量时不会触发媒体库刷新。" hidden>
             <div class="rules-section-card">
                 <div class="rules-section-head">
                     <div class="rules-section-title-row">
@@ -621,58 +621,12 @@
             <div class="rules-section-card">
                 <div class="rules-section-head">
                     <div class="rules-section-title-row">
-                        <div class="section-title">消息通知与下游服务联动</div>
-                        <span class="rules-section-badge">NOTIFICATION &amp; LINKAGE</span>
+                        <div class="section-title">下游服务联动</div>
+                        <span class="rules-section-badge">LINKAGE</span>
                     </div>
-                    <p class="rules-section-desc">STRM 统一经过调度器执行；没有实际增量时不会触发媒体库刷新。</p>
+                    <p class="rules-section-desc">STRM 统一经过调度器执行；没有实际增量时不会触发媒体库刷新。整理与 STRM 的 Telegram 通知请在 <a href="/settings#telegram">设置 → Telegram</a> 中配置。</p>
                 </div>
 
-                <div class="rules-sub-label">消息通知策略</div>
-                <div class="organize-grid-3">
-                    <div class="strm-toggle-card organize-toggle-tile">
-                        <div class="organize-toggle-top">
-                            <div class="organize-toggle-title">
-                                <div class="organize-toggle-icon"><i data-lucide="send"></i></div>
-                                <label for="r_notify">Telegram 通知</label>
-                            </div>
-                            <label class="toggle">
-                                <input type="checkbox" id="r_notify" data-key="GY_ORGANIZE_NOTIFY_ENABLED" data-bool="1" checked>
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-                        <span class="organize-toggle-hint">整理及 STRM 消息推送总开关</span>
-                    </div>
-
-                    <div class="strm-toggle-card organize-toggle-tile" id="libraryNotifyRow">
-                        <div class="organize-toggle-top">
-                            <div class="organize-toggle-title">
-                                <div class="organize-toggle-icon"><i data-lucide="bell"></i></div>
-                                <label for="r_library_notify">整理入库通知</label>
-                            </div>
-                            <label class="toggle">
-                                <input type="checkbox" id="r_library_notify" data-key="GY_ORGANIZE_LIBRARY_NOTIFY" data-bool="1" checked>
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-                        <span class="organize-toggle-hint">控制整理结果、失败和待确认通知；仅需操作与异常时，请在设置中选择精简通知</span>
-                    </div>
-
-                    <div class="strm-toggle-card organize-toggle-tile" id="strmNotifyRow">
-                        <div class="organize-toggle-top">
-                            <div class="organize-toggle-title">
-                                <div class="organize-toggle-icon"><i data-lucide="message-square-text"></i></div>
-                                <label for="r_strm_notify">STRM 明细通知</label>
-                            </div>
-                            <label class="toggle">
-                                <input type="checkbox" id="r_strm_notify" data-key="GY_ORGANIZE_STRM_DETAIL_NOTIFY" data-bool="1" checked>
-                                <span class="toggle-slider"></span>
-                            </label>
-                        </div>
-                        <span class="organize-toggle-hint">详细通知模式下推送 STRM 变动明细，同时受 STRM 页 TG 任务通知开关控制</span>
-                    </div>
-                </div>
-
-                <div class="rules-sub-label">下游服务联动</div>
                 <div class="organize-grid-2">
                     <div class="strm-toggle-card organize-toggle-tile">
                         <div class="organize-toggle-top">

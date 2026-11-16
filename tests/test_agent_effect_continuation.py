@@ -483,7 +483,7 @@ def test_real_outbox_handoff_survives_crash_before_delivery_ack_without_new_mode
             publish_agent_continuation_delivery,
         )
         from app.modules import telegram_notification_center as notifications
-        values = {'AGENT_ENABLED': '1', 'TG_AGENT_ENABLED': '1', 'TG_CHAT_ID': '-100', 'TG_AGENT_ALLOWED_USER_IDS': '7'}
+        values = {'AGENT_LLM_ENABLED': '1', 'TG_AGENT_ENABLED': '1', 'TG_CHAT_ID': '-100', 'TG_AGENT_ALLOWED_USER_IDS': '7'}
         with patch(__name__ + '.OWNER', 'tg:v1:-100\x1f7'), patch.object(notifications, 'wake_telegram_notification_dispatcher', return_value=False):
             async with _ready_case(tmp_path, channel='telegram', route={'chat_id': '-100', 'message_thread_id': 42}, runtime_settings=values) as (store, candidate, client, reads, stack, _users):
                 script = FollowScript(resume=True)

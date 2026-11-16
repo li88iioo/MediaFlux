@@ -317,7 +317,6 @@ def test_native_missing_resources_consumes_saved_owner_profile(preference_db, wh
     service=FakeIndexerService(private_results=False)
     service.search_media=AsyncMock(return_value=_search_result(items=source_items))
     with patch("app.modules.missing_resources.audit_series_episodes",return_value=audit), \
-         patch("app.modules.missing_resources.config.get_bool",return_value=True), \
          patch("app.modules.missing_resources.get_indexer_service",return_value=service):
         for owner,overrides,expected in [("viewer",None,"b"*20),("other",None,"a"*20),
                 ("viewer",{"preferred_resolution":"2160p"},"a"*20),

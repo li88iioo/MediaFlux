@@ -333,7 +333,7 @@ class Diagnostics:
     @staticmethod
     @sdk_method('read')
     def component(component: str) -> dict:
-        """读取一个配置组件的完整状态、字段来源、缺项、校验错误、能力影响和安全下一步。支持jellyfin/emby/tmdb/qbittorrent/strm/ai_recognition/discovery/douban/resource_results/indexer_search。不会修改配置或调用模型。"""
+        """读取一个配置组件的完整状态、字段来源、缺项、校验错误、能力影响和安全下一步。支持jellyfin/emby/tmdb/qbittorrent/strm/ai_recognition/discovery/douban/indexer_search。不会修改配置或调用模型。"""
         from app.modules.diagnostics import component as read
 
         if not _owner().startswith(("webk:v1:", "tg:v1:")):
@@ -658,7 +658,7 @@ class Settings:
     @staticmethod
     @sdk_method('write')
     def set_feature(feature: str, enabled: bool) -> dict:
-        """确认后单项设置功能。feature仅支持discovery/douban/resource_results/indexer_search/web_search/web_read/offline_magnet/offline_ed2k/offline_http/strm_metadata/download_verification_notify，enabled必须为bool。不修改部署覆盖、Agent权限或任意配置；同状态无需确认。使用配置CAS和Web相同reload；保存或刷新结果未知先读取核验，不重放脚本或旧卡。"""
+        """确认后单项设置功能。feature仅支持discovery/douban/indexer_search/web_search/web_read/offline_magnet/offline_ed2k/offline_http/strm_metadata/download_verification_notify，enabled必须为bool。不修改部署覆盖、Agent权限或任意配置；同状态无需确认。使用配置CAS和Web相同reload；保存或刷新结果未知先读取核验，不重放脚本或旧卡。"""
         raise ValueError("功能开关写入须通过工作区的 EffectExecutor 确认执行器调用")
 
 
@@ -1118,12 +1118,10 @@ class Media:
     def search(query: str, page: int = 1, providers: list[str] | None = None, *,
                media_type: str = "", year: str = "", region: str = "", genre: str = "") -> dict:
         """按片名搜索公网作品身份，返回完整当前页items/has_more/providers_attempted/providers_succeeded/errors/status/partial。media_type/year精确过滤本页；region/genre只作查询关键词，不保证硬性筛选。资源版本和磁力检索使用resources.search。"""
-        from app.discovery.search import discovery_provider_names, get_discovery_search_service
-        from app.discovery.service import require_discovery_enabled
+        from app.discovery.search import get_discovery_search_service
 
-        require_discovery_enabled()
         return get_discovery_search_service().search(
-            query, page, discovery_provider_names(providers), media_type=media_type, year=year, region=region, genre=genre,
+            query, page, providers, media_type=media_type, year=year, region=region, genre=genre,
             cancelled=_CALL_CANCELLED.get(),
         ).to_dict()
 
@@ -1131,7 +1129,7 @@ class Media:
     @sdk_method('read')
     def sources() -> dict:
         """catalogs 列出全部可查询的 provider/category/media_types；supports_collection 表示可传 limit 收集推荐。
-        sections 仅为探索首页展示栏目，不是全部查询能力；enabled 表示来源开关。
+        sections 仅为探索首页当前展示的栏目（随页面开关变化），不是全部查询能力。
         """
         from app.discovery.registry import list_catalog_definitions
         from app.discovery.service import get_discovery_service
@@ -1162,9 +1160,8 @@ class Media:
         推荐条目取顶层items，未取完按scope.next_page/next_offset续取。
         Bangumi周历用bangumi/calendar/tv，filters.weekday为1–7，不传取全周；三平台动漫排期用media.calendar。
         """
-        from app.discovery.service import get_discovery_service, require_discovery_enabled
+        from app.discovery.service import get_discovery_service
 
-        require_discovery_enabled()
         if limit is not None:
             from app.services import collect_discovery_recommendations
 
@@ -1189,9 +1186,8 @@ class Media:
         >>> item = media.detail("tmdb", "tv", "12345")["item"]
         >>> seasons = item["seasons"] if item is not None else None
         """
-        from app.discovery.service import get_discovery_service, require_discovery_enabled
+        from app.discovery.service import get_discovery_service
 
-        require_discovery_enabled()
         return {"item": get_discovery_service().describe_media(provider, media_type, external_id)}
 
     @staticmethod
@@ -1215,9 +1211,7 @@ class Media:
         保留VIP/免费事件和来源时间；未知时间不是停更，旧缓存不是刷新。本周外日期无覆盖；Bangumi周历用media.catalog。
         """
         from app.discovery.calendar.service import get_calendar_service
-        from app.discovery.service import require_discovery_enabled
 
-        require_discovery_enabled()
         if type(refresh) is not bool:
             raise ValueError("refresh 必须是布尔值")
         service = get_calendar_service()
@@ -1227,9 +1221,8 @@ class Media:
     @sdk_method('read')
     def resolve(provider: str, external_id: str, media_type: str, title: str, year: str = "") -> dict:
         """只读返回已确认的 TMDB 映射或完整候选；候选含真实 tmdb_id、标题、年份、media_type 和评分，不自动保存。"""
-        from app.discovery.service import get_discovery_service, require_discovery_enabled
+        from app.discovery.service import get_discovery_service
 
-        require_discovery_enabled()
         return get_discovery_service().lookup_tmdb_mapping(
             provider, external_id, media_type, title, year,
         )

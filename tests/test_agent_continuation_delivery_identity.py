@@ -426,7 +426,7 @@ def _process_drain(db_path, secret, pipe):
     """真实子进程执行 outbox；只替换 Telegram I/O 与测试配置来源。"""
     db.configure_database(db_path, test_mode=True)
     values = {"WEB_SECRET_KEY": secret, "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": ROUTE["chat_id"],
-              "TG_AGENT_ALLOWED_USER_IDS": "7", "AGENT_ENABLED": "1"}
+              "TG_AGENT_ALLOWED_USER_IDS": "7", "AGENT_LLM_ENABLED": "1"}
 
     class BlockingBot(NativeBotFixture):
         def send_message(self, *args, **kwargs):

@@ -132,21 +132,18 @@ def initialize_runtime_fence(*, defer_initial_setup: bool = False) -> RuntimeFen
             )
             return fence
 
-AGENT_ENABLED_KEY = "AGENT_ENABLED"
 _runtime_generation_lock = threading.Lock()
 _runtime_admission_lock = threading.RLock()
 _runtime_generation = 0
 
 
 def is_agent_enabled() -> bool:
-    """返回 Agent 是否整体启用。
+    """Media Agent 总开关（AGENT_LLM_ENABLED）：所有 AI 能力共用，默认关闭；子功能只在开启时生效。
 
-    默认关闭；只有显式配置 ``AGENT_ENABLED=1`` 后才启用。
-    既有安装已经保存的开关值不受缺省值调整影响。
-    子功能开关只有在总开关开启时才生效。
+    读取调用方当前的配置快照；逐次模型请求另用 is_agent_llm_enabled 读取最新值。
     """
 
-    return config.get_bool(AGENT_ENABLED_KEY, False)
+    return config.get_bool("AGENT_LLM_ENABLED", False)
 
 
 def is_agent_llm_enabled() -> bool:
@@ -160,7 +157,6 @@ def recognition_review_enabled() -> bool:
     try:
         return bool(
             is_agent_enabled()
-            and config.get_bool("AGENT_LLM_ENABLED", False)
             and config.get_bool("AGENT_RECOGNITION_REVIEW_ENABLED", False)
             and (config.get("AGENT_LLM_API_URL", "") or "").strip()
             and (config.get("AGENT_LLM_MODEL", "") or "").strip()

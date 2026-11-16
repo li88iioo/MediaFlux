@@ -15,7 +15,7 @@ def test_startup_rejects_configuration_mismatch_before_migration(agent_enabled):
     from tests.test_setup_bootstrap_support import initialize_paths
 
     with first_run_case() as case:
-        initialize_paths(case.paths, {'AGENT_ENABLED': agent_enabled})
+        initialize_paths(case.paths, {'AGENT_LLM_ENABLED': agent_enabled})
         case._reload_runtime_modules()
         with case.database.get_conn() as conn:
             conn.execute('PRAGMA user_version=0')

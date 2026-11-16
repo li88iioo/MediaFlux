@@ -440,9 +440,7 @@ with ThreadPoolExecutor(4) as pool:
         client.list_media_identity_inventory.return_value = MediaIdentityInventory(
             candidates=[MediaIdentityCandidate(tmdb_id="77", name="测试剧77", media_type="tv")], total=1,
         )
-        with patch("app.discovery.search.get_discovery_search_service", return_value=search), patch(
-            "app.discovery.service.require_discovery_enabled",
-        ), patch("app.services._configured_media_sources", return_value=[("jellyfin", "Jellyfin", "", client)]):
+        with patch("app.discovery.search.get_discovery_search_service", return_value=search), patch("app.services._configured_media_sources", return_value=[("jellyfin", "Jellyfin", "", client)]):
             result = await self.execute('import json\nfrom mf import media, library\n'
                 'found = media.search("测试剧", providers=["tmdb"], media_type="tv")\n'
                 'checked = library.presence(found["items"])\n'

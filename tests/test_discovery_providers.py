@@ -18,7 +18,6 @@ from app.discovery.models import (
     DiscoveryPage,
     ProviderAuthenticationError,
     ProviderInvalidResponse,
-    ProviderNotConfigured,
     ProviderRateLimited,
     ProviderTimeout,
     ProviderUnavailable,
@@ -545,7 +544,6 @@ class DoubanProviderTests(unittest.TestCase):
         **kwargs,
     ):
         return DoubanProvider(
-            enabled=True,
             api_key=api_key,
             api_secret=api_secret,
             public_client=public_client,
@@ -555,16 +553,6 @@ class DoubanProviderTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_provider_defaults_enabled_and_explicit_zero_disables(self):
-        self.assertTrue(DoubanProvider(config={}, public_client=Mock()).enabled)
-        self.assertFalse(
-            DoubanProvider(
-                config={"DISCOVERY_DOUBAN_ENABLED": "0"},
-                public_client=Mock(),
-            ).enabled
-        )
-        self.assertFalse(DoubanProvider(enabled=0, public_client=Mock()).enabled)
-        self.assertFalse(DoubanProvider(enabled="0", public_client=Mock()).enabled)
 
 
     def test_public_list_success_never_accesses_configured_frodo_keys(self):
@@ -885,19 +873,9 @@ class DoubanProviderTests(unittest.TestCase):
                     self.assertIs(raised.exception, public_error)
                     factory.assert_not_called()
 
-    def test_disabled_and_local_validation_never_touch_either_client(self):
+    def test_local_validation_never_touches_either_client(self):
         public = Mock()
         factory = Mock(side_effect=AssertionError("Frodo must stay lazy"))
-        disabled = DoubanProvider(
-            enabled=False,
-            api_key=self.API_KEY,
-            api_secret=self.API_SECRET,
-            public_client=public,
-            frodo_client_factory=factory,
-        )
-        with self.assertRaises(ProviderNotConfigured):
-            disabled.list_items("movie_hot", "movie", 1, {})
-
         provider = self.make_provider(public, frodo_factory=factory)
         invalid_calls = (
             lambda: provider.list_items("unknown", "movie", 1, {}),
@@ -950,7 +928,6 @@ class DoubanProviderTests(unittest.TestCase):
                 raise AssertionError("Frodo called on public success")
 
         provider = DoubanProvider(
-            enabled=True,
             public_client=public,
             frodo_client=LazyFrodo(),
         )
@@ -970,7 +947,6 @@ class DoubanProviderTests(unittest.TestCase):
             ProviderUnavailable("failure-4"),
         ]
         provider = DoubanProvider(
-            enabled=True,
             api_key="",
             api_secret="",
             public_client=public,
@@ -1004,7 +980,6 @@ class DoubanProviderTests(unittest.TestCase):
         })
         public = DoubanPublicClient(session=session, min_interval=0)
         provider = DoubanProvider(
-            enabled=True,
             api_key="",
             api_secret="",
             public_client=public,
@@ -1029,7 +1004,6 @@ class DoubanProviderTests(unittest.TestCase):
         )
         public = DoubanPublicClient(session=session, min_interval=0)
         provider = DoubanProvider(
-            enabled=True,
             api_key="",
             api_secret="",
             public_client=public,
@@ -1072,25 +1046,6 @@ class DoubanRegistryTests(unittest.TestCase):
             ("douban", "tv_global_weekly", "tv"),
         )
 
-    def test_registry_defaults_enabled_and_explicit_zero_disables_only_douban(self):
-        enabled = list_section_definitions(douban_enabled=True)
-        disabled = list_section_definitions(douban_enabled=0)
-
-        self.assertTrue(all(section["enabled"] for section in enabled))
-        self.assertTrue(
-            all(
-                not section["enabled"]
-                for section in disabled
-                if section["provider"] == "douban"
-            )
-        )
-        self.assertTrue(
-            all(
-                section["enabled"]
-                for section in disabled
-                if section["provider"] != "douban"
-            )
-        )
 
     def test_douban_sort_values_use_public_endpoint_contract(self):
         for media_type in ("movie", "tv"):
@@ -1344,7 +1299,7 @@ class ProviderLifecycleTests(unittest.TestCase):
 
     def test_douban_provider_close_deduplicates_shared_session(self):
         session = FakeSession()
-        provider = DoubanProvider(enabled=True, session=session)
+        provider = DoubanProvider(session=session)
 
         provider.close()
         provider.close()
@@ -1361,7 +1316,6 @@ class ProviderLifecycleTests(unittest.TestCase):
         new_client = Mock(configured=True, session=new_session)
         factory = Mock(side_effect=(old_client, new_client))
         provider = DoubanProvider(
-            enabled=True,
             config=config,
             public_client=object(),
             authenticated_client_factory=factory,
@@ -1391,7 +1345,6 @@ class ProviderLifecycleTests(unittest.TestCase):
         new_client = Mock(configured=True, session=new_session)
         factory = Mock(side_effect=(old_client, new_client))
         provider = DoubanProvider(
-            enabled=True,
             config=config,
             public_client=object(),
             authenticated_client_factory=factory,
@@ -1422,7 +1375,7 @@ class ProviderLifecycleTests(unittest.TestCase):
             ("bangumi", lambda session: BangumiProvider(session=session)),
             (
                 "douban",
-                lambda session: DoubanProvider(enabled=True, session=session),
+                lambda session: DoubanProvider(session=session),
             ),
         )
         for name, factory in cases:

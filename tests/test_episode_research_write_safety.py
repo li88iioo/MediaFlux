@@ -378,7 +378,7 @@ class EpisodeResearchWriteSafetyTests(IsolatedDatabaseTestCase):
                     if fault == "disabled":
                         case.values["AGENT_EPISODE_RESEARCH_ENABLED"] = "0"
                     elif fault == "agent_disabled":
-                        case.values["AGENT_ENABLED"] = "0"
+                        case.values["AGENT_LLM_ENABLED"] = "0"
                     else:
                         case.enterContext(patch.object(
                             type(case.rules), "from_config",

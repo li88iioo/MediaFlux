@@ -79,12 +79,13 @@ def close_poster_session() -> None:
         logger.warning("关闭探索海报 HTTP Session 失败 type=%s", type(exc).__name__)
 
 
-def _require_discovery_enabled() -> None:
+def require_discovery_page_enabled() -> None:
+    """媒体探索开关只控制 Web 探索页与其接口；Agent 查询影视资料不受影响。"""
     if not config.get_bool("DISCOVERY_ENABLED"):
         raise HTTPException(status_code=404, detail="not found")
 
 
-router = APIRouter(dependencies=[Depends(_require_discovery_enabled)])
+router = APIRouter(dependencies=[Depends(require_discovery_page_enabled)])
 _MAX_TOKEN_LENGTH = 2048
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._~!$&'()+,;=:@/-]+$")
 

@@ -153,11 +153,11 @@ class DiscoveryConfigTests(unittest.TestCase):
 
     def test_unrelated_config_save_does_not_shutdown_discovery_service(self):
         response, persist, shutdown = self._save(
-            {"RSS_QB_CATEGORY": "mediaflux"}
+            {"RSS_QB_SAVE_PATH": "/downloads/rss"}
         )
 
         self.assertEqual(response, {"success": True})
-        persist.assert_called_once_with({"RSS_QB_CATEGORY": "mediaflux"})
+        persist.assert_called_once_with({"RSS_QB_SAVE_PATH": "/downloads/rss"})
         shutdown.assert_not_called()
 
     def test_unknown_configuration_key_remains_rejected(self):
@@ -174,7 +174,7 @@ class DiscoveryConfigTests(unittest.TestCase):
             response = get_config(self.request)
         self.assertEqual(response["DISCOVERY_CACHE_TTL_SECONDS"], "21600")
         self.assertEqual(response["DISCOVERY_DOUBAN_ENABLED"], "1")
-        self.assertEqual(response["AGENT_ENABLED"], "0")
+        self.assertEqual(response["AGENT_LLM_ENABLED"], "0")
         self.assertEqual(response["AI_RECOGNITION_REQUESTS_PER_MINUTE"], "6")
         self.assertEqual(response["AI_RECOGNITION_CONFIDENCE_THRESHOLD"], "0.8")
         self.assertEqual(response["TG_NOTIFICATION_LEVEL"], "standard")
@@ -262,7 +262,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         for key in (
             "DISCOVERY_ENABLED",
             "DISCOVERY_DOUBAN_ENABLED",
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
+            "INDEXER_SEARCH_ENABLED",
         ):
             with self.subTest(key=key):
                 response, persist, _shutdown = self._save({key: "sometimes"})
@@ -273,12 +273,12 @@ class DiscoveryConfigTests(unittest.TestCase):
 
     def test_resource_results_switch_is_validated_and_persisted(self):
         response, persist, _shutdown = self._save(
-            {"DISCOVERY_RESOURCE_RESULTS_ENABLED": "false"}
+            {"INDEXER_SEARCH_ENABLED": "false"}
         )
 
         self.assertEqual(response, {"success": True})
         persist.assert_called_once_with(
-            {"DISCOVERY_RESOURCE_RESULTS_ENABLED": "0"}
+            {"INDEXER_SEARCH_ENABLED": "0"}
         )
 
     def test_invalid_or_out_of_range_ttls_are_rejected(self):
@@ -375,13 +375,13 @@ class DiscoveryConfigTests(unittest.TestCase):
 
     def test_indexer_site_selection_is_ordered_deduplicated_and_syncs_sukebei(self):
         response, persist, _shutdown = self._save({
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
+            "INDEXER_SEARCH_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "tpb, nyaa, sukebei, tpb",
         })
 
         self.assertEqual(response, {"success": True})
         persist.assert_called_once_with({
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
+            "INDEXER_SEARCH_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,tpb,sukebei",
             "INDEXER_SUKEBEI_ENABLED": "1",
             "INDEXER_SITE_CONFIG_VERSION": "3",
@@ -392,7 +392,7 @@ class DiscoveryConfigTests(unittest.TestCase):
             with self.subTest(value=value):
                 response, persist, _shutdown = self._save(
                     {
-                        "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
+                        "INDEXER_SEARCH_ENABLED": "1",
                         "INDEXER_ENABLED_SITES": value,
                     },
                 )
@@ -403,13 +403,13 @@ class DiscoveryConfigTests(unittest.TestCase):
 
     def test_indexer_site_selection_clears_legacy_sukebei_toggle(self):
         response, persist, _shutdown = self._save({
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
+            "INDEXER_SEARCH_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,mikan",
         })
 
         self.assertEqual(response, {"success": True})
         persist.assert_called_once_with({
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
+            "INDEXER_SEARCH_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,mikan",
             "INDEXER_SUKEBEI_ENABLED": "0",
             "INDEXER_SITE_CONFIG_VERSION": "3",
@@ -441,7 +441,6 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_CACHE_TTL_SECONDS",
             "DISCOVERY_STALE_TTL_SECONDS",
             "DISCOVERY_DOUBAN_ENABLED",
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
             "INDEXER_SEARCH_ENABLED",
             "INDEXER_ENABLED_SITES",
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS",
@@ -463,7 +462,6 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_CACHE_TTL_SECONDS",
             "DISCOVERY_STALE_TTL_SECONDS",
             "DISCOVERY_DOUBAN_ENABLED",
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
             "INDEXER_SEARCH_ENABLED",
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS",
             "DOUBAN_CACHE_TTL_SECONDS",
@@ -482,7 +480,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         self.assertRegex(
             html,
             re.compile(
-                r'豆瓣公共探索[\s\S]+data-key="DOUBAN_DBCL2"'
+                r'豆瓣数据源[\s\S]+data-key="DOUBAN_DBCL2"'
             ),
         )
         self.assertIn('data-settings-target="discovery"', html)

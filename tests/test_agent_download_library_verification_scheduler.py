@@ -536,7 +536,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         route_env = patch.dict(
             os.environ,
             {
-                "AGENT_ENABLED": "1",
+                "AGENT_LLM_ENABLED": "1",
                 "TG_AGENT_ENABLED": "1",
                 "TG_CHAT_ID": _TG_CHAT_ID,
                 "TG_AGENT_ALLOWED_USER_IDS": "200",

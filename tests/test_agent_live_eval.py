@@ -178,7 +178,6 @@ def native_calendar(cases, monkeypatch):
             return future
         service = CalendarService(providers={"tencent": Week()}, metadata=RawMetadata(), http_factory=NoNetwork,
                                   submit=submit, clock=lambda: datetime(2026, 9, 9, 12))
-        monkeypatch.setattr("app.discovery.service.require_discovery_enabled", lambda: None)
         monkeypatch.setattr("app.discovery.calendar.service.get_calendar_service", lambda: service)
         try:
             case = cases["tencent_week"]

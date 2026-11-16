@@ -140,7 +140,7 @@ async def _handoff(store, candidate):
 @asynccontextmanager
 async def _completed_effect(tmp_path, clock):
     values = {
-        "AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "-100123",
+        "AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "-100123",
         "TG_AGENT_ALLOWED_USER_IDS": "7",
     }
     with patch.object(effect_cases, "OWNER", OWNER), patch.object(effect_cases, "SID", SID), patch.object(

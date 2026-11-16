@@ -111,7 +111,6 @@ class DoubanFallbackBreakerTests(unittest.TestCase):
         public.get_detail.side_effect = ProviderUnavailable("公共接口失败")
         public.list_items.side_effect = ProviderUnavailable("公共接口失败")
         return DoubanProvider(
-            enabled=True,
             public_client=public,
             frodo_client=frodo,
             authenticated_client=authenticated,

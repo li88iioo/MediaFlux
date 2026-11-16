@@ -15,6 +15,7 @@ from starlette.datastructures import URL
 from starlette.requests import Request
 
 from app import config
+from app.bot import handlers as bot_handlers
 from app.repositories import agent_web_search as agent_web_search_repo
 from app.agent.feature_gate import is_agent_enabled
 from app.defaults import (
@@ -70,13 +71,13 @@ class AgentSettingsUiTests(unittest.TestCase):
             side_effect=lambda _key, default=False: default,
         ) as get_bool:
             self.assertFalse(is_agent_enabled())
-        get_bool.assert_called_once_with("AGENT_ENABLED", False)
+        get_bool.assert_called_once_with("AGENT_LLM_ENABLED", False)
 
         from app.routes.api import _UI_DEFAULTS
 
-        self.assertEqual(_UI_DEFAULTS["AGENT_ENABLED"], "0")
+        self.assertEqual(_UI_DEFAULTS["AGENT_LLM_ENABLED"], "0")
         html = (Path("app/templates/settings.html").read_text(encoding="utf-8") + Path("app/static/js/settings.js").read_text(encoding="utf-8"))
-        self.assertNotIn("AGENT_ENABLED:'1'", html)
+        self.assertNotIn("AGENT_LLM_ENABLED:'1'", html)
 
     def test_agent_stream_display_defaults_on_for_legacy_config(self):
         self.assertTrue(DEFAULT_AGENT_STREAM_DISPLAY_ENABLED)
@@ -111,7 +112,12 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertNotIn('data-lucide="message-circle-check"', html)
         self.assertIn('data-settings-target="agent"', html)
         self.assertIn('data-settings-panel="agent"', html)
-        stream_toggle = '<input type="checkbox" data-key="AGENT_STREAM_DISPLAY_ENABLED" data-bool="1"'
+        stream_match = re.search(r'<input\b[^>]*data-key="AGENT_STREAM_DISPLAY_ENABLED"[^>]*>', html)
+        assert stream_match is not None
+        stream_toggle = stream_match.group(0)
+        self.assertIn('type="checkbox"', stream_toggle)
+        self.assertIn('data-bool="1"', stream_toggle)
+        self.assertIn('data-requires="AGENT_LLM_ENABLED"', stream_toggle)
         self.assertEqual(
             Path("app/templates/settings.html")
             .read_text(encoding="utf-8")
@@ -238,8 +244,8 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn('id="testTelegramBtn"', telegram_card)
         self.assertNotIn('id="testTelegramBtn"', telegram_savebar)
         self.assertIn('id="testAgentModelBtn"', agent_panel)
-        self.assertIn("模型运行", agent_panel)
-        self.assertIn("统一 Agent Kernel", agent_panel)
+        self.assertIn("AI 总开关", agent_panel)
+        self.assertEqual(agent_panel.count('data-key="AGENT_LLM_ENABLED"'), 1)
         self.assertIn('min="16384" max="2000000"', agent_panel)
         self.assertNotIn("AGENT_LLM_REQUESTS_PER_MINUTE", agent_panel)
         self.assertNotIn("每用户速率", agent_panel)
@@ -304,8 +310,8 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn("event.key==='Home'", html)
         for label in (
             "启用自动巡检",
-            "发送巡检通知",
-            "发送下载后入库复核通知",
+            "全库缺集巡检通知",
+            "下载入库核验通知",
             "巡检间隔（小时）",
             "单次巡检剧集上限",
             "启用 Tavily 网页搜索",
@@ -418,7 +424,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
     def test_only_real_config_changes_persist_and_advance_agent_runtime(self):
         values = {
-            "AGENT_ENABLED": "1",
+            "AGENT_LLM_ENABLED": "1",
             "AGENT_LLM_MODEL": "old-model",
             "AGENT_LLM_TIMEOUT_SECONDS": "30",
         }
@@ -429,18 +435,18 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.bot.restart_bot"
         ) as restart, patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.agent_runtime.request_agent_runtime_reconcile"
-        ) as reconcile, patch(
-            "app.bot.handlers.request_command_menu_refresh"
+        ) as reconcile, patch.object(
+            bot_handlers, "request_command_menu_refresh"
         ) as refresh_menu, patch(
             "app.agent.feature_gate.invalidate_agent_runtime_generation"
         ) as invalidate, patch(
             "app.agent.kernel.bootstrap.invalidate_agent_kernel_runtime"
         ) as invalidate_kernel:
-            unchanged = save_config(self._request(), {"AGENT_ENABLED": "1"})
+            unchanged = save_config(self._request(), {"AGENT_LLM_ENABLED": "1"})
             changed = save_config(
                 self._request(),
                 {
-                    "AGENT_ENABLED": "1",
+                    "AGENT_LLM_ENABLED": "1",
                     "AGENT_LLM_MODEL": "new-model",
                     "AGENT_LLM_TIMEOUT_SECONDS": "120",
                 },
@@ -570,17 +576,17 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "AGENT_ENABLED" else default),
+            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "AGENT_LLM_ENABLED" else default),
         ), patch("app.routes.api.config.set_and_save"), patch(
             "app.bot.restart_bot"
         ) as restart, patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.agent_runtime.request_agent_runtime_reconcile"
-        ) as reconcile, patch(
-            "app.bot.handlers.request_command_menu_refresh"
+        ) as reconcile, patch.object(
+            bot_handlers, "request_command_menu_refresh"
         ) as refresh_menu, patch(
             "app.agent.feature_gate.invalidate_agent_runtime_generation"
         ) as invalidate:
-            response = save_config(request, {"AGENT_ENABLED": "0"})
+            response = save_config(request, {"AGENT_LLM_ENABLED": "0"})
 
         self.assertEqual(response, {"success": True})
         restart.assert_not_called()
@@ -601,7 +607,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         with patch(
             "app.routes.api.config.get",
-            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "AGENT_ENABLED" else default),
+            side_effect=preserve_web_auth_config(lambda key, default="": "1" if key == "AGENT_LLM_ENABLED" else default),
         ), patch(
             "app.routes.api.config.set_and_save",
             side_effect=lambda _updates: events.append("persist"),
@@ -612,7 +618,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.agent.feature_gate.invalidate_agent_runtime_generation",
             side_effect=lambda: events.append("invalidate") or 1,
         ), patch("app.services.clear_dashboard_cache"):
-            response = save_config(self._request(), {"AGENT_ENABLED": "0"})
+            response = save_config(self._request(), {"AGENT_LLM_ENABLED": "0"})
 
         self.assertEqual(response, {"success": True})
         self.assertEqual(events, ["enter", "persist", "invalidate", "exit"])
@@ -628,8 +634,8 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.bot.restart_bot"
         ) as restart, patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.agent_runtime.request_agent_runtime_reconcile"
-        ) as reconcile, patch(
-            "app.bot.handlers.request_command_menu_refresh"
+        ) as reconcile, patch.object(
+            bot_handlers, "request_command_menu_refresh"
         ) as refresh_menu, patch(
             "app.agent.feature_gate.invalidate_agent_runtime_generation"
         ) as invalidate:
@@ -1311,7 +1317,6 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn("margin: 16px var(--settings-inline-gutter) 0", agent_css)
         self.assertNotIn("width: min(1324px, 100%)", agent_css)
         self.assertNotIn("width: min(1536px, 100%)", agent_css)
-        self.assertIn('grid-template-areas:\n        "global global"\n        "model search"\n        "patrol notify"', agent_css)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", agent_css)
         self.assertIn("border-left: 1px solid var(--border-soft)", agent_css)
         self.assertIn("min-height: 28px", css)

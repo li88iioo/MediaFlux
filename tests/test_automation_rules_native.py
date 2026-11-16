@@ -154,7 +154,7 @@ def test_cancel_scope_revision_route_and_admission_never_overwrite(backend, chan
         elif change == "route":
             config.set_and_save({"TG_CHAT_ID": "999"})
         else:
-            config.set_and_save({"AGENT_ENABLED": "0"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         with pytest.raises(ToolPipelineError):
             await executor().execute_confirmed(plan.plan_id, context=context)
         row = rules.get_rule(agent_job_owner_digest(OWNER), saved["rule_id"])

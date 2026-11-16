@@ -6,7 +6,8 @@ from typing import cast
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+import os
+from unittest.mock import AsyncMock, Mock, patch
 
 from app.discovery.ratings import (
     _rating_from_douban_html,
@@ -55,9 +56,8 @@ def _search_result(
 
 
 class MediaRatingArgumentTests(unittest.TestCase):
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
-    def test_arguments_are_strict_and_normalized(self, source, _enabled):
+    def test_arguments_are_strict_and_normalized(self, source):
         source.return_value.search.return_value = _search_result(_card(title="九門"))
         result = sdk.media.rating("  九門  ", media_type="TV", year=2026, allow_web_fallback=False)
         source.return_value.search.assert_called_once_with("九門", 1, ["douban"])
@@ -105,11 +105,15 @@ class MediaRatingArgumentTests(unittest.TestCase):
 
 
 class MediaRatingExecutionTests(unittest.TestCase):
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
+    def setUp(self):
+        # 回退场景由实际结构化空结果驱动；页面隐藏开关不再阻止共享查询。
+        self.structured = SimpleNamespace(search=Mock(return_value=_search_result()))
+        self.enterContext(patch("app.discovery.ratings.get_discovery_search_service", return_value=self.structured))
+
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.get_discovery_service")
     def test_requested_year_is_verified_even_when_search_already_has_a_rating(
-        self, detail_factory, search_factory, _enabled
+        self, detail_factory, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result(_card(year="", rating=7.4))
         for detail_year, expected in (("2025", False), ("", False), ("2026", True)):
@@ -122,11 +126,10 @@ class MediaRatingExecutionTests(unittest.TestCase):
                     self.assertEqual(result["data"]["year"], "2026")
                     self.assertEqual(result["data"]["source_method"], "douban_detail")
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.search_web")
     def test_same_type_remakes_need_a_year_and_never_fall_back_to_search_order(
-        self, web_search, search_factory, _enabled
+        self, web_search, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result(
             _card(year="2000", external_id="100", rating=7.4),
@@ -139,11 +142,10 @@ class MediaRatingExecutionTests(unittest.TestCase):
         resolved = sdk.media.rating("九门", media_type="tv", year="2026", allow_web_fallback=False)
         self.assertEqual(resolved["data"]["rating"], 8.4)
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.get_discovery_service")
     def test_detail_does_not_replace_the_requested_identity_or_year(
-        self, detail_factory, search_factory, _enabled
+        self, detail_factory, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result(_card(rating=None))
         for detail in (_card(year="2025"), _card(external_id="other"), _card(media_type="movie")):
@@ -155,25 +157,19 @@ class MediaRatingExecutionTests(unittest.TestCase):
                 self.assertEqual(result["evidence"][-1]["status"], "identity_mismatch")
 
     def test_failed_web_search_keeps_source_status_instead_of_reporting_not_found(self):
-        for structured in (False, True):
-            for failure in ("timeout", "authentication", "budget_exhausted"):
-                with self.subTest(structured=structured, failure=failure), patch(
-                    "app.discovery.ratings.config.get_bool", return_value=structured
-                ), patch("app.discovery.ratings.get_discovery_search_service") as source, patch(
-                    "app.discovery.ratings.search_web", return_value=make_result(False, failure, "搜索未完成")
-                ):
-                    source.return_value.search.return_value = _search_result()
-                    result = sdk.media.rating("九门", media_type="tv", year="2026")
-                self.assertEqual(result["status"], "unavailable")
-                self.assertEqual(result["error"], "rating_unavailable")
-                self.assertEqual(result["evidence"][-1]["source"], "web_search")
-                self.assertEqual(result["evidence"][-1]["status"], failure)
-                self.assertFalse(result["evidence"][-1]["ok"])
+        for failure in ("timeout", "authentication", "budget_exhausted"):
+            with self.subTest(failure=failure), patch("app.discovery.ratings.search_web", return_value=make_result(False, failure, "搜索未完成")):
+                result = sdk.media.rating("九门", media_type="tv", year="2026")
+            self.assertEqual(result["status"], "unavailable")
+            self.assertEqual(result["error"], "rating_unavailable")
+            self.assertEqual(result["evidence"][-1]["source"], "web_search")
+            self.assertEqual(result["evidence"][-1]["status"], failure)
+            self.assertFalse(result["evidence"][-1]["ok"])
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=False)
+    @patch.dict(os.environ, {"DISCOVERY_DOUBAN_ENABLED": "0"})
     @patch("app.discovery.ratings.search_web")
     @patch("app.discovery.ratings.FixedHostHttpClient")
-    def test_page_fetch_failure_and_empty_page_remain_distinct(self, client_factory, web_search, _disabled):
+    def test_page_fetch_failure_and_empty_page_remain_distinct(self, client_factory, web_search):
         web_search.return_value = make_result(True, "ok", "网页结果", data={"results": [{
             "title": "九门 (豆瓣)", "url": "https://movie.douban.com/subject/12345678/",
             "snippet": "九门 电视剧 2026 剧情简介",
@@ -199,10 +195,9 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(sum(item["source"] == "web_fetch" and item["ok"] is False for item in result["evidence"]), 2)
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.search_web")
-    def test_successful_web_fallback_keeps_failed_structured_source_evidence(self, web_search, source, _enabled):
+    def test_successful_web_fallback_keeps_failed_structured_source_evidence(self, web_search, source):
         source.return_value.search.return_value = _search_result(errors=({"code": "timeout"},), succeeded=())
         web_search.return_value = make_result(True, "ok", "网页结果", data={"results": [{
             "title": "九门 (豆瓣)", "url": "https://movie.douban.com/subject/12345678/",
@@ -222,9 +217,8 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertEqual(result["evidence"][2]["status"], "timeout")
         self.assertFalse(result["evidence"][2]["ok"])
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=False)
     @patch("app.discovery.ratings.search_web")
-    def test_web_fallback_does_not_guess_between_same_title_subjects(self, web_search, _disabled):
+    def test_web_fallback_does_not_guess_between_same_title_subjects(self, web_search):
         web_search.return_value = make_result(True, "ok", "网页结果", data={"results": [
             {"title": "九门 (豆瓣)", "url": f"https://movie.douban.com/subject/{identity}/",
              "snippet": f"九门 电视剧 {year} 豆瓣评分 {score}"}
@@ -235,32 +229,27 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertIsNone(result["data"]["rating"])
 
     def test_failure_evidence_only_describes_attempted_sources(self):
-        for structured in (False, True):
-            for fallback in (False, True):
-                with self.subTest(structured=structured, fallback=fallback), patch(
-                    "app.discovery.ratings.config.get_bool", return_value=structured
-                ), patch("app.discovery.ratings.get_discovery_search_service") as source, patch(
-                    "app.discovery.ratings.search_web", return_value=make_result(True, "empty", "网页结果为空", data={"results": []})
-                ) as web:
-                    source.return_value.search.return_value = _search_result(
-                        errors=({"provider": "douban", "code": "unavailable"},), succeeded=()
-                    )
-                    result = sdk.media.rating(**{"query": "九门", "media_type": "tv", "allow_web_fallback": fallback})
-                self.assertFalse(result["ok"])
-                self.assertEqual(source.called, structured)
-                self.assertEqual(web.called, fallback)
-                self.assertEqual(result["data"]["web_fallback_used"], fallback)
-                evidence = " ".join(item["description"] for item in result["evidence"])
-                self.assertIn("网页补查未取得" if fallback else "未进行网页补查", result["summary"])
-                self.assertIn("已尝试豆瓣结构化查询" if structured else "结构化查询未启用", evidence)
-                self.assertIn("已尝试网页补查" if fallback else "未进行网页补查", evidence)
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback), patch.dict(os.environ, {"DISCOVERY_DOUBAN_ENABLED": "0", "DISCOVERY_ENABLED": "0"}), patch(
+                "app.discovery.ratings.search_web", return_value=make_result(True, "empty", "网页结果为空", data={"results": []})
+            ) as web:
+                self.structured.search.reset_mock()
+                self.structured.search.return_value = _search_result(errors=({"provider": "douban", "code": "unavailable"},), succeeded=())
+                result = sdk.media.rating("九门", media_type="tv", allow_web_fallback=fallback)
+            self.assertFalse(result["ok"])
+            self.structured.search.assert_called_once_with("九门", 1, ["douban"])
+            self.assertEqual(web.called, fallback)
+            self.assertEqual(result["data"]["web_fallback_used"], fallback)
+            evidence = " ".join(item["description"] for item in result["evidence"])
+            self.assertIn("网页补查未取得" if fallback else "未进行网页补查", result["summary"])
+            self.assertIn("已尝试豆瓣结构化查询", evidence)
+            self.assertIn("已尝试网页补查" if fallback else "未进行网页补查", evidence)
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.get_discovery_service")
     @patch("app.discovery.ratings.search_web")
     def test_structured_search_rating_wins_without_detail_or_web(
-        self, web_search, detail_factory, search_factory, _enabled
+        self, web_search, detail_factory, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result(
             _card(rating=8.1)
@@ -275,12 +264,11 @@ class MediaRatingExecutionTests(unittest.TestCase):
         detail_factory.assert_not_called()
         web_search.assert_not_called()
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.get_discovery_service")
     @patch("app.discovery.ratings.search_web")
     def test_detail_supplies_rating_when_search_card_has_none(
-        self, web_search, detail_factory, search_factory, _enabled
+        self, web_search, detail_factory, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result(
             _card(rating=None)
@@ -296,10 +284,9 @@ class MediaRatingExecutionTests(unittest.TestCase):
         )
         web_search.assert_not_called()
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=False)
     @patch("app.discovery.ratings.search_web")
     def test_controlled_web_fallback_accepts_only_verified_douban_subject(
-        self, web_search, _disabled
+        self, web_search
     ):
         web_search.return_value = make_result(
             True,
@@ -342,11 +329,10 @@ class MediaRatingExecutionTests(unittest.TestCase):
             )
         )
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=False)
     @patch("app.discovery.ratings._fetch_douban_rating_async", new_callable=AsyncMock, return_value=7.9)
     @patch("app.discovery.ratings.search_web")
     def test_web_fallback_fetches_verified_subject_when_snippet_has_no_score(
-        self, web_search, fetch_rating, _disabled
+        self, web_search, fetch_rating
     ):
         web_search.return_value = make_result(
             True,
@@ -374,10 +360,9 @@ class MediaRatingExecutionTests(unittest.TestCase):
             media_type="tv",
         )
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=False)
     @patch("app.discovery.ratings._fetch_douban_rating_async", new_callable=AsyncMock, return_value=None)
     @patch("app.discovery.ratings.search_web")
-    def test_web_fallback_rejects_wrong_host_path_year_and_media_type(self, web_search, _fetch, _disabled):
+    def test_web_fallback_rejects_wrong_host_path_year_and_media_type(self, web_search, _fetch):
         web_search.return_value = make_result(
             True,
             "success",
@@ -410,11 +395,10 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertFalse(sdk.media.rating(query="九门", media_type="tv", year="2026")["ok"])
         self.assertFalse(sdk.media.rating(query="九门", media_type="", year="2026")["ok"])
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.search_web")
     def test_successful_empty_provider_is_not_reported_as_unavailable(
-        self, web_search, search_factory, _enabled
+        self, web_search, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result()
         result = sdk.media.rating(**
@@ -429,11 +413,10 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertFalse(result["data"]["web_fallback_used"])
         web_search.assert_not_called()
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=True)
     @patch("app.discovery.ratings.get_discovery_search_service")
     @patch("app.discovery.ratings.search_web")
     def test_total_provider_failure_is_unavailable_without_optional_fallback(
-        self, web_search, search_factory, _enabled
+        self, web_search, search_factory
     ):
         search_factory.return_value.search.return_value = _search_result(
             errors=({"provider": "douban", "code": "timeout"},), succeeded=()
@@ -449,10 +432,9 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         web_search.assert_not_called()
 
-    @patch("app.discovery.ratings.config.get_bool", return_value=False)
     @patch("app.discovery.ratings.search_web")
     def test_unknown_media_type_requires_clarification_and_skips_web(
-        self, web_search, _disabled
+        self, web_search
     ):
         result = sdk.media.rating(**{"query": "九门"})
         self.assertFalse(result["ok"])

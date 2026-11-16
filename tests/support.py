@@ -25,10 +25,11 @@ _TEST_DATABASE_LOCK = threading.RLock()
 
 @pytest.fixture
 def agent_llm_enabled(monkeypatch):
-    """真实 adapter 的离线协议测试显式启用；开关行为测试自行发布配置。"""
+    """显式开启“模型运行”：逐请求读取与普通配置读取都看到开启；开关行为测试自行发布配置。"""
     from app import config
 
     monkeypatch.setitem(config._SYSTEM_ENV_SNAPSHOT, "AGENT_LLM_ENABLED", "1")
+    monkeypatch.setenv("AGENT_LLM_ENABLED", "1")
 
 
 def authenticated_session(**extra: Any) -> dict[str, Any]:
@@ -249,7 +250,7 @@ def initialized_web_runtime(paths=None):
                 os.environ.pop(key, None)
             os.environ["MEDIAFLUX_TEST_MODE"] = "0"
             os.environ.pop("MEDIAFLUX_TEST_DB_PATH", None)
-            settings = dict(credentials, ENV_WEB_PASSWORD="fixture-install-password", AGENT_ENABLED="1")
+            settings = dict(credentials, ENV_WEB_PASSWORD="fixture-install-password", AGENT_LLM_ENABLED="1")
             initialize_paths(paths, settings)
             first_run._reset_startup_state_for_tests()
             # Preserve legacy login credentials using the real controlled

@@ -1591,7 +1591,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         from jinja2 import Environment, FileSystemLoader
         templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         html = templates.get_template("discovery.html").render(
-            active="discovery", resource_results_enabled=details is None,
+            active="discovery", resource_results_enabled=details is None, douban_enabled=True,
             csrf_token=lambda: "test",
             url_for=lambda name: "/" + name.split(".")[-1],
             static_url=lambda path: "/static/" + path,

@@ -162,6 +162,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
                 "app.modules.web_evidence.get",
                 side_effect=_config({"WEB_SEARCH_ENABLED": "0"}),
             ),
+            patch("app.config.get", side_effect=_config({"WEB_SEARCH_ENABLED": "0"})),
             patch("app.modules.web_evidence._search_tavily") as provider,
         ):
             self.assertEqual(search_web(**{"query": "x"})['status'], "disabled")
@@ -171,6 +172,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
                 "app.modules.web_evidence.get",
                 side_effect=_config({"WEB_SEARCH_ENABLED": "1", "TAVILY_API_KEY": ""}),
             ),
+            patch("app.config.get", side_effect=_config({"WEB_SEARCH_ENABLED": "1", "TAVILY_API_KEY": ""})),
             patch("app.modules.web_evidence._search_tavily") as provider,
         ):
             self.assertEqual(search_web(**{"query": "x"})['status'], "configuration_missing")

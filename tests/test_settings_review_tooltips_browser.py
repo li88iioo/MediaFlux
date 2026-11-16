@@ -180,7 +180,7 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
 
     def ready(self, config, width=390):
         page, errors = self._page(width, {
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1", "INDEXER_SEARCH_ENABLED": "1", **config,
+            "INDEXER_SEARCH_ENABLED": "1", **config,
         })
         fixture.NsfwCleanReviewSettingsBrowserTests._resolve_config(page)
         page.locator('[data-settings-target="discovery"]').click()
@@ -267,11 +267,11 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
                 else:
                     assert expect is not None
                     expect(site_toggle).not_to_be_checked()
-                for key in ('INDEXER_SEARCH_ENABLED', 'DISCOVERY_RESOURCE_RESULTS_ENABLED'):
+                for key in ('INDEXER_SEARCH_ENABLED',):
                     toggle = page.locator(f'[data-key="{key}"]')
                     toggle.locator('..').click()
                     assert expect is not None
-                    expect(site_toggle).to_be_disabled()
+                    expect(site_toggle).to_be_enabled()
                     self.assertEqual(self.selected(page), [site for site in sites.split(',') if site])
                     toggle.locator('..').click()
                     expect(site_toggle).to_be_enabled()

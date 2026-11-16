@@ -38,6 +38,7 @@ from app.clients.openai_compatible import (
     resolve_protocol,
 )
 from app.clients.tmdb import TMDBClient, close_tmdb_client
+from app.agent.feature_gate import is_agent_llm_enabled
 from app.config import get, get_bool, get_int_setting
 from app.defaults import AI_RECOGNITION_CONFIDENCE_BOUNDS
 from app.discovery.models import (
@@ -6754,7 +6755,7 @@ class TMDBScraper:
         media_type_hint: str = "",
     ) -> RecognitionResult:
         """未知发布组仅在 AI 高置信 + 去前缀后 TMDB 严格命中时即时采用。"""
-        if not get_bool("AI_RECOGNITION_ENABLED"):
+        if not get_bool("AI_RECOGNITION_ENABLED") or not is_agent_llm_enabled():
             return deterministic
         if deterministic.status not in {"no_result", "low_confidence"}:
             return deterministic
@@ -7292,10 +7293,11 @@ class TMDBScraper:
         *,
         source_anchors: list[str] | None = None,
     ) -> RecognitionResult:
-        if not get_bool("AI_RECOGNITION_ENABLED"):
+        if not get_bool("AI_RECOGNITION_ENABLED") or not is_agent_llm_enabled():
+            # “模型运行”是所有模型调用的总闸，关闭时整理不再调用模型。
             deterministic.ai_diagnostic = {
                 "attempted": False,
-                "reason": "disabled",
+                "reason": "disabled" if not get_bool("AI_RECOGNITION_ENABLED") else "model_disabled",
             }
             return deterministic
         if deterministic.status not in {"no_result", "low_confidence"}:

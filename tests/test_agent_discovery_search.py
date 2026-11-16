@@ -12,7 +12,7 @@ import pytest
 
 from app import sdk
 from app.clients.tmdb import TMDBClient
-from app.discovery.models import MediaCard, ProviderTimeout
+from app.discovery.models import DiscoveryPage, MediaCard, ProviderTimeout
 from app.discovery.providers.tmdb import TMDBProvider
 from app.discovery.search import DiscoverySearchService, TMDBSearchProvider
 from app.discovery.service import DiscoveryService
@@ -50,19 +50,43 @@ def test_search_rejects_invalid_constraints_before_provider(enabled, arguments):
         service.shutdown()
 
 
-@pytest.mark.parametrize("call,getter", [
-    (lambda: sdk.media.search("x"), "app.discovery.search.get_discovery_search_service"),
-    (lambda: sdk.media.detail("tmdb", "tv", "1"), "app.discovery.service.get_discovery_service"),
-    (lambda: sdk.media.catalog("tmdb", "discover", "movie"), "app.discovery.service.get_discovery_service"),
-    (lambda: sdk.media.catalog("tmdb", "discover", "movie", limit=2), "app.discovery.service.get_discovery_service"),
-    (lambda: sdk.media.catalog("bangumi", "calendar", "tv"), "app.discovery.service.get_discovery_service"),
-    (lambda: sdk.media.calendar(), "app.discovery.calendar.service.get_calendar_service"),
+@pytest.mark.parametrize("method,args,kwargs", [
+    ("search", ("x",), {}),
+    ("detail", ("tmdb", "tv", "1"), {}),
+    ("catalog", ("tmdb", "discover", "movie"), {}),
+    ("catalog", ("tmdb", "discover", "movie"), {"limit": 2}),
+    ("catalog", ("bangumi", "calendar", "tv"), {}),
+    ("calendar", (), {}),
 ])
-def test_disabled_metadata_never_constructs_service(monkeypatch, call, getter):
+def test_hidden_discovery_page_keeps_shared_metadata_queries_available(monkeypatch, method, args, kwargs):
     monkeypatch.setenv("DISCOVERY_ENABLED", "0")
-    with patch(getter) as factory, pytest.raises(ValueError, match="关闭"):
-        call()
-    factory.assert_not_called()
+    provider = SimpleNamespace(search=Mock(return_value=([card()], False)))
+    search = DiscoverySearchService(providers={"tmdb": provider})
+    metadata = Mock(spec=DiscoveryService)
+    expected = card(provider="bangumi" if args and args[0] == "bangumi" else "tmdb")
+    metadata.list_items.return_value = DiscoveryPage(items=(expected,))
+    metadata.describe_media.return_value = expected.to_dict()
+    calendar = SimpleNamespace(providers={"tencent": object()}, get_week=Mock(return_value={"days": [{"items": [{"title": "影片"}]}]}))
+    try:
+        with patch("app.discovery.search.get_discovery_search_service", return_value=search), patch(
+            "app.discovery.service.get_discovery_service", return_value=metadata
+        ), patch("app.discovery.calendar.service.get_calendar_service", return_value=calendar):
+            result = getattr(sdk.media, method)(*args, **kwargs)
+        if method == "detail":
+            assert result["item"] == expected.to_dict()
+            metadata.describe_media.assert_called_once_with(*args)
+        elif method == "calendar":
+            assert result["days"][0]["items"][0]["title"] == "影片"
+            calendar.get_week.assert_called_once_with(force=False, wait_sources=("tencent",), cancelled=None)
+        else:
+            assert [item["external_id"] for item in result["items"]] == ["1"]
+            if method == "search":
+                provider.search.assert_called_once_with("x", 1)
+            else:
+                assert metadata.list_items.call_count == 1
+                assert metadata.list_items.call_args.args[:3] == args
+    finally:
+        search.shutdown()
 
 
 @pytest.mark.parametrize("arguments,query,ids", [

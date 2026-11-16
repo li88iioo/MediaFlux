@@ -465,7 +465,7 @@ def test_security_or_cancelled_ticket_never_starts_reobservation(agent_llm_enabl
         elif boundary == "permission_revoked":
             config.set_and_save({"TG_AGENT_ALLOWED_USER_IDS": "99999"})
         else:
-            config.set_and_save({"AGENT_ENABLED": "0"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         before = await case.state()
         events, state = await case.confirm(old, owner=owner)
         case.assert_counts(reads=1, prepares=1, attempts=0, mutations=0, models=2)

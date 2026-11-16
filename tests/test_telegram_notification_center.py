@@ -77,7 +77,7 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         chat_id: str = "100",
     ):
         values = {
-            "AGENT_ENABLED": "1" if agent_enabled else "0",
+            "AGENT_LLM_ENABLED": "1" if agent_enabled else "0",
             "TG_AGENT_ENABLED": "1" if telegram_enabled else "0",
             "TG_NOTIFICATION_ENABLED": "1" if notifications_enabled else "0",
             "TG_CHAT_ID": chat_id,

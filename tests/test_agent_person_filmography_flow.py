@@ -26,7 +26,6 @@ def test_filmography_identities_feed_one_native_inventory_read(extra):
         candidates=[MediaIdentityCandidate(tmdb_id="157336", name="星际穿越", year="2014", media_type="movie")], total=1,
     )
     with (
-        patch("app.discovery.people.config.get_bool", return_value=True),
         patch("app.discovery.people.TMDBClient", return_value=tmdb),
         patch("app.services._configured_media_sources", return_value=[("jellyfin", "Jellyfin", "", client)]),
     ):

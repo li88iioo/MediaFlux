@@ -107,7 +107,7 @@ class TelegramIndexerWorkerTests(unittest.TestCase):
         worker = TelegramIndexerWorker()
         service = Mock()
         service.search_media = AsyncMock(
-            return_value=AggregatedIndexerResult("Frieren", 1, [], (), (), [], False, False, False)
+            return_value=AggregatedIndexerResult(query="Frieren", page=1, items=[], sites_attempted=(), sites_succeeded=())
         )
         def call(factory, **_):
             return asyncio.run(factory(service))

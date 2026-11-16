@@ -160,12 +160,11 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                 normalize_site_selection(**cast(Any, arguments))
 
     def test_settings_route_keeps_legacy_string_input_contract(self):
-        discovery = {"DISCOVERY_RESOURCE_RESULTS_ENABLED": "0"}
         for value, expected in ((None, ""), (0, ""), (False, ""), ("tpb,nyaa,tpb", "nyaa,tpb")):
-            updates = _validate_indexer_updates({"INDEXER_ENABLED_SITES": value}, discovery)
+            updates = _validate_indexer_updates({"INDEXER_SEARCH_ENABLED": "0", "INDEXER_ENABLED_SITES": value})
             self.assertEqual(updates["INDEXER_ENABLED_SITES"], expected)
         with self.assertRaises(ValueError):
-            _validate_indexer_updates({"INDEXER_ENABLED_SITES": ["nyaa", "tpb"]}, discovery)
+            _validate_indexer_updates({"INDEXER_SEARCH_ENABLED": "0", "INDEXER_ENABLED_SITES": ["nyaa", "tpb"]})
 
     def test_registry_exposes_read_and_confirmation_gated_write(self):
         registry = build_tool_registry()
@@ -233,7 +232,7 @@ class SiteConfigurationWriteTests(unittest.TestCase):
         self.root = paths.data_dir.parent
         self.env = paths.env_file
         config.update_runtime_env_file(self.env, {"INDEXER_ENABLED_SITES": "nyaa", "INDEXER_SUKEBEI_ENABLED": "0",
-            "INDEXER_SEARCH_ENABLED": "1", "AGENT_ENABLED": "1", "UNCHANGED_SETTING": "keep-me"}, expected=config.read_env_snapshot(self.env)[0])
+            "INDEXER_SEARCH_ENABLED": "1", "AGENT_LLM_ENABLED": "1", "UNCHANGED_SETTING": "keep-me"}, expected=config.read_env_snapshot(self.env)[0])
         self.refresh = self.enterContext(patch("app.indexers.runtime.refresh_indexer_configuration",
             return_value={"web": True, "telegram": False}))
 

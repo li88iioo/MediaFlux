@@ -321,7 +321,7 @@ def test_runtime_and_authority_are_rechecked_before_mapping_write(backend, chang
             config.set_and_save({"DISCOVERY_ENABLED": "0"})
             config.set_and_save({"DISCOVERY_ENABLED": "1"})
         else:
-            config.set_and_save({"AGENT_ENABLED": "0"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         with pytest.raises(ToolPipelineError) as error:
             await effects.execute_confirmed(plan.plan_id, context=context)
         assert error.value.code == ("confirmation_stale" if change == "config_aba" else "agent_disabled")
@@ -410,6 +410,7 @@ def test_unknown_result_is_never_replayed(backend):
 
 @pytest.mark.parametrize("provider,media_type", [("douban", "tv"), ("bangumi", "tv"), ("tmdb", "movie")])
 def test_real_source_provider_and_media_type_are_preserved(backend, provider, media_type):
+    config.set_and_save({"DISCOVERY_ENABLED": "0"})
     async def exercise():
         store = SQLiteKernelStore()
         context = await context_for(store, owner=OWNER)
@@ -430,7 +431,7 @@ def test_real_source_provider_and_media_type_are_preserved(backend, provider, me
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("failure", ["source_mismatch", "missing_source", "target_mismatch", "tmdb_source_mismatch", "disabled"])
+@pytest.mark.parametrize("failure", ["source_mismatch", "missing_source", "target_mismatch", "tmdb_source_mismatch", "agent_disabled"])
 def test_unverifiable_mapping_never_creates_a_live_plan(backend, failure):
     async def exercise():
         store = SQLiteKernelStore()
@@ -445,10 +446,10 @@ def test_unverifiable_mapping_never_creates_a_live_plan(backend, failure):
         elif failure == "tmdb_source_mismatch":
             arguments = {**ARGS, "provider": "tmdb"}
         else:
-            config.set_and_save({"DISCOVERY_ENABLED": "0"})
+            config.set_and_save({"AGENT_LLM_ENABLED": "0"})
         with pytest.raises(ToolPipelineError) as error:
             await effects.prepare("media.confirm_mapping", arguments, context=context)
-        assert error.value.code == ("not_found" if failure == "missing_source" else "disabled" if failure == "disabled" else "precondition_failed")
+        assert error.value.code == ("not_found" if failure == "missing_source" else "agent_disabled" if failure == "agent_disabled" else "precondition_failed")
         assert await effects.get_pending_plan(owner=OWNER, session_id=context.session_id) is None
         assert discovery_repo.get_media_external_id("douban", "101", "movie") is None
     asyncio.run(exercise())

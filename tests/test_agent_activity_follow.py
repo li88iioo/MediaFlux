@@ -47,7 +47,7 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
         from app.notifier import TelegramSendResult
         owner = 'tg:v1:123\x1f456'
         context = ToolContext(owner=owner, session_id='topic-77', request_id='follow-topic', delivery_route={'chat_id': '123', 'message_thread_id': 77})
-        values = {'AGENT_ENABLED': '1', 'TG_AGENT_ENABLED': '1', 'TG_AGENT_ALLOWED_USER_IDS': '456', 'TG_NOTIFICATION_ENABLED': '1', 'TG_NOTIFICATION_LEVEL': 'standard'}
+        values = {'AGENT_LLM_ENABLED': '1', 'TG_AGENT_ENABLED': '1', 'TG_AGENT_ALLOWED_USER_IDS': '456', 'TG_NOTIFICATION_ENABLED': '1', 'TG_NOTIFICATION_LEVEL': 'standard'}
         current_get = config.get
         with patch.object(config, 'get', side_effect=lambda key, default='': values.get(key, current_get(key, default))), patch('app.modules.telegram_notification_center.send_event_result', side_effect=[TelegramSendResult(ok=False, status_code=429, retry_after_seconds=1), TelegramSendResult(ok=True, message_id=1234)]) as send:
             token = prepare_follow(**self.arguments, owner=context.owner, delivery_route=context.delivery_route)['snapshot']

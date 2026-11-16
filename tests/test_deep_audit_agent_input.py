@@ -21,7 +21,7 @@ from app.bot.agent_adapter import (
 @pytest.mark.parametrize("separator", [",", ";", "，", "；", " ", "\n", "\t"])
 def test_normal_telegram_entry_and_kernel_share_allowed_user_syntax(separator):
     values = {
-        "AGENT_ENABLED": "1",
+        "AGENT_LLM_ENABLED": "1",
         "TG_AGENT_ENABLED": "1",
         "TG_CHAT_ID": "-100123",
         "TG_AGENT_ALLOWED_USER_IDS": f"123{separator}456",
@@ -57,7 +57,7 @@ def test_normal_telegram_entry_and_kernel_share_allowed_user_syntax(separator):
 
 def test_history_telegram_route_revalidates_revoked_user_without_cached_allow():
     values = {
-        "AGENT_ENABLED": "1",
+        "AGENT_LLM_ENABLED": "1",
         "TG_AGENT_ENABLED": "1",
         "TG_CHAT_ID": "-100123",
         "TG_AGENT_ALLOWED_USER_IDS": "123，456",

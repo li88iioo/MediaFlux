@@ -955,7 +955,7 @@ def test_native_stop_revokes_delivery_approval_then_tg_sends_buttonless_facts(ag
     from tests.test_agent_continuation_telegram import OWNER, ROUTE, NativeBotFixture
 
     async def run():
-        values = {"AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "7"}
+        values = {"AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "7"}
         with patch.object(cases, "OWNER", OWNER):
             async with cases._ready_case(tmp_path, channel="telegram", route=ROUTE, runtime_settings=values) as (store, candidate, client, reads, stack, _users):
                 session = cases._session(store, cases.NextWriteScript(), client, reads, stack=stack)

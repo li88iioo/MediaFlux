@@ -633,7 +633,6 @@
     function updateDependencies(){
         syncNsfwPanel();
         const keepMulti=bool('r_keep_multi');document.getElementById('r_keep_remux').disabled=!keepMulti;
-        const notify=bool('r_notify');document.getElementById('r_library_notify').disabled=!notify;document.getElementById('r_strm_notify').disabled=!notify||!bool('r_strm');
         document.getElementById('r_emby').disabled=!bool('r_strm');
         const scheduleEnabled=bool('r_schedule_enabled');document.getElementById('r_schedule_cron').disabled=!scheduleEnabled;
         const cronRow=document.getElementById('organizeCronRow');if(cronRow){cronRow.style.display=scheduleEnabled?'grid':'none';}
@@ -955,7 +954,7 @@
     document.getElementById('tmdbRegexRuleForm').addEventListener('submit',saveRegexRule);
     document.getElementById('tmdbRegexMediaType').addEventListener('change',syncRegexSeasonField);
     document.querySelectorAll('.cron-preset-btn').forEach(btn=>{btn.addEventListener('click',()=>{const cronInput=document.getElementById('r_schedule_cron');if(cronInput){cronInput.value=btn.dataset.cron;cronInput.dispatchEvent(new Event('input',{bubbles:true}));}});});
-    ['r_keep_multi','r_notify','r_strm','r_schedule_enabled'].forEach(id=>document.getElementById(id).addEventListener('change',updateDependencies));
+    ['r_keep_multi','r_strm','r_schedule_enabled'].forEach(id=>document.getElementById(id).addEventListener('change',updateDependencies));
     document.getElementById('r_nsfw').addEventListener('change',()=>{updateDependencies();syncNsfwPanel({collapseWhenDisabled:true,focusEndpoint:bool('r_nsfw')});});
     document.getElementById('nsfwProviderDisclosure').addEventListener('click',()=>setNsfwPanelExpanded(document.getElementById('nsfwProviderBody').hidden));
 

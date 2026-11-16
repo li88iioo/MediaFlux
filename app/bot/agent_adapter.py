@@ -1471,8 +1471,8 @@ def _apply_agent_control_action(action_name: str) -> str:
     if action_name == "enable_telegram" and not is_agent_enabled():
         raise ValueError("请先开启 Media Agent 全局开关")
     actions = {
-        "enable_all": ({"AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1"}, "Media Agent 已开启"),
-        "disable_all": ({"AGENT_ENABLED": "0", "TG_AGENT_ENABLED": "0"}, "Media Agent 已关闭"),
+        "enable_all": ({"AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "1"}, "Media Agent 已开启"),
+        "disable_all": ({"AGENT_LLM_ENABLED": "0", "TG_AGENT_ENABLED": "0"}, "Media Agent 已关闭"),
         "enable_telegram": ({"TG_AGENT_ENABLED": "1"}, "Telegram Agent 已开启"),
         "disable_telegram": ({"TG_AGENT_ENABLED": "0"}, "Telegram Agent 已关闭"),
     }

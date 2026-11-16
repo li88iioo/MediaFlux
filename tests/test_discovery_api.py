@@ -331,7 +331,7 @@ class DiscoveryAPITests(_BaseClientTests):
         self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("禁止真实外联")))
 
         def service():
-            provider = DoubanProvider(enabled=True, public_client=public)
+            provider = DoubanProvider(public_client=public)
             current = DiscoveryService(registry=ProviderRegistry({"douban": provider}), cache=DiscoveryCache())
             self.addCleanup(current.shutdown)
             return current

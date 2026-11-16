@@ -827,7 +827,6 @@ def test_rpc_missing_pack_preserves_every_verification_goal_through_selection_an
     monkeypatch.setattr(missing_resources, 'audit_series_episodes', audit)
     monkeypatch.setattr(downloads.episode_audit, 'audit_series_episodes', audit)
     monkeypatch.setattr(downloads, 'preview_indexer_download_batch', _prepare_batch)
-    monkeypatch.setattr(missing_resources.config, 'get_bool', lambda *args, **kwargs: True)
     async def exercise():
         pipeline = native.pipeline()
         context = await context_for(native.store)

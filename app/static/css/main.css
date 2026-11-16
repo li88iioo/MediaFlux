@@ -918,7 +918,8 @@ html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: bloc
     color: var(--text-muted);
     line-height: 1.4;
 }
-.strm-toggle-card .toggle {
+.strm-toggle-card .toggle,
+.strm-toggle-card .jump-btn {
     margin-left: auto;
     flex-shrink: 0;
 }
@@ -1284,7 +1285,8 @@ html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: bloc
     background: var(--border-soft);
     margin: 4px 0;
 }
-.strm-toggle-copy label {
+.strm-toggle-copy label,
+.strm-toggle-copy strong {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -2099,8 +2101,9 @@ input[type="password"].form-input { padding-right: 44px; }
 .toggle-slider::before { content: ""; position: absolute; top: 50%; left: 3px; width: 14px; height: 14px; background: var(--text-muted); border-radius: 50%; transform: translateY(-50%); transition: .25s var(--ease-out); }
 .toggle input:checked + .toggle-slider { background: var(--accent-dark); border-color: var(--accent); }
 .toggle input:checked + .toggle-slider::before { background: var(--accent); transform: translate(20px,-50%); }
+.toggle input:disabled + .toggle-slider { opacity: .55; cursor: not-allowed; }
 .form-row.is-disabled, #offlineSecondaryRows.is-disabled { opacity: .45; }
-.form-input:disabled, textarea:disabled { cursor: not-allowed; opacity: .55; }
+.form-input:disabled, .form-select:disabled, textarea:disabled { cursor: not-allowed; opacity: .55; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .mt-16 { margin-top: 16px; }
 .text-muted { color: var(--text-muted); }

@@ -69,7 +69,6 @@ _CLEARABLE_SECRET_KEYS = frozenset({
 _DISCOVERY_BOOLEAN_KEYS = {
     "DISCOVERY_ENABLED",
     "DISCOVERY_DOUBAN_ENABLED",
-    "DISCOVERY_RESOURCE_RESULTS_ENABLED",
     "ORGANIZE_DOUBAN_HINTS_ENABLED",
     "ORGANIZE_BANGUMI_HINTS_ENABLED",
 }
@@ -158,7 +157,7 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
     "TMDB_API_KEY", "TMDB_API_URL",
     "TMDB_MATCH_MODE", "PROXY_URL", "TG_BOT_TOKEN", "TG_CHAT_ID",
-    "TG_NOTIFICATION_ENABLED", "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS", "AGENT_ENABLED",
+    "TG_NOTIFICATION_ENABLED", "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS",
     *AI_RECOGNITION_KEYS,
     *ORGANIZE_TAVILY_KEYS,
     *_ORGANIZE_POLICY_KEYS,
@@ -168,7 +167,6 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     *_WEB_ACCESS_KEYS,
     *NSFW_ORGANIZE_KEYS,
     "DISCOVERY_ENABLED", "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS",
-    "DISCOVERY_RESOURCE_RESULTS_ENABLED",
     "DISCOVERY_DOUBAN_ENABLED", "DOUBAN_DBCL2", "DOUBAN_CACHE_TTL_SECONDS", "BANGUMI_USER_AGENT",
     "ORGANIZE_DOUBAN_HINTS_ENABLED", "ORGANIZE_BANGUMI_HINTS_ENABLED",
     "INDEXER_SEARCH_ENABLED", "INDEXER_ENABLED_SITES", "INDEXER_SUKEBEI_ENABLED",
@@ -309,9 +307,7 @@ def _normalize_discovery_ttl(key: str, value: Any) -> str:
     return str(seconds)
 
 
-def _validate_indexer_updates(
-    data: dict[str, Any], discovery_updates: dict[str, str]
-) -> dict[str, str]:
+def _validate_indexer_updates(data: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
     if "INDEXER_SEARCH_ENABLED" in data:
         normalized["INDEXER_SEARCH_ENABLED"] = normalize_boolean(
@@ -329,12 +325,11 @@ def _validate_indexer_updates(
         normalized[key] = str(interval)
     if "INDEXER_ENABLED_SITES" in data:
         sites = encode_indexer_site_ids(str(data.get("INDEXER_ENABLED_SITES") or ""))
-        resource_enabled = discovery_updates.get(
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
-            "1" if config.get_bool("DISCOVERY_RESOURCE_RESULTS_ENABLED", True) else "0",
+        search_enabled = normalized.get(
+            "INDEXER_SEARCH_ENABLED", "1" if config.get_bool("INDEXER_SEARCH_ENABLED") else "0",
         )
-        if resource_enabled == "1" and not sites:
-            raise ValueError("启用站点资源时至少选择一个资源站点")
+        if search_enabled == "1" and not sites:
+            raise ValueError("启用多站资源索引时至少选择一个资源站点")
         normalized.update(build_indexer_site_updates(sites))
     elif "INDEXER_SUKEBEI_ENABLED" in data:
         normalized["INDEXER_SUKEBEI_ENABLED"] = normalize_boolean(
@@ -417,10 +412,6 @@ def _validate_web_access_updates(data: dict[str, Any]) -> dict[str, str]:
 
 def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
     normalized: dict[str, str] = {}
-    if "AGENT_ENABLED" in data:
-        normalized["AGENT_ENABLED"] = normalize_boolean(
-            "AGENT_ENABLED", data["AGENT_ENABLED"]
-        )
     if "AGENT_LLM_ENABLED" in data:
         normalized["AGENT_LLM_ENABLED"] = normalize_boolean(
             "AGENT_LLM_ENABLED", data["AGENT_LLM_ENABLED"]
@@ -1164,7 +1155,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         try:
             telegram_agent_updates = _validate_telegram_agent_updates(data)
             discovery_updates = _validate_discovery_updates(data)
-            indexer_updates = _validate_indexer_updates(data, discovery_updates)
+            indexer_updates = _validate_indexer_updates(data)
             ai_recognition_updates = _validate_ai_recognition_updates(data)
             organize_tavily_updates = _validate_organize_tavily_updates(data)
             organize_policy_updates = _validate_organize_policy_updates(data)

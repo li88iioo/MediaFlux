@@ -23,7 +23,7 @@ from tests.test_backup import make_paths
 def runtime_env(tmp_path):
     paths = make_paths(tmp_path)
     paths.ensure_writable_dirs()
-    paths.env_file.write_text("AGENT_ENABLED=1\nAGENT_LLM_ENABLED=0\nAGENT_LLM_MODEL=old\nAGENT_LLM_API_URL=https://invalid.example/v1\n")
+    paths.env_file.write_text("AGENT_LLM_ENABLED=0\nAGENT_LLM_MODEL=old\nAGENT_LLM_API_URL=https://invalid.example/v1\n")
     with isolated_test_database(), patch.object(config, 'PATHS', paths), patch.object(config, 'ENV_FILE', paths.env_file), patch.object(config, '_cache', None), patch.dict(os.environ):
         for key in ('AGENT_LLM_MODEL', 'AGENT_LLM_API_URL'):
             os.environ.pop(key, None)

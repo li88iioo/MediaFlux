@@ -39,7 +39,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM telegram_notification_outbox")
             conn.execute("DELETE FROM download_requests")
         self.enterContext(patch.dict(os.environ, {
-            "AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "100",
+            "AGENT_LLM_ENABLED": "1", "TG_AGENT_ENABLED": "1", "TG_CHAT_ID": "100",
             "TG_AGENT_ALLOWED_USER_IDS": "200", "TG_NOTIFICATION_ENABLED": "1",
             "TG_NOTIFICATION_LEVEL": "standard", "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "1",
         }))
@@ -248,7 +248,7 @@ class DownloadVerificationNotificationTests(IsolatedDatabaseTestCase):
     def test_revoked_route_never_calls_sender(self):
         request_id = self._request()
         for key, value in (
-            ("AGENT_ENABLED", "0"),
+            ("AGENT_LLM_ENABLED", "0"),
             ("TG_AGENT_ENABLED", "0"),
             ("TG_CHAT_ID", "999"),
             ("TG_AGENT_ALLOWED_USER_IDS", "201"),

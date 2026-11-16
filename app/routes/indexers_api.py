@@ -42,6 +42,7 @@ logger = get_logger(__name__)
 
 
 def _require_enabled() -> None:
+    # “多站资源索引”只管媒体档案的站点资源（页面）；Agent、Telegram 与订阅只受站点选择约束。
     if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         raise HTTPException(status_code=404, detail="not found")
 

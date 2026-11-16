@@ -48,35 +48,26 @@ class FreeCalendarAPITests(_BaseClientTests):
         self.authenticate()
         from app import config
         original = config.get_bool
-        for resource_enabled in (True, False):
-            for indexer_enabled in (True, False):
-                def get_bool(key, *args, mode=resource_enabled, indexer=indexer_enabled, **kwargs):
-                    if key == "DISCOVERY_RESOURCE_RESULTS_ENABLED":
-                        return mode
-                    if key == "INDEXER_SEARCH_ENABLED":
-                        return indexer
-                    return original(key, *args, **kwargs)
-                with self.subTest(resource=resource_enabled, indexer=indexer_enabled), patch.object(config, "get_bool", side_effect=get_bool):
-                    for path in ("/discovery", "/discovery/calendar"):
-                        response = self.client.get(path)
-                        self.assertEqual(response.status_code, 200)
-                        self.assertEqual(re.findall(r'data-resource-results-enabled="(true|false)"', response.text),
-                                         [str(resource_enabled).lower()], path)
+        for enabled in (True, False):
+            def get_bool(key, *args, enabled=enabled, **kwargs):
+                return enabled if key == "INDEXER_SEARCH_ENABLED" else original(key, *args, **kwargs)
+            with self.subTest(enabled=enabled), patch.object(config, "get_bool", side_effect=get_bool):
+                for path in ("/discovery", "/discovery/calendar"):
+                    response = self.client.get(path)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(re.findall(r'data-resource-results-enabled="(true|false)"', response.text), [str(enabled).lower()], path)
         self.service.get_week.assert_not_called()
 
     def test_calendar_page_preserves_discovery_default_resource_mode(self):
         self.authenticate()
         from app import config
-        original = config.get_bool
-        def get_bool(key, *args, **kwargs):
-            if key == "DISCOVERY_RESOURCE_RESULTS_ENABLED":
-                return args[0] if args else kwargs.get("default", False)
-            return original(key, *args, **kwargs)
-        with patch.object(config, "get_bool", side_effect=get_bool) as flag:
+        original = config.get
+        def get_value(key, default=""):
+            return default if key == "INDEXER_SEARCH_ENABLED" else original(key, default)
+        with patch.object(config, "get", side_effect=get_value):
             response = self.client.get("/discovery/calendar")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(re.findall(r'data-resource-results-enabled="(true|false)"', response.text), ["true"])
-            flag.assert_any_call("DISCOVERY_RESOURCE_RESULTS_ENABLED", True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(re.findall(r'data-resource-results-enabled="(true|false)"', response.text), ["true"])
         self.service.get_week.assert_not_called()
 
     def test_calendar_resource_display_does_not_bypass_indexer_master_switch(self):
@@ -84,15 +75,13 @@ class FreeCalendarAPITests(_BaseClientTests):
         from app import config
         original = config.get_bool
         def get_bool(key, *args, **kwargs):
-            if key == "DISCOVERY_RESOURCE_RESULTS_ENABLED":
-                return True
             if key == "INDEXER_SEARCH_ENABLED":
                 return False
             return original(key, *args, **kwargs)
         with patch.object(config, "get_bool", side_effect=get_bool), patch("app.routes.indexers_api.get_indexer_service") as getter:
             page = self.client.get("/discovery/calendar")
             self.assertEqual(page.status_code, 200)
-            self.assertIn('data-resource-results-enabled="true"', page.text)
+            self.assertIn('data-resource-results-enabled="false"', page.text)
             self.assertEqual(self.client.post("/api/indexers/search", headers=headers,
                                              json={"title": "离线动漫", "media_type": "tv"}).status_code, 404)
             self.assertEqual(self.client.get("/api/indexers/search?q=offline").status_code, 404)

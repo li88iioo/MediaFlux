@@ -86,7 +86,7 @@ def test_completed_native_receipt_rechecks_current_authorization_before_bot(agen
     ("TG_AGENT_ALLOWED_USER_IDS", "8", 403),
     ("TG_CHAT_ID", "-100999", 403),
     ("TG_AGENT_ENABLED", "0", 503),
-    ("AGENT_ENABLED", "0", 503),
+    ("AGENT_LLM_ENABLED", "0", 503),
 ])
 def test_direct_native_continuation_sender_retains_live_authorization_contract(agent_llm_enabled, tmp_path, setting, value, status):
     async def run():
@@ -107,7 +107,7 @@ def test_direct_native_continuation_sender_retains_live_authorization_contract(a
 
 def test_control_permission_can_enable_agent_while_delivery_remains_disabled():
     values = {"TG_CHAT_ID": ROUTE["chat_id"], "TG_AGENT_ALLOWED_USER_IDS": "7",
-              "AGENT_ENABLED": "0", "TG_AGENT_ENABLED": "0"}
+              "AGENT_LLM_ENABLED": "0", "TG_AGENT_ENABLED": "0"}
     with patch.object(config, "get", side_effect=lambda key, default="": values.get(key, default)):
         assert adapter.telegram_agent_control_access(ROUTE["chat_id"], "7") == "allowed"
         assert adapter.telegram_agent_access(ROUTE["chat_id"], "7") == "disabled"

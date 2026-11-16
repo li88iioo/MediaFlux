@@ -30,7 +30,7 @@ class MetadataSettingsAlignmentBrowserTests(unittest.TestCase):
         return page, errors
 
     def _cards(self, page):
-        return [page.locator(f'[aria-labelledby="metadata-{name}-heading"]') for name in ("tmdb", "tavily", "ai")]
+        return [page.locator(f'[aria-labelledby="metadata-{name}-heading"]') for name in ("tmdb", "tavily", "ai", "review")]
 
     def test_desktop_card_edges_align_and_loading_preserves_geometry(self):
         for width, gap_override in product((1280, 1440, 1920), (None, 24)):
@@ -49,12 +49,14 @@ class MetadataSettingsAlignmentBrowserTests(unittest.TestCase):
                 gap = cards[0].evaluate("card => parseFloat(getComputedStyle(card.parentElement).rowGap)")
                 self.assertGreater(gap, 0, "cards must keep the spacing declared by their layout")
                 self._resolve_config(page)
-                tmdb, tavily, ai = [self._rect(card) for card in cards]
-                for old, new in zip(before, (tmdb, tavily, ai)):
+                tmdb, tavily, ai, review = [self._rect(card) for card in cards]
+                for old, new in zip(before, (tmdb, tavily, ai, review)):
                     self._assert_same_rect(old, new)
                 self.assertAlmostEqual(tmdb["y"], ai["y"], delta=.5)
-                self.assertAlmostEqual(tavily["y"] + tavily["height"], ai["y"] + ai["height"], delta=.5)
+                self.assertAlmostEqual(tavily["y"] + tavily["height"], review["y"] + review["height"], delta=.5)
                 self.assertAlmostEqual(tmdb["width"], ai["width"], delta=.5)
+                self.assertAlmostEqual(review["x"], ai["x"], delta=.5)
+                self.assertAlmostEqual(review["y"] - ai["y"] - ai["height"], gap, delta=.5)
                 self.assertAlmostEqual(tavily["y"] - tmdb["y"] - tmdb["height"], gap, delta=.5)
                 for card in cards:
                     self.assertGreaterEqual(card.locator(".metadata-card-body").bounding_box()["height"], 100)
@@ -71,7 +73,7 @@ class MetadataSettingsAlignmentBrowserTests(unittest.TestCase):
                 page, errors = self._open(width)
                 self._resolve_config(page)
                 cards = self._cards(page)
-                tmdb, tavily, ai = [self._rect(card) for card in cards]
+                tmdb, tavily, ai, review = [self._rect(card) for card in cards]
                 self.assertAlmostEqual(tmdb["x"], ai["x"], delta=.5)
                 self.assertGreater(ai["y"], tavily["y"] + tavily["height"])
                 self.assertLess(tavily["height"], tmdb["height"])
@@ -87,7 +89,7 @@ class MetadataSettingsAlignmentBrowserTests(unittest.TestCase):
         original = [self._rect(card) for card in self._cards(page)]
         page.set_viewport_size({"width": 390, "height": 900})
         page.evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))")
-        tmdb, tavily, ai = [self._rect(card) for card in self._cards(page)]
+        tmdb, tavily, ai, review = [self._rect(card) for card in self._cards(page)]
         self.assertGreater(ai["y"], tavily["y"] + tavily["height"])
         page.set_viewport_size({"width": 1920, "height": 900})
         page.evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))")

@@ -44,8 +44,7 @@ Media Agent 是现有媒体业务的自然语言入口，不是第二套下载�
 
 | 配置项 | 作用 |
 |---|---|
-| `AGENT_ENABLED` | Agent 总开关 |
-| `AGENT_LLM_ENABLED` | Agent 模型开关 |
+| `AGENT_LLM_ENABLED` | Media Agent 总开关；历史 `AGENT_ENABLED` 已退役 |
 | `AGENT_LLM_API_URL` / `AGENT_LLM_API_KEY` / `AGENT_LLM_MODEL` | 模型服务与凭据；不要把 Key 粘贴到聊天中 |
 | `AGENT_LLM_PROTOCOL` | `auto`、`responses`、`chat_completions` 或 `anthropic_messages` |
 | `AGENT_LLM_CONTEXT_WINDOW_TOKENS` | 默认 `128000`，可配置范围 `16384`–`2000000`；不是要求模型输出这么多 Token |

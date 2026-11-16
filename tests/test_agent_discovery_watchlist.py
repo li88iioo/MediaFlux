@@ -407,17 +407,8 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         )
 
     def test_add_prepare_confirm_replay_and_owner_isolation(self) -> None:
-        self.enterContext(
-            patch(
-                "app.agent.kernel.ports.sdk_effects.config.get_bool", return_value=True
-            )
-        )
         service = get_agent_service()
         with (
-            patch(
-                "app.agent.kernel.ports.sdk_effects.config.get_bool",
-                return_value=True,
-            ),
             patch.object(
                 DiscoveryService, "get_detail", return_value=_card(1)
             ) as detail,
@@ -444,17 +435,8 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         self.assertNotIn("api_key=secret", serialized)
 
     def test_add_confirmation_detects_concurrent_insert(self) -> None:
-        self.enterContext(
-            patch(
-                "app.agent.kernel.ports.sdk_effects.config.get_bool", return_value=True
-            )
-        )
         service = get_agent_service()
         with (
-            patch(
-                "app.agent.kernel.ports.sdk_effects.config.get_bool",
-                return_value=True,
-            ),
             patch.object(DiscoveryService, "get_detail", return_value=_card(2)),
         ):
             prepared = service.prepare(
@@ -476,9 +458,6 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
     ) -> None:
         service = get_agent_service()
         with (
-            patch(
-                "app.agent.kernel.ports.sdk_effects.config.get_bool", return_value=True
-            ),
             patch.object(
                 DiscoveryService,
                 "get_detail",
@@ -500,21 +479,13 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             self.assertNotIn(private, serialized)
 
     def test_remove_prepare_confirm_and_stale_snapshot(self) -> None:
-        self.enterContext(
-            patch(
-                "app.agent.kernel.ports.sdk_effects.config.get_bool", return_value=True
-            )
-        )
         number = self._insert(external_id="201", title="待移除")
         service = get_agent_service()
-        with patch(
-            "app.agent.kernel.ports.sdk_effects.config.get_bool", return_value=True
-        ):
-            prepared = service.prepare(
-                "watchlist.remove",
-                {"watchlist_id": number},
-                owner="owner",
-            )
+        prepared = service.prepare(
+            "watchlist.remove",
+            {"watchlist_id": number},
+            owner="owner",
+        )
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE media_watchlist SET title=? WHERE id=?", ("状态已变化", number)
@@ -524,14 +495,11 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         assert (discovery_repo.get_media_watchlist_by_id(number)) is not None
         reset_agent_service_for_tests()
         service = get_agent_service()
-        with patch(
-            "app.agent.kernel.ports.sdk_effects.config.get_bool", return_value=True
-        ):
-            prepared = service.prepare(
-                "watchlist.remove",
-                {"watchlist_id": number},
-                owner="owner",
-            )
+        prepared = service.prepare(
+            "watchlist.remove",
+            {"watchlist_id": number},
+            owner="owner",
+        )
         confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "success")
         self.assertIsNone(discovery_repo.get_media_watchlist_by_id(number))

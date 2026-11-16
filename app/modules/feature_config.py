@@ -16,10 +16,9 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 FEATURES = {
-    "discovery": ("DISCOVERY_ENABLED", "媒体探索", DEFAULT_DISCOVERY_ENABLED),
-    "douban": ("DISCOVERY_DOUBAN_ENABLED", "豆瓣探索", True),
-    "resource_results": ("DISCOVERY_RESOURCE_RESULTS_ENABLED", "探索页站点资源结果", True),
-    "indexer_search": ("INDEXER_SEARCH_ENABLED", "多站资源搜索", DEFAULT_INDEXER_SEARCH_ENABLED),
+    "discovery": ("DISCOVERY_ENABLED", "媒体探索页面", DEFAULT_DISCOVERY_ENABLED),
+    "douban": ("DISCOVERY_DOUBAN_ENABLED", "探索页豆瓣来源", True),
+    "indexer_search": ("INDEXER_SEARCH_ENABLED", "媒体档案站点资源", DEFAULT_INDEXER_SEARCH_ENABLED),
     "web_search": ("WEB_SEARCH_ENABLED", "Tavily 联网搜索", False),
     "web_read": ("WEB_READ_ENABLED", "本地网页读取", True),
     "offline_magnet": ("OFFLINE_MAGNET_ENABLED", "光鸭磁力链接离线转存", True),
@@ -32,7 +31,7 @@ BOOLEAN_VALUES = {**dict.fromkeys(("1", "true", "yes", "on", "y"), "1"),
                   **dict.fromkeys(("0", "false", "no", "off", "n"), "0")}
 DISCOVERY_RUNTIME_KEYS = frozenset({
     "DISCOVERY_ENABLED", "DISCOVERY_CACHE_TTL_SECONDS", "DISCOVERY_STALE_TTL_SECONDS",
-    "DISCOVERY_RESOURCE_RESULTS_ENABLED", "DISCOVERY_DOUBAN_ENABLED", "DOUBAN_DBCL2",
+    "DISCOVERY_DOUBAN_ENABLED", "DOUBAN_DBCL2",
     "DOUBAN_CACHE_TTL_SECONDS", "BANGUMI_USER_AGENT", "ORGANIZE_DOUBAN_HINTS_ENABLED",
     "ORGANIZE_BANGUMI_HINTS_ENABLED", "TMDB_API_KEY", "TMDB_API_URL", "TMDB_MATCH_MODE", "PROXY_URL",
 })
@@ -63,11 +62,7 @@ def _facts() -> dict[str, Any]:
         if not enabled[name]:
             reasons.append("feature_disabled")
         else:
-            if name in {"douban", "resource_results"} and not enabled["discovery"]:
-                reasons.append("parent_disabled")
-            if name == "resource_results" and not enabled["indexer_search"]:
-                reasons.append("search_disabled")
-            if name in {"resource_results", "indexer_search"} and not sites:
+            if name == "indexer_search" and not sites:
                 reasons.append("no_enabled_sites")
             if name == "web_search" and not tavily:
                 reasons.append("provider_not_configured")
@@ -101,7 +96,7 @@ def _prepare(feature: str, enabled: bool) -> tuple[bytes | None, dict[str, Any]]
         status, ok, message = "environment_override", False, f"{label}由运行环境管理，不能覆盖部署配置"
     elif item["enabled"] == enabled:
         status, message = "no_changes", f"{label}已经处于目标状态"
-    elif enabled and feature in {"resource_results", "indexer_search"} and not facts["indexer_site_count"]:
+    elif enabled and feature == "indexer_search" and not facts["indexer_site_count"]:
         status, ok, message = "not_configured", False, "当前没有可用资源站点，请先在设置页选择"
     elif enabled and feature == "web_search" and not facts["tavily_configured"]:
         status, ok, message = "not_configured", False, "联网搜索供应商尚未配置，请先在设置页配置 Tavily API Key"
@@ -110,15 +105,7 @@ def _prepare(feature: str, enabled: bool) -> tuple[bytes | None, dict[str, Any]]
         ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     effects = ["仅改变这一项白名单功能，后续请求使用新状态；不会启动下载、搜索或整理任务。",
                "关闭不会取消已发出的请求；STRM 元数据从下一次同步生效；链接转存不重跑历史消息。"]
-    suggestions = []
-    if enabled and feature in {"douban", "resource_results"}:
-        parent = next(row for row in facts["features"] if row["feature"] == "discovery")
-        if not parent["enabled"]:
-            suggestions.append("媒体探索总开关关闭；本设置会保存，开启总开关后才生效。")
-    if enabled and feature == "resource_results":
-        search = next(row for row in facts["features"] if row["feature"] == "indexer_search")
-        if not search["enabled"]:
-            suggestions.append("探索页资源结果需同时开启多站资源搜索。")
+    suggestions: list[str] = []
     return raw, {"fingerprint": fingerprint, "preview": {"ok": ok, "status": status, "summary": message,
         "data": {"feature": feature, "label": label, "current_enabled": item["enabled"],
                  "requested_enabled": enabled, "effects": effects}, "suggestions": suggestions,
@@ -293,14 +280,14 @@ def _refresh_bot_and_agent(keys: set[str], outcome: _Reload, *, background_servi
             logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
         finally:
             logger.info("Telegram Bot 配置热更新 ms=%s", max(1, round((time.perf_counter() - started) * 1000)))
-    elif background_services and {"AGENT_ENABLED", "TG_AGENT_ENABLED"} & keys:
+    elif background_services and {"AGENT_LLM_ENABLED", "TG_AGENT_ENABLED"} & keys:
         try:
             from app.bot.handlers import request_command_menu_refresh
 
             request_command_menu_refresh()
         except Exception as exc:
             logger.warning("Telegram Bot 命令菜单后台刷新失败 type=%s", type(exc).__name__)
-    if "AGENT_ENABLED" in keys and background_services:
+    if "AGENT_LLM_ENABLED" in keys and background_services:
         try:
             from app.modules.agent_runtime import request_agent_runtime_reconcile
 

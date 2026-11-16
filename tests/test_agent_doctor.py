@@ -27,7 +27,6 @@ class AgentDoctorTests(IsolatedDatabaseTestCase):
         provider_key = "provider-key-not-for-output"
         scrape_key = "metrics-key-" + ("y" * 32)
         with patch.dict(os.environ, {
-            "AGENT_ENABLED": "1",
             "AGENT_LLM_ENABLED": "1",
             "AGENT_LLM_API_URL": "https://api.example.test/v1",
             "AGENT_LLM_PROTOCOL": "chat_completions",
@@ -53,6 +52,10 @@ class AgentDoctorTests(IsolatedDatabaseTestCase):
         self.assertNotIn(provider_key, serialized)
         self.assertNotIn(scrape_key, serialized)
         self.assertIn("本次未联网", serialized)
+        # 诊断与真实运行共用唯一总闸，残留旧键不得遮蔽开启或关闭。
+        for master, legacy, expected in (("1", "0", "ok"), ("0", "1", "warning")):
+            with self.subTest(master=master, legacy=legacy), patch.dict(os.environ, {"AGENT_LLM_ENABLED": master, "AGENT_ENABLED": legacy}):
+                self.assertEqual(agent_doctor._agent_config_check().status, expected)
 
     def test_doctor_rejects_unavailable_workspace_even_when_sdk_is_available(self) -> None:
         reason = "代码工作区需要容器 root 入口"
@@ -67,7 +70,6 @@ class AgentDoctorTests(IsolatedDatabaseTestCase):
 
     def test_doctor_flags_invalid_provider_and_weak_scrape_key_safely(self) -> None:
         with patch.dict(os.environ, {
-            "AGENT_ENABLED": "1",
             "AGENT_LLM_ENABLED": "1",
             "AGENT_LLM_API_URL": "http://127.0.0.1:8000/v1?token=private",
             "AGENT_LLM_PROTOCOL": "chat_completions",

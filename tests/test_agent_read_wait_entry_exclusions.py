@@ -107,7 +107,7 @@ def tg_config(tmp_path, monkeypatch):
         config.write_env_file(config.ENV_FILE, {}, replace=False)
         db.init_db()
         initialize_runtime_fence()
-        config.set_and_save({'AGENT_ENABLED': '1', 'AGENT_LLM_ENABLED': '1'})
+        config.set_and_save({'AGENT_LLM_ENABLED': '1'})
         yield
 
 
@@ -133,8 +133,8 @@ def test_real_authorization_changes_block_wait_stream(tg_config, change):
     if change == 'tg_revoke':
         config.set_and_save({'TG_AGENT_ALLOWED_USER_IDS': '8'})
     elif change == 'disable_enable':
-        config.set_and_save({'AGENT_ENABLED': '0'})
-        config.set_and_save({'AGENT_ENABLED': '1'})
+        config.set_and_save({'AGENT_LLM_ENABLED': '0'})
+        config.set_and_save({'AGENT_LLM_ENABLED': '1'})
     else:
         # Independent publisher changes real config while old object is retained.
         from concurrent.futures import ThreadPoolExecutor

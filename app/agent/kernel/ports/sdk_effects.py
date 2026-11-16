@@ -8,7 +8,7 @@ from copy import deepcopy
 from functools import partial
 from typing import Any
 
-from app import config, database as db
+from app import database as db
 from app.agent import effect_completion
 from app.agent.confirmation_contract import build_confirmation_contract
 from app.modules.resource_candidates import _deserialize_private_item, _serialize_private_item
@@ -1650,8 +1650,6 @@ def media_mapping_tool() -> KernelToolSpec:
         try:
             with confirmation_runtime(context) as prefix:
                 context.cancellation.raise_if_cancelled()
-                if not config.get_bool("DISCOVERY_ENABLED"):
-                    raise ToolPipelineError("影视探索当前未启用", code="disabled")
                 snapshot = get_discovery_service().prepare_tmdb_mapping(**arguments)
                 context.cancellation.raise_if_cancelled()
                 if snapshot is None:
@@ -1690,8 +1688,6 @@ def media_mapping_tool() -> KernelToolSpec:
                 snapshot = active.metadata.get("mapping_snapshot")
                 if not isinstance(snapshot, dict) or prefix + _fingerprint(snapshot) != expected_snapshot:
                     raise ToolPipelineError("确认时的配置或快照已变化，请重新预检", code="confirmation_stale")
-                if not config.get_bool("DISCOVERY_ENABLED"):
-                    raise ToolPipelineError("影视探索当前未启用", code="disabled")
                 context.cancellation.raise_if_cancelled()
                 saved = get_discovery_service().confirm_tmdb_mapping_if_unchanged(
                     **arguments, expected_mapping=snapshot["mapping"], expected_source=snapshot["source"],
@@ -1737,8 +1733,6 @@ def watchlist_tools() -> tuple[KernelToolSpec, KernelToolSpec]:
         try:
             with confirmation_runtime(context) as prefix:
                 context.cancellation.raise_if_cancelled()
-                if not config.get_bool("DISCOVERY_ENABLED"):
-                    raise ToolPipelineError("影视探索当前未启用", code="disabled")
                 if operation == "add":
                     snapshot = get_discovery_service().prepare_watchlist_add(**arguments)
                     if snapshot is None:
@@ -1786,8 +1780,6 @@ def watchlist_tools() -> tuple[KernelToolSpec, KernelToolSpec]:
                 snapshot = active.metadata["watchlist_snapshot"]
                 if prefix + _fingerprint(snapshot) != expected_snapshot:
                     raise ToolPipelineError("确认时的配置或快照已变化，请重新预检", code="confirmation_stale")
-                if not config.get_bool("DISCOVERY_ENABLED"):
-                    raise ToolPipelineError("影视探索当前未启用", code="disabled")
                 context.cancellation.raise_if_cancelled()
                 if operation == "add":
                     item = snapshot["canonical"]

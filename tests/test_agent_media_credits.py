@@ -42,7 +42,7 @@ def _call(payload, **kwargs):
     session = _Session(payload)
     client = TMDBClient(api_key="private-secret", base_url="https://api.themoviedb.org/3", proxy_url="", session=session)
     arguments: dict[str, Any] = {"tmdb_id": "272938", "media_type": "tv", **kwargs}
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         result = sdk.media.credits(**arguments)
     assert session.closed
     return result, session
@@ -149,7 +149,7 @@ def test_explicit_wrong_media_identity_or_season_is_not_accepted(payload, args):
 def test_failures_are_factual_sanitized_and_close_client(method, args, exc, state, status):
     client = Mock()
     getattr(client, {"credits": "media_credits", "filmography": "person_movie_credits", "people": "search_people"}[method]).side_effect = exc
-    with patch("app.discovery.people.config.get_bool", return_value=True), patch("app.discovery.people.TMDBClient", return_value=client):
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         result = getattr(sdk.media, method)(*args)
     assert not result["ok"] and result["status"] == status and result["query_state"] == state
     assert "cast" not in result and "items" not in result
@@ -157,13 +157,20 @@ def test_failures_are_factual_sanitized_and_close_client(method, args, exc, stat
     client.close.assert_called_once()
 
 
-@pytest.mark.parametrize("method,args", [("credits", ("1", "movie")), ("filmography", ("525",)), ("people", ("诺兰",))])
-def test_disabled_does_not_instantiate_provider_or_claim_empty(method, args):
-    with patch("app.discovery.people.config.get_bool", return_value=False), patch("app.discovery.people.TMDBClient") as factory:
+@pytest.mark.parametrize("method,args,payload,field", [
+    ("credits", ("1", "movie"), {"id": 1, "cast": [{"id": 2, "name": "演员", "character": "角色"}], "crew": []}, "cast"),
+    ("filmography", ("525",), {"id": 525, "cast": [], "crew": [{"id": 1, "title": "作品", "release_date": "2020-01-01", "job": "Director", "department": "Directing"}]}, "items"),
+    ("people", ("诺兰",), {"page": 1, "total_pages": 1, "total_results": 1, "results": [{"id": 525, "name": "诺兰", "known_for_department": "Directing"}]}, "items"),
+])
+def test_discovery_page_switch_does_not_block_people_queries(method, args, payload, field, monkeypatch):
+    monkeypatch.setenv("DISCOVERY_ENABLED", "0")
+    session = _Session(payload)
+    client = TMDBClient(api_key="fixture-key", base_url="https://api.themoviedb.org/3", proxy_url="", session=session)
+    with patch("app.discovery.people.TMDBClient", return_value=client):
         result = getattr(sdk.media, method)(*args)
-    factory.assert_not_called()
-    assert result["status"] == "disabled" and result["query_state"] == "not_queried"
-    assert "cast" not in result and "items" not in result
+    assert result["ok"] and result["query_state"] == "available"
+    assert len(result[field]) == 1
+    assert len(session.calls) == 1 and session.closed
 
 
 @pytest.mark.parametrize("bad", [

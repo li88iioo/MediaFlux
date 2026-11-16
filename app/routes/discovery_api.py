@@ -6,24 +6,18 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
-from app import config
 from app.discovery.calendar.models import SourceUnavailable
 from app.discovery.calendar.service import get_calendar_service
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.registry import FILTER_QUERY_KEYS
 from app.discovery.search import discovery_provider_names, get_discovery_search_service
 from app.discovery.service import get_discovery_service, project_watchlist_state
-from app.routes.discovery_image import decode_poster_token, encode_poster_token
+from app.routes.discovery_image import decode_poster_token, encode_poster_token, require_discovery_page_enabled
 from app.web import api_error, api_response, require_api_login
 from app.discovery.models import DISCOVERY_PROVIDERS
 
 
-def _require_discovery_enabled() -> None:
-    if not config.get_bool("DISCOVERY_ENABLED"):
-        raise HTTPException(status_code=404, detail="not found")
-
-
-router = APIRouter(prefix="/api/discovery", dependencies=[Depends(_require_discovery_enabled)])
+router = APIRouter(prefix="/api/discovery", dependencies=[Depends(require_discovery_page_enabled)])
 _BASE_QUERY_KEYS = {"provider", "category", "media_type", "page"}
 _MEDIA_TYPES = {"movie", "tv"}
 _PROVIDER_MEDIA_TYPES = {
@@ -159,6 +153,7 @@ def items(
         return api_error("页码无效", 400)
     filters = {key: value for key in FILTER_QUERY_KEYS if (value := request.query_params.get(key)) not in (None, "")}
     try:
+        discovery_provider_names([provider])
         result = get_discovery_service().list_items(provider, category, media_type, page_number, filters)
         return api_response(_page_payload(result))
     except ProviderError as exc:
@@ -181,6 +176,7 @@ def detail(request: Request, provider: str, media_type: str, external_id: str):
     require_api_login(request)
     try:
         provider, media_type, external_id = _identity(provider, media_type, external_id)
+        discovery_provider_names([provider])
         card = get_discovery_service().get_detail(provider, media_type, external_id)
         if card is None:
             return api_error("未找到媒体详情", 404)

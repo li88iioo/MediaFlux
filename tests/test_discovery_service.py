@@ -94,30 +94,17 @@ class DiscoveryRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_request("tmdb", "trending_week", "movie")
 
-    def test_douban_sections_report_disabled_without_feature_flag(self):
-        sections = list_section_definitions(douban_enabled=False)
-        douban = [item for item in sections if item["provider"] == "douban"]
-        self.assertTrue(douban)
-        self.assertTrue(all(item["enabled"] is False for item in douban))
+    def test_douban_page_sections_filter_hidden_source_without_disabling_other_catalogs(self):
+        visible = list_section_definitions(douban_enabled=True)
+        self.assertEqual({item["provider"] for item in visible}, {"tmdb", "douban", "bangumi"})
+        kept = [item for item in visible if item["provider"] != "douban"]
+        self.assertEqual(list_section_definitions(douban_enabled=False), kept)
+        for raw, expected in ((None, visible), ("1", visible), ("0", kept)):
+            with self.subTest(raw=raw), patch("app.discovery.registry.config.get", side_effect=lambda key, default="", raw=raw: default if raw is None else raw):
+                self.assertEqual(list_section_definitions(), expected)
+        self.assertFalse(any("enabled" in item for item in visible))
 
-    def test_douban_sections_default_enabled_when_config_is_absent(self):
-        with patch(
-            "app.discovery.registry.config.get",
-            side_effect=lambda key, default="": default,
-        ):
-            sections = list_section_definitions()
 
-        douban = [item for item in sections if item["provider"] == "douban"]
-        self.assertTrue(douban)
-        self.assertTrue(all(item["enabled"] is True for item in douban))
-
-    def test_douban_sections_respect_explicit_disabled_config(self):
-        with patch("app.discovery.registry.config.get", return_value="0"):
-            sections = list_section_definitions()
-
-        douban = [item for item in sections if item["provider"] == "douban"]
-        self.assertTrue(douban)
-        self.assertTrue(all(item["enabled"] is False for item in douban))
 
     def test_discover_date_range_validation(self):
         for media_type, field in (("movie", "release_date"), ("tv", "first_air_date")):
@@ -457,7 +444,7 @@ class DiscoveryServiceTests(unittest.TestCase):
                 self.now += timedelta(seconds=age)
                 with patch.object(self.provider, "list_items", return_value=source_page) as fetch, patch(
                     "app.discovery.service.get_discovery_service", return_value=self.service,
-                ), patch("app.discovery.service.require_discovery_enabled"):
+                ):
                     page = media.catalog("tmdb", "discover", "movie", page=number)
                     collected = media.catalog("tmdb", "discover", "movie", page=number, limit=1)
 

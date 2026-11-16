@@ -79,7 +79,7 @@ class TavilySettingsBrowserTests(unittest.TestCase):
 
         for width in (320, 390, 1280):
             with self.subTest(width=width):
-                page, errors = self._page(width, _UI_DEFAULTS)
+                page, errors = self._page(width, {**_UI_DEFAULTS, "AGENT_LLM_ENABLED": "1"})
                 self._resolve_config(page)
                 page.locator('[data-settings-target="agent"]').click()
                 search = page.locator('[data-key="WEB_SEARCH_ENABLED"]')
@@ -90,12 +90,14 @@ class TavilySettingsBrowserTests(unittest.TestCase):
                 option = read.locator('..').locator('..')
                 option.scroll_into_view_if_needed()
                 before = self._rect(option)
+                page.locator('[data-key="WEB_READ_TIMEOUT_SECONDS"]').fill('15')
+                page.locator('[data-key="WEB_READ_CACHE_TTL_SECONDS"]').fill('120')
                 read.locator('..').click()
                 self.assertFalse(read.is_checked())
                 self.assertFalse(search.is_checked())
                 self._assert_same_rect(before, self._rect(option))
-                page.locator('[data-key="WEB_READ_TIMEOUT_SECONDS"]').fill('15')
-                page.locator('[data-key="WEB_READ_CACHE_TTL_SECONDS"]').fill('120')
+                self.assertTrue(page.locator('[data-key="WEB_READ_TIMEOUT_SECONDS"]').is_disabled())
+                self.assertEqual(page.locator('[data-key="WEB_READ_TIMEOUT_SECONDS"]').input_value(), '15')
                 page.locator('#settings-panel-agent [data-save-settings]').click()
                 page.wait_for_function('window.__settingsWrites.length === 1')
                 self.assertEqual(page.evaluate('window.__settingsWrites[0]'), {

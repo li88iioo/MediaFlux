@@ -12,14 +12,13 @@ from urllib.parse import urlsplit
 import httpx
 from bs4 import BeautifulSoup
 
-from app import config
 from app.concurrency import run_awaitable_sync
 from app.modules.web_evidence import search_web
 from app.clients.http import FixedHostHttpClient, HttpError
 from app.discovery.models import (
     MediaCard, ProviderAuthenticationError, ProviderError, ProviderRateLimited, ProviderUnavailable,
 )
-from app.discovery.search import discovery_provider_names, get_discovery_search_service
+from app.discovery.search import get_discovery_search_service
 from app.discovery.service import get_discovery_service
 from app.logger import get_logger
 from app.sensitive_data import contains_sensitive_credential
@@ -421,35 +420,32 @@ def lookup_rating(
     selected: MediaCard | None = None
     provider_error = False
     web_fallback_attempted = False
-    structured_attempted = config.get_bool("DISCOVERY_ENABLED")
     ambiguous = False
     evidence: list[dict[str, Any]] = [{"source": "douban", "status": "not_queried", "ok": None,
-                 "description": "已尝试豆瓣结构化查询。" if structured_attempted else "结构化查询未启用，本次未调用。",
-                 "collected_at": _now()}]
+                 "description": "已尝试豆瓣结构化查询。", "collected_at": _now()}]
 
-    if structured_attempted:
-        try:
-            search_result = get_discovery_search_service().search(query, 1, discovery_provider_names(["douban"]))
-            selected = _select_card(
-                search_result.items,
-                query=query,
-                media_type=media_type,
-                year=year,
-            )
-            provider_error = bool(search_result.errors) and not bool(
-                search_result.providers_succeeded
-            )
-            ambiguous = selected is None and any(
-                _candidate_score(card, query_key=_match_text(query), media_type=media_type, year=year) is not None
-                for card in search_result.items
-            )
-            evidence[0].update(ok=not provider_error,
-                               status=search_result.errors[0]["code"] if provider_error else
-                               "ambiguous" if ambiguous else "available" if search_result.items else "empty")
-        except Exception as exc:  # 辅助评分失败只报告该来源，不中断调用方。
-            logger.warning("豆瓣评分结构化查询失败 type=%s", type(exc).__name__)
-            provider_error = True
-            evidence[0].update(ok=False, status=getattr(exc, "code", "unavailable"))
+    try:
+        search_result = get_discovery_search_service().search(query, 1, ["douban"])
+        selected = _select_card(
+            search_result.items,
+            query=query,
+            media_type=media_type,
+            year=year,
+        )
+        provider_error = bool(search_result.errors) and not bool(
+            search_result.providers_succeeded
+        )
+        ambiguous = selected is None and any(
+            _candidate_score(card, query_key=_match_text(query), media_type=media_type, year=year) is not None
+            for card in search_result.items
+        )
+        evidence[0].update(ok=not provider_error,
+                           status=search_result.errors[0]["code"] if provider_error else
+                           "ambiguous" if ambiguous else "available" if search_result.items else "empty")
+    except Exception as exc:  # 辅助评分失败只报告该来源，不中断调用方。
+        logger.warning("豆瓣评分结构化查询失败 type=%s", type(exc).__name__)
+        provider_error = True
+        evidence[0].update(ok=False, status=getattr(exc, "code", "unavailable"))
 
     if selected is not None:
         rating = _valid_rating(selected.rating)

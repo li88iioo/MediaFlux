@@ -25,7 +25,6 @@ class FeatureSummaryUnitTests(unittest.TestCase):
         values = {
             "DISCOVERY_ENABLED": False,
             "DISCOVERY_DOUBAN_ENABLED": True,
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": True,
             "INDEXER_SEARCH_ENABLED": False,
             "WEB_SEARCH_ENABLED": True,
         }
@@ -48,23 +47,23 @@ class FeatureSummaryUnitTests(unittest.TestCase):
             ),
         ):
             result = features()
-        self.assertEqual({row["feature"] for row in result["features"]}, {"discovery", "douban", "resource_results", "indexer_search", "web_search", "web_read", "offline_magnet", "offline_ed2k", "offline_http", "strm_metadata", "download_verification_notify"})
+            values["INDEXER_SEARCH_ENABLED"] = True
+            missing_sites = next(row for row in features()["features"] if row["feature"] == "indexer_search")
+        self.assertEqual(missing_sites["availability"], "blocked")
+        self.assertEqual(missing_sites["reason_codes"], ["no_enabled_sites"])
+        self.assertEqual({row["feature"] for row in result["features"]}, {"discovery", "douban", "indexer_search", "web_search", "web_read", "offline_magnet", "offline_ed2k", "offline_http", "strm_metadata", "download_verification_notify"})
         self.assertEqual(result["status"], "attention")
-        self.assertEqual(result["feature_count"], 11)
-        self.assertEqual(result["enabled_count"], 7)
-        self.assertEqual(result["available_count"], 4)
+        self.assertEqual(result["feature_count"], 10)
+        self.assertEqual(result["enabled_count"], 6)
+        self.assertEqual(result["available_count"], 5)
         self.assertEqual(result["disabled_count"], 4)
-        self.assertEqual(result["attention_count"], 3)
+        self.assertEqual(result["attention_count"], 1)
         by_feature = {item["feature"]: item for item in result["features"]}
         self.assertEqual(by_feature["discovery"]["availability"], "disabled")
         self.assertEqual(by_feature["discovery"]["reason_codes"], ["feature_disabled"])
-        self.assertEqual(by_feature["douban"]["availability"], "blocked")
-        self.assertEqual(by_feature["douban"]["reason_codes"], ["parent_disabled"])
+        self.assertEqual(by_feature["douban"]["availability"], "available")
+        self.assertEqual(by_feature["douban"]["reason_codes"], [])
         self.assertTrue(by_feature["douban"]["managed_by_environment"])
-        self.assertEqual(
-            by_feature["resource_results"]["reason_codes"],
-            ["parent_disabled", "search_disabled", "no_enabled_sites"],
-        )
         self.assertEqual(by_feature["indexer_search"]["availability"], "disabled")
         self.assertEqual(by_feature["web_search"]["availability"], "blocked")
         self.assertEqual(
@@ -88,7 +87,6 @@ class FeatureSummaryUnitTests(unittest.TestCase):
         enabled = {
             "DISCOVERY_ENABLED": True,
             "DISCOVERY_DOUBAN_ENABLED": True,
-            "DISCOVERY_RESOURCE_RESULTS_ENABLED": True,
             "INDEXER_SEARCH_ENABLED": True,
             "INDEXER_SUKEBEI_ENABLED": True,
         }
@@ -105,7 +103,7 @@ class FeatureSummaryUnitTests(unittest.TestCase):
         ):
             result = features()
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["available_count"], 8)
+        self.assertEqual(result["available_count"], 7)
         with (
             patch("app.modules.feature_config.config.get_bool", return_value=False),
             patch("app.modules.feature_config.config.get", return_value=""),
@@ -117,4 +115,4 @@ class FeatureSummaryUnitTests(unittest.TestCase):
             disabled = features()
         self.assertEqual(disabled["status"], "disabled")
         self.assertEqual(disabled["available_count"], 0)
-        self.assertEqual(disabled["disabled_count"], 11)
+        self.assertEqual(disabled["disabled_count"], 10)
