@@ -524,6 +524,23 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.assertFalse(any(call['path'].endswith('/reorganize') and call['method']=='POST' for call in self.calls()))
         self.assertTrue(self.page.locator('#organizeDetailModal').evaluate('el => el.scrollWidth <= el.clientWidth'))
 
+    def test_desktop_detail_footer_pins_delete_left_and_labels_related_status(self):
+        self.page.evaluate("""() => Object.assign(window.__testConfig, {
+          relatedLogsById:{'10':[{id:11,status:'confirmed',updated_at:'2026-10-21 03:19:39'}]},
+        })""")
+        self.page.locator(".detail-btn").first.click()
+        self.page.locator("#organizeDetailModal").wait_for(state="visible")
+        self.page.locator('#organizeDetailTitle').filter(has_text='#10').wait_for()
+        self.assertEqual(self.page.locator('#organizeSafetyNotice button').inner_text(), '#11 · 已确认')
+        # 状态文字曾以 flex:1 与按钮组平分底栏，把回收站挤到中间。
+        footer = self.page.locator('.organize-detail-footer').bounding_box()
+        delete = self.page.locator('#organizeDeleteBtn').bounding_box()
+        primary = self.page.locator('#organizeReorganizeBtn').bounding_box()
+        assert footer and delete and primary
+        self.assertLessEqual(delete['x'] - footer['x'], 25)
+        self.assertLessEqual(footer['x'] + footer['width'] - primary['x'] - primary['width'], 25)
+        self.assertEqual(len({round(box['y']) for box in (delete, primary)}), 1)
+
     def test_late_operation_transport_failure_does_not_overwrite_another_log(self):
         for action in ('returnOrganizeToSource', 'revertOrganize', 'deleteOrganizeGroup'):
             for phase in ('request', 'body'):

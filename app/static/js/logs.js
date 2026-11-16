@@ -21,7 +21,7 @@ function api(path, opts={}) { return fetch(path, {headers:{'Content-Type':'appli
 function _esc(v) { const d=document.createElement('div'); d.textContent=v==null?'':String(v); return d.innerHTML; }
 function _attr(v) { return _esc(v).replaceAll('\"','&quot;').replaceAll("'",'&#39;'); }
 
-const orgStatusMap = {success:['成功','done'], failed:['失败','failed'], skipped:['跳过','paused'], manual:['待确认','paused'], processing:['处理中','running'], reverted:['已回退','running'], interrupted:['操作中断','failed'], reorganizing:['重新整理中','running'], returning:['送回中','running'], reverting:['回退中','running'], deleting:['移入回收站中','running'], deleted:['已移入回收站','done'], partial_failed:['部分失败','failed'], revert_failed:['回退失败','failed']};
+const orgStatusMap = {success:['成功','done'], failed:['失败','failed'], skipped:['跳过','paused'], manual:['待确认','paused'], processing:['处理中','running'], reverted:['已回退','running'], interrupted:['操作中断','failed'], reorganizing:['重新整理中','running'], returning:['送回中','running'], reverting:['回退中','running'], deleting:['移入回收站中','running'], deleted:['已移入回收站','done'], confirmed:['已确认','done'], partial_failed:['部分失败','failed'], revert_failed:['回退失败','failed']};
 
 function lockElementHeight(element) {
     if (!element) return () => {};
@@ -665,8 +665,8 @@ function _renderReleaseParse(parse){
         <div class="organize-parse-card">
             <span class="organize-parse-label">季集映射</span>
             <div class="organize-parse-main">
-                <code class="organize-pos-badge">${_esc(isPositionShifted ? `${sourcePosition} → ${effectivePosition}` : (effectivePosition || '-'))}</code>
-                <small class="organize-parse-sub">${isPositionShifted ? '已纠偏映射/覆盖' : '未发生位置换算'}</small>
+                ${effectivePosition==='-' ? `<span class="organize-parse-empty">${parse.media_type==='movie' ? '电影无季集位置' : '未识别季集'}</span>` : `<code class="organize-pos-badge">${_esc(isPositionShifted ? `${sourcePosition} → ${effectivePosition}` : effectivePosition)}</code>
+                <small class="organize-parse-sub">${isPositionShifted ? '已纠偏映射/覆盖' : '未发生位置换算'}</small>`}
             </div>
         </div>
         <div class="organize-parse-card organize-parse-card-proof">
@@ -699,6 +699,7 @@ function _renderOrganizeDetail(data){
     const notice=document.getElementById('organizeSafetyNotice');
     const related=data.related_logs||[];
     notice.hidden=!data.safety_notice&&!related.length;
+    notice.classList.toggle('is-related',!data.safety_notice);
     notice.textContent=data.safety_notice||'';
     if(related.length){
         notice.append(document.createTextNode(' 同一文件的其它整理记录（按最近更新排序）：'));
