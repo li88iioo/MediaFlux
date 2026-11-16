@@ -4660,7 +4660,9 @@ class TMDBScraper:
         """
         media_type = "tv" if media_type == "tv" else "movie"
         clean = self.clean_title(query)
-        for title in _split_title_variants(clean):
+        if not clean:
+            return []
+        for title in dict.fromkeys((clean, *_split_title_variants(clean))):
             candidates = self.search(title, year, media_type)
             if not candidates and year:
                 candidates = self.search(title, "", media_type)

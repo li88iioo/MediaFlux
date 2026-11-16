@@ -105,6 +105,23 @@ class ManualSearchSingleLanguageFallbackTests(IsolatedDatabaseTestCase):
                     self.scraper.search_candidates(query, '', 'movie')
                 self.assertEqual(self.calls, expected)
 
+    def test_original_query_is_searched_even_without_a_comparison_key(self):
+        for title in ('Брат', 'Москва слезам не верит', 'Αθήνα'):
+            with self.subTest(title=title):
+                self.calls.clear()
+                hit = {'id': 1, 'title': title, 'release_date': '2000-01-01'}
+                with self._search({title: [hit]}):
+                    candidates = self.scraper.search_candidates(title, '2000', 'movie')
+                self.assertEqual(self.calls, [(title, '2000')])
+                self.assertEqual([item.title for item in candidates], [title])
+
+    def test_original_query_retries_without_year_once_before_language_fallback(self):
+        self.calls.clear()
+        with self._search({}):
+            candidates = self.scraper.search_candidates('Брат', '2000', 'movie')
+        self.assertEqual(candidates, [])
+        self.assertEqual(self.calls, [('Брат', '2000'), ('Брат', '')])
+
     def test_noise_only_query_does_not_search(self):
         with self._search({}):
             self.assertEqual(self.scraper.search_candidates('[1080p][AAC]', '', 'movie'), [])
