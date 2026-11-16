@@ -248,14 +248,15 @@ class _RefreshRecorder:
         self.items = items
         self.items_error = items_error
         self.refreshed: list[str] = []
-        self.refresh_all_calls = 0
+        # 合法刷新都经 refresh_library 记录；任何额外 POST（如全库扫描）都是缺陷。
+        self.posts = Mock(side_effect=AssertionError("不得发起额外刷新请求"))
         self.unexpected_request = Mock(side_effect=AssertionError("不得逐季查询单集"))
         client.list_virtual_folders = lambda: self.folders
         client._request = self.unexpected_request
         client._library_items_with_paths = self._library_items
         client._library_root_items_with_paths = self._library_roots
         client.refresh_library = self._refresh_library
-        client.refresh_all = self._refresh_all
+        client._session.post = self.posts
 
     def _library_items(self, library_id: str):
         if self.items_error:
@@ -277,10 +278,6 @@ class _RefreshRecorder:
 
     def _refresh_library(self, library_id: str) -> bool:
         self.refreshed.append(library_id)
-        return True
-
-    def _refresh_all(self) -> bool:
-        self.refresh_all_calls += 1
         return True
 
 
@@ -439,7 +436,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                 self.assertTrue(result["ok"])
                 self.assertEqual(recorder.refreshed, ["series-a"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertEqual(result["fallback"], "")
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(result["endpoints"], ["/Items/series-a/Refresh"])
@@ -481,13 +478,13 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     ]})
                     paths = [f"{show_root}/{name}" for name in changed]
 
-                    result = client.refresh_for_paths(paths, allow_global_fallback=False)
+                    result = client.refresh_for_paths(paths)
 
                     self.assertTrue(result["ok"])
                     self.assertEqual(sorted(recorder.refreshed), expected)
                     recorder.unexpected_request.assert_not_called()
                     self.assertEqual(sorted(result["succeeded_paths"]), sorted(paths))
-                    self.assertEqual(recorder.refresh_all_calls, 0)
+                    recorder.posts.assert_not_called()
 
     def test_movie_refresh_stays_on_the_movie_unless_files_appear_or_vanish(self):
         b, other = "作品 B/B.strm", "作品 B/B.part2.strm"
@@ -574,7 +571,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                 self.assertTrue(result["ok"])
                 self.assertEqual(recorder.refreshed, ["season-1"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 recorder.unexpected_request.assert_not_called()
 
     def test_existing_series_wins_over_folder_at_same_season_path(self):
@@ -642,7 +639,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(recorder.refreshed, ["root-movies"])
                 self.assertEqual(result["scope"], "folder")
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_flat_movie_directory_uses_covering_folder_but_file_target_stays_precise(self):
         directory = f"{ROOT}/电影/合集"
@@ -663,21 +660,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     result = client.refresh_for_paths([f"{directory}/B.strm"])
                     self.assertTrue(result["ok"])
                     self.assertEqual(recorder.refreshed, ["changed"])
-                    self.assertEqual(recorder.refresh_all_calls, 0)
-
-    def test_automatic_caller_can_forbid_configured_global_fallback(self):
-        client = JellyfinClient(
-            "http://jf", "token", allow_global_refresh_fallback=True,
-        )
-        recorder = _RefreshRecorder(client, _folders(), _items())
-
-        result = client.refresh_for_paths(
-            ["/outside/library"], allow_global_fallback=False,
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["scope"], "skipped")
-        self.assertEqual(recorder.refresh_all_calls, 0)
+                    recorder.posts.assert_not_called()
 
     def test_strict_file_batch_keeps_series_deduplication_without_broad_scan(self):
         directory = f"{ROOT}/剧集/作品 A"
@@ -692,7 +675,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(recorder.refreshed, ["series"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_recent_target_id_is_resolved_but_not_refreshed_again(self):
         for label, client in self._clients():
@@ -743,7 +726,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["succeeded_paths"], paths)
                 self.assertEqual(result["folders"], [])
                 self.assertEqual(result["libraries"], [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_many_targets_strict_mode_skips_instead_of_library_refresh(self):
         for label, client in self._clients():
@@ -786,7 +769,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["succeeded_paths"], paths)
                 self.assertEqual(result["folders"], [])
                 self.assertEqual(result["libraries"], [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 recorder.unexpected_request.assert_not_called()
 
                 recorder.refreshed.clear()
@@ -830,7 +813,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 result = client.refresh_for_paths([f"{ROOT}/剧集/新作品/Season 01"])
 
                 self.assertEqual(recorder.refreshed, ["lib-tv"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertTrue(result["fallback"])
                 self.assertEqual(result["scope"], "library")
 
@@ -849,12 +832,12 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["skipped"])
                 self.assertEqual(result["scope"], "skipped")
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_item_listing_failure_is_safely_skipped(self):
         clients = (
-            JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),
-            EmbyClient("http://emby", "token", allow_global_refresh_fallback=True),
+            JellyfinClient("http://jf", "token"),
+            EmbyClient("http://emby", "token"),
         )
         for client in clients:
             with self.subTest(server=client.display_name):
@@ -865,7 +848,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 result = client.refresh_for_paths([f"{ROOT}/剧集/作品 A/Season 01"])
 
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["skipped"])
                 self.assertIn("条目读取失败", result["fallback"])
@@ -890,7 +873,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["scope"], "library")
                 self.assertEqual(recorder.refreshed, ["lib-tv"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_oversized_library_prefers_physical_root_over_virtual_library(self):
         items = {"lib-tv": [{
@@ -920,7 +903,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 result = client.refresh_for_paths(["/somewhere/else/A"])
 
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["skipped"])
                 self.assertEqual(result["scope"], "skipped")
@@ -934,7 +917,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                 result = client.refresh_for_paths([f"{ROOT}/剧集/作品 A/Season 01"])
 
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["skipped"])
                 self.assertEqual(result["scope"], "skipped")
@@ -942,8 +925,8 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
     def test_bound_library_constraint_rejects_other_library_without_global_fallback(self):
         clients = (
-            JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),
-            EmbyClient("http://emby", "token", allow_global_refresh_fallback=True),
+            JellyfinClient("http://jf", "token"),
+            EmbyClient("http://emby", "token"),
         )
         for client in clients:
             with self.subTest(server=client.display_name):
@@ -958,13 +941,13 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["scope"], "skipped")
                 self.assertEqual(result["allowed_libraries"], ["lib-movie"])
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_posix_root_library_does_not_capture_unc_target(self):
         folders = [{"id": "posix-root", "name": "根", "locations": ["/"]}]
         clients = (
-            JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),
-            EmbyClient("http://emby", "token", allow_global_refresh_fallback=True),
+            JellyfinClient("http://jf", "token"),
+            EmbyClient("http://emby", "token"),
         )
         for client in clients:
             with self.subTest(server=client.display_name):
@@ -978,23 +961,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["scope"], "skipped")
                 self.assertEqual(result["matched"], 0)
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
-
-    def test_global_refresh_fallback_requires_explicit_opt_in(self):
-        clients = (
-            JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),
-            EmbyClient("http://emby", "token", allow_global_refresh_fallback=True),
-        )
-        for client in clients:
-            with self.subTest(server=client.display_name):
-                recorder = _RefreshRecorder(client, _folders(), _items())
-
-                result = client.refresh_for_paths(["/somewhere/else/A"])
-
-                self.assertEqual(recorder.refresh_all_calls, 1)
-                self.assertTrue(result["ok"])
-                self.assertEqual(result["scope"], "global")
-                self.assertEqual(result["endpoints"], ["/Library/Refresh"])
+                recorder.posts.assert_not_called()
 
     def test_explicit_path_mapping_matches_unc_library(self):
         mapping = MediaServerPathMapping(
@@ -1060,7 +1027,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["mapped"], 0)
                 self.assertEqual(result["matched"], 0)
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_unc_virtual_folder_matching_is_case_insensitive(self):
         folders = [{
@@ -1079,7 +1046,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(recorder.refreshed, ["movie-item"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_posix_virtual_folder_matching_is_case_sensitive(self):
         folders = [{
@@ -1099,7 +1066,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["scope"], "skipped")
                 self.assertEqual(result["matched"], 0)
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_item_index_preserves_path_style_case_and_component_boundaries(self):
         cases = (
@@ -1120,7 +1087,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertEqual(result["ok"], matched)
                     self.assertEqual(recorder.refreshed, ["series"] if matched else [])
                     self.assertEqual(result["succeeded_paths"], [target] if matched else [])
-                    self.assertEqual(recorder.refresh_all_calls, 0)
+                    recorder.posts.assert_not_called()
 
     def test_same_canonical_item_path_keeps_existing_candidate_priority(self):
         for label, client in self._clients():
@@ -1153,7 +1120,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["ambiguous"], 1)
                 self.assertIn("匹配多个媒体库", result["fallback"])
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_ambiguous_target_never_uses_opt_in_global_fallback(self):
         folders = [
@@ -1161,8 +1128,8 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
             {"id": "lib-b", "name": "电影 B", "locations": ["/media/movies"]},
         ]
         clients = (
-            JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),
-            EmbyClient("http://emby", "token", allow_global_refresh_fallback=True),
+            JellyfinClient("http://jf", "token"),
+            EmbyClient("http://emby", "token"),
         )
         for client in clients:
             with self.subTest(server=client.display_name):
@@ -1175,7 +1142,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["scope"], "skipped")
                 self.assertEqual(result["ambiguous"], 1)
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_partial_match_refreshes_safe_target_without_global_scan(self):
         for label, client in self._clients():
@@ -1188,7 +1155,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 ])
 
                 self.assertEqual(recorder.refreshed, ["series-a"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(result["matched"], 1)
@@ -1240,12 +1207,12 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["deferred_paths"], paths[:1])
                 self.assertEqual(result["unmatched_paths"], paths[2:])
                 self.assertEqual(recorder.refreshed, [])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
 
     def test_partial_match_never_uses_opt_in_global_fallback(self):
         clients = (
-            JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),
-            EmbyClient("http://emby", "token", allow_global_refresh_fallback=True),
+            JellyfinClient("http://jf", "token"),
+            EmbyClient("http://emby", "token"),
         )
         for client in clients:
             with self.subTest(server=client.display_name):
@@ -1257,7 +1224,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 ])
 
                 self.assertEqual(recorder.refreshed, ["series-a"])
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(result["matched"], 1)
@@ -1288,7 +1255,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
                 result = client.refresh_for_paths([])
 
-                self.assertEqual(recorder.refresh_all_calls, 0)
+                recorder.posts.assert_not_called()
                 self.assertTrue(result["ok"])
                 self.assertTrue(result["skipped"])
                 self.assertTrue(result["fallback"])

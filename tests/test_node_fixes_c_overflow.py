@@ -105,10 +105,10 @@ def test_C02_saturated_sync_delivers_every_library_with_policy(tmp_path, mode, p
                 folders = [{"id": f"lib{i}", "name": f"Library{i}", "locations": [path]} for i, path in enumerate(sorted(expected))]
                 items = {f"lib{i}": [{"Id": f"folder{i}", "Type": "Folder", "Path": path}] for i, path in enumerate(sorted(expected))}
                 recorder = _RefreshRecorder(client, folders, items)
-                outcome = client.refresh_for_paths(paths, allow_global_fallback=False)
+                outcome = client.refresh_for_paths(paths)
                 assert outcome["ok"] and outcome["unmatched"] == 0, outcome
                 assert set(recorder.refreshed) == {f"folder{i}" for i in range(6)}
-                assert recorder.refresh_all_calls == 0
+                recorder.posts.assert_not_called()
                 recorders[name] = recorder
                 client.close()
             # 交接期间新事件覆盖同路径，旧快照 ACK 不得吞掉新令牌。
@@ -170,7 +170,7 @@ def test_C02_exact_spill_survives_real_refresh_queue_and_consumers(tmp_path, all
             with patch.object(worker, "_client_for", return_value=client):
                 worker._process_group(group)
             assert set(recorder.refreshed) == {f"folder{i}" for i in range(6)}
-            assert recorder.refresh_all_calls == 0
+            recorder.posts.assert_not_called()
         assert media_refresh_queue_status()["paths"] == 0
 
 

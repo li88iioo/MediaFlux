@@ -235,7 +235,9 @@ class MediaRefreshCoordinator:
         profile = profiles.get(provider)
         if profile is None:
             return None
-        return profile.create_client(**configured_media_server_refresh_options(provider))
+        return profile.create_client(
+            path_mappings=configured_media_server_refresh_options(provider)["path_mappings"],
+        )
 
     @staticmethod
     def _resolve_library_binding(client, group: dict[str, Any]) -> tuple[str, ...]:
@@ -286,8 +288,7 @@ class MediaRefreshCoordinator:
                 raise ValueError("媒体服务器已停用或配置不完整")
             allowed_ids = self._resolve_library_binding(client, group)
             outcome = client.refresh_for_paths(
-                paths, allowed_library_ids=allowed_ids, allow_global_fallback=False,
-                skip_item_ids=recent_ids,
+                paths, allowed_library_ids=allowed_ids, skip_item_ids=recent_ids,
             )
         except Exception as exc:
             outcome = {"ok": False, "fallback": redact_sensitive_text(str(exc)) or type(exc).__name__}

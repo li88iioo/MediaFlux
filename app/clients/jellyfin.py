@@ -57,15 +57,8 @@ class JellyfinClient(MediaServerClient):
         timeout: int = 10,
         *,
         path_mappings: tuple[MediaServerPathMapping, ...] = (),
-        allow_global_refresh_fallback: bool = False,
     ):
-        super().__init__(
-            url,
-            token,
-            timeout,
-            path_mappings=path_mappings,
-            allow_global_refresh_fallback=allow_global_refresh_fallback,
-        )
+        super().__init__(url, token, timeout, path_mappings=path_mappings)
         self._cached_user_id = ""
 
     def _isolated_part(self, method_name: str, user_id: str):
@@ -75,7 +68,6 @@ class JellyfinClient(MediaServerClient):
             self.token,
             self.timeout,
             path_mappings=self.path_mappings,
-            allow_global_refresh_fallback=self.allow_global_refresh_fallback,
         )
         try:
             client._cached_user_id = user_id
@@ -523,21 +515,3 @@ class JellyfinClient(MediaServerClient):
     @staticmethod
     def _normalize_path(path: str) -> str:
         return (path or "").replace("\\", "/").rstrip("/").lower()
-
-    def refresh_for_path(self, media_path: str) -> bool:
-        """兼容单路径调用；沿用安全的批量精准刷新策略。"""
-        return bool(self.refresh_for_paths([media_path]).get("ok"))
-
-    def refresh_all(self) -> bool:
-        """显式全局刷新兼容入口；自动整理链路不会调用该接口。"""
-        try:
-            resp = self._session.post(
-                f"{self.url}/Library/Refresh",
-                headers=self._headers(),
-                timeout=15,
-            )
-            resp.raise_for_status()
-            return True
-        except Exception as exc:
-            logger.error("Jellyfin 全局刷新失败 type=%s", type(exc).__name__)
-            return False

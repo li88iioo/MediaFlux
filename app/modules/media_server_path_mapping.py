@@ -364,7 +364,7 @@ class MediaServerRefreshOptions(TypedDict):
 
 
 def configured_media_server_refresh_options(server_type: str) -> MediaServerRefreshOptions:
-    """读取指定媒体服务器的路径映射和全局刷新降级策略。"""
+    """读取指定媒体服务器的路径映射；历史全库回退开关只作配置摘要元数据，不参与刷新。"""
     normalized = (server_type or "").strip().lower()
     try:
         mapping_key, fallback_key = MAPPING_CONFIG[normalized]
@@ -373,7 +373,7 @@ def configured_media_server_refresh_options(server_type: str) -> MediaServerRefr
     try:
         mappings = parse_media_server_path_mappings(config.get(mapping_key, ""))
     except MediaServerPathMappingError as exc:
-        # 配置损坏时 fail closed：不带映射继续匹配，并保持禁止全局刷新。
+        # 配置损坏时 fail closed：不带映射继续匹配，历史开关摘要值保持 false。
         logger.error("%s 路径映射配置无效，已安全忽略: %s", normalized, exc)
         mappings = ()
         allow_global_refresh_fallback = False

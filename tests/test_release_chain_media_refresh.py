@@ -22,7 +22,7 @@ def test_real_unmapped_refresh_finishes_without_automatic_retry():
             job = claim_due_media_refreshes(owner="audit", now_epoch=100)[0]
             client = client_type("http://media.invalid", "test-key")
             client.list_virtual_folders = lambda: [{"id": "tv", "name": "TV", "locations": ["/media/TV"]}]
-            client.refresh_all = Mock(side_effect=AssertionError("global refresh forbidden"))
+            client._session.post = Mock(side_effect=AssertionError("global refresh forbidden"))
             coordinator = MediaRefreshCoordinator()
             coordinator._owner = "audit"
             # 真实客户端刷新规划；仅替换远端目录读取，不伪造 ok/retryable DTO。
@@ -33,13 +33,13 @@ def test_real_unmapped_refresh_finishes_without_automatic_retry():
             assert claim_due_media_refreshes(owner="later", force=True) == []
             assert coordinator._completed_session == 0
             assert coordinator._failed_session == 1
-            client.refresh_all.assert_not_called()
+            client._session.post.assert_not_called()
 
 
 def test_no_target_refresh_is_an_explicit_successful_noop():
     client = JellyfinClient("http://media.invalid", "test-key")
     try:
-        result = client.refresh_for_paths([], allow_global_fallback=False)
+        result = client.refresh_for_paths([])
         assert result["ok"] is True
         assert result["skipped"] is True
     finally:
@@ -59,7 +59,7 @@ def test_movie_directory_refresh_failure_finishes_and_new_change_scans_covering_
             ]  # B 还未被媒体服务器发现，刷新 old 不能覆盖它。
             refresh = Mock(side_effect=[False, True])
             client.refresh_library = refresh
-            client.refresh_all = Mock(side_effect=AssertionError("global refresh forbidden"))
+            client._session.post = Mock(side_effect=AssertionError("global refresh forbidden"))
             worker = MediaRefreshCoordinator()
             worker._owner = "directory-audit"
             try:
@@ -77,7 +77,7 @@ def test_movie_directory_refresh_failure_finishes_and_new_change_scans_covering_
                 assert media_refresh_queue_status()["paths"] == 0
                 assert worker._completed_session == 1
                 assert [call.args for call in refresh.call_args_list] == [("root",), ("root",)]
-                client.refresh_all.assert_not_called()
+                client._session.post.assert_not_called()
             finally:
                 client.close()
 

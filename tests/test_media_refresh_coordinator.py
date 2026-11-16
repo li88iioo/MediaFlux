@@ -312,7 +312,6 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
         client.refresh_for_paths.assert_called_once_with(
             ["/media/A"],
             allowed_library_ids=(),
-            allow_global_fallback=False,
             skip_item_ids=(),
         )
         self.assertTrue(queued["group_key"])

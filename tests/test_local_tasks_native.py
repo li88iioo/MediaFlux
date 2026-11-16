@@ -271,7 +271,7 @@ def media_server(backend, monkeypatch):
     return selected, client, profile, options
 
 
-@pytest.mark.parametrize("change", ["none", "endpoint", "credential", "user", "user-switch", "user-clear", "mapping", "target", "cancel"])
+@pytest.mark.parametrize("change", ["none", "endpoint", "credential", "user", "user-switch", "user-clear", "mapping", "legacy-global-flag", "target", "cancel"])
 def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, media_server, change):
     selected, client, profile, options = media_server
     if change in ("user-switch", "user-clear"):
@@ -290,6 +290,9 @@ def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, med
             profile.user_id = {"user": "family", "user-switch": "other", "user-clear": ""}[change]
         elif change == "mapping":
             options["path_mappings"] = (MediaServerPathMapping("/nas", "/changed"),)
+        elif change == "legacy-global-flag":
+            # 历史开关仍是确认摘要的一部分：改动后旧确认失效，且不发起刷新。
+            options["allow_global_refresh_fallback"] = False
         elif change == "target":
             current = current_task(selected)
             assert current is not None
@@ -319,14 +322,14 @@ def test_bound_local_refresh_preserves_exact_movie_path_with_strict_scope(backen
     ]
     refresh = Mock(return_value=True)
     client.refresh_library = refresh
-    client.refresh_all = Mock(side_effect=AssertionError("global refresh forbidden"))
+    client._session.post = Mock(side_effect=AssertionError("global refresh forbidden"))
     monkeypatch.setattr(profile, "create_client", lambda **kwargs: client)
     preview = library.prepare_local_task_refresh(selected)
     result = library.refresh_local_task_library(selected, expected_fingerprint=preview["fingerprint"])
     assert result["status"] == "completed"
     refresh.assert_called_once_with("video")
     assert result["data"]["paths"] == ["/nas/Shows/Show/Season 2/E24.mkv"]
-    client.refresh_all.assert_not_called()
+    client._session.post.assert_not_called()
 
 
 def test_refresh_two_owners_use_original_atomic_lease_and_unknown_not_replay(backend, media_server):

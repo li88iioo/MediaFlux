@@ -117,9 +117,7 @@ class MediaLibraryResponseAuditTests(TestCase):
             JellyfinClient("http://synthetic.invalid", "synthetic") as client,
             patch.object(client, "_request", return_value=False),
         ):
-            outcome = client.refresh_for_paths(
-                ["/media/Movies"], allow_global_fallback=False
-            )
+            outcome = client.refresh_for_paths(["/media/Movies"])
         self.assertFalse(outcome["ok"])
         self.assertTrue(outcome["retryable"])
         self.assertEqual(outcome["succeeded_target_ids"], [])

@@ -65,8 +65,7 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
             worker._process_group(group)
         self.assertEqual(media_refresh_queue_status()["paths"], 0)
         client.refresh_for_paths.assert_called_once_with(
-            ["/media/Movies/Film"], allowed_library_ids=("movies",),
-            allow_global_fallback=False, skip_item_ids=(),
+            ["/media/Movies/Film"], allowed_library_ids=("movies",), skip_item_ids=(),
         )
 
     def test_old_outbox_ack_cannot_delete_new_same_path_event(self):
@@ -142,7 +141,6 @@ class RefreshHandoffRecoveryTests(IsolatedDatabaseTestCase):
                     self.assertEqual(client.refresh_for_paths.call_count, int(accepted))
                     self.assertEqual(media_refresh_queue_status()["paths"], 0)
                     self.assertEqual(worker.status()["failed_session"], int(not accepted))
-                    client.refresh_all.assert_not_called()
                     if accepted:
                         self.assertEqual(client.refresh_for_paths.call_args.kwargs["allowed_library_ids"], ("movies",))
 

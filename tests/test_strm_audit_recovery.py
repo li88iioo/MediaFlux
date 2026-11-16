@@ -197,7 +197,6 @@ def test_retry_batches_flow_through_durable_refresh_coordinator(tmp_path):
         with patch.object(coordinator, "_client_for", return_value=provider), patch("app.services.clear_dashboard_cache"):
             coordinator._process_group(groups[0])
         provider.refresh_for_paths.assert_called_once()
-        assert provider.refresh_for_paths.call_args.kwargs["allow_global_fallback"] is False
         assert not queue.claim_due_media_refreshes(owner=coordinator._owner, limit=8)
         assert strm_repo.count_strm_refresh_paths() == 0
 

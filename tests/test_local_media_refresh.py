@@ -176,7 +176,9 @@ class LocalMediaRefreshTests(TestCase):
 
         with patch.object(client, "_request", side_effect=request), patch.object(
             client, "refresh_library", return_value=True
-        ) as refresh, patch.object(client, "refresh_all", return_value=True) as refresh_all:
-            self.assertTrue(client.refresh_for_path("/media/Movies/Film (2026)"))
+        ) as refresh, patch.object(
+            client._session, "post", side_effect=AssertionError("global refresh forbidden")
+        ) as post:
+            self.assertTrue(client.refresh_for_paths(["/media/Movies/Film (2026)"])["ok"])
         refresh.assert_called_once_with("movies")
-        refresh_all.assert_not_called()
+        post.assert_not_called()

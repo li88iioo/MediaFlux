@@ -151,12 +151,20 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             patch("app.routes.media_libraries_api._mapping_payload", side_effect=lambda provider: mapping_payloads[provider]),
             patch("app.routes.media_libraries_api._local_bindings", return_value=bindings),
             patch("app.routes.media_libraries_api._strm_summary", return_value=strm),
-            patch("app.routes.media_libraries_api.config.get_bool", return_value=False),
+            # 历史全库回退键已不参与刷新，但概览字段与原值保持对外契约。
+            patch(
+                "app.routes.media_libraries_api.config.get_bool",
+                side_effect=lambda key, default=None: key == "JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK",
+            ),
         ):
             response = self.client.get("/api/media-libraries/overview")
 
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
+        self.assertEqual(
+            [(server["fallback_key"], server["allow_global_refresh_fallback"]) for server in payload["servers"]],
+            [("JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK", True), ("EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK", False)],
+        )
         self.assertEqual(payload["summary"], {
             "configured_servers": 2,
             "online_servers": 1,
@@ -300,6 +308,18 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(nested.status_code, 200, nested.text)
         self.assertEqual(nested.json()["directories"][0]["id"], str(child))
         self.assertEqual(escaped.status_code, 400, escaped.text)
+
+    def test_legacy_global_refresh_keys_stay_savable_and_read_back(self):
+        """历史全库回退键不再控制刷新，但旧配置提交与原值回读不能变成 400 或丢值。"""
+        from app import config
+
+        headers = {"X-CSRF-Token": self.login()}
+        legacy = {"JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK": "1", "EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK": "0"}
+        response = self.client.post("/api/config", json=legacy, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual({key: config.get(key) for key in legacy}, legacy)
+        payload = self.client.get("/api/config").json()
+        self.assertEqual({key: payload[key] for key in legacy}, legacy)
 
     def test_unified_save_persists_strm_and_local_mappings(self):
         csrf = self.login()

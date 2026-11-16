@@ -132,7 +132,7 @@ def bound_local_task_library(task: Any) -> dict[str, Any]:
             "绑定的媒体服务器当前未启用或未配置"
         )
     refresh_options = configured_media_server_refresh_options(provider)
-    client = profile.create_client(**refresh_options)
+    client = profile.create_client(path_mappings=refresh_options["path_mappings"])
     try:
         try:
             folders = client.list_virtual_folders()

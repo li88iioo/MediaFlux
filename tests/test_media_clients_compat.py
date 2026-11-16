@@ -35,7 +35,6 @@ class MediaRuntimeTests(unittest.TestCase):
                     with client:
                         self.assertEqual(client._user_id(), "family")
                         self.assertEqual(client.path_mappings, options["path_mappings"])
-                        self.assertTrue(client.allow_global_refresh_fallback)
                         self.assertEqual(client.timeout, 10)
 
     def test_dashboard_reuses_complete_recent_snapshot_including_empty_results(self):

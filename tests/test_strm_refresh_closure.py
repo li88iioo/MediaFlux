@@ -108,7 +108,6 @@ def _consume(*, providers, expected_paths):
         client.refresh_for_paths.return_value = {"ok": True, "deduplicated": 0, "succeeded_target_ids": ["item"]}
         with patch.object(coordinator, "_client_for", return_value=client), patch("app.services.clear_dashboard_cache"):
             coordinator._process_group(group)
-        assert client.refresh_for_paths.call_args.kwargs["allow_global_fallback"] is False
     assert repository.count_strm_refresh_paths() == 0
     assert media_refresh_queue_status()["paths"] == 0
 

@@ -397,13 +397,11 @@ class MediaServerClient:
         timeout: int = 10,
         *,
         path_mappings: tuple[MediaServerPathMapping, ...] = (),
-        allow_global_refresh_fallback: bool = False,
     ):
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
         self.path_mappings = tuple(path_mappings or ())
-        self.allow_global_refresh_fallback = allow_global_refresh_fallback
         self._session = requests.Session()
 
     def close(self) -> None:
@@ -1260,9 +1258,6 @@ class MediaServerClient:
             )
             return False
 
-    def refresh_all(self) -> bool:
-        raise NotImplementedError
-
     @staticmethod
     def _normalize_media_path(path: object) -> str:
         try:
@@ -1516,27 +1511,11 @@ class MediaServerClient:
             return "unknown", 0
 
     def _finish_unlocatable_refresh(
-        self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
-        permit_global_fallback: bool = False, retryable: bool = False,
-        source_paths: list[str],
+        self, result: dict[str, Any], reason: str, *, retryable: bool = False,
     ) -> dict[str, Any]:
-        """定位失败时默认安全跳过；自动链路绝不隐式全局扫描。"""
+        """定位失败时安全跳过；任何调用方都不会回退为全库扫描。"""
         result["fallback"] = reason
         result["retryable"] = retryable
-        if (
-            allow_global
-            and permit_global_fallback
-            and self.allow_global_refresh_fallback
-        ):
-            logger.warning(
-                "[%s] %s，配置允许回退全局刷新", self.display_name, reason
-            )
-            result["scope"] = "global"
-            result["endpoints"] = ["/Library/Refresh"]
-            result["ok"] = self.refresh_all()
-            if result["ok"]:
-                result["succeeded_paths"] = source_paths
-            return result
         logger.warning(
             "[%s] %s，已安全跳过；未触发全局媒体库扫描", self.display_name, reason
         )
@@ -1551,14 +1530,13 @@ class MediaServerClient:
         *,
         allowed_library_ids: tuple[str, ...] = (),
         allow_library_fallback: bool = True,
-        allow_global_fallback: bool | None = None,
         skip_item_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """按变化路径执行最小范围刷新。
 
         剧集变化按作品合并刷新，同时更新整剧汇总日期；电影按自身刷新。全新作品优先刷新
-        对应物理根 Folder，只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方
-        默认禁止全局 ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的
+        对应物理根 Folder，只有无法获得物理根 Item 时才退到虚拟媒体库；无法定位时
+        安全跳过，从不发起全局 ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的
         原始输入路径；unmatched_paths 是不属于任何（或唯一）媒体库的输入路径。
         deferred_paths 仅记录因短暂去重而尚未提交的原始路径，供队列延后提交；
         这些回执不表示服务端异步扫描已经完成。
@@ -1571,11 +1549,6 @@ class MediaServerClient:
             (item or "").strip() for item in skip_item_ids or ()
             if (item or "").strip()
         }
-        permit_global_fallback = (
-            self.allow_global_refresh_fallback
-            if allow_global_fallback is None
-            else allow_global_fallback
-        )
         mapping_rows: list[dict[str, Any]] = []
         mapped_targets: list[str] = []
         source_paths = _dedupe_texts(paths or [])
@@ -1637,12 +1610,7 @@ class MediaServerClient:
         except Exception as exc:
             logger.warning("[%s] 读取媒体库目录失败: %s", self.display_name, exc)
             return self._finish_unlocatable_refresh(
-                result,
-                "媒体库目录读取失败",
-                allow_global=not allowed_ids,
-                permit_global_fallback=permit_global_fallback,
-                retryable=True,
-                source_paths=source_paths,
+                result, "媒体库目录读取失败", retryable=True,
             )
         if allowed_ids:
             folders = [
@@ -1699,13 +1667,7 @@ class MediaServerClient:
                     self.display_name, reason,
                 )
                 return result
-            return self._finish_unlocatable_refresh(
-                result,
-                reason,
-                allow_global=not allowed_ids,
-                permit_global_fallback=permit_global_fallback,
-                source_paths=source_paths,
-            )
+            return self._finish_unlocatable_refresh(result, reason)
 
         targets_by_library: dict[str, list[tuple[str, str]]] = {}
         for target, (library_id, library_location) in library_for_target.items():
@@ -1898,13 +1860,7 @@ class MediaServerClient:
                 result["skipped"] = True
                 result["ok"] = not unmatched_targets
                 return result
-            return self._finish_unlocatable_refresh(
-                result,
-                "无法定位任何刷新目标",
-                allow_global=not allowed_ids,
-                permit_global_fallback=permit_global_fallback,
-                source_paths=source_paths,
-            )
+            return self._finish_unlocatable_refresh(result, "无法定位任何刷新目标")
 
         ordered_ids = [*item_ids, *folder_ids, *library_ids]
         outcomes: list[bool] = []

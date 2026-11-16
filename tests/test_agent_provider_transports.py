@@ -300,9 +300,6 @@ def test_public_library_precise_refresh_never_calls_global_refresh(monkeypatch):
             calls.append(target_id)
             return True
 
-        def refresh_all(self):
-            raise AssertionError("精准刷新不得调用全库刷新")
-
     profile = MediaServerProfile(
         source="configured:jellyfin",
         server_type="jellyfin",
@@ -347,9 +344,6 @@ def test_public_library_refresh_rejection_or_exception_has_unknown_outcome(
             if isinstance(failure, Exception):
                 raise failure
             return failure
-
-        def refresh_all(self):
-            raise AssertionError("结果未知时不得回退全库刷新")
 
     profile = MediaServerProfile(
         source="configured:jellyfin",

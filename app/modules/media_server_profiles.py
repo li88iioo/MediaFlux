@@ -59,7 +59,6 @@ class MediaServerProfile:
 
     def create_client(
         self, *, path_mappings: tuple[MediaServerPathMapping, ...] = (),
-        allow_global_refresh_fallback: bool = False,
     ) -> MediaServerClient:
         """用同一配置快照构造客户端，显式用户优先于服务器默认用户。"""
         from app.clients.base import normalize_explicit_media_user_id
@@ -70,10 +69,7 @@ class MediaServerProfile:
         if self.server_type not in {"jellyfin", "emby"}:
             raise ValueError("媒体服务器类型不受支持")
         factory = JellyfinClient if self.server_type == "jellyfin" else EmbyClient
-        client = factory(
-            self.url, self.credential, timeout=10, path_mappings=path_mappings,
-            allow_global_refresh_fallback=allow_global_refresh_fallback,
-        )
+        client = factory(self.url, self.credential, timeout=10, path_mappings=path_mappings)
         if user_id:
             client._cached_user_id = user_id
         return client

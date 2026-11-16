@@ -3019,10 +3019,11 @@ class MediaRefreshTests(unittest.TestCase):
 
         client._request = request
         client.refresh_library = Mock(return_value=True)
-        client.refresh_all = Mock(return_value=True)
-        self.assertTrue(client.refresh_for_path("D:/Media/STRM"))
+        client._session.post = Mock(side_effect=AssertionError("global refresh forbidden"))
+        result = client.refresh_for_paths(["D:/Media/STRM"])
+        self.assertTrue(result["ok"])
         client.refresh_library.assert_called_once_with("lib-1")
-        client.refresh_all.assert_not_called()
+        client._session.post.assert_not_called()
 
 
 class STRMIndexTests(IsolatedDatabaseTestCase):
