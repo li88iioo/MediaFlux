@@ -645,7 +645,7 @@
                 }
                 const singleDelete=tr.querySelector('[data-delete-single]');
                 if(singleDelete){
-                    singleDelete.addEventListener('click',()=>deleteSingleFailure(row.id));
+                    singleDelete.addEventListener('click',()=>clearFailures({ids:[Number(row.id)]},row.filename));
                 }
                 failureList.append(tr);
             });
@@ -776,71 +776,41 @@
             syncFailureActions();
         }
     }
-    async function clearFailures(){
-        if(failureRetrying||failureLoading)return;
-        const ids=[...selectedFailures];
-        let title='清除失败记录';
-        let message='确定从失败台账中清除失败记录吗？这不会影响云盘文件或本地媒体库。';
-        let body={};
-        if(ids.length>0){
-            title=`清除 ${ids.length} 条选中记录`;
-            message=`将从失败台账中移除已选中的 ${ids.length} 条记录。不会删除云盘中的任何文件。`;
-            body={ids};
-        }else if(failureSnapshot.length>0){
-            title='清除当前筛选记录';
-            message=`确定清除当前筛选条件下的全部 ${failureSnapshot.length} 条失败记录吗？不会删除云盘中的任何文件。`;
-            body={all:true,source_id:failureSourceFilter.value,action:failureActionFilter.value,status:failureStatusFilter.value};
-        }else{
-            return;
-        }
-
-        const confirmed=await appConfirm({
-            title,
-            message,
-            confirmText:'确认清除',
-            danger:true,
+    async function clearFailures(payload,name=''){
+        const action=Object.freeze({
+            all:payload.all===true,
+            ids:Object.freeze([...(payload.ids??selectedFailures)]),
+            count:payload.all===true?failureTotalCount:payload.ids.length,
+            name,
+            body:JSON.stringify(payload),
         });
-        if(!confirmed)return;
-
-        failureState.textContent='正在清除台账记录…';
+        if(failureRetrying||failureLoading||!action.count)return;
+        failureRetrying=true;
+        syncFailureActions();
         try{
+            const confirmed=await appConfirm({
+                title:action.name?'删除失败记录':`清除 ${action.count} 条记录`,
+                message:`确定从失败台账中清除${action.name?`「${action.name}」的`:action.all?'当前筛选条件下的全部':'选中的'} ${action.count} 条记录吗？不会删除云盘中的任何文件。`,
+                confirmText:'确认清除',
+                danger:true,
+            });
+            if(!confirmed)return;
+            failureState.textContent='正在清除台账记录…';
             const response=await fetch('/api/strm/failures/clear',{
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
-                body:JSON.stringify(body),
+                body:action.body,
             });
             const data=await response.json();
             if(!response.ok||data.ok===false)throw new Error(data.error||'清除失败');
-            selectedFailures.clear();
+            for(const id of action.ids)selectedFailures.delete(id);
             await loadFailures();
             failureState.textContent=`已成功清除 ${Number(data.deleted||0)} 条失败记录。`;
         }catch(error){
             failureState.textContent=error.message||'清除失败';
-        }
-    }
-    async function deleteSingleFailure(id){
-        if(failureRetrying||failureLoading)return;
-        const row=failureSnapshot.find(item=>Number(item.id)===Number(id));
-        const confirmed=await appConfirm({
-            title:'删除失败记录',
-            message:`确定从台账中删除「${row?.filename||id}」的记录吗？`,
-            confirmText:'删除记录',
-            danger:true,
-        });
-        if(!confirmed)return;
-        try{
-            const response=await fetch('/api/strm/failures/clear',{
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({ids:[Number(id)]}),
-            });
-            const data=await response.json();
-            if(!response.ok||data.ok===false)throw new Error(data.error||'删除失败');
-            selectedFailures.delete(Number(id));
-            await loadFailures();
-            failureState.textContent='记录已删除。';
-        }catch(error){
-            failureState.textContent=error.message||'删除失败';
+        }finally{
+            failureRetrying=false;
+            syncFailureActions();
         }
     }
     async function validateCron(){const value=cron.value.trim();const box=document.getElementById('cronPreview');if(!value){box.innerHTML='';box.style.display='none';return;}try{const response=await fetch('/api/strm/schedule/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cron:value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Cron 校验失败');box.style.display='inline-flex';if(data.valid){box.style.color='var(--accent)';box.style.borderColor='var(--accent-border)';box.style.background='var(--accent-soft)';box.innerHTML=`<i data-lucide="clock" style="width:13px;height:13px;"></i><span>下次运行：${esc(data.next_run)}</span>`;}else{box.style.color='var(--danger)';box.style.borderColor='var(--danger-border)';box.style.background='var(--danger-soft)';box.innerHTML=`<i data-lucide="alert-circle" style="width:13px;height:13px;"></i><span>格式无效：需要 5 段 cron 表达式</span>`;}}catch(error){box.style.display='inline-flex';box.style.color='var(--danger)';box.style.borderColor='var(--danger-border)';box.style.background='var(--danger-soft)';box.textContent=error.message||'Cron 校验失败';}window.renderLucideIcons?.(box);}
@@ -944,7 +914,9 @@
     retryAllBtn.addEventListener('click',()=>retryFailures({all:true,source_id:failureSourceFilter.value,action:failureActionFilter.value}));
     if(failurePrevBtn)failurePrevBtn.addEventListener('click',()=>{if(failurePage>1)loadFailures(failurePage-1);});
     if(failureNextBtn)failureNextBtn.addEventListener('click',()=>{if(failurePage<failureTotalPages)loadFailures(failurePage+1);});
-    if(clearFailuresBtn)clearFailuresBtn.addEventListener('click',clearFailures);
+    if(clearFailuresBtn)clearFailuresBtn.addEventListener('click',()=>clearFailures(selectedFailures.size
+        ?{ids:[...selectedFailures]}
+        :{all:true,source_id:failureSourceFilter.value,action:failureActionFilter.value,status:failureStatusFilter.value}));
     if(selectAllCheckbox){
         selectAllCheckbox.addEventListener('change',()=>{
             const selectableRows=failureSnapshot.filter(row=>row.status==='open');

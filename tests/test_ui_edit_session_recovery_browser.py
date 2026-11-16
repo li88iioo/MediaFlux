@@ -473,6 +473,132 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
     def test_strm_retry_all_uses_confirmed_filter_mobile(self):
         self.strm_all_retry_snapshot(390)
 
+    def strm_clear_filtered_pages(self, width):
+        from app import database as db
+
+        page = self.make_strm_page(width)
+        db.record_strm_failure(
+            source_id="fixture-b", source_name="隔离来源 B", file_id="other",
+            parent_id="fixture-b", filename="other.nfo", action="metadata",
+            rel_dir="fixture", target_rel_path="fixture/other.nfo", error="fixture failure",
+        )
+        for selector, value in (("#strmFailureSourceFilter", "fixture-a"), ("#strmFailureActionFilter", "generate")):
+            page.locator(selector).select_option(value)
+            page.wait_for_function("document.querySelector('#strmFailureList').getAttribute('aria-busy') === 'false'")
+        assert self.strm_client is not None
+        self.assertEqual(self.strm_client.post("/api/strm/failures/clear", json={"ids": list(range(1000000, 1000500))}).status_code, 200)
+        self.assertEqual(self.strm_client.post("/api/strm/failures/clear", json={"ids": list(range(1000000, 1000501))}).status_code, 400)
+        self.assertEqual(page.locator("#strmFailureList tr[data-id]").count(), 100)
+        self.assertIn("共 241 条", page.locator("#strmFailurePageInfo").inner_text())
+        page.locator("#clearStrmFailuresBtn").click()
+        self.assertIn("241", page.locator("#appConfirmMessage").inner_text())
+        page.locator("#appConfirmSubmit").click()
+        page.wait_for_function("document.querySelector('#strmFailureState').textContent.includes('清除 241')")
+        self.assertEqual(db.count_strm_failures(status="open", source_id="fixture-a"), 0)
+        self.assertEqual(db.count_strm_failures(status="open", source_id="fixture-b"), 1)
+        self.assertEqual([row["body"] for row in self.requests if row["method"] == "POST"], [
+            {"all": True, "source_id": "fixture-a", "action": "generate", "status": "open"},
+        ])
+        self.observations = {"width": width, "visible_rows": 100, "confirmed_and_deleted": 241, "other_source_remaining": 1}
+
+    def test_strm_clear_all_counts_every_filtered_page_desktop(self):
+        self.strm_clear_filtered_pages(1280)
+
+    def test_strm_clear_all_counts_every_filtered_page_mobile(self):
+        self.strm_clear_filtered_pages(390)
+
+    def strm_clear_single_and_selected(self, width):
+        from app import database as db
+
+        page = self.make_strm_page(width, count=4)
+        ids = page.locator("#strmFailureList tr[data-id]").evaluate_all("rows => rows.map(row => Number(row.dataset.id))")
+        first = page.locator(f'#strmFailureList tr[data-id="{ids[0]}"]')
+        others = page.locator(f'#strmFailureList input[value="{ids[1]}"], #strmFailureList input[value="{ids[2]}"]')
+        for checkbox in others.all():
+            checkbox.check()
+        for single in (True, False):
+            trigger = first.locator("[data-delete-single]") if single else page.locator("#clearStrmFailuresBtn")
+            count = 1 if single else 2
+            trigger.click()
+            self.assertIn(str(count), page.locator("#appConfirmMessage").inner_text())
+            self.assertTrue(page.locator("#clearStrmFailuresBtn").is_disabled())
+            page.locator("#appConfirmCancel").click()
+            self.assertTrue(all(checkbox.is_checked() for checkbox in others.all()))
+            self.assertEqual(db.count_strm_failures(status="open"), 4 if single else 3)
+            self.assertEqual(len([row for row in self.requests if row["method"] == "POST"]), 0 if single else 2)
+            self.replies[("POST", "/api/strm/failures/clear")] = [(503, {"error": "fixture clear unavailable"})]
+            trigger.click()
+            page.locator("#appConfirmSubmit").click()
+            page.wait_for_function("document.querySelector('#strmFailureState').textContent.includes('fixture clear unavailable')")
+            self.assertTrue(all(checkbox.is_checked() and not checkbox.is_disabled() for checkbox in others.all()))
+            self.assertEqual(db.count_strm_failures(status="open"), 4 if single else 3)
+            self.hold_reply("/api/strm/failures/clear", "clear-action")
+            before = page.locator("#clearStrmFailuresBtn").bounding_box()
+            trigger.click()
+            page.locator("#appConfirmSubmit").click()
+            self.wait_reply("clear-action")
+            # 行按钮仍可触发事件，但同一个 busy 状态必须挡住第二次提交。
+            page.locator(f'[data-delete-single="{ids[3]}"]').click()
+            after = page.locator("#clearStrmFailuresBtn").bounding_box()
+            assert before is not None and after is not None
+            self.assertEqual((before["width"], before["height"]), (after["width"], after["height"]))
+            self.assertEqual(len([row for row in self.requests if row["method"] == "POST"]), 2 if single else 4)
+            self.release_reply("clear-action")
+            page.wait_for_function("!document.querySelector('#clearStrmFailuresBtn').disabled")
+            if single:
+                self.assertTrue(all(checkbox.is_checked() for checkbox in others.all()))
+        self.assertEqual(db.count_strm_failures(status="open"), 1)
+        self.assertEqual(page.locator("#strmFailureList tr[data-id]").get_attribute("data-id"), str(ids[3]))
+        self.assertEqual([row["body"] for row in self.requests if row["method"] == "POST"], [
+            {"ids": [ids[0]]}, {"ids": [ids[0]]}, {"ids": ids[1:3]}, {"ids": ids[1:3]},
+        ])
+        self.observations = {"width": width, "single_id": ids[0], "selected_ids": ids[1:3], "remaining_id": ids[3]}
+
+    def test_strm_clear_single_selected_cancel_failure_and_duplicate_desktop(self):
+        self.strm_clear_single_and_selected(1280)
+
+    def test_strm_clear_single_selected_cancel_failure_and_duplicate_mobile(self):
+        self.strm_clear_single_and_selected(390)
+
+    def strm_clear_filter_snapshot(self, width):
+        from app import database as db
+
+        page = self.make_strm_page(width, count=3)
+        for selector, value in (("#strmFailureSourceFilter", "fixture-a"), ("#strmFailureActionFilter", "generate")):
+            page.locator(selector).select_option(value)
+            page.wait_for_function("document.querySelector('#strmFailureList').getAttribute('aria-busy') === 'false'")
+        page.locator("#clearStrmFailuresBtn").click()
+        confirmation = page.locator("#appConfirmMessage").inner_text()
+        self.assertIn("3", confirmation)
+        db.record_strm_failure(
+            source_id="fixture-b", source_name="隔离来源 B", file_id="new",
+            parent_id="fixture-b", filename="new.mkv", action="generate",
+            rel_dir="fixture", target_rel_path="fixture/new.strm", error="fixture failure",
+        )
+        self.hold_reply("/api/strm/failures", "new-filters", method="GET")
+        # 走原生筛选事件和真实 GET，模拟确认期间已有筛选事件/来源更新的晚到回包。
+        page.locator("#strmFailureSourceFilter").evaluate(
+            "field => { field.value=''; field.dispatchEvent(new Event('change',{bubbles:true})); }",
+        )
+        self.wait_reply("new-filters")
+        self.release_reply("new-filters")
+        self.assertIn("共 4 条", page.locator("#strmFailurePageInfo").inner_text())
+        self.assertEqual(page.locator("#appConfirmMessage").inner_text(), confirmation)
+        self.hold_reply("/api/strm/failures/clear", "filtered-clear")
+        page.locator("#appConfirmSubmit").click()
+        self.wait_reply("filtered-clear")
+        self.assertEqual(self.requests[-1]["body"], {"all": True, "source_id": "fixture-a", "action": "generate", "status": "open"})
+        self.assertEqual(db.count_strm_failures(status="open", source_id="fixture-a"), 0)
+        self.assertEqual(db.count_strm_failures(status="open", source_id="fixture-b"), 1)
+        self.release_reply("filtered-clear")
+        self.observations = {"width": width, "confirmation": confirmation, "visible_total_changed_to": 4, "actual_deleted": 3}
+
+    def test_strm_clear_keeps_confirmed_filter_during_late_list_desktop(self):
+        self.strm_clear_filter_snapshot(1280)
+
+    def test_strm_clear_keeps_confirmed_filter_during_late_list_mobile(self):
+        self.strm_clear_filter_snapshot(390)
+
     def proxy_late_save(self, *, binding=False, status=200, new_pending=False, width=1280, same_object=False):
         page = self.make_page("media_proxy", width)
         modal, field, save, notice = (
