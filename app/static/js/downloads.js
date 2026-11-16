@@ -7,6 +7,9 @@ let issueBatchBusy = false;
 let logBatchBusy = false;
 let downloadLogPage = 1;
 let downloadIssuePage = 1;
+// 轮询沿用尚未完成的翻页意图，避免旧页覆盖用户请求。
+let downloadLogRequestedPage = 1;
+let downloadIssueRequestedPage = 1;
 let downloadLogRequestSerial = 0;
 let downloadIssueRequestSerial = 0;
 let hasLoadedDownloadLogs = false;
@@ -48,13 +51,13 @@ function switchDlTab(tabName, syncUrl=true) {
         if(panel)panel.hidden=!active;
     });
     document.getElementById('dlLogsFilters').style.display = isLogs ? 'grid' : 'none';
-    if(isIssues&&!hasLoadedDownloadIssues){
+    if(isIssues){
         announceDownloadTab('正在加载待处理请求');
-        loadIssues(downloadIssuePage).then(ok=>announceDownloadTab(ok?'待处理请求已加载':'待处理请求加载失败'));
+        loadIssues(downloadIssueRequestedPage).then(ok=>announceDownloadTab(ok?'待处理请求已加载':'待处理请求加载失败'));
     }
-    if(isLogs&&!hasLoadedDownloadLogs){
+    if(isLogs){
         announceDownloadTab('正在加载下载日志');
-        loadLogs(downloadLogPage).then(ok=>announceDownloadTab(ok?'下载日志已加载':'下载日志加载失败'));
+        loadLogs(downloadLogRequestedPage).then(ok=>announceDownloadTab(ok?'下载日志已加载':'下载日志加载失败'));
     }
     if(syncUrl){
         const url=new URL(window.location.href);
@@ -415,7 +418,7 @@ function downloadLogTargetHtml(path) {
 
 function renderLogs(data) {
     const rows=data.items||[]; const page=Number(data.page)||1; const pages=Number(data.pages)||0; const total=Number(data.total)||0;
-    downloadLogPage=page;
+    downloadLogPage=downloadLogRequestedPage=page;
     currentLogIds=rows.map(row=>Number(row.id)||0).filter(Boolean);
     const logCountEl=document.getElementById('logCount');
     if(window.MFAnim && logCountEl) window.MFAnim.countUp(logCountEl, total);
@@ -473,7 +476,7 @@ function renderLogs(data) {
 
 function renderIssues(data) {
     const rows=data.items||[]; const page=Number(data.page)||1; const pages=Number(data.pages)||0; const total=Number(data.total)||0;
-    downloadIssuePage=page;
+    downloadIssuePage=downloadIssueRequestedPage=page;
     currentIssueIds=rows.map(row=>Number(row.id)||0).filter(Boolean);
     const issueBadgeEl=document.getElementById('tabIssuesBadge');
     if(window.MFAnim && issueBadgeEl) window.MFAnim.countUp(issueBadgeEl, total);
@@ -532,6 +535,12 @@ function renderIssues(data) {
     window.renderLucideIcons?.(body);
 }
 
+function refreshActiveDownloadList(){
+    if(!document.getElementById('viewIssues').hidden)return loadIssues(downloadIssueRequestedPage);
+    if(!document.getElementById('viewLogs').hidden)return loadLogs(downloadLogRequestedPage);
+    return Promise.resolve(true);
+}
+
 function loadOverview(manual=false) {
     overviewRefreshQueued=true;
     overviewQueuedManual=overviewQueuedManual||manual;
@@ -545,7 +554,10 @@ function loadOverview(manual=false) {
                 overviewRefreshQueued=false;
                 overviewQueuedManual=false;
                 try{
-                    const data=await api('/api/downloads/overview').then(readApiResponse);
+                    const [data,listLoaded]=await Promise.all([
+                        api('/api/downloads/overview').then(readApiResponse),
+                        refreshActiveDownloadList(),
+                    ]);
                     const qb=data.qb||{tasks:[],error:'读取失败'};
                     const signature=qbDisplaySignature(qb);
                     if(signature!==currentQbDisplaySignature){
@@ -554,8 +566,8 @@ function loadOverview(manual=false) {
                     }else{
                         updateQbLiveRows(qb);
                     }
-                    document.getElementById('lastRefresh').textContent=currentManual?'刚刚更新':'更新于 '+new Date().toLocaleTimeString();
-                    succeeded=true;
+                    if(listLoaded)document.getElementById('lastRefresh').textContent=currentManual?'刚刚更新':'更新于 '+new Date().toLocaleTimeString();
+                    succeeded=listLoaded;
                 }catch(error){
                     document.getElementById('qbStatus').textContent='请求失败';
                     if(currentManual&&window.appAlert)appAlert({type:'error',title:'刷新失败',message:error.message||'无法读取下载器状态。'});
@@ -571,6 +583,7 @@ function loadOverview(manual=false) {
 
 function loadLogs(page=1){
     const requestedPage=Math.max(1,Number(page)||1);
+    downloadLogRequestedPage=requestedPage;
     const requestSerial=++downloadLogRequestSerial;
     const s=document.getElementById('logSource').value,st=document.getElementById('logStatus').value,k=document.getElementById('logKeyword').value.trim();
     const q=[`page=${requestedPage}`,`page_size=${DOWNLOAD_LOG_PAGE_SIZE}`];
@@ -588,6 +601,7 @@ function loadLogs(page=1){
 }
 function loadIssues(page=1){
     const requestedPage=Math.max(1,Number(page)||1);
+    downloadIssueRequestedPage=requestedPage;
     const requestSerial=++downloadIssueRequestSerial;
     return api(`/api/downloads/issues?page=${requestedPage}&page_size=${DOWNLOAD_ISSUE_PAGE_SIZE}`).then(readApiResponse).then(data=>{
         if(requestSerial!==downloadIssueRequestSerial)return false;
@@ -640,7 +654,7 @@ async function resubmitIssue(requestId,target){
             title:partial?'下载任务部分提交成功':'下载任务已重新提交',
             message:`新请求 #${data.request_id}${succeeded.length?` · 已提交到 ${succeeded.join('、')}`:''}${failed.length?` · ${failed.join('、')} 提交失败，请查看新的待处理记录`:''}`,
         });
-        await Promise.all([loadIssues(downloadIssuePage),loadOverview(true)]);
+        await loadOverview(true);
         return true;
     }catch(error){
         appAlert({
@@ -671,7 +685,7 @@ async function retryLocalImport(requestId){
         const data=await response.json().catch(()=>({}));
         if(!response.ok||!data.ok)throw new Error(data.error||'本地整理未能重新排队');
         appAlert({type:'success',title:'本地整理已重新排队',message:`请求 #${id} 将由下载跟踪器重新检查，不会重新提交下载。`});
-        await Promise.all([loadLogs(downloadLogPage),loadIssues(downloadIssuePage),loadOverview()]);
+        await loadOverview();
         return true;
     }catch(error){
         appAlert({type:receivedResponse?'error':'warning',title:receivedResponse?'重试整理失败':'重试状态待核对',message:receivedResponse?(error.message||'请核对本地来源配置'):'请先刷新任务状态核对，不要立即重复操作。'});
@@ -750,13 +764,16 @@ async function resubmitIssuesBatch(target){
         const response=await api('/api/downloads/issues/batch/resubmit',{method:'POST',body:JSON.stringify({request_ids:requestIds,target})});
         receivedResponse=true;
         const data=await response.json().catch(()=>({}));
-        if(!response.ok)throw new Error(data.error||'批量重新提交失败');
-        selectedIssueIds.clear();
+        const items=Array.isArray(data.items)?data.items:[];
+        if(!response.ok||(data.ok===false&&!items.length))throw new Error(data.error||'批量重新提交失败');
+        items.forEach(item=>{
+            if(['succeeded','partial'].includes(item.outcome))selectedIssueIds.delete(Number(item.source_request_id));
+        });
         const completed=Number(data.succeeded||0)+Number(data.partial||0);
         const failed=Number(data.failed||0);
         const skipped=Number(data.skipped||0);
-        const type=failed?(completed?'warning':'error'):((Number(data.partial||0)||skipped)?'warning':'success');
-        const reasons=(Array.isArray(data.items)?data.items:[])
+        const type=failed?(completed?'warning':'error'):((!completed||Number(data.partial||0)||skipped)?'warning':'success');
+        const reasons=items
             .filter(item=>item.error&&['skipped','failed','partial'].includes(item.outcome))
             .slice(0,3).map(item=>`请求 #${item.source_request_id}：${item.error}`);
         appAlert({
@@ -764,7 +781,7 @@ async function resubmitIssuesBatch(target){
             title:type==='success'?'批量重新提交完成':type==='error'?'批量重新提交失败':'批量重新提交已处理',
             message:`成功 ${Number(data.succeeded||0)} 条 · 部分成功 ${Number(data.partial||0)} 条 · 跳过 ${skipped} 条 · 失败 ${failed} 条${reasons.length?'\n'+reasons.join('\n'):''}`,
         });
-        await Promise.all([loadIssues(downloadIssuePage),loadOverview(true),loadLogs(downloadLogPage)]);
+        await loadOverview(true);
         return completed>0;
     }catch(error){
         appAlert({
