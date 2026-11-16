@@ -23,6 +23,7 @@ from app.repositories.media_refresh_queue import (
     next_media_refresh_due_in,
     recent_media_refresh_target_ids,
     recover_media_refresh_leases,
+    register_media_refresh_handoff,
 )
 
 logger = get_logger(__name__)
@@ -69,6 +70,7 @@ def enqueue_media_refresh_paths(
     library_binding: dict[str, str] | None = None,
     immediate: bool = False,
     allow_emby: bool = True,
+    source_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, str]:
     """持久登记刷新；无可用自动目标时明确返回全局 skipped，不创建待办。"""
     selected = tuple(dict.fromkeys(
@@ -79,6 +81,8 @@ def enqueue_media_refresh_paths(
         )
         if (item or "").strip()
     ))
+    if source_entries is not None:
+        register_media_refresh_handoff(source_entries, providers=selected or ("媒体库",))
     if not selected:
         return {"媒体库": "skipped"}
     results: dict[str, str] = {}
@@ -94,6 +98,7 @@ def enqueue_media_refresh_paths(
                 allowed_library_ids=allowed_library_ids,
                 library_binding=library_binding,
                 debounce_seconds=delay,
+                source_entries=source_entries,
             )
         except Exception as exc:
             logger.warning(
@@ -201,6 +206,7 @@ class MediaRefreshCoordinator:
                         lease_seconds=300,
                         limit=8,
                     )
+                    self._reconcile_results()
                     for group in claimed:
                         worked = True
                         self._process_group(group)
@@ -227,6 +233,14 @@ class MediaRefreshCoordinator:
                     self._worker_lock.release()
                 except Exception:
                     logger.exception("释放媒体库刷新合并器跨进程锁失败")
+
+    @staticmethod
+    def _reconcile_results() -> None:
+        from app.modules.scheduler import reconcile_strm_media_refresh_results
+        from app.repositories.media_refresh_queue import collect_media_refresh_results
+
+        reconcile_strm_media_refresh_results()
+        collect_media_refresh_results()
 
     @staticmethod
     def _client_for(provider: str):
@@ -298,6 +312,7 @@ class MediaRefreshCoordinator:
             close_media_server_client(client)
 
         deferred = outcome.get("deferred_targets") or {}
+        outcome["fallback"] = redact_sensitive_text(str(outcome.get("fallback") or ""))[:500]
         # 数据库结算失败必须交回消费者恢复；不能当成媒体服务器失败再清空队列。
         if not settle_media_refresh(
             str(group.get("group_key") or ""), owner=self._owner,
@@ -305,6 +320,7 @@ class MediaRefreshCoordinator:
             deferred_targets=deferred,
             refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
             recent_ttl_seconds=_recent_ttl_seconds(),
+            outcome=outcome,
         ):
             return
         failed = bool(outcome.get("retryable") or outcome.get("unmatched_paths") or (
@@ -318,7 +334,7 @@ class MediaRefreshCoordinator:
             logger.warning(
                 "%s 媒体库刷新未完成，失败路径已结束自动处理；已完成的整理与 STRM 不受影响，"
                 "请在 %s 中手动刷新媒体库。原因=%s 路径数=%s 样例=%s",
-                label, label, redact_sensitive_text(str(outcome.get("fallback") or "路径未匹配媒体库或刷新失败"))[:300],
+                label, label, redact_sensitive_text(outcome.get("fallback") or "路径未匹配媒体库或刷新失败")[:300],
                 len(paths), "；".join(paths[:3]),
             )
         else:
@@ -332,6 +348,7 @@ class MediaRefreshCoordinator:
             from app.services import clear_dashboard_cache
 
             clear_dashboard_cache(keep_stale=True)
+        self._reconcile_results()
 
 
 _coordinator = MediaRefreshCoordinator()

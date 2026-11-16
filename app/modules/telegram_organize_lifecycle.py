@@ -645,13 +645,15 @@ def update_organize_lifecycle_downstream(
         if strm_run_id is not None and strm_run_id < previous_run_id:
             return NotificationPublishResult(False, status="stale_run")
         new_run = strm_run_id is not None and strm_run_id > previous_run_id
+        if new_run:
+            downstream = {}
         receipt = None if new_run else previous.lifecycle.get("refresh")
         if refresh_handoff:
             entries = set(tuple(item) for item in (receipt or {}).get("entries", []))
             entries.update((path, refresh_handoff["allow_emby"]) for path in refresh_handoff["paths"])
             receipt = {"entries": sorted(entries), "pending_label": media_refresh, "error": error}
         # 刷新错误单独结算；后续单批成功不能清掉前批非刷新错误。
-        preserve_failure = not new_run and (bool(refresh_handoff) or not (partial or error))
+        preserve_failure = bool(refresh_handoff) or (not new_run and not (partial or error))
         event, importance = _project_downstream(
             previous, strm_status=strm_status, media_refresh=media_refresh,
             partial=bool(downstream.get("partial")) if preserve_failure else partial,

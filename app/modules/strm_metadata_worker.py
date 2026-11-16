@@ -381,9 +381,11 @@ class STRMMetadataWorker:
 
     def _flush_media_refresh(self, *, force: bool) -> None:
         from app.modules.telegram_organize_lifecycle import reconcile_organize_refresh_notifications
+        from app.modules.scheduler import reconcile_strm_media_refresh_results
 
         # 先收敛上轮 ACK 后中断的通知；即使刷新 outbox 已空也不能漏掉。
         reconcile_organize_refresh_notifications()
+        reconcile_strm_media_refresh_results()
         entries = strm_repo.list_strm_refresh_entries(limit=20000)
         if not entries:
             return
@@ -422,6 +424,7 @@ class STRMMetadataWorker:
                     paths,
                     immediate=force,
                     allow_emby=allow_emby,
+                    source_entries=batch,
                 )
             except Exception:
                 retry_pending = True
@@ -448,6 +451,7 @@ class STRMMetadataWorker:
                 )
         self._refresh_retry_pending = retry_pending
         reconcile_organize_refresh_notifications()
+        reconcile_strm_media_refresh_results()
 
 
 _worker = STRMMetadataWorker()

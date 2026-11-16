@@ -152,7 +152,7 @@ class StrmFirstInstallRecoveryTests(unittest.TestCase):
         ) as handoff:
             STRMMetadataWorker()._flush_media_refresh(force=True)
         handoff.assert_called_once_with(
-            [str(self.target)], immediate=True, allow_emby=False,
+            [str(self.target)], immediate=True, allow_emby=False, source_entries=entries,
         )
         self.assertEqual(strm_repo.count_strm_refresh_paths(), 0)
 

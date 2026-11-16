@@ -43,7 +43,7 @@ def _tree(*, flat=False, etag="e"):
 
 def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
          flat=False, retire=False, configured_text=None, queue_only=False,
-         trigger_type="manual", metadata_exts=None):
+         trigger_type="manual", metadata_exts=None, run_options=None):
     """经真实 scheduler 注入策略；不直接为安装器伪造刷新行为。"""
     scheduler = STRMScheduler()
     sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""})
@@ -74,6 +74,7 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
 
         def execute_with_policy(trigger, run_id):
             scheduler._run_options.update(media_server_refresh_override=enabled)
+            scheduler._run_options.update(run_options or {})
             return execute(trigger, run_id)
 
         stack.enter_context(patch.object(scheduler, "_execute_locked", side_effect=execute_with_policy))
@@ -110,6 +111,283 @@ def _consume(*, providers, expected_paths):
             coordinator._process_group(group)
     assert repository.count_strm_refresh_paths() == 0
     assert media_refresh_queue_status()["paths"] == 0
+
+
+def test_refresh_failure_is_persisted_on_original_run_without_reverting_generation(tmp_path):
+    with isolated_test_database(), _providers("jellyfin"):
+        result = _run(tmp_path)
+        assert result["stats"]["generated"] == 1
+        original = db.get_last_task_run("strm_sync")
+        assert original is not None
+        coordinator = refresh.MediaRefreshCoordinator()
+        group = claim_due_media_refreshes(owner=coordinator._owner, force=True)[0]
+        client = Mock(display_name="Jellyfin")
+        client.refresh_for_paths.return_value = {"ok": False, "retryable": True, "fallback": "HTTP 503"}
+        with patch.object(coordinator, "_client_for", return_value=client):
+            coordinator._process_group(group)
+        db.init_db()
+        row = db.get_task_run(original["id"])
+        assert row is not None
+        payload = json.loads(row["result"])
+        assert row["status"] == "success"
+        assert payload["media_refresh"] == {"Jellyfin": "failed"}
+        assert payload["media_refresh_results"]["status"] == "failed"
+        assert "HTTP 503" in str(payload["media_refresh_results"])
+        public = scheduler_module.strm_status(original["id"])
+        assert public["status"] == "completed"
+        assert public["data"]["task"]["media_refresh"] == {"status": "failed", "pending": False, "providers": {"Jellyfin": "failed"}}
+        assert "HTTP 503" not in str(public)
+        assert list(tmp_path.rglob("*.strm"))
+        assert claim_due_media_refreshes(owner="restart", force=True) == []
+
+
+@pytest.mark.parametrize("probe", [False, True])
+@pytest.mark.parametrize("notify_override", [False, True])
+def test_silent_confirmation_receives_refresh_terminal_result(tmp_path, probe, notify_override):
+    from app.repositories import organize_confirmations as confirmations
+
+    with isolated_test_database(), _providers("jellyfin"), patch(
+        "app.modules.telegram_notification_center.get_notification_thread_event",
+        side_effect=AssertionError("静默确认不能读取或投递 TG 线程"),
+    ) as telegram_thread:
+        confirmations.create_organize_confirmation(
+            token="s06-silent", fingerprint="s06-silent", chat_id="s06-chat",
+            source_name="S", directory_path="Film", payload={}, expires_at="2099-01-01 00:00:00",
+        )
+        confirmations.update_organize_confirmation("s06-silent", status="completed", result_json="{}")
+        refs = [{
+            "topic": "confirmation", "thread_key": "confirmation:s06-silent", "token": "s06-silent",
+            "chat_id": "s06-chat", "topic_enabled": False,
+        }]
+        options = {"notify_override": notify_override, "notification_threads": refs}
+        if probe:
+            options = {"notification_scopes": [{"probe": True, "notify_override": notify_override,
+                "context": {"notification_threads": refs, "notify_enabled": True, "topic_enabled": True}}]}
+        _run(tmp_path, run_options=options)
+        worker = refresh.MediaRefreshCoordinator()
+        group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+        client = Mock(display_name="Jellyfin")
+        client.refresh_for_paths.return_value = {"ok": False, "fallback": "HTTP 503"}
+        with patch.object(worker, "_client_for", return_value=client):
+            worker._process_group(group)
+        row = confirmations.get_organize_confirmation("s06-silent")
+        assert row is not None
+        assert row["status"] == "completed"
+        downstream = json.loads(row["result_json"])["_downstream"]
+        assert downstream["strm"] == "完成"
+        assert "失败" in downstream["media_refresh"]
+        assert downstream["partial"]
+        telegram_thread.assert_not_called()
+
+
+def test_multiple_providers_preserve_failure_and_deferred_success_after_restart(tmp_path):
+    with isolated_test_database(), _providers("jellyfin", "emby"):
+        _run(tmp_path)
+        row = db.get_last_task_run("strm_sync")
+        assert row is not None
+        run_id = row["id"]
+        worker = refresh.MediaRefreshCoordinator()
+        groups = {group["provider"]: group for group in claim_due_media_refreshes(owner=worker._owner, force=True)}
+        path = groups["jellyfin"]["paths"][0]
+        client = Mock(display_name="fixture")
+        client.refresh_for_paths.return_value = {"ok": False, "fallback": "HTTP 503"}
+        with patch.object(worker, "_client_for", return_value=client):
+            worker._process_group(groups["emby"])
+        client.refresh_for_paths.return_value = {"ok": True, "deferred_targets": {path: "film"}}
+        with patch.object(worker, "_client_for", return_value=client):
+            worker._process_group(groups["jellyfin"])
+        row = db.get_task_run(run_id)
+        assert row is not None
+        result = json.loads(row["result"])
+        assert result["media_refresh_results"]["status"] == "partial"
+        assert result["refresh_pending"]
+        db.init_db()
+        worker = refresh.MediaRefreshCoordinator()
+        pending = claim_due_media_refreshes(owner=worker._owner, force=True)
+        assert len(pending) == 1 and pending[0]["provider"] == "jellyfin"
+        client.refresh_for_paths.return_value = {"ok": True, "succeeded_paths": [path]}
+        with patch.object(worker, "_client_for", return_value=client):
+            worker._process_group(pending[0])
+        row = db.get_task_run(run_id)
+        assert row is not None
+        result = json.loads(row["result"])
+        assert result["media_refresh"] == {"Emby": "failed", "Jellyfin": "success"}
+        assert not result["refresh_pending"]
+        assert row["status"] == "success"
+        assert claim_due_media_refreshes(owner="later", force=True) == []
+        assert json.loads(db.kv_get("media_refresh_queue:v1"))["events"] == {}
+
+
+def test_projection_outage_restarts_without_replaying_actual_refresh(tmp_path):
+    with isolated_test_database(), _providers("jellyfin"):
+        _run(tmp_path)
+        row = db.get_last_task_run("strm_sync")
+        assert row is not None
+        worker = refresh.MediaRefreshCoordinator()
+        group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+        client = Mock(display_name="fixture")
+        client.refresh_for_paths.return_value = {"ok": False, "fallback": "HTTP 503"}
+        with patch.object(worker, "_client_for", return_value=client), patch.object(
+            scheduler_module, "_publish_linked_notification_threads", side_effect=sqlite3.OperationalError("outbox unavailable"),
+        ):
+            worker._process_group(group)
+        state = json.loads(db.kv_get("media_refresh_queue:v1"))
+        assert state["events"] and state["origins"] and not state["groups"]
+        db.init_db()
+        restarted = refresh.MediaRefreshCoordinator()
+        with patch.object(restarted, "_client_for") as retry:
+            restarted._reconcile_results()
+        retry.assert_not_called()
+        assert client.refresh_for_paths.call_count == 1
+        state = json.loads(db.kv_get("media_refresh_queue:v1"))
+        assert not state["events"] and not state["origins"]
+        result = db.get_task_run(row["id"])
+        assert result is not None
+        assert json.loads(result["result"])["media_refresh"] == {"Jellyfin": "failed"}
+
+
+def test_actual_client_partial_results_are_saved_on_original_run(tmp_path):
+    from tests.test_deep_audit_media_chain import MediaEndpoint
+
+    tree = {"s": [GuangYaFile("a", "A", True, parent_id="s"), GuangYaFile("b", "B", True, parent_id="s")],
+            "a": [GuangYaFile("va", "A.mkv", False, 100, "a", "a")],
+            "b": [GuangYaFile("vb", "B.mkv", False, 100, "b", "b")]}
+    with isolated_test_database(), _providers("jellyfin"):
+        _run(tmp_path, tree=tree)
+        endpoint = MediaEndpoint(tmp_path / strm.STRM_SUBDIR, series={
+            "accepted-a": tmp_path / strm.STRM_SUBDIR / "A", "failed-b": tmp_path / strm.STRM_SUBDIR / "B",
+        })
+        post = endpoint.post
+
+        def partial_http(url, **kwargs):
+            if "failed-b" in url:
+                raise OSError("fixture HTTP 503")
+            return post(url, **kwargs)
+
+        worker = refresh.MediaRefreshCoordinator()
+        group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+        with patch.object(worker, "_client_for", side_effect=endpoint.client), patch.object(endpoint, "post", side_effect=partial_http):
+            worker._process_group(group)
+        row = db.get_last_task_run("strm_sync")
+        assert row is not None and row["status"] == "success"
+        result = json.loads(row["result"])["media_refresh_results"]
+        assert result["status"] == "partial" and not result["pending"]
+        statuses = {Path(event["path"]).parent.name: event["providers"]["jellyfin"]["status"] for event in result["events"].values()}
+        assert statuses == {"A": "success", "B": "failed"}
+        assert endpoint.posts == ["/Items/accepted-a/Refresh"]
+        assert claim_due_media_refreshes(owner="restart", force=True) == []
+
+
+@pytest.mark.parametrize("remaining", [("jellyfin",), ()])
+def test_provider_disabled_before_failed_enqueue_recovery_reaches_terminal(tmp_path, remaining):
+    enqueue = refresh.enqueue_media_refresh
+
+    def unavailable(provider, *args, **kwargs):
+        if provider == "emby":
+            raise sqlite3.OperationalError("fixture unavailable")
+        return enqueue(provider, *args, **kwargs)
+
+    with isolated_test_database():
+        with _providers("jellyfin", "emby"), patch.object(refresh, "enqueue_media_refresh", side_effect=unavailable):
+            _run(tmp_path)
+        assert repository.count_strm_refresh_paths() == 1
+        with _providers(*remaining):
+            STRMMetadataWorker()._flush_media_refresh(force=True)
+        assert repository.count_strm_refresh_paths() == 0
+        worker = refresh.MediaRefreshCoordinator()
+        groups = claim_due_media_refreshes(owner=worker._owner, force=True)
+        assert len(groups) == 1 and groups[0]["provider"] == "jellyfin"
+        client = Mock(display_name="fixture")
+        client.refresh_for_paths.return_value = {"ok": True}
+        with patch.object(worker, "_client_for", return_value=client):
+            worker._process_group(groups[0])
+        db.init_db()
+        worker._reconcile_results()
+        row = db.get_last_task_run("strm_sync")
+        assert row is not None
+        result = json.loads(row["result"])
+        assert result["media_refresh"] == {"Jellyfin": "success", "Emby": "skipped"}
+        assert row["status"] == "success" and result["strm_partial"] is False
+        assert not result["refresh_pending"]
+        state = json.loads(db.kv_get("media_refresh_queue:v1"))
+        assert state["events"] == state["origins"] == state["groups"] == {}
+
+
+def test_faster_refresh_cannot_be_overwritten_by_scheduler_queued_result(tmp_path):
+    with isolated_test_database(), _providers("jellyfin"):
+        enqueue = refresh.enqueue_media_refresh_paths
+        worker = refresh.MediaRefreshCoordinator()
+        client = Mock(display_name="fixture")
+        client.refresh_for_paths.return_value = {"ok": False, "fallback": "HTTP 503"}
+
+        def consume_before_return(*args, **kwargs):
+            result = enqueue(*args, **kwargs)
+            group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+            with patch.object(worker, "_client_for", return_value=client):
+                worker._process_group(group)
+            return result
+
+        with patch.object(refresh, "enqueue_media_refresh_paths", side_effect=consume_before_return):
+            _run(tmp_path)
+        row = db.get_last_task_run("strm_sync")
+        assert row is not None and row["status"] == "success"
+        assert json.loads(row["result"])["media_refresh"] == {"Jellyfin": "failed"}
+
+
+@pytest.mark.parametrize("newer_finished", [False, True])
+def test_run_fence_preserves_newer_confirmation_after_origin_gc(tmp_path, newer_finished):
+    from app.repositories import organize_confirmations as confirmations
+
+    with isolated_test_database():
+        confirmations.create_organize_confirmation(
+            token="s06-newer", fingerprint="s06-newer", chat_id="s06-chat", source_name="S",
+            directory_path="Film", payload={"_notification_suppressed": True}, expires_at="2099-01-01 00:00:00",
+        )
+        confirmations.update_organize_confirmation("s06-newer", status="completed", result_json="{}")
+        options = {"notify_override": False, "notification_threads": [{
+            "topic": "confirmation", "thread_key": "confirmation:s06-newer", "token": "s06-newer",
+            "chat_id": "s06-chat", "topic_enabled": False,
+        }]}
+        with _providers("jellyfin"):
+            _run(tmp_path / "old", run_options=options)
+        old_run = db.get_last_task_run("strm_sync")
+        assert old_run is not None
+        worker = refresh.MediaRefreshCoordinator()
+        old = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+        with _providers("emby"):
+            _run(tmp_path / "new", run_options=options)
+        new_run = db.get_last_task_run("strm_sync")
+        assert new_run is not None
+        new = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+        client = Mock(display_name="fixture")
+        client.refresh_for_paths.return_value = {"ok": True}
+        if newer_finished:
+            with patch.object(worker, "_client_for", return_value=client):
+                worker._process_group(new)
+            assert str(new_run["id"]) not in json.loads(db.kv_get("media_refresh_queue:v1"))["origins"]
+        row = confirmations.get_organize_confirmation("s06-newer")
+        assert row is not None
+        newer = json.loads(row["result_json"])["_downstream"]
+        assert newer["media_refresh"] == ("Emby 已刷新" if newer_finished else "Emby 已排队")
+        client.refresh_for_paths.return_value = {"ok": False, "fallback": "late HTTP 503"}
+        with patch.object(worker, "_client_for", return_value=client):
+            worker._process_group(old)
+        row = confirmations.get_organize_confirmation("s06-newer")
+        assert row is not None
+        assert json.loads(row["result_json"])["_downstream"] == newer
+        old_history = db.get_task_run(old_run["id"])
+        new_history = db.get_task_run(new_run["id"])
+        assert old_history is not None and new_history is not None
+        assert json.loads(old_history["result"])["media_refresh"] == {"Jellyfin": "failed"}
+        assert json.loads(new_history["result"])["media_refresh"] == {"Emby": "success" if newer_finished else "queued"}
+        if not newer_finished:
+            client.refresh_for_paths.return_value = {"ok": True}
+            with patch.object(worker, "_client_for", return_value=client):
+                worker._process_group(new)
+        db.init_db()
+        worker._reconcile_results()
+        state = json.loads(db.kv_get("media_refresh_queue:v1"))
+        assert state["events"] == state["origins"] == state["groups"] == {}
 
 
 @pytest.mark.parametrize("trigger_type", ["organize", "manual", "cron"])
@@ -256,7 +534,9 @@ def test_empty_provider_finishes_without_pending_refresh_or_later_replay(tmp_pat
             assert result["stats"]["generated"] == 1
             assert result["ok"] and not result["partial"]
             assert not result["refresh_pending"] and result["media_refresh"] == {}
-            assert db.get_last_task_run("strm_sync")["status"] == "success"
+            last_run = db.get_last_task_run("strm_sync")
+            assert last_run is not None
+            assert last_run["status"] == "success"
         assert repository.count_strm_refresh_paths() == 0
         assert media_refresh_queue_status()["paths"] == 0
         with _providers("jellyfin"):

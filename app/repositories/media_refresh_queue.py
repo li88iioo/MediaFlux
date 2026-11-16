@@ -10,17 +10,20 @@ import hashlib
 import json
 import time
 from collections.abc import Iterable, Mapping
+from contextlib import ExitStack
 from typing import Any
 
 from app import database as db
+from app.modules.process_lock import CrossProcessLock
 
 _QUEUE_KEY = "media_refresh_queue:v1"
 _STATE_VERSION = 1
 _MAX_RECENT_TARGETS = 4096
+media_refresh_projection_lock = CrossProcessLock("media-refresh-projection")
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": _STATE_VERSION, "groups": {}, "recent": {}}
+    return {"version": _STATE_VERSION, "groups": {}, "recent": {}, "events": {}, "origins": {}}
 
 
 def _read_state(conn) -> dict[str, Any]:
@@ -37,6 +40,8 @@ def _read_state(conn) -> dict[str, Any]:
         raise RuntimeError("媒体库刷新队列版本无效，已拒绝覆盖")
     if not isinstance(state.get("groups"), dict) or not isinstance(state.get("recent"), dict):
         raise RuntimeError("媒体库刷新队列结构无效，已拒绝覆盖")
+    state.setdefault("events", {})
+    state.setdefault("origins", {})
     # 旧等待/退避状态归一为一次待处理工作；不保留第二套恢复状态机。
     for group in state["groups"].values():
         if not isinstance(group, dict):
@@ -59,6 +64,59 @@ def _write_state(conn, state: dict[str, Any]) -> None:
         separators=(",", ":"),
     )
     db.kv_set_conn(conn, _QUEUE_KEY, payload)
+
+
+def _live_event_tokens(conn, entries: Iterable[dict[str, Any]]) -> set[str]:
+    """一次 SQL 批量查原事件，按 outbox 的 (path,allow_emby) 主键定位。"""
+    keys = [[entry["path"], int(entry.get("allow_emby", True)), entry["event_token"]] for entry in entries]
+    if not keys:
+        return set()
+    return {str(row["event_token"]) for row in conn.execute(
+        "SELECT o.event_token FROM json_each(?) j JOIN strm_refresh_outbox o "
+        "ON o.path=json_extract(j.value,'$[0]') AND o.allow_emby=json_extract(j.value,'$[1]') "
+        "AND o.event_token=json_extract(j.value,'$[2]')",
+        (json.dumps(keys, ensure_ascii=False),),
+    )}
+
+
+def _outbox_references(conn, state: dict[str, Any]) -> set[str]:
+    return _live_event_tokens(conn, (
+        {"event_token": token, "path": event["path"], "allow_emby": event.get("allow_emby", True)}
+        for token, event in state["events"].items() if event.get("source")
+    ))
+
+
+def _collect_results(conn, state: dict[str, Any]) -> None:
+    """队列只保留未完成交接/投影；历史终态已经属于原 task_run。"""
+    referenced = {
+        token for group in state["groups"].values()
+        for field in ("pending_events", "inflight_events")
+        for tokens in group.get(field, {}).values() for token in tokens
+    }
+    live_outbox = _outbox_references(conn, state)
+    terminal = {
+        token for token, event in state["events"].items()
+        if event["providers"] and all(value["status"] in {"success", "failed", "skipped"} for value in event["providers"].values())
+    }
+    busy = referenced | live_outbox
+    for key, origin in list(state["origins"].items()):
+        tokens = set(origin["events"])
+        if ("completion" in origin and origin["revision"] == origin["projected_revision"]
+                and tokens <= terminal and not tokens.intersection(busy)):
+            state["origins"].pop(key)
+    retained = {token for origin in state["origins"].values() for token in origin["events"]}
+    for token in terminal - retained - referenced - live_outbox:
+        state["events"].pop(token)
+
+
+def collect_media_refresh_results() -> None:
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _read_state(conn)
+        before = (len(state["events"]), len(state["origins"]))
+        _collect_results(conn, state)
+        if before != (len(state["events"]), len(state["origins"])):
+            _write_state(conn, state)
 
 
 def _normalized_provider(value: object) -> str:
@@ -173,6 +231,9 @@ def _recover_running_groups(
         group["pending_paths"] = _merge_paths(
             group.get("inflight_paths"), group.get("pending_paths")
         )
+        for path, tokens in group.pop("inflight_events", {}).items():
+            pending = group.setdefault("pending_events", {})
+            pending[path] = _merge_paths(tokens, pending.get(path))
         group["inflight_paths"] = []
         group["status"] = "queued"
         group["lease_owner"] = ""
@@ -191,6 +252,7 @@ def enqueue_media_refresh(
     library_binding: dict[str, str] | None = None,
     debounce_seconds: float = 20.0,
     now_epoch: float | None = None,
+    source_entries: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """合并一组变化路径；运行中到达的新路径只进入 pending，不覆盖 inflight。"""
     normalized_provider = _normalized_provider(provider)
@@ -205,6 +267,35 @@ def enqueue_media_refresh(
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
+        entries = list(source_entries or ())
+        live_tokens = _live_event_tokens(conn, entries) if source_entries is not None else set()
+        events_by_path: dict[str, list[str]] = {}
+        path_set = set(normalized_paths)
+        touched_origins = set()
+        for entry in entries:
+            path, token = str(entry["path"]), str(entry["event_token"])
+            if path not in path_set:
+                continue
+            if source_entries is not None and token not in live_tokens:
+                continue
+            event = state["events"].setdefault(token, {
+                "path": path, "providers": {}, "source": source_entries is not None,
+                "allow_emby": bool(entry.get("allow_emby", True)), "origins": [],
+            })
+            # outbox ACK 失败后的幂等交接不能重放已接受/失败的刷新。
+            previous = event["providers"].get(normalized_provider, {})
+            if previous.get("status") in {"success", "failed", "skipped"}:
+                continue
+            if previous.get("status") != "queued":
+                touched_origins.update(event.get("origins", []))
+                event["providers"][normalized_provider] = {"status": "queued"}
+            events_by_path.setdefault(path, []).append(token)
+        for origin_key in touched_origins:
+            state["origins"][origin_key]["revision"] += 1
+        if source_entries is not None:
+            normalized_paths = list(events_by_path)
+        if not normalized_paths:
+            return {"queued": 0, "group_key": key, "path_count": 0}
         # 生产者只追加 pending，绝不依据时间回收 running；消费者可能仍在执行
         # 一个较慢的媒体服务器请求。崩溃恢复只允许持有跨进程消费者锁的一方执行。
         _prune_recent(state, now_value)
@@ -235,6 +326,16 @@ def enqueue_media_refresh(
         group["pending_paths"] = _merge_paths(
             group.get("pending_paths"), normalized_paths
         )
+        pending_events = group.setdefault("pending_events", {})
+        inflight_events = group.get("inflight_events", {})
+        for path, tokens in events_by_path.items():
+            # 同一事件已被消费者领取时，重交接只收尾原 outbox。
+            tokens = [token for token in tokens if token not in inflight_events.get(path, [])]
+            pending_events[path] = _merge_paths(pending_events.get(path), tokens)
+        group["pending_paths"] = [
+            path for path in group["pending_paths"]
+            if path not in events_by_path or pending_events.get(path)
+        ]
         deadlines = group.get("path_due_at") or {}
         for path in normalized_paths:
             if path in deadlines:
@@ -291,13 +392,16 @@ def claim_due_media_refreshes(
             deadlines = _pending_deadlines(group)
             pending = [path for path, due_at in deadlines.items() if force or due_at <= now_value]
             ready = set(pending)
-            generation = max(0, int(group.get("lease_generation") or 0)) + 1
+            generation = max(int(state.get("lease_sequence") or 0), int(group.get("lease_generation") or 0)) + 1
+            state["lease_sequence"] = generation
             group["pending_paths"] = [path for path in deadlines if path not in ready]
             group["path_due_at"] = {
                 path: due_at for path, due_at in (group.get("path_due_at") or {}).items()
                 if path not in ready
             }
             group["inflight_paths"] = pending
+            pending_events = group.setdefault("pending_events", {})
+            group["inflight_events"] = {path: pending_events.pop(path, []) for path in pending}
             group["status"] = "running"
             group["lease_owner"] = safe_owner
             group["lease_until"] = now_value + max(30, (lease_seconds or 300))
@@ -325,6 +429,7 @@ def settle_media_refresh(
     deferred_targets: Mapping[str, str] | None = None,
     recent_ttl_seconds: int = 90,
     now_epoch: float | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> bool:
     """按延期目标原 expiry 结算；保留新变化的 quiet window 与未到期路径。"""
     now_value = float(time.time() if now_epoch is None else now_epoch)
@@ -350,6 +455,25 @@ def settle_media_refresh(
         inflight = _normalized_paths(group.get("inflight_paths"))
         if not deferred.keys() <= set(inflight):
             raise ValueError("延后刷新路径不属于本轮任务")
+        result = outcome or {"ok": True}
+        succeeded = set(result.get("succeeded_paths") or ())
+        failed = bool(result.get("retryable") or result.get("unmatched_paths") or (
+            not result.get("ok") and not deferred
+        ))
+        inflight_events = group.pop("inflight_events", {})
+        touched_origins = set()
+        for path in inflight:
+            status = "queued" if path in deferred else "success" if path in succeeded or not failed else "failed"
+            for token in inflight_events.get(path, []):
+                event = state["events"][token]
+                touched_origins.update(event.get("origins", []))
+                event["providers"][provider] = {
+                    "status": status, "finished_at": now_value if status != "queued" else None,
+                    "error": str(result.get("fallback") or "刷新失败，请手动刷新媒体库") if status == "failed" else "",
+                    "scope": str(result.get("scope") or ""),
+                }
+        for key in touched_origins:
+            state["origins"][key]["revision"] += 1
         pending = _normalized_paths(group.get("pending_paths"))
         pending_deadlines = _pending_deadlines(group)
         deadlines = dict(group.get("path_due_at") or {})
@@ -357,14 +481,135 @@ def settle_media_refresh(
             expiry = float(state["recent"].get(f"{provider}:{target}") or now_value)
             deadlines[path] = max(now_value, expiry, pending_deadlines.get(path, 0))
         group["pending_paths"] = _merge_paths((path for path in inflight if path in deferred), pending)
+        pending_events = group.setdefault("pending_events", {})
+        for path in deferred:
+            pending_events[path] = _merge_paths(inflight_events.get(path), pending_events.get(path))
         group["path_due_at"] = deadlines
         if not group["pending_paths"]:
             state["groups"].pop(group_key, None)
         else:
             group.update(inflight_paths=[], status="queued", lease_owner="", lease_until=0, updated_at=now_value)
         _prune_recent(state, now_value)
+        _collect_results(conn, state)
         _write_state(conn, state)
     return True
+
+
+def register_media_refresh_handoff(
+    entries: list[dict[str, Any]], *, providers: Iterable[str] | None = None,
+    run_id: int | None = None, options: dict[str, Any] | None = None,
+    completion: dict[str, Any] | None = None,
+) -> None:
+    """在交接前冻结原事件/运行；后到的初始化不能覆盖消费者终态。"""
+    from app.repositories.strm_request_ownership import refresh_work_key
+
+    with ExitStack() as stack:
+        media_refresh_projection_lock.acquire()
+        stack.callback(media_refresh_projection_lock.release)
+        conn = stack.enter_context(db.get_conn())
+        conn.execute("BEGIN IMMEDIATE")
+        state = _read_state(conn)
+        if run_id is not None:
+            origin = state["origins"].setdefault(str(run_id), {
+                "run_id": run_id, "events": [], "options": options or {}, "revision": 0, "projected_revision": -1,
+            })
+            if options is not None and origin["options"] != options:
+                origin["options"] = options
+                origin["revision"] += 1
+            if completion is not None:
+                origin["completion"] = completion
+                origin["revision"] += 1
+                row = conn.execute("SELECT result FROM task_runs WHERE id=?", (run_id,)).fetchone()
+                if row is not None:
+                    result = json.loads(row["result"] or "{}")
+                    result["media_refresh_origin"] = {"options": origin["options"], "completion": completion}
+                    conn.execute("UPDATE task_runs SET result=? WHERE id=?", (json.dumps(result, ensure_ascii=False), run_id))
+        origin_tokens = {key: set(origin["events"]) for key, origin in state["origins"].items()}
+        selected = set(providers) if providers is not None else None
+        live_tokens = _live_event_tokens(conn, entries)
+        work_keys = [[refresh_work_key(str(entry["path"]), bool(entry.get("allow_emby", True))), entry["event_token"]]
+                     for entry in entries if entry["event_token"] in live_tokens]
+        owners_by_token: dict[str, set[str]] = {}
+        if work_keys:
+            rows = conn.execute(
+                "SELECT DISTINCT json_extract(j.value,'$[1]') AS token,r.strm_run_id "
+                "FROM json_each(?) j CROSS JOIN strm_request_work w "
+                "ON w.kind='refresh' AND w.work_key=json_extract(j.value,'$[0]') "
+                "CROSS JOIN download_requests r ON r.id=w.request_id AND r.strm_generation=w.generation "
+                "AND COALESCE(r.organize_task_id,'')=w.organize_task_id WHERE r.strm_run_id IS NOT NULL",
+                (json.dumps(work_keys),),
+            )
+            for row in rows:
+                owners_by_token.setdefault(str(row["token"]), set()).add(str(row["strm_run_id"]))
+        for entry in entries:
+            token, path = str(entry["event_token"]), str(entry["path"])
+            if token not in live_tokens:
+                continue
+            event = state["events"].setdefault(token, {
+                "path": path, "providers": {}, "source": True,
+                "allow_emby": bool(entry.get("allow_emby", True)), "origins": [],
+            })
+            if selected is not None:
+                retired = False
+                for provider, outcome in event["providers"].items():
+                    if outcome["status"] == "pending" and provider not in selected:
+                        event["providers"][provider] = {"status": "skipped", "error": "交接前媒体服务器已停用"}
+                        retired = True
+                if retired:
+                    for key in event["origins"]:
+                        state["origins"][key]["revision"] += 1
+                for provider in selected:
+                    event["providers"].setdefault(provider, {"status": "skipped" if provider == "媒体库" else "pending"})
+            # 恢复 worker 在 ACK 删除归属前读取原运行；绝不借用新的默认 chat。
+            origins = set(owners_by_token.get(token, ()))
+            if run_id is not None:
+                origins.add(str(run_id))
+            for key in origins:
+                origin = state["origins"].get(key)
+                if origin is None:
+                    row = conn.execute("SELECT result FROM task_runs WHERE id=?", (int(key),)).fetchone()
+                    result = json.loads(row["result"] or "{}") if row else {}
+                    archived = result.get("media_refresh_origin")
+                    if archived:
+                        origin = {"run_id": int(key), "events": [], "revision": 0, "projected_revision": -1,
+                                  **archived, "baseline": result.get("media_refresh_results", {}).get("providers", {})}
+                        state["origins"][key] = origin
+                        origin_tokens[key] = set()
+                if origin is not None and token not in origin_tokens[key]:
+                    origin["events"].append(token)
+                    origin_tokens[key].add(token)
+                    event["origins"].append(key)
+                    origin["revision"] += 1
+        _write_state(conn, state)
+
+
+def pending_media_refresh_projections() -> list[dict[str, Any]]:
+    with db.get_conn() as conn:
+        state = _read_state(conn)
+        outstanding = _outbox_references(conn, state)
+    origins = state["origins"]
+    pending = []
+    for origin in origins.values():
+        if "completion" not in origin or origin["revision"] == origin["projected_revision"]:
+            continue
+        snapshot = {**origin, "results": {token: state["events"][token] for token in origin["events"]},
+                    "outbox_pending": bool(outstanding.intersection(origin["events"]))}
+        pending.append(snapshot)
+    return pending
+
+
+def acknowledge_media_refresh_projections(revisions: list[tuple[int, int]]) -> None:
+    if not revisions:
+        return
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _read_state(conn)
+        for run_id, revision in revisions:
+            origin = state["origins"].get(str(run_id))
+            if origin is not None and origin["revision"] == revision:
+                origin["projected_revision"] = revision
+        _collect_results(conn, state)
+        _write_state(conn, state)
 
 
 def recover_media_refresh_leases(*, now_epoch: float | None = None) -> int:
@@ -374,6 +619,16 @@ def recover_media_refresh_leases(*, now_epoch: float | None = None) -> int:
         conn.execute("BEGIN IMMEDIATE")
         state = _read_state(conn)
         recovered = _recover_running_groups(state, now_value, force=True)
+        for origin in state["origins"].values():
+            if "completion" in origin:
+                continue
+            row = conn.execute("SELECT status,result FROM task_runs WHERE id=?", (origin["run_id"],)).fetchone()
+            if row is not None and row["status"] != "running":
+                result = json.loads(row["result"] or "{}")
+                partial = bool(result.get("strm_partial") or row["status"] in {"failed", "skipped"})
+                origin["completion"] = {"strm_status": "部分完成" if partial else "完成", "partial": partial,
+                                        "error": "STRM 同步未全部完成，请查看运行记录" if partial else ""}
+                recovered += 1
         pruned = _prune_recent(state, now_value)
         if recovered or pruned:
             _write_state(conn, state)

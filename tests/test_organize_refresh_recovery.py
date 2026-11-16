@@ -182,6 +182,14 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
             # 新 worker 实例从 SQLite 读取失败遗留项；不传入通知 ID 或伪造成功回调。
             STRMMetadataWorker()._flush_media_refresh(force=True)
             assert strm_repo.count_strm_refresh_paths() == 0
+            after_handoff = snapshot()
+            assert dict(after_handoff["fields"])["媒体库"] == "Jellyfin 已排队"
+            assert after_handoff["event_key"] == before["event_key"]
+            if fail_refresh:
+                # 原恢复器解除待交接标记，统一队列再投影明确 provider；均原位更新。
+                assert after_handoff["revision"] == after_failure["revision"] + 2
+            else:
+                assert after_handoff == after_failure
             coordinator = refresh.MediaRefreshCoordinator()
             api = Mock(display_name="Jellyfin")
             api.refresh_for_paths.return_value = {"ok": True, "scope": "item", "requested": 1}
@@ -197,12 +205,12 @@ def test_real_handoff_and_refresh_recovery(tmp_path, monkeypatch, fail_refresh, 
             if fail_refresh:
                 assert after_failure["state"] == "partial"
                 assert "等待后台重试" in after_failure["footer"]
-                assert after_recovery["revision"] == after_failure["revision"] + 1
                 assert after_recovery["delivered_revision"] == after_recovery["revision"]
                 assert "等待后台重试" not in after_recovery["footer"]
-                assert dict(after_recovery["fields"])["媒体库"] == "已排队"
-            else:
-                assert after_recovery == after_failure
+            assert after_recovery["revision"] == after_handoff["revision"] + 1
+            assert dict(after_recovery["fields"])["媒体库"] == "Jellyfin 已刷新"
+            assert after_recovery["event_key"] == before["event_key"]
+            assert dict(after_recovery["fields"])["整理"] == dict(before["fields"])["整理"]
             assert after_recovery["state"] == ("partial" if parent_failed else "completed")
             assert after_recovery["title"] == ("⚠️ 光鸭整理部分完成" if parent_failed else "✅ 光鸭整理完成")
             assert sender.call_count == 1

@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -18,6 +19,7 @@ from app.repositories.media_refresh_queue import (
     recover_media_refresh_leases,
     settle_media_refresh,
     next_media_refresh_due_in,
+    register_media_refresh_handoff,
 )
 from tests.support import IsolatedDatabaseTestCase
 
@@ -335,6 +337,123 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
 class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         clear_media_refresh_queue()
+
+    def test_finished_large_batches_are_collected_after_projection_and_restart(self):
+        from app.repositories import strm as strm_repo
+
+        worker = MediaRefreshCoordinator()
+        client = Mock(display_name="Jellyfin")
+        for batch in range(6):
+            paths = [f"/media/{batch}/{index}.strm" for index in range(2000)]
+            entries = strm_repo.enqueue_strm_refresh_paths(paths)
+            run_id = db.add_task_run("strm_sync", "manual")
+            register_media_refresh_handoff(entries, run_id=run_id)
+            with patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator"):
+                enqueue_media_refresh_paths(paths, providers=("jellyfin",), immediate=True, source_entries=entries)
+            strm_repo.acknowledge_strm_refresh_paths(entries)
+            db.finish_task_run(run_id, "success", result='{"stats":{"generated":2000}}')
+            register_media_refresh_handoff([], run_id=run_id, completion={"strm_status": "完成", "partial": False})
+            client.refresh_for_paths.return_value = {"ok": batch % 2 == 0, "fallback": "HTTP 503" if batch % 2 else ""}
+            group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+            with patch.object(worker, "_client_for", return_value=client):
+                worker._process_group(group)
+            db.init_db()
+            state = json.loads(db.kv_get("media_refresh_queue:v1"))
+            self.assertEqual((state["events"], state["origins"], state["groups"]), ({}, {}, {}))
+            self.assertLess(len(json.dumps(state)), 10000)
+            row = db.get_task_run(run_id)
+            assert row is not None
+            persisted = json.loads(row["result"])["media_refresh_results"]
+            self.assertEqual(len(persisted["events"]), 2000)
+            self.assertEqual(persisted["status"], "success" if batch % 2 == 0 else "failed")
+            # GC 后重送已经 ACK 的旧快照，不能复活已完成事件。
+            with patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator"):
+                enqueue_media_refresh_paths(paths, providers=("jellyfin",), immediate=True, source_entries=entries)
+            self.assertEqual(claim_due_media_refreshes(owner="late", force=True), [])
+            # 无原运行的普通本地刷新沿用原队列路径，不创建逐路径事件台账。
+            enqueue_media_refresh("jellyfin", paths, debounce_seconds=0)
+            group = claim_due_media_refreshes(owner=worker._owner, force=True)[0]
+            with patch.object(worker, "_client_for", return_value=client):
+                worker._process_group(group)
+            state = json.loads(db.kv_get("media_refresh_queue:v1"))
+            self.assertEqual((state["events"], state["origins"]), ({}, {}))
+            self.assertNotIn("last_results", state)
+
+    def test_late_lease_cannot_settle_recreated_group_for_same_worker(self):
+        first = enqueue_media_refresh("jellyfin", ["/media/old"], debounce_seconds=0)
+        old = claim_due_media_refreshes(owner="same-worker", force=True)[0]
+        self.assertTrue(settle_media_refresh(first["group_key"], owner="same-worker", lease_generation=old["lease_generation"]))
+        enqueue_media_refresh("jellyfin", ["/media/new"], debounce_seconds=0)
+        new = claim_due_media_refreshes(owner="same-worker", force=True)[0]
+        self.assertFalse(settle_media_refresh(first["group_key"], owner="same-worker", lease_generation=old["lease_generation"]))
+        self.assertEqual(media_refresh_queue_status()["paths"], 1)
+        self.assertTrue(settle_media_refresh(new["group_key"], owner="same-worker", lease_generation=new["lease_generation"]))
+
+    def test_real_request_work_registration_scales_by_batch_and_collects(self):
+        from app.repositories import download_requests, strm as strm_repo
+        from app.repositories.strm_request_ownership import refresh_work_key
+
+        request_id, _ = download_requests.create_download_request("s06-owner-scale", "magnet")
+        original = db.get_conn
+        vm_steps = []
+        previous_entries = []
+        for count in (200, 2000):
+            run_id = db.add_task_run("strm_sync", "manual")
+            paths = [f"/owner-scale/{index}" for index in range(count)]
+            entries = strm_repo.enqueue_strm_refresh_paths(paths)
+            with original() as conn:
+                conn.execute("DELETE FROM strm_request_work WHERE request_id=?", (request_id,))
+                conn.execute("UPDATE download_requests SET strm_generation=1,organize_task_id='scale',strm_run_id=? WHERE id=?", (run_id, request_id))
+                conn.executemany(
+                    "INSERT INTO strm_request_work(request_id,generation,organize_task_id,kind,work_key) VALUES(?,1,'scale','refresh',?)",
+                    [(request_id, refresh_work_key(path, True)) for path in paths],
+                )
+            steps = 0
+            queries = []
+
+            def progress():
+                nonlocal steps
+                steps += 1000
+                return 0
+
+            def trace(sql):
+                if "json_each(" in sql and "JOIN strm_request_work" in sql:
+                    queries.append(sql)
+
+            @contextmanager
+            def measured():
+                with original() as conn:
+                    conn.set_progress_handler(progress, 1000)
+                    conn.set_trace_callback(trace)
+                    yield conn
+
+            with patch.object(db, "get_conn", measured):
+                register_media_refresh_handoff(entries, providers=("jellyfin",), run_id=run_id)
+            vm_steps.append(steps)
+            self.assertEqual(len(queries), 1)
+            with original() as conn:
+                plan = " ".join(row["detail"] for row in conn.execute("EXPLAIN QUERY PLAN " + queries[0]))
+            self.assertIn("idx_strm_request_work_key (kind=? AND work_key=?)", plan)
+            state = json.loads(db.kv_get("media_refresh_queue:v1"))
+            self.assertEqual(len(state["events"]), count)
+            self.assertTrue(all(event["origins"] == [str(run_id)] for event in state["events"].values()))
+            enqueue_media_refresh("jellyfin", paths, source_entries=entries, debounce_seconds=0)
+            if previous_entries:
+                # 相同路径已经属于新 run，旧 source token 不得重新附着或 ACK 新事件。
+                enqueue_media_refresh("jellyfin", paths, source_entries=previous_entries, debounce_seconds=0)
+                self.assertEqual(strm_repo.acknowledge_strm_refresh_paths(previous_entries), 0)
+            strm_repo.acknowledge_strm_refresh_paths(entries)
+            db.finish_task_run(run_id, "success", result="{}")
+            register_media_refresh_handoff([], run_id=run_id, completion={"strm_status": "完成", "partial": False})
+            lease = claim_due_media_refreshes(owner="owner-scale", force=True)[0]
+            settle_media_refresh(lease["group_key"], owner="owner-scale", lease_generation=lease["lease_generation"], outcome={"ok": True})
+            MediaRefreshCoordinator()._reconcile_results()
+            db.init_db()
+            state = json.loads(db.kv_get("media_refresh_queue:v1"))
+            self.assertEqual((state["events"], state["origins"], state["groups"]), ({}, {}, {}))
+            previous_entries = entries
+        # 输入与真实 work 行数各增十倍，VM 工作量应接近线性，禁止笛卡尔扫描。
+        self.assertLess(vm_steps[1], vm_steps[0] * 15 + 5000)
 
     def test_no_eligible_automatic_provider_skips_without_queue_or_worker(self):
         cases = (

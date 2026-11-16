@@ -157,6 +157,8 @@ def _refresh_notification_label(refresh: dict) -> str:
             True: "完成",
             False: "失败",
             "failed": "失败",
+            "success": "已刷新",
+            "partial": "部分失败（请手动刷新）",
             "queued": "已排队",
             "pending": _REFRESH_PENDING_LABEL,
             "skipped": "已跳过",
@@ -186,8 +188,25 @@ def _publish_foreground_linked_notification_threads(
     partial: bool = False,
     error: str = "",
     refresh_handoff: dict[str, Any] | None = None,
+    raise_errors: bool = False,
+    strm_run_id: int | None = None,
 ) -> bool:
     accepted = False
+    # 人工确认是业务回执；关闭 TG 投递不能跳过其持久状态。
+    from app.modules.organize_confirmations import update_confirmation_lifecycle_downstream
+
+    for ref in _merge_notification_threads(options.get("notification_threads")):
+        if str(ref.get("topic") or "") != "confirmation" or not ref.get("token"):
+            continue
+        scoped_status, scoped_partial, scoped_error = probe_downstream_state(
+            ref, strm_status=strm_status, partial=partial, error=error,
+        )
+        accepted = update_confirmation_lifecycle_downstream(
+            ref["token"], chat_id=str(ref.get("chat_id") or ""), strm_status=scoped_status,
+            media_refresh=media_refresh, partial=scoped_partial, error=scoped_error,
+            notify_enabled=options.get("notify_override") is not False and bool(ref.get("topic_enabled", True)),
+            strm_run_id=strm_run_id,
+        ) or accepted
     if options.get("notify_override") is False:
         return False
     try:
@@ -200,6 +219,8 @@ def _publish_foreground_linked_notification_threads(
                 )
             ) or accepted
     except Exception as exc:
+        if raise_errors:
+            raise
         logger.warning(
             "STRM 更新下载事务通知失败 type=%s", type(exc).__name__
         )
@@ -226,38 +247,15 @@ def _publish_foreground_linked_notification_threads(
                     partial=scoped_partial,
                     error=scoped_error,
                     topic_enabled=bool(ref.get("topic_enabled", True)),
+                    strm_run_id=strm_run_id,
                     **({"refresh_handoff": refresh_handoff} if refresh_handoff else {}),
                 )
             ) or accepted
     except Exception as exc:
+        if raise_errors:
+            raise
         logger.warning(
             "STRM 更新整理事务通知失败 type=%s", type(exc).__name__
-        )
-    try:
-        from app.modules.organize_confirmations import (
-            update_confirmation_lifecycle_downstream,
-        )
-
-        for ref in _merge_notification_threads(options.get("notification_threads")):
-            if not ref.get("topic_enabled", True) or str(ref.get("topic") or "") != "confirmation":
-                continue
-            token = str(ref.get("token") or "").strip()
-            if not token:
-                continue
-            scoped_status, scoped_partial, scoped_error = probe_downstream_state(
-                ref, strm_status=strm_status, partial=partial, error=error,
-            )
-            accepted = update_confirmation_lifecycle_downstream(
-                    token,
-                    chat_id=str(ref.get("chat_id") or ""),
-                    strm_status=scoped_status,
-                    media_refresh=media_refresh,
-                    partial=scoped_partial,
-                    error=scoped_error,
-                ) or accepted
-    except Exception as exc:
-        logger.warning(
-            "STRM 更新人工确认事务通知失败 type=%s", type(exc).__name__
         )
     return accepted
 
@@ -266,6 +264,8 @@ def _publish_linked_notification_threads(
     options: dict[str, Any], *, strm_status: str, media_refresh: str,
     partial: bool = False, error: str = "",
     refresh_handoff: dict[str, Any] | None = None,
+    raise_errors: bool = False,
+    strm_run_id: int | None = None,
 ) -> bool:
     accepted = False
     scopes = notification_scopes(options)
@@ -275,17 +275,115 @@ def _publish_linked_notification_threads(
             "合并同步存在异常，请在 Web 运行记录中查看。"
             if error and (len(scopes) > 1 or options.get("has_silent_notification_scope")) else error
         )
-        publish = publish_probe_scope if scope.get("probe") else _publish_foreground_linked_notification_threads
         try:
-            accepted = publish(
-                scope, strm_status=strm_status, media_refresh=media_refresh,
-                partial=partial, error=scoped_error,
-                **({"refresh_handoff": refresh_handoff}
-                   if refresh_handoff and not scope.get("probe") else {}),
-            ) or accepted
+            if scope.get("probe"):
+                context = scope.get("context") or {}
+                refs = context.get("notification_threads") or []
+                confirmations = [ref for ref in refs if ref.get("topic") == "confirmation"]
+                if confirmations:
+                    # probe 静默分支也必须先进入同一确认领域入口；其它父线程仍用原发布器。
+                    accepted = _publish_foreground_linked_notification_threads(
+                        {"notification_threads": confirmations, "notify_override": scope.get("notify_override") is not False
+                         and context.get("notify_enabled", True) and context.get("topic_enabled", True)},
+                        strm_status=strm_status, media_refresh=media_refresh,
+                        partial=partial, error=scoped_error, raise_errors=raise_errors,
+                        strm_run_id=strm_run_id,
+                    ) or accepted
+                    refs = [ref for ref in refs if ref.get("topic") != "confirmation"]
+                if refs or not confirmations:
+                    accepted = publish_probe_scope({**scope, "context": {**context, "notification_threads": refs}},
+                        strm_status=strm_status, media_refresh=media_refresh, partial=partial, error=scoped_error,
+                        strm_run_id=strm_run_id) or accepted
+            else:
+                accepted = _publish_foreground_linked_notification_threads(
+                    scope, strm_status=strm_status, media_refresh=media_refresh,
+                    partial=partial, error=scoped_error, refresh_handoff=refresh_handoff, raise_errors=raise_errors,
+                    strm_run_id=strm_run_id,
+                ) or accepted
         except Exception as exc:
+            if raise_errors:
+                raise
             logger.warning("STRM 更新通知范围失败 type=%s", type(exc).__name__)
     return accepted
+
+
+def _media_refresh_summary(events: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
+    providers: dict[str, list[str]] = {}
+    for provider, value in (baseline or {}).items():
+        name = {"Jellyfin": "jellyfin", "Emby": "emby"}.get(provider, provider)
+        providers[name] = [value]
+    for event in events.values():
+        for provider, outcome in event["providers"].items():
+            providers.setdefault(provider, []).append(outcome["status"])
+    statuses = [value for values in providers.values() for value in values]
+    pending = bool(events) and (not statuses or any(value in {"pending", "queued"} for value in statuses))
+
+    def status(values):
+        if "partial" in values:
+            return "partial"
+        if "failed" in values:
+            return "partial" if any(value != "failed" for value in values) else "failed"
+        if any(value in {"pending", "queued"} for value in values):
+            return "queued"
+        return "success" if "success" in values else "skipped"
+
+    return {"status": status(statuses), "pending": pending,
+            "providers": {{"jellyfin": "Jellyfin", "emby": "Emby"}.get(name, name): status(values)
+                          for name, values in providers.items() if name != "媒体库"}, "events": events}
+
+
+def reconcile_strm_media_refresh_results() -> None:
+    """沿现有消费者恢复原运行与回执；投影失败保留修订号，下轮只重做投影。"""
+    from app.repositories.media_refresh_queue import (
+        acknowledge_media_refresh_projections, pending_media_refresh_projections, media_refresh_projection_lock,
+    )
+
+    if not media_refresh_projection_lock.acquire(blocking=False):
+        return
+    try:
+        projected = []
+        for origin in pending_media_refresh_projections():
+            try:
+                if not origin["results"]:
+                    projected.append((origin["run_id"], origin["revision"]))
+                    continue
+                if not any(event["providers"] for event in origin["results"].values()):
+                    continue
+                summary = _media_refresh_summary(origin["results"], origin.get("baseline"))
+                with db.get_conn() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute("SELECT * FROM task_runs WHERE id=? AND task_name=?", (origin["run_id"], TASK_NAME)).fetchone()
+                    if row is None or row["status"] == "running":
+                        continue
+                    result = json.loads(row["result"] or "{}")
+                    summary["events"] = {**result.get("media_refresh_results", {}).get("events", {}), **summary["events"]}
+                    result["media_refresh_results"] = summary
+                    result["media_refresh"] = summary["providers"]
+                    result["refresh_pending"] = summary["pending"]
+                    generation_status = "success" if row["status"] == "partial" and result.get("strm_partial") is False else row["status"]
+                    conn.execute("UPDATE task_runs SET status=?,result=? WHERE id=?",
+                                 (generation_status, json.dumps(result, ensure_ascii=False), origin["run_id"]))
+                options = deepcopy(origin["options"])
+                owners = {int(owner["request_id"]): owner for owner in options.get("download_request_owners") or []}
+                for scope in options.get("notification_scopes") or []:
+                    ids = scope.get("download_request_ids") or []
+                    current = {int(owner["request_id"]): owner for owner in strm_request_ownership_repo.current_strm_request_owners(ids)}
+                    scope["download_request_ids"] = [request_id for request_id in ids if current.get(int(request_id)) == owners.get(int(request_id))]
+                completion = origin["completion"]
+                failed = summary["status"] in {"failed", "partial"}
+                error = completion.get("error") or ("媒体库刷新未完成，请在媒体服务器中手动刷新；已完成的 STRM 不受影响。" if failed else "")
+                _publish_linked_notification_threads(
+                    options, strm_status=completion["strm_status"], media_refresh=_refresh_notification_label(summary["providers"]),
+                    partial=bool(completion.get("partial") or failed), error=error, raise_errors=True,
+                    strm_run_id=origin["run_id"],
+                )
+                if not origin["outbox_pending"]:
+                    projected.append((origin["run_id"], origin["revision"]))
+            except Exception:
+                logger.exception("媒体库刷新结果投影失败 run_id=%s，下轮仅重试投影", origin["run_id"])
+        acknowledge_media_refresh_projections(projected)
+    finally:
+        media_refresh_projection_lock.release()
 
 
 def _has_linked_notification_thread(options: dict[str, Any]) -> bool:
@@ -1748,6 +1846,13 @@ class STRMScheduler:
                 options, strm_run_id=run_id, strm_status="running",
                 strm_error="", strm_finished_at=None,
             )
+            # 扫描期间伴随 worker 也可能先交接刷新，原运行必须先于文件写入登记。
+            from app.repositories.media_refresh_queue import register_media_refresh_handoff
+
+            register_media_refresh_handoff([], run_id=run_id, options={
+                "notification_scopes": notification_scopes(options),
+                "download_request_owners": options.get("download_request_owners") or [],
+            })
             error = self.validate_config(auto_only=False)
             if error:
                 raise ValueError(error)
@@ -1963,6 +2068,7 @@ class STRMScheduler:
                         changed_paths=list(aggregate.get("changed_strm_paths") or []),
                         changed_dirs=list(aggregate.get("changed_dirs") or []),
                         persist_only=True,
+                        run_id=run_id, notification_options=options,
                     )
                 with self._state_lock:
                     for row in self._source_runtime:
@@ -1998,7 +2104,10 @@ class STRMScheduler:
                     media_refresh="已保留，重启后重试" if media_refresh else "未触发",
                     partial=True,
                     error="服务停止，STRM 同步已安全中止；变化目标已保留，重启后可继续处理",
+                    strm_run_id=run_id,
                 )
+                self._complete_refresh_handoff(run_id, strm_status="已停止", partial=True,
+                    error="服务停止，STRM 同步已安全中止")
                 self._set_progress("stopped", 1, 1, "同步已停止")
                 if lease_heartbeat:
                     lease_heartbeat.stop()
@@ -2024,6 +2133,7 @@ class STRMScheduler:
                 changed_dirs=list(stats.get("changed_dirs") or []),
                 immediate=trigger_type in {"manual", "telegram"},
                 handoff_entries=refresh_entries,
+                run_id=run_id, notification_options=options,
             )
             stats["refresh_elapsed_seconds"] = round(
                 max(0.0, monotonic() - refresh_started), 3
@@ -2099,11 +2209,14 @@ class STRMScheduler:
                 partial=partial,
                 error=partial_error,
                 refresh_handoff=refresh_handoff,
+                strm_run_id=run_id,
             )
             self._notify_scoped_results(
                 options, stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
                 run_id=run_id,
             )
+            self._complete_refresh_handoff(run_id, strm_status="部分完成" if strm_partial else "完成",
+                partial=strm_partial, error="STRM 同步部分完成，请查看运行记录" if strm_partial else "")
             return {"ok": True, "partial": partial, **result}
         except Exception as exc:
             with self._state_lock:
@@ -2123,6 +2236,7 @@ class STRMScheduler:
                 media_refresh="未完成",
                 partial=True,
                 error=error_text[:260],
+                strm_run_id=run_id,
             )
             if lease_heartbeat:
                 lease_heartbeat.stop()
@@ -2132,6 +2246,7 @@ class STRMScheduler:
                 empty_retry_delay=60.0,
             )
             self._notify_scoped_failure(options, error_text, trigger_type, run_id=run_id)
+            self._complete_refresh_handoff(run_id, strm_status="失败", partial=True, error=error_text[:260])
             return {"ok": False, "error": error_text}
         finally:
             if lease_heartbeat:
@@ -2169,6 +2284,16 @@ class STRMScheduler:
         return set(parse_strm_extensions(get("STRM_VIDEO_EXTS", ""), defaults=DEFAULT_VIDEO_EXTS))
 
     @staticmethod
+    def _complete_refresh_handoff(run_id: int, **completion: Any) -> None:
+        from app.repositories.media_refresh_queue import register_media_refresh_handoff
+
+        def complete():
+            register_media_refresh_handoff([], run_id=run_id, completion=completion)
+            reconcile_strm_media_refresh_results()
+
+        _run_notification_side_effect("media-refresh-projection", complete)
+
+    @staticmethod
     def _metadata_exts() -> set[str]:
         if not get_bool("STRM_METADATA_ENABLED", False):
             return set()
@@ -2183,6 +2308,8 @@ class STRMScheduler:
         immediate: bool = False,
         persist_only: bool = False,
         handoff_entries: list[dict[str, Any]] | None = None,
+        run_id: int | None = None,
+        notification_options: dict[str, Any] | None = None,
     ) -> dict[str, str]:
         """统一规划并保存刷新意图；关停时仅落盘，不唤醒消费者。"""
         if not has_changes:
@@ -2217,6 +2344,13 @@ class STRMScheduler:
         # 投递统一刷新队列；投递失败只重试刷新，绝不重新生成 STRM。
         owner_kwargs: _RefreshOwnerOptions = {"request_owners": refresh_policy.request_owners} if refresh_policy.request_owners else {}
         entries = strm_repo.enqueue_strm_refresh_paths(targets, allow_emby=refresh_policy.allow_emby, **owner_kwargs)
+        from app.repositories.media_refresh_queue import register_media_refresh_handoff
+
+        options = notification_options or {}
+        register_media_refresh_handoff(entries, run_id=run_id, options={
+            "notification_scopes": notification_scopes(options),
+            "download_request_owners": options.get("download_request_owners") or [],
+        })
         if handoff_entries is not None:
             handoff_entries.extend(entries)
         if persist_only:
@@ -2226,6 +2360,7 @@ class STRMScheduler:
                 targets,
                 immediate=immediate,
                 allow_emby=refresh_policy.allow_emby,
+                source_entries=entries,
             )
         except Exception as exc:
             logger.warning(
@@ -2800,6 +2935,8 @@ def _public_strm_run(row: dict, runtime: dict) -> dict:
             payload = {}
     payload = payload if isinstance(payload, dict) else {}
     stats = payload.get("stats")
+    refresh = payload.get("media_refresh_results") or {}
+    refresh = refresh if isinstance(refresh, dict) else {}
     mode = str(payload.get("mode") or "").strip().casefold()
     elapsed = None
     try:
@@ -2814,6 +2951,10 @@ def _public_strm_run(row: dict, runtime: dict) -> dict:
             "trigger_type": trigger if trigger in {"manual", "cron", "organize", "telegram", "config-retirement"} else "unknown",
             **timestamps, "mode": mode if mode in {"full", "fast", "incremental", "fast_noop", "fast_partial", "full_fallback"} else "unknown",
             "elapsed_seconds": elapsed,
+            "media_refresh": {"status": refresh.get("status"), "pending": bool(refresh.get("pending")),
+                              "providers": {key: value for key, value in (refresh.get("providers") or {}).items()
+                                            if key in {"Jellyfin", "Emby"} and value in {"pending", "queued", "skipped", "success", "partial", "failed"}}}
+                             if refresh.get("status") in {"queued", "skipped", "success", "partial", "failed"} else {},
             "progress": {key: value for key, value in (progress or {}).items()
                          if key in {"stage", "completed", "total", "percent"}},
             "stats": {key: _strm_count(value) for key, value in (stats or {}).items() if key in _STRM_STAT_FIELDS}

@@ -114,7 +114,9 @@ def test_old_consumer_finishes_frozen_root_then_full_migrates_latest_policy(runt
     handoff.return_value = {"Jellyfin": "queued"}
     worker._flush_media_refresh(force=True)
     if enabled:
-        handoff.assert_called_once_with(sorted(paths), immediate=True, allow_emby=allow_emby)
+        handoff.assert_called_once_with(
+            sorted(paths), immediate=True, allow_emby=allow_emby, source_entries=entries,
+        )
     else:
         handoff.assert_not_called()
     assert strm_repo.list_strm_refresh_entries() == []

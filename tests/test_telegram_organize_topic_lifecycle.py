@@ -179,6 +179,7 @@ def test_ack_confirmation_rollup_and_refresh_recovery_keep_run_marker(fenced_par
     assert update_organize_lifecycle_downstream(
         "fenced-parent", chat_id="100", strm_status="完成", media_refresh="等待刷新交接",
         refresh_handoff={"paths": ["/isolated/refresh"], "allow_emby": True}, strm_run_id=20,
+        partial=True, error="STRM 已完成，媒体库刷新等待后台重试",
     )
     assert update_organize_lifecycle_downstream(
         "fenced-parent", chat_id="100", strm_status="完成", media_refresh="等待刷新交接",
@@ -191,6 +192,9 @@ def test_ack_confirmation_rollup_and_refresh_recovery_keep_run_marker(fenced_par
     event = json.loads(_outbox("fenced-parent", "100")["event_json"])
     assert event["lifecycle"]["downstream"]["strm_run_id"] == 20
     assert "refresh" not in event["lifecycle"]
+    assert "等待后台重试" not in event["footer"]
+    assert event["lifecycle"]["downstream"]["partial"] is False
+    assert event["lifecycle"]["downstream"]["error"] == ""
     assert event["_delivery_route"] == {"chat_id": "100", "message_thread_id": 500}
     assert update_organize_lifecycle_downstream(
         "fenced-parent", chat_id="100", strm_status="完成", media_refresh="同运行终态",
