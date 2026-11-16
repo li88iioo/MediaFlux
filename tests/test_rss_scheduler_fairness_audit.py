@@ -10,6 +10,7 @@ from unittest.mock import patch
 from app import database as db
 from app.repositories import rss as rss_repo
 from app.modules import rss_scheduler as module
+from app.modules.rss import MikanParser, rss_subscription_refresh_revision
 from tests.support import isolated_test_database
 
 
@@ -27,6 +28,65 @@ class HeldThread:
 
     def is_alive(self):
         return True
+
+
+class RSSSchedulerProjectionTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_test_database())
+        HeldThread.instances = []
+        HeldThread.fail_start = False
+        self.enterContext(patch.object(module.threading, "Thread", HeldThread))
+        self.enterContext(patch.object(module.RSSScheduler, "_notify_issue"))
+
+    def test_due_projection_runs_bound_refresh_and_auto_download(self):
+        bindings = [
+            {},
+            {"media_tmdb_id": "123"},
+            {"media_tmdb_id": "123", "media_default_season": 0},
+            {"media_tmdb_id": "123", "skip_existing_episodes": 1},
+        ]
+        for action in ("subscribe", "download"):
+            for binding in bindings:
+                with self.subTest(action=action, binding=binding):
+                    sid = rss_repo.add_rss_subscription(
+                        "scheduled", "https://example.invalid/feed",
+                        action=action, refresh_interval_minutes=10, **binding,
+                    )
+                    due = rss_repo.list_due_rss_subscriptions()
+                    self.assertEqual([row["id"] for row in due], [sid])
+                    self.assertEqual(
+                        rss_subscription_refresh_revision(due[0]),
+                        rss_subscription_refresh_revision(rss_repo.get_rss_subscription(sid)),
+                    )
+                    scheduler = module.RSSScheduler()
+                    with patch.object(MikanParser, "parse", return_value=[]) as parse:
+                        self.assertEqual(scheduler.run_due(), 1)
+                        worker = HeldThread.instances.pop()
+                        with patch.object(module.threading, "current_thread", return_value=worker):
+                            worker.target(*worker.args)
+                    parse.assert_called_once_with("https://example.invalid/feed")
+                    self.assertTrue(assert_present(rss_repo.get_rss_subscription(sid))["last_refreshed_at"])
+                    self.assertEqual(rss_repo.list_due_rss_subscriptions(), [])
+
+    def test_due_filters_and_order_survive_media_binding_join(self):
+        ids = [
+            rss_repo.add_rss_subscription(
+                f"feed-{index}", "https://example.invalid/feed",
+                media_tmdb_id="123", refresh_interval_minutes=10,
+            )
+            for index in range(7)
+        ]
+        for sid, fields in zip(ids, (
+            {"enabled": 0}, {"refresh_interval_minutes": 0},
+            {"last_refreshed_at": "2026-11-17 12:00:00"},
+            {"last_refreshed_at": "2026-11-17 11:50:00"},
+            {"last_refreshed_at": "invalid"}, {"last_refreshed_at": ""}, {},
+        )):
+            rss_repo.update_rss_subscription(sid, fields)
+        self.assertEqual(
+            [row["id"] for row in rss_repo.list_due_rss_subscriptions("2026-11-17 12:00:00")],
+            ids[3:],
+        )
 
 
 class RSSSchedulerFairnessAuditTests(unittest.TestCase):

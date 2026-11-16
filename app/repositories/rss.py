@@ -1515,10 +1515,10 @@ def list_due_rss_subscriptions(current_time: str | None = None) -> list[sqlite3.
     current_time = current_time or db.now()
     with db.get_conn() as conn:
         return conn.execute(
-            "SELECT * FROM rss_items WHERE enabled=1 AND refresh_interval_minutes>0 AND ("
-            "last_refreshed_at IS NULL OR last_refreshed_at='' OR datetime(last_refreshed_at) IS NULL OR "
-            "datetime(last_refreshed_at, '+' || refresh_interval_minutes || ' minutes') <= datetime(?)"
-            ") ORDER BY id",
+            _rss_subscription_select() + " WHERE i.enabled=1 AND i.refresh_interval_minutes>0 AND ("
+            "i.last_refreshed_at IS NULL OR i.last_refreshed_at='' OR datetime(i.last_refreshed_at) IS NULL OR "
+            "datetime(i.last_refreshed_at, '+' || i.refresh_interval_minutes || ' minutes') <= datetime(?)"
+            ") ORDER BY i.id",
             (current_time,),
         ).fetchall()
 
