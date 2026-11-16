@@ -823,6 +823,10 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             ),
         )
 
+        listed = self.client.get("/api/local-media/tasks").json()["tasks"]
+        self.assertTrue(next(task for task in listed if task["id"] == task_id)["interrupted_write"])
+        self.assertTrue(self.client.get(f"/api/local-media/tasks/{task_id}").json()["task"]["interrupted_write"])
+
         with patch("app.routes.local_media_api.get_local_media_scheduler") as scheduler:
             blocked = self.client.post(
                 f"/api/local-media/tasks/{task_id}/retry",
@@ -843,6 +847,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             "waiting_stable",
         )
         self.assertEqual(local_media_repo.list_local_media_task_items(task_id, owner="admin"), [])
+        self.assertFalse(self.client.get(f"/api/local-media/tasks/{task_id}").json()["task"]["interrupted_write"])
         scheduler.return_value.reload.assert_called_once_with()
 
     def test_requires_manual_directory_task_displays_the_specific_failed_episode(self):

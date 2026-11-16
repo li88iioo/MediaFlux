@@ -252,7 +252,7 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
         context.add_init_script(r"""(() => {
             const fixture = window.__lmFixture = {
                 calls: [], executes: [], refreshes: [], holdRefresh: false, failResources: [], previewSerial: 0,
-                previews: [], holdPreview: false,
+                previews: [], holdPreview: false, retries: [],
             };
             const json = (body, status = 200) => new Response(JSON.stringify(body), {
                 status, headers: {'Content-Type': 'application/json'},
@@ -266,10 +266,17 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
                     targets: [{path: '/archive', category: 'movie'}]}]},
                 tasks: {tasks: [], has_more: false}, items: {items, sources: []},
             };
+            fixture.resources = resources;
             window.fetch = async (url, options = {}) => {
                 const path = new URL(String(url), location.href).pathname;
                 const body = JSON.parse(options.body || '{}');
                 fixture.calls.push({path, body});
+                if (/^\/api\/local-media\/tasks\/\d+\/retry$/.test(path)) {
+                    fixture.retries.push({path, body});
+                    const task = resources.tasks.tasks.find(item => path.endsWith(`/${item.id}/retry`));
+                    if (task) { task.status = 'recognizing'; task.interrupted_write = false; }
+                    return json({queued: true});
+                }
                 const resource = path.split('/').pop();
                 if (path.startsWith('/api/local-media/') && resource in resources) {
                     const reply = () => fixture.failResources.includes(resource)
@@ -307,6 +314,39 @@ class LocalMediaExecutionBrowserTests(unittest.TestCase):
         page.locator('[data-open-item-menu]').nth(index).click()
         page.locator('[data-item-action="auto"]').click()
         page.wait_for_function("!document.querySelector('#lmExecuteBtn').disabled && document.querySelector('#lmScrapeStatus').textContent === '计划已就绪'")
+
+    def test_interrupted_write_retry_requires_user_confirmation_on_both_views(self):
+        for width in (390, 1280):
+            with self.subTest(width=width):
+                page, unexpected, errors = self.make_page(width)
+                page.evaluate("""() => {
+                    window.__lmFixture.resources.tasks.tasks = [
+                        {id: 7, status: 'requires_manual', interrupted_write: true, content_name: 'Interrupted.mkv', source_name: '来源', clearable: true},
+                        {id: 8, status: 'failed', interrupted_write: false, content_name: 'Failed.mkv', source_name: '来源', clearable: true},
+                    ];
+                }""")
+                page.locator('#lmRefreshBtn').click()
+                page.locator('#appMessageClose').click()
+                page.locator('#lmTabReviewBtn').click()
+                recovery = page.locator('#lmReviewList [data-retry="7"]')
+                recovery.wait_for()
+                self.assertEqual(recovery.inner_text(), '核验重试')
+                self.assertEqual(page.locator('#lmReviewList [data-review-task="7"]').count(), 0)
+                recovery.click()
+                self.assertTrue(page.locator('#appConfirmSubmit').is_disabled())
+                page.locator('#appConfirmCancel').click()
+                self.assertEqual(page.evaluate('window.__lmFixture.retries'), [])
+                page.locator('#lmTabTasksBtn').click()
+                page.locator('#lmTaskList [data-retry="7"]').click()
+                page.locator('#appConfirmVerifyInput').fill('RETRY')
+                page.locator('#appConfirmSubmit').click()
+                page.wait_for_function('window.__lmFixture.retries.length === 1')
+                self.assertEqual(page.evaluate('window.__lmFixture.retries[0].body'), {'confirm_interrupted_write': True})
+                page.locator('#lmTaskList [data-retry="8"]').click()
+                page.wait_for_function('window.__lmFixture.retries.length === 2')
+                self.assertEqual(page.evaluate('window.__lmFixture.retries[1].body'), {})
+                self.assertEqual(unexpected, [])
+                self.assertEqual(errors, [])
 
     @staticmethod
     def start_execute(page, count=1):

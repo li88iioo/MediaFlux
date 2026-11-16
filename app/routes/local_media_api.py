@@ -114,6 +114,7 @@ def _task_payload(task, source_name: str, active_confirmations: set[str]) -> dic
         "numbering_mode": getattr(task, "numbering_mode", "auto") or "auto",
         "clearable": can_clear_local_media_task(task.id, task.status, active_confirmations),
         "error": task.error, "warning": task.warning,
+        "interrupted_write": db.is_interrupted_local_media_write_error(task.error),
         "confirmation_actor": getattr(task, "confirmation_actor", "") or "",
         "created_at": task.created_at, "updated_at": task.updated_at,
         "completed_at": task.completed_at,

@@ -283,13 +283,19 @@
         return task?.display_name || task?.content_name || '未命名';
     }
 
+    function taskWorkflowAction(task) {
+        if (task.interrupted_write && ['requires_manual', 'failed'].includes(task.status)) {
+            return `<button class="jump-btn" type="button" data-retry="${task.id}"><i data-lucide="shield-check"></i>核验重试</button>`;
+        }
+        if (task.status === 'requires_manual') {
+            return `<button class="jump-btn" type="button" data-review-task="${task.id}"><i data-lucide="search-check"></i>人工确认</button>`;
+        }
+        return task.status === 'failed'
+            ? `<button class="jump-btn" type="button" data-retry="${task.id}"><i data-lucide="rotate-ccw"></i>重试</button>` : '';
+    }
+
     function taskRow(task) {
         const state = states[task.status] || [task.status, ''];
-        const workflowAction = task.status === 'requires_manual'
-            ? `<button class="jump-btn" type="button" data-review-task="${task.id}"><i data-lucide="search-check"></i>人工确认</button>`
-            : task.status === 'failed'
-                ? `<button class="jump-btn" type="button" data-retry="${task.id}"><i data-lucide="rotate-ccw"></i>重试</button>`
-                : '';
         const selected = selectedTaskIds.has(Number(task.id));
         const selectTitle = task.clearable ? '选择此条整理日志' : '运行中或仍有待执行确认的日志不可清除';
         return `
@@ -300,7 +306,7 @@
                 <td data-label="触发">${esc(triggerLabels[task.trigger] || task.trigger || '—')}</td>
                 <td data-label="状态"><span class="status-pill ${state[1]}">${esc(state[0])}</span></td>
                 <td data-label="更新时间">${esc(task.updated_at || task.created_at || '—')}</td>
-                <td data-label="操作"><div class="lm-task-actions"><button class="jump-btn" type="button" data-task-detail="${task.id}"><i data-lucide="file-search"></i>详情</button>${workflowAction}</div></td>
+                <td data-label="操作"><div class="lm-task-actions"><button class="jump-btn" type="button" data-task-detail="${task.id}"><i data-lucide="file-search"></i>详情</button>${taskWorkflowAction(task)}</div></td>
             </tr>`;
     }
 
@@ -340,7 +346,7 @@
         const query = $('lmTaskSearch').value.trim().toLocaleLowerCase();
         const signature = JSON.stringify(tasks.map((task) => [
             task.id, task.display_name, task.content_name, task.source_name, task.trigger, task.status,
-            task.updated_at, task.created_at, task.error, task.warning, task.tmdb_id, task.clearable,
+            task.updated_at, task.created_at, task.error, task.warning, task.tmdb_id, task.clearable, task.interrupted_write,
         ]));
         const viewSignature = `${filter}\u0000${query}`;
         if (!force && signature === taskSignature && viewSignature === renderedFilter) return;
@@ -368,7 +374,7 @@
             ? review.slice(0, 30).map((task) => `
                 <article class="lm-review-item">
                     <div><strong>${esc(taskDisplayName(task))}</strong><span>${esc(task.error || '需要重新指定 TMDB 信息')}</span></div>
-                    <button class="jump-btn" type="button" data-review-task="${task.id}"><i data-lucide="search-check"></i>人工确认</button>
+                    ${taskWorkflowAction(task)}
                 </article>`).join('')
             : `<div class="lm-empty-state">
                 <div class="lm-empty-icon is-success"><i data-lucide="check-circle-2"></i></div>
@@ -1907,14 +1913,33 @@
         const retry = event.target.closest('[data-retry]');
         if (retry) {
             if (retry.disabled) return;
-            setBusy(retry, true, '入队中');
+            const task = tasks.find((item) => String(item.id) === retry.dataset.retry);
+            const interruptedWrite = Boolean(task?.interrupted_write);
+            const retryLabel = interruptedWrite ? '核验重试' : '重试';
+            retry.disabled = true;
             try {
-                await api(`/api/local-media/tasks/${retry.dataset.retry}/retry`, {method: 'POST', body: '{}'});
+                if (interruptedWrite) {
+                    const confirmed = await appConfirm({
+                        trigger: retry,
+                        title: '核验中断写入后重试',
+                        message: '请先通过“详情”核对来源文件、归档目标、操作步骤及 qB 状态。仅在来源文件可重新整理时重试；已经完成的移动不会自动回退。',
+                        confirmText: '已核验，重新排队',
+                        danger: true,
+                        verifyText: 'RETRY',
+                        verifyLabel: '核验文件及 qB 状态后，输入 RETRY',
+                    });
+                    if (!confirmed) return;
+                }
+                setBusy(retry, true, retryLabel);
+                await api(`/api/local-media/tasks/${retry.dataset.retry}/retry`, {
+                    method: 'POST',
+                    body: JSON.stringify(interruptedWrite ? {confirm_interrupted_write: true} : {}),
+                });
                 await loadAll();
             } catch (error) {
                 appAlert({type: 'error', title: '重试失败', message: error.message});
             } finally {
-                setBusy(retry, false, '重试');
+                setBusy(retry, false, retryLabel);
             }
         }
     });
