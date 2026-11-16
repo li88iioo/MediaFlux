@@ -59,7 +59,9 @@ class FakeShareClient:
         self.create_dir_calls.append((name, parent_id))
         return f"staging-{parent_id}"
 
-    def restore_share(self, access_token: str, file_ids: list[str], target_dir_id: str) -> dict:
+    def restore_share(self, access_token: str, file_ids: list[str], target_dir_id: str, *, cancel_check=None) -> dict:
+        if cancel_check:
+            cancel_check()
         self.restore_calls.append((access_token, list(file_ids), target_dir_id))
         return {"success": True, "count": len(file_ids)}
 
@@ -147,27 +149,63 @@ class GuangYaRestoreResultTests(unittest.TestCase):
         return client
 
     def test_restore_classifies_explicit_failure_as_retry_safe(self):
-        result = self._client_with_response(
-            {"code": 500, "msg": "provider rejected"}
-        ).restore_share("share-token", ["file-1"], "target")
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["retry_safe"])
+        for response in (
+            {"code": 500, "msg": "provider rejected"},
+            {"code": 200, "success": False, "msg": "保存失败"},
+            {"code": 0, "data": {"success": False, "msg": "空间不足"}},
+            {"code": 200, "msg": "success", "data": {"code": 403, "msg": "无权限"}},
+            {"success": True, "data": {"success": False}},
+            {"success": True, "data": {"code": 166, "msg": "目录不可用"}},
+            {"code": 0, "msg": "转存失败"},
+        ):
+            with self.subTest(response=response):
+                result = self._client_with_response(response).restore_share(
+                    "share-token", ["file-1"], "target"
+                )
+                self.assertFalse(result["success"])
+                self.assertTrue(result["retry_safe"])
+                self.assertEqual(result["count"], 0)
 
     def test_restore_classifies_ambiguous_response_as_manual_review(self):
-        result = self._client_with_response({}).restore_share(
-            "share-token", ["file-1"], "target"
-        )
-
-        self.assertFalse(result["success"])
-        self.assertFalse(result["retry_safe"])
+        for response in (None, {}, [], "", {"msg": "pending"}, {"msg": "转存失败"}, {"data": {"code": 0}}):
+            with self.subTest(response=response):
+                result = self._client_with_response(response).restore_share(
+                    "share-token", ["file-1"], "target"
+                )
+                self.assertFalse(result["success"])
+                self.assertFalse(result["retry_safe"])
+                self.assertEqual(result["count"], 0)
 
     def test_restore_accepts_explicit_success_code(self):
-        result = self._client_with_response({"code": 0}).restore_share(
-            "share-token", ["file-1"], "target"
-        )
+        for response in ({"code": 0}, {"code": "200"}, {"success": True}, {"msg": "success"}):
+            with self.subTest(response=response):
+                result = self._client_with_response(response).restore_share(
+                    "share-token", ["file-1"], "target"
+                )
+                self.assertTrue(result["success"])
+                self.assertFalse(result["retry_safe"])
+                self.assertEqual(result["count"], 1)
 
-        self.assertTrue(result["success"])
+    def test_restore_checks_cancellation_after_raw_initialization(self):
+        import asyncio
+        from app.agent.kernel.state_types import CancellationToken
+
+        token = CancellationToken()
+        raw = Mock()
+
+        class InitializingClient(GuangYaClient):
+            @property
+            def raw(self):
+                token.cancel()
+                return raw
+
+        client = InitializingClient.__new__(InitializingClient)
+        with self.assertRaises(asyncio.CancelledError):
+            client.restore_share(
+                "share-token", ["file-1"], "target",
+                cancel_check=token.raise_if_cancelled,
+            )
+        raw.share_restore.assert_not_called()
 
 
 class ShareTransferPreviewStoreTests(unittest.TestCase):
@@ -502,14 +540,19 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
     def test_failed_request_can_be_explicitly_retried_once_without_new_request(self):
         from app.modules.share_transfer import create_share_request
 
-        self.client.restore_share = Mock(side_effect=[
-            {"success": False, "retry_safe": True},
-            {"success": True, "task_id": "retry-ok"},
-        ])
+        response = {"code": 0, "data": {"success": False, "msg": "空间不足"}}
+        normalizer = GuangYaRestoreResultTests._client_with_response(response)
+        self.client.restore_share = Mock(wraps=normalizer.restore_share)
         first = create_share_request(
             self.preview_id, ["file-1"], "dir-retry", "chat-100",
             user_id="user-200", client=cast(GuangYaClient, self.client), store=self.store,
         )
+        self.assertEqual(first["status"], "failed")
+        failed = download_requests_repo.get_download_request(first["request_id"])
+        assert failed is not None
+        self.assertEqual(failed["gy_status"], "failed")
+        response.clear()
+        response["code"] = 0
         second = create_share_request(
             self.preview_id, ["file-1"], "dir-retry", "chat-100",
             user_id="user-200", client=cast(GuangYaClient, self.client), store=self.store,

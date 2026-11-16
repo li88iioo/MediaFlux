@@ -2570,12 +2570,16 @@ class GuangYaClient:
         }, access_token)
 
     def restore_share(self, access_token: str, file_ids: list[str],
-                      target_dir_id: str = "0") -> dict:
+                      target_dir_id: str = "0", *,
+                      cancel_check: Callable[[], None] | None = None) -> dict:
         """把已解析分享中的指定文件转存到目标目录。"""
         selected = list(dict.fromkeys(item.strip() for item in file_ids if item.strip()))
         if not selected:
             return {"success": False, "error": "至少选择一个文件", "count": 0}
-        result = self.raw.share_restore(
+        raw = self.raw
+        if cancel_check:
+            cancel_check()
+        result = raw.share_restore(
             access_token=access_token,
             file_ids=selected,
             parent_id=target_dir_id if target_dir_id != "0" else "",
@@ -2589,15 +2593,24 @@ class GuangYaClient:
             }
         message = self._extract_message(result)
         code = result.get("code")
-        success = (
-            result.get("success") is True
-            or str(result.get("msg", "")).lower() == "success"
-            or code in (0, 200, "0", "200")
-        )
-        if success:
-            logger.info(f"光鸭转存成功: {len(selected)} 项 → {target_dir_id}")
-            return {"success": True, "retry_safe": False, "count": len(selected)}
         explicit_failure = result.get("success") is False or code is not None
+        try:
+            _validate_write_response(result, operation="share_restore")
+        except GuangYaWriteRejected as exc:
+            message = exc.public_message or message
+            data = result.get("data")
+            explicit_failure = explicit_failure or bool(exc.code) or (
+                isinstance(data, dict) and data.get("success") is False
+            )
+        else:
+            success = (
+                result.get("success") is True
+                or str(result.get("msg", "")).lower() == "success"
+                or code in (0, 200, "0", "200")
+            )
+            if success:
+                logger.info(f"光鸭转存成功: {len(selected)} 项 → {target_dir_id}")
+                return {"success": True, "retry_safe": False, "count": len(selected)}
         return {
             "success": False,
             "retry_safe": explicit_failure,
