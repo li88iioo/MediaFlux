@@ -1304,11 +1304,11 @@ class LocalPlaybackPassthroughTests(unittest.TestCase):
         self.assertEqual(error, "本地媒体由 Jellyfin/Emby 处理，不再支持本地绑定")
 
 class MediaProxyTemplateTests(unittest.TestCase):
-    def test_proxy_page_uses_configured_profiles_and_guangya_advanced_mapping(self):
+    def test_proxy_page_uses_configured_profiles_and_instance_playback_mapping(self):
         template = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
         self.assertIn("已配置媒体服务器", template)
-        self.assertIn("高级光鸭播放映射", template)
-        self.assertIn("本地视频继续由上游负责", template)
+        self.assertIn("手动播放映射", template)
+        self.assertIn("本地播放透传上游", template)
         self.assertIn("/api/media-proxy/profiles", template)
         self.assertNotIn("本地媒体根目录", template)
         self.assertNotIn("本地相对路径", template)

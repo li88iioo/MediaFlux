@@ -166,7 +166,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.assertEqual(self.errors, [], "页面不能有未处理脚本异常")
         self.assertEqual(self.unexpected, [], "所有请求必须完全离线且在 fake 边界内")
 
-    def make_page(self, template, width=1280):
+    def make_page(self, template, width=1280, *, fragment=""):
         self.context = self.browser.new_context(
             viewport={"width": width, "height": 900 if width > 600 else 844},
             service_workers="block",
@@ -181,11 +181,11 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.page = self.context.new_page()
         self.page.set_default_timeout(2500)
         self.page.on("pageerror", lambda error: self.errors.append(str(error)))
-        self.page.goto("http://offline.invalid/" + template)
+        self.page.goto("http://offline.invalid/" + template + ("#" + fragment if fragment else ""))
         ready = {
             "rss": '[data-subscription-id="1"]',
             "guangya": '[data-media-id="A"]',
-            "media_proxy": '[data-select-instance="1"]',
+            "media_proxy": '[data-proxy-instance="1"]',
             "guangya_strm": '#saveStrmBtn:not(:disabled)',
             "media_libraries": '[data-mapping-server]',
         }[template]
@@ -769,6 +769,15 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
     def test_strm_clear_keeps_confirmed_filter_during_late_list_mobile(self):
         self.strm_clear_filter_snapshot(390)
 
+    def open_proxy_bindings(self, ident):
+        menu = self.page.locator(f'[data-proxy-instance="{ident}"] details.proxy-instance-more')
+        if not menu.evaluate("node => node.open"):
+            menu.locator("summary").click()
+        menu.locator(f'[data-open-bindings="{ident}"]').click()
+        self.page.locator("#bindingsModal").wait_for(state="visible")
+        self.assertEqual(self.page.locator("#bindingsModalTitle").inner_text(), "手动播放映射")
+        self.assertIn(f"反代 {ident}", self.page.locator("#bindingPanelHint").inner_text())
+
     def proxy_late_save(self, *, binding=False, status=200, new_pending=False, width=1280, same_object=False):
         page = self.make_page("media_proxy", width)
         modal, field, save, notice = (
@@ -778,10 +787,11 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
 
         def edit(ident):
             if binding:
-                page.locator("#proxyTabButton_instances").click()
-                page.locator(f'[data-select-instance="{ident}"] strong').first.click()
-                page.locator("#proxyTabButton_advanced").click()
+                if page.locator("#bindingsModal").is_visible():
+                    page.locator("#bindingsModal [data-bindings-close]").first.click()
+                self.open_proxy_bindings(ident)
                 page.locator("#newBindingBtn").click()
+                self.assertIn(f"反代 {ident}", page.locator("#bindingInstanceHint").inner_text())
                 page.locator("#bindingGuangyaId").fill(f"cloud-{ident}")
             else:
                 page.locator(f'[data-edit-instance="{ident}"]').click()
@@ -823,7 +833,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             self.release_reply("new-save")
             page.locator(f"#{modal}").wait_for(state="hidden")
             if not binding:
-                page.locator('[data-select-instance="2"].active').wait_for()
+                self.open_proxy_bindings(2)
                 self.assertTrue(page.locator("#newBindingBtn").is_enabled())
                 self.assertIn("反代 2", page.locator("#bindingPanelHint").inner_text())
         saves = [r for r in self.requests if r["method"] == method]
@@ -857,8 +867,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
     def proxy_current_failure_retry(self, *, binding=False):
         page = self.make_page("media_proxy")
         if binding:
-            page.locator('[data-select-instance="1"] strong').first.click()
-            page.locator("#proxyTabButton_advanced").click()
+            self.open_proxy_bindings(1)
             page.locator("#newBindingBtn").click()
             page.locator("#bindingGuangyaId").fill("cloud-1")
         else:
@@ -886,6 +895,94 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
 
     def test_proxy_binding_current_error_preserves_draft_and_can_retry(self):
         self.proxy_current_failure_retry(binding=True)
+
+    def test_proxy_legacy_advanced_link_returns_to_instances_without_selecting_one(self):
+        page = self.make_page("media_proxy", fragment="advanced")
+        self.assertEqual(page.locator(".proxy-tab-btn").evaluate_all(
+            "nodes => nodes.map(node => node.dataset.tab)"), ["instances", "records"])
+        self.assertEqual(page.locator("#proxyTabButton_instances").get_attribute("aria-selected"), "true")
+        self.assertEqual(page.locator("#proxyTabButton_records").get_attribute("aria-selected"), "false")
+        self.assertTrue(page.locator("#proxyTab_instances").is_visible())
+        self.assertTrue(page.locator("#proxyTab_records").is_hidden())
+        self.assertTrue(page.locator("#bindingsModal").is_hidden())
+        self.assertTrue(page.locator("#bindingModal").is_hidden())
+        self.assertFalse(any(request["path"].endswith("/bindings") for request in self.requests))
+
+    def test_proxy_old_binding_list_cannot_replace_another_instance(self):
+        page = self.make_page("media_proxy")
+        self.hold_reply(PROXY + "/1/bindings", "old-list", method="GET", payload=[{
+            "id": 11, "media_item_id": "old-instance-item", "media_source_id": "source-1",
+            "source_type": "guangya", "guangya_file_id": "cloud-1",
+        }])
+        self.open_proxy_bindings(1)
+        self.wait_reply("old-list")
+        page.locator("#bindingsModal [data-bindings-close]").first.click()
+        self.replies[("GET", PROXY + "/2/bindings")] = [(200, [{
+            "id": 22, "media_item_id": "current-instance-item", "media_source_id": "source-2",
+            "source_type": "guangya", "guangya_file_id": "cloud-2",
+        }])]
+        self.open_proxy_bindings(2)
+        page.locator("#proxyBindingList strong").filter(has_text="current-instance-item").wait_for()
+        current = page.locator("#proxyBindingList").inner_html()
+        self.release_reply("old-list")
+        self.assertTrue(page.locator("#bindingsModal").is_visible())
+        self.assertIn("反代 2", page.locator("#bindingPanelHint").inner_text())
+        self.assertEqual(page.locator("#proxyBindingList").inner_html(), current)
+        self.assertNotIn("old-instance-item", page.locator("#proxyBindingList").inner_text())
+        self.assertFalse(any(request["method"] != "GET" for request in self.requests))
+
+    def test_proxy_binding_list_errors_retry_and_mobile_focus(self):
+        page = self.make_page("media_proxy", 390)
+        page.set_viewport_size({"width": 390, "height": 640})
+        summary = page.locator('[data-proxy-instance="1"] .proxy-instance-more > summary')
+        for status in (404, 500):
+            with self.subTest(status=status):
+                message = f"映射列表暂不可用 {status}"
+                self.replies[("GET", PROXY + "/1/bindings")] = [
+                    (status, {"error": message}),
+                    (200, [{"id": 11, "media_item_id": "item-" + "x" * 160,
+                            "media_source_id": "source-" + "y" * 100, "source_type": "guangya",
+                            "guangya_file_id": "cloud-" + "z" * 100}]),
+                ]
+                summary.evaluate("node => node.scrollIntoView({block:'end'})")
+                self.assertEqual(summary.get_attribute("title"), "更多操作")
+                self.assertIn("更多操作", summary.get_attribute("aria-label") or "")
+                summary.focus()
+                page.keyboard.press("Enter")
+                self.settle()
+                bounds = page.locator('[data-proxy-instance="1"] .proxy-instance-menu').bounding_box()
+                assert bounds is not None
+                self.assertGreaterEqual(bounds["x"], 0)
+                self.assertGreaterEqual(bounds["y"], 0)
+                self.assertLessEqual(bounds["x"] + bounds["width"], 390)
+                self.assertLessEqual(bounds["y"] + bounds["height"], 640)
+                self.open_proxy_bindings(1)
+                page.locator("#bindingsListState").filter(has_text=message).wait_for()
+                self.assertIn("重试", page.locator("#bindingsListState").inner_text())
+                self.assertTrue(page.locator("#refreshBindingsBtn").is_enabled())
+                page.locator("#refreshBindingsBtn").click()
+                page.locator("#proxyBindingList strong").wait_for()
+                self.assertNotIn(message, page.locator("#bindingsListState").inner_text())
+                self.assertTrue(page.locator("#bindingsModal .media-config-dialog").evaluate(
+                    "node => node.scrollWidth <= node.clientWidth"))
+                self.assertTrue(page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
+                page.locator("#newBindingBtn").focus()
+                page.keyboard.press("Enter")
+                page.locator("#bindingModal").wait_for(state="visible")
+                self.assertIn("反代 1", page.locator("#bindingInstanceHint").inner_text())
+                self.assertTrue(page.locator("#bindingModal .media-config-dialog").evaluate(
+                    "node => node.scrollWidth <= node.clientWidth"))
+                page.locator("#bindingItemId").focus()
+                page.keyboard.press("Tab")
+                self.assertTrue(page.locator("#bindingSourceId").evaluate("node => node === document.activeElement"))
+                page.keyboard.press("Escape")
+                page.locator("#bindingModal").wait_for(state="hidden")
+                self.assertTrue(page.locator("#bindingsModal").is_visible())
+                page.wait_for_function("document.activeElement.id === 'newBindingBtn'")
+                page.keyboard.press("Escape")
+                page.locator("#bindingsModal").wait_for(state="hidden")
+                page.wait_for_function("document.activeElement.matches('[data-proxy-instance=\"1\"] summary')")
+        self.assertFalse(any(request["method"] != "GET" for request in self.requests))
 
     def manual(self, name):
         self.page.locator(f'[data-media-id="{name}"] .gy-dir-action-btn').click()

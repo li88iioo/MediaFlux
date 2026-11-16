@@ -770,8 +770,7 @@ html[data-media-proxy-initial-tab] .proxy-tab-btn[data-tab="instances"] {
 }
 html[data-strm-initial-tab="schedule"] .strm-sync-page .strm-tab-btn[data-tab="schedule"],
 html[data-strm-initial-tab="diagnostics"] .strm-sync-page .strm-tab-btn[data-tab="diagnostics"],
-html[data-media-proxy-initial-tab="records"] .proxy-tab-btn[data-tab="records"],
-html[data-media-proxy-initial-tab="advanced"] .proxy-tab-btn[data-tab="advanced"] {
+html[data-media-proxy-initial-tab="records"] .proxy-tab-btn[data-tab="records"] {
     color: var(--accent);
     background: var(--accent-soft);
 }
@@ -779,8 +778,7 @@ html[data-strm-initial-tab] .strm-sync-page #strmTab_config,
 html[data-media-proxy-initial-tab] #proxyTab_instances { display: none !important; }
 html[data-strm-initial-tab="schedule"] .strm-sync-page #strmTab_schedule,
 html[data-strm-initial-tab="diagnostics"] .strm-sync-page #strmTab_diagnostics,
-html[data-media-proxy-initial-tab="records"] #proxyTab_records,
-html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: block !important; }
+html[data-media-proxy-initial-tab="records"] #proxyTab_records { display: block !important; }
 
 @media (max-width: 768px) {
     .strm-nav-tabs,
@@ -1816,8 +1814,6 @@ html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: bloc
 .proxy-design-note strong { font-size: 13px; }
 .proxy-design-note p { margin-top: 5px; color: var(--text-muted); font-size: 11px; line-height: 1.7; }
 .proxy-instance-list, .proxy-binding-list { display: grid; gap: 9px; min-width: 0; }
-.proxy-instance-card { display: grid; grid-template-columns: 42px minmax(0,1fr) auto; gap: 11px; align-items: center; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg-input); cursor: pointer; transition: border-color .18s ease, background .18s ease; }
-.proxy-instance-card:hover, .proxy-instance-card.active { border-color: rgba(109,139,255,.55); background: rgba(109,139,255,.07); }
 .proxy-instance-icon, .proxy-binding-icon { width: 38px; height: 38px; display: grid; place-items: center; color: var(--accent); background: rgba(109,139,255,.1); border-radius: 10px; }
 .proxy-instance-icon svg, .proxy-binding-icon svg { width: 18px; height: 18px; }
 .proxy-instance-copy { min-width: 0; }
@@ -1827,14 +1823,10 @@ html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: bloc
 .proxy-instance-copy p svg { width: 12px; height: 12px; flex: 0 0 auto; }
 .proxy-instance-copy small { display: block; margin-top: 4px; color: var(--text-dim); font-size: 9px; }
 .proxy-instance-copy em { display: block; margin-top: 5px; color: var(--danger); font-size: 10px; font-style: normal; }
-.proxy-instance-actions { display: flex; gap: 5px; align-items: center; }
 .proxy-instance-actions .is-success { color: var(--success); }
 .proxy-instance-actions .is-error { color: var(--danger); }
 .proxy-binding-guide { display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 8px; align-items: start; margin-bottom: 10px; padding: 9px 10px; color: var(--text-muted); background: rgba(109,139,255,.06); border: 1px solid rgba(109,139,255,.16); border-radius: var(--radius-sm); font-size: 10px; line-height: 1.55; }
 .proxy-binding-guide svg { width: 15px; height: 15px; color: var(--accent); }
-.proxy-binding-card { display: grid; grid-template-columns: 38px minmax(0,1fr) auto; gap: 10px; align-items: center; padding: 11px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg-input); }
-.proxy-binding-card strong { font-size: 12px; }
-.proxy-binding-card p { margin-top: 4px; color: var(--text-muted); font-size: 10px; overflow-wrap: anywhere; }
 .proxy-config-dialog { width: min(760px, calc(100vw - 28px)); }
 .proxy-binding-dialog { width: min(680px, calc(100vw - 28px)); }
 .proxy-enable-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg-input); }
@@ -5591,9 +5583,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .proxy-instance-panel { margin-bottom: 0; }
 .proxy-instance-list { min-height: 126px; display: grid; gap: 12px; align-content: start; }
 .proxy-instance-placeholder { min-height: 126px; }
-.proxy-instance-card { display: grid; grid-template-columns: 42px minmax(0,1fr) auto; gap: 14px; align-items: center; padding: 14px 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg-elevated); cursor: pointer; transition: border-color .18s ease, background .18s ease; }
+.proxy-instance-card { display: grid; grid-template-columns: 42px minmax(0,1fr) auto; gap: 14px; align-items: center; padding: 14px 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg-elevated); }
 [data-theme="dark"] .proxy-instance-card { background: rgba(255, 255, 255, 0.04); }
-.proxy-instance-card:hover, .proxy-instance-card.active { border-color: var(--accent); background: var(--accent-soft); }
 .proxy-instance-icon, .proxy-binding-icon { width: 40px; height: 40px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border-radius: var(--radius-sm); }
 .proxy-instance-icon svg, .proxy-binding-icon svg { width: 20px; height: 20px; }
 .proxy-instance-copy { min-width: 0; }
@@ -5679,6 +5670,31 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .proxy-instance-copy small { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 11px; }
 .proxy-instance-copy em { display: block; margin-top: 5px; color: var(--danger); font-size: 12px; font-style: normal; }
 .proxy-instance-actions { display: flex; gap: 6px; align-items: center; }
+.proxy-instance-actions .icon-action { width: 40px; height: 40px; }
+.proxy-instance-more { position: relative; }
+.proxy-instance-more > summary { list-style: none; cursor: pointer; }
+.proxy-instance-more > summary::-webkit-details-marker { display: none; }
+.proxy-instance-more[open] > summary { color: var(--accent); background: var(--accent-soft); }
+.proxy-instance-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 10; min-width: 188px; padding: 5px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-card); box-shadow: var(--shadow); }
+.proxy-instance-more.opens-up .proxy-instance-menu { top: auto; bottom: calc(100% + 6px); }
+.proxy-instance-menu button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 44px; padding: 9px 12px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); font: inherit; font-size: 13px; text-align: left; cursor: pointer; white-space: nowrap; }
+.proxy-instance-menu button:hover, .proxy-instance-menu button:focus-visible { background: var(--accent-soft); }
+.proxy-instance-menu button.danger { color: var(--danger); }
+.proxy-instance-menu svg { width: 16px; height: 16px; }
+.proxy-bindings-dialog { width: min(760px, 100%); }
+.proxy-bindings-toolbar { display: flex; align-items: center; gap: 8px; margin: 16px 0; }
+.proxy-bindings-toolbar [role="status"] { flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.proxy-bindings-toolbar .jump-btn { flex-shrink: 0; min-width: 80px; }
+.proxy-bindings-dialog .proxy-binding-list { min-height: 180px; align-content: start; }
+.proxy-bindings-dialog .empty-state { min-height: 180px; }
+.proxy-bindings-dialog .proxy-binding-card > div { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+    .proxy-instance-actions .icon-action { width: 44px; height: 44px; }
+    .proxy-bindings-toolbar { flex-wrap: wrap; justify-content: flex-end; }
+    .proxy-bindings-toolbar [role="status"] { flex-basis: 100%; min-height: 18px; }
+    .proxy-bindings-dialog .proxy-binding-card { grid-template-columns: minmax(0,1fr) auto; }
+    .proxy-bindings-dialog .proxy-binding-icon { display: none; }
+}
 
 @media (max-width: 768px) {
     .proxy-profile-grid {
@@ -5711,16 +5727,6 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     }
 }
 
-.proxy-advanced-panel { display: flex; flex-direction: column; gap: 16px; }
-.proxy-work-mode { display: grid; grid-template-columns: 36px minmax(0,1fr); gap: 12px; padding: 14px 16px; background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: var(--radius-sm); }
-.proxy-work-mode > svg { width: 20px; height: 20px; margin: 2px auto 0; color: var(--accent); }
-.proxy-work-mode strong { font-size: 13.5px; font-weight: 600; }
-.proxy-work-mode p, .proxy-compat-note p { margin-top: 4px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
-.proxy-compat-note { display: grid; grid-template-columns: 20px minmax(0,1fr); gap: 10px; padding: 12px 14px; background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); }
-[data-theme="dark"] .proxy-compat-note { background: rgba(255, 255, 255, 0.03); }
-.proxy-compat-note svg { width: 16px; height: 16px; color: var(--info); }
-.proxy-compat-note p { margin: 0; }
-.proxy-mapping-head { margin-top: 6px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
 .proxy-binding-card { display: grid; grid-template-columns: 38px minmax(0,1fr) auto; gap: 12px; align-items: center; padding: 12px 14px; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg-elevated); }
 [data-theme="dark"] .proxy-binding-card { background: rgba(255, 255, 255, 0.04); }
 .proxy-binding-card strong { font-size: 13px; font-weight: 600; }

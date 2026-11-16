@@ -5,7 +5,7 @@
 <script>
 (() => {
     const initialTab = window.location.hash.slice(1);
-    if (new Set(['records', 'advanced']).has(initialTab)) {
+    if (initialTab === 'records') {
         document.documentElement.dataset.mediaProxyInitialTab = initialTab;
     }
 })();
@@ -26,9 +26,6 @@
         </button>
         <button type="button" class="strm-tab-btn proxy-tab-btn" id="proxyTabButton_records" data-tab="records" role="tab" aria-controls="proxyTab_records" aria-selected="false" tabindex="-1">
             <i data-lucide="history"></i>播放链路记录
-        </button>
-        <button type="button" class="strm-tab-btn proxy-tab-btn" id="proxyTabButton_advanced" data-tab="advanced" role="tab" aria-controls="proxyTab_advanced" aria-selected="false" tabindex="-1">
-            <i data-lucide="wrench"></i>高级映射与模式
         </button>
     </div>
 
@@ -165,30 +162,6 @@
         </section>
     </div>
 
-    <!-- Tab 3: Advanced Mappings -->
-    <div class="proxy-tab-panel" id="proxyTab_advanced" role="tabpanel" aria-labelledby="proxyTabButton_advanced" hidden>
-        <section class="card card-pad proxy-advanced-panel">
-            <div class="proxy-compat-note">
-                <i data-lucide="badge-info"></i>
-                <p>光鸭 302 以原画直链为主。强制转码、字幕烧录或 HLS 分片由 Jellyfin/Emby 处理，此时不保证继续使用光鸭直链。</p>
-            </div>
-
-            <div class="panel-head proxy-mapping-head">
-                <div>
-                    <h3>高级光鸭播放映射</h3>
-                    <p id="bindingPanelHint">先在上方选择一个反代实例</p>
-                </div>
-                <button type="button" class="jump-btn" id="newBindingBtn" disabled>
-                    <i data-lucide="link-2"></i>新增光鸭映射
-                </button>
-            </div>
-            <div id="proxyBindingList" class="proxy-binding-list">
-                <div class="empty-state compact">
-                    <i data-lucide="mouse-pointer-2"></i><p>选择实例后查看映射</p>
-                </div>
-            </div>
-        </section>
-    </div>
 </div>
 
 <!-- Modals -->
@@ -231,10 +204,29 @@
     </form>
 </div>
 
+<div id="bindingsModal" class="media-config-modal" hidden>
+    <div class="media-config-dialog proxy-bindings-dialog" role="dialog" aria-modal="true" aria-labelledby="bindingsModalTitle" aria-describedby="bindingPanelHint">
+        <div class="media-config-head">
+            <div><h3 id="bindingsModalTitle">手动播放映射</h3><p id="bindingPanelHint"></p></div>
+            <button type="button" class="icon-btn" data-bindings-close aria-label="关闭手动播放映射"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body">
+            <p class="panel-desc">标准 STRM 会自动识别。仅在播放来源识别失败时，手动指定对应的光鸭文件；转码和字幕烧录仍由 Jellyfin / Emby 处理。</p>
+            <div class="proxy-bindings-toolbar">
+                <span id="bindingsListState" role="status"></span>
+                <button type="button" class="jump-btn" id="refreshBindingsBtn"><i data-lucide="refresh-cw"></i>刷新</button>
+                <button type="button" class="jump-btn" id="newBindingBtn"><i data-lucide="plus"></i>新增映射</button>
+            </div>
+            <div id="proxyBindingList" class="proxy-binding-list" aria-live="polite"></div>
+        </div>
+        <div class="media-config-footer"><button type="button" class="jump-btn" data-bindings-close>关闭</button></div>
+    </div>
+</div>
+
 <div id="bindingModal" class="media-config-modal" hidden>
     <div class="media-config-dialog proxy-binding-dialog" role="dialog" aria-modal="true" aria-labelledby="bindingModalTitle">
         <div class="media-config-head">
-            <div><span>GUANGYA OVERRIDE</span><h3 id="bindingModalTitle">新增光鸭播放映射</h3><p>仅在自动识别失败时建立精确覆盖关系。</p></div>
+            <div><h3 id="bindingModalTitle">新增播放映射</h3><p id="bindingInstanceHint"></p></div>
             <button type="button" class="icon-btn" data-binding-close title="关闭"><i data-lucide="x"></i></button>
         </div>
         <div class="media-config-body">
@@ -252,7 +244,7 @@
 (function(){
     let profiles=[];
     let instances=[];
-    let selectedId=null;
+    let bindingPanelSession=null;
     let proxyEditSession=null;
     let bindingEditSession=null;
     let selectedSource='';
@@ -272,6 +264,7 @@
     let proxyLegacyExpanded=false;
     let proxyLegacyRequestSerial=0;
     const proxyModal=createAppModal(document.getElementById('proxyModal'),{onRequestClose:closeProxyEditor});
+    const bindingsModal=createAppModal(document.getElementById('bindingsModal'),{onRequestClose:closeBindings});
     const bindingModal=createAppModal(document.getElementById('bindingModal'),{onRequestClose:closeBindingEditor});
     const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
     const proxyTabs=[...document.querySelectorAll('.proxy-tab-btn')];
@@ -296,7 +289,7 @@
             if(active&&focus)button.focus({preventScroll:true});
         });
         proxyPanels.forEach(panel=>{panel.hidden=panel.id!==`proxyTab_${normalized}`;});
-        if(updateHash){
+        if(updateHash||!validProxyTabs.has(tab)){
             const url=new URL(window.location.href);
             url.hash=normalized==='instances'?'':normalized;
             window.history.replaceState(window.history.state,'',`${url.pathname}${url.search}${url.hash}`);
@@ -360,8 +353,8 @@
             const [profileData,instanceData]=await Promise.all([request('/api/media-proxy/profiles'),request('/api/media-proxy')]);
             profiles=profileData;instances=instanceData;
             if(!background)await settleInitialProxyLoading();
-            renderProfiles();renderProxyRecordInstances();
-            await selectInstance(instances.some(item=>item.id===selectedId)?selectedId:null);
+            renderProfiles();renderProxyRecordInstances();renderInstances();
+            if(bindingPanelSession&&!instances.some(item=>item.id===bindingPanelSession.instanceId))closeBindings();
             return true;
         }catch(error){
             if(!background){
@@ -472,22 +465,84 @@
                 }
             }
             const proxyUrl=resolveInstanceProxyUrl(instance);
-            return `<article class="proxy-instance-card ${selectedId===instance.id?'active':''}" data-select-instance="${instance.id}"><div class="proxy-instance-icon"><i data-lucide="${instance.server_type==='emby'?'tv-minimal-play':'server'}"></i></div><div class="proxy-instance-copy"><div><strong>${esc(instance.name)}</strong><span class="status-pill ${meta[0]}">${meta[1]}</span>${testBadge}</div><p class="proxy-url-line"><button type="button" class="proxy-url-chip" data-copy-url="${esc(proxyUrl)}" title="点击复制反代地址"><i data-lucide="copy" class="proxy-copy-icon"></i><span class="proxy-url-text">${esc(proxyUrl)}</span></button><i data-lucide="arrow-right" class="proxy-arrow-icon"></i><span class="proxy-upstream-url">${esc(instance.upstream_url)}</span></p><small>${esc(instance.source_label||instance.server_type.toUpperCase())} · 本地播放透传上游</small>${instance.last_error?`<em>${esc(instance.last_error)}</em>`:''}</div><div class="proxy-instance-actions"><button class="icon-action" data-test-instance="${instance.id}" title="测试上游"><i data-lucide="activity"></i></button><button class="icon-action" data-edit-instance="${instance.id}" title="编辑"><i data-lucide="pencil"></i></button><button class="icon-action danger" data-delete-instance="${instance.id}" title="删除"><i data-lucide="trash-2"></i></button></div></article>`;
+            return `<article class="proxy-instance-card" data-proxy-instance="${instance.id}">
+                <div class="proxy-instance-icon"><i data-lucide="${instance.server_type==='emby'?'tv-minimal-play':'server'}"></i></div>
+                <div class="proxy-instance-copy">
+                    <div><strong>${esc(instance.name)}</strong><span class="status-pill ${meta[0]}">${meta[1]}</span>${testBadge}</div>
+                    <p class="proxy-url-line"><button type="button" class="proxy-url-chip" data-copy-url="${esc(proxyUrl)}" title="点击复制反代地址"><i data-lucide="copy" class="proxy-copy-icon"></i><span class="proxy-url-text">${esc(proxyUrl)}</span></button><i data-lucide="arrow-right" class="proxy-arrow-icon"></i><span class="proxy-upstream-url">${esc(instance.upstream_url)}</span></p>
+                    <small>${esc(instance.source_label||instance.server_type.toUpperCase())} · 本地播放透传上游</small>
+                    ${instance.last_error?`<em>${esc(instance.last_error)}</em>`:''}
+                </div>
+                <div class="proxy-instance-actions">
+                    <button type="button" class="icon-action" data-test-instance="${instance.id}" title="测试上游"><i data-lucide="activity"></i></button>
+                    <button type="button" class="icon-action" data-edit-instance="${instance.id}" title="编辑"><i data-lucide="pencil"></i></button>
+                    <details class="proxy-instance-more" name="proxy-instance-actions">
+                        <summary class="icon-action" title="更多操作" aria-label="更多操作：${esc(instance.name)}"><i data-lucide="ellipsis"></i></summary>
+                        <div class="proxy-instance-menu">
+                            <button type="button" data-open-bindings="${instance.id}"><i data-lucide="link-2"></i>手动播放映射</button>
+                            <button type="button" class="danger" data-delete-instance="${instance.id}"><i data-lucide="trash-2"></i>删除实例</button>
+                        </div>
+                    </details>
+                </div>
+            </article>`;
         }).join('');
-        root.querySelectorAll('[data-select-instance]').forEach(card=>card.addEventListener('click',event=>{if(event.target.closest('button'))return;selectInstance(Number(card.dataset.selectInstance));}));
+        root.querySelectorAll('.proxy-instance-more').forEach(menu=>menu.addEventListener('toggle',()=>{
+            if(menu.open)menu.classList.toggle('opens-up',menu.getBoundingClientRect().bottom+menu.lastElementChild.offsetHeight+6>window.innerHeight);
+        }));
+        root.querySelectorAll('[data-open-bindings]').forEach(btn=>btn.addEventListener('click',()=>{
+            const menu=btn.closest('details');
+            menu.open=false;
+            openBindings(Number(btn.dataset.openBindings),menu.querySelector('summary'));
+        }));
         root.querySelectorAll('[data-copy-url]').forEach(btn=>btn.addEventListener('click',event=>{event.stopPropagation();event.preventDefault();copyProxyUrl(btn.dataset.copyUrl,btn);}));
         root.querySelectorAll('[data-test-instance]').forEach(btn=>btn.addEventListener('click',()=>testInstance(Number(btn.dataset.testInstance),btn)));
         root.querySelectorAll('[data-edit-instance]').forEach(btn=>btn.addEventListener('click',()=>openInstance(instances.find(item=>item.id===Number(btn.dataset.editInstance)))));
-        root.querySelectorAll('[data-delete-instance]').forEach(btn=>btn.addEventListener('click',()=>removeInstance(Number(btn.dataset.deleteInstance))));
+        root.querySelectorAll('[data-delete-instance]').forEach(btn=>btn.addEventListener('click',()=>{
+            const menu=btn.closest('details');
+            menu.open=false;menu.querySelector('summary').focus();
+            removeInstance(Number(btn.dataset.deleteInstance));
+        }));
         renderLucideIcons(root);
     }
-    async function selectInstance(id){selectedId=id;document.getElementById('newBindingBtn').disabled=!id;const instance=instances.find(item=>item.id===id);document.getElementById('bindingPanelHint').textContent=instance?`当前实例：${instance.name}`:'先在上方选择一个反代实例';renderInstances();await loadBindings(id);}
-    async function loadBindings(instanceId=selectedId){
+    function openBindings(instanceId,trigger){
+        const instance=instances.find(item=>item.id===instanceId);
+        if(!instance)return;
+        closeBindingEditor();
+        bindingPanelSession={instanceId,name:instance.name};
+        document.getElementById('bindingPanelHint').textContent=`当前实例：${instance.name}`;
+        document.getElementById('proxyBindingList').innerHTML='<div class="empty-state compact"><p>正在读取播放映射…</p></div>';
+        bindingsModal.open(trigger);
+        void loadBindings();
+    }
+    function closeBindings(){
+        const instanceId=bindingPanelSession?.instanceId;
+        bindingPanelSession=null;
+        closeBindingEditor();
+        bindingsModal.close();
+        document.querySelector(`[data-proxy-instance="${instanceId}"] summary`)?.focus({preventScroll:true});
+    }
+    async function loadBindings(session=bindingPanelSession){
+        if(!session||bindingPanelSession!==session)return;
         const root=document.getElementById('proxyBindingList');
-        const requestedId=Number(instanceId||0);
+        const state=document.getElementById('bindingsListState');
+        const refresh=document.getElementById('refreshBindingsBtn');
         const serial=++bindingsRequestSerial;
-        if(!requestedId){root.innerHTML='<div class="empty-state compact"><i data-lucide="mouse-pointer-2"></i><p>选择实例后查看映射</p></div>';renderLucideIcons(root);return;}
-        try{const rows=(await request(`/api/media-proxy/${requestedId}/bindings`)).filter(row=>row.source_type==='guangya');if(serial!==bindingsRequestSerial||requestedId!==Number(selectedId||0))return;root.innerHTML=rows.length?rows.map(row=>`<article class="proxy-binding-card"><div class="proxy-binding-icon"><i data-lucide="cloud"></i></div><div><strong>${esc(row.media_item_id)}</strong><p>${row.media_source_id?`Source ${esc(row.media_source_id)} · `:''}光鸭文件 ${esc(row.guangya_file_id)}</p></div><button class="icon-action danger" data-delete-binding="${row.id}" title="删除映射"><i data-lucide="trash-2"></i></button></article>`).join(''):'<div class="empty-state compact"><i data-lucide="link-2-off"></i><p>没有人工映射</p><span class="hint">标准 STRM 会自动识别，无需手工配置</span></div>';root.querySelectorAll('[data-delete-binding]').forEach(btn=>btn.addEventListener('click',()=>removeBinding(Number(btn.dataset.deleteBinding))));renderLucideIcons(root);}catch(error){if(serial!==bindingsRequestSerial||requestedId!==Number(selectedId||0))return;root.innerHTML=`<div class="empty-state compact"><p>${esc(error.message)}</p></div>`;}
+        const isCurrent=()=>bindingPanelSession===session&&serial===bindingsRequestSerial;
+        root.setAttribute('aria-busy','true');refresh.disabled=true;state.textContent='读取中…';
+        try{
+            const rows=(await request(`/api/media-proxy/${session.instanceId}/bindings`)).filter(row=>row.source_type==='guangya');
+            if(!isCurrent())return;
+            root.innerHTML=rows.length?rows.map(row=>`<article class="proxy-binding-card"><div class="proxy-binding-icon"><i data-lucide="cloud"></i></div><div><strong>${esc(row.media_item_id)}</strong><p>${row.media_source_id?`Source ${esc(row.media_source_id)} · `:''}光鸭文件 ${esc(row.guangya_file_id)}</p></div><button type="button" class="icon-action danger" data-delete-binding="${row.id}" title="删除映射"><i data-lucide="trash-2"></i></button></article>`).join(''):'<div class="empty-state compact"><i data-lucide="link-2-off"></i><p>没有手动播放映射</p><span class="hint">标准 STRM 会自动识别，无需手工配置</span></div>';
+            root.querySelectorAll('[data-delete-binding]').forEach(btn=>btn.addEventListener('click',()=>removeBinding(Number(btn.dataset.deleteBinding),session)));
+            session.loaded=true;state.textContent=`共 ${rows.length} 条映射`;
+            renderLucideIcons(root);
+        }catch(error){
+            if(!isCurrent())return;
+            state.textContent=`读取失败：${error.message}，请点击刷新重试`;
+            if(!session.loaded)root.innerHTML='<div class="empty-state compact"><p>播放映射暂时无法读取</p></div>';
+        }finally{
+            if(isCurrent()){root.setAttribute('aria-busy','false');refresh.disabled=false;}
+        }
     }
     function openInstance(instance=null,presetSource=''){
         proxyEditSession={id:instance?.id||null,saving:false};
@@ -503,15 +558,23 @@
         if(selectedSource==='custom'){body.server_type=document.getElementById('proxyServerType').value;body.upstream_url=document.getElementById('proxyUpstream').value.trim();body.api_key=document.getElementById('proxyApiKey').value.trim();}
         session.saving=true;btn.disabled=true;setNotice('保存并热加载中...');
         try{
-            const result=await request(session.id?`/api/media-proxy/${session.id}`:'/api/media-proxy',{method:session.id?'PUT':'POST',body:JSON.stringify(body)});
+            await request(session.id?`/api/media-proxy/${session.id}`:'/api/media-proxy',{method:session.id?'PUT':'POST',body:JSON.stringify(body)});
             if(proxyEditSession!==session)return;
-            closeProxyEditor();selectedId=result.instance.id;await loadAll(true);
+            closeProxyEditor();await loadAll(true);
         }catch(error){if(proxyEditSession===session)setNotice(error.message,true);}
         finally{if(proxyEditSession===session){session.saving=false;btn.disabled=false;}}
     }
     async function testInstance(id,btn){instanceTestState[id]={loading:true};renderInstances();try{const result=await request(`/api/media-proxy/${id}/test`,{method:'POST'});instanceTestState[id]={success:true,elapsed_ms:result.elapsed_ms};}catch(error){instanceTestState[id]={error:error.message||'连接失败'};}finally{renderInstances();window.setTimeout(()=>{if(instanceTestState[id]&&!instanceTestState[id].loading){delete instanceTestState[id];renderInstances();}},8000);}}
-    async function removeInstance(id){const instance=instances.find(item=>item.id===id);const confirmed=await appConfirm({title:'删除媒体反代实例',message:`删除实例「${instance?.name||id}」及其人工光鸭映射。监听端口会立即关闭。`,confirmText:'删除实例',danger:true,verifyText:'DELETE'});if(!confirmed)return;try{await request(`/api/media-proxy/${id}`,{method:'DELETE'});if(selectedId===id)selectedId=null;await loadAll(true);}catch(error){setNotice(error.message,true);}}
-    function openBinding(){if(!selectedId)return;bindingEditSession={instanceId:selectedId,saving:false};document.getElementById('saveBindingBtn').disabled=false;document.getElementById('bindingItemId').value='';document.getElementById('bindingSourceId').value='';document.getElementById('bindingGuangyaId').value='';document.getElementById('bindingSaveState').textContent='';bindingModal.open(document.getElementById('newBindingBtn'));}
+    async function removeInstance(id){const instance=instances.find(item=>item.id===id);const confirmed=await appConfirm({title:'删除媒体反代实例',message:`删除实例「${instance?.name||id}」及其人工光鸭映射。监听端口会立即关闭。`,confirmText:'删除实例',danger:true,verifyText:'DELETE'});if(!confirmed)return;try{await request(`/api/media-proxy/${id}`,{method:'DELETE'});if(bindingPanelSession?.instanceId===id)closeBindings();await loadAll(true);}catch(error){setNotice(error.message,true);}}
+    function openBinding(){
+        if(!bindingPanelSession)return;
+        bindingEditSession={instanceId:bindingPanelSession.instanceId,panel:bindingPanelSession,saving:false};
+        document.getElementById('saveBindingBtn').disabled=false;
+        document.getElementById('bindingInstanceHint').textContent=`当前实例：${bindingPanelSession.name}`;
+        ['bindingItemId','bindingSourceId','bindingGuangyaId'].forEach(id=>{document.getElementById(id).value='';});
+        document.getElementById('bindingSaveState').textContent='';
+        bindingModal.open(document.getElementById('newBindingBtn'));
+    }
     function closeBindingEditor(){bindingEditSession=null;bindingModal.close();}
     async function saveBinding(){
         const session=bindingEditSession;
@@ -523,11 +586,20 @@
         try{
             await request(`/api/media-proxy/${session.instanceId}/bindings`,{method:'POST',body:JSON.stringify(body)});
             if(bindingEditSession!==session)return;
-            closeBindingEditor();await loadBindings(session.instanceId);
+            closeBindingEditor();await loadBindings(session.panel);
         }catch(error){if(bindingEditSession===session)state.textContent=error.message;}
         finally{if(bindingEditSession===session){session.saving=false;btn.disabled=false;}}
     }
-    async function removeBinding(id){const confirmed=await appConfirm({title:'删除光鸭播放映射',message:'删除后该播放请求将恢复自动识别或透传上游，不会删除光鸭文件。',confirmText:'删除映射',danger:true});if(!confirmed)return;try{await request(`/api/media-proxy/${selectedId}/bindings/${id}`,{method:'DELETE'});await loadBindings();}catch(error){document.getElementById('bindingPanelHint').textContent=error.message;}}
+    async function removeBinding(id,session){
+        const confirmed=await appConfirm({title:'删除光鸭播放映射',message:'删除后该播放请求将恢复自动识别或透传上游，不会删除光鸭文件。',confirmText:'删除映射',danger:true});
+        if(!confirmed||bindingPanelSession!==session)return;
+        try{
+            await request(`/api/media-proxy/${session.instanceId}/bindings/${id}`,{method:'DELETE'});
+            await loadBindings(session);
+        }catch(error){
+            if(bindingPanelSession===session)document.getElementById('bindingsListState').textContent=error.message;
+        }
+    }
     function renderProxyRecordInstances(){const select=document.getElementById('proxyRecordInstance');const current=select.value;select.innerHTML='<option value="">全部实例</option>'+instances.map(item=>`<option value="${item.id}">${esc(item.name)}</option>`).join('');if([...select.options].some(option=>option.value===current))select.value=current;}
     function sourceBadge(record){
         const source=record?.source;
@@ -639,6 +711,16 @@
     function renderProxyRecords(data){const root=document.getElementById('proxyRecordList');root.querySelectorAll('.proxy-session-card[data-session-id][open]').forEach(card=>proxyExpandedSessions.add(Number(card.dataset.sessionId)));const existingLegacy=root.querySelector('.proxy-legacy-session');if(existingLegacy)proxyLegacyExpanded=existingLegacy.open;const rows=Array.isArray(data.items)?data.items:[];const legacyTotal=Number(data.unlinked_total||0);proxyRecordTotal=Number(data.total||0);const legacyMarkup=proxyRecordPage===1&&legacyTotal?proxyLegacyMarkup(legacyTotal):'';if(!rows.length&&!legacyMarkup){root.innerHTML='<div class="empty-state proxy-record-empty"><i data-lucide="history"></i><p>暂无符合筛选条件的媒体播放会话</p></div>';}else{root.innerHTML=legacyMarkup+rows.map(proxySessionMarkup).join('');bindProxySessionDetails(root);}const pages=Math.max(1,Math.ceil(proxyRecordTotal/20));proxyRecordPage=Math.min(proxyRecordPage,pages);const legacyLabel=legacyTotal?` · ${legacyTotal} 条历史明细`:'';document.getElementById('proxyRecordPage').textContent=`第 ${proxyRecordPage} / ${pages} 页 · ${proxyRecordTotal} 次播放${legacyLabel}`;const prev=document.getElementById('proxyRecordPrev');const next=document.getElementById('proxyRecordNext');prev.dataset.pageDisabled=proxyRecordPage<=1?'1':'0';next.dataset.pageDisabled=proxyRecordPage>=pages?'1':'0';prev.disabled=prev.dataset.pageDisabled==='1';next.disabled=next.dataset.pageDisabled==='1';renderLucideIcons(root);}
     async function loadProxyRecords({background=false}={}){const serial=++proxyRecordRequestSerial;const instance=document.getElementById('proxyRecordInstance').value;const status=document.getElementById('proxyRecordStatus').value;const source=document.getElementById('proxyRecordSource').value;const filterKey=JSON.stringify({instance,status,source,page:proxyRecordPage});const query=new URLSearchParams({page:String(proxyRecordPage),page_size:'20'});if(instance)query.set('instance_id',instance);if(status)query.set('status',status);if(source)query.set('source',source);if(!background&&!proxyRecordsLoaded)document.getElementById('proxyRecordList').innerHTML='<div class="proxy-record-loading"><i data-lucide="activity"></i><p>正在读取媒体播放会话...</p></div>';setProxyRecordsBusy(true);try{const metricsQuery=instance?`?instance_id=${encodeURIComponent(instance)}`:'';const [sessionsResult,metricsResult]=await Promise.allSettled([request(`/api/media-proxy/sessions?${query}`),request(`/api/media-proxy/cache-metrics${metricsQuery}`)]);if(serial!==proxyRecordRequestSerial)return;const failures=[];if(sessionsResult.status==='fulfilled'){renderProxyRecords(sessionsResult.value);proxyRecordsLoaded=true;lastProxyRecordFilterKey=filterKey;}else{failures.push(`播放记录：${sessionsResult.reason?.message||'刷新失败'}`);if(!proxyRecordsLoaded)document.getElementById('proxyRecordList').innerHTML=`<div class="empty-state proxy-record-empty"><p>${esc(sessionsResult.reason?.message||'播放记录刷新失败')}</p></div>`;else document.getElementById('proxyRecordPage').textContent=lastProxyRecordFilterKey===filterKey?'刷新失败 · 保留上次结果':'刷新失败 · 当前显示的是上一筛选结果';}if(metricsResult.status==='fulfilled')renderProxyCacheMetrics(metricsResult.value);else failures.push(`缓存指标：${metricsResult.reason?.message||'刷新失败'}`);if(failures.length)appAlert({title:'播放记录刷新未完成',message:failures.join('；'),type:'warning'});}finally{if(serial===proxyRecordRequestSerial){setProxyRecordsBusy(false);renderLucideIcons(document.getElementById('proxyRecordsPanel'));}}}
     async function clearProxyRecords(){const instance=document.getElementById('proxyRecordInstance').value;const confirmed=await appConfirm({title:'清理媒体播放会话',message:instance?'仅清理当前筛选实例的播放摘要与请求明细。此操作不会影响反代实例或媒体文件。':'清理全部反代实例的播放摘要与请求明细。此操作不会影响媒体文件。',confirmText:'清理记录',danger:true,verifyText:'CLEAR PLAYBACK RECORDS'});if(!confirmed)return;setProxyRecordsBusy(true);try{const body={confirm:'CLEAR PLAYBACK RECORDS'};if(instance)body.instance_id=Number(instance);await request('/api/media-proxy/records',{method:'DELETE',body:JSON.stringify(body)});proxySessionDetails.clear();proxySessionDetailPromises.clear();proxyExpandedSessions.clear();proxyLegacyExpanded=false;proxyLegacyRequestSerial+=1;proxyRecordPage=1;await loadProxyRecords({background:true});}catch(error){document.getElementById('proxyRecordPage').textContent=error.message;}finally{setProxyRecordsBusy(false);}}
+    document.getElementById('refreshBindingsBtn').addEventListener('click',()=>loadBindings());
+    document.querySelectorAll('[data-bindings-close]').forEach(btn=>btn.addEventListener('click',closeBindings));
+    document.addEventListener('click',event=>{
+        document.querySelectorAll('.proxy-instance-more[open]').forEach(menu=>{if(!menu.contains(event.target))menu.open=false;});
+    });
+    document.addEventListener('keydown',event=>{
+        if(event.key!=='Escape')return;
+        const menu=document.querySelector('.proxy-instance-more[open]');
+        if(menu){menu.open=false;menu.querySelector('summary').focus();event.preventDefault();}
+    });
     document.getElementById('newProxyBtn').addEventListener('click',()=>openInstance());document.getElementById('refreshProxyBtn').addEventListener('click',()=>loadAll(true));document.getElementById('saveProxyBtn').addEventListener('click',saveInstance);document.getElementById('proxyTrustForwardedHeaders').addEventListener('change',syncForwardedTrustState);document.getElementById('newBindingBtn').addEventListener('click',openBinding);document.getElementById('saveBindingBtn').addEventListener('click',saveBinding);document.getElementById('proxyRecordRefreshBtn').addEventListener('click',()=>loadProxyRecords({background:true}));document.getElementById('proxyRecordClearBtn').addEventListener('click',clearProxyRecords);['proxyRecordInstance','proxyRecordStatus','proxyRecordSource'].forEach(id=>document.getElementById(id).addEventListener('change',()=>{proxyRecordPage=1;loadProxyRecords({background:true});}));document.getElementById('proxyRecordPrev').addEventListener('click',()=>{if(proxyRecordPage>1){proxyRecordPage-=1;loadProxyRecords({background:true});}});document.getElementById('proxyRecordNext').addEventListener('click',()=>{proxyRecordPage+=1;loadProxyRecords({background:true});});document.querySelectorAll('[data-proxy-close]').forEach(btn=>btn.addEventListener('click',closeProxyEditor));document.querySelectorAll('[data-binding-close]').forEach(btn=>btn.addEventListener('click',closeBindingEditor));
 })();
 </script>

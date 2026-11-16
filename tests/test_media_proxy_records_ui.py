@@ -18,12 +18,14 @@ class MediaProxyRecordsUiTests(unittest.TestCase):
         self.assertIn("document.documentElement.dataset.mediaProxyInitialTab", self.template)
         self.assertIn("window.history.replaceState", self.template)
         self.assertIn("activateProxyTab(window.location?.hash?.slice(1)||''", self.template)
-        for tab in ("instances", "records", "advanced"):
+        for tab in ("instances", "records"):
             self.assertIn(f'id="proxyTabButton_{tab}"', self.template)
             self.assertIn(f'aria-controls="proxyTab_{tab}"', self.template)
             self.assertIn(f'aria-labelledby="proxyTabButton_{tab}"', self.template)
         self.assertIn('html[data-media-proxy-initial-tab="records"] #proxyTab_records', self.css)
-        self.assertIn('html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced', self.css)
+        self.assertNotIn('id="proxyTabButton_advanced"', self.template)
+        self.assertNotIn('id="proxyTab_advanced"', self.template)
+        self.assertNotIn('html[data-media-proxy-initial-tab="advanced"]', self.css)
 
     def test_initial_instance_loading_uses_delayed_stable_skeletons(self):
         self.assertNotIn("正在读取服务器配置...", self.template)
