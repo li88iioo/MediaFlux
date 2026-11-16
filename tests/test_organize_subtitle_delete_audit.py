@@ -274,6 +274,72 @@ class ManualRecycleBinDeleteTests(IsolatedDatabaseTestCase):
                             and not row["replacement_file_id"] for row in db.list_organize_delete_audits(log_id)))
         self.assertEqual(len(service.detail(log_id)["delete_audits"]), 2)
 
+    def test_manual_delete_rechecks_each_member_after_preflight(self):
+        for batch in (False, True):
+            for mutation_point in ("provider_return", "pending_audit"):
+                with self.subTest(batch=batch, mutation_point=mutation_point):
+                    log_id, service, client, remote, _retained = self._duplicate_delete_fixture()
+                    log_ids = [log_id]
+                    later_id, later_log = "video", log_id
+                    if batch:
+                        later_id = "other-video"
+                        later_log = db.add_organize_log(
+                            "guangya", "other-source", "other-target/Other.mkv", later_id,
+                            "success", "2", original_parent_id="other-source",
+                            original_name="Other.mkv", current_parent_id="other-target",
+                            current_name="Other.mkv", legacy_incomplete=False,
+                        )
+                        db.add_organize_log_items(later_log, [{
+                            "file_id": later_id, "role": "video", "original_parent_id": "other-source",
+                            "original_name": "Other.mkv", "current_parent_id": "other-target",
+                            "current_name": "Other.mkv", "size": 100, "etag": "other-gcid",
+                            "status": "success",
+                        }])
+                        remote[later_id] = replace(
+                            cloud_file(later_id, "Other.mkv", size=100, etag="other-gcid"),
+                            parent_id="other-target",
+                        )
+                        log_ids.append(later_log)
+                    original_delete = client.delete.side_effect
+                    original_audit = db.add_organize_delete_audit
+
+                    def move_later():
+                        remote[later_id].parent_id = "moved-outside-confirmed-source"
+                        remote[later_id].name = "Moved.mkv"
+
+                    def delete(ids):
+                        result = original_delete(ids)
+                        if mutation_point == "provider_return" and ids == ["sub"]:
+                            move_later()
+                        return result
+
+                    def audit(**kwargs):
+                        result = original_audit(**kwargs)
+                        if mutation_point == "pending_audit" and kwargs["file_id"] == later_id:
+                            move_later()
+                        return result
+
+                    client.delete.side_effect = delete
+                    with patch.object(db, "add_organize_delete_audit", side_effect=audit):
+                        if batch:
+                            result = service.run_batch("delete", [
+                                {"log_id": item, "operation_token": f"manual-{item}",
+                                 "expected_version": service.detail(item)["version"]}
+                                for item in log_ids
+                            ], "DELETE")
+                            self.assertFalse(result["success"])
+                            self.assertEqual(service.detail(log_id)["status"], "deleted")
+                        else:
+                            with self.assertRaises(RuntimeError):
+                                service.delete_group(log_id, "manual-recheck", 1, "DELETE")
+                    self.assertIn(later_id, remote)
+                    self.assertEqual([call.args[0] for call in client.delete.call_args_list],
+                                     [["sub"], ["video"]] if batch else [["sub"]])
+                    self.assertEqual(service.detail(later_log)["status"], "failed" if batch else "partial_failed")
+                    audits = {item["file_id"]: item for item in db.list_organize_delete_audits(limit=20)}
+                    self.assertEqual(audits[later_id]["status"], "blocked")
+                    self.assertEqual(audits["sub"]["status"], "success")
+
     def test_automatic_delete_audits_retained_file_and_leaves_directory_cleanup_to_organizer(self):
         log_id, service, client, remote, retained = self._duplicate_delete_fixture()
         guard = unittest.mock.Mock()

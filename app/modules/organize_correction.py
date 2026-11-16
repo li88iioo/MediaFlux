@@ -2198,7 +2198,7 @@ class OrganizeCorrectionService:
                                 retained.size, retained.etag,
                             ) if retained is not None else None,
                             organize_log_id=log_id,
-                            delete_operation=delete_current if before_delete is not None else None,
+                            delete_operation=delete_current,
                         )
                         deleted.add(item.file_id)
                         batch_deleted.add(item.file_id)
