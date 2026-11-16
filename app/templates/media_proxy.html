@@ -179,7 +179,7 @@
                 <div class="proxy-config-details-body proxy-custom-fields">
                     <div class="form-group"><label class="form-label" for="proxyServerType">服务器类型</label><select class="form-select" id="proxyServerType"><option value="jellyfin">Jellyfin</option><option value="emby">Emby</option></select></div>
                     <div class="form-group"><label class="form-label" for="proxyUpstream">上游地址</label><input class="form-input" id="proxyUpstream" placeholder="http://192.168.88.11:8096"></div>
-                    <div class="form-group"><label class="form-label" for="proxyApiKey">管理 API Key / Token</label><input class="form-input" id="proxyApiKey" type="password" autocomplete="new-password" placeholder="留空表示不修改现有凭据"></div>
+                    <div class="form-group"><label class="form-label" for="proxyApiKey">管理 API Key / Token</label><input class="form-input" id="proxyApiKey" type="password" autocomplete="new-password" placeholder="留空将清除现有凭据；保留 ******** 则不修改"></div>
                 </div>
             </details>
             <div class="grid-2"><div class="form-group"><label class="form-label" for="proxyHost">监听地址</label><select class="form-select" id="proxyHost"><option value="0.0.0.0">0.0.0.0（局域网）</option><option value="127.0.0.1">127.0.0.1（仅本机）</option><option value="::">::（IPv6 全部）</option><option value="::1">::1（IPv6 本机）</option></select></div><div class="form-group"><label class="form-label" for="proxyPort">监听端口</label><input class="form-input" id="proxyPort" type="number" min="1024" max="65535" value="18096"></div></div>

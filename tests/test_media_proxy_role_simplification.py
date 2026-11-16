@@ -147,7 +147,144 @@ class MediaProxyProfileApiTests(InitializedWebTestCase):
                 self.assertNotIn("server-secret", created.text)
 
 
+class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
+    def test_custom_api_key_mask_preserves_and_explicit_empty_clears(self):
+        from app.repositories import media_proxy as repository
+        from app.routes import media_proxy_api
+
+        instance_id = repository.add_media_proxy_instance(
+            name="Custom source",
+            server_type="jellyfin",
+            upstream_url="http://127.0.0.1:8096",
+            api_key="original-secret",
+            listen_host="127.0.0.1",
+            listen_port=18103,
+            enabled=0,
+        )
+        request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+            background_services_enabled=False,
+        ))))
+        body = {
+            "name": "Custom source",
+            "config_source": "custom",
+            "server_type": "jellyfin",
+            "upstream_url": "http://127.0.0.1:8096",
+            "listen_host": "127.0.0.1",
+            "listen_port": 18103,
+            "enabled": False,
+        }
+        with patch.object(media_proxy_api, "require_api_login", return_value=None):
+            for submitted, expected in (
+                ("********", "original-secret"),
+                ("", ""),
+                ("replacement-secret", "replacement-secret"),
+            ):
+                with self.subTest(submitted=submitted):
+                    response = asyncio.run(media_proxy_api.update_instance(
+                        instance_id, request, {**body, "api_key": submitted},
+                    ))
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(repository.get_media_proxy_instance(instance_id)["api_key"], expected)
+                    instance = json.loads(bytes(response.body))["instance"]
+                    self.assertEqual(instance["has_api_key"], bool(expected))
+                    self.assertEqual(instance["api_key"], "********" if expected else "")
+
+    def test_unavailable_configured_source_can_be_disabled_without_losing_bindings(self):
+        from app.modules import media_proxy, media_server_profiles
+        from app.repositories import media_proxy as repository
+        from app.routes import media_proxy_api
+
+        values = {
+            "JELLYFIN_ENABLED": "true",
+            "JELLYFIN_URL": "http://127.0.0.1:8096",
+            "JELLYFIN_API_KEY": "profile-secret",
+        }
+        for index, (key, unavailable) in enumerate((
+            ("JELLYFIN_ENABLED", "false"),
+            ("JELLYFIN_URL", ""),
+            ("JELLYFIN_API_KEY", ""),
+        )):
+            with self.subTest(unavailable=key):
+                port = 18100 + index
+                instance_id = repository.add_media_proxy_instance(
+                    name="Configured source",
+                    server_type="jellyfin",
+                    config_source="configured:jellyfin",
+                    upstream_url="",
+                    api_key="",
+                    listen_host="127.0.0.1",
+                    listen_port=port,
+                )
+                binding = repository.create_media_proxy_binding(
+                    instance_id=instance_id,
+                    media_item_id="item",
+                    media_source_id="source",
+                    source_type="guangya",
+                    guangya_file_id="file",
+                )
+                manager = media_proxy.MediaProxyManager()
+                runtime = SimpleNamespace(instance_id=instance_id)
+                manager._runtimes[instance_id] = runtime
+                request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+                    background_services_enabled=True,
+                    media_proxy_manager=manager,
+                ))))
+                body = {
+                    "name": "Configured source",
+                    "config_source": "configured:jellyfin",
+                    "listen_host": "127.0.0.1",
+                    "listen_port": port,
+                    "enabled": False,
+                }
+                with (
+                    patch.object(media_proxy_api, "require_api_login", return_value=None),
+                    patch.object(
+                        media_server_profiles.config,
+                        "get",
+                        side_effect=lambda name, default="", unavailable_key=key, value=unavailable:
+                            value if name == unavailable_key else values.get(name, default),
+                    ),
+                    patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop,
+                ):
+                    disabled = asyncio.run(media_proxy_api.update_instance(instance_id, request, body))
+                    self.assertEqual(disabled.status_code, 200, bytes(disabled.body))
+                    stopped = repository.get_media_proxy_instance(instance_id)
+                    self.assertEqual(stopped["enabled"], 0)
+                    self.assertEqual(stopped["status"], "stopped")
+                    stop.assert_awaited_once_with(runtime)
+                    self.assertNotIn(instance_id, manager.status())
+                    self.assertEqual(
+                        [row["id"] for row in repository.list_media_proxy_bindings(instance_id)],
+                        [binding["id"]],
+                    )
+                    enabled = asyncio.run(media_proxy_api.update_instance(
+                        instance_id, request, {**body, "enabled": True},
+                    ))
+                    self.assertEqual(enabled.status_code, 400)
+                    self.assertEqual(repository.get_media_proxy_instance(instance_id)["enabled"], 0)
+
+
 class MediaProxyProbeApiTests(unittest.TestCase):
+    def test_probe_endpoint_does_not_treat_login_redirect_as_success(self):
+        from app.routes import media_proxy_api
+
+        with (
+            patch.object(media_proxy_api, "require_api_login", return_value=None),
+            patch("app.repositories.media_proxy.get_media_proxy_instance", return_value={"id": 7}),
+            patch.object(
+                media_proxy_api, "probe_media_proxy_instance",
+                new=AsyncMock(return_value={"status_code": 302, "latency_ms": 37}),
+            ),
+        ):
+            response = asyncio.run(media_proxy_api.test_instance(7, cast(Request, SimpleNamespace())))
+
+        self.assertEqual(response.status_code, 502)
+        payload = json.loads(bytes(response.body))
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["status_code"], 302)
+        self.assertEqual(payload["elapsed_ms"], 37)
+        self.assertIn("重定向", payload["error"])
+
     def test_probe_endpoint_reuses_pinned_service_and_preserves_contract(self):
         import json
 

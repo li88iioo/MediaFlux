@@ -159,6 +159,7 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
     if trust_forwarded_headers and not trusted_proxy_cidrs:
         return None, "启用转发头信任时至少填写一个可信代理地址"
 
+    enabled = bool(data.get("enabled", True))
     if config_source == "custom":
         server_type = str(data.get("server_type") or "jellyfin").strip().lower()
         if server_type not in {"jellyfin", "emby"}:
@@ -172,15 +173,16 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
             api_key = str(existing["api_key"] or "")
     else:
         server_type = config_source.split(":", 1)[1]
-        try:
-            resolve_proxy_instance({
-                "config_source": config_source,
-                "server_type": server_type,
-                "upstream_url": "",
-                "api_key": "",
-            })
-        except ValueError as exc:
-            return None, str(exc)
+        if enabled:
+            try:
+                resolve_proxy_instance({
+                    "config_source": config_source,
+                    "server_type": server_type,
+                    "upstream_url": "",
+                    "api_key": "",
+                })
+            except ValueError as exc:
+                return None, str(exc)
         upstream_url = ""
         api_key = ""
     return {
@@ -196,7 +198,7 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
         "trusted_proxy_cidrs_json": encode_trusted_proxy_cidrs(
             trusted_proxy_cidrs
         ),
-        "enabled": 1 if data.get("enabled", True) else 0,
+        "enabled": 1 if enabled else 0,
     }, ""
 
 
@@ -402,11 +404,15 @@ async def test_instance(instance_id: int, request: Request):
     except Exception as exc:
         return api_error(f"连接失败：{exc}", 502)
     status_code = result["status_code"]
-    return api_response({
-        "success": 200 <= status_code < 400,
+    success = 200 <= status_code < 300
+    payload: dict[str, Any] = {
+        "success": success,
         "status_code": status_code,
         "elapsed_ms": result["latency_ms"],
-    }, 200 if status_code < 400 else 502)
+    }
+    if 300 <= status_code < 400:
+        payload["error"] = "上游返回重定向，尚未验证媒体服务连接"
+    return api_response(payload, 200 if success else 502)
 
 
 @router.get("/{instance_id}/bindings")
