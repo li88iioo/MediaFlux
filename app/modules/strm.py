@@ -25,7 +25,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
@@ -3289,6 +3289,22 @@ def trigger_cloud_changes(operations: list[dict], *, sources: dict[str, str] | N
     return stats
 
 
+def _retry_filter_config(runtime: dict | None = None) -> dict:
+    """补齐旧运行快照缺少的过滤字段；已有冻结值不再读取当前配置。"""
+    runtime = runtime or {}
+    metadata_enabled = bool(runtime["metadata_enabled"]) if "metadata_enabled" in runtime else get_bool("STRM_METADATA_ENABLED", False)
+    video_exts, metadata_exts = validate_strm_extensions(
+        runtime["video_exts"] if "video_exts" in runtime else get("STRM_VIDEO_EXTS", ""),
+        parse_strm_extensions(
+            runtime["metadata_exts"] if "metadata_exts" in runtime else get("STRM_METADATA_EXTS", ""),
+            defaults=DEFAULT_STRM_METADATA_EXTS,
+        ) if metadata_enabled else (),
+    )
+    threshold = runtime["skip_threshold_mb"] if "skip_threshold_mb" in runtime else get_int("STRM_SKIP_THRESHOLD_MB", 0)
+    return {"video_exts": tuple(sorted(video_exts)), "metadata_enabled": metadata_enabled,
+            "metadata_exts": tuple(sorted(metadata_exts)), "skip_threshold_mb": max(0, int(threshold))}
+
+
 def _retry_runtime_config() -> tuple[dict, str]:
     sources, source_error = configured_strm_source_plans()
     if source_error:
@@ -3300,21 +3316,22 @@ def _retry_runtime_config() -> tuple[dict, str]:
     if not base_url:
         return {}, "未配置 STRM 播放服务地址"
     try:
-        validate_strm_extensions(get("STRM_VIDEO_EXTS", ""), parse_strm_extensions(
-            get("STRM_METADATA_EXTS", ""), defaults=DEFAULT_STRM_METADATA_EXTS,
-        ) if get_bool("STRM_METADATA_ENABLED", False) else ())
+        filters = _retry_filter_config()
     except ValueError as exc:
         return {}, str(exc)
     root = Path(root_text).expanduser().resolve(strict=False)
     if root.exists() and not root.is_dir():
         return {}, "STRM 本地根目录不是目录"
-    return {"sources": sources, "strm_root": str(root), "base_url": base_url}, ""
+    return {"sources": sources, "strm_root": str(root), "base_url": base_url, **filters}, ""
 
 
 def capture_strm_retry_runtime_config() -> tuple[dict, str]:
     """冻结一次已解析的 STRM 重试配置，供确认动作在执行时复用。"""
-    runtime, error = _retry_runtime_config()
-    return deepcopy(runtime), (error or "")
+    from app import config
+
+    with config.runtime_config_read_guard():
+        runtime, error = _retry_runtime_config()
+        return deepcopy(runtime), (error or "")
 
 
 def strm_failures(status: str = "all", action: str = "", source_id: str = "",
@@ -3555,7 +3572,7 @@ def _retry_result(trigger_type: str, *, requested: int = 0) -> dict:
 def _process_claimed_strm_failures(
     rows: list,
     *,
-    client: GuangYaClient,
+    client: GuangYaClient | None,
     runtime: dict,
     lookup: _RetryLookupResult,
     result: dict,
@@ -3573,10 +3590,9 @@ def _process_claimed_strm_failures(
         enabled=bool(runtime.get("media_server_refresh", True)),
         allow_emby=bool(runtime.get("allow_emby", True)),
     )
-    video_exts = set(parse_strm_extensions(
-        runtime.get("video_exts", get("STRM_VIDEO_EXTS", "")), defaults=DEFAULT_STRM_VIDEO_EXTS,
-    ))
-    threshold_bytes = int(runtime.get("skip_threshold_mb", get_int("STRM_SKIP_THRESHOLD_MB", 0))) * 1024 * 1024
+    video_exts = set(runtime["video_exts"])
+    metadata_exts = set(runtime["metadata_exts"])
+    threshold_bytes = runtime["skip_threshold_mb"] * 1024 * 1024
     for completed, row in enumerate(rows, 1):
         failure_id = int(row["id"])
         try:
@@ -3595,6 +3611,24 @@ def _process_claimed_strm_failures(
                 result["deferred"] += 1
                 continue
             resolved = located.get((str(row["source_id"]), str(row["file_id"])))
+            action = str(row["action"] or "")
+            filter_error = ""
+            if action == "metadata" and not runtime["metadata_enabled"]:
+                filter_error = "STRM 伴随同步已暂停，保留待重试"
+            elif resolved is not None:
+                file = resolved[0]
+                extension = file.name.rsplit(".", 1)[-1].lower() if "." in file.name else ""
+                if action == "generate" and extension not in video_exts:
+                    filter_error = "STRM 视频类型已被本轮配置排除，保留待重试"
+                elif action == "generate" and threshold_bytes and 0 < file.size < threshold_bytes:
+                    filter_error = "STRM 视频大小低于本轮最小阈值，保留待重试"
+                elif action == "metadata" and extension not in metadata_exts:
+                    filter_error = "STRM 伴随文件类型已被本轮配置排除，保留待重试"
+            if filter_error:
+                if not db.release_strm_failure_retry(failure_id, error=filter_error, expected_status="retrying"):
+                    raise RuntimeError("STRM deferred 状态已变化，拒绝覆盖")
+                result["deferred"] += 1
+                continue
             if resolved is None:
                 if lookup.scan_incomplete or lookup.stopped:
                     deferred_error = (
@@ -3620,7 +3654,7 @@ def _process_claimed_strm_failures(
                 result["failed"] += 1
                 continue
             file, rel_dir, source = resolved
-            action = str(row["action"] or "")
+            assert client is not None
             target = (
                 _strm_target(file, rel_dir, strm_root)
                 if action == "generate"
@@ -3718,7 +3752,7 @@ def _retry_strm_failures_locked(
 ) -> dict:
     """选中/全部重试共用准备与分批执行；客户端和扫描成功前不领取失败项。"""
     normalized = list(dict.fromkeys(ids)) if ids is not None else None
-    snapshot: list[tuple[int, str, str]] = []
+    snapshot: list[tuple[int, str, str, str]] = []
     from app.repositories.strm import strm_failure_selection
 
     before_id: int | None = None
@@ -3734,7 +3768,7 @@ def _retry_strm_failures_locked(
         if not candidates:
             break
         snapshot.extend(
-            (int(row["id"]), str(row["source_id"]), str(row["file_id"])) for row in candidates
+            (int(row["id"]), str(row["source_id"]), str(row["file_id"]), str(row["action"])) for row in candidates
         )
         if normalized is not None:
             break
@@ -3746,18 +3780,27 @@ def _retry_strm_failures_locked(
     if not snapshot:
         return result
     if runtime_config is None:
-        runtime, config_error = _retry_runtime_config()
+        runtime, config_error = capture_strm_retry_runtime_config()
         if config_error:
             return {**result, "ok": False, "error": config_error}
     else:
+        from app import config
+
         runtime = deepcopy(runtime_config)
-    with _guangya_client_scope(client) as runtime_client:
+        try:
+            with config.runtime_config_read_guard():
+                runtime.update(_retry_filter_config(runtime))
+        except ValueError as exc:
+            return {**result, "ok": False, "error": str(exc)}
+    wanted = {(source, file_id) for _, source, file_id, item_action in snapshot
+              if item_action != "metadata" or runtime["metadata_enabled"]}
+    with (_guangya_client_scope(client) if wanted else nullcontext(None)) as runtime_client:
         lookup = _locate_retry_files(
             runtime_client,
             runtime["sources"],
-            {(source, file_id) for _, source, file_id in snapshot},
+            wanted,
             should_stop=should_stop,
-        )
+        ) if runtime_client is not None else _RetryLookupResult({}, 0, 0, False, "", False)
         result.update({
             "scan_incomplete": lookup.scan_incomplete,
             "scan_limit_reason": lookup.scan_limit_reason,
@@ -3771,7 +3814,7 @@ def _retry_strm_failures_locked(
         progress.emit("retry", 0, total, "重试失败项")
         for offset in range(0, total, 1000):
             batch = snapshot[offset:offset + 1000]
-            rows = db.claim_strm_failures([failure_id for failure_id, _, _ in batch], limit=1000)
+            rows = db.claim_strm_failures([failure_id for failure_id, _, _, _ in batch], limit=1000)
             if normalized is None:
                 result["batches"] += 1
             result["matched"] += len(rows)

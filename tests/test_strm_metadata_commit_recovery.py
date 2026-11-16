@@ -80,6 +80,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
         return strm.retry_all_strm_failures("source", "metadata", "test", client=cast(GuangYaClient, self.client), runtime_config={
             "sources": strm.plan_strm_sources([{"id": "source", "name": "整理"}], prefixes={"source": ""}),
             "strm_root": str(self.root), "base_url": "http://play.invalid", "media_server_refresh": True,
+            "video_exts": ("mkv",), "metadata_enabled": True, "metadata_exts": ("nfo",), "skip_threshold_mb": 0,
         })
 
     def _assert_removed_source_download_is_discarded(self, *, download_fails):

@@ -46,6 +46,7 @@ def backend(tmp_path, monkeypatch):
     setattr(client, "close", Mock())
     with (isolated_test_database(),
           patch.object(service, "get", side_effect=lambda key, default="": settings.get(key, default)),
+          patch.object(service, "get_bool", side_effect=lambda key, default=False: settings.get(key, "1" if default else "0") == "1"),
           patch.object(service, "GuangYaClient", return_value=client),
           patch("socket.socket.connect", side_effect=AssertionError("不得联网"))):
         yield SimpleNamespace(client=client, settings=settings, root=tmp_path / "strm")
@@ -141,6 +142,7 @@ def test_invalid_config_is_safe_and_does_not_issue_confirmation(backend):
 
 def test_metadata_selection_reuses_public_download_install_and_ledger(backend):
     identifier = record(0, "metadata")
+    backend.settings["STRM_METADATA_ENABLED"] = "1"
     backend.client.tree["source"] = [GuangYaFile("video-0", "Show.nfo", False, 8, "fresh", "source")]
     with patch.object(service.requests, "get", return_value=_Response(b"metadata")):
         result = sdk.strm.retry_failures([identifier])
