@@ -10,7 +10,7 @@ import threading
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -505,6 +505,26 @@ class FirstRunTests(unittest.TestCase):
             response = client.get("/network-applying", follow_redirects=False)
 
         self.assertEqual(response.status_code, 404)
+
+    def test_login_page_explains_activation_failure_and_can_retry(self):
+        with self._new_client() as client:
+            page = self._setup_page(client)
+            response = client.post('/setup', data=self._fields(page), follow_redirects=False)
+            self.assertEqual(response.status_code, 303)
+            before = self.paths.env_file.read_bytes()
+            client.app.state.ready = False
+            with patch.object(client.app.state, 'activate_runtime', new=AsyncMock(side_effect=RuntimeError('unavailable'))) as activate:
+                page = client.get('/login')
+                self.assertEqual(page.status_code, 503)
+                self.assertIn('服务尚未就绪', page.text)
+                activate.assert_awaited_once()
+                response = client.post('/login', data={
+                    'csrf_token': self._csrf_token(page), 'username': 'admin', 'password': 'password123',
+                }, follow_redirects=False)
+                self.assertEqual(response.status_code, 503)
+            self.assertEqual(self.paths.env_file.read_bytes(), before)
+            client.app.state.ready = True
+            self.assertEqual(client.get('/login').status_code, 200)
 
     def test_unicode_credentials_survive_setup_cold_login_logout_and_login(self):
         username, password = '管理员', '密码足够长度1234'

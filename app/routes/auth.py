@@ -54,14 +54,27 @@ def render_setup(
     )
 
 
+async def _activate_login_runtime(request: Request):
+    # 安装已提交但浏览器中断了原请求时，登录页仍可在同一服务内完成激活。
+    activate = getattr(request.app.state, "activate_runtime", None)
+    if activate is not None and not request.app.state.ready:
+        try:
+            await activate()
+        except Exception as exc:  # noqa: BLE001 - 未就绪时不得签发已登录会话。
+            logger.error("登录前运行时启动失败 type=%s", type(exc).__name__)
+            request.session.clear()
+            return await asyncio.to_thread(
+                _render_login, request, status_code=503,
+                error="服务尚未就绪，请检查日志并重启服务后登录",
+            )
+
+
 @router.get("/login", name="auth.login")
 async def login_page(request: Request):
     if first_run.needs_initialization():
         return RedirectResponse("/setup", status_code=302)
-    # 安装已提交但浏览器中断了原请求时，登录页仍可在同一服务内完成激活。
-    activate = getattr(request.app.state, "activate_runtime", None)
-    if activate is not None and not request.app.state.ready:
-        await activate()
+    if failure := await _activate_login_runtime(request):
+        return failure
     if is_web_authenticated(request):
         return RedirectResponse("/", status_code=302)
     return await asyncio.to_thread(_render_login, request)
@@ -75,17 +88,8 @@ async def login_submit(
 ):
     if first_run.needs_initialization():
         return RedirectResponse("/setup", status_code=302)
-    activate = getattr(request.app.state, "activate_runtime", None)
-    if activate is not None and not request.app.state.ready:
-        try:
-            await activate()
-        except Exception as exc:  # noqa: BLE001 - 未就绪时不得签发已登录会话。
-            logger.error("登录前运行时启动失败 type=%s", type(exc).__name__)
-            request.session.clear()
-            return await asyncio.to_thread(
-                _render_login, request, status_code=503,
-                error="服务尚未就绪，请检查日志并重启服务后登录",
-            )
+    if failure := await _activate_login_runtime(request):
+        return failure
     if is_web_authenticated(request):
         return RedirectResponse("/", status_code=302)
     identity = request.client.host if request.client else "unknown"
