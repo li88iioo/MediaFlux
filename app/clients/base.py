@@ -23,6 +23,7 @@ from app.modules.local_path_mapping import normalized_path_parts
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
     apply_media_server_path_mapping,
+    match_media_server_libraries,
     media_server_path_is_within,
     media_server_path_key,
     normalize_media_server_path,
@@ -1624,26 +1625,11 @@ class MediaServerClient:
         unmatched_targets: list[str] = []
         ambiguous_targets = 0
         for target in targets:
-            direct_matches: list[tuple[int, str, str]] = []
-            for folder in folders:
-                library_id = str(folder.get("id") or "").strip()
-                if not library_id:
-                    continue
-                for raw_location in folder.get("locations", []):
-                    location = self._normalize_media_path(raw_location)
-                    if location and media_server_path_is_within(target, location):
-                        direct_matches.append((len(location), library_id, location))
-            if direct_matches:
-                longest = max(length for length, _library_id, _location in direct_matches)
-                winners = {
-                    (library_id, location)
-                    for length, library_id, location in direct_matches
-                    if length == longest
-                }
-                if len(winners) == 1:
-                    library_for_target[target] = next(iter(winners))
-                    continue
-                ambiguous_targets += 1
+            match = match_media_server_libraries(target, folders)
+            if match.selected is not None:
+                library_for_target[target] = match.selected
+                continue
+            ambiguous_targets += int(match.ambiguous)
             unmatched_targets.append(target)
 
         result["matched"] = len(library_for_target)

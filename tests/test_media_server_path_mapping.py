@@ -9,6 +9,7 @@ from app.modules.media_server_path_mapping import (
     apply_media_server_path_mapping,
     configured_media_server_refresh_options,
     encode_media_server_path_mappings,
+    match_media_server_libraries,
     media_server_path_is_within,
     normalize_media_server_path,
     parse_media_server_path_mappings,
@@ -141,6 +142,46 @@ class MediaServerPathMappingTests(unittest.TestCase):
 
         self.assertEqual(options["path_mappings"], ())
         self.assertFalse(options["allow_global_refresh_fallback"])
+
+    def test_library_match_deduplicates_canonical_locations_before_unique_selection(self):
+        for root, locations in (
+            ("//NAS/Media", [r"\\NAS\Media", "//nas/media/"]),
+            ("D:/STRASSE", ["d:/Straße/", r"D:\STRASSE"]),
+        ):
+            with self.subTest(root=root):
+                match = match_media_server_libraries(f"{root}/Film.strm", [
+                    {"id": "movies", "locations": locations},
+                ])
+                self.assertFalse(match.ambiguous)
+                self.assertEqual(match.selected, ("movies", normalize_media_server_path(locations[0])))
+                duplicate = match_media_server_libraries(f"{root}/Film.strm", [
+                    {"id": "movies", "locations": locations},
+                    {"id": "other", "locations": [root]},
+                ])
+                self.assertTrue(duplicate.ambiguous)
+                self.assertIsNone(duplicate.selected)
+                self.assertEqual({item[0] for item in duplicate.candidates}, {"movies", "other"})
+
+    def test_library_match_uses_only_longest_segment_safe_prefix_with_valid_id(self):
+        folders = [
+            {"id": "a", "locations": ["/media"]},
+            {"id": "b", "locations": ["/media"]},
+            {"id": "nested", "locations": ["", "/media/../bad", "NUL\x00", "/media/movies"]},
+            {"id": "", "locations": ["/media/movies/Film.strm"]},
+        ]
+        self.assertEqual(match_media_server_libraries("/media/movies/Film.strm", folders).selected,
+                         ("nested", "/media/movies"))
+        self.assertTrue(match_media_server_libraries("/media/movies-extra/Film.strm", folders).ambiguous)
+        self.assertEqual(match_media_server_libraries("/media/MOVIES/Film.strm", folders).candidates,
+                         (("a", "/media"), ("b", "/media")))
+        self.assertEqual(match_media_server_libraries("/elsewhere/Film.strm", folders).candidates, ())
+
+    def test_library_match_rejects_empty_or_invalid_locations_without_treating_them_as_root(self):
+        folders = [{"id": "invalid", "locations": [None, "", " ", ".", "./", "/media/../bad", "NUL\x00"]}]
+        self.assertEqual(match_media_server_libraries("/media/Film.strm", folders).candidates, ())
+        self.assertEqual(match_media_server_libraries("/media/Film.strm", [
+            {"id": "root", "locations": ["/"]},
+        ]).selected, ("root", "/"))
 
 if __name__ == "__main__":
     unittest.main()

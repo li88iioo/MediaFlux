@@ -1105,22 +1105,104 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(recorder.refreshed, ["preferred"])
 
     def test_duplicate_direct_virtual_folder_location_is_safely_rejected(self):
+        for target, locations in (
+            ("/media/movies/Film", ["/media/movies", "/media/movies"]),
+            ("//NAS/Media/Film", [r"\\NAS\Media", "//nas/media/"]),
+            ("D:/STRASSE/Film", ["d:/Straße", "D:/STRASSE"]),
+        ):
+            folders = [
+                {"id": library_id, "locations": [location]}
+                for library_id, location in zip(("lib-a", "lib-b"), locations)
+            ]
+            for label, client in self._clients():
+                with self.subTest(server=label, target=target):
+                    recorder = _RefreshRecorder(client, folders, {})
+
+                    result = client.refresh_for_paths([target])
+
+                    self.assertFalse(result["ok"])
+                    self.assertEqual(result["scope"], "skipped")
+                    self.assertEqual(result["unmatched"], 1)
+                    self.assertEqual(result["ambiguous"], 1)
+                    self.assertEqual(result["unmatched_paths"], [target])
+                    self.assertIn("匹配多个媒体库", result["fallback"])
+                    self.assertEqual(recorder.refreshed, [])
+                    recorder.posts.assert_not_called()
+                    recorder.unexpected_request.assert_not_called()
+
+    def test_canonical_locations_in_same_library_do_not_block_mapped_refresh(self):
+        target = "/data/strm/Film.strm"
+        for label, client in self._clients(path_mappings=(MediaServerPathMapping("/data/strm", "//NAS/Media"),)):
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, [
+                    {"id": "movies", "locations": [r"\\NAS\Media", "//nas/media/"]},
+                ], {"movies": [{"Id": "movie", "Type": "Movie", "Path": "//nas/media/Film.strm"}]})
+                result = client.refresh_for_paths([target], allow_library_fallback=False)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["ambiguous"], 0)
+                self.assertEqual(result["succeeded_paths"], [target])
+                self.assertEqual(recorder.refreshed, ["movie"])
+                recorder.posts.assert_not_called()
+
+    def test_bound_local_library_can_refresh_duplicate_root_while_unbound_strm_is_ambiguous(self):
+        from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
+
+        target = "/media/movies/Film.strm"
+        folders = [{"id": key, "name": f"电影 {key.upper()}", "locations": ["/media/movies"]} for key in ("a", "b")]
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, folders, {"a": [{"Id": "movie", "Type": "Movie", "Path": target}]})
+                allowed = MediaRefreshCoordinator._resolve_library_binding(client, {
+                    "library_binding": {"id": "a", "name": "电影 A"},
+                })
+                local = client.refresh_for_paths([target], allowed_library_ids=allowed)
+                self.assertTrue(local["ok"])
+                self.assertEqual(local["allowed_libraries"], ["a"])
+                self.assertEqual(local["ambiguous"], 0)
+                self.assertEqual(local["succeeded_paths"], [target])
+                self.assertEqual(recorder.refreshed, ["movie"])
+                recorder.refreshed.clear()
+                strm = client.refresh_for_paths([target])
+                self.assertFalse(strm["ok"])
+                self.assertEqual(strm["allowed_libraries"], [])
+                self.assertEqual(strm["ambiguous"], 1)
+                self.assertEqual(strm["unmatched_paths"], [target])
+                self.assertEqual(recorder.refreshed, [])
+                recorder.posts.assert_not_called()
+
+    def test_empty_and_dot_library_locations_cannot_trigger_posix_refresh(self):
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, [
+                    {"id": "bad", "locations": [None, "", " ", ".", "./"]},
+                ], {})
+                result = client.refresh_for_paths(["/media/Film.strm"])
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["scope"], "skipped")
+                self.assertEqual(result["matched"], 0)
+                self.assertEqual(recorder.refreshed, [])
+                recorder.posts.assert_not_called()
+
+    def test_ambiguous_and_unique_paths_only_refresh_the_unique_target(self):
+        ambiguous = "/media/movies/Film.strm"
+        unique = "/media/movies/anime/Film.strm"
         folders = [
-            {"id": "lib-a", "name": "电影 A", "locations": ["/media/movies"]},
-            {"id": "lib-b", "name": "电影 B", "locations": ["/media/movies"]},
+            {"id": "a", "locations": ["/media/movies"]},
+            {"id": "b", "locations": ["/media/movies"]},
+            {"id": "anime", "locations": ["/media/movies/anime"]},
         ]
         for label, client in self._clients():
             with self.subTest(server=label):
-                recorder = _RefreshRecorder(client, folders, {})
-
-                result = client.refresh_for_paths(["/media/movies/Film"])
-
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["scope"], "skipped")
-                self.assertEqual(result["unmatched"], 1)
+                recorder = _RefreshRecorder(client, folders, {"anime": [
+                    {"Id": "movie", "Type": "Movie", "Path": unique},
+                ]})
+                result = client.refresh_for_paths([ambiguous, unique], allow_library_fallback=False)
+                self.assertEqual(result["matched"], 1)
                 self.assertEqual(result["ambiguous"], 1)
-                self.assertIn("匹配多个媒体库", result["fallback"])
-                self.assertEqual(recorder.refreshed, [])
+                self.assertEqual(result["succeeded_paths"], [unique])
+                self.assertEqual(result["unmatched_paths"], [ambiguous])
+                self.assertEqual(recorder.refreshed, ["movie"])
+                self.assertEqual(result["libraries"], [])
                 recorder.posts.assert_not_called()
 
     def test_ambiguous_target_never_uses_opt_in_global_fallback(self):

@@ -330,7 +330,8 @@
                     <button class="jump-btn danger" type="button" data-remove-mapping aria-label="删除映射" title="删除映射"
                         ${locked ? 'disabled' : ''}><i data-lucide="trash-2"></i></button>
                 </div>
-                <div class="ml-mapping-result" data-mapping-result></div>
+                <div class="ml-mapping-result" data-mapping-result role="status" aria-live="polite"
+                    style="display: block; min-height: 64px;"></div>
                 ${locked ? '<div class="ml-managed-note">该 STRM 映射由部署环境管理，本页仅展示。</div>' : ''}
             </article>`;
     }
@@ -526,6 +527,7 @@
             return;
         }
         setBusy(button, true, '');
+        resultNode.removeAttribute('title');
         resultNode.className = 'ml-mapping-result';
         resultNode.textContent = '正在核对服务器媒体库…';
         try {
@@ -533,6 +535,9 @@
                 method: 'POST',
                 body: JSON.stringify({
                     provider: row.provider,
+                    source_kind: row.kind,
+                    library_id: row.libraryId,
+                    library_name: row.libraryName,
                     local_path: row.local,
                     server_path: row.server,
                     sample_path: row.local,
@@ -542,7 +547,14 @@
                 (item) => String(item.id || '') === row.libraryId,
             );
             const names = result.matches.map((item) => item.name).filter(Boolean);
-            if ((result.status === 'matched' || result.status === 'covered') && selectedMatch) {
+            if (result.status === 'ambiguous') {
+                resultNode.className = 'ml-mapping-result is-warning';
+                resultNode.textContent = '路径有歧义，自动刷新将跳过。请调整媒体库目录后重试。';
+                resultNode.title = names.join('、');
+            } else if (result.status === 'covered') {
+                resultNode.className = 'ml-mapping-result is-warning';
+                resultNode.textContent = '当前路径是媒体库的上层目录，请选择库内目录后重试。';
+            } else if (result.status === 'matched' && selectedMatch) {
                 resultNode.className = 'ml-mapping-result is-success';
                 resultNode.textContent = `映射有效：${result.mapped_path} · ${row.libraryName || names.join('、')}`;
             } else if (result.matches.length) {

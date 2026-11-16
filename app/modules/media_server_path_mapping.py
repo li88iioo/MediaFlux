@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterable, TypedDict
@@ -77,6 +77,50 @@ def media_server_path_is_within(candidate: object, ancestor: object) -> bool:
     if _DRIVE_RE.fullmatch(ancestor_key):
         return candidate_key.startswith(ancestor_key)
     return candidate_key.startswith(f"{ancestor_key}/")
+
+
+@dataclass(frozen=True)
+class MediaServerLibraryMatch:
+    """最长目录候选；规范化后仅有一个候选才允许刷新。"""
+
+    candidates: tuple[tuple[str, str], ...]
+
+    @property
+    def selected(self) -> tuple[str, str] | None:
+        return self.candidates[0] if len(self.candidates) == 1 else None
+
+    @property
+    def ambiguous(self) -> bool:
+        return len(self.candidates) > 1
+
+
+def match_media_server_libraries(
+    raw_path: object, libraries: Iterable[Mapping[str, Any]],
+) -> MediaServerLibraryMatch:
+    """测试与执行共用最长前缀、目录边界及唯一性判定，忽略无 ID 的库。"""
+    candidates: dict[tuple[str, str], str] = {}
+    longest = -1
+    for library in libraries:
+        library_id = str(library.get("id") or "").strip()
+        if not library_id:
+            continue
+        for raw_location in library.get("locations") or []:
+            try:
+                location = normalize_media_server_path(raw_location)
+            except ValueError:
+                continue
+            if not location or not media_server_path_is_within(raw_path, location):
+                continue
+            key = media_server_path_key(location)
+            length = len(key)
+            if length > longest:
+                candidates.clear()
+                longest = length
+            if length == longest:
+                candidates.setdefault((library_id, key), location)
+    return MediaServerLibraryMatch(tuple(
+        (library_id, location) for (library_id, _key), location in candidates.items()
+    ))
 
 
 def _alias_value(entry: dict, keys: tuple[str, ...], *, label: str) -> str:

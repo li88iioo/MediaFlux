@@ -539,6 +539,109 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(client.close.call_count, 3)
         self.assertEqual(unmatched.json()["matches"], [])
 
+    def test_path_test_uses_unique_longest_library_location(self):
+        headers = {"X-CSRF-Token": self.login()}
+        profile = self._profiles()[0]
+        client = Mock()
+        cases = (
+            ("duplicate", "/media/movies", [
+                {"id": "a", "locations": ["/media/movies"]},
+                {"id": "b", "locations": ["/media/movies"]},
+            ], "ambiguous", {"a", "b"}),
+            ("nested", "/media/movies/anime", [
+                {"id": "a", "locations": ["/media/movies"]},
+                {"id": "b", "locations": ["/media/movies"]},
+                {"id": "anime", "locations": ["/media/movies/anime"]},
+            ], "matched", {"anime"}),
+            ("nested-duplicate", "/media/movies/anime", [
+                {"id": "root", "locations": ["/media/movies"]},
+                {"id": "a", "locations": ["/media/movies/anime"]},
+                {"id": "b", "locations": ["/media/movies/anime"]},
+            ], "ambiguous", {"a", "b"}),
+            ("unc-duplicate", "//NAS/Media", [
+                {"id": "a", "locations": [r"\\NAS\Media"]},
+                {"id": "b", "locations": ["//nas/media/"]},
+            ], "ambiguous", {"a", "b"}),
+            ("same-library-aliases", "D:/STRASSE", [
+                {"id": "a", "locations": ["d:/Straße/", r"D:\STRASSE"]},
+            ], "matched", {"a"}),
+            ("missing-library-id", "/media/movies", [
+                {"id": "", "locations": ["/media/movies"]},
+            ], "unmatched", set()),
+        )
+        with (
+            patch("app.routes.media_libraries_api.list_configured_profiles", return_value=[profile]),
+            patch("app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=client),
+        ):
+            for label, server_path, folders, status, ids in cases:
+                with self.subTest(case=label):
+                    client.list_virtual_folders.return_value = folders
+                    response = self.client.post("/api/media-libraries/path-test", headers=headers, json={
+                        "provider": "jellyfin", "local_path": "/data/strm", "server_path": server_path,
+                        "sample_path": "/data/strm/Film.strm",
+                    })
+                    self.assertEqual(response.status_code, 200, response.text)
+                    result = response.json()
+                    self.assertEqual(result["status"], status)
+                    self.assertEqual({item["id"] for item in result["matches"]}, ids)
+                    self.assertTrue(all(item["mode"] == "direct" for item in result["matches"]))
+        self.assertEqual(client.close.call_count, len(cases))
+
+    def test_path_test_local_binding_matches_execution_without_binding_strm(self):
+        headers = {"X-CSRF-Token": self.login()}
+        profile = self._profiles()[0]
+        client = Mock()
+        folders = [
+            {"id": "a", "name": "电影 A", "locations": ["/media/movies"]},
+            {"id": "b", "name": "电影 B", "locations": ["/media/movies"]},
+        ]
+        payload = {"provider": "jellyfin", "local_path": "/data/library", "server_path": "/media/movies",
+                   "sample_path": "/data/library/Film.strm", "library_id": "a", "library_name": "电影 A"}
+        cases = (
+            ("bound-local", {"source_kind": "local"}, folders, 200, "matched", {"a"}),
+            ("selected-strm", {"source_kind": "strm"}, folders, 200, "ambiguous", {"a", "b"}),
+            ("unspecified-kind", {}, folders, 200, "ambiguous", {"a", "b"}),
+            ("stale-id", {"source_kind": "local", "library_id": "missing"}, folders, 400, "绑定已失效", set()),
+            ("stale-name", {"source_kind": "local", "library_name": "旧名称"}, folders, 400, "名称与绑定 ID 不一致", set()),
+            ("legacy-name", {"source_kind": "local", "library_id": ""}, folders, 200, "matched", {"a"}),
+            ("duplicate-name", {"source_kind": "local", "library_id": ""}, [folders[0], {**folders[1], "name": "电影 A"}],
+             400, "存在同名媒体库", set()),
+            ("selected-other-path", {"source_kind": "local", "server_path": "/elsewhere"}, folders, 200, "unmatched", set()),
+            ("filter-before-longest", {"source_kind": "local"}, [{**folders[0], "locations": ["/media"]}, folders[1]],
+             200, "matched", {"a"}),
+        )
+        with (
+            patch("app.routes.media_libraries_api.list_configured_profiles", return_value=[profile]),
+            patch("app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=client),
+        ):
+            for label, extra, libraries, http_status, status, ids in cases:
+                with self.subTest(case=label):
+                    client.list_virtual_folders.return_value = libraries
+                    response = self.client.post("/api/media-libraries/path-test", headers=headers, json={**payload, **extra})
+                    self.assertEqual(response.status_code, http_status, response.text)
+                    if http_status == 400:
+                        self.assertIn(status, response.json()["error"])
+                        continue
+                    result = response.json()
+                    self.assertEqual(result["status"], status)
+                    self.assertEqual({item["id"] for item in result["matches"]}, ids)
+                    self.assertEqual(result["allowed_library_ids"], ["a"] if extra.get("source_kind") == "local" else [])
+        self.assertEqual(client.close.call_count, len(cases))
+
+    def test_path_test_validates_source_kind_and_binding_fields_before_upstream(self):
+        headers = {"X-CSRF-Token": self.login()}
+        payload = {"provider": "jellyfin", "local_path": "/data/library", "server_path": "/media/movies"}
+        with patch("app.routes.media_libraries_api.list_configured_profiles") as profiles:
+            for extra in (
+                {"source_kind": "invalid"}, {"source_kind": []}, {"source_kind": "local"},
+                {"source_kind": "local", "library_id": ["a"]},
+                {"source_kind": "local", "library_id": "a", "library_name": {}},
+            ):
+                with self.subTest(extra=extra):
+                    response = self.client.post("/api/media-libraries/path-test", headers=headers, json={**payload, **extra})
+                    self.assertEqual(response.status_code, 400, response.text)
+            profiles.assert_not_called()
+
     def test_path_test_rejects_invalid_input_and_handles_upstream_failure(self):
         csrf = self.login()
         headers = {"X-CSRF-Token": csrf}

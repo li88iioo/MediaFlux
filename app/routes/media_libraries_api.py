@@ -17,6 +17,7 @@ from app.modules.local_path_mapping import (
     require_container_absolute_path,
     validate_source_target_roots,
 )
+from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
     MediaServerPathMappingError,
@@ -24,6 +25,7 @@ from app.modules.media_server_path_mapping import (
     list_path_mappings,
     mapping_updates,
     mapping_write_guard,
+    match_media_server_libraries,
     media_server_path_is_within,
 )
 from app.modules.media_server_profiles import (
@@ -450,6 +452,13 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
             raise ValueError("媒体服务器类型无效")
         local_path = _required_text(payload, "local_path", "MediaFlux 路径")
         server_path = _required_text(payload, "server_path", "媒体服务器路径")
+        source_kind = _optional_text(payload, "source_kind", maximum=16) or "strm"
+        if source_kind not in {"strm", "local"}:
+            raise ValueError("来源类型仅支持 strm 或 local")
+        library_id = _optional_text(payload, "library_id", maximum=256)
+        library_name = _optional_text(payload, "library_name", maximum=128)
+        if source_kind == "local" and not library_id and not library_name:
+            raise ValueError("本地来源缺少媒体库绑定，请重新选择媒体库")
         raw_sample_path = payload.get("sample_path")
         sample_path = (
             _required_text(payload, "sample_path", "测试路径")
@@ -466,9 +475,20 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
     if profile is None or not profile.enabled or not profile.configured:
         return api_error("媒体服务器未启用或配置不完整", 400)
     client = None
+    allowed_ids: tuple[str, ...] = ()
     try:
         client = profile.create_client()
+        if source_kind == "local":
+            # 本地归档与实际消费者共用绑定校验；STRM 的所选库仅用于页面展示。
+            try:
+                allowed_ids = MediaRefreshCoordinator._resolve_library_binding(client, {
+                    "library_binding": {"id": library_id, "name": library_name},
+                })
+            except ValueError as exc:
+                return api_error(str(exc), 400)
         libraries = [_library_payload(item) for item in client.list_virtual_folders()]
+        if allowed_ids:
+            libraries = [library for library in libraries if library["id"] in allowed_ids]
     except Exception as exc:
         logger.warning(
             "媒体库路径测试读取上游失败 provider=%s type=%s",
@@ -479,35 +499,35 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
     finally:
         close_media_server_client(client)
 
+    match = match_media_server_libraries(mapped_path, libraries)
     matches: list[dict[str, Any]] = []
-    for library in libraries:
-        direct_locations = [
-            location for location in library["locations"]
-            if media_server_path_is_within(mapped_path, location)
-        ]
-        covered_locations = [
-            location for location in library["locations"]
-            if not media_server_path_is_within(mapped_path, location)
-            and media_server_path_is_within(location, mapped_path)
-        ]
-        if direct_locations or covered_locations:
-            matches.append({
-                "id": library["id"],
-                "name": library["name"],
-                "mode": "direct" if direct_locations else "covered",
-                "locations": direct_locations or covered_locations,
-            })
+    locations_by_id: dict[str, list[str]] = {}
+    for library_id, location in match.candidates:
+        locations_by_id.setdefault(library_id, []).append(location)
+    if match.candidates:
+        status = "ambiguous" if match.ambiguous else "matched"
+        names = {library["id"]: library["name"] for library in libraries}
+        matches = [{"id": library_id, "name": names[library_id], "mode": "direct", "locations": locations}
+                   for library_id, locations in locations_by_id.items()]
+    else:
+        # 上层覆盖仅作目录提示，不能视为样本路径可执行刷新。
+        for library in libraries:
+            covered_locations = [location for location in library["locations"]
+                                 if media_server_path_is_within(location, mapped_path)]
+            if library["id"] and covered_locations:
+                matches.append({"id": library["id"], "name": library["name"],
+                                "mode": "covered", "locations": covered_locations})
+        status = "covered" if matches else "unmatched"
 
     return {
         "success": True,
         "provider": provider,
+        "source_kind": source_kind,
+        "allowed_library_ids": list(allowed_ids),
         "local_path": mapping.local_prefix,
         "server_path": mapping.server_prefix,
         "sample_path": sample_path,
         "mapped_path": mapped_path,
-        "status": (
-            "matched" if any(item["mode"] == "direct" for item in matches)
-            else "covered" if matches else "unmatched"
-        ),
+        "status": status,
         "matches": matches,
     }
