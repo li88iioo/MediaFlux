@@ -245,12 +245,14 @@ def _restore_directory_scrape_preview(
     record = service.store.get_preview(owner, preview_id)
     # 历史 v1/v2 任务只保存含规则的签名，没有通知快照。通知是规则比较已忽略的
     # 三个布尔偏好；仅重建这些位核验原签名，业务规则、文件、目标与候选仍全部绑定。
-    notification_fields = ("notify_enabled", "library_notify", "strm_detail_notify")
     if rebuilt != guard or not any(
         scrape_execution_fingerprint(snapshot, dataclasses.replace(
-            record, rules=dataclasses.replace(record.rules, **dict(zip(notification_fields, values))),
+            record, rules=dataclasses.replace(
+                record.rules, notify_enabled=notify_enabled, library_notify=library_notify,
+                strm_detail_notify=strm_detail_notify,
+            ),
         )) == expected
-        for values in product((False, True), repeat=len(notification_fields))
+        for notify_enabled, library_notify, strm_detail_notify in product((False, True), repeat=3)
     ):
         service.store.consume_preview(owner, preview_id)
         raise DirectoryScrapeConflictError("刮削预览已变化，请重新预检")

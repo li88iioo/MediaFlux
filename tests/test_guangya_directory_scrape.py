@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from app.modules.process_lock import CrossProcessLock
 
-from typing import cast
+from typing import Any, cast
 from app.clients.guangya import GuangYaClient
 from app.clients.tmdb import TMDBClient
 
@@ -2191,10 +2191,16 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             with self.subTest(current=current):
                 self.setUp()
                 self.addCleanup(self.service.close)
-                self.rules = replace(self.rules, link_strm=True, **dict(zip(fields, initial)))
+                self.rules = replace(
+                    self.rules, link_strm=True, notify_enabled=initial[0],
+                    library_notify=initial[1], strm_detail_notify=initial[2],
+                )
                 inspected = self.service.inspect("owner", "movie-dir")
                 preview = self.service.preview("owner", inspected["inspection_id"], "1726", "movie")
-                self.rules = replace(self.rules, **dict(zip(fields, current)))
+                self.rules = replace(
+                    self.rules, notify_enabled=current[0], library_notify=current[1],
+                    strm_detail_notify=current[2],
+                )
                 with patch.object(Organizer, "notify_directory_results") as notify, \
                     patch("app.modules.organize.get", side_effect=lambda key, default="": {
                         "GY_STRM_BASE_URL": "http://play.invalid", "STRM_ROOT": "/isolated-strm",
@@ -2209,6 +2215,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                     persisted = conn.execute(
                         "SELECT status FROM organize_log WHERE id=?", (result["log_ids"][0],),
                     ).fetchone()
+                assert persisted is not None
                 self.assertEqual(persisted["status"], "success")
                 applied = notify.call_args.args[1]
                 self.assertEqual(tuple(getattr(applied, key) for key in fields), current)
@@ -2253,7 +2260,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                     reference="已确认目录", payload=payload, dedupe_key=f"notify-cold-{version}",
                 )
                 row = claim_organize_operation_job(job["job_id"])
-                self.assertIsNotNone(row)
+                assert row is not None
                 self.rules = replace(self.rules, notify_enabled=True, library_notify=False, strm_detail_notify=False)
                 fresh = DirectoryScrapeService(
                     client=cast(GuangYaClient, self.client), scraper=cast(TMDBScraper, self.scraper),
@@ -2263,6 +2270,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
                 with patch("app.modules.directory_scrape.get_directory_scrape_service", return_value=fresh), \
                     patch("app.modules.organize.Organizer.notify_directory_results") as notify:
                     result = OrganizeTaskManager._execute_durable_operation(dict(row))
+                assert isinstance(result, dict)
                 self.assertEqual(result["stats"]["moved"], 1)
                 self.assertTrue(result["stats"]["notification_context"]["notify_enabled"])
                 self.assertFalse(result["stats"]["notification_context"]["topic_enabled"])
@@ -2433,7 +2441,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             manager.return_value.start_durable_operation.assert_not_called()
         self.assertEqual(self.client.infos["v1"].parent_id, before["v1"].parent_id)
 
-    def _durable_payload(self):
+    def _durable_payload(self) -> dict[str, Any]:
         from app.modules.directory_scrape import scrape_execution_fingerprint, summarize_scrape_preview
 
         record = self.store.get_preview("owner", self.preview_id)

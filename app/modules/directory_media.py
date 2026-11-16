@@ -1097,7 +1097,7 @@ class DirectoryMediaInspector:
         pending_videos: list[PendingMedia] | tuple[PendingMedia, ...] = (),
         directories: list[DirectorySnapshot] | tuple[DirectorySnapshot, ...] = (),
     ) -> str:
-        payload = {
+        payload: dict[str, object] = {
             "files": [
                 asdict(item)
                 for item in sorted(
