@@ -2200,6 +2200,10 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
 
         def subscription_reply(route):
             requests.append(route.request.url)
+            if route.request.method == "DELETE":
+                mutations.append(("DELETE", urlsplit(route.request.url).path))
+                route.fulfill(json={"success": True, "removed": True})
+                return
             rows = [row] if mutations[-1][0] == "POST" else []
             payload = ({"items": rows, "total": len(rows), "has_more": False, "next": None}
                        if urlsplit(route.request.url).path.endswith("/watchlist") else {})
