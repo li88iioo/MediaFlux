@@ -35,10 +35,8 @@ _cache: OrderedDict[tuple[str, str, tuple[str, ...]], tuple[float, RecognitionHi
 
 def enabled_hint_providers(media_type: str) -> tuple[str, ...]:
     providers: list[str] = []
-    if (
-        get_bool("ORGANIZE_DOUBAN_HINTS_ENABLED", False)
-        and get_bool("DISCOVERY_DOUBAN_ENABLED", True)
-    ):
+    # 只看整理规则自己的开关；媒体探索的总开关与豆瓣子开关不影响整理辅助识别。
+    if get_bool("ORGANIZE_DOUBAN_HINTS_ENABLED", False):
         providers.append("douban")
     if (media_type or "").lower() == "tv" and get_bool(
         "ORGANIZE_BANGUMI_HINTS_ENABLED", False

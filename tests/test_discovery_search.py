@@ -301,21 +301,43 @@ class DiscoverySearchUnitTests(unittest.TestCase):
         self.assertEqual(result.providers_succeeded, ())
         self.assertEqual(result.errors[0]["code"], "timeout")
 
-    def test_disabled_douban_is_never_called_and_cannot_be_selected(self):
-        from app.discovery.search import DiscoverySearchService
+    def test_discovery_douban_switch_gates_only_discovery_entries(self):
+        from app import sdk
+        from app.discovery.ratings import lookup_rating
+        from app.discovery.search import DiscoverySearchService, discovery_provider_names
+        from app.modules.global_search import _discovery_section
 
-        douban = FakeSearchProvider("douban", [
-            MediaCard(provider="douban", external_id="1", media_type="movie", title="不应调用")
-        ])
-        tmdb = FakeSearchProvider("tmdb", [])
-        service = DiscoverySearchService(providers={"tmdb": tmdb, "douban": douban})
+        providers = {
+            "tmdb": FakeSearchProvider("tmdb", []),
+            "douban": FakeSearchProvider("douban", [
+                MediaCard(provider="douban", external_id="1", media_type="movie", title="电影", rating=8.0)
+            ]),
+            "bangumi": FakeSearchProvider("bangumi", []),
+        }
+        douban = providers["douban"]
+        service = DiscoverySearchService(providers=providers)
+        targets = (
+            "app.discovery.search.get_discovery_search_service",
+            "app.modules.global_search.get_discovery_search_service",
+            "app.discovery.ratings.get_discovery_search_service",
+        )
         try:
-            with patch("app.discovery.search.app_config.get_bool", return_value=False):
-                result = service.search("电影", 1, None)
-                self.assertEqual(result.providers_attempted, ("tmdb",))
-                self.assertEqual(douban.calls, [])
+            with patch.dict(os.environ, {"DISCOVERY_ENABLED": "1", "DISCOVERY_DOUBAN_ENABLED": "0"}), \
+                    patch(targets[0], return_value=service), patch(targets[1], return_value=service), \
+                    patch(targets[2], return_value=service):
+                self.assertEqual(list(sdk.media.search("电影")["providers_attempted"]), ["tmdb", "bangumi"])
                 with self.assertRaisesRegex(ValueError, "已关闭"):
-                    service.search("电影", 1, ["douban"])
+                    sdk.media.search("电影", providers=["Douban"])
+                _discovery_section("电影")
+                rating = lookup_rating("电影", allow_web_fallback=False)
+                self.assertEqual(rating["evidence"][0]["status"], "unavailable")
+                self.assertEqual(douban.calls, [])
+                # 共享执行层不读取用途开关：整理辅助识别显式选择豆瓣仍会真实请求。
+                service.search("电影", 1, ["douban"])
+                self.assertEqual(douban.calls, [("电影", 1)])
+            with patch.dict(os.environ, {"DISCOVERY_DOUBAN_ENABLED": "1"}):
+                self.assertIsNone(discovery_provider_names())
+                self.assertEqual(discovery_provider_names(["douban"]), ["douban"])
         finally:
             service.shutdown()
 
@@ -448,6 +470,27 @@ class DiscoverySearchAPITests(InitializedWebTestCase):
         self.assertTrue(payload["items"][0]["poster_url"].startswith("/discovery-poster/tmdb/"))
         self.assertNotIn("poster_key", payload["items"][0])
         self.assertEqual(payload["errors"][0]["code"], "unavailable")
+
+    def test_search_api_keeps_discovery_douban_switch_with_real_service(self):
+        from app.discovery.search import DiscoverySearchService
+
+        douban = FakeSearchProvider("douban", [MediaCard(provider="douban", external_id="1", media_type="movie", title="电影")])
+        tmdb = FakeSearchProvider("tmdb", [])
+        service = DiscoverySearchService(providers={"tmdb": tmdb, "douban": douban, "bangumi": FakeSearchProvider("bangumi", [])})
+        self.authenticate()
+        try:
+            with patch.dict(os.environ, {"DISCOVERY_DOUBAN_ENABLED": "0"}), \
+                    patch("app.routes.discovery_api.get_discovery_search_service", return_value=service):
+                rejected = self.client.get("/api/discovery/search?q=电影&providers=douban")
+                default = self.client.get("/api/discovery/search?q=电影")
+        finally:
+            service.shutdown()
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("已关闭", rejected.json()["error"])
+        self.assertEqual(default.status_code, 200)
+        self.assertEqual(default.json()["providers_attempted"], ["tmdb", "bangumi"])
+        self.assertEqual(douban.calls, [])
+        self.assertEqual(tmdb.calls, [("电影", 1)])
 
     def test_search_api_rejects_oversized_provider_parameter(self):
         self.authenticate()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -12,20 +14,6 @@ class RecognitionHintTests(unittest.TestCase):
         from app.modules.recognition_hints import clear_recognition_hint_cache
         clear_recognition_hint_cache()
 
-    def test_provider_switches_are_real_and_tv_only_enables_bangumi(self):
-        from app.modules.recognition_hints import enabled_hint_providers
-
-        values = {
-            "ORGANIZE_DOUBAN_HINTS_ENABLED": True,
-            "DISCOVERY_DOUBAN_ENABLED": True,
-            "ORGANIZE_BANGUMI_HINTS_ENABLED": True,
-        }
-        with patch(
-            "app.modules.recognition_hints.get_bool",
-            side_effect=lambda key, default=False: values.get(key, default),
-        ):
-            self.assertEqual(enabled_hint_providers("movie"), ("douban",))
-            self.assertEqual(enabled_hint_providers("tv"), ("douban", "bangumi"))
 
     def test_search_uses_short_budget_and_cache(self):
         from app.modules.recognition_hints import search_recognition_hints
@@ -309,6 +297,108 @@ class RecognitionHintTests(unittest.TestCase):
 
         self.assertIs(result, failed)
         hints.assert_not_called()
+
+
+class _RecordingProvider:
+    def __init__(self, name: str, media_type: str):
+        self.name = name
+        self.cards = [MediaCard(provider=name, external_id="1", media_type=media_type, title="迷宫饭")]
+        self.calls: list[tuple[str, int]] = []
+
+    def search(self, query, page):
+        self.calls.append((query, page))
+        return self.cards, False
+
+
+class OrganizeHintPurposeTests(unittest.TestCase):
+    """整理辅助识别只看整理规则开关；媒体探索的开关只约束探索用途。"""
+
+    def setUp(self):
+        from app.discovery.search import DiscoverySearchService
+        from app.modules.recognition_hints import clear_recognition_hint_cache
+
+        clear_recognition_hint_cache()
+        self.providers = {
+            "tmdb": _RecordingProvider("tmdb", "tv"),
+            "douban": _RecordingProvider("douban", "tv"),
+            "bangumi": _RecordingProvider("bangumi", "tv"),
+        }
+        # 真实共享搜索服务，只替换外部来源，断言来源实际收到的调用。
+        self.service = DiscoverySearchService(providers=self.providers)
+        for target in (
+            "app.modules.recognition_hints.get_discovery_search_service",
+            "app.discovery.search.get_discovery_search_service",
+        ):
+            patcher = patch(target, return_value=self.service)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        from app.modules.recognition_hints import clear_recognition_hint_cache
+
+        clear_recognition_hint_cache()
+        self.service.shutdown()
+
+    def _calls(self) -> dict[str, int]:
+        return {name: len(provider.calls) for name, provider in self.providers.items()}
+
+    def test_discovery_switches_never_gate_automatic_or_manual_hints(self):
+        from app.modules.directory_scrape import DirectoryScrapeService
+        from app.modules.recognition_hints import clear_recognition_hint_cache, search_recognition_hints
+
+        for discovery, discovery_douban in product("01", repeat=2):
+            with self.subTest(discovery=discovery, discovery_douban=discovery_douban), patch.dict(os.environ, {
+                "DISCOVERY_ENABLED": discovery,
+                "DISCOVERY_DOUBAN_ENABLED": discovery_douban,
+                "ORGANIZE_DOUBAN_HINTS_ENABLED": "1",
+                "ORGANIZE_BANGUMI_HINTS_ENABLED": "1",
+            }):
+                clear_recognition_hint_cache()
+                before = self._calls()
+                automatic = search_recognition_hints("迷宫饭", "tv")
+                # 光鸭与本地媒体的人工线索共用这一入口。
+                manual = DirectoryScrapeService.query_external_hints("迷宫饭", "tv")
+                after = self._calls()
+
+                self.assertEqual(automatic.providers, ("douban", "bangumi"))
+                self.assertEqual({card.provider for card in automatic.items}, {"douban", "bangumi"})
+                self.assertEqual(manual["providers_attempted"], ["douban", "bangumi"])
+                self.assertEqual(after["douban"] - before["douban"], 2)
+                self.assertEqual(after["bangumi"] - before["bangumi"], 2)
+                self.assertEqual(after["tmdb"], before["tmdb"])
+
+    def test_bangumi_stays_tv_only_and_each_organize_switch_is_independent(self):
+        from app.modules.recognition_hints import enabled_hint_providers
+
+        for douban, bangumi in product("01", repeat=2):
+            with self.subTest(douban=douban, bangumi=bangumi), patch.dict(os.environ, {
+                "DISCOVERY_ENABLED": "0", "DISCOVERY_DOUBAN_ENABLED": "0",
+                "ORGANIZE_DOUBAN_HINTS_ENABLED": douban, "ORGANIZE_BANGUMI_HINTS_ENABLED": bangumi,
+            }):
+                expected_movie = ("douban",) if douban == "1" else ()
+                self.assertEqual(enabled_hint_providers("movie"), expected_movie)
+                self.assertEqual(
+                    enabled_hint_providers("tv"),
+                    expected_movie + (("bangumi",) if bangumi == "1" else ()),
+                )
+
+    def test_closed_organize_switch_skips_cache_and_providers(self):
+        from app.modules.directory_scrape import DirectoryScrapeService
+        from app.modules.recognition_hints import search_recognition_hints
+
+        enabled = {"ORGANIZE_DOUBAN_HINTS_ENABLED": "1", "ORGANIZE_BANGUMI_HINTS_ENABLED": "0"}
+        with patch.dict(os.environ, enabled):
+            warmed = search_recognition_hints("迷宫饭", "movie")
+        self.assertEqual(warmed.providers, ("douban",))
+        calls = self._calls()
+
+        with patch.dict(os.environ, {"ORGANIZE_DOUBAN_HINTS_ENABLED": "0", "ORGANIZE_BANGUMI_HINTS_ENABLED": "0"}):
+            closed = search_recognition_hints("迷宫饭", "movie")
+            manual = DirectoryScrapeService.query_external_hints("迷宫饭", "movie")
+
+        self.assertEqual((closed.items, closed.providers, closed.cached), ((), (), False))
+        self.assertEqual(manual["errors"][0]["code"], "disabled")
+        self.assertEqual(self._calls(), calls)
 
 
 if __name__ == "__main__":

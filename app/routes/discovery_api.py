@@ -11,7 +11,7 @@ from app.discovery.calendar.models import SourceUnavailable
 from app.discovery.calendar.service import get_calendar_service
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.registry import FILTER_QUERY_KEYS
-from app.discovery.search import get_discovery_search_service
+from app.discovery.search import discovery_provider_names, get_discovery_search_service
 from app.discovery.service import get_discovery_service, project_watchlist_state
 from app.routes.discovery_image import decode_poster_token, encode_poster_token
 from app.web import api_error, api_response, require_api_login
@@ -126,7 +126,7 @@ def search(
     try:
         page_number = int(page)
         selected = [value.strip().lower() for value in providers.split(",") if value.strip()] or None
-        result = get_discovery_search_service().search(q, page_number, selected)
+        result = get_discovery_search_service().search(q, page_number, discovery_provider_names(selected))
     except ValueError as exc:
         return api_error(str(exc), 400)
     payload = {

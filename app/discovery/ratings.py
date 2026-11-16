@@ -19,7 +19,7 @@ from app.clients.http import FixedHostHttpClient, HttpError
 from app.discovery.models import (
     MediaCard, ProviderAuthenticationError, ProviderError, ProviderRateLimited, ProviderUnavailable,
 )
-from app.discovery.search import get_discovery_search_service
+from app.discovery.search import discovery_provider_names, get_discovery_search_service
 from app.discovery.service import get_discovery_service
 from app.logger import get_logger
 from app.sensitive_data import contains_sensitive_credential
@@ -429,7 +429,7 @@ def lookup_rating(
 
     if structured_attempted:
         try:
-            search_result = get_discovery_search_service().search(query, 1, ["douban"])
+            search_result = get_discovery_search_service().search(query, 1, discovery_provider_names(["douban"]))
             selected = _select_card(
                 search_result.items,
                 query=query,

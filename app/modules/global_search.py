@@ -10,7 +10,7 @@ from app import database as db
 from app.repositories import download_requests as download_requests_repo
 from app.repositories import rss as rss_repo
 from app.clients.base import MediaItem
-from app.discovery.search import get_discovery_search_service
+from app.discovery.search import discovery_provider_names, get_discovery_search_service
 from app.logger import get_logger
 from app.routes.discovery_image import encode_poster_token
 from app.services import search_media_servers
@@ -171,7 +171,7 @@ def _local_section(query: str) -> dict:
 
 
 def _discovery_section(query: str) -> dict:
-    result = get_discovery_search_service().search(query, 1)
+    result = get_discovery_search_service().search(query, 1, discovery_provider_names())
     items = []
     for card in result.items[:_MEDIA_SECTION_LIMIT]:
         poster_url = ""

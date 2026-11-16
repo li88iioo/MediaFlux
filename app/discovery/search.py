@@ -282,12 +282,6 @@ class DiscoverySearchService:
         if close_providers and self._close_providers():
             _release_discovery_search_service(self)
 
-    def _enabled_names(self) -> list[str]:
-        names = [name for name in DISCOVERY_PROVIDERS if name in self.providers]
-        if not app_config.get_bool("DISCOVERY_DOUBAN_ENABLED", True):
-            names = [name for name in names if name != "douban"]
-        return names
-
     def _normalize(self, query: str, page: int, provider_names: list[str] | tuple[str, ...] | None):
         if not isinstance(query, str):
             raise ValueError("搜索关键词必须是字符串")
@@ -295,22 +289,22 @@ class DiscoverySearchService:
 
         if type(page) is not int or page < 1 or page > 100:
             raise ValueError("页码必须在 1 到 100 之间")
-        enabled = self._enabled_names()
+        # 共享执行层只校验结构；探索与整理辅助识别各自在业务入口决定可用来源。
+        available = [name for name in DISCOVERY_PROVIDERS if name in self.providers]
         if provider_names is not None and (
             not isinstance(provider_names, (list, tuple)) or not provider_names
             or len(provider_names) > 3 or not all(isinstance(name, str) for name in provider_names)
         ):
             raise ValueError("providers 必须选择 1 到 3 个来源")
-        selected = list(provider_names if provider_names is not None else enabled)
+        selected = list(provider_names if provider_names is not None else available)
         selected = list(dict.fromkeys((name or "").strip().lower() for name in selected if (name or "").strip()))
         if not selected:
             raise ValueError("至少选择一个搜索来源")
         unknown = [name for name in selected if name not in DISCOVERY_PROVIDERS]
         if unknown:
             raise ValueError("不支持的搜索来源")
-        disabled = [name for name in selected if name not in enabled]
-        if disabled:
-            raise ValueError("搜索来源已关闭")
+        if any(name not in available for name in selected):
+            raise ValueError("搜索来源不可用")
         return normalized_query, page, selected
 
     def search(
@@ -469,6 +463,25 @@ def _release_discovery_search_service(service: DiscoverySearchService) -> None:
     with _search_service_lock:
         if _search_service is service:
             _search_service = None
+
+
+def discovery_provider_names(
+    requested: list[str] | tuple[str, ...] | None = None,
+) -> list[str] | tuple[str, ...] | None:
+    """探索用途（页面、公开 API、Agent、全局搜索、评分）的来源许可。
+
+    探索豆瓣开关只约束探索用途；整理的豆瓣/Bangumi 辅助识别由整理规则自行选择来源，
+    不经过这里。请求格式交给共享搜索服务统一校验，这里只拦截已关闭的来源；未指定
+    来源且没有被关闭的来源时返回 None，沿用共享服务的默认选择。
+    """
+    douban_enabled = app_config.get_bool("DISCOVERY_DOUBAN_ENABLED", True)
+    if requested is None:
+        return None if douban_enabled else [name for name in DISCOVERY_PROVIDERS if name != "douban"]
+    if not douban_enabled and isinstance(requested, (list, tuple)) and any(
+        isinstance(name, str) and name.strip().lower() == "douban" for name in requested
+    ):
+        raise ValueError("搜索来源已关闭")
+    return requested
 
 
 def get_discovery_search_service() -> DiscoverySearchService:

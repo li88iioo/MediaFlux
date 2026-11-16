@@ -1118,12 +1118,12 @@ class Media:
     def search(query: str, page: int = 1, providers: list[str] | None = None, *,
                media_type: str = "", year: str = "", region: str = "", genre: str = "") -> dict:
         """按片名搜索公网作品身份，返回完整当前页items/has_more/providers_attempted/providers_succeeded/errors/status/partial。media_type/year精确过滤本页；region/genre只作查询关键词，不保证硬性筛选。资源版本和磁力检索使用resources.search。"""
-        from app.discovery.search import get_discovery_search_service
+        from app.discovery.search import discovery_provider_names, get_discovery_search_service
         from app.discovery.service import require_discovery_enabled
 
         require_discovery_enabled()
         return get_discovery_search_service().search(
-            query, page, providers, media_type=media_type, year=year, region=region, genre=genre,
+            query, page, discovery_provider_names(providers), media_type=media_type, year=year, region=region, genre=genre,
             cancelled=_CALL_CANCELLED.get(),
         ).to_dict()
 
