@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -267,6 +268,82 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
             ))
         publish.assert_called_once_with("batch", chat_id="chat")
         self.assertEqual(batches.list_confirmations()["items"][0]["downstream"]["strm"], "完成")
+
+    def test_silent_confirmation_keeps_handoff_and_faster_downstream_receipts(self):
+        from app.clients.guangya import GuangYaFile
+        from app.modules.scraper import MatchResult
+
+        rules = replace(self.rules, clean_empty=False, notify_enabled=False, library_notify=False)
+        for outcome in ("rejected", "exception", "accepted", "skipped"):
+            with self.subTest(outcome=outcome):
+                token = f"silent-{outcome}"
+                payload = self.create(token)
+                payload.update(_notification_suppressed=True, rules=organize_rules_snapshot(rules))
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE organize_confirmations SET payload_json=? WHERE token=?", (json.dumps(payload), token))
+                organize_confirmations_repo.claim_organize_confirmation(token, chat_id="chat", selected_index=0)
+                claimed = organize_confirmations_repo.claim_queued_organize_confirmation(token)
+                payload = confirmations.decode_row(claimed)
+                file = payload["files"][0]
+                client = SimpleNamespace(file_info=lambda _id: GuangYaFile(
+                    file["file_id"], file["name"], False, file["size"], "", file["parent_id"],
+                ))
+                candidate = payload["candidates"][0]
+                match = MatchResult(tmdb_id=candidate["tmdb_id"], title=candidate["title"],
+                                    year=candidate["year"], media_type="movie", confidence=1.0)
+                scraper = SimpleNamespace(get_detail_with_credits=lambda *_: {"id": 100},
+                    match_from_tmdb=lambda *_: match, confirm=lambda *_, **__: None)
+
+                def post_actions(stats, *_args, **_kwargs):
+                    if outcome == "exception":
+                        raise RuntimeError("STRM 提交异常")
+                    if outcome == "accepted":
+                        # 完成回调快于 trigger 返回，保存交接不得再把终态覆盖成排队。
+                        confirmations.update_confirmation_lifecycle_downstream(
+                            token, strm_status="完成", media_refresh="未启用或无目标",
+                        )
+                    stats["strm"] = ({"ok": False, "error": "STRM 调度器正在停止"}
+                                     if outcome == "rejected" else {"ok": True, "skipped": True}
+                                     if outcome == "skipped" else {"ok": True, "queued": True})
+
+                with (patch.object(OrganizeRules, "from_config", return_value=rules),
+                      patch.object(OrganizeRules, "for_source", return_value=rules),
+                      patch.object(confirmations, "GuangYaClient", return_value=client),
+                      patch.object(confirmations, "TMDBScraper", return_value=scraper),
+                      patch.object(confirmations, "Organizer") as factory,
+                      patch.object(confirmations, "_dispatch_due_confirmation_delivery") as delivery):
+                    factory.return_value.organize.side_effect = [
+                        ([SimpleNamespace(file_id=token)], {}),
+                        ([], {"total": 1, "moved": 1, "skipped": 0, "failed": 0, "need_confirm": 0}),
+                    ]
+                    factory.trigger_post_actions.side_effect = post_actions
+                    result = confirmations._execute_confirmation(
+                        token, payload, candidate, selected_index=0, chat_id="chat",
+                    )
+                delivery.assert_not_called()
+                row = self.row(token)
+                saved = json.loads(row["result_json"])
+                self.assertEqual((row["status"], saved["moved"]), ("completed", 1))
+                self.assertEqual(saved["strm"], result["stats"]["strm"])
+                view = batches.list_confirmations(confirmation_ids=[token], status="all")["items"][0]
+                downstream = view["downstream"]
+                self.assertEqual(downstream["strm"], "完成" if outcome == "accepted" else
+                                 "已跳过" if outcome == "skipped" else "启动失败")
+                self.assertEqual(downstream["partial"], outcome in {"rejected", "exception"})
+                if outcome in {"rejected", "exception"}:
+                    self.assertTrue(downstream["error"])
+                self.assertEqual(factory.return_value.organize.call_count, 2)
+
+    def test_non_batch_downstream_is_persisted_without_a_telegram_thread(self):
+        self.create("no-thread")
+        with patch("app.modules.telegram_notification_center.get_notification_thread_event", return_value=None):
+            self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
+                "no-thread", strm_status="完成", media_refresh="刷新失败", partial=True, error="媒体库不可用",
+            ))
+        view = batches.list_confirmations()["items"][0]
+        self.assertEqual(view["downstream"], {
+            "strm": "完成", "media_refresh": "刷新失败", "partial": True, "error": "媒体库不可用",
+        })
 
     def test_sdk_and_web_read_execution_receipt_without_requerying_cloud(self):
         from app import sdk

@@ -593,17 +593,22 @@ def update_confirmation_lifecycle_downstream(
     partial: bool = False,
     error: str = "",
 ) -> bool:
-    """在人工确认卡的同一消息上补齐 STRM 与媒体库终态。"""
+    """先保存 STRM/媒体库业务终态，再按通知偏好更新人工确认消息。"""
     from app.modules.telegram_notification_center import get_notification_thread_event
     from app.modules.telegram_notification_policy import NotificationTopic
 
     row = organize_confirmations_repo.get_organize_confirmation(token)
-    batch_id = str(decode_json_object(row["payload_json"]).get("_confirmation_batch") or "") if row else ""
+    if row is None:
+        return False
+    payload = decode_json_object(row["payload_json"])
+    downstream = {"strm": strm_status, "media_refresh": media_refresh,
+                  "partial": partial, "error": redact_sensitive_text(error)}
+    organize_confirmations_repo.set_confirmation_downstream(token, downstream)
+    if not _confirmation_delivery_enabled(payload):
+        return False
+    batch_id = str(payload.get("_confirmation_batch") or "")
     if batch_id:
         from app.modules.telegram_confirmation_batch import publish_batch_summary
-        downstream = {"strm": strm_status, "media_refresh": media_refresh,
-                      "partial": partial, "error": redact_sensitive_text(error)}
-        organize_confirmations_repo.set_confirmation_downstream(token, downstream)
         return publish_batch_summary(batch_id, chat_id=chat_id)
     thread_key = f"confirmation:{(token or '').strip()}"
     previous = get_notification_thread_event(
@@ -2929,21 +2934,17 @@ def _execute_guangya_confirmation(
                 ),
             )
         except Exception as post_exc:
-            warning = f"STRM 后处理启动失败：{post_exc}"
+            warning = f"STRM 后处理启动失败：{redact_sensitive_text(post_exc)}"
             stats.setdefault("warnings", []).append(warning)
-            organize_confirmations_repo.update_organize_confirmation(
+            stats["strm"] = {"ok": False, "error": warning}
+            update_confirmation_lifecycle_downstream(
                 token,
-                result_json=json.dumps(stats, ensure_ascii=False, default=str),
+                chat_id=chat_id,
+                strm_status="启动失败",
+                media_refresh="未触发",
+                partial=True,
+                error=warning,
             )
-            if delivery_enabled:
-                update_confirmation_lifecycle_downstream(
-                    token,
-                    chat_id=chat_id,
-                    strm_status="启动失败",
-                    media_refresh="未触发",
-                    partial=True,
-                    error=warning,
-                )
             organize_task_id = str(
                 payload.get("organize_task_id") or ""
             ).strip()
@@ -2964,6 +2965,19 @@ def _execute_guangya_confirmation(
                 "人工确认整理已完成但后处理启动失败 token=%s type=%s",
                 token[:6],
                 type(post_exc).__name__,
+            )
+        handoff = stats.get("strm")
+        if isinstance(handoff, dict) and handoff:
+            error = redact_sensitive_text(handoff.get("error") or "")
+            failed = handoff.get("ok") is False and not handoff.get("skipped")
+            skipped = bool(handoff.get("skipped"))
+            downstream = {
+                "strm": "启动失败" if failed or error else "已跳过" if skipped else "已排队",
+                "media_refresh": "未触发" if failed or skipped or error else "等待 STRM 完成",
+                "partial": bool(failed or error), "error": error,
+            }
+            organize_confirmations_repo.set_confirmation_strm_handoff(
+                token, handoff, downstream, warnings=stats.get("warnings"),
             )
         if download_request_ids:
             try:

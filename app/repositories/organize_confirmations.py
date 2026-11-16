@@ -988,3 +988,22 @@ def set_confirmation_downstream(token: str, downstream: dict) -> None:
             "'$._downstream',json(?)),updated_at=? WHERE token=?",
             (json.dumps(downstream, ensure_ascii=False), db.now(), token),
         )
+
+
+def set_confirmation_strm_handoff(
+    token: str, handoff: dict, downstream: dict, *, warnings: list | None = None,
+) -> None:
+    """只补交接字段，不覆盖已异步到达的 STRM/刷新终态或整理执行事实。"""
+    result = (
+        "json_insert(json_set(CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END,"
+        "'$.strm',json(?)),'$._downstream',json(?))"
+    )
+    values: list = [json.dumps(handoff, ensure_ascii=False), json.dumps(downstream, ensure_ascii=False)]
+    if warnings is not None:
+        result = f"json_set({result},'$.warnings',json(?))"
+        values.append(json.dumps(warnings, ensure_ascii=False))
+    with db.get_conn() as conn:
+        conn.execute(
+            f"UPDATE organize_confirmations SET result_json={result},updated_at=? WHERE token=? AND status='completed'",
+            (*values, db.now(), token),
+        )
