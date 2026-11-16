@@ -754,7 +754,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
         source = (ROOT / "app/templates/_share_transfer_scripts.html").read_text(
             encoding="utf-8"
         )
-        block = _extract(source, "    let previewId='';", "\n    function renderTarget")
+        block = _extract(source, "    let previewId='';", "\n    const wait=")
         script = (
             textwrap.dedent(
                 """
@@ -765,8 +765,6 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               shareSelectionCount: {textContent: ''},
               shareCheckAll: {checked: false, indeterminate: false},
               restoreShareBtn: {disabled: false},
-              shareTransferSummary: {textContent: ''},
-              shareTargetDirName: {value: '目标目录'},
               shareFileToolbar: {hidden: true},
               shareFileList: {
                 innerHTML: '', children: [],

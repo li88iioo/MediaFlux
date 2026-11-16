@@ -851,7 +851,7 @@ class ShareApiSecurityTests(IsolatedDatabaseTestCase):
 
 @unittest.skipIf(sync_playwright is None, "未安装 Playwright")
 class WebShareLifecycleBrowserTests(unittest.TestCase):
-    """完整分享组件在 Chromium 执行；只替换网络/目录选择/确认边界。"""
+    """实际模板、CSS、app.js 与目录选择器；仅接口离线替换。"""
 
     @classmethod
     def setUpClass(cls):
@@ -861,111 +861,226 @@ class WebShareLifecycleBrowserTests(unittest.TestCase):
         if executable is None:
             raise unittest.SkipTest("未找到 Chromium")
         cls.browser = cls.playwright.chromium.launch(
-            executable_path=executable, headless=True, args=["--no-sandbox"]
+            executable_path=executable, headless=True, args=["--no-sandbox", "--disable-background-networking"]
         )
         cls.addClassCleanup(cls.browser.close)
-        root = Path(__file__).resolve().parents[1] / "app/templates"
-        cls.html = (root / "_share_transfer_content.html").read_text()
-        cls.script = (root / "_share_transfer_scripts.html").read_text().removeprefix("<script>").removesuffix("</script>\n")
+        from app.web import templates
+
+        cls.root = Path(__file__).resolve().parents[1]
+        cls.html = templates.env.from_string(
+            '{% extends "base.html" %}{% block content %}{% include "_share_transfer_content.html" %}'
+            '{% endblock %}{% block scripts %}{% include "_share_transfer_scripts.html" %}{% endblock %}'
+        ).render(
+            active="guangya_more", discovery_enabled=False, agent_enabled=False,
+            app_version="offline-share", csrf_token=lambda: "offline-csrf",
+            static_url=lambda value: "/static/" + value,
+            url_for=lambda name: "/" + name.split(".")[-1],
+        )
 
     def setUp(self):
-        self.page = self.browser.new_page()
+        self.page = self.browser.new_page(viewport={"width": 1280, "height": 900}, reduced_motion="reduce")
         self.addCleanup(self.page.close)
-        self.page.set_default_timeout(2500)
-        self.errors = []
+        self.page.set_default_timeout(3000)
+        self.errors, self.unexpected = [], []
         self.page.on("pageerror", lambda error: self.errors.append(str(error)))
-        self.page.route("**/*", lambda route: route.abort())
-        self.page.set_content(self.html)
-        self.page.add_script_tag(content="""
-            window.calls=[]; window.confirmations=[];
-            window.loadAppConfig=()=>new Promise(resolve=>window.finishConfig=resolve);
-            window.appConfirm=data=>new Promise(resolve=>confirmations.push({data,resolve}));
-            window.openGuangYaDirectoryPicker=({onSelect})=>onSelect(window.target);
-            window.fetch=(url,options={})=>new Promise(resolve=>calls.push({url,options,resolve}));
+        self.page.route("**/*", self.route)
+        self.page.add_init_script("""
+            window.calls=[];
+            window.fetch=(url,options={})=>new Promise(resolve=>{
+                const call={url:String(url),options,resolve}; calls.push(call);
+                if(call.url.startsWith('/api/guangya/dirs')){
+                    const parent=new URL(call.url,location.origin).searchParams.get('parent_id');
+                    const files=parent==='0'?[{file_id:'drive',name:'我的光鸭',is_dir:true}]:
+                        parent==='drive'?[{file_id:'folder-a',name:'目录 A',is_dir:true},{file_id:'folder-b',name:'任意目录 B',is_dir:true}]:[];
+                    resolve({ok:true,status:200,json:async()=>files});
+                }
+            });
             window.reply=(index,data,status=200)=>calls[index].resolve({ok:status<400,status,json:async()=>data});
-        """ + self.script)
-        self.page.evaluate("finishConfig({GY_SHARE_TARGET_DIR:'folder-a',GY_SHARE_TARGET_DIR_NAME:'目录 A'})")
-        self.inspect("a")
+        """)
+        self.page.goto("http://offline-share.invalid/")
+        self.page.locator("#inspectShareBtn").wait_for()
+
+    def route(self, route):
+        from urllib.parse import urlsplit
+
+        url = urlsplit(route.request.url)
+        if url.netloc == "offline-share.invalid" and url.path == "/":
+            route.fulfill(content_type="text/html", body=self.html)
+        elif url.netloc == "offline-share.invalid" and url.path.startswith("/static/"):
+            import mimetypes
+
+            path = (self.root / "app" / url.path.lstrip("/")).resolve()
+            if path.is_relative_to(self.root / "app/static") and path.is_file():
+                route.fulfill(body=path.read_bytes(), content_type=mimetypes.guess_type(str(path))[0] or "application/octet-stream")
+            else:
+                self.unexpected.append(route.request.url)
+                route.abort()
+        else:
+            self.unexpected.append(route.request.url)
+            route.abort()
 
     def tearDown(self):
         self.assertEqual(self.errors, [])
+        self.assertEqual(self.unexpected, [])
+        paths = self.page.evaluate("calls.map(call=>call.url)")
+        self.assertTrue(all(path.startswith(('/api/share/', '/api/guangya/dirs')) for path in paths), paths)
 
-    def inspect(self, suffix):
+    def ready_preview(self):
+        self.inspect("a")
+
+    def inspect(self, suffix, *, long_name=False):
         self.page.locator("#shareUrl").fill("https://share.invalid/" + suffix)
         self.page.locator("#inspectShareBtn").click()
-        self.page.evaluate("""suffix=>reply(calls.length-1,{preview_id:suffix,share_id:suffix,count:1,
-            files:[{id:'file-'+suffix,name:'Video '+suffix,is_dir:false,size:1000}]})""", suffix)
+        self.page.evaluate("""({suffix,longName})=>{
+            const index=calls.findLastIndex(call=>call.url==='/api/share/inspect');
+            reply(index,{preview_id:suffix,share_id:suffix,count:2,files:[
+                {id:'file-'+suffix,name:longName?'电影'.repeat(150)+'.mkv':'Video '+suffix,is_dir:false,size:1000},
+                {id:'second-'+suffix,name:'第二个视频.mp4',is_dir:false,size:2000},
+            ]});
+        }""", {"suffix": suffix, "longName": long_name})
         self.page.locator(f".share-file-check[value='file-{suffix}']").wait_for()
 
-    def submit(self):
+    def choose(self, name="目录 A"):
         self.page.locator("#restoreShareBtn").click()
-        self.page.evaluate("confirmations.at(-1).resolve(true)")
+        self.page.locator("#shareDirModal .settings-dir-open").filter(has_text="我的光鸭").click()
+        self.page.locator("#shareDirModal .settings-dir-item").filter(has_text=name).locator(".settings-dir-select").click()
+        self.page.locator("#appConfirmModal").wait_for(state="visible")
+        self.assertEqual(self.page.locator("#shareDirModal").count(), 0)
+
+    def submit(self, name="目录 A"):
+        self.choose(name)
+        self.page.locator("#appConfirmSubmit").click()
         self.page.wait_for_function("calls.at(-1).url==='/api/share/restore'")
         return self.page.evaluate("calls.length-1")
 
-    def test_cancel_and_failure_release_the_same_submit_state(self):
+    def test_cancel_picker_and_confirmation_reopen_with_any_directory(self):
+        self.ready_preview()
         self.page.locator("#restoreShareBtn").click()
-        self.page.evaluate("confirmations[0].resolve(false)")
+        self.page.locator("#shareDirModal [data-dir-close]").click()
+        self.choose()
+        self.page.locator("#appConfirmCancel").focus()
+        self.page.keyboard.press("Enter")
         self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
-        self.assertEqual(self.page.evaluate("calls.filter(c=>c.url==='/api/share/restore').length"), 0)
+        self.page.wait_for_function("document.activeElement.id==='restoreShareBtn'")
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 0)
+        pending = self.submit("任意目录 B")
+        body = self.page.evaluate("index=>JSON.parse(calls[index].options.body)", pending)
+        self.assertEqual((body["target_dir_id"], body["target_dir_name"]), ("folder-b", "任意目录 B"))
+        self.page.evaluate("index=>reply(index,{success:true,count:2})", pending)
+        self.page.wait_for_function("document.querySelector('#shareStateTag').textContent.includes('转存成功')")
+
+    def test_repeated_save_does_not_duplicate_picker_or_submission(self):
+        self.ready_preview()
+        self.page.locator("#restoreShareBtn").click()
+        self.page.locator("#shareDirModal .settings-dir-select").wait_for()
+        self.page.locator("#restoreShareBtn").dispatch_event("click")
+        self.assertEqual(self.page.locator("#shareDirModal").count(), 1)
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url.startsWith('/api/guangya/dirs')).length"), 1)
+        self.page.locator("#shareDirModal .settings-dir-select").click()
+        self.page.locator("#appConfirmSubmit").click()
+        self.page.wait_for_function("calls.at(-1).url==='/api/share/restore'")
+        self.page.locator("#restoreShareBtn").dispatch_event("click")
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 1)
+
+    def test_link_change_discards_old_picker_and_confirmation(self):
+        self.ready_preview()
+        self.page.locator("#restoreShareBtn").click()
+        self.inspect("b")
+        self.assertEqual(self.page.locator("#shareDirModal").count(), 0)
+        self.choose()
+        self.page.locator("#shareUrl").evaluate("el=>{el.value='https://share.invalid/c';el.dispatchEvent(new Event('input'));}")
+        self.page.locator("#appConfirmSubmit").click()
+        self.page.wait_for_function("!document.querySelector('#restoreShareBtn .spin')")
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 0)
+        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
+
+    def test_selection_change_before_confirmation_never_submits_old_files(self):
+        self.ready_preview()
+        self.choose()
+        self.page.locator(".share-file-check").first.evaluate("el=>{el.checked=false;el.dispatchEvent(new Event('change'));}")
+        self.page.locator("#appConfirmSubmit").click()
+        self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 0)
+        self.assertEqual(self.page.locator(".share-file-check:checked").count(), 1)
+
+    def test_selection_change_during_post_keeps_receipt_and_consumes_preview(self):
+        self.ready_preview()
+        pending = self.submit()
+        self.page.locator(".share-file-check").first.uncheck()
+        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
+        self.page.evaluate("index=>reply(index,{success:true,count:2,target_dir_name:'目录 A'})", pending)
+        self.page.wait_for_function("document.querySelector('#shareStateTag').textContent.includes('转存成功')")
+        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
+        self.page.locator(".share-file-check").first.check()
+        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 1)
+
+    def test_cancelled_confirmation_never_steals_focus_from_a_new_dialog(self):
+        self.ready_preview()
+        self.choose()
+        self.page.evaluate("void appConfirm({title:'新的确认',message:'保留当前焦点',trigger:document.querySelector('#inspectShareBtn')})")
+        self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
+        self.assertEqual(self.page.locator("#appConfirmTitle").inner_text(), "新的确认")
+        self.assertTrue(self.page.evaluate("Boolean(document.activeElement.closest('#appConfirmModal'))"))
+
+    def test_failure_releases_submission_for_retry(self):
+        self.ready_preview()
         pending = self.submit()
         self.page.evaluate("index=>reply(index,{error:'当前请求失败'},502)", pending)
         self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
         self.assertEqual(self.page.locator("#shareMessage").inner_text(), "当前请求失败")
-        pending = self.submit()
-        self.page.evaluate("index=>reply(index,{success:true,count:1})", pending)
-        self.page.wait_for_function("document.querySelector('#shareStateTag').textContent.includes('转存成功')")
-        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
-
-    def test_switching_preview_during_confirmation_never_clears_the_new_selection(self):
-        self.page.locator("#restoreShareBtn").click()
-        self.inspect("b")
-        self.page.evaluate("confirmations[0].resolve(true)")
-        self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
-        self.assertEqual(self.page.evaluate("calls.filter(c=>c.url==='/api/share/restore').length"), 0)
-        self.assertIn("分享 ID: b", self.page.locator("#shareMessage").inner_text())
-        self.assertEqual(self.page.locator(".share-file-check").input_value(), "file-b")
-
-    def test_confirmation_freezes_target_id_with_its_display_name(self):
-        self.page.locator("#restoreShareBtn").click()
-        self.page.evaluate("target={id:'folder-b',name:'目录 B'}")
-        self.page.locator("#pickShareTargetBtn").click()
-        self.page.evaluate("confirmations[0].resolve(true)")
-        self.page.wait_for_function("calls.at(-1).url==='/api/share/restore'")
-        body = self.page.evaluate("JSON.parse(calls.at(-1).options.body)")
-        self.assertEqual((body["target_dir_id"], body["target_dir_name"]), ("folder-a", "目录 A"))
-
-    def test_selection_change_cannot_reenable_inflight_submit(self):
-        self.submit()
-        self.page.locator(".share-file-check").uncheck()
-        self.page.locator(".share-file-check").check()
-        self.assertTrue(self.page.locator("#restoreShareBtn").is_disabled())
-        self.page.locator("#restoreShareBtn").dispatch_event("click")
-        self.assertEqual(self.page.evaluate("confirmations.length"), 1)
+        self.submit("任意目录 B")
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url==='/api/share/restore').length"), 2)
 
     def test_old_submission_response_does_not_clear_new_preview(self):
+        self.ready_preview()
         pending = self.submit()
         self.inspect("b")
-        self.page.evaluate("index=>reply(index,{success:true,count:1,target_dir_name:'目录 A'})", pending)
-        self.page.wait_for_function("!document.querySelector('#restoreShareBtn .spin')")
+        self.page.evaluate("index=>reply(index,{success:true,count:2,target_dir_name:'目录 A'})", pending)
+        self.page.wait_for_function("!document.querySelector('#restoreShareBtn').disabled")
         self.assertIn("分享 ID: b", self.page.locator("#shareMessage").inner_text())
-        self.page.locator("#restoreShareBtn").click()
-        self.assertEqual(self.page.evaluate("confirmations.length"), 2)
-        self.assertEqual(self.page.locator(".share-file-check").input_value(), "file-b")
+        pending = self.submit("任意目录 B")
+        self.assertEqual(self.page.evaluate("index=>JSON.parse(calls[index].options.body).preview_id", pending), "b")
 
     def test_old_status_poll_does_not_overwrite_new_preview(self):
+        self.ready_preview()
         self.page.clock.install()
         pending = self.submit()
-        self.page.evaluate("index=>reply(index,{accepted:true,duplicate:true,request_id:7},202)", pending)
+        self.page.evaluate("index=>reply(index,{accepted:true,request_id:7},202)", pending)
         self.page.clock.fast_forward(2000)
         self.page.wait_for_function("calls.at(-1).url==='/api/share/requests/7'")
         poll = self.page.evaluate("calls.length-1")
         self.inspect("b")
         self.page.evaluate("index=>reply(index,{terminal:true,success:true,target_dir_name:'目录 A'})", poll)
-        self.page.wait_for_function("!document.querySelector('#restoreShareBtn .spin')")
-        self.assertIn("分享 ID: b", self.page.locator("#shareMessage").inner_text())
         self.page.clock.fast_forward(10000)
-        self.assertEqual(self.page.evaluate("calls.filter(c=>c.url.includes('/requests/')).length"), 1)
+        self.assertIn("分享 ID: b", self.page.locator("#shareMessage").inner_text())
+        self.assertEqual(self.page.evaluate("calls.filter(call=>call.url.includes('/requests/')).length"), 1)
+
+    def test_desktop_and_mobile_layout_with_real_css_and_picker(self):
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({"width": width, "height": 900})
+                self.inspect(str(width), long_name=True)
+                self.assertEqual(self.page.locator(".share-target-card, #saveShareTargetBtn, #shareTargetDir").count(), 0)
+                self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
+                button = self.page.locator("#restoreShareBtn").bounding_box()
+                assert button is not None
+                self.assertGreaterEqual(button["height"], 44)
+                self.assertLessEqual(button["x"] + button["width"], width)
+                evidence = self.root / ".superpowers/tmp"
+                evidence.mkdir(parents=True, exist_ok=True)
+                self.page.screenshot(path=str(evidence / f"share-transfer-{width}.png"))
+                self.page.locator("#restoreShareBtn").click()
+                self.page.locator("#shareDirModal .settings-dir-select").wait_for()
+                self.assertEqual(self.page.locator("#shareDirModal [data-dir-title]").inner_text(), "选择本次转存目录")
+                self.assertTrue(self.page.locator("#shareDirModal [data-dir-confirm]").is_hidden())
+                self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
+                self.page.locator("#shareDirModal").evaluate("""async modal=>{
+                    await new Promise(requestAnimationFrame);
+                    await Promise.all(modal.getAnimations({subtree:true}).map(animation=>animation.finished.catch(()=>{})));
+                }""")
+                self.page.screenshot(path=str(evidence / f"share-transfer-picker-{width}.png"))
+                self.page.locator("#shareDirModal [data-dir-close]").click()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@
     let inspectGeneration=0;
     let inspectController=null;
     let submitting=false;
-    let targetSelected=false;
+    let selectionGeneration=0;
+    let pickerSession=null;
 
     const escapeHtml=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const formatSize=size=>{
@@ -43,7 +44,6 @@
         document.getElementById('shareCheckAll').checked=files.length>0&&selected.length===files.length;
         document.getElementById('shareCheckAll').indeterminate=selected.length>0&&selected.length<files.length;
         document.getElementById('restoreShareBtn').disabled=submitting||!validPreview||!selected.length;
-        if(validPreview&&!submitting) document.getElementById('shareTransferSummary').textContent=`${selected.length} 项将转存到「${document.getElementById('shareTargetDirName').value}」`;
     }
     function invalidateSharePreview(message=''){
         const hadPreview=Boolean(previewId||files.length||inspectController);
@@ -54,7 +54,7 @@
         previewId='';
         previewUrl='';
         files=[];
-        document.getElementById('shareTransferSummary').textContent='尚未解析分享链接';
+        cancelPicker();
         document.getElementById('shareFileToolbar').hidden=true;
         document.getElementById('shareFileList').replaceChildren();
         updateSelection();
@@ -75,7 +75,7 @@
             </div>
         </label>`).join('');
         window.renderLucideIcons?.(list);
-        list.querySelectorAll('.share-file-check').forEach(el=>el.addEventListener('change',updateSelection));
+        list.querySelectorAll('.share-file-check').forEach(el=>el.addEventListener('change',selectionChanged));
         updateSelection();
     }
     async function inspectShare(){
@@ -113,56 +113,34 @@
             }
         }
     }
-    function renderTarget(directory){
-        document.getElementById('shareTargetDir').value=String(directory.id||'0');
-        document.getElementById('shareTargetDirName').value=directory.name||'根目录';
-        const value=document.getElementById('shareTargetValue');
-        value.innerHTML = `
-            <div class="share-target-icon"><i data-lucide="folder-tree"></i></div>
-            <div class="share-target-details">
-                <strong>${escapeHtml(directory.name||'根目录')}</strong>
-                <small>ID ${escapeHtml(String(directory.id||'0'))}</small>
-            </div>
-        `;
-        window.renderLucideIcons?.(value);
+    function cancelPicker(){
+        const session=pickerSession;
+        pickerSession=null;
+        session?.picker?.close({restoreFocus:false});
+    }
+    function selectionChanged(){
+        selectionGeneration+=1;
+        cancelPicker();
         updateSelection();
     }
-    function openTargetPicker(){
-        openGuangYaDirectoryPicker({
-            modalId:'shareDirModal',
-            title:'选择转存目标目录',
-            onSelect:(directory)=>{targetSelected=true;renderTarget(directory);},
-        });
-    }
-    async function saveDefaultTarget(){
-        const btn=document.getElementById('saveShareTargetBtn');
-        btn.disabled=true;
-        try{
-            const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-                GY_SHARE_TARGET_DIR:document.getElementById('shareTargetDir').value,
-                GY_SHARE_TARGET_DIR_NAME:document.getElementById('shareTargetDirName').value,
-            })});
-            const data=await response.json();
-            if(!response.ok) throw new Error(data.error||'保存失败');
-            document.getElementById('shareMessage').textContent='默认转存目录已保存';
-        }catch(error){document.getElementById('shareMessage').textContent=error.message;}
-        finally{btn.disabled=false;}
+    function ownsPreview(session){
+        return session.generation===inspectGeneration
+            &&document.getElementById('shareUrl').value.trim()===session.url;
     }
     const wait=milliseconds=>new Promise(resolve=>window.setTimeout(resolve,milliseconds));
-    function renderTransferStatus(state,message,summary,tone=''){
+    function renderTransferStatus(state,message,tone=''){
         setState(state,tone);
         document.getElementById('shareMessage').textContent=message;
-        document.getElementById('shareTransferSummary').textContent=summary;
     }
-    async function followShareRequest(requestId,targetName,generation){
+    async function followShareRequest(requestId,targetName,session){
         let queryFailures=0;
         for(let attempt=0;attempt<45;attempt+=1){
             await wait(2000);
-            if(generation!==inspectGeneration)return;
+            if(!ownsPreview(session))return;
             try{
                 const response=await fetch(`/api/share/requests/${encodeURIComponent(requestId)}`,{headers:{Accept:'application/json'},cache:'no-store'});
                 const data=await response.json();
-                if(generation!==inspectGeneration)return;
+                if(!ownsPreview(session))return;
                 if(!response.ok) throw new Error(data.error||'状态查询失败');
                 queryFailures=0;
                 if(!data.terminal){
@@ -170,63 +148,76 @@
                     continue;
                 }
                 if(data.success){
-                    renderTransferStatus('转存成功',`转存请求 ${requestId} 已完成 · 目标「${data.target_dir_name||targetName}」`,'本次转存已完成','is-success');
+                    renderTransferStatus('转存成功',`转存请求 ${requestId} 已完成 · 目标「${data.target_dir_name||targetName}」`,'is-success');
                 }else{
-                    renderTransferStatus(data.status==='manual_review'?'需要核对':'转存失败',data.error||`转存请求 ${requestId} 未完成，请重新解析后重试`,'请核对目标目录或重新解析分享链接','is-danger');
+                    renderTransferStatus(data.status==='manual_review'?'需要核对':'转存失败',data.error||`转存请求 ${requestId} 未完成，请重新解析后重试`,'is-danger');
                 }
                 return;
             }catch(error){
-                if(generation!==inspectGeneration)return;
+                if(!ownsPreview(session))return;
                 if(++queryFailures>=3){
-                    renderTransferStatus('状态待确认',`转存请求 ${requestId} 已受理，但暂时无法查询状态，请稍后在下载或日志页面核对`,'请求仍可能在后台执行');
+                    renderTransferStatus('状态待确认',`转存请求 ${requestId} 已受理，但暂时无法查询状态，请稍后在下载或日志页面核对`);
                     return;
                 }
             }
         }
-        renderTransferStatus('仍在处理',`转存请求 ${requestId} 仍在处理，请稍后在下载或日志页面核对`,'请求已受理并在后台继续执行');
+        renderTransferStatus('仍在处理',`转存请求 ${requestId} 仍在处理，请稍后在下载或日志页面核对`);
     }
 
-    async function restoreShare(){
-        if(submitting)return;
+    function restoreShare(){
+        if(submitting||pickerSession?.picker?.modal.isConnected)return;
         const ids=selectedIds();
-        const currentUrl=document.getElementById('shareUrl').value.trim();
-        if(!previewId||!ids.length||previewUrl!==currentUrl){invalidateSharePreview('分享链接已变化，请重新解析后再转存');return;}
-        // 确认与提交共用同一份参数；异步回执只属于发起时的预览。
-        const generation=inspectGeneration;
-        const body={preview_id:previewId,file_ids:ids,target_dir_id:document.getElementById('shareTargetDir').value,target_dir_name:document.getElementById('shareTargetDirName').value};
-        const targetName=body.target_dir_name;
-        submitting=true;updateSelection();
+        const url=document.getElementById('shareUrl').value.trim();
+        if(!previewId||!ids.length||previewUrl!==url){invalidateSharePreview('分享链接已变化，请重新解析后再转存');return;}
+        const session={generation:inspectGeneration,selection:selectionGeneration,url,previewId,ids};
+        pickerSession=session;
+        session.picker=openGuangYaDirectoryPicker({
+            modalId:'shareDirModal',title:'选择本次转存目录',trigger:document.getElementById('restoreShareBtn'),
+            preserveWhileLoading:true,
+            onSelect:directory=>{
+                if(pickerSession!==session||!ownsPreview(session)||session.selection!==selectionGeneration)return;
+                const target={id:String(directory.id),name:String(directory.name||directory.id)};
+                pickerSession=null;
+                submitting=true;
+                updateSelection();
+                // 先让共享选择器关闭，再打开现有确认框，避免两个弹窗争抢焦点。
+                queueMicrotask(()=>submitShare(session,target));
+            },
+        });
+    }
+    async function submitShare(session,target){
+        const button=document.getElementById('restoreShareBtn');
+        let confirmed=null;
         try{
-            const confirmed=await appConfirm({title:'确认分享转存',message:`把 ${ids.length} 项文件转存到「${targetName}」。该操作将在云盘直接执行。`,confirmText:'开始转存'});
-            if(!confirmed||generation!==inspectGeneration)return;
-            renderActionButton('restoreShareBtn',true,'执行转存','cloud-download');
+            if(!ownsPreview(session)||session.selection!==selectionGeneration)return;
+            confirmed=await appConfirm({title:'确认分享转存',message:`把 ${session.ids.length} 项文件保存到「${target.name}」。`,confirmText:'保存到此目录',trigger:button});
+            if(!confirmed||!ownsPreview(session)||session.selection!==selectionGeneration)return;
+            renderActionButton('restoreShareBtn',true,'保存到光鸭','cloud-download');
+            const body={preview_id:session.previewId,file_ids:session.ids,target_dir_id:target.id,target_dir_name:target.name};
             const response=await fetch('/api/share/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
             const data=await response.json();
-            if(generation!==inspectGeneration)return;
+            if(!ownsPreview(session))return;
             if(!response.ok)throw new Error(data.error||'转存失败');
             previewId='';previewUrl='';
             if(response.status===202||(data.accepted&&data.duplicate)){
-                renderTransferStatus('请求处理中',`相同请求正在处理${data.request_id?` · 请求 ${data.request_id}`:''}`,'已复用正在执行的转存请求，正在跟踪结果');
-                if(data.request_id) void followShareRequest(data.request_id,targetName,generation);
+                renderTransferStatus('请求处理中',`转存请求已受理${data.request_id?` · 请求 ${data.request_id}`:''}`);
+                if(data.request_id)void followShareRequest(data.request_id,target.name,session);
             }else{
-                renderTransferStatus('转存成功',`已成功转存 ${data.count||0} 项到「${data.target_dir_name||targetName}」`,'本次转存已完成','is-success');
+                renderTransferStatus('转存成功',`已成功转存 ${data.count||0} 项到「${data.target_dir_name||target.name}」`,'is-success');
             }
         }catch(error){
-            if(generation===inspectGeneration){setState('转存失败','is-danger');document.getElementById('shareMessage').textContent=error.message;}
+            if(ownsPreview(session)){setState('转存失败','is-danger');document.getElementById('shareMessage').textContent=error.message;}
         }finally{
             submitting=false;
-            renderActionButton('restoreShareBtn',false,'执行转存','cloud-download');
+            renderActionButton('restoreShareBtn',false,'保存到光鸭','cloud-download');
             updateSelection();
+            if(confirmed===false&&ownsPreview(session)&&session.selection===selectionGeneration
+                &&!button.disabled&&!document.body.classList.contains('modal-open'))button.focus({preventScroll:true});
         }
     }
     document.getElementById('inspectShareBtn').addEventListener('click',inspectShare);
     document.getElementById('shareUrl').addEventListener('input',()=>invalidateSharePreview('分享链接已变化，请重新解析'));
-    document.getElementById('shareCheckAll').addEventListener('change',e=>{document.querySelectorAll('.share-file-check').forEach(el=>el.checked=e.target.checked);updateSelection();});
-    document.getElementById('pickShareTargetBtn').addEventListener('click',openTargetPicker);
-    document.getElementById('saveShareTargetBtn').addEventListener('click',saveDefaultTarget);
+    document.getElementById('shareCheckAll').addEventListener('change',e=>{document.querySelectorAll('.share-file-check').forEach(el=>el.checked=e.target.checked);selectionChanged();});
     document.getElementById('restoreShareBtn').addEventListener('click',restoreShare);
-    loadAppConfig().catch(()=>({})).then(config=>{
-        if(!targetSelected)renderTarget({id:config.GY_SHARE_TARGET_DIR||'0',name:config.GY_SHARE_TARGET_DIR_NAME||'根目录'});
-    });
 })();
 </script>

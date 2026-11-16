@@ -3271,6 +3271,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .settings-dir-current { width: auto; flex: 0 0 auto; }
 .settings-dir-current.is-selected { color: var(--accent); border-color: var(--accent-border); }
 .settings-dir-confirm { width: auto; min-width: 92px; flex: 0 0 auto; }
+.settings-dir-confirm[hidden] { display: none; }
 .settings-dir-footer-actions .jump-btn,
 .settings-dir-footer-actions .btn { min-height: var(--modal-action-height); border-radius: var(--modal-action-radius); }
 @media (max-width: 620px) {
@@ -3717,16 +3718,15 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 
 /* Links & Share Transfer Redesign */
 .share-transfer-shell { width: 100%; margin: 0; }
-.share-transfer-grid { display: grid; grid-template-columns: minmax(0, 1.32fr) minmax(340px, 0.68fr); gap: 16px; align-items: start; }
-.share-main-card, .share-target-card { min-width: 0; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: var(--radius-md, 12px); padding: 20px 22px; transition: border-color 0.2s ease; box-shadow: none; }
-.share-main-card:hover, .share-target-card:hover { border-color: var(--border); }
+.share-main-card { min-width: 0; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: var(--radius-md, 12px); padding: 20px 22px; transition: border-color 0.2s ease; box-shadow: none; }
+.share-main-card:hover { border-color: var(--border); }
 
 .share-status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; font-size: 11.5px; font-weight: 600; color: var(--text-secondary); background: var(--surface-muted, var(--bg-card-hover)); border: 1px solid var(--border-soft); border-radius: 999px; flex-shrink: 0; }
 .share-status-badge svg { width: 14px; height: 14px; color: var(--accent); }
 .share-status-badge.is-success { color: var(--success); background: var(--accent-soft); border-color: var(--accent-border); }
 .share-status-badge.is-danger { color: var(--danger); background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.2); }
 
-.share-card-body, .share-target-body { display: flex; flex-direction: column; gap: 16px; margin-top: 16px; }
+.share-card-body { display: flex; flex-direction: column; gap: 16px; margin-top: 16px; }
 .share-main-card .strm-composite-input-wrap {
     height: 44px;
     padding: 0 4px 0 12px;
@@ -3756,7 +3756,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .share-check-all { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--text-primary); cursor: pointer; user-select: none; }
 .share-count-badge { font-size: 11px; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); padding: 3px 10px; border-radius: 999px; font-weight: 600; }
 
-.share-file-list { display: flex; flex-direction: column; gap: 8px; max-height: 520px; overflow-y: auto; padding-right: 2px; }
+.share-file-list { min-height: 240px; min-width: 0; display: flex; flex-direction: column; gap: 8px; max-height: 520px; overflow-y: auto; padding-right: 2px; }
 .share-file-row { display: flex; align-items: center; gap: 12px; padding: 11px 14px; background: var(--bg-input); border: 1px solid var(--border-soft); border-radius: 9px; transition: all 0.15s ease; cursor: pointer; }
 .share-file-row:hover { border-color: var(--border); background: var(--bg-card-hover); }
 .share-file-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
@@ -3764,7 +3764,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .share-file-type-icon svg { width: 17px; height: 17px; }
 .share-file-meta { min-width: 0; flex: 1; }
 .share-file-meta strong { display: block; font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.share-file-meta small { display: block; margin-top: 2px; font-size: 11px; color: var(--text-muted); }
+.share-file-meta small { display: block; margin-top: 2px; font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
 
 .share-empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; min-height: 240px; padding: 32px 20px; background: var(--surface-subtle, var(--bg-input)); border: 1px dashed var(--border-soft); border-radius: 10px; }
 .share-empty-icon { width: 44px; height: 44px; display: grid; place-items: center; background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 12px; color: var(--accent); margin-bottom: 12px; }
@@ -3775,38 +3775,21 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .share-link-tips span { white-space: nowrap; }
 .share-link-tips code { font-family: "SFMono-Regular", Consolas, monospace; color: var(--accent); font-weight: 600; overflow-wrap: anywhere; }
 
-/* Right Target Card */
-.share-target-card { position: sticky; top: 88px; }
-.share-target-card-box { padding: 14px; background: var(--surface-subtle, var(--bg-input)); border: 1px solid var(--border-soft); border-radius: 10px; }
-.share-target-info { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding-bottom: 11px; border-bottom: 1px solid var(--border-soft); }
-.share-target-icon { width: 38px; height: 38px; display: grid; place-items: center; background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 9px; color: var(--accent); flex-shrink: 0; }
-.share-target-icon svg { width: 18px; height: 18px; }
-.share-target-details { min-width: 0; flex: 1; }
-.share-target-details strong { display: block; font-size: 13.5px; font-weight: 650; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.share-target-details small { display: block; margin-top: 2px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; color: var(--text-muted); }
-.share-target-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.share-target-actions .jump-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-size: 12px; font-weight: 600; height: 36px; min-height: 36px; padding: 0 10px; width: 100%; background: var(--bg-card); border: 1px solid var(--border-soft); color: var(--text-primary); border-radius: 8px; transition: all 0.15s ease; }
-.share-target-actions .jump-btn:hover { background: var(--bg-card-hover); border-color: var(--border); }
-
-.share-summary-box { padding: 12px 14px; background: var(--surface-subtle, var(--bg-input)); border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: 8px; }
-.share-summary-text { font-size: 12.5px; font-weight: 500; color: var(--text-secondary); line-height: 1.5; }
-
-.share-execute-btn { width: 100% !important; height: 42px; min-height: 42px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 13.5px; font-weight: 650; border-radius: 9px; }
+.share-save-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.share-save-actions > span { font-size: 12px; line-height: 1.5; }
+.share-execute-btn { min-width: 154px; height: 44px; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 13.5px; font-weight: 650; border-radius: 9px; }
 .share-execute-btn svg { width: 17px; height: 17px; }
 
-.share-safety-hint { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-muted); line-height: 1.5; padding: 10px 12px; background: var(--surface-subtle, var(--bg-input)); border: 1px solid var(--border-soft); border-radius: 8px; }
-.share-safety-hint svg { width: 15px; height: 15px; color: var(--accent); flex-shrink: 0; }
-
-@media (max-width: 960px) {
-    .share-transfer-grid { grid-template-columns: 1fr; }
-    .share-target-card { position: static; }
-    .share-inspect-btn { width: auto !important; }
-}
 @media (max-width: 560px) {
-    .share-main-card, .share-target-card { padding: 16px; }
+    .share-main-card { padding: 16px; }
     .share-main-card .strm-section-head { flex-wrap: wrap; gap: 10px 12px; }
     .share-main-card .strm-section-head .title-group { flex: 1 1 180px; }
     .share-status-badge { margin-left: auto; }
+    .share-save-actions > span, .share-execute-btn { width: 100%; }
+    .share-main-card .strm-composite-input-wrap { height: auto; min-height: 44px; flex-wrap: wrap; gap: 8px; padding: 8px; }
+    .share-main-card .strm-composite-input { min-width: 0; font-size: 16px; }
+    .share-inspect-btn { width: 100% !important; min-height: 44px !important; }
+    .share-file-toolbar { flex-wrap: wrap; gap: 8px; }
 }
 
 /* 整理页滚动路径保持轻量：避免固定遮罩与卡片动态阴影反复参与合成。 */
@@ -4111,26 +4094,6 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     padding: 0 8px;
 }
 
-.share-safety-note {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    padding: 10px 12px;
-    background: var(--bg-input);
-    border: 1px solid var(--border-soft);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    font-size: 10.5px;
-    line-height: 1.45;
-}
-.share-safety-note svg {
-    width: 14px;
-    height: 14px;
-    color: var(--warning);
-    flex-shrink: 0;
-    margin-top: 1px;
-}
-
 .organize-stop-btn:not(:disabled) { color: var(--warning); border-color: var(--warning-border); }
 .organize-plan-list { max-height: 520px; display: grid; gap: 6px; overflow: auto; }
 #previewCard { margin-top: 16px; }
@@ -4356,9 +4319,9 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .workspace-menu-btn { display: inline-grid; }
     .workspace-bar { padding-top: 18px; }
     #toggleSidebar { display: inline-grid; }
-    .grid-2, .gcid-grid, .share-transfer-layout, .organize-workspace { grid-template-columns: 1fr; }
+    .grid-2, .gcid-grid, .organize-workspace { grid-template-columns: 1fr; }
     .organize-flow-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .share-target-panel, .organize-control-card { position: static; }
+    .organize-control-card { position: static; }
     .form-row { align-items: stretch; flex-direction: column; gap: 7px; }
     .field-control { width: 100%; }
     .strm-settings-grid, .offline-settings-grid, .network-config-grid { grid-template-columns: 1fr; }
@@ -4785,9 +4748,6 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .poster-card { width: 116px; flex: 0 0 116px; scroll-snap-align: start; }
     .poster-open { opacity: 1; transform: none; }
     .poster-copy strong { min-height: 31px; }
-    .share-url-row { grid-template-columns: 1fr; }
-    .share-url-row .btn { width: 100%; }
-    .share-file-item { grid-template-columns: auto 34px minmax(0,1fr); padding: 8px; }
     .proxy-grid { grid-template-columns: 1fr; }
     .scrape-input { flex-direction: column; }
     .scrape-input .btn { width: 100%; max-width: 100% !important; }
