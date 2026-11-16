@@ -775,6 +775,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 recorder.refreshed.clear()
                 deferred = client.refresh_for_paths(paths, skip_item_ids=("series-a",))
                 self.assertEqual(deferred["deferred_paths"], paths[:2])
+                self.assertEqual(deferred["deferred_targets"], dict.fromkeys(paths[:2], "series-a"))
                 self.assertEqual(deferred["succeeded_paths"], paths[2:])
                 self.assertEqual(sorted(recorder.refreshed), ["movie-b", "series-b"])
 
@@ -1188,6 +1189,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                     self.assertEqual(result["retryable"], not deferred)
                     self.assertEqual(result["deduplicated"], int(deferred))
                     self.assertEqual(result["deferred_paths"], paths[2:3] if deferred else [])
+                    self.assertEqual(result["deferred_targets"], dict.fromkeys(paths[2:3], "movie-b") if deferred else {})
 
     def test_dedupe_receipt_survives_other_library_read_failure(self):
         paths = [f"{ROOT}/剧集/作品 A/Season 01", f"{ROOT}/电影/作品 B", "/outside/unmapped"]
@@ -1205,6 +1207,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["retryable"])
                 self.assertEqual(result["deferred_paths"], paths[:1])
+                self.assertEqual(result["deferred_targets"], {paths[0]: "series-a"})
                 self.assertEqual(result["unmatched_paths"], paths[2:])
                 self.assertEqual(recorder.refreshed, [])
                 recorder.posts.assert_not_called()

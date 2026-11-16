@@ -295,12 +295,12 @@ class MediaRefreshCoordinator:
         finally:
             close_media_server_client(client)
 
-        deferred = outcome.get("deferred_paths") or ()
+        deferred = outcome.get("deferred_targets") or {}
         # 数据库结算失败必须交回消费者恢复；不能当成媒体服务器失败再清空队列。
         if not settle_media_refresh(
             str(group.get("group_key") or ""), owner=self._owner,
             lease_generation=int(group.get("lease_generation") or 0),
-            deferred_paths=deferred, delay_seconds=_recent_ttl_seconds(),
+            deferred_targets=deferred,
             refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
             recent_ttl_seconds=_recent_ttl_seconds(),
         ):

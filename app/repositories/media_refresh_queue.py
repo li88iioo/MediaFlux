@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from app import database as db
@@ -140,6 +140,19 @@ def _prune_recent(state: dict[str, Any], now_epoch: float) -> int:
     return before - len(recent)
 
 
+def _pending_deadlines(group: dict[str, Any]) -> dict[str, float]:
+    """旧记录沿用批次 quiet window；延期路径使用持久化的独立截止时间。"""
+    try:
+        due_at = float(group.get("due_at") or 0)
+    except (TypeError, ValueError, OverflowError):
+        due_at = 0
+    overrides = group.get("path_due_at") or {}
+    return {
+        path: float(overrides.get(path, due_at))
+        for path in _normalized_paths(group.get("pending_paths"))
+    }
+
+
 def _recover_running_groups(
     state: dict[str, Any], now_epoch: float, *, force: bool = False,
 ) -> int:
@@ -164,6 +177,7 @@ def _recover_running_groups(
         group["status"] = "queued"
         group["lease_owner"] = ""
         group["lease_until"] = 0
+        # 沿用重启立即接管普通 pending 的行为；独立 expiry 不受批次 due_at 影响。
         group["due_at"] = min(due_at, now_epoch)
         recovered += 1
     return recovered
@@ -221,9 +235,14 @@ def enqueue_media_refresh(
         group["pending_paths"] = _merge_paths(
             group.get("pending_paths"), normalized_paths
         )
+        deadlines = group.get("path_due_at") or {}
+        for path in normalized_paths:
+            if path in deadlines:
+                deadlines[path] = max(float(deadlines[path]), due_at)
+        group["path_due_at"] = deadlines
         if str(group.get("status") or "") != "running":
             group["status"] = "queued"
-        # quiet-window 语义：每次新入队都把 pending 的执行时间推到最后一次变化后。
+        # 新变化共享 quiet window；其它已延期路径的原 expiry 不随之重置。
         group["due_at"] = due_at
         group["updated_at"] = now_value
         _write_state(conn, state)
@@ -260,21 +279,24 @@ def claim_due_media_refreshes(
             status = str(group.get("status") or "")
             if status != "queued":
                 continue
-            pending = _normalized_paths(group.get("pending_paths"))
-            if not pending:
+            deadlines = _pending_deadlines(group)
+            if not deadlines:
                 continue
-            try:
-                due_at = float(group.get("due_at") or 0)
-            except (TypeError, ValueError, OverflowError):
-                due_at = 0
+            due_at = min(deadlines.values())
             if not force and due_at > now_value:
                 continue
             candidates.append((due_at, str(key), group))
         claimed: list[dict[str, Any]] = []
         for _due_at, key, group in sorted(candidates)[:safe_limit]:
-            pending = _normalized_paths(group.get("pending_paths"))
+            deadlines = _pending_deadlines(group)
+            pending = [path for path, due_at in deadlines.items() if force or due_at <= now_value]
+            ready = set(pending)
             generation = max(0, int(group.get("lease_generation") or 0)) + 1
-            group["pending_paths"] = []
+            group["pending_paths"] = [path for path in deadlines if path not in ready]
+            group["path_due_at"] = {
+                path: due_at for path, due_at in (group.get("path_due_at") or {}).items()
+                if path not in ready
+            }
             group["inflight_paths"] = pending
             group["status"] = "running"
             group["lease_owner"] = safe_owner
@@ -299,13 +321,12 @@ def settle_media_refresh(
     *,
     owner: str,
     lease_generation: int,
-    delay_seconds: int = 0,
     refreshed_target_ids: Iterable[object] | None = (),
-    deferred_paths: Iterable[object] | None = (),
+    deferred_targets: Mapping[str, str] | None = None,
     recent_ttl_seconds: int = 90,
     now_epoch: float | None = None,
 ) -> bool:
-    """结束本轮在途工作，只延后明确命中去重的路径；保留新变化与其 quiet window。"""
+    """按延期目标原 expiry 结算；保留新变化的 quiet window 与未到期路径。"""
     now_value = float(time.time() if now_epoch is None else now_epoch)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -325,18 +346,21 @@ def settle_media_refresh(
             expiry = now_value + ttl
             for item_id in _normalized_paths(refreshed_target_ids):
                 state["recent"][f"{provider}:{item_id}"] = expiry
-        deferred = set(_normalized_paths(deferred_paths))
+        deferred = dict(deferred_targets or {})
         inflight = _normalized_paths(group.get("inflight_paths"))
-        if not deferred.issubset(inflight):
+        if not deferred.keys() <= set(inflight):
             raise ValueError("延后刷新路径不属于本轮任务")
         pending = _normalized_paths(group.get("pending_paths"))
+        pending_deadlines = _pending_deadlines(group)
+        deadlines = dict(group.get("path_due_at") or {})
+        for path, target in deferred.items():
+            expiry = float(state["recent"].get(f"{provider}:{target}") or now_value)
+            deadlines[path] = max(now_value, expiry, pending_deadlines.get(path, 0))
         group["pending_paths"] = _merge_paths((path for path in inflight if path in deferred), pending)
+        group["path_due_at"] = deadlines
         if not group["pending_paths"]:
             state["groups"].pop(group_key, None)
         else:
-            # 本轮去重不能覆盖执行中收到的新变化及其 quiet window。
-            if not pending:
-                group["due_at"] = now_value + max(1, delay_seconds)
             group.update(inflight_paths=[], status="queued", lease_owner="", lease_until=0, updated_at=now_value)
         _prune_recent(state, now_value)
         _write_state(conn, state)
@@ -386,12 +410,7 @@ def next_media_refresh_due_in(*, now_epoch: float | None = None) -> float | None
             continue
         if str(group.get("status") or "") != "queued":
             continue
-        if not _normalized_paths(group.get("pending_paths")):
-            continue
-        try:
-            due_values.append(float(group.get("due_at") or 0))
-        except (TypeError, ValueError, OverflowError):
-            due_values.append(0)
+        due_values.extend(_pending_deadlines(group).values())
     if not due_values:
         return None
     return max(0.0, min(due_values) - now_value)

@@ -1539,6 +1539,7 @@ class MediaServerClient:
         安全跳过，从不发起全局 ``/Library/Refresh``。succeeded_paths 仅记录已获服务端接受的
         原始输入路径；unmatched_paths 是不属于任何（或唯一）媒体库的输入路径。
         deferred_paths 仅记录因短暂去重而尚未提交的原始路径，供队列延后提交；
+        deferred_targets 为这些路径保留目标 ID，供队列沿原目标 expiry 排期。
         这些回执不表示服务端异步扫描已经完成。
         """
         allowed_ids = {
@@ -1595,6 +1596,7 @@ class MediaServerClient:
             "succeeded_target_ids": [],
             "succeeded_paths": [],
             "deferred_paths": [],
+            "deferred_targets": {},
             "unmatched_paths": [],
             "allowed_libraries": sorted(allowed_ids),
         }
@@ -1837,10 +1839,11 @@ class MediaServerClient:
         requested_ids = [*item_ids, *folder_ids, *library_ids]
         deduplicated_ids = [item for item in requested_ids if item in skipped_ids]
         result["deduplicated"] = len(deduplicated_ids)
-        result["deferred_paths"] = _dedupe_texts([
-            source for target, item_id in target_ids.items() if item_id in skipped_ids
+        result["deferred_targets"] = {
+            source: item_id for target, item_id in target_ids.items() if item_id in skipped_ids
             for source in sources_for_target[target]
-        ])
+        }
+        result["deferred_paths"] = list(result["deferred_targets"])
         item_ids = [item for item in item_ids if item not in skipped_ids]
         folder_ids = [item for item in folder_ids if item not in skipped_ids]
         library_ids = [item for item in library_ids if item not in skipped_ids]

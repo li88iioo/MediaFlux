@@ -17,8 +17,19 @@ from app.repositories.media_refresh_queue import (
     recent_media_refresh_target_ids,
     recover_media_refresh_leases,
     settle_media_refresh,
+    next_media_refresh_due_in,
 )
 from tests.support import IsolatedDatabaseTestCase
+
+
+def _remember_targets(**expiries):
+    for target, expiry in expiries.items():
+        queued = enqueue_media_refresh("jellyfin", [f"/seed/{target}"], debounce_seconds=0, now_epoch=0)
+        lease = claim_due_media_refreshes(owner="seed", now_epoch=0)[0]
+        settle_media_refresh(
+            queued["group_key"], owner="seed", lease_generation=lease["lease_generation"],
+            refreshed_target_ids=[target], recent_ttl_seconds=expiry, now_epoch=0,
+        )
 
 
 class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
@@ -142,6 +153,7 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         for deferred in ([], ["/media/B"]):
             with self.subTest(deferred=deferred):
                 clear_media_refresh_queue()
+                _remember_targets(series_b=192)
                 queued = enqueue_media_refresh(
                     "jellyfin", ["/media/A", "/media/B"], debounce_seconds=0, now_epoch=100,
                 )
@@ -152,8 +164,8 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
                 )
                 self.assertTrue(settle_media_refresh(
                     queued["group_key"], owner="old", lease_generation=first["lease_generation"],
-                    deferred_paths=deferred, refreshed_target_ids=["series-a"],
-                    delay_seconds=90, now_epoch=102,
+                    deferred_targets={path: "series_b" for path in deferred},
+                    refreshed_target_ids=["series-a"], now_epoch=102,
                 ))
                 stored = json.loads(db.kv_get("media_refresh_queue:v1"))
                 self.assertEqual(stored["version"], 1)
@@ -162,32 +174,39 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
                 db.init_db()
                 self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=120), [])
                 next_group = claim_due_media_refreshes(owner="new", now_epoch=121)[0]
-                self.assertEqual(next_group["paths"], deferred + ["/media/A", "/media/C"])
-                self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=121), ("series-a",))
+                self.assertEqual(next_group["paths"], ["/media/A", "/media/C"])
+                self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=121), ("series-a", "series_b"))
                 self.assertEqual(recover_media_refresh_leases(now_epoch=122), 1)
                 recovered = claim_due_media_refreshes(owner="restarted", now_epoch=122)[0]
                 self.assertEqual(recovered["paths"], next_group["paths"])
+                settle_media_refresh(queued["group_key"], owner="restarted", lease_generation=recovered["lease_generation"], now_epoch=122)
+                self.assertEqual(claim_due_media_refreshes(owner="later", now_epoch=191), [])
+                self.assertEqual(
+                    [group["paths"] for group in claim_due_media_refreshes(owner="later", now_epoch=192)],
+                    [deferred] if deferred else [],
+                )
 
     def test_settlement_is_idempotent_and_delays_only_deduplicated_paths(self):
         for deferred in ([], ["/media/A"]):
             with self.subTest(deferred=deferred):
                 clear_media_refresh_queue()
+                _remember_targets(**{"series-a": 190})
                 queued = enqueue_media_refresh(
                     "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
                 )
                 lease = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
                 arguments = dict(
                     owner="worker", lease_generation=lease["lease_generation"],
-                    deferred_paths=deferred, delay_seconds=90,
-                    refreshed_target_ids=["series-a"], now_epoch=101,
+                    deferred_targets={path: "series-a" for path in deferred},
+                    refreshed_target_ids=[] if deferred else ["series-a"], now_epoch=101,
                 )
                 self.assertTrue(settle_media_refresh(queued["group_key"], **arguments))
                 snapshot = db.kv_get("media_refresh_queue:v1")
                 self.assertFalse(settle_media_refresh(queued["group_key"], **arguments))
                 self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
                 self.assertEqual(recent_media_refresh_target_ids("jellyfin", now_epoch=102), ("series-a",))
-                self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=190), [])
-                claimed = claim_due_media_refreshes(owner="next", now_epoch=191)
+                self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=189), [])
+                claimed = claim_due_media_refreshes(owner="next", now_epoch=190)
                 self.assertEqual([path for group in claimed for path in group["paths"]], deferred)
 
     def test_superseded_lease_and_foreign_deferred_path_cannot_change_queue(self):
@@ -205,9 +224,112 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         with self.assertRaises(ValueError):
             settle_media_refresh(
                 queued["group_key"], owner="worker", lease_generation=new["lease_generation"],
-                deferred_paths=["/media/foreign"], refreshed_target_ids=["must-not-be-recorded"], now_epoch=132,
+                deferred_targets={"/media/foreign": "series-a"}, refreshed_target_ids=["must-not-be-recorded"], now_epoch=132,
             )
         self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
+
+    def test_each_expiry_survives_new_quiet_window_and_restart(self):
+        _remember_targets(**{"series-a": 190, "series-b": 230})
+        queued = enqueue_media_refresh("jellyfin", ["/media/A", "/media/B"], debounce_seconds=0, now_epoch=180)
+        old = claim_due_media_refreshes(owner="old", now_epoch=180)[0]
+        enqueue_media_refresh("jellyfin", ["/media/C"], debounce_seconds=300, now_epoch=181)
+        settle_media_refresh(
+            queued["group_key"], owner="old", lease_generation=old["lease_generation"],
+            deferred_targets={"/media/A": "series-a", "/media/B": "series-b"}, now_epoch=182,
+        )
+        # 新变化只能延长普通 quiet window，不能将 A/B 的原到期时间推迟到 481。
+        self.assertEqual(next_media_refresh_due_in(now_epoch=182), 8)
+        enqueue_media_refresh("jellyfin", ["/media/D"], debounce_seconds=300, now_epoch=185)
+        self.assertEqual(next_media_refresh_due_in(now_epoch=185), 5)
+        db.init_db()
+        self.assertEqual(recover_media_refresh_leases(now_epoch=183), 0)
+        first = claim_due_media_refreshes(owner="first", now_epoch=190)[0]
+        self.assertEqual(first["paths"], ["/media/A"])
+        self.assertEqual(media_refresh_queue_status(now_epoch=190)["paths"], 4)
+        # 初始批次旧租约不能结算此次只领取 A 的新租约。
+        self.assertFalse(settle_media_refresh(
+            queued["group_key"], owner="old", lease_generation=old["lease_generation"], now_epoch=191,
+        ))
+        settle_media_refresh(queued["group_key"], owner="first", lease_generation=first["lease_generation"], now_epoch=191)
+        self.assertEqual(claim_due_media_refreshes(owner="later", now_epoch=229), [])
+        second = claim_due_media_refreshes(owner="later", now_epoch=230)[0]
+        self.assertEqual(second["paths"], ["/media/B"])
+        settle_media_refresh(queued["group_key"], owner="later", lease_generation=second["lease_generation"], now_epoch=230)
+        self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=484), [])
+        self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=485)[0]["paths"], ["/media/C", "/media/D"])
+
+    def test_concurrent_enqueue_keeps_new_copy_of_a_claimed_path(self):
+        _remember_targets(**{"series-a": 190, "series-b": 230})
+        queued = enqueue_media_refresh("jellyfin", ["/media/A", "/media/B"], debounce_seconds=0, now_epoch=180)
+        lease = claim_due_media_refreshes(owner="worker", now_epoch=180)[0]
+        settle_media_refresh(
+            queued["group_key"], owner="worker", lease_generation=lease["lease_generation"],
+            deferred_targets={"/media/A": "series-a", "/media/B": "series-b"}, now_epoch=182,
+        )
+        first = claim_due_media_refreshes(owner="worker", now_epoch=190)[0]
+        failures = []
+
+        def enqueue():
+            try:
+                enqueue_media_refresh("jellyfin", ["/media/A", "/media/C"], debounce_seconds=20, now_epoch=191)
+            except Exception as exc:
+                failures.append(exc)
+
+        producer = threading.Thread(target=enqueue)
+        producer.start()
+        producer.join(5)
+        self.assertFalse(producer.is_alive())
+        self.assertEqual(failures, [])
+        settle_media_refresh(
+            queued["group_key"], owner="worker", lease_generation=first["lease_generation"],
+            refreshed_target_ids=["series-a"], now_epoch=192,
+        )
+        self.assertEqual(claim_due_media_refreshes(owner="new", now_epoch=210), [])
+        next_group = claim_due_media_refreshes(owner="new", now_epoch=211)[0]
+        self.assertEqual(next_group["paths"], ["/media/A", "/media/C"])
+        settle_media_refresh(
+            queued["group_key"], owner="new", lease_generation=next_group["lease_generation"],
+            deferred_targets={"/media/A": "series-a"}, now_epoch=212,
+        )
+        self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=230)[0]["paths"], ["/media/B"])
+        self.assertEqual(media_refresh_queue_status(now_epoch=230)["paths"], 2)
+
+    def test_new_change_to_deferred_path_keeps_its_quiet_window(self):
+        _remember_targets(**{"series-a": 190})
+        queued = enqueue_media_refresh("jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=180)
+        lease = claim_due_media_refreshes(owner="worker", now_epoch=180)[0]
+        enqueue_media_refresh("jellyfin", ["/media/A", "/media/new"], debounce_seconds=40, now_epoch=181)
+        settle_media_refresh(
+            queued["group_key"], owner="worker", lease_generation=lease["lease_generation"],
+            deferred_targets={"/media/A": "series-a"}, now_epoch=182,
+        )
+        self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=220), [])
+        self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=221)[0]["paths"], ["/media/A", "/media/new"])
+
+    def test_expired_target_is_ready_without_another_delay_and_legacy_state_loads(self):
+        # 固定的历史 version=1 字面量，没有新字段，也不借当前生产者生成夹具。
+        db.kv_set("media_refresh_queue:v1", """{
+            "version": 1, "recent": {"jellyfin:series-a": 190},
+            "groups": {"legacy": {
+                "provider": "jellyfin", "allowed_library_ids": [], "library_binding": {},
+                "pending_paths": ["/media/A"], "inflight_paths": [],
+                "status": "queued", "due_at": 180, "lease_owner": "",
+                "lease_until": 0, "lease_generation": 0
+            }}
+        }""")
+        db.init_db()
+        self.assertEqual(claim_due_media_refreshes(owner="worker", now_epoch=179), [])
+        lease = claim_due_media_refreshes(owner="worker", now_epoch=180)[0]
+        settle_media_refresh(
+            lease["group_key"], owner="worker", lease_generation=lease["lease_generation"],
+            deferred_targets={"/media/A": "series-a"}, now_epoch=195,
+        )
+        db.init_db()
+        stored = json.loads(db.kv_get("media_refresh_queue:v1"))
+        self.assertEqual(stored["version"], 1)
+        self.assertEqual(stored["groups"][lease["group_key"]]["path_due_at"], {"/media/A": 195})
+        self.assertEqual(next_media_refresh_due_in(now_epoch=195), 0)
+        self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=195)[0]["paths"], ["/media/A"])
 
 
 class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
@@ -379,6 +501,7 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
             "libraries": [],
             "deduplicated": 1,
             "deferred_paths": ["/media/new-episode"],
+            "deferred_targets": {"/media/new-episode": "series-a"},
             "retryable": False,
             "succeeded_target_ids": [],
             "fallback": "",
@@ -398,10 +521,37 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
         self.assertEqual(coordinator._completed_session, 0)
         self.assertEqual(coordinator._failed_session, 0)
 
+    def test_deferred_refresh_uses_original_target_expiry(self):
+        enqueue_media_refresh("jellyfin", ["/media/old-season"], debounce_seconds=0, now_epoch=100)
+        previous = claim_due_media_refreshes(owner="previous", now_epoch=100)[0]
+        settle_media_refresh(
+            previous["group_key"], owner="previous", lease_generation=previous["lease_generation"],
+            refreshed_target_ids=["series-a"], recent_ttl_seconds=90, now_epoch=100,
+        )
+        enqueue_media_refresh("jellyfin", ["/media/new-season"], debounce_seconds=0, now_epoch=180)
+        coordinator = MediaRefreshCoordinator()
+        claimed = claim_due_media_refreshes(owner=coordinator._owner, now_epoch=180)[0]
+        client = Mock(display_name="Jellyfin")
+        client.refresh_for_paths.return_value = {
+            "ok": True, "scope": "deduplicated", "deduplicated": 1,
+            "deferred_paths": ["/media/new-season"],
+            "deferred_targets": {"/media/new-season": "series-a"},
+        }
+        with patch.object(coordinator, "_client_for", return_value=client), patch(
+            "app.repositories.media_refresh_queue.time.time", return_value=180,
+        ), patch("app.modules.media_refresh_coordinator._recent_ttl_seconds", return_value=90):
+            coordinator._process_group(claimed)
+        self.assertEqual(claim_due_media_refreshes(owner="next", now_epoch=189), [])
+        self.assertEqual(
+            [group["paths"] for group in claim_due_media_refreshes(owner="next", now_epoch=190)],
+            [["/media/new-season"]],
+        )
+
     def test_partial_success_is_not_replayed_after_dedupe_expires(self):
         for deferred in (False, True):
             with self.subTest(deferred=deferred):
                 clear_media_refresh_queue()
+                _remember_targets(**{"series-b": 190})
                 enqueue_media_refresh(
                     "jellyfin", ["/media/A", "/media/B"], debounce_seconds=0, now_epoch=100,
                 )
@@ -412,6 +562,7 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
                     "items": ["series-a"], "retryable": not deferred,
                     "deduplicated": int(deferred),
                     "deferred_paths": ["/media/B"] if deferred else [],
+                    "deferred_targets": {"/media/B": "series-b"} if deferred else {},
                     "succeeded_target_ids": ["series-a"], "succeeded_paths": ["/media/A"],
                     "fallback": "等待去重窗口" if deferred else "1 个刷新请求失败",
                 }
@@ -453,12 +604,14 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
             Path(unmapped).write_text("unchanged")
             paths = ["/media/accepted", "/media/deduped", "/media/failed", deleted, unmapped, "/server-only/media"]
             coordinator = MediaRefreshCoordinator()
+            _remember_targets(deduped=190)
             enqueue_media_refresh("jellyfin", paths, debounce_seconds=0, now_epoch=100)
             claimed = claim_due_media_refreshes(owner=coordinator._owner, now_epoch=100)[0]
             client = Mock(display_name="Jellyfin")
             client.refresh_for_paths.return_value = {
                 "ok": False, "retryable": True, "deduplicated": 1,
                 "deferred_paths": ["/media/deduped"], "succeeded_paths": ["/media/accepted"],
+                "deferred_targets": {"/media/deduped": "deduped"},
                 "succeeded_target_ids": ["accepted"], "unmatched_paths": paths[3:],
                 "fallback": "1 个刷新请求失败，3 个路径未匹配",
             }
