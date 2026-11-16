@@ -731,7 +731,7 @@ class AgentTurn:
     async def failure(self, code: str, message: str, *, analysis_text: str = "") -> None:
 
         failure_factory = self.factory or EventFactory(
-            session_id=self.agent_input.session_id, turn_id=secrets.token_urlsafe(12),
+            session_id=self.agent_input.session_id, turn_id=self.lease.turn_id if self.lease else secrets.token_urlsafe(12),
             request_id=self.agent_input.request_id,
         )
         measurements = {"successful_read_queries": len(getattr(self, "observed_reads", ()))}

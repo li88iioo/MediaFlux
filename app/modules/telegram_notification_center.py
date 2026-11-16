@@ -412,14 +412,15 @@ def _legacy_effect_delivery(item, state=None):
     source = None
     if state is None:
         with db.get_conn() as conn:
+            conn.execute("BEGIN")
             row = conn.execute(
                 "SELECT generation,state_json,state_hmac FROM agent_kernel_sessions "
                 "WHERE owner_digest=? AND session_digest=?", (owner_digest, session_digest),
             ).fetchone()
-        if row is None:
-            raise ValueError(reason)
-        payload = store._decode(row["state_json"], row["state_hmac"],
-            domain=f"state:v1:{owner_digest}:{session_digest}:{row['generation']}".encode(), expected_type=dict)
+            if row is None:
+                raise ValueError(reason)
+            payload = store._restore_history(conn,
+                store._decode_state(row, owner_digest, session_digest), owner_digest, session_digest)
         source = row["generation"], payload
         metadata = payload.get("metadata") or {}
     else:
@@ -435,7 +436,8 @@ def _legacy_effect_delivery(item, state=None):
                     or store._scope(seed["owner"], seed["session_id"]) != (owner_digest, session_digest)):
                 continue
             if source is not None:
-                state = store._state_from_payload(owner=seed["owner"], session_id=seed["session_id"],
+                from app.agent.kernel.session_state import SessionState
+                state = SessionState.from_payload(owner=seed["owner"], session_id=seed["session_id"],
                     generation=source[0], payload=source[1])
             if state is None:
                 raise ValueError(reason)

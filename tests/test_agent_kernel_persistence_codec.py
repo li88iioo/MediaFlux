@@ -13,6 +13,8 @@ import pytest
 
 from app import database as db
 from app.agent.kernel.events import AgentEvent, AgentEventType
+from app.agent.kernel.conversation_state import historical_user_sources
+from app.agent.kernel.conversation_codec import state_storage_payload
 from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.references import ReferenceError
 from app.agent.kernel.session_guard import session_scope_guard
@@ -43,6 +45,156 @@ def outcome(call):
 @pytest.fixture
 def store():
     return SQLiteKernelStore(secret_provider=lambda: SECRET, clock=lambda: 100.0)
+
+
+async def archived_history(store, *, count=24, label="original"):
+    lease, _ = await store.begin_turn(owner="o", session_id="history", request_id="seed")
+    rows = [{"role": "user", "content": f"{label}-{i}:" + "原文\n\t\"" * 2000} for i in range(count)]
+    return lease, await store.commit(lease, conversation=rows)
+
+
+def archive_rows():
+    with db.get_conn() as conn:
+        return [tuple(row) for row in conn.execute(
+            "SELECT * FROM agent_kernel_refs WHERE expires_at=0 ORDER BY ref_id")]
+
+
+@pytest.mark.parametrize("operation", ["reset", "delete", "purge"])
+def test_history_archive_survives_ttl_cleanup_and_obeys_session_lifecycle(operation):
+    async def run():
+        now = [100.0]
+        store = SQLiteKernelStore(secret_provider=lambda: SECRET, clock=lambda: now[0])
+        lease, before = await archived_history(store)
+        assert len(before.summary.encode()) > 256 * 1024
+        sources = historical_user_sources(before)
+        short = await store.put(owner="o", session_id="history", kind="short", value="temporary")
+        minimum = await store.put(owner="o", session_id="history", kind="short", value="minimum", ttl_seconds=0)
+        assert minimum.expires_at == now[0] + 1
+        frozen = archive_rows()
+        await store.commit(lease, updates=(StateUpdate("metadata.marker", "kept"),))
+        await store.patch_session_display(owner="o", session_id="history", patch={"title": "完整历史"})
+        assert archive_rows() == frozen, "不变原文不能重新加密或改写 manifest"
+        assert (await store.list_sessions(owner="o"))[0]["title"] == "完整历史"
+        now[0] += 3 * 86400
+        await store.put(owner="other", session_id="other", kind="ordinary", value="kept")
+        with pytest.raises(ReferenceError):
+            await store.resolve(short.ref, owner="o", session_id="history")
+        cold = SQLiteKernelStore(secret_provider=lambda: SECRET, clock=lambda: now[0])
+        loaded = await cold.load(owner="o", session_id="history")
+        assert loaded.summary == before.summary and historical_user_sources(loaded) == sources
+        assert archive_rows() == frozen
+        if operation == "reset":
+            changed = await cold.reset_session(owner="o", session_id="history")
+            assert changed.lifecycle_id != before.lifecycle_id
+        elif operation == "delete":
+            assert await cold.delete_session(owner="o", session_id="history")
+        else:
+            with patch("app.modules.web_secret.get_web_secret", return_value=SECRET):
+                db.purge_agent_subject_data(owner="o")
+        assert archive_rows() == []
+        assert await cold.resolve((await cold.put(owner="other", session_id="other", kind="ordinary", value="kept")).ref,
+                                  owner="other", session_id="other") == "kept"
+        _, recreated = await cold.begin_turn(owner="o", session_id="history", request_id="recreated")
+        assert recreated.summary == "" and recreated.generation > lease.generation
+    with isolated_test_database():
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("stage", ["part", "manifest", "state"])
+def test_history_archive_write_failure_rolls_back_state_and_every_reference(stage):
+    async def run():
+        store = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        lease, before = await archived_history(store)
+        frozen = archive_rows()
+        write = store._write_reference
+        def failing_write(*args):
+            if args[4] == ("session_history_part" if stage == "part" else "session_history"):
+                raise OSError("synthetic archive write refusal")
+            return write(*args)
+        target = "_write_epoch" if stage == "state" else "_write_reference"
+        failure = OSError("synthetic state write refusal") if stage == "state" else failing_write
+        with patch.object(store, target, side_effect=failure):
+            with pytest.raises(OSError, match="synthetic"):
+                await store.commit(lease, conversation=[{"role": "user", "content": "新的原文" * 50000}])
+        assert await SQLiteKernelStore(secret_provider=lambda: SECRET).load(owner="o", session_id="history") == before
+        assert archive_rows() == frozen
+    with isolated_test_database():
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("damage", ["missing", "signature", "kind", "lifecycle"])
+def test_corrupt_history_is_rejected_by_full_load_and_session_listing(damage):
+    async def run():
+        store = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        _, before = await archived_history(store)
+        descriptor = state_storage_payload(before.to_payload(), owner="o")["summary"]
+        ref_id = descriptor["ref"]
+        with db.get_conn() as conn:
+            if damage == "missing":
+                conn.execute("DELETE FROM agent_kernel_refs WHERE ref_id=?", (ref_id + ":0",))
+            elif damage == "signature":
+                conn.execute("UPDATE agent_kernel_refs SET value_hmac='bad' WHERE ref_id=?", (ref_id + ":0",))
+            elif damage == "kind":
+                conn.execute("UPDATE agent_kernel_refs SET kind='other' WHERE ref_id=?", (ref_id + ":0",))
+            else:
+                od, sd = store._scope("o", "history")
+                row = conn.execute("SELECT value_json,value_hmac FROM agent_kernel_refs WHERE ref_id=?", (ref_id,)).fetchone()
+                manifest = store._decode_reference(row[0], row[1], domain=f"ref:v1:{ref_id}:{od}:{sd}:session_history:0.0".encode())
+                store._write_reference(conn, ref_id, od, sd, "session_history", {**manifest, "lifecycle_id": "other"}, 0.0, 0.0)
+        with pytest.raises(ValueError):
+            await store.load(owner="o", session_id="history")
+        assert await store.list_sessions(owner="o") == [], "列表不能把未恢复的 descriptor 当作完整会话"
+    with isolated_test_database():
+        asyncio.run(run())
+
+
+def test_legacy_inline_history_reads_are_side_effect_free_and_next_commit_migrates():
+    async def run():
+        store = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        lease, before = await archived_history(store, count=8)
+        od, sd = store._scope("o", "history")
+        encoded, signature = store._encode(before.to_payload(),
+            domain=f"state:v1:{od}:{sd}:{lease.generation}".encode(), maximum=store.max_state_bytes)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE agent_kernel_sessions SET state_json=?,state_hmac=?", (encoded, signature))
+            conn.execute("DELETE FROM agent_kernel_refs")
+        cold = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        assert await cold.load(owner="o", session_id="history") == before
+        assert len(await cold.list_sessions(owner="o")) == 1
+        with db.get_conn() as conn:
+            assert tuple(conn.execute("SELECT state_json,state_hmac FROM agent_kernel_sessions").fetchone()) == (encoded, signature)
+        assert not archive_rows()
+        after = await cold.commit(lease, updates=(StateUpdate("metadata.migrated", True),))
+        assert after.summary == before.summary and archive_rows()
+        assert (await cold.load(owner="o", session_id="history")).summary == before.summary
+    with isolated_test_database():
+        asyncio.run(run())
+
+
+def test_history_read_savepoint_keeps_one_snapshot_during_concurrent_replacement():
+    async def run():
+        writer = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        lease, before = await archived_history(writer)
+        reader = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        entered, release = threading.Event(), threading.Event()
+        decode = reader._decode_state
+        def blocked_decode(*args, **kwargs):
+            result = decode(*args, **kwargs)
+            entered.set()  # 主 state 已读取，归档 SELECT 尚未开始。
+            assert release.wait(5)
+            return result
+        with patch.object(reader, "_decode_state", side_effect=blocked_decode):
+            task = asyncio.create_task(reader.load(owner="o", session_id="history"))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                after = await writer.commit(lease, conversation=[{"role": "user", "content": "后续原文" * 50000}])
+                assert after.summary != before.summary
+            finally:
+                release.set()
+            assert (await task).summary == before.summary
+        assert (await reader.load(owner="o", session_id="history")).summary == after.summary
+    with isolated_test_database():
+        asyncio.run(run())
 
 
 @pytest.mark.parametrize("reference", [False, True])

@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from .conversation_codec import conversation_payload, conversation_rows, json_text
+from .conversation_codec import conversation_payload, conversation_rows, json_text, state_storage_payload
 from .conversation_state import history_memory
 from .state_types import (
     PublicationLease,
@@ -309,7 +309,7 @@ def state_capacity(payload: Mapping[str, Any], normal: int) -> int:
 
 
 def validate_execution_state(state: SessionState) -> None:
-    payload = state.to_payload()
+    payload = state_storage_payload(state.to_payload(), owner=state.owner)
     conversation_rows(payload["conversation"])
     if len(json_text(payload).encode()) > state_capacity(payload, 256 * 1024):
         raise ValueError("Agent Kernel 数据超过持久化上限")

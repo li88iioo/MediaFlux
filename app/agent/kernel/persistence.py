@@ -19,8 +19,8 @@ from cryptography.fernet import Fernet, InvalidToken
 from app import database as db
 from app.modules.web_secret import get_web_secret
 
-from .conversation_codec import conversation_rows, state_json_value
-from .conversation_state import commit_conversation
+from .conversation_codec import conversation_rows, state_json_value, state_storage_payload
+from .conversation_state import commit_conversation, history_memory
 from .events import TERMINAL_EVENT_TYPES, AgentEvent, AgentEventType
 from .references import OpaqueReference, ReferenceError
 from .session_guard import (
@@ -223,8 +223,7 @@ class SQLiteKernelStore:
             ).fetchall()
             for row in rows:
                 try:
-                    payload = self._decode(row["state_json"], row["state_hmac"],
-                        domain=f"state:v1:{row['owner_digest']}:{row['session_digest']}:{row['generation']}".encode(), expected_type=dict)
+                    payload = self._decode_state(row, row["owner_digest"], row["session_digest"])
                     for record in due_records(payload.get("metadata") or {}, self._clock()):
                         if self._scope(record["owner"], record["session_id"]) == (row["owner_digest"], row["session_digest"]):
                             due.append(record)
@@ -241,8 +240,7 @@ class SQLiteKernelStore:
             ).fetchall()
         for row in rows:
             try:
-                payload = self._decode(row["state_json"], row["state_hmac"],
-                    domain=f"state:v1:{row['owner_digest']}:{row['session_digest']}:{row['generation']}".encode(), expected_type=dict)
+                payload = self._decode_state(row, row["owner_digest"], row["session_digest"])
                 record = payload["metadata"]["read_wait"]
                 owner, session_id = record["owner"], record["session_id"]
                 if self._scope(owner, session_id) != (row["owner_digest"], row["session_digest"]):
@@ -449,8 +447,6 @@ class SQLiteKernelStore:
         return encoded, payload
 
     def _encode(self, value: Any, *, domain: bytes, maximum: int) -> tuple[str, str]:
-        if domain.startswith(b"state:v1:"):
-            maximum = state_capacity(value, maximum)
         encoded, payload = self._json_payload(value, label="数据")
         if len(payload) > maximum:
             raise ValueError("Agent Kernel 数据超过持久化上限")
@@ -461,31 +457,47 @@ class SQLiteKernelStore:
 
     def _decode(
         self,
-        encoded: Any,
-        signature: Any,
+        encoded: str,
+        signature: str,
         *,
         domain: bytes,
         expected_type: type,
+        parser: Callable[[str], Any] = json.loads,
     ) -> Any:
-        text = str(encoded or "")
-        payload = text.encode("utf-8")
-        if domain.startswith(b"state:v1:") and len(payload) > self.max_state_bytes + TRANSIENT_EXTRA_BYTES:
-            raise ValueError("Agent Kernel 数据超过持久化上限")
+        payload = encoded.encode("utf-8")
         expected = hmac.new(
             self._secret(), domain + b"\0" + payload, hashlib.sha256
         ).hexdigest()
-        if not secrets.compare_digest(expected, str(signature or "")):
+        if not secrets.compare_digest(expected, signature):
             raise ValueError("Agent Kernel 持久化数据校验失败")
-        value = state_json_value(text) if domain.startswith(b"state:v1:") else json.loads(text)
+        value = parser(encoded)
         if not isinstance(value, expected_type):
             raise TypeError("Agent Kernel 持久化数据类型无效")
-        if domain.startswith(b"state:v1:"):
-            if len(payload) > state_capacity(value, self.max_state_bytes):
-                raise ValueError("Agent Kernel 数据超过持久化上限")
-            conversation_rows(value.get("conversation", []))
-            from .continuation import normalize_delivery_payload
-            normalize_delivery_payload(value)
         return value
+
+    def _decode_state(self, row, owner_digest: str, session_digest: str) -> dict:
+        size = len(row["state_json"].encode())
+        if size > self.max_state_bytes + TRANSIENT_EXTRA_BYTES:
+            raise ValueError("Agent Kernel 数据超过持久化上限")
+        payload = self._decode(row["state_json"], row["state_hmac"],
+            domain=f"state:v1:{owner_digest}:{session_digest}:{row['generation']}".encode(),
+            expected_type=dict, parser=state_json_value)
+        if size > state_capacity(payload, self.max_state_bytes):
+            raise ValueError("Agent Kernel 数据超过持久化上限")
+        conversation_rows(payload.get("conversation", []))
+        from .continuation import normalize_delivery_payload
+        normalize_delivery_payload(payload)
+        return payload
+
+    def _encode_state(self, conn, payload: Mapping[str, Any], *, owner: str,
+                      owner_digest: str, session_digest: str, generation: int) -> tuple[str, str]:
+        stored = state_storage_payload(payload, owner=owner)
+        conversation_rows(stored["conversation"])
+        encoded = self._encode(stored,
+            domain=f"state:v1:{owner_digest}:{session_digest}:{generation}".encode(),
+            maximum=state_capacity(stored, self.max_state_bytes))
+        self._save_history(conn, payload, stored, owner, owner_digest, session_digest)
+        return encoded
 
     def _reference_cipher(self) -> Fernet:
         key = hashlib.sha256(
@@ -535,8 +547,72 @@ class SQLiteKernelStore:
         # 兼容切换前已签名但未加密的短期引用；新写入一律使用 enc:v1。
         return json.loads(text)
 
-    _state_payload = staticmethod(SessionState.to_payload)
-    _state_from_payload = staticmethod(SessionState.from_payload)
+    def _write_reference(self, conn, ref_id: str, owner_digest: str, session_digest: str,
+                         kind: str, value: Any, expires_at: float, created_at: float) -> None:
+        encoded, signature = self._encode_reference(value,
+            domain=f"ref:v1:{ref_id}:{owner_digest}:{session_digest}:{kind}:{expires_at}".encode())
+        conn.execute(
+            "INSERT INTO agent_kernel_refs(ref_id,owner_digest,session_digest,kind,value_json,value_hmac,expires_at,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(ref_id) DO UPDATE SET "
+            "value_json=excluded.value_json,value_hmac=excluded.value_hmac,expires_at=excluded.expires_at",
+            (ref_id, owner_digest, session_digest, kind, encoded, signature, expires_at, created_at))
+
+    def _save_history(self, conn, payload, stored, owner, owner_digest, session_digest):
+        descriptor = stored.get("summary")
+        if not isinstance(descriptor, dict):
+            return
+        # 来源验证沿用逻辑历史合同，不因物理归档而把 legacy note 提升为用户原文。
+        history_memory(SessionState.from_payload(owner=owner, session_id=payload["session_id"],
+            generation=0, payload=payload))
+        ref_id = descriptor["ref"]
+        current = conn.execute("SELECT value_json,value_hmac FROM agent_kernel_refs "
+            "WHERE ref_id=? AND owner_digest=? AND session_digest=? AND kind='session_history' AND expires_at=0",
+            (ref_id, owner_digest, session_digest)).fetchone()
+        if current is not None:
+            manifest = self._decode_reference(current["value_json"], current["value_hmac"],
+                domain=f"ref:v1:{ref_id}:{owner_digest}:{session_digest}:session_history:0.0".encode())
+            if manifest["sha256"] == descriptor["sha256"]:
+                return
+        summary = payload["summary"]
+        chunk_size = min(16_384, (self.max_ref_bytes - 128) // 6)
+        conn.execute("DELETE FROM agent_kernel_refs WHERE owner_digest=? AND session_digest=? "
+            "AND kind='session_history_part' AND expires_at=0 AND ref_id GLOB ?",
+            (owner_digest, session_digest, ref_id + ":*"))
+        parts = range(0, len(summary), chunk_size)
+        now = self._clock()
+        for index, start in enumerate(parts):
+            self._write_reference(conn, f"{ref_id}:{index}", owner_digest, session_digest,
+                "session_history_part", summary[start:start + chunk_size], 0.0, now)
+        self._write_reference(conn, ref_id, owner_digest, session_digest, "session_history", {
+            "version": 1, "lifecycle_id": payload["lifecycle_id"], "sha256": descriptor["sha256"],
+            "utf8_bytes": len(summary.encode()), "part_count": len(parts)}, 0.0, now)
+
+    def _restore_history(self, conn, payload, owner_digest, session_digest):
+        descriptor = payload.get("summary")
+        if not isinstance(descriptor, dict):
+            return payload
+        if (set(descriptor) != {"storage", "ref", "sha256"} or descriptor["storage"] != "session-history-v1"
+                or payload.get("metadata", {}).get("history_memory_version") != 1):
+            raise ValueError("Agent Kernel 历史归档格式无效")
+        ref_id = descriptor["ref"]
+        rows = conn.execute("SELECT ref_id,kind,value_json,value_hmac FROM agent_kernel_refs "
+            "WHERE owner_digest=? AND session_digest=? AND expires_at=0 AND "
+            "((ref_id=? AND kind='session_history') OR (ref_id GLOB ? AND kind='session_history_part'))",
+            (owner_digest, session_digest, ref_id, ref_id + ":*")).fetchall()
+        values = {row["ref_id"]: self._decode_reference(row["value_json"], row["value_hmac"],
+            domain=f"ref:v1:{row['ref_id']}:{owner_digest}:{session_digest}:{row['kind']}:0.0".encode()) for row in rows}
+        try:
+            manifest = values.pop(ref_id)
+            if (manifest["version"] != 1 or manifest["lifecycle_id"] != payload["lifecycle_id"]
+                    or manifest["sha256"] != descriptor["sha256"] or len(values) != manifest["part_count"]):
+                raise ValueError("Agent Kernel 历史归档身份无效")
+            summary = "".join(values[f"{ref_id}:{i}"] for i in range(len(values)))
+            if (len(summary.encode()) != manifest["utf8_bytes"]
+                    or hashlib.sha256(summary.encode()).hexdigest() != descriptor["sha256"]):
+                raise ValueError("Agent Kernel 历史归档不完整")
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Agent Kernel 历史归档不完整") from exc
+        return {**payload, "summary": summary}
 
     def _empty_state(self, owner: str, session_id: str) -> SessionState:
         return SessionState(owner=owner, session_id=session_id)
@@ -560,36 +636,22 @@ class SQLiteKernelStore:
 
     def _load_existing_row(self, conn: Any, owner: str, session_id: str) -> SessionState | None:
         owner_digest, session_digest = self._scope(owner, session_id)
-        row = conn.execute(
-            "SELECT generation,state_json,state_hmac FROM agent_kernel_sessions "
-            "WHERE owner_digest=? AND session_digest=?",
-            (owner_digest, session_digest),
-        ).fetchone()
-        if row is None:
-            return None
-        generation = int(row["generation"])
-        payload = self._decode(
-            row["state_json"],
-            row["state_hmac"],
-            domain=f"state:v1:{owner_digest}:{session_digest}:{generation}".encode(),
-            expected_type=dict,
-        )
-        return self._state_from_payload(
-            owner=owner,
-            session_id=session_id,
-            generation=generation,
-            payload=payload,
-        )
+        conn.execute("SAVEPOINT agent_history_read")
+        try:
+            row = conn.execute(
+                "SELECT generation,state_json,state_hmac FROM agent_kernel_sessions "
+                "WHERE owner_digest=? AND session_digest=?", (owner_digest, session_digest)).fetchone()
+            if row is None:
+                return None
+            payload = self._restore_history(conn, self._decode_state(row, owner_digest, session_digest), owner_digest, session_digest)
+            return SessionState.from_payload(owner=owner, session_id=session_id, generation=int(row["generation"]), payload=payload)
+        finally:
+            conn.execute("RELEASE SAVEPOINT agent_history_read")
 
     def _write_state(self, conn: Any, state: SessionState) -> None:
         owner_digest, session_digest = self._scope(state.owner, state.session_id)
-        payload = self._state_payload(state)
-        conversation_rows(payload["conversation"])
-        encoded, signature = self._encode(
-            payload,
-            domain=f"state:v1:{owner_digest}:{session_digest}:{state.generation}".encode(),
-            maximum=self.max_state_bytes,
-        )
+        encoded, signature = self._encode_state(conn, state.to_payload(), owner=state.owner,
+            owner_digest=owner_digest, session_digest=session_digest, generation=state.generation)
         conn.execute(
             "INSERT INTO agent_kernel_sessions(owner_digest,session_digest,generation,state_json,state_hmac,updated_at) "
             "VALUES(?,?,?,?,?,?) ON CONFLICT(owner_digest,session_digest) DO UPDATE SET "
@@ -792,14 +854,8 @@ class SQLiteKernelStore:
             for row in rows:
                 owner_digest = str(row["owner_digest"])
                 session_digest = str(row["session_digest"])
-                generation = int(row["generation"])
                 try:
-                    payload = self._decode(
-                        row["state_json"],
-                        row["state_hmac"],
-                        domain=f"state:v1:{owner_digest}:{session_digest}:{generation}".encode(),
-                        expected_type=dict,
-                    )
+                    payload = self._decode_state(row, owner_digest, session_digest)
                 except (TypeError, ValueError):
                     continue
                 metadata = payload.get("metadata")
@@ -844,22 +900,18 @@ class SQLiteKernelStore:
             if row is None:
                 return None
             generation = int(row["generation"])
-            domain = f"state:v1:{owner_digest}:{session_digest}:{generation}".encode()
-            payload = self._decode(
-                row["state_json"], row["state_hmac"], domain=domain, expected_type=dict,
-            )
+            payload = self._restore_history(conn, self._decode_state(row, owner_digest, session_digest), owner_digest, session_digest)
             metadata = payload.get("metadata", {})
             if not isinstance(metadata, dict) or payload.get("session_id") != session_id:
                 raise ValueError("会话显示元数据无效")
             # 不经过 State DTO 的截断/归一化往返，保留所有非显示字段的原始 JSON 值。
             payload["metadata"] = {**metadata, **deepcopy(patch)}
-            state = self._state_from_payload(
+            state = SessionState.from_payload(
                 owner=owner, session_id=session_id, generation=generation, payload=payload,
             )
             payload["lifecycle_id"] = state.lifecycle_id
-            encoded, signature = self._encode(
-                payload, domain=domain, maximum=self.max_state_bytes,
-            )
+            encoded, signature = self._encode_state(conn, payload, owner=owner,
+                owner_digest=owner_digest, session_digest=session_digest, generation=generation)
             # 显示更新不更改 generation/epoch/updated_at，也不碰确认与对话。
             conn.execute(
                 "UPDATE agent_kernel_sessions SET state_json=?,state_hmac=? "
@@ -905,16 +957,13 @@ class SQLiteKernelStore:
                     continue
                 generation = int(row["generation"])
                 try:
-                    payload = self._decode(
-                        row["state_json"], row["state_hmac"],
-                        domain=f"state:v1:{owner_digest}:{session_digest}:{generation}".encode(),
-                        expected_type=dict,
-                    )
+                    payload = self._decode_state(row, owner_digest, session_digest)
                     session_id = str(payload.get("session_id") or "").strip()
                     if not session_id or self._scope(owner, session_id)[1] != session_digest:
                         continue
-                    state = self._state_from_payload(
-                        owner=owner, session_id=session_id, generation=generation, payload=payload,
+                    state = SessionState.from_payload(
+                        owner=owner, session_id=session_id, generation=generation,
+                        payload=self._restore_history(conn, payload, owner_digest, session_digest),
                     )
                 except (TypeError, ValueError):
                     continue
@@ -998,33 +1047,16 @@ class SQLiteKernelStore:
         now = self._clock()
         expires_at = now + max(1, min(ttl_seconds, 86_400))
         ref_id = "ref_" + secrets.token_urlsafe(18)
-        encoded, signature = self._encode_reference(
-            value,
-            domain=f"ref:v1:{ref_id}:{owner_digest}:{session_digest}:{normalized_kind}:{expires_at}".encode(),
-        )
         with db.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM agent_kernel_refs WHERE expires_at<=?", (now,))
+            conn.execute("DELETE FROM agent_kernel_refs WHERE expires_at>0 AND expires_at<=?", (now,))
             if lease is not None:
                 from .continuation import check_claim
                 state = self._load_row(conn, lease.owner, lease.session_id)
                 if not publication_commit_matches(lease, state, None, ()):
                     raise StalePublicationError("reference publication revoked")
                 check_claim(state, lease, self._clock(), conn)
-            conn.execute(
-                "INSERT INTO agent_kernel_refs(ref_id,owner_digest,session_digest,kind,value_json,value_hmac,expires_at,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    ref_id,
-                    owner_digest,
-                    session_digest,
-                    normalized_kind,
-                    encoded,
-                    signature,
-                    expires_at,
-                    now,
-                ),
-            )
+            self._write_reference(conn, ref_id, owner_digest, session_digest, normalized_kind, value, expires_at, now)
         return OpaqueReference(ref=ref_id, kind=normalized_kind, expires_at=expires_at)
 
     def _resolve_ref_sync(

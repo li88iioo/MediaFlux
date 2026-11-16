@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -18,6 +19,18 @@ class PendingText(str):
 
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def state_storage_payload(payload: Mapping[str, Any], *, owner: str) -> dict[str, Any]:
+    """容量与 SQLite 共用物理表示；逻辑导出仍保留完整 summary。"""
+    stored = dict(payload)
+    if payload.get("metadata", {}).get("history_memory_version") == 1:
+        summary = payload["summary"]
+        identity = json_text([owner, payload["session_id"], payload["lifecycle_id"]])
+        stored["summary"] = {"storage": "session-history-v1",
+                             "ref": "ref_" + sha256(identity.encode()).hexdigest(),
+                             "sha256": sha256(summary.encode()).hexdigest()}
+    return stored
 
 
 def state_json_value(text: str) -> Any:

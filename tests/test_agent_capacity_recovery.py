@@ -487,9 +487,11 @@ def test_cold_explanation_preserves_unknown_across_generations_and_new_read(
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "memory"])
-def test_unstorable_new_user_request_cannot_evict_original_checkpoint(kind):
+@pytest.mark.parametrize("limit", ["metadata", "required_group"])
+def test_archived_user_requests_preserve_pending_checkpoint_and_unstorable_state_rolls_back(kind, limit):
     from app.agent.kernel.conversation_codec import pending_content
-    from app.agent.kernel.state_types import _ExecutionCapacity
+    from app.agent.kernel.conversation_state import historical_user_sources
+    from app.agent.kernel.state_types import HistoryCapacityError, _ExecutionCapacity
 
     async def exercise():
         store = make_store() if kind == "sqlite" else InMemorySessionStateStore()
@@ -516,10 +518,26 @@ def test_unstorable_new_user_request_cannot_evict_original_checkpoint(kind):
             },
         ]
         saved = await store.commit(lease, conversation=rows)
-        with pytest.raises(ValueError, match="持久化上限"):
+        history = [{"role": "user", "content": f"prior-{i}:" + "历史条件" * 2500} for i in range(12)]
+        saved = await store.commit(lease, conversation=history + saved.conversation,
+            updates=(_ExecutionCapacity("", False, current_start=len(history)),))
+        assert historical_user_sources(saved) == tuple([*(r["content"] for r in history), "original"])
+        assert saved.conversation[-1]["content"] == pending_content(True)
+        assert type(saved.conversation[-1]["content"]) is type(pending_content(True))
+        assert saved.conversation[-1]["tool_call_id"] == "old"
+        proposed = saved.conversation + [{"role": "user", "content": "new question"}]
+        updates = (_ExecutionCapacity("", False, current_start=len(saved.conversation)),)
+        if limit == "metadata":
+            updates += (StateUpdate("metadata.oversized", "x" * (B + 1)),)
+        else:
+            proposed += [{"role": "assistant", "tool_calls": [{"call_id": "new", "name": "inspect_batch",
+                "arguments": {"selector": "x" * (B + 1)}}]},
+                {"role": "tool", "tool_call_id": "new", "tool_name": "inspect_batch", "content": pending_content(True)}]
+        error = ValueError if limit == "metadata" else HistoryCapacityError
+        message = "持久化上限" if limit == "metadata" else "current execution group exceeds conversation budget"
+        with pytest.raises(error, match=message):
             await store.commit(
-                lease, conversation=rows + [{"role": "user", "content": "x" * (B + 1)}],
-                updates=(_ExecutionCapacity("", False),),
+                lease, conversation=proposed, updates=updates,
             )
         cold = make_store() if kind == "sqlite" else store
         assert await cold.load(owner=OWNER, session_id=SESSION) == saved
@@ -860,7 +878,7 @@ def test_signed_invalid_phase_rejected_without_rewrite(phase):
         lease, state = await store.begin_turn(
             owner=OWNER, session_id=SESSION, request_id="phase"
         )
-        payload = store._state_payload(state)
+        payload = state.to_payload()
         payload["execution_capacity"] = phase
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         o, s = store._scope(OWNER, SESSION)
@@ -948,7 +966,7 @@ def test_unfinished_confirmation_preserves_capacity_and_receipt_without_replay(
         assert isinstance(active.state_store, SQLiteKernelStore)
         size = len(
             json.dumps(
-                active.state_store._state_payload(current),
+                current.to_payload(),
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode()

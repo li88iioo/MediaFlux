@@ -391,7 +391,7 @@ def test_payload_and_clone_do_not_trim_unmigrated_legacy_conversation():
 
 
 @pytest.mark.parametrize("oversized_store", ("memory", "sqlite"), ids=("memory-store", "sqlite-store"))
-def test_oversized_cropped_user_history_rejects_commit_without_mutating_checkpoint(
+def test_oversized_cropped_user_history_is_lossless_but_metadata_refusal_keeps_checkpoint(
     oversized_store,
 ):
     async def exercise(store):
@@ -402,25 +402,26 @@ def test_oversized_cropped_user_history_rejects_commit_without_mutating_checkpoi
             initial,
             conversation=[{"role": "user", "content": "已有检查点，保持不变。"}],
         )
-        lease, before = await store.begin_turn(
+        lease, _ = await store.begin_turn(
             owner=OWNER, session_id=SESSION, request_id="oversized-history"
         )
 
-        # 原 200k ASCII 可完整归入 summary；拒写边界应是整个状态的字节容量。
+        original = "OVERSIZED_USER_SOURCE_" + ("z" * (256 * 1024))
+        saved = await store.commit(lease,
+            conversation=[{"role": "user", "content": original}],
+            updates=(_ExecutionCapacity("", False),))
+        assert original in historical_user_sources(saved)
+        assert len(saved.summary.encode()) > 256 * 1024
+        # 原文归档不能扩大真正 metadata 的准入；拒写仍保留完整检查点。
         with pytest.raises(ValueError, match="持久化上限"):
             await store.commit(
                 lease,
-                conversation=[
-                    {"role": "user", "content": "OVERSIZED_USER_SOURCE_" + ("z" * (256 * 1024))}
-                ],
-                updates=(_ExecutionCapacity("", False),),
+                updates=(StateUpdate("metadata.oversized", "z" * (256 * 1024)),
+                         _ExecutionCapacity("", False)),
             )
 
         after = await store.load(owner=OWNER, session_id=SESSION)
-        assert after.generation == before.generation
-        assert after.conversation == before.conversation
-        assert after.summary == before.summary
-        assert after.metadata == before.metadata
+        assert after == saved
 
     if oversized_store == "memory":
         _run(exercise(InMemorySessionStateStore()))

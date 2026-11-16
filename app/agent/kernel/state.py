@@ -11,7 +11,7 @@ from typing import Any
 
 from app.concurrency import CrossLoopAsyncLock
 
-from .conversation_codec import conversation_rows, json_text, pending_content
+from .conversation_codec import conversation_rows, json_text, pending_content, state_storage_payload
 from .conversation_state import commit_conversation
 from .session_state import (
     CandidateSelectionGuard,
@@ -185,7 +185,7 @@ def _settle_cancelled_reads(state, receipts, maximum=256 * 1024):
             return None
         positions.add(receipt.tool_index)
         updated.conversation[receipt.tool_index]["content"] = receipt._content
-    payload = updated.to_payload()
+    payload = state_storage_payload(updated.to_payload(), owner=updated.owner)
     if (_exact_value(conversation_rows(payload["conversation"])) != _exact_value(updated.conversation)
             or len(json_text(payload).encode()) > maximum):
         raise ValueError("cancelled read settlement exceeds lossless state capacity")
