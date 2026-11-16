@@ -119,6 +119,48 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
     def _checked(page, key: str) -> bool:
         return page.locator(f'[data-key="{key}"]').first.is_checked()
 
+    def test_settings_same_document_links_and_history_select_panel_without_losing_draft(self):
+        from playwright.sync_api import expect
+
+        page = self._open("/settings#console")
+        username = page.locator('[data-key="ENV_WEB_PASSPORT"]')
+        username.fill("unsaved-draft")
+        page.evaluate("location.hash = 'telegram'")
+        expect(page.locator('[data-settings-panel="telegram"]')).to_be_visible()
+        expect(page.locator('[data-settings-target="telegram"]')).to_have_attribute("aria-selected", "true")
+        page.go_back()
+        expect(page.locator('[data-settings-panel="console"]')).to_be_visible()
+        expect(username).to_have_value("unsaved-draft")
+        page.evaluate("location.hash = 'not-a-panel'")
+        expect(page.locator('[data-settings-panel="console"]')).to_be_visible()
+        page.wait_for_function("location.hash === '#console'")
+
+    def test_connection_tests_do_not_reuse_credentials_cleared_in_the_form(self):
+        from playwright.sync_api import expect
+
+        self._write(TG_BOT_TOKEN="123:stored-token", TG_CHAT_ID="456", TMDB_API_KEY="stored-tmdb-key")
+        with patch("app.modules.telegram_connection_test.send_test_message", return_value=SimpleNamespace(message_id=1)) as send:
+            page = self._open("/settings#telegram")
+            page.locator('#testTelegramBtn').click()
+            expect(page.locator('[data-settings-panel="telegram"] [data-settings-state]')).to_contain_text('测试消息已发送')
+            send.assert_called_once_with("123:stored-token", "456")
+            page.locator('[data-key="TG_BOT_TOKEN"]').locator('..').locator('.secret-input-clear').click()
+            page.locator('#testTelegramBtn').click()
+            expect(page.locator('[data-settings-panel="telegram"] [data-settings-state]')).to_contain_text('Bot Token')
+            self.assertEqual(send.call_count, 1)
+            page.locator('[data-key="TG_BOT_TOKEN"]').fill("789:draft-token")
+            page.locator('[data-key="TG_CHAT_ID"]').fill("")
+            page.locator('#testTelegramBtn').click()
+            expect(page.locator('[data-settings-panel="telegram"] [data-settings-state]')).to_contain_text('Chat ID')
+            self.assertEqual(send.call_count, 1)
+        page.close()
+        page = self._open("/settings#metadata")
+        page.locator('#tmdbApiKeyInput').locator('..').locator('.secret-input-clear').click()
+        with patch("app.routes.tools_api.requests.get") as get:
+            page.locator('#testTmdbBtn').click()
+            expect(page.locator('#tmdbConnectionState')).to_contain_text('API Key')
+            get.assert_not_called()
+
     def test_organize_both_views_show_missing_defaults_explicit_empty_and_truthy_text(self):
         self._write(
             GY_ORGANIZE_EMBY_REFRESH="", GY_ORGANIZE_CLEAN_EMPTY="", GY_ORGANIZE_SCHEDULE_CRON="",

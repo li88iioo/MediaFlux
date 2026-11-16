@@ -82,6 +82,7 @@
     indexerSiteInputs.forEach(input=>input.addEventListener('change',syncIndexerSiteSelection));
 
     function activate(target){
+        if(!tabs.some(button=>button.dataset.settingsTarget===target))target='console';
         let activeTab=null;
         tabs.forEach(button=>{const active=button.dataset.settingsTarget===target;button.classList.toggle('active',active);button.setAttribute('aria-selected',active?'true':'false');button.tabIndex=active?0:-1;if(active)activeTab=button;});
         panels.forEach(panel=>{const active=panel.dataset.settingsPanel===target;panel.hidden=!active;panel.classList.toggle('active',active);});
@@ -104,7 +105,8 @@
         });
     });
     const initial=window.__mediafluxInitialSettingsTarget||location.hash.slice(1);
-    activate(tabs.some(button=>button.dataset.settingsTarget===initial)?initial:'console');
+    activate(initial);
+    window.addEventListener('hashchange',()=>activate(location.hash.slice(1)));
 
     const saveButtons=[...document.querySelectorAll('[data-save-settings]')];
     let configReady=false;
@@ -486,7 +488,7 @@
     const tgTokenField=telegramPanel?.querySelector('[data-key="TG_BOT_TOKEN"]');
     const tgChatIdField=telegramPanel?.querySelector('[data-key="TG_CHAT_ID"]');
     const tgConnectionBadge=document.getElementById('tgConnectionBadge');
-    const getTelegramDraft=()=>({token:tgTokenField?.value||'',chat_id:tgChatIdField?.value||''});
+    const getTelegramDraft=()=>({token:settingsSecretDraft(tgTokenField).trim(),chat_id:tgChatIdField?.value.trim()||''});
     const telegramRequestGate=createDraftRequestGate(getTelegramDraft,()=>{
         if(testTelegramButton)testTelegramButton.disabled=false;
         if(telegramState){telegramState.className='';telegramState.textContent='配置已变化，请重新测试';}
@@ -500,6 +502,8 @@
         telegramState.className='';telegramState.textContent='正在发送测试消息...';
         if(tgConnectionBadge){tgConnectionBadge.className='telemetry-status-badge';tgConnectionBadge.dataset.tone='testing';tgConnectionBadge.textContent='测试中…';}
         try{
+            if(!draft.token)throw new Error('请填写 Bot Token；已清除的凭据不会用于测试');
+            if(!draft.chat_id)throw new Error('请填写 Chat ID');
             const response=await fetch('/api/telegram/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft),signal:ticket.signal});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'发送失败');
@@ -772,7 +776,7 @@
     const tmdbConnectionState=document.getElementById('tmdbConnectionState');
     const tmdbApiKeyInput=document.getElementById('tmdbApiKeyInput');
     const tmdbApiUrlInput=document.getElementById('tmdbApiUrlInput');
-    const getTmdbDraft=()=>({api_key:tmdbApiKeyInput?.value||'',api_url:tmdbApiUrlInput?.value||''});
+    const getTmdbDraft=()=>({api_key:settingsSecretDraft(tmdbApiKeyInput).trim(),api_url:tmdbApiUrlInput?.value||''});
     const setTmdbConnectionState=(tone,message,iconName='')=>{
         if(!tmdbConnectionState)return;
         tmdbConnectionState.className=`tmdb-connection-status is-${tone}`;
@@ -792,6 +796,7 @@
         testTmdbBtn.disabled=true;
         setTmdbConnectionState('testing','正在测试 TMDB API 连通性...','loader-circle');
         try{
+            if(!draft.api_key)throw new Error('请填写 TMDB API Key；已清除的凭据不会用于测试');
             const response=await fetch('/api/tools/tmdb/test',{
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
