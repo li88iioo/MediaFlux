@@ -322,9 +322,12 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
 
                     page.route("**/*", route_request)
                     page.clock.install()
-                    page.goto("http://fixture.test/downloads?view=issues")
+                    page.goto("http://fixture.test/downloads")
                     page.add_script_tag(content=script)
                     page.evaluate("() => {window.readErrors=[]; window.appAlert=value=>window.readErrors.push(value);}")
+                    page.wait_for_function("!loading")
+                    self.assertEqual(calls, [], "未打开的日志与待处理面板不应提前读取")
+                    page.locator("#tabIssuesBtn").click()
                     expect(page.locator("#issueList")).to_contain_text("当前没有")
                     for kind, tab, body, badge in (
                         ("issues", "#tabIssuesBtn", "#issueList", "#tabIssuesBadge"),

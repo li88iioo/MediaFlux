@@ -232,8 +232,9 @@ class EpisodeResearchSettingsUiTests(unittest.TestCase):
         self.assertNotIn("checked", toggle)
         self.assertIn("disabled", toggle)
         self.assertEqual(toggle["aria-describedby"], "episodeResearchDescription episodeResearchDependency")
-        for key, value in (("type", "number"), ("min", "1"), ("max", "100"), ("step", "1"), ("value", "10")):
+        for key, value in (("type", "number"), ("min", "1"), ("max", "100"), ("step", "1")):
             self.assertEqual(limit[key], value)
+        self.assertNotIn("value", limit, "数值由后端配置回填，模板不持有另一份初值")
         self.assertIn("disabled", limit)
         self.assertIn("aria-label", toggle)
         self.assertIn("aria-describedby", limit)

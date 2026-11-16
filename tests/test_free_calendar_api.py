@@ -67,7 +67,7 @@ class FreeCalendarAPITests(_BaseClientTests):
         with patch.object(config, "get", side_effect=get_value):
             response = self.client.get("/discovery/calendar")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(re.findall(r'data-resource-results-enabled="(true|false)"', response.text), ["true"])
+        self.assertEqual(re.findall(r'data-resource-results-enabled="(true|false)"', response.text), ["false"])
         self.service.get_week.assert_not_called()
 
     def test_calendar_resource_display_does_not_bypass_indexer_master_switch(self):

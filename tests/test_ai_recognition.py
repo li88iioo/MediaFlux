@@ -705,7 +705,7 @@ class AIFallbackPipelineTests(IsolatedDatabaseTestCase):
         with patch("app.modules.scraper.get", return_value=""), patch("app.config.get", return_value=""):
             provider = TMDBScraper._ai_provider_settings()
 
-        self.assertEqual(provider, ("", "", "", 12, "auto"))
+        self.assertEqual(provider, ("", "", "", 120, "auto"))
 
     def test_ai_result_runs_fresh_tmdb_search_and_requires_tmdb_detail_revalidation(self):
         from app.modules.scraper import TMDBScraper

@@ -184,7 +184,7 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         from app.modules.organize_rules import DEFAULT_ORGANIZE_VIDEO_EXTS
 
         pages = (
-            ("/settings", "#settingsForm", ("AGENT_LLM_CONTEXT_WINDOW_TOKENS", "TAVILY_MAX_RESULTS", "AGENT_LLM_TIMEOUT_SECONDS")),
+            ("/settings", "#settingsForm", ("AGENT_LLM_CONTEXT_WINDOW_TOKENS", "TAVILY_MAX_RESULTS", "AGENT_LLM_TIMEOUT_SECONDS", "AGENT_EPISODE_RESEARCH_DAILY_LIMIT")),
             ("/guangya/strm", "#strmForm", ("STRM_METADATA_EXTS", "STRM_VIDEO_EXTS", "STRM_SKIP_THRESHOLD_MB")),
             ("/organize-rules", "#organizeWorkspace", (
                 "GY_ORGANIZE_VIDEO_EXTS", "GY_ORGANIZE_METADATA_EXTS", "GY_ORGANIZE_SMALL_FILE_MB",
