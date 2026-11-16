@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 
@@ -83,6 +84,15 @@ class DirectoryInspection:
     directories: tuple[DirectorySnapshot, ...] = ()
     requires_manual_match: bool = False
     manual_match_reason: str = ""
+    # 内容校验包含未被主媒体选中的元数据；持久签名也复用同一份扫描快照。
+    fingerprint_companions: tuple[MediaSnapshot, ...] = ()
+
+    def fingerprint_for_rules(self, rules: OrganizeRules) -> str:
+        """保留已受理任务的含规则签名协议，内容比较本身不包含配置。"""
+        return DirectoryMediaInspector._fingerprint(
+            self.videos, self.fingerprint_companions, rules,
+            pending_videos=self.pending_videos, directories=self.directories,
+        )
 
     @property
     def representative(self) -> MediaSnapshot:
@@ -290,7 +300,6 @@ class DirectoryMediaInspector:
         fingerprint = self._fingerprint(
             videos,
             fingerprint_companions,
-            rules,
             pending_videos=pending_videos,
             directories=directories,
         )
@@ -390,6 +399,7 @@ class DirectoryMediaInspector:
             directories=tuple(directories),
             requires_manual_match=requires_manual_match,
             manual_match_reason=manual_match_reason,
+            fingerprint_companions=tuple(fingerprint_companions),
         )
 
     def inspect_file(
@@ -480,10 +490,11 @@ class DirectoryMediaInspector:
                 "metadata": 0,
             },
             mixed=False,
-            fingerprint=self._fingerprint(videos, companions, rules),
+            fingerprint=self._fingerprint(videos, companions),
             season=season,
             episode=episode,
             season_inferred=season_inferred,
+            fingerprint_companions=tuple(companions),
         )
 
     def _validate_target_outside_source(self, source_id: str, target_id: str) -> None:
@@ -1079,9 +1090,9 @@ class DirectoryMediaInspector:
 
     @staticmethod
     def _fingerprint(
-        videos: list[MediaSnapshot],
-        companions: list[MediaSnapshot],
-        rules: OrganizeRules,
+        videos: Sequence[MediaSnapshot],
+        companions: Sequence[MediaSnapshot],
+        rules: OrganizeRules | None = None,
         *,
         pending_videos: list[PendingMedia] | tuple[PendingMedia, ...] = (),
         directories: list[DirectorySnapshot] | tuple[DirectorySnapshot, ...] = (),
@@ -1115,8 +1126,9 @@ class DirectoryMediaInspector:
                     key=lambda row: (row.file_id, row.parent_id, row.name),
                 )
             ],
-            "rules": organize_rules_snapshot(rules),
         }
+        if rules is not None:
+            payload["rules"] = organize_rules_snapshot(rules)
         encoded = json.dumps(
             payload,
             ensure_ascii=False,

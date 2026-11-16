@@ -8,6 +8,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from functools import wraps
+from itertools import product
 from sqlite3 import Row
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
@@ -122,7 +123,7 @@ def scrape_execution_fingerprint(snapshot: dict, record: PreviewRecord) -> str:
         rules.pop("recycle_duplicates_enabled")
     return signed_context_fingerprint({
         "scope": [snapshot["scope_type"], snapshot["scope_id"]],
-        "inspection_fingerprint": str(getattr(record.inspection, "fingerprint", "") or ""),
+        "inspection_fingerprint": record.inspection.fingerprint_for_rules(record.rules),
         "signature": repr(record.signature),
         "target_snapshot": repr(getattr(record, "target_snapshot", ())),
         "rules": rules,
@@ -242,7 +243,15 @@ def _restore_directory_scrape_preview(
     )}
     preview_id = str(preview.get("preview_id") or "").strip()
     record = service.store.get_preview(owner, preview_id)
-    if rebuilt != guard or scrape_execution_fingerprint(snapshot, record) != expected:
+    # 历史 v1/v2 任务只保存含规则的签名，没有通知快照。通知是规则比较已忽略的
+    # 三个布尔偏好；仅重建这些位核验原签名，业务规则、文件、目标与候选仍全部绑定。
+    notification_fields = ("notify_enabled", "library_notify", "strm_detail_notify")
+    if rebuilt != guard or not any(
+        scrape_execution_fingerprint(snapshot, dataclasses.replace(
+            record, rules=dataclasses.replace(record.rules, **dict(zip(notification_fields, values))),
+        )) == expected
+        for values in product((False, True), repeat=len(notification_fields))
+    ):
         service.store.consume_preview(owner, preview_id)
         raise DirectoryScrapeConflictError("刮削预览已变化，请重新预检")
     return service, owner, preview_id
@@ -1607,8 +1616,8 @@ class DirectoryScrapeService:
 
             notification_context = build_notification_context(
                 operation_token=operation_token,
-                notify_enabled=record.rules.notify_enabled,
-                topic_enabled=record.rules.notify_enabled and record.rules.library_notify,
+                notify_enabled=current_rules.notify_enabled,
+                topic_enabled=current_rules.notify_enabled and current_rules.library_notify,
             )
             # 最终重扫只验证原确认版本，不能以 current 或实时属性重新绑定授权。
             source_snapshots = {
@@ -1634,7 +1643,7 @@ class DirectoryScrapeService:
                     position_overrides=record.position_overrides,
                 ),
             )
-            if self._target_snapshot(record.plans, record.rules, organizer) != record.target_snapshot:
+            if self._target_snapshot(record.plans, current_rules, organizer) != record.target_snapshot:
                 raise DirectoryScrapeConflictError("归档目标内容已变化，请重新检查并确认")
             signature_organizer = Organizer(
                 client=PreviewSnapshotGuangYaClient(organizer.client, current),
@@ -1643,7 +1652,7 @@ class DirectoryScrapeService:
             check_cancel()
             current_plans, _current_stats = signature_organizer.organize(
                 record.inspection.directory_id,
-                record.rules,
+                current_rules,
                 dry_run=True,
                 post_actions=False,
                 source_member_ids=source_member_ids,
@@ -1668,7 +1677,7 @@ class DirectoryScrapeService:
                 raise DirectoryScrapeConflictError("下载目录仍在写入或整理中，请等待当前任务完成后重新预览")
             _plans, stats = organizer.organize(
                 record.inspection.directory_id,
-                record.rules,
+                current_rules,
                 dry_run=False,
                 post_actions=False,
                 source_member_ids=source_member_ids,
@@ -1694,14 +1703,14 @@ class DirectoryScrapeService:
         # 所有收尾步骤共用取消门，顺序仍为源目录清理、通知、联动。
         for finish in (
             lambda: _cleanup_manual_source_root(
-                organizer, record.scope_id, current.directory_name, record.rules, stats,
+                organizer, record.scope_id, current.directory_name, current_rules, stats,
                 trigger_type="manual" if record.scope_type == "directory" else "file",
                 cancel_check=cancellation_requested,
             ),
             lambda: Organizer.notify_directory_results(
-                stats, record.rules, source_name=record.inspection.directory_name),
+                stats, current_rules, source_name=record.inspection.directory_name),
             lambda: Organizer.trigger_post_actions(
-                stats, record.rules, source_name=record.inspection.directory_name),
+                stats, current_rules, source_name=record.inspection.directory_name),
         ):
             if cancellation_requested():
                 stats["stopped"] = 1

@@ -172,6 +172,31 @@ class _EventuallyConsistentTreeClient(_MutableTreeClient):
 
 
 class DirectoryMediaInspectorTests(unittest.TestCase):
+    def test_inspection_content_fingerprint_ignores_notifications_without_cloud_writes(self):
+        from app.modules.directory_media import DirectoryMediaInspector
+
+        video = _file("video", "Iron.Man.2008.mkv", "source")
+        client = _MutableTreeClient(
+            {"source": [video], "archive": []},
+            {"source": _dir("source", "钢铁侠"), "archive": _dir("archive", "媒体库"), "video": video},
+        )
+        inspector = DirectoryMediaInspector(
+            client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _ParsingScraper()),
+        )
+        rules = OrganizeRules(target_dir_id="archive", small_file_mb=0)
+        current = replace(rules, notify_enabled=False, library_notify=False, strm_detail_notify=False)
+        before = dict(client.infos)
+        with patch.object(client, "create_dir", side_effect=AssertionError("检查不得写入")), \
+            patch.object(client, "move", side_effect=AssertionError("检查不得写入")), \
+            patch.object(client, "rename", side_effect=AssertionError("检查不得写入")), \
+            patch.object(client, "delete", side_effect=AssertionError("检查不得写入")):
+            for inspect, identifier in ((inspector.inspect, "source"), (inspector.inspect_file, "video")):
+                original = inspect(identifier, rules)
+                refreshed = inspect(identifier, current)
+                self.assertEqual(original.fingerprint, refreshed.fingerprint)
+                self.assertNotEqual(original.fingerprint_for_rules(rules), refreshed.fingerprint_for_rules(current))
+        self.assertEqual(client.infos, before)
+
     def test_directory_inspection_excludes_samples_before_primary_media_grouping(self):
         from app.modules.directory_media import DirectoryMediaInspector
         from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
@@ -2152,6 +2177,134 @@ def test_manual_metatube_identity_drives_preview_and_execution(scope, filename):
 
 
 class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
+    def test_execute_preview_uses_current_notification_preferences(self):
+        from app.modules.organize import Organizer
+
+        cases = (
+            ((True, True, True), (False, False, False)),
+            ((True, True, True), (True, False, True)),
+            ((True, True, True), (True, True, False)),
+            ((False, False, False), (True, True, True)),
+        )
+        fields = ("notify_enabled", "library_notify", "strm_detail_notify")
+        for initial, current in cases:
+            with self.subTest(current=current):
+                self.setUp()
+                self.addCleanup(self.service.close)
+                self.rules = replace(self.rules, link_strm=True, **dict(zip(fields, initial)))
+                inspected = self.service.inspect("owner", "movie-dir")
+                preview = self.service.preview("owner", inspected["inspection_id"], "1726", "movie")
+                self.rules = replace(self.rules, **dict(zip(fields, current)))
+                with patch.object(Organizer, "notify_directory_results") as notify, \
+                    patch("app.modules.organize.get", side_effect=lambda key, default="": {
+                        "GY_STRM_BASE_URL": "http://play.invalid", "STRM_ROOT": "/isolated-strm",
+                    }.get(key, default)), \
+                    patch("app.modules.scheduler.get_scheduler") as scheduler:
+                    scheduler.return_value.trigger.return_value = {"ok": True, "queued": True}
+                    result = self.service.execute_preview("owner", preview["preview_id"])
+                self.assertEqual(result["stats"]["moved"], 1)
+                self.assertNotEqual(self.client.infos["v1"].parent_id, "movie-dir")
+                self.assertTrue(result["log_ids"])
+                with db.get_conn() as conn:
+                    persisted = conn.execute(
+                        "SELECT status FROM organize_log WHERE id=?", (result["log_ids"][0],),
+                    ).fetchone()
+                self.assertEqual(persisted["status"], "success")
+                applied = notify.call_args.args[1]
+                self.assertEqual(tuple(getattr(applied, key) for key in fields), current)
+                context = result["stats"]["notification_context"]
+                self.assertEqual(context["notify_enabled"], current[0])
+                self.assertEqual(context["topic_enabled"], current[0] and current[1])
+                options = scheduler.return_value.trigger.call_args.kwargs
+                self.assertEqual(options["notify_override"], current[0])
+                self.assertEqual(options["detail_notify_override"], current[0] and current[2])
+                self.assertTrue(options["organize_changes"])
+
+    def test_cold_restore_keeps_historical_signature_after_notification_changes(self):
+        from app.modules.directory_scrape import (
+            DirectoryScrapeService,
+            DirectoryScrapeStore,
+        )
+        from app.modules.organize_tasks import OrganizeTaskManager
+        from app.repositories.organize_operation_jobs import (
+            claim_organize_operation_job,
+            enqueue_organize_operation_job,
+        )
+
+        # 来自修复前协议的固定签名；不通过待验证的新函数重算历史证据。
+        historical_contexts = {
+            1: "ef9815d8c33ec5762363b702fe84767509549c8531a0b3fcc88b9a925c1fdaf6",
+            2: "de0826a6a69bbd1bd0aa07e36da231ca7eec7d87019b9147890c941eddb49179",
+        }
+        # v1 人工任务与 v2 原生任务都必须继续通过同一个持久执行入口。
+        for version in (1, 2):
+            with self.subTest(version=version), patch(
+                "app.modules.web_secret.get_web_secret", return_value="org03-historical-signature-test-secret",
+            ):
+                self.setUp()
+                self.addCleanup(self.service.close)
+                payload = (self._durable_payload() if version == 1 else self.service.build_execution(
+                    "owner", "movie-dir", "movie", tmdb_id="1726",
+                )["execution_payload"])
+                self.assertEqual(payload["expected_context"], historical_contexts[version])
+                payload["expected_context"] = historical_contexts[version]
+                job, _ = enqueue_organize_operation_job(
+                    job_kind="agent_directory_scrape", owner="owner", operation="目录刮削",
+                    reference="已确认目录", payload=payload, dedupe_key=f"notify-cold-{version}",
+                )
+                row = claim_organize_operation_job(job["job_id"])
+                self.assertIsNotNone(row)
+                self.rules = replace(self.rules, notify_enabled=True, library_notify=False, strm_detail_notify=False)
+                fresh = DirectoryScrapeService(
+                    client=cast(GuangYaClient, self.client), scraper=cast(TMDBScraper, self.scraper),
+                    store=DirectoryScrapeStore(), rules_loader=lambda: self.rules,
+                )
+                self.addCleanup(fresh.close)
+                with patch("app.modules.directory_scrape.get_directory_scrape_service", return_value=fresh), \
+                    patch("app.modules.organize.Organizer.notify_directory_results") as notify:
+                    result = OrganizeTaskManager._execute_durable_operation(dict(row))
+                self.assertEqual(result["stats"]["moved"], 1)
+                self.assertTrue(result["stats"]["notification_context"]["notify_enabled"])
+                self.assertFalse(result["stats"]["notification_context"]["topic_enabled"])
+                applied = notify.call_args.args[1]
+                self.assertEqual((applied.notify_enabled, applied.library_notify, applied.strm_detail_notify), (True, False, False))
+
+    def test_cold_restore_rejects_business_drift_after_notification_changes(self):
+        from app.modules.directory_scrape import (
+            DirectoryScrapeService,
+            DirectoryScrapeStore,
+            _restore_directory_scrape_preview,
+        )
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+
+        for version in (1, 2):
+            for drift in ("file", "target", "rules", "candidate"):
+                with self.subTest(version=version, drift=drift):
+                    self.setUp()
+                    self.addCleanup(self.service.close)
+                    payload = (self._durable_payload() if version == 1 else self.service.build_execution(
+                        "owner", "movie-dir", "movie", tmdb_id="1726",
+                    )["execution_payload"])
+                    self.rules = replace(self.rules, library_notify=False, strm_detail_notify=False)
+                    if drift == "file":
+                        self.client.rename("v1", "Iron.Man.2008.720p.mkv")
+                    elif drift == "target":
+                        movie_root = self.client.create_dir("电影", "archive")
+                        self.client.create_dir("钢铁侠 (2008) {tmdb-1726}", movie_root)
+                    elif drift == "rules":
+                        self.rules = replace(self.rules, year_split=True)
+                    else:
+                        payload["flow"]["selected_candidate"].update(tmdb_id="2996", external_id="2996")
+                    fresh = DirectoryScrapeService(
+                        client=cast(GuangYaClient, self.client), scraper=cast(TMDBScraper, self.scraper),
+                        store=DirectoryScrapeStore(), rules_loader=lambda: self.rules,
+                    )
+                    self.addCleanup(fresh.close)
+                    before = dict(self.client.infos)
+                    with self.assertRaises(DirectoryScrapeConflictError):
+                        _restore_directory_scrape_preview(fresh, payload)
+                    self.assertEqual(self.client.infos, before)
+
     def test_native_selection_uses_the_numbering_modes_supported_by_the_service(self):
         for mode in ("auto", "standard", "absolute", "season_continuous"):
             with self.subTest(mode=mode):
@@ -2884,6 +3037,13 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "目录内容已变化"):
             self.service.execute_preview("owner", self.preview_id)
+
+    def test_execute_preview_rejects_changed_business_rules(self):
+        self.rules = replace(self.rules, year_split=True, library_notify=False)
+        before = dict(self.client.infos)
+        with self.assertRaisesRegex(RuntimeError, "整理规则已变化"):
+            self.service.execute_preview("owner", self.preview_id)
+        self.assertEqual(self.client.infos, before)
 
     def test_execute_preview_rejects_target_conflict_drift(self):
         movie_root = self.client.create_dir("电影", "archive")
