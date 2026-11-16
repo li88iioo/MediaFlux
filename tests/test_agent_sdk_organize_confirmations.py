@@ -1,6 +1,7 @@
 """整理候选 SDK 的宿主确认契约；公共服务用替身，不执行文件操作或模型调用。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import os
@@ -416,7 +417,7 @@ def test_run_code_read_review_pause_cold_confirm_queue_and_read_same_confirmatio
         pipeline.catalog.register(sandbox.run_code_tool(pipeline))
 
         async def code(source):
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": source}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": source}, context=context)
             assert result.outcome.public_content["ok"] is True, result.outcome.public_content
             if result.effect_plan is None:
                 assert result.outcome.public_content["data"]["exit_code"] == 0, result.outcome.public_content

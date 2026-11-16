@@ -1,13 +1,19 @@
 """工具调用上下文与结果契约；不依赖执行器实现。"""
 from __future__ import annotations
 
+import inspect
+import json
+import re
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from app import sdk
+
 from .capabilities import ToolEffect
+from .projection import _arguments_safe
 
 if TYPE_CHECKING:
     from asyncio import Timeout
@@ -17,6 +23,37 @@ if TYPE_CHECKING:
     from .capabilities import KernelToolSpec
     from .projection import ToolOutcome
     from .task_state import TaskPatch
+
+
+RUN_CODE_TOOL = "agent.run_code"
+RUN_CODE_MAX_CHARS = 64_000
+SDK_REQUEST_NAME = re.compile(r"[0-9a-f]{32}\.json\Z")
+
+
+def resumed_sdk_read_arguments(invocation) -> dict[str, Any]:
+    """签名等待只恢复一次已绑定的 READ；原脚本及其后续语句不参与生成。"""
+    if not isinstance(invocation, dict) or set(invocation) != {"v", "method", "arguments", "rpc_id"}:
+        raise ValueError("invalid SDK read wait")
+    method, arguments, rpc_id = (invocation[key] for key in ("method", "arguments", "rpc_id"))
+    if (type(invocation["v"]) is not int or invocation["v"] != 1
+            or not isinstance(method, str) or method not in sdk.METHODS or sdk.METHOD_EFFECTS.get(method) != "read"
+            or not isinstance(rpc_id, str) or not SDK_REQUEST_NAME.fullmatch(rpc_id)
+            or not isinstance(arguments, dict) or _arguments_safe(arguments) != arguments):
+        raise ValueError("SDK read wait no longer available")
+    try:
+        bound = inspect.signature(sdk.METHODS[method]).bind(**arguments)
+        bound.apply_defaults()
+    except TypeError as exc:
+        raise ValueError("SDK read signature changed") from exc
+    if {key: value for key, value in bound.arguments.items() if value is not Ellipsis} != arguments:
+        raise ValueError("SDK read defaults changed")
+    namespace, name = method.split(".")
+    encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+    code = ("import json, mf\n"
+            f"print(json.dumps(getattr(getattr(mf, {namespace!r}), {name!r})(**json.loads({encoded!r})), ensure_ascii=False))")
+    if len(code) > RUN_CODE_MAX_CHARS:
+        raise ValueError("SDK read exceeds the native entry capacity")
+    return {"language": "python", "code": code}
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,7 @@
 """媒体用户原生写：真实SQLite确认、冷恢复、取消及工作区，不接真实媒体。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from dataclasses import replace
@@ -251,7 +252,7 @@ def test_native_workspace_api_cli_file_readback_and_cold_confirmation_do_not_rep
             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore(), record_actions=True),
             authorization=MediaFluxAuthorizationPolicy(), effect_lifecycle=MediaFluxEffectLifecycle())
         pipeline.catalog.register(sandbox.run_code_tool(pipeline))
-        read = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''import json, subprocess
+        read = await pipeline.execute(RUN_CODE_TOOL, {"code": '''import json, subprocess
 from mf import library
 state=library.user_state("movie1")
 members=library.playlist("playlist1")
@@ -261,7 +262,7 @@ assert len(members["items"])==40
 print(state["item"]["id"],listed["items"][0]["id"])
 '''}, context=context)
         assert read.outcome.public_content["data"]["exit_code"] == 0, read.outcome.public_content
-        pending = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''from pathlib import Path
+        pending = await pipeline.execute(RUN_CODE_TOOL, {"code": '''from pathlib import Path
 import json, subprocess
 json.dump(["movie2"], open("playlist-ids.json", "w"))
 subprocess.run(["mf", "library.add_to_playlist", "--playlist-id", "playlist1", "--item-ids", "@playlist-ids.json"], check=True)
@@ -273,7 +274,7 @@ Path("after-write").write_text("script replayed")
         result = await executor(SQLiteKernelStore()).execute_confirmed(plan.plan_id, context=context)
         assert result.outcome.public_content["data"]["member_count"] == 41
         assert len(result.outcome.public_content["data"]["items"]) == 41
-        after = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''import json
+        after = await pipeline.execute(RUN_CODE_TOOL, {"code": '''import json
 from pathlib import Path
 from mf import library
 saved=json.load(open("before.json"))

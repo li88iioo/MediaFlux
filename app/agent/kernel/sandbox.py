@@ -6,7 +6,6 @@ import hashlib
 import inspect
 import json
 import os
-import re
 import shutil
 import stat
 import sys
@@ -20,15 +19,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from app import sdk
 from app.agent.errors import ToolPipelineError, ToolRateLimitError, _ReadPermitRejected
 from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.modules.process_lock import CrossProcessLock
 from app.runtime_paths import get_runtime_paths
-from app.sdk import METHODS, METHOD_EFFECTS, call_owner, describe_methods, describe_namespaces
+from app.sdk import METHODS, call_owner, describe_methods, describe_namespaces
 from app.sensitive_data import redact_sensitive_text
 
+from . import tool_calls
 from .capabilities import KernelToolSpec, ToolEffect
-from .projection import ToolOutcome, _arguments_safe, _json_safe
+from .projection import ToolOutcome, _json_safe
 from .state_types import SessionBusyError, _PublicationUnprotected
 from .task_state import identity, observation_patch, read_observations
 from .tool_calls import PipelineResult, SDKReadRetry
@@ -38,41 +39,12 @@ if TYPE_CHECKING:
     from .pipeline import ToolPipeline
     from .tool_calls import ToolCallContext
 
-RUN_CODE_TOOL = "agent.run_code"
 _TASK_METHODS = frozenset({"task", "start_task", "revise_task", "checkpoint_task", "cancel_task"})
 _CHILD = Path(__file__).with_name("sandbox_child.py")
 _CLIENT = Path(__file__).with_name("workspace_client.py")
 _SKILLS = Path(__file__).parent.parent / "skills"
 _OUTPUT_CHARS = 16_000
-_CODE_MAX_CHARS = 64_000
 _REQUEST_BYTES = 4 * 1024 * 1024
-_REQUEST_NAME = re.compile(r"[0-9a-f]{32}\.json\Z")
-
-
-def resumed_sdk_read_arguments(invocation) -> dict[str, Any]:
-    """签名等待只恢复一次已绑定的 READ；原脚本及其后续语句不参与生成。"""
-    if not isinstance(invocation, dict) or set(invocation) != {"v", "method", "arguments", "rpc_id"}:
-        raise ValueError("invalid SDK read wait")
-    method, arguments, rpc_id = (invocation[key] for key in ("method", "arguments", "rpc_id"))
-    if (type(invocation["v"]) is not int or invocation["v"] != 1
-            or not isinstance(method, str) or method not in METHODS or METHOD_EFFECTS.get(method) != "read"
-            or not isinstance(rpc_id, str) or not _REQUEST_NAME.fullmatch(rpc_id)
-            or not isinstance(arguments, dict) or _arguments_safe(arguments) != arguments):
-        raise ValueError("SDK read wait no longer available")
-    try:
-        bound = inspect.signature(METHODS[method]).bind(**arguments)
-        bound.apply_defaults()
-    except TypeError as exc:
-        raise ValueError("SDK read signature changed") from exc
-    if {key: value for key, value in bound.arguments.items() if value is not Ellipsis} != arguments:
-        raise ValueError("SDK read defaults changed")
-    namespace, name = method.split(".")
-    encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
-    code = ("import json, mf\n"
-            f"print(json.dumps(getattr(getattr(mf, {namespace!r}), {name!r})(**json.loads({encoded!r})), ensure_ascii=False))")
-    if len(code) > _CODE_MAX_CHARS:
-        raise ValueError("SDK read exceeds the native entry capacity")
-    return {"language": "python", "code": code}
 
 
 def _sdk_activity(identity, method, arguments, *, status="running", result=None, error=""):
@@ -315,7 +287,7 @@ class _SDKRequests:
             function = METHODS.get(method)
             if function is None:
                 raise ValueError(f"未知 SDK 方法：{method}；可运行 mf --help 查看接口")
-            effect = METHOD_EFFECTS.get(method)
+            effect = sdk.METHOD_EFFECTS.get(method)
             if effect not in {"read", "write", "control", "local_write"}:
                 raise ToolPipelineError("SDK 方法未声明行为类别，调用未执行", code="sdk_method_unclassified")
             arguments = request["arguments"]
@@ -381,7 +353,7 @@ class _SDKRequests:
                             "rpc_id": name,
                         }
                         try:
-                            resumed_sdk_read_arguments(invocation)
+                            tool_calls.resumed_sdk_read_arguments(invocation)
                         except ValueError:
                             raise exc  # 无法无损保存时维持原可 catch 的拒绝响应。
                         self.read_retry = SDKReadRetry(exc, invocation, tuple(self.settled_confirmations))
@@ -466,7 +438,7 @@ class _SDKRequests:
             if patch is not None:
                 self.patches.append(patch)
         self.write(name, encoded)
-        if observation or METHOD_EFFECTS.get(method) == "write":
+        if observation or sdk.METHOD_EFFECTS.get(method) == "write":
             self.completed_responses.append((name, call))
 
     async def poll(self):
@@ -480,7 +452,7 @@ class _SDKRequests:
                     if len(self.pending) >= 4 or self.read_retry is not None:
                         break
                     name = entry.name
-                    if not _REQUEST_NAME.fullmatch(name) or name in self.accepted:
+                    if not tool_calls.SDK_REQUEST_NAME.fullmatch(name) or name in self.accepted:
                         continue
                     try:
                         os.stat(name, dir_fd=self.responses_fd, follow_symlinks=False)
@@ -687,7 +659,7 @@ async def run_code(pipeline: ToolPipeline, arguments: dict[str, Any], context: T
     if "candidate_view" in safe:
         model["candidate_view"] = {"ref": safe["candidate_view"]["ref"]} if safe["candidate_view"] else None
     outcome = ToolOutcome(model_content=json.dumps(model, ensure_ascii=False), public_content=safe)
-    return PipelineResult(tool=pipeline.catalog.get(RUN_CODE_TOOL), arguments=arguments,
+    return PipelineResult(tool=pipeline.catalog.get(tool_calls.RUN_CODE_TOOL), arguments=arguments,
                           outcome=outcome, task_patch=patch,
                           effect_plan=proposal.effect_plan if proposal else None,
                           sdk_read_retry=retry)
@@ -706,7 +678,7 @@ def run_code_tool(pipeline: ToolPipeline) -> KernelToolSpec:
         for path in sorted(_SKILLS.glob("*/SKILL.md"))
     )
     return KernelToolSpec(
-        name=RUN_CODE_TOOL, domain="agent", effect=ToolEffect.READ,
+        name=tool_calls.RUN_CODE_TOOL, domain="agent", effect=ToolEffect.READ,
         description=("执行普通 Python 或 Shell。Python 已提供 mf 业务 SDK；每次调用启动新进程，其他变量与 import 不跨调用保留；同一会话的 /work 文件持久保留。"
                      "可 import、读写文件、运行子进程。"
                      "业务接口用 import mf；可用的 /skills 文档见下方目录。"
@@ -718,7 +690,7 @@ def run_code_tool(pipeline: ToolPipeline) -> KernelToolSpec:
                      "任务资料保存到 /work，已验证的长期经验用 mf.skills 保存；远端写入遵循确认授权。"
                      f"\nSDK 范围：\n{namespaces}\n已安装流程文档：\n{skills}"),
         input_schema={"type": "object", "required": ["code"], "additionalProperties": False, "properties": {
-            "code": {"type": "string", "minLength": 1, "maxLength": _CODE_MAX_CHARS},
+            "code": {"type": "string", "minLength": 1, "maxLength": tool_calls.RUN_CODE_MAX_CHARS},
             "language": {"type": "string", "enum": ["python", "shell"], "default": "python"},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
         }}, read=read,

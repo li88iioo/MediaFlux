@@ -1,6 +1,7 @@
 """SDK 写入共用确认账本；测试真实预检/持久化，下载后端用替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 from app.agent.kernel.ports.sdk_effects import activity_confirm_organize_tool, cloud_organize_tools
 
 import asyncio
@@ -206,13 +207,13 @@ def test_native_activity_follow_script_stops_at_card_and_is_not_replayed(activit
                 f'activity.follow("download", {activity_request}, hours=2)\n'
                 'Path("after").write_text("should not execute")')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=context)
             assert result.effect_plan is not None and result.effect_plan.tool_name == "activity.follow"
             root, _ = sandbox._workspace_location(context.owner, context.session_id)
             assert (root / "work/before").read_text() == "once" and not (root / "work/after").exists()
             await executor(SQLiteKernelStore()).execute_confirmed(result.effect_plan.plan_id, context=context)
             assert not (root / "work/after").exists()
-            read = await pipeline.execute(sandbox.RUN_CODE_TOOL, {
+            read = await pipeline.execute(RUN_CODE_TOOL, {
                 "code": 'from mf import activity\nrows=activity.follows()["data"]["items"]\nassert len(rows)==1 and rows[0]["enabled"]\nprint("follow persisted")',
             }, context=context)
             assert read.outcome.public_content["data"]["exit_code"] == 0
@@ -672,7 +673,7 @@ def test_script_stops_at_approval_and_confirm_does_not_replay_script(resources_b
         catalog.register(sandbox.run_code_tool(pipeline))
         invocation = ('resources.download([f"candidate-{i:016d}" for i in range(20)])' if method == "resources.download" else
                       'downloads.submit("magnet:?xt=urn:btih:" + "b" * 40, "qb")')
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": f'''
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": f'''
 from pathlib import Path
 from mf import resources, downloads
 Path("before.txt").write_text("read completed")
@@ -697,7 +698,7 @@ Path("after.txt").write_text("must not run")
         else:
             url_backend.assert_called_once()
         assert not (root / "work/after.txt").exists()
-        resumed = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code":
+        resumed = await pipeline.execute(RUN_CODE_TOOL, {"code":
             'from pathlib import Path\nprint(Path("before.txt").read_text())'}, context=context)
         assert resumed.outcome.public_content["data"]["stdout"].strip() == "read completed"
         if method == "resources.download":
@@ -721,7 +722,7 @@ def test_parallel_write_requests_produce_one_approval(resources_backend, monkeyp
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
                                 effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
         catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''
 from concurrent.futures import ThreadPoolExecutor
 from mf import resources
 with ThreadPoolExecutor(2) as pool:
@@ -757,7 +758,7 @@ def test_session_emits_confirmation_and_resumes_with_authoritative_receipt(resou
                                 effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
         catalog.register(sandbox.run_code_tool(pipeline))
         model = ScriptedModel([
-            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("native-write", sandbox.RUN_CODE_TOOL, {
+            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("native-write", RUN_CODE_TOOL, {
                 "code": 'from mf import resources\nresources.download([f"candidate-{i:016d}" for i in range(20)], "qb")',
             })), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
             [ModelEvent(ModelEventType.TEXT_DELTA, text="20 项下载已提交。"),
@@ -1058,7 +1059,7 @@ def test_library_native_workspace_reads_complete_pages_without_provider_refs(nat
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
         catalog.register(sandbox.run_code_tool(pipeline))
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {'code': '''import json
+            result = await pipeline.execute(RUN_CODE_TOOL, {'code': '''import json
 from pathlib import Path
 import mf
 folders = mf.library.libraries(server="jellyfin")
@@ -1069,7 +1070,7 @@ print(len(result["data"]["items"]), result["data"]["items"][-1]["id"])
             assert result.effect_plan is None
             assert result.outcome.public_content['data']['exit_code'] == 0
             assert '31 item-30' in result.outcome.public_content['data']['stdout']
-            again = await pipeline.execute(sandbox.RUN_CODE_TOOL, {'code': 'import json; from pathlib import Path; print(json.loads(Path("quality.json").read_text())["data"]["complete"])'}, context=context)
+            again = await pipeline.execute(RUN_CODE_TOOL, {'code': 'import json; from pathlib import Path; print(json.loads(Path("quality.json").read_text())["data"]["complete"])'}, context=context)
             assert again.outcome.public_content['data']['exit_code'] == 0
             assert 'True' in again.outcome.public_content['data']['stdout']
             client.refresh_library.assert_not_called()

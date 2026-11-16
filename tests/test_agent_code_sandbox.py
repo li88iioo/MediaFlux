@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 from app.agent.kernel import sandbox
 from app.agent.kernel.capabilities import KernelToolSpec, ToolCatalog, ToolEffect
-from app.agent.kernel.tool_calls import PreparedEffect
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL, PreparedEffect
 from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelMessage, ModelToolCall
 from app.agent.kernel.pipeline import ToolPipeline
@@ -134,8 +134,8 @@ class WorkspaceContractTests(unittest.IsolatedAsyncioTestCase):
                          {catalog.get(name).model_name for name in ("agent.run_code",)})
         self.assertNotIn("library.item_99", request.system_prompt)
         description = next(tool["description"] for tool in request.tools
-                           if tool["name"] == catalog.get(sandbox.RUN_CODE_TOOL).model_name)
-        self.assertEqual(description, catalog.get(sandbox.RUN_CODE_TOOL).description)
+                           if tool["name"] == catalog.get(RUN_CODE_TOOL).model_name)
+        self.assertEqual(description, catalog.get(RUN_CODE_TOOL).description)
         for name, purpose in sandbox.describe_namespaces().items():
             self.assertIn(f"mf.{name}: {purpose}", description)
         for skill in sandbox._SKILLS.glob("*/SKILL.md"):
@@ -207,7 +207,7 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         return found
 
     async def execute(self, code, *, language="python", timeout=15, context=None):
-        result = await self.pipeline.execute(sandbox.RUN_CODE_TOOL,
+        result = await self.pipeline.execute(RUN_CODE_TOOL,
             {"code": code, "language": language, "timeout_seconds": timeout}, context=context or self.context)
         payload = json.loads(result.outcome.full_model_content or result.outcome.model_content)
         return payload["data"]
@@ -392,7 +392,7 @@ with ThreadPoolExecutor(4) as pool:
 
         model = ScriptedModel([
             [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                "read", sandbox.RUN_CODE_TOOL, {"code": 'mf.library.episodes("sample")'})),
+                "read", RUN_CODE_TOOL, {"code": 'mf.library.episodes("sample")'})),
              ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
             [ModelEvent(ModelEventType.TEXT_DELTA, text="本次取得两项，仍有后续页。"),
              ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
@@ -400,7 +400,7 @@ with ThreadPoolExecutor(4) as pool:
              ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
         ])
         session = AgentSession(model=model, catalog=self.catalog, pipeline=self.pipeline,
-                               state_store=self.store, model_tools=[sandbox.RUN_CODE_TOOL])
+                               state_store=self.store, model_tools=[RUN_CODE_TOOL])
         with patch.dict(sandbox.METHODS, {"library.episodes": lambda series_id: {
             "items": [{"id": "one"}, {"id": "two"}], "has_more": True, "partial": True,
         }}):
@@ -464,12 +464,12 @@ with ThreadPoolExecutor(4) as pool:
         code = "help(mf.session.batch)\nprint('password:\\n\\nhistory-private-value')"
         model = ScriptedModel([[
             ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                tool_call=ModelToolCall("help", sandbox.RUN_CODE_TOOL, {"code": code})),
+                tool_call=ModelToolCall("help", RUN_CODE_TOOL, {"code": code})),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
         ], [ModelEvent(ModelEventType.TEXT_DELTA, text="已核对帮助"),
             ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
         session = AgentSession(model=model, catalog=self.catalog, pipeline=self.pipeline,
-            state_store=self.store, model_tools=[sandbox.RUN_CODE_TOOL])
+            state_store=self.store, model_tools=[RUN_CODE_TOOL])
         events = [event async for event in session.run(AgentInput(
             owner="help-owner", session_id="help-native", message="查看原生帮助"))]
         self.assertEqual(events[-1].payload["status"], "success")
@@ -501,7 +501,7 @@ with ThreadPoolExecutor(4) as pool:
             'print(v["items"][-1], len(v["body"]))',
         ]
         rounds = [[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                             tool_call=ModelToolCall(str(i), sandbox.RUN_CODE_TOOL, {"code": code})),
+                             tool_call=ModelToolCall(str(i), RUN_CODE_TOOL, {"code": code})),
                    ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
                   for i, code in enumerate(commands)]
         rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="已核对完整结果。"),
@@ -532,7 +532,7 @@ with ThreadPoolExecutor(4) as pool:
 
         model = FailsAfterCommands([
             [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                str(i), sandbox.RUN_CODE_TOOL, {"code": code})),
+                str(i), RUN_CODE_TOOL, {"code": code})),
              ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
             for i, code in enumerate(('print("saved observation")', 'raise NameError("bad variable")'))
         ])
@@ -562,7 +562,7 @@ with ThreadPoolExecutor(4) as pool:
                 'print("second-result")',
             ]
             rounds = [[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                str(i), sandbox.RUN_CODE_TOOL, {"code": code})), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
+                str(i), RUN_CODE_TOOL, {"code": code})), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
                 for i, code in enumerate(commands)]
             model = ScriptedModel([*rounds, [ModelEvent(ModelEventType.TEXT_DELTA, text="已记录退出状态"),
                                            ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
@@ -589,7 +589,7 @@ with ThreadPoolExecutor(4) as pool:
             self.assertNotIn("agent__read_result", {t["name"] for t in model.requests[-1].tools})
             other = await make_context(store, owner="bob", session="cold-native")
             read_path = tools[0]["data"]["sdk_calls"][0]["response_path"]
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code":
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code":
                 f'from pathlib import Path\nprint(Path({tools[0]["data"]["stdout_path"]!r}).exists(), '
                 f'Path({tools[0]["data"]["stderr_path"]!r}).exists(), Path({read_path!r}).exists())'}, context=other)
             self.assertEqual(json.loads(result.outcome.model_content)["data"]["stdout"].strip(), "False False False")
@@ -606,6 +606,7 @@ with ThreadPoolExecutor(4) as pool:
                 from unittest.mock import patch
                 from app import database as db
                 from app.agent.kernel import sandbox
+                from app.agent.kernel.tool_calls import RUN_CODE_TOOL
                 from app.agent.kernel.capabilities import ToolCatalog
                 from app.agent.kernel.events import AgentEventType
                 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -632,10 +633,10 @@ with ThreadPoolExecutor(4) as pool:
                     response_path = state["tools"][0]["data"]["sdk_calls"][0]["response_path"]
                     code += f'\nimport json\nv = json.load(open({response_path!r}))\nassert v["result"]["raw_fact"] == "SDK_ORIGINAL" and v["result"]["cached"] is True'
                     model = ScriptedModel([[
-                        ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("read-tail", sandbox.RUN_CODE_TOOL, {"code": code})),
+                        ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("read-tail", RUN_CODE_TOOL, {"code": code})),
                         ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")], [
                         ModelEvent(ModelEventType.TEXT_DELTA, text="已核验末项"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
-                    session = AgentSession(model=model, catalog=catalog, model_tools=[sandbox.RUN_CODE_TOOL], pipeline=pipeline, state_store=store)
+                    session = AgentSession(model=model, catalog=catalog, model_tools=[RUN_CODE_TOOL], pipeline=pipeline, state_store=store)
                     with patch.object(pipeline, "save_result", side_effect=AssertionError("不得重建终端快照")):
                         events = [e async for e in session.run(AgentInput(owner="alice", session_id="cold-native", message="继续核验输出末项"))]
                     assert events[-1].type == AgentEventType.TURN_COMPLETED and events[-1].payload["status"] == "success", events[-1].payload
@@ -679,7 +680,7 @@ with ThreadPoolExecutor(4) as pool:
                             f'print(len(out), out.endswith("\\n"), err.endswith({error_tail!r}))')
                     self.rounds.insert(0, [
                         ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                            tool_call=ModelToolCall("read-files", sandbox.RUN_CODE_TOOL, {"code": code})),
+                            tool_call=ModelToolCall("read-files", RUN_CODE_TOOL, {"code": code})),
                         ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
                     ])
                 async for event in super().stream(request, cancellation=cancellation):
@@ -687,7 +688,7 @@ with ThreadPoolExecutor(4) as pool:
 
         model = RecoveringModel([[
             ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                       tool_call=ModelToolCall("large-current", sandbox.RUN_CODE_TOOL, {"code": command})),
+                       tool_call=ModelToolCall("large-current", RUN_CODE_TOOL, {"code": command})),
             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
         ], [ModelEvent(ModelEventType.TEXT_DELTA, text="已读取完整输出并核对错误。"),
             ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])

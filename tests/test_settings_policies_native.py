@@ -1,6 +1,7 @@
 """策略纵切：真实配置 CAS、确认账本、锁外 reload、冷确认及 Python/CLI RPC。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -247,7 +248,7 @@ def test_root_python_and_cli_preserve_scalar_type_and_stop_at_confirmation(backe
                 'python -c \'import json;assert json.load(open("policies.json"))["data"]["policy_count"]==13\'\n'
                 f'echo once > before\nmf settings.set_policy --policy {policy} --value {value}\necho unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == WRITE, result.outcome.public_content
             assert plan.arguments == {"policy": policy, "value": value}

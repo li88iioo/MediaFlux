@@ -1,5 +1,6 @@
 """RSS 原生条目投递：完整范围、原始回执、冷确认及真实工作区 RPC。"""
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import os
@@ -97,7 +98,7 @@ def test_workspace_optional_defaults_prepare_full_scope_and_cancel(native_worksp
         pipe = ToolPipeline(catalog=effects.catalog, state_store=store, effect_store=effects.effect_store)
         pipe.catalog.register(sandbox.run_code_tool(pipe))
         with patch.object(rss_delivery, "execute", side_effect=AssertionError("取消后不能提交")) as submit:
-            result = await pipe.execute(sandbox.RUN_CODE_TOOL,
+            result = await pipe.execute(RUN_CODE_TOOL,
                 {"code": _workspace_call(operation, arguments, language), "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None, result.outcome.model_content
@@ -143,7 +144,7 @@ def test_workspace_invalid_rss_scope_never_freezes_or_executes(native_workspace,
         pipe = ToolPipeline(catalog=effects.catalog, state_store=store, effect_store=effects.effect_store)
         pipe.catalog.register(sandbox.run_code_tool(pipe))
         with patch.object(rss_delivery, "prepare", side_effect=AssertionError("无效范围不能读取业务快照")) as prepare, patch.object(rss_delivery, "execute", side_effect=AssertionError("无效范围不能提交")) as submit:
-            result = await pipe.execute(sandbox.RUN_CODE_TOOL,
+            result = await pipe.execute(RUN_CODE_TOOL,
                 {"code": _workspace_call(operation, arguments, language), "language": language}, context=context)
             assert result.effect_plan is None
             assert "invalid_arguments" in result.outcome.model_content
@@ -514,7 +515,7 @@ def test_root_workspace_proposal_cold_confirm_and_full_persisted_readback(tmp_pa
         )
         catalog.register(sandbox.run_code_tool(pipeline))
         result = await pipeline.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": f'from mf import rss\nv = rss.entries(subscription_id={sid}, status="all")["data"]["items"][0]\nprint(v["id"], v["status"], len(v["title"]))'
             },

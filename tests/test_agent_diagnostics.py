@@ -1,6 +1,7 @@
 """只读诊断：白名单表的非凭据列可查，凭据/私有表/写入/越权身份一律拒绝，日志按条件检索并打码。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import sqlite3
@@ -245,7 +246,7 @@ print(facts["db"]["data"]["rows"][0][0], len(facts["logs"]["data"]["records"]))
         with patch.object(diag, "query_db", wraps=diag.query_db) as query_call, patch.object(
             diag, "search_logs", wraps=diag.search_logs,
         ) as log_call:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=context)
         data = result.outcome.public_content["data"]
         assert result.effect_plan is None
         if owner == TG:
@@ -257,7 +258,7 @@ print(facts["db"]["data"]["rows"][0][0], len(facts["logs"]["data"]["records"]))
         assert data["exit_code"] == 0, data
         assert data["stdout"].strip().splitlines() == ["拒绝私有读取", "完整字段 2"]
         assert [call["ok"] for call in data["sdk_calls"]] == [True, True, False, True, True]
-        later = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code":
+        later = await pipeline.execute(RUN_CODE_TOOL, {"code":
             'import json\nf=json.load(open("diagnostics.json"))\nprint(f["logs"]["data"]["matched_in_scan"])'}, context=context)
         assert later.outcome.public_content["data"]["stdout"].strip() == "2"
         assert later.outcome.public_content["data"]["sdk_calls"] == []
@@ -291,7 +292,7 @@ def test_new_diagnostics_native_rpc_keeps_full_local_facts_without_actions(tmp_p
             else:
                 code = "mf diagnostics.component --component qbittorrent > diagnosis.json"
             try:
-                result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+                result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
                 assert result.outcome.public_content["data"]["exit_code"] == 0, result.outcome.public_content
                 root, _ = sandbox._workspace_location(context.owner, context.session_id)
                 full = json.loads((root / "work/diagnosis.json").read_text())

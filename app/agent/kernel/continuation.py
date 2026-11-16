@@ -22,7 +22,7 @@ from .session_guard import publication_execution_active
 from .session_state import SessionState
 from .state_types import PublicationLease, StalePublicationError, StateUpdate
 from .task_state import identity
-from .tool_calls import PipelineResult, SDKReadRetry
+from .tool_calls import RUN_CODE_TOOL, PipelineResult, SDKReadRetry, resumed_sdk_read_arguments
 
 MAX_WAIT_SEGMENTS = 3
 MAX_WAIT_SECONDS = 180
@@ -129,7 +129,6 @@ def history_call(state, record):
     if len(matches) != 1:
         raise ValueError("read wait history changed")
     if "sdk_read" in record:
-        from .sandbox import RUN_CODE_TOOL, resumed_sdk_read_arguments
         resumed_sdk_read_arguments(record["sdk_read"])
         if anchor["tool"] != RUN_CODE_TOOL or matches[0].get("name") not in {RUN_CODE_TOOL, RUN_CODE_TOOL.replace(".", "__")}:
             raise ValueError("SDK wait requires the original native call")
@@ -142,7 +141,6 @@ def park_anchor(state, record, lease, value):
     record.pop("settled_publication", None)
     if retry is None:
         return anchor_for(state, value["call_id"], value["permit"].tool_name)
-    from .sandbox import RUN_CODE_TOOL
     if (not isinstance(retry, SDKReadRetry) or retry.permit is not value["permit"]
             or retry.invocation.get("method") != retry.permit.tool_name):
         raise ValueError("untrusted SDK read wait")

@@ -1,6 +1,7 @@
 """偏好 SDK：真实 SQLite 确认、事务证据、旧回退凭证与原生工作区。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from types import SimpleNamespace
@@ -297,7 +298,7 @@ Path("after.txt").write_text("must not run")
 subprocess.run(["mf", "preferences.update", "--preferred-resolution", "2160p",
                 "--min-rating", "0", "--max-episode-size-gb", "1.5", "--no-exclude-played",
                 "--memory-notes"], check=True)''')
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=context)
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=context)
         assert result.effect_plan is not None and result.effect_plan.tool_name == "preferences.update"
         root, _ = sandbox._workspace_location(OWNER, context.session_id)
         assert (root / "work/runs.txt").read_text() == "once\n"

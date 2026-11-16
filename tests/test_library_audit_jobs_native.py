@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import subprocess
@@ -461,7 +462,7 @@ def test_real_workspace_api_cli_freeze_cold_confirm_and_read_saved_job_file(
         )
         try:
             prepared = await pipeline.execute(
-                sandbox.RUN_CODE_TOOL,
+                RUN_CODE_TOOL,
                 {"language": language, "code": code},
                 context=context,
             )
@@ -486,7 +487,7 @@ def test_real_workspace_api_cli_freeze_cold_confirm_and_read_saved_job_file(
             backend.wake.assert_called_once()
             assert not (root / "work/after").exists()
             read = await pipeline.execute(
-                sandbox.RUN_CODE_TOOL,
+                RUN_CODE_TOOL,
                 {
                     "language": "shell",
                     "code": f"mf library.audit_job --job-id {identity} > job.json\ncat job.json",
@@ -503,7 +504,7 @@ def test_real_workspace_api_cli_freeze_cold_confirm_and_read_saved_job_file(
                 and not saved["data"]["coverage_complete"]
             )
             cancel = await pipeline.execute(
-                sandbox.RUN_CODE_TOOL,
+                RUN_CODE_TOOL,
                 {
                     "language": "python",
                     "code": "from mf import library\n"
@@ -523,7 +524,7 @@ def test_real_workspace_api_cli_freeze_cold_confirm_and_read_saved_job_file(
             )
             assert result.outcome.public_content["status"] == "completed"
             readback = await pipeline.execute(
-                sandbox.RUN_CODE_TOOL,
+                RUN_CODE_TOOL,
                 {
                     "language": "python",
                     "code": "from pathlib import Path\nimport json\nfrom mf import library\n"

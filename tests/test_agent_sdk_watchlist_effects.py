@@ -1,6 +1,7 @@
 """原生收藏写使用公共业务、真实 SQLite 确认账本；来源详情为离线替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import time
@@ -364,7 +365,7 @@ watchlist.add("tmdb", "tv", "{identity}")
 Path("tail-{label}.txt").write_text("must not resume")
 '''
         return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
-                          tool_call=ModelToolCall(f"script-{label}", sandbox.RUN_CODE_TOOL, {"code": code})),
+                          tool_call=ModelToolCall(f"script-{label}", RUN_CODE_TOOL, {"code": code})),
                 ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
 
     async def check():

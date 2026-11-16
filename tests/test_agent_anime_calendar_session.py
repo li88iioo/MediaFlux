@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 from app.agent.kernel import sandbox
 from app.agent.kernel.capabilities import ToolCatalog
 from app.agent.kernel.pipeline import ToolPipeline
@@ -77,7 +78,7 @@ class NativeMediaWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.context = await make_context(self.store)
 
     async def execute(self, code):
-        result = await self.pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=self.context)
+        result = await self.pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=self.context)
         return json.loads(result.outcome.full_model_content or result.outcome.model_content)["data"]
 
     async def test_cold_native_python_cli_full_responses_and_saved_work_readback(self):

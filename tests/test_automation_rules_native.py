@@ -1,6 +1,7 @@
 """原生自动化：真实 SQLite/确认账本/RPC；所有元数据和通知均为替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import socket
@@ -321,7 +322,7 @@ def test_native_rpc_reads_complete_file_then_cold_confirms_without_script_replay
             write = f'mf automation.set_digest --no-enabled --rule-id {saved["rule_id"]}' if kind == "digest" else 'mf subscriptions.create --provider tmdb --external-id 123 --media-type tv --action auto --sites nyaa --check-interval-minutes 10080'
             code = f'mf automation.digests > facts.json\necho once > before\n{write}\necho unexpected > after'
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None, result.outcome.public_content
             expected = "automation.set_digest" if kind == "digest" else "subscriptions.create"

@@ -1,6 +1,7 @@
 """Skills 的真实 SQLite 修订、发布事务及 native owner 隐私边界。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import sqlite3
@@ -78,7 +79,7 @@ def test_native_sdk_skills_survive_workspace_reset_and_keep_owner_boundary(monke
         catalog = ToolCatalog()
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
         catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=context)
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=context)
         assert result.effect_plan is None
         data = json.loads(result.outcome.full_model_content or result.outcome.model_content)["data"]
         assert data["exit_code"] == 0, data

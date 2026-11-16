@@ -1,6 +1,7 @@
 """原生SDK完整剧集事实→共享算法→唯一cloud.change/SQLite；Provider仅内存替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from copy import deepcopy
@@ -236,7 +237,7 @@ def test_root_sdk_facts_to_sqlite_cold_confirmation_and_original_job_once(episod
                  'echo once > before\nmf cloud.change --operations @operations.json --no-trigger-strm\n'
                  'echo invalid > after')
         try:
-            proposed = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": language, "code": python if language == "python" else shell}, context=context)
+            proposed = await pipeline.execute(RUN_CODE_TOOL, {"language": language, "code": python if language == "python" else shell}, context=context)
             assert proposed.effect_plan is not None, proposed.outcome.public_content
             root, _ = sandbox._workspace_location(context.owner, context.session_id)
             assert (root / "work/before").read_text().strip() == "once" and not (root / "work/after").exists()

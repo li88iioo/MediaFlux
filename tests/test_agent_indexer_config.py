@@ -1,6 +1,7 @@
 """Media Agent 受控资源站点配置测试。"""
 
 from __future__ import annotations
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 from starlette.requests import Request
 from typing import Any, cast
 
@@ -181,46 +182,52 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
             registry.execute("resources.configure_sites", {"site_ids": ["nyaa"]})
 
     def test_summary_preview_and_context_do_not_leak_other_config(self):
-        with tempfile.TemporaryDirectory() as root:
-            env_file = Path(root) / "user.env"
-            secret = "super-secret-must-not-leak"
-            config.write_env_file(
-                env_file,
-                {
-                    "INDEXER_ENABLED_SITES": "mikan,nyaa",
-                    "INDEXER_SUKEBEI_ENABLED": "0",
-                    "TMDB_API_KEY": secret,
-                },
-                replace=False,
-            )
-            with (
-                patch.dict(
-                    os.environ,
+        # Web 展示默认关闭；显式开关不影响站点预览或敏感配置隔离。
+        for configured, enabled in ((None, False), ("0", False), ("1", True)):
+            with self.subTest(search_enabled=configured), tempfile.TemporaryDirectory() as root:
+                env_file = Path(root) / "user.env"
+                secret = "super-secret-must-not-leak"
+                config.write_env_file(
+                    env_file,
                     {
-                        "INDEXER_ENABLED_SITES": "",
-                        "INDEXER_SUKEBEI_ENABLED": "",
-                        "INDEXER_SEARCH_ENABLED": "",
+                        "INDEXER_ENABLED_SITES": "mikan,nyaa",
+                        "INDEXER_SUKEBEI_ENABLED": "0",
+                        "TMDB_API_KEY": secret,
+                        **({"INDEXER_SEARCH_ENABLED": configured} if configured is not None else {}),
                     },
-                    clear=False,
-                ),
-                patch.object(config, "ENV_FILE", env_file),
-                patch.object(config, "_cache", None),
-                patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
-            ):
-                summary = site_configuration()
-                preview, context = prepare_site_configuration(**
-                    {"site_ids": ["nyaa", "tpb"]}
+                    replace=False,
                 )
-            rendered = repr((summary, preview, context))
-            self.assertNotIn(secret, rendered)
-            self.assertNotIn("TMDB_API_KEY", rendered)
-            self.assertNotIn(str(env_file), rendered)
-            self.assertEqual(summary["site_count"], 2)
-            self.assertEqual(
-                [site["site_id"] for site in summary["sites"]], ["nyaa", "mikan"]
-            )
-            self.assertTrue(summary["search_enabled"])
-            self.assertEqual(len(context), 64)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "INDEXER_ENABLED_SITES": "",
+                            "INDEXER_SUKEBEI_ENABLED": "",
+                            "INDEXER_SEARCH_ENABLED": "",
+                        },
+                        clear=False,
+                    ),
+                    patch.object(config, "ENV_FILE", env_file),
+                    patch.object(config, "_cache", None),
+                    patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()),
+                ):
+                    summary = site_configuration()
+                    preview, context = prepare_site_configuration(**
+                        {"site_ids": ["nyaa", "tpb"]}
+                    )
+                rendered = repr((summary, preview, context))
+                self.assertNotIn(secret, rendered)
+                self.assertNotIn("TMDB_API_KEY", rendered)
+                self.assertNotIn(str(env_file), rendered)
+                self.assertEqual(summary["site_count"], 2)
+                self.assertEqual(
+                    [site["site_id"] for site in summary["sites"]], ["nyaa", "mikan"]
+                )
+                self.assertIs(summary["search_enabled"], enabled)
+                self.assertTrue(preview["ok"])
+                self.assertIs(preview["data"]["search_enabled"], enabled)
+                self.assertIsNone(preview["data"]["requested_enable_search"])
+                self.assertEqual(len(context), 64)
 
 
 
@@ -329,10 +336,10 @@ class SiteConfigurationWriteTests(unittest.TestCase):
                 effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
             catalog.register(sandbox.run_code_tool(pipeline))
             try:
-                result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": 'from mf import resources; print(resources.sources()["configuration"]["site_ids"])'}, context=context)
+                result = await pipeline.execute(RUN_CODE_TOOL, {"code": 'from mf import resources; print(resources.sources()["configuration"]["site_ids"])'}, context=context)
                 assert result.outcome.public_content["data"]["exit_code"] == 0
                 assert "nyaa" in result.outcome.public_content["data"]["stdout"]
-                proposed = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": "mf resources.configure_sites --site-ids nyaa tpb", "language": "shell"}, context=context)
+                proposed = await pipeline.execute(RUN_CODE_TOOL, {"code": "mf resources.configure_sites --site-ids nyaa tpb", "language": "shell"}, context=context)
                 assert proposed.effect_plan is not None, proposed.outcome.public_content
                 assert current_indexer_site_ids() == ("nyaa",)
                 self.refresh.assert_not_called()

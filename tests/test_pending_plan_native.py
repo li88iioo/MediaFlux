@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import inspect
 import json
@@ -63,7 +64,7 @@ async def context_for(runtime, owner=dialogue.OWNER, session_id=dialogue.SID):
 
 async def code(runtime, context, source):
     return await runtime.pipeline.execute(
-        sandbox.RUN_CODE_TOOL, {"code": source}, context=context
+        RUN_CODE_TOOL, {"code": source}, context=context
     )
 
 

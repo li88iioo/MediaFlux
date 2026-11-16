@@ -1,6 +1,7 @@
 """订阅原生纵切：真实 SQLite/确认账本/工作区，元数据与通知用既有替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from unittest.mock import AsyncMock, Mock
@@ -283,7 +284,7 @@ def test_python_shell_real_rpc_reads_full_record_then_stops_at_cold_confirmation
             code = (f'mf subscriptions.get --subscription-id {identifier} > facts.json\necho once > before\n'
                     f'mf subscriptions.{operation} --subscription-id {identifier}{options}\necho replayed > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == "subscriptions." + operation, result.outcome.public_content
             root, _ = sandbox._workspace_location(context.owner, context.session_id)

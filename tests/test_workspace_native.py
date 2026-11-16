@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import importlib.util
 import json
@@ -302,7 +303,7 @@ json.dump({"overview":result,"pages":pages},open("workspace.json","w"))
 print(sum(p["data"]["returned"] for p in pages))
 """
         result = await pipeline.execute(
-            sandbox.RUN_CODE_TOOL, {"code": code}, context=context
+            RUN_CODE_TOOL, {"code": code}, context=context
         )
         data = result.outcome.public_content["data"]
         assert data["exit_code"] == 0, data
@@ -315,7 +316,7 @@ print(sum(p["data"]["returned"] for p in pages))
             "diagnostics.search",
         ]
         saved = await pipeline.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": """import json
 r=json.load(open("workspace.json"))
@@ -340,7 +341,7 @@ print(ids)
         effects = Mock(side_effect=AssertionError("read handoff reached effects"))
         monkeypatch.setattr(pipeline, "prepare", effects)
         denied = await pipeline.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": """from mf import settings, skills, Error
 for method,args in [(settings.test_notification,{}),(skills.save,dict(name="blocked",description="blocked",content="blocked"))]:

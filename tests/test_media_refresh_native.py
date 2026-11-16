@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from copy import deepcopy
@@ -444,7 +445,7 @@ def test_refresh_agent_turn_delivers_answer_without_approval(backend, tmp_path, 
                                 effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
         catalog.register(sandbox.run_code_tool(pipeline))
         model = ScriptedModel([
-            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("refresh", sandbox.RUN_CODE_TOOL, {
+            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("refresh", RUN_CODE_TOOL, {
                 "code": f'from mf import media\nprint(media.refresh("movie-49", server={backend.server!r}, mode="replace"))',
             })), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
             [ModelEvent(ModelEventType.TEXT_DELTA, text="已提交覆盖元数据刷新。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
@@ -494,12 +495,12 @@ assert page["data"]["sources"][0]["items"][49]["id"]=="movie-49"
 assert len(episodes["data"]["episodes"])==651 and cli["data"]["offset"]==50
 json.dump(episodes,open("inventory.json","w"))
 print("full inventory saved")"""
-        result = await pipe.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=ctx)
+        result = await pipe.execute(RUN_CODE_TOOL, {"code": code}, context=ctx)
         assert result.outcome.public_content["data"]["exit_code"] == 0, (
             result.outcome.public_content
         )
         refreshed = await pipe.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": f"""from mf import media
 from pathlib import Path
@@ -520,7 +521,7 @@ Path("continued").write_text("refresh queued")"""
         assert not any(call.args[0].get("activity", {}).get("status") == "approval_required"
                        for call in ctx.report_progress.call_args_list)
         after = await pipe.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": """import json
 from pathlib import Path

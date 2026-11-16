@@ -1,5 +1,6 @@
 """RSS原生配置：真实分页、CAS、冷确认、取消和未知写回执。"""
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import os
@@ -280,7 +281,7 @@ def test_rss_rpc_cold_confirmation_and_full_result_file(tmp_path):
         )
         catalog.register(sandbox.run_code_tool(pipeline))
         result = await pipeline.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": f'from mf import rss\nv = rss.subscription({sid})["data"]\nprint(v["id"], len(v["exclude_keywords"]))'
             },

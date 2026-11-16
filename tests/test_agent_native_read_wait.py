@@ -9,7 +9,7 @@ from dataclasses import replace
 
 import pytest
 
-from app import config
+from app import config, sdk
 from app.agent import rate_limit
 from app.agent.feature_gate import initialize_runtime_fence
 from app.agent.kernel.bootstrap import _capture_creation_binding, build_agent_kernel_runtime
@@ -174,7 +174,7 @@ def test_native_wait_revoked_before_cold_resume(local_config, monkeypatch, entry
             config.set_and_save({"AGENT_LLM_MODEL": "changed-route"})
             fresh.session.continuation_binding = _capture_creation_binding()
         elif entry == "method_changed":
-            monkeypatch.setattr(sandbox, "METHOD_EFFECTS", {**sandbox.METHOD_EFFECTS, "diagnostics.component": "write"})
+            monkeypatch.setattr(sdk, "METHOD_EFFECTS", {**sdk.METHOD_EFFECTS, "diagnostics.component": "write"})
         elif entry == "new_user":
             await fresh.store.begin_turn(owner=OWNER, session_id=SESSION, request_id="new-user")
         else:

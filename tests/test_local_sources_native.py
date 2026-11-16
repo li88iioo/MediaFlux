@@ -1,6 +1,7 @@
 """本地来源纵切：真实 SQLite/CAS、原扫描回执及原生 Python/CLI 冷确认。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import importlib.util
 import json
@@ -356,7 +357,7 @@ def test_native_python_cli_full_read_then_cold_confirmation_without_script_repla
                     f'mf local.update_source --source-id {selected} --no-enabled\n'
                     'echo unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == "local.update_source", result.outcome.public_content
             assert plan.arguments == {"source_id": selected, "enabled": False}

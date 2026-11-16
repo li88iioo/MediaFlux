@@ -1,6 +1,7 @@
 """原生 recognition：真实 EffectExecutor、冻结确认、冷恢复和隔离 MF 工作区。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import time
@@ -207,7 +208,7 @@ def test_real_mf_workspace_reads_full_batches_and_save_stops_script_until_cold_c
                 "preview = mf.recognition.preview_release_format(**value)\n"
                 "json.dump({'parsed': parsed, 'preview': preview}, open('recognition.json', 'w'))\n"
                 "print(len(parsed['rows']), len(preview['rows']), preview['rows'][-1]['after']['episode'])\n")
-        read = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=context)
+        read = await pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=context)
         assert read.effect_plan is None
         data = read.outcome.public_content["data"]
         assert data["stdout"].strip() == "100 100 114" and data["exit_code"] == 0
@@ -219,7 +220,7 @@ def test_real_mf_workspace_reads_full_batches_and_save_stops_script_until_cold_c
                  "print(len(saved['parsed']['rows']), saved['preview']['rows'][-1]['after']['episode'], flush=True)\n"
                  f"mf.recognition.save_release_format(**json.loads({json.dumps(value, ensure_ascii=False)!r}))\n"
                  "open('should-not-run', 'w').write('bad')\n")
-        write = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": later}, context=context)
+        write = await pipeline.execute(RUN_CODE_TOOL, {"code": later}, context=context)
         assert write.effect_plan is not None and write.effect_plan.tool_name == SAVE
         assert write.outcome.public_content["data"]["stdout"].strip() == "100 114"
         assert formats.list_rules() == []
@@ -228,7 +229,7 @@ def test_real_mf_workspace_reads_full_batches_and_save_stops_script_until_cold_c
         assert (await rebuilt.execute_confirmed(write.effect_plan.plan_id, context=context)).outcome.public_content["ok"]
         assert len(formats.list_rules()) == 1
         rebuilt.catalog.register(sandbox.run_code_tool(rebuilt))
-        observed = await rebuilt.execute(sandbox.RUN_CODE_TOOL,
+        observed = await rebuilt.execute(RUN_CODE_TOOL,
             {"code": "import pathlib\nprint(pathlib.Path('should-not-run').exists())\n"}, context=context)
         assert observed.outcome.public_content["data"]["stdout"].strip() == "False"
     asyncio.run(check())
@@ -254,7 +255,7 @@ class TeachingModel:
             if self.save:
                 code += "mf.recognition.save_release_format(**value)\n"
             yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(
-                "teaching-workspace", sandbox.RUN_CODE_TOOL, {"code": code}))
+                "teaching-workspace", RUN_CODE_TOOL, {"code": code}))
             yield ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")
         else:
             trusted = any("可信系统结果" in message.content for message in request.messages)

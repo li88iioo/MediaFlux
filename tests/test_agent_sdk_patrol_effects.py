@@ -1,6 +1,7 @@
 """原生后台巡检沿真实 SQLite 单例、逐次运行记录和持久确认执行。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 from datetime import datetime
 from types import SimpleNamespace
@@ -249,7 +250,7 @@ def test_workspace_patrol_cold_confirmation_does_not_replay_script(scheduler, mo
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()), authorization=MediaFluxAuthorizationPolicy())
         catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''
 from pathlib import Path
 import json
 from mf import library

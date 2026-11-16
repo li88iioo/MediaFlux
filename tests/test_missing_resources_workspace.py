@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 from types import SimpleNamespace
 
@@ -144,7 +145,7 @@ def test_native_search_file_cli_cold_batch_confirmation_and_original_verificatio
             session="native-missing-session",
         )
         read = await first.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": """import json,subprocess
 from mf import resources
@@ -172,7 +173,7 @@ print(r["status"],p["workflows"][0]["source_tool"])
         expected_searches = 4 if precise_timeout else 2
         assert len(searches) == expected_searches and not writes
         prepared = await first.execute(
-            sandbox.RUN_CODE_TOOL,
+            RUN_CODE_TOOL,
             {
                 "code": """import json
 from mf import resources

@@ -1,6 +1,7 @@
 """原生规则纵切：公共事务CAS、真实ID、缓存、格式注册表与SQLite冷确认。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import os
@@ -397,7 +398,7 @@ def test_root_rpc_lists_real_ids_stops_at_card_and_does_not_replay_script(backen
                     'mf recognition.set_rule_enabled --rule-type tmdb_regex_rule --rule-id "$rule_id" --no-enabled\n'
                     'echo unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == "recognition.set_rule_enabled", result.outcome.public_content
             assert plan.arguments["rule_id"] == row["id"] and plan.arguments["rule_type"] == rule_type

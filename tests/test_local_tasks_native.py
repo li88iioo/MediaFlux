@@ -1,6 +1,7 @@
 """本地任务：真实ID、完整事实、原事务CAS、原生Python/CLI及冷确认。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import importlib.util
 import json
@@ -407,7 +408,7 @@ def test_native_read_complete_error_then_cold_retry_without_replaying_script(bac
             code = (f'mf local.tasks --scope failed --limit 1 > page.json\nmf local.task --task-id {selected} > facts.json\n'
                     'echo once > before\n' + f'mf local.retry --task-id {selected}\n' + 'echo unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == "local.retry", result.outcome.public_content
             assert plan.arguments == {"task_id": selected, "confirm_interrupted_write": False}

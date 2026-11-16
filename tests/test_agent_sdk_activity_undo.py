@@ -1,6 +1,7 @@
 """活动查询与补偿 SDK 的真实原生文件 IPC；后端只用内存模拟，不访问云端。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from unittest.mock import Mock
@@ -161,7 +162,7 @@ def test_root_sdk_file_ipc_query_receipt_cold_confirm_cancel_and_owner(
         pipeline = executor(store, cls=ToolPipeline)
         assert isinstance(pipeline, ToolPipeline)
         pipeline.catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''
 from pathlib import Path
 import json, subprocess
 from mf import activity

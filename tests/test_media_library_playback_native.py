@@ -1,6 +1,7 @@
 """原生观看读取：只替换HTTP边界，真实SDK、服务、用户选择和客户端解析。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 from dataclasses import replace
@@ -450,7 +451,7 @@ def test_native_workspace_keeps_preferences_recovers_parameters_and_saves_full_r
         context = await make_context(store, owner=owner)
         pipeline = ToolPipeline(catalog=ToolCatalog(), state_store=store)
         pipeline.catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''import json, subprocess
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''import json, subprocess
 from mf import library
 try:
     library.recommend(media_type="movie", limit=0)
@@ -467,7 +468,7 @@ print(result["items"][0]["id"], resume["items"][0]["id"], history["status"])
         assert data["stdout"].strip().splitlines() == ["修正参数", "allowed resume-real empty"]
         assert [call["ok"] for call in data["sdk_calls"]] == [False, True, True, True]
         assert result.effect_plan is None
-        saved = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''import json
+        saved = await pipeline.execute(RUN_CODE_TOOL, {"code": '''import json
 r=json.load(open("playback.json"))
 assert r["recommend"]["criteria"]["media_type"] == "movie"
 assert r["recommend"]["criteria"]["exclude"] == ["剧情"]

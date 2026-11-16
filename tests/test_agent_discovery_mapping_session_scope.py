@@ -1,6 +1,7 @@
 """真实映射身份沿原生 SDK 和持久确认账本流转，不再依赖候选序号上下文。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import threading
@@ -480,7 +481,7 @@ def test_real_workspace_resolves_full_candidates_and_cold_confirms_without_scrip
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()), authorization=MediaFluxAuthorizationPolicy())
         catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''
 from pathlib import Path
 import json
 from mf import media

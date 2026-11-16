@@ -1,6 +1,7 @@
 """识别知识原生切片：真实 SQLite、业务 CAS、冷确认与 Python/Shell 工作区。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import os
@@ -371,7 +372,7 @@ def test_native_python_cli_card_cold_confirmation_and_no_script_replay(backend, 
                     'mf recognition.create_knowledge --knowledge-type release_group --canonical-value ScriptTeam\n'
                     'echo unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == "recognition.create_knowledge", result.outcome.public_content
             root, _ = sandbox._workspace_location(context.owner, context.session_id)
@@ -395,7 +396,7 @@ def test_native_python_cli_card_cold_confirmation_and_no_script_replay(backend, 
             assert not (root / "work/after").exists()
             with pytest.raises(ToolPipelineError):
                 await executor().execute_confirmed(plan.plan_id, context=context)
-            reread = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": 'mf recognition.knowledge --keyword ScriptTeam', "language": "shell"}, context=context)
+            reread = await pipeline.execute(RUN_CODE_TOOL, {"code": 'mf recognition.knowledge --keyword ScriptTeam', "language": "shell"}, context=context)
             assert reread.outcome.public_content["data"]["exit_code"] == 0
             payload = json.loads(reread.outcome.public_content["data"]["stdout"])
             assert payload["total"] == (0 if outcome == "cancel" else 1)

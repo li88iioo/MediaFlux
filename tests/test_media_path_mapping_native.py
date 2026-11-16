@@ -1,6 +1,7 @@
 """路径映射原生纵切：自然键、真实文件CAS、SQLite冷确认与有界Web并发。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import socket
@@ -273,7 +274,7 @@ def test_real_python_cli_cold_confirmation_stops_script_and_never_replays(backen
                     'mf library.create_path_mapping --server jellyfin --local-path /媒体/strm --server-path //NAS/媒体\n'
                     'echo unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == "library.create_path_mapping", result.outcome.public_content
             assert sdk.library.path_mappings("jellyfin")["count"] == 0
@@ -303,7 +304,7 @@ def test_real_python_cli_cold_confirmation_stops_script_and_never_replays(backen
             with pytest.raises(ToolPipelineError):
                 await executor().execute_confirmed(plan.plan_id, context=context)
             assert not (root / "work/after").exists()
-            reread = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": "shell",
+            reread = await pipeline.execute(RUN_CODE_TOOL, {"language": "shell",
                 "code": 'mf library.path_mappings --server jellyfin'}, context=context)
             assert reread.outcome.public_content["data"]["exit_code"] == 0
             expected = 0 if outcome in {"cancel", "drift"} else 1
@@ -313,7 +314,7 @@ def test_real_python_cli_cold_confirmation_stops_script_and_never_replays(backen
                     'mf library.update_path_mapping --server jellyfin --local-path /媒体/strm --server-path D:/Media',
                     'mf library.delete_path_mapping --server jellyfin --local-path /媒体/strm',
                 ):
-                    next_result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": "shell", "code": command}, context=context)
+                    next_result = await pipeline.execute(RUN_CODE_TOOL, {"language": "shell", "code": command}, context=context)
                     next_plan = next_result.effect_plan
                     assert next_plan is not None
                     await executor().execute_confirmed(next_plan.plan_id, context=context)

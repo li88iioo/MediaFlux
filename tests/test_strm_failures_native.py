@@ -1,6 +1,7 @@
 """STRM 失败事实 → 原生 Python/CLI → 原 SQLite 确认 → 公共重试；只替换云盘边界。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import importlib.util
 import json
@@ -341,7 +342,7 @@ def test_real_native_workspace_reads_full_facts_then_cold_confirms_selected_ids(
                 'open("/work/failures.json", "w").write(json.dumps(page, ensure_ascii=False))\n'
                 'print(json.dumps(page, ensure_ascii=False))\n') if language == "python" else (
                     'mf strm.failures --status open --limit 2 > /work/failures.json\ncat /work/failures.json\n')
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
+        result = await pipeline.execute(RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
         data = result.outcome.public_content["data"]
         assert result.outcome.public_content["ok"] and data["exit_code"] == 0, data
         page = json.loads(data["stdout"])["data"]
@@ -361,7 +362,7 @@ def test_real_native_workspace_reads_full_facts_then_cold_confirms_selected_ids(
                     'python -c \'import json; p=json.load(open("/work/failures.json")); '
                     'print(json.dumps([p["data"]["items"][0]["id"]]))\' > /work/ids.json\n'
                     'mf strm.retry_failures --ids @/work/ids.json\n')
-        proposed = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
+        proposed = await pipeline.execute(RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
         plan = proposed.effect_plan
         assert plan is not None and plan.arguments == {"ids": [ids[-1]]}
         assert not backend.client.list_calls

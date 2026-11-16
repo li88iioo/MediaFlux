@@ -1,6 +1,7 @@
 """新前台目标可选择任务；同一任务仍受跨回合累计预算约束。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import socket
@@ -73,8 +74,8 @@ open('/work/continued', 'w').write('continued after deadline')
 mf.media.search('after')'''
         observed = []
         agent, model = session(task_store, [calls(
-            (sandbox.RUN_CODE_TOOL, {"code": code, "timeout_seconds": 5}),
-            (sandbox.RUN_CODE_TOOL, {"code": "open('/work/next-call', 'w').write('ran')"}),
+            (RUN_CODE_TOOL, {"code": code, "timeout_seconds": 5}),
+            (RUN_CODE_TOOL, {"code": "open('/work/next-call', 'w').write('ran')"}),
             (READ, {}),
         ), final("不应再请求模型伪造成功")], observed)
         events = await asyncio.wait_for(collect(agent.run(AgentInput(
@@ -127,7 +128,7 @@ def test_native_rpc_rechecks_budget_without_recharging_attempts(task_store, nati
     async def run():
         before = await old_task(task_store, exhaust="none")
         monkeypatch.setattr(AgentTurn, "reserve_budget", counted)
-        agent, model = session(task_store, [calls((sandbox.RUN_CODE_TOOL, {
+        agent, model = session(task_store, [calls((RUN_CODE_TOOL, {
             "code": "for query in ('one', 'two', 'three'):\n    print(mf.media.search(query))",
         })), final()])
         events = await collect(agent.run(AgentInput(message=GOAL, owner=OWNER, session_id=SID)))
@@ -158,7 +159,7 @@ def test_sdk_business_error_with_budget_code_remains_catchable(task_store, nativ
 
     async def run():
         await old_task(task_store, exhaust="none")
-        agent, model = session(task_store, [calls((sandbox.RUN_CODE_TOOL, {"code": '''try:
+        agent, model = session(task_store, [calls((RUN_CODE_TOOL, {"code": '''try:
     mf.media.search('retry')
 except mf.Error as exc:
     assert exc.code == 'active_time_budget_exceeded'

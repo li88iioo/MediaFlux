@@ -1,6 +1,7 @@
 """原生反代管理：真实SQLite/SDK/文件IPC；运行时与上游HTTP仅用替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import concurrent.futures
 import importlib.util
@@ -434,7 +435,7 @@ def test_native_python_cli_full_fact_files_to_cold_confirmation(backend, tmp_pat
                     'python -c \'import json; p=json.load(open("/work/instances.json")); print(p["data"]["instances"][0]["instance_id"])\' > /work/id.txt\n'
                     'mf playback.failures --instance-id "$(cat /work/id.txt)" > /work/failures.json\n'
                     'python -c \'import json; p=json.load(open("/work/failures.json")); print(json.dumps({"instance_id":p["data"]["instance_id"],"returned":p["data"]["returned"]}))\'\n')
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
+        result = await pipeline.execute(RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
         public = result.outcome.public_content
         assert public["ok"] and public["data"]["exit_code"] == 0, public
         observed = json.loads(public["data"]["stdout"])
@@ -454,7 +455,7 @@ def test_native_python_cli_full_fact_files_to_cold_confirmation(backend, tmp_pat
                 'instance = json.load(open("/work/instances.json"))\n'
                 'playback.restart(instance["instance_id"])\n') if language == "python" else (
                     'mf playback.restart --instance-id "$(cat /work/id.txt)"\n')
-        proposal = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
+        proposal = await pipeline.execute(RUN_CODE_TOOL, {"language": language, "code": code}, context=context)
         plan = proposal.effect_plan
         assert plan is not None and plan.arguments == {"instance_id": target}
         backend.clear.assert_not_called()

@@ -1,6 +1,7 @@
 """原生下载诊断的目录和真实隔离工作区文件 IPC；qB HTTP 后端仅用内存替身。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import importlib.util
 import json
@@ -78,7 +79,7 @@ def test_download_diagnosis_runs_through_real_sdk_file_ipc(
         catalog = ToolCatalog([download_diagnose_tool()])
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store)
         catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": (
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": (
             "import json\nfrom mf import downloads\n"
             "print(json.dumps(downloads.diagnose(), ensure_ascii=False))\n"
         )}, context=context)

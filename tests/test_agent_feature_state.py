@@ -1,6 +1,7 @@
 """功能配置纵切：真实配置/SQLite、原确认、CAS、reload 与离线工作区。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import os
@@ -318,7 +319,7 @@ def test_root_rpc_reads_features_and_stops_at_one_confirmation(backend, language
                 'python -c \'import json;assert any(row["feature"]=="discovery" for row in json.load(open("features.json"))["features"])\'\n'
                 'echo once > before\nmf settings.set_feature --feature discovery --enabled\necho unexpected > after')
         try:
-            result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
+            result = await pipeline.execute(RUN_CODE_TOOL, {"code": code, "language": language}, context=context)
             plan = result.effect_plan
             assert plan is not None and plan.tool_name == WRITE, result.outcome.public_content
             root, _ = sandbox._workspace_location(context.owner, context.session_id)

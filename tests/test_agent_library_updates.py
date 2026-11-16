@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import json
 import threading
 import time
@@ -860,7 +861,7 @@ assert len(result["data"]["items"]) == 31 and result["data"]["items"][-1]["query
 assert result["status"] == "partial" and result["data"]["items"][-1]["status"] == "inconclusive"
 Path("full-updates.json").write_text(json.dumps(result))
 print("31 complete rows saved")'''
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=context)
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": code}, context=context)
         assert result.outcome.public_content["data"]["exit_code"] == 0, result.outcome.public_content
         saved = json.loads((root / "work/full-updates.json").read_text())
         assert saved["data"]["counts"] == {"requested": 31, "updates_available": 30, "up_to_date": 0, "uncertain": 1}
@@ -869,7 +870,7 @@ print("31 complete rows saved")'''
         archived = [json.loads(path.read_text()) for path in (root / "output").glob("*.sdk.json")]
         batch = next(row["result"] for row in archived if row.get("arguments", {}).get("queries") == [f"Show{i}" for i in range(31)])
         assert batch == saved and len(json.dumps(saved)) > 24_000
-        later = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": 'import json\nr=json.load(open("full-updates.json"))\nassert r["data"]["items"][-1]["query"]=="Show30"\nprint(len(r["data"]["items"]))'}, context=context)
+        later = await pipeline.execute(RUN_CODE_TOOL, {"code": 'import json\nr=json.load(open("full-updates.json"))\nassert r["data"]["items"][-1]["query"]=="Show30"\nprint(len(r["data"]["items"]))'}, context=context)
         assert later.outcome.public_content["data"]["exit_code"] == 0
     with patch("socket.socket.connect", side_effect=AssertionError("external network forbidden")):
         asyncio.run(run())
@@ -907,7 +908,7 @@ def test_native_updates_cancel_archives_only_completed_batch_facts(native_update
     episode_audit.reset_episode_audit_cache_for_tests()
     async def run():
         pipeline, context, root = await native_updates_runtime()
-        task = asyncio.create_task(pipeline.execute(sandbox.RUN_CODE_TOOL, {"timeout_seconds": 2, "code":
+        task = asyncio.create_task(pipeline.execute(RUN_CODE_TOOL, {"timeout_seconds": 2, "code":
             'from mf import library\nlibrary.updates(queries=["Fast"]+[f"Slow{i}" for i in range(30)], media_type="tv", as_of="2026-08-01")'}, context=context))
         try:
             assert await asyncio.to_thread(checkpointed.wait, 3)
@@ -937,7 +938,7 @@ def test_native_updates_cancel_archives_only_completed_batch_facts(native_update
         assert archived[0].read_bytes() == snapshot  # 取消后的在途读取不能覆写归档。
         cold, following, _ = await native_updates_runtime()
         code = 'import json\nfrom pathlib import Path\nr=json.load(next(Path("/output").glob("*.sdk.json")).open())\nassert r["result"]["data"]["items"][0]["missing_count"]==2\nprint("completed facts restored")'
-        result = await cold.execute(sandbox.RUN_CODE_TOOL, {"code": code}, context=following)
+        result = await cold.execute(RUN_CODE_TOOL, {"code": code}, context=following)
         assert result.outcome.public_content["data"]["exit_code"] == 0
     with patch("socket.socket.connect", side_effect=AssertionError("external network forbidden")):
         asyncio.run(run())

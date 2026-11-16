@@ -1,6 +1,7 @@
 """连接SDK的原生工作区、CLI和完整结果回读；HTTP替身，无真实服务器。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import importlib.util
 import json
@@ -89,7 +90,7 @@ def test_native_connection_api_cli_recovers_errors_and_saves_full_identity(conne
             turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
         pipeline = ToolPipeline(catalog=ToolCatalog(), state_store=store)
         pipeline.catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''import json, subprocess
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''import json, subprocess
 from mf import library
 try:
     library.connection(server="plex")
@@ -109,7 +110,7 @@ print(single["data"]["nodes"][0]["server_name"],both["status"])
         assert [(call["ok"], call["status"]) for call in data["sdk_calls"]] == [
             (False, "ValueError"), (False, "http_error"), (True, "healthy"), (True, "healthy")]
         assert result.effect_plan is None
-        saved = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''import json
+        saved = await pipeline.execute(RUN_CODE_TOOL, {"code": '''import json
 r=json.load(open("connection.json"))
 n=r["single"]["data"]["nodes"][0]
 assert n["product_name"]=="Jellyfin Server" and n["product"]=="jellyfin"

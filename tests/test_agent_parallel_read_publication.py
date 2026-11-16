@@ -1,4 +1,5 @@
 """真实SQLite会话文件锁争用控制：网络/模型为脚本，不伪造引用写入结果。"""
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import socket
@@ -56,9 +57,9 @@ from concurrent.futures import ThreadPoolExecutor
 with ThreadPoolExecutor(max_workers=4) as pool:
     values = list(pool.map(mf.media.search, ['0', '1', '2', '3']))
 print(json.dumps(values))'''
-        model = ScriptedModel([calls((sandbox.RUN_CODE_TOOL, {"code": code, "timeout_seconds": 10})), final()])
+        model = ScriptedModel([calls((RUN_CODE_TOOL, {"code": code, "timeout_seconds": 10})), final()])
         session = AgentSession(model=model, catalog=catalog, pipeline=pipeline, state_store=task_store,
-                               journal=task_store, model_tools=[sandbox.RUN_CODE_TOOL])
+                               journal=task_store, model_tools=[RUN_CODE_TOOL])
         session.continuation_binding = _capture_creation_binding()
         events = [event async for event in session.run(AgentInput(
             owner=OWNER, session_id=SID, message="继续查询这四项", request_id="four-sdk-events"))]

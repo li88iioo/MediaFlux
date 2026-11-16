@@ -1,6 +1,7 @@
 """整理原生确认：离线 provider + 真实 SQLite、单飞管理器和工作区 RPC。"""
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import json
 import socket
@@ -252,7 +253,7 @@ def test_workspace_coldconfirm_keeps_preview_and_never_replays_script(backend, m
         pipeline = ToolPipeline(catalog=catalog, state_store=store, reference_store=store,
             effect_store=ConfirmationEffectPlanStore(SQLiteConfirmationStore()), authorization=MediaFluxAuthorizationPolicy())
         catalog.register(sandbox.run_code_tool(pipeline))
-        result = await pipeline.execute(sandbox.RUN_CODE_TOOL, {"code": '''
+        result = await pipeline.execute(RUN_CODE_TOOL, {"code": '''
 from pathlib import Path
 import json
 from mf import cloud

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.agent.kernel.tool_calls import RUN_CODE_TOOL
 import asyncio
 import threading
 from copy import deepcopy
@@ -611,7 +612,7 @@ def test_native_python_cli_complete_read_to_sqlite_cold_confirmation_without_scr
         )
         try:
             result = await pipeline.execute(
-                sandbox.RUN_CODE_TOOL,
+                RUN_CODE_TOOL,
                 {
                     "code": python if language == "python" else shell,
                     "language": language,
