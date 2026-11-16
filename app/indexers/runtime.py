@@ -48,7 +48,7 @@ def source_readiness(*, scope: str = "manual") -> dict[str, Any]:
     data: dict[str, Any] = {
         "probe_mode": "local", "scope": scope,
         "network_accessed": False, "filesystem_accessed": False,
-        "indexer_enabled": None,
+        "indexer_enabled": True,
         "counts": {"registered": 0, "enabled": 0, "searchable": 0, "downloadable": 0, "attention": 0},
         "transport": {"mode": "direct", "outbound_proxy_applied": False},
         "sites": [], "configuration": None,
@@ -56,9 +56,6 @@ def source_readiness(*, scope: str = "manual") -> dict[str, Any]:
     try:
         from .config import site_configuration
         data["configuration"] = site_configuration()
-        data["indexer_enabled"] = config.get_bool("INDEXER_SEARCH_ENABLED")
-        if not data["indexer_enabled"]:
-            return {"ok": True, "status": "disabled", **data}
         service = get_indexer_service()
         registered = tuple(service.registry.ids())
         enabled = set(service.site_ids_for_scope(scope))

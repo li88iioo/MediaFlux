@@ -540,7 +540,6 @@ class IndexerReceivingSourceTests(unittest.TestCase):
         with (
             patch("app.modules.offline.OfflineRules.from_config", return_value=replace(OfflineRules.from_config(), target_dir_id="normal", target_dir_name="Inbox", secondary_enabled=False)),
             patch("app.modules.organize_sources.list_nsfw_download_sources", return_value=[{"id": "special", "name": "FixtureSpecial"}]),
-            patch("app.modules.missing_resources.config.get_bool", return_value=True),
             patch("app.indexers.runtime.get_indexer_service", return_value=service),
             patch("app.indexers.downloads.download_target_readiness", return_value={"guangya": True}),
         ):

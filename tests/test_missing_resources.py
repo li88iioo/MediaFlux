@@ -146,7 +146,6 @@ def audit_for(query="Show", season=1, episodes=range(1, 12), *, identity="12345"
 def backend(monkeypatch):
     service = FakeIndexerService(result_store=IndexerResultStore())
     monkeypatch.setattr(actions, "get_indexer_service", lambda: service)
-    monkeypatch.setattr(actions.config, "get_bool", lambda *_: True)
     monkeypatch.setattr(actions, "get_media_preferences", lambda _: {})
     capture = Mock(return_value="workflow-test-id")
     monkeypatch.setattr(
@@ -173,6 +172,13 @@ def backend(monkeypatch):
     service.search_media = AsyncMock(side_effect=search)
     with sdk.call_owner("viewer"):
         yield SimpleNamespace(service=service, audit=audit, capture=capture)
+
+
+def test_page_switch_does_not_disable_agent_missing_search(backend, monkeypatch):
+    monkeypatch.setenv("INDEXER_SEARCH_ENABLED", "0")
+    result = sdk.resources.search_missing([{"query": "Show", "season": 1, "episodes": [1]}])
+    assert result["ok"] and result["status"] == "success"
+    backend.service.search_media.assert_awaited_once()
 
 
 def test_native_unified_method_refreshes_once_and_reuses_shared_search(backend):

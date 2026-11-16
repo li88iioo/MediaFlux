@@ -13,7 +13,6 @@ from dataclasses import asdict, replace
 from datetime import date, datetime
 from typing import Any
 
-from app import config
 from app import database as db
 from app.database import media_owner_digest
 from app.indexers.models import IndexerMediaSearchRequest
@@ -262,7 +261,7 @@ def _season(
             "request": asdict(current),
             "items": [],
             "ok": False,
-            "status": "disabled",
+            "status": "unavailable",
             "partial": True,
             "has_more": None,
             "complete": False,
@@ -270,50 +269,49 @@ def _season(
             "errors": [],
             "truncated": False,
         }
-        if config.get_bool("INDEXER_SEARCH_ENABLED"):
-            try:
-                result = run_indexer_awaitable_sync(
-                    service.search_media(
-                        current,
-                        sites,
-                        scope="agent",
-                        timeout_seconds=max(0.001, timeout - min(0.25, timeout / 10)),
-                    ),
-                    timeout_seconds=timeout,
-                    cancelled=cancelled,
-                )
-                raw.update(
-                    search_payload(service, result), ok=bool(result.sites_succeeded)
-                )
-                raw["status"] = (
-                    "partial"
-                    if raw["partial"]
-                    else "success"
-                    if raw["items"]
-                    else "empty"
-                    if raw["ok"]
-                    else "unavailable"
-                )
-            except InterruptedError:
-                raw["status"] = "cancelled"
-                group["stop_reason"] = "cancelled"
-            except Exception as exc:  # noqa: BLE001 - 单次外部查询失败不能清空此前结果。
-                logger.warning("缺集资源单次检索失败 type=%s", type(exc).__name__)
-                raw.update(
-                    status=getattr(
-                        exc,
-                        "code",
-                        "timeout" if isinstance(exc, TimeoutError) else "unavailable",
-                    ),
-                    errors=[
-                        {
-                            "code": getattr(exc, "code", "unavailable"),
-                            "message": getattr(
-                                exc, "public_message", "资源检索当前不可用"
-                            ),
-                        }
-                    ],
-                )
+        try:
+            result = run_indexer_awaitable_sync(
+                service.search_media(
+                    current,
+                    sites,
+                    scope="agent",
+                    timeout_seconds=max(0.001, timeout - min(0.25, timeout / 10)),
+                ),
+                timeout_seconds=timeout,
+                cancelled=cancelled,
+            )
+            raw.update(
+                search_payload(service, result), ok=bool(result.sites_succeeded)
+            )
+            raw["status"] = (
+                "partial"
+                if raw["partial"]
+                else "success"
+                if raw["items"]
+                else "empty"
+                if raw["ok"]
+                else "unavailable"
+            )
+        except InterruptedError:
+            raw["status"] = "cancelled"
+            group["stop_reason"] = "cancelled"
+        except Exception as exc:  # noqa: BLE001 - 单次外部查询失败不能清空此前结果。
+            logger.warning("缺集资源单次检索失败 type=%s", type(exc).__name__)
+            raw.update(
+                status=getattr(
+                    exc,
+                    "code",
+                    "timeout" if isinstance(exc, TimeoutError) else "unavailable",
+                ),
+                errors=[
+                    {
+                        "code": getattr(exc, "code", "unavailable"),
+                        "message": getattr(
+                            exc, "public_message", "资源检索当前不可用"
+                        ),
+                    }
+                ],
+            )
         group["searches"].append(raw)
         if group["stop_reason"] == "cancelled":
             progress(group)

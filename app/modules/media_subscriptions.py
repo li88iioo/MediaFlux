@@ -885,7 +885,7 @@ class MediaSubscriptionService:
                 result, detail, targets = await self._check_tv(row, cancel_event=cancel_event, identity_batch=identity_batch)
             else:
                 result, detail, targets = await self._check_movie(row, cancel_event=cancel_event, identity_batch=identity_batch)
-            if targets and str(row["action"]) != "notify" and config.get_bool("INDEXER_SEARCH_ENABLED"):
+            if targets and str(row["action"]) != "notify":
                 service = get_indexer_service()
                 sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service) if tv else None
                 if tv:
@@ -1651,8 +1651,6 @@ class MediaSubscriptionService:
         max_search_episodes: int,
         limit_per_media: int,
     ) -> dict[str, Any]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
-            return self._empty_preview_search("disabled")
         service = get_indexer_service()
         sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service)
         targets = sorted(
@@ -1720,8 +1718,6 @@ class MediaSubscriptionService:
         *,
         limit_per_media: int,
     ) -> dict[str, Any]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
-            return self._empty_preview_search("disabled")
         service = get_indexer_service()
         aggregated = await self._search_resources(
             row, detail, service,

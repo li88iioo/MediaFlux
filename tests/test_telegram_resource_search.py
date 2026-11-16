@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import time
 import unittest
 from types import CoroutineType, SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from tests.support import FakeTelegramBot, fake_telebot_types
 
@@ -102,22 +103,19 @@ def _sites() -> list[dict[str, Any]]:
 
 
 class TelegramIndexerWorkerTests(unittest.TestCase):
-    def test_search_rejects_disabled_indexer_before_starting_worker(self):
+    def test_page_switch_does_not_disable_telegram_search(self):
         worker = TelegramIndexerWorker()
-
-        with (
-            patch(
-                "app.modules.telegram_resource_search.config.get_bool",
-                return_value=False,
-            ),
-            patch.object(worker, "_call") as call,self.assertRaisesRegex(
-            TelegramResourceSearchError, "资源站搜索当前已关闭"
+        service = Mock()
+        service.search_media = AsyncMock(
+            return_value=AggregatedIndexerResult("Frieren", 1, [], (), (), [], False, False, False)
         )
-        ):
-            worker.search("Frieren")
-
-        call.assert_not_called()
-        self.assertIsNone(worker._thread)
+        def call(factory, **_):
+            return asyncio.run(factory(service))
+        with patch.dict(os.environ, {"INDEXER_SEARCH_ENABLED": "0"}), patch.object(
+            worker, "_call", side_effect=call,
+        ), patch("app.modules.telegram_resource_search._search_snapshot", return_value={"ok": True}):
+            self.assertEqual(worker.search("Frieren"), {"ok": True})
+        service.search_media.assert_awaited_once()
 
     def test_call_closes_coroutine_when_threadsafe_submission_fails(self):
         worker = TelegramIndexerWorker()

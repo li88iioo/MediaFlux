@@ -313,8 +313,6 @@ def _receiving_folders(snapshot: dict) -> list[str]:
 
 def preview_indexer_download_batch(service, result_ids: list[str], target: str, *, scope: str = "manual") -> tuple[dict, dict]:
     """公开预览与冻结事实共用一次采集；不解析资源、不创建下载请求。"""
-    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
-        return {"ok": False, "status": "disabled", "summary": "资源检索功能已关闭", "data": {}, "error": "资源检索功能未启用。"}, {}
     try:
         snapshot = preflight_indexer_download_batch(service, result_ids, target, scope=scope)
         snapshots = snapshot["resources"]

@@ -1707,9 +1707,6 @@ def _register_commands(bot, telebot):
                 "搜索完成后，可直接回复“下载第 2 个”。",
             )
             return
-        if not get_bool("INDEXER_SEARCH_ENABLED"):
-            _reply_to_source(bot,msg, "资源站搜索当前已关闭，请先在设置中启用")
-            return
         progress = TelegramProgress(
             bot,
             telebot,

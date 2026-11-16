@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -48,6 +49,17 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         runtime.unbind_indexer_event_loop()
         runtime._service = None
+
+    def test_agent_readiness_uses_sites_when_page_search_is_hidden(self):
+        from tests.test_agent_indexer_actions import FakeIndexerService
+
+        with patch.dict(os.environ, {"INDEXER_SEARCH_ENABLED": "0"}), patch.object(
+            runtime, "get_indexer_service", return_value=FakeIndexerService(),
+        ):
+            result = runtime.source_readiness(scope="agent")
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["indexer_enabled"])
+        self.assertEqual(result["counts"]["searchable"], 1)
 
     def test_build_service_adds_sukebei_only_once_when_enabled(self):
         registry = FakeRegistry()
@@ -324,6 +336,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def test_standalone_process_exit_closes_browser_session_before_executor(self):
         script = """
 import asyncio
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace

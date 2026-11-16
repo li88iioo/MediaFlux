@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1142,7 +1143,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.sites_attempted, ("sukebei",))
 
-    async def test_global_disable_blocks_search_and_existing_result_resolution(self):
+    async def test_page_disable_keeps_agent_search_and_existing_result_resolution(self):
         adapter = FakeAdapter("nyaa")
         service = self.service([adapter], enabled_site_ids=("nyaa",))
         stored_id = self.store.put(
@@ -1153,16 +1154,15 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch("app.indexers.service.config.get_bool", return_value=False):
-            with self.assertRaises(IndexerValidationError):
-                await service.search("query", scope="agent")
-            with self.assertRaises(IndexerValidationError):
-                service.get_result(stored_id, scope="agent")
-            with self.assertRaises(IndexerValidationError):
-                await service.resolve(stored_id, scope="agent")
+        with patch.dict(os.environ, {"INDEXER_SEARCH_ENABLED": "0"}):
+            result = await service.search("query", scope="agent")
+            self.assertEqual(result.sites_succeeded, ("nyaa",))
+            self.assertEqual(service.get_result(stored_id, scope="agent").title, "Stored")
+            _, resolved = await _resolve(service, stored_id, scope="agent")
+            self.assertEqual(resolved.kind, "magnet")
 
-        self.assertEqual(adapter.calls, 0)
-        self.assertEqual(adapter.resolve_calls, [])
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(len(adapter.resolve_calls), 1)
 
     async def test_existing_result_resolution_uses_current_scope_not_creation_scope(self):
         ordinary = FakeAdapter("nyaa")
@@ -1866,7 +1866,7 @@ class PublicSiteSelectionTests(unittest.TestCase):
         registry = IndexerRegistry({"nyaa": FakeAdapter("nyaa"), "sukebei": FakeAdapter("sukebei")})
         service = IndexerService(registry=registry, result_store=IndexerResultStore(),
                                  enabled_site_ids=("nyaa",), sukebei_authorized=False)
-        with patch("app.indexers.service.config.get_bool", return_value=True):
+        with patch.dict(os.environ, {"INDEXER_SEARCH_ENABLED": "0"}):
             for scope in ("manual", "agent"):
                 with self.subTest(scope=scope):
                     self.assertEqual(service.select_sites(["NYAA", "nyaa"], scope=scope), ("nyaa",))
@@ -1876,8 +1876,3 @@ class PublicSiteSelectionTests(unittest.TestCase):
                         self.assertEqual(caught.exception.code, "validation_error")
                         self.assertEqual(caught.exception.public_message,
                                          "未选择可用资源站点，请在设置中重新选择" if not requested else "搜索参数无效")
-        with patch("app.indexers.service.config.get_bool", return_value=False):
-            with self.assertRaises(IndexerValidationError) as caught:
-                service.select_sites(None, scope="agent")
-            self.assertEqual((caught.exception.code, caught.exception.public_message),
-                             ("validation_error", "资源检索功能已关闭"))

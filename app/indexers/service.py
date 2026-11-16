@@ -11,7 +11,6 @@ from time import perf_counter
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-from app import config
 from app.clients.http import HttpError, HttpInvalidResponse, HttpSecurityError
 from app.logger import get_logger
 from app.modules.media_probe import release_dynamic_range_evidence
@@ -867,11 +866,6 @@ class IndexerService:
     def site_ids_for_scope(self, scope: str = "manual") -> tuple[str, ...]:
         """返回该服务端调用入口当前可用的站点白名单。"""
         normalized_scope = self._normalize_scope(scope)
-        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
-            raise IndexerValidationError(
-                "indexer search is disabled",
-                public_message="资源检索功能已关闭",
-            )
         registered = tuple(self.registry.ids())
         if normalized_scope == "manual":
             allowed = self.enabled_site_ids

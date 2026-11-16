@@ -4,6 +4,7 @@ from __future__ import annotations
 from tests.support import seed_media_subscription_candidates
 
 import asyncio
+import os
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -170,7 +171,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                     self.assertEqual(event["failure_stage"], "search")
                     self.assertNotIn("sensitive-value", " ".join(logs.output))
 
-    def test_four_search_paths_keep_the_same_normalized_requests(self):
+    def test_four_search_paths_keep_requests_when_page_search_is_hidden(self):
         from app.indexers.models import (
             AggregatedIndexerResult,
             IndexerItem,
@@ -197,7 +198,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
                                                     media=request, fallback_query=request.title)]
                     return response
                 indexer = SimpleNamespace(media_site_route=lambda **_: ["site"], search_media=AsyncMock(side_effect=search))
-                with patch("app.modules.media_subscriptions.config.get_bool", return_value=True), patch(
+                with patch.dict(os.environ, {"INDEXER_SEARCH_ENABLED": "0"}), patch(
                     "app.modules.media_subscriptions.get_indexer_service", return_value=indexer
                 ), patch("app.modules.media_subscriptions.run_indexer_awaitable", new=run):
                     if media_type == "tv":
