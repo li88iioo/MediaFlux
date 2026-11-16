@@ -751,6 +751,106 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 self.assertEqual(stats["generated"], 1)
                 self.assertEqual([row["file_id"] for row in rows], ["winner"])
 
+    def test_smaller_or_tied_incremental_duplicate_preserves_full_scan_winner(self):
+        for size, winner_id, duplicate_id in ((300, "large", "small"), (100, "a", "z")):
+            with self.subTest(winner=winner_id), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                winner = GuangYaFile(winner_id, "Movie.mkv", False, size, "winner", "source")
+                duplicate = GuangYaFile(duplicate_id, "Movie.mp4", False, 100, "duplicate", "source")
+                options = dict(source_dir_id="source", base_url="http://media.invalid", strm_root=root,
+                               video_exts={"mkv", "mp4"})
+                full_client = _TreeClient({"source": [duplicate, winner]})
+                sync_strm(**options, client=cast(GuangYaClient, full_client))
+                target = Path(root) / STRM_SUBDIR / "Movie.strm"
+                before = (target.read_bytes(), target.stat().st_mtime_ns)
+                strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
+                client = _IncrementalClient({item.file_id: item for item in (duplicate, winner)})
+                for _ in range(2):
+                    stats = sync_strm_incremental(**options, changes=[{
+                        "source_id": "source", "file_id": duplicate.file_id,
+                    }], client=cast(GuangYaClient, client))
+                    self.assertFalse(stats["fallback_required"], stats)
+                    self.assertEqual(stats["generated"], 0)
+                    self.assertEqual(stats["duplicates_skipped"], 1)
+                    self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+                    self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index("guangya:source")], [winner_id])
+                    self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+                self.assertEqual(client.list_calls, 0)
+                self.assertEqual(sync_strm(**options, client=cast(GuangYaClient, full_client))["generated"], 0)
+
+    def test_incremental_uses_live_conflict_instead_of_stale_index_size(self):
+        for state in ("deleted", "renamed", "smaller", "moved", "unreadable"):
+            with self.subTest(state=state), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                old = GuangYaFile("old", "Movie.mkv", False, 300, "old", "source")
+                new = GuangYaFile("new", "Movie.mp4", False, 100, "new", "source")
+                options = dict(source_dir_id="source", base_url="http://media.invalid", strm_root=root,
+                               video_exts={"mkv", "mp4"})
+                sync_strm(**options, client=cast(GuangYaClient, _TreeClient({"source": [old]})))
+                target = Path(root) / STRM_SUBDIR / "Movie.strm"
+                before = target.read_bytes()
+                files = {"new": new}
+                if state != "deleted":
+                    files["old"] = GuangYaFile("old", "Other.mkv" if state == "renamed" else "Movie.mkv",
+                                               False, 50 if state == "smaller" else 300, "fresh",
+                                               "elsewhere" if state == "moved" else "source")
+                client = _IncrementalClient(files)
+                original_info = client.file_info
+
+                def read_info(file_id):
+                    if state == "unreadable" and file_id == "old":
+                        raise OSError("isolated conflict lookup unavailable")
+                    return original_info(file_id)
+
+                with patch.object(client, "file_info", side_effect=read_info):
+                    stats = sync_strm_incremental(**options, changes=[{
+                        "source_id": "source", "file_id": "new",
+                    }], client=cast(GuangYaClient, client))
+                uncertain = state in {"unreadable", "moved"}
+                self.assertEqual(stats["fallback_required"], uncertain)
+                self.assertEqual(stats["generated"], 0 if uncertain else 1)
+                self.assertEqual(target.read_bytes() == before, uncertain)
+                self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index("guangya:source")],
+                                 ["old"] if uncertain else ["new"])
+
+    def test_incremental_better_candidate_or_changed_filter_replaces_existing_winner(self):
+        for reason in ("larger", "same-size-id", "old-type-excluded"):
+            with self.subTest(reason=reason), isolated_test_database(), tempfile.TemporaryDirectory() as root:
+                old = GuangYaFile("z", "Movie.mkv", False, 100, "old", "source")
+                new = GuangYaFile("a", "Movie.mp4", False, 200 if reason == "larger" else 100, "new", "source")
+                options = dict(source_dir_id="source", base_url="http://media.invalid", strm_root=root,
+                               video_exts={"mkv", "mp4"})
+                sync_strm(**options, client=cast(GuangYaClient, _TreeClient({"source": [old]})))
+                if reason == "old-type-excluded":
+                    options["video_exts"] = {"mp4"}
+                    old.size = 300
+                stats = sync_strm_incremental(**options, changes=[{
+                    "source_id": "source", "file_id": "a",
+                }], client=cast(GuangYaClient, _IncrementalClient({"a": new, "z": old})))
+                self.assertFalse(stats["fallback_required"], stats)
+                self.assertEqual(stats["generated"], 1)
+                self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index("guangya:source")], ["a"])
+                complete = sync_strm(**options, client=cast(GuangYaClient, _TreeClient({"source": [old, new]})))
+                self.assertEqual(complete["generated"], 0)
+
+    def test_incremental_losing_rename_cleans_its_old_path_without_touching_winner(self):
+        with isolated_test_database(), tempfile.TemporaryDirectory() as root:
+            winner = GuangYaFile("winner", "Movie.mkv", False, 300, "winner", "source")
+            old = GuangYaFile("loser", "Other.mp4", False, 100, "old", "source")
+            options = dict(source_dir_id="source", base_url="http://media.invalid", strm_root=root,
+                           video_exts={"mkv", "mp4"})
+            sync_strm(**options, client=cast(GuangYaClient, _TreeClient({"source": [winner, old]})))
+            target = Path(root) / STRM_SUBDIR / "Movie.strm"
+            before = target.read_bytes()
+            moved = GuangYaFile("loser", "Movie.mp4", False, 100, "new", "source")
+            stats = sync_strm_incremental(**options, changes=[{
+                "source_id": "source", "file_id": "loser",
+            }], client=cast(GuangYaClient, _IncrementalClient({"loser": moved, "winner": winner})))
+            self.assertFalse(stats["fallback_required"], stats)
+            self.assertEqual(stats["generated"], 0)
+            self.assertEqual(stats["cleaned"], 1)
+            self.assertEqual(target.read_bytes(), before)
+            self.assertFalse((target.parent / "Other.strm").exists())
+            self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index("guangya:source")], ["winner"])
+
     def test_incremental_mutual_rename_keeps_latest_owners_and_relative_old_paths(self):
         source = "incremental-swap"
         namespace = f"guangya:{source}"

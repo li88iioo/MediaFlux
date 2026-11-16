@@ -776,6 +776,32 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
             }],
         }
 
+    def test_retry_of_smaller_duplicate_preserves_current_full_scan_winner(self):
+        small = GuangYaFile("small", "Movie.mp4", False, 100, "small", "source")
+        winner = GuangYaFile("winner", "Movie.mkv", False, 300, "winner", "source")
+        with tempfile.TemporaryDirectory() as root:
+            options = dict(source_dir_id="source", base_url="http://mediaflux.invalid", strm_root=root,
+                           video_exts={"mkv", "mp4"})
+            with patch("app.modules.strm.generate_strm", side_effect=OSError("isolated write failure")):
+                failed = strm_module.sync_strm(**options, client=cast(GuangYaClient, _TreeClient({"source": [small]})))
+            self.assertEqual(failed["failed"], 1)
+            failure_id = db.list_strm_failures(status="open")[0]["id"]
+            client = _TreeClient({"source": [small, winner]})
+            strm_module.sync_strm(**options, client=cast(GuangYaClient, client))
+            target = Path(root) / "光鸭云盘" / "Movie.strm"
+            before = (target.read_bytes(), target.stat().st_mtime_ns)
+            strm_repo.acknowledge_strm_refresh_paths(strm_repo.list_strm_refresh_entries())
+            result = strm_module.retry_strm_failures(
+                [failure_id], "manual", client=cast(GuangYaClient, client),
+                runtime_config={**self._runtime(root, "source"), "video_exts": {"mkv", "mp4"}},
+            )
+            self.assertEqual(result["resolved"], 1)
+            self.assertEqual(result["failed"], 0)
+            self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+            self.assertEqual([row["file_id"] for row in strm_repo.list_strm_index("guangya:source")], ["winner"])
+            self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+            self.assertEqual(db.list_strm_failures(status="open"), [])
+
     def test_retry_closes_internally_created_client_on_success(self):
         failure_id = self._failure(
             "source-owned", "Owned Client Source", "missing", "Missing.mkv"

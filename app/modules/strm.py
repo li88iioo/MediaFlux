@@ -951,6 +951,39 @@ def _record_candidate(
     winners[target_text] = (winner[0], winner[1], current[2] + 1)
 
 
+def _video_candidate_wins(
+    file: GuangYaFile,
+    rel_dir: str,
+    expected: Path,
+    strm_root: str,
+    existing_by_path: dict[str, dict[str, Any]],
+    *,
+    lookup_file: Callable[[str], GuangYaFile | None],
+    video_exts: set[str],
+    threshold_bytes: int,
+    removed_ids: set[str] | None = None,
+) -> bool:
+    """增量和重试按完整扫描的排序核验当前目标所有者，不信任历史大小。"""
+    candidate_key = _candidate_sort_key((file, rel_dir))
+    for owner_id in existing_by_path.get(str(expected), {}):
+        if owner_id == file.file_id or owner_id in (removed_ids or ()):
+            continue
+        current = lookup_file(owner_id)
+        if current is None or current.is_dir:
+            continue
+        extension = current.name.rsplit(".", 1)[-1].lower() if "." in current.name else ""
+        if extension not in video_exts or threshold_bytes and 0 < current.size < threshold_bytes:
+            continue
+        if _strm_target(current, rel_dir, strm_root) != expected:
+            continue
+        if _candidate_sort_key((current, rel_dir)) >= candidate_key:
+            continue
+        if (current.parent_id or "") != (file.parent_id or ""):
+            raise RuntimeError("STRM 目标竞争对象位置已变化，需要完整校准")
+        return False
+    return True
+
+
 def _build_index_maps(existing_rows: list, strm_root: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     """视频/元数据共用物理路径桶；原始行保持不变，供历史索引回滚。"""
     by_id: dict[str, Any] = {}
@@ -1837,6 +1870,8 @@ def _sync_strm_incremental_impl(
     video_by_id: dict[str, Any] = {}
     video_by_path: dict[str, dict[str, Any]] = {}
     upserts = [item for item in normalized.values() if item["action"] == "upsert"]
+    removed_video_ids = {file_id for (kind, file_id), item in normalized.items()
+                         if kind == "video" and item["action"] == "remove"}
     total_work = len(normalized)
     completed = 0
     generate_started = time.monotonic()
@@ -1855,6 +1890,14 @@ def _sync_strm_incremental_impl(
             time.monotonic() - generate_started, 3
         )
         return stats
+
+    remote_files: dict[str, GuangYaFile | None] = {}
+
+    def lookup_competitor(owner_id: str) -> GuangYaFile | None:
+        if owner_id not in remote_files:
+            stats["incremental_file_info_requests"] += 1
+            remote_files[owner_id] = client.file_info(owner_id)
+        return remote_files[owner_id]
 
     for change in upserts:
         if stop_requested("incremental"):
@@ -1883,6 +1926,7 @@ def _sync_strm_incremental_impl(
             else:
                 stats["incremental_file_info_requests"] += 1
                 file = _incremental_remote_file(client, change)
+            remote_files[file_id] = file
             rel_dir = _incremental_rel_dir(
                 str(change.get("rel_dir") or ""), rel_prefix
             )
@@ -1905,6 +1949,18 @@ def _sync_strm_incremental_impl(
                         owner_path = _safe_indexed_path(row["strm_path"], strm_root)
                         if owner_path is not None:
                             video_by_path.setdefault(str(owner_path), {})[owner_id] = row
+
+                if not _video_candidate_wins(
+                    file, rel_dir, expected, strm_root, video_by_path,
+                    lookup_file=lookup_competitor, video_exts=exts,
+                    threshold_bytes=threshold_bytes, removed_ids=removed_video_ids,
+                ):
+                    stats["duplicates_skipped"] += 1
+                    stats["skipped"] += 1
+                    pending_resolutions["generate"][file_id] = (file, rel_dir)
+                    # 同目标的旧索引或重命名前路径仍需按受管文件规则退役。
+                    change["action"] = "remove"
+                    continue
                 current = video_by_id.get(file_id)
                 expected_url = build_play_url(
                     base_url, file.file_id, file.etag, file.size, file.name
@@ -3517,6 +3573,10 @@ def _process_claimed_strm_failures(
         enabled=bool(runtime.get("media_server_refresh", True)),
         allow_emby=bool(runtime.get("allow_emby", True)),
     )
+    video_exts = set(parse_strm_extensions(
+        runtime.get("video_exts", get("STRM_VIDEO_EXTS", "")), defaults=DEFAULT_STRM_VIDEO_EXTS,
+    ))
+    threshold_bytes = int(runtime.get("skip_threshold_mb", get_int("STRM_SKIP_THRESHOLD_MB", 0))) * 1024 * 1024
     for completed, row in enumerate(rows, 1):
         failure_id = int(row["id"])
         try:
@@ -3577,12 +3637,25 @@ def _process_claimed_strm_failures(
                         strm_root,
                     )
                     current_before_install = existing_by_id.get(file.file_id)
-                    cleaned, _installed_fingerprint = _install_video_candidate(
-                        file, rel_dir, target, base_url, strm_root, source_key,
-                        existing_by_id, existing_by_path,
-                    )
-                    if cleaned and current_before_install:
-                        refresh_paths.append(str(_row_field(current_before_install, "strm_path", "")))
+                    if _video_candidate_wins(
+                        file, rel_dir, target, strm_root, existing_by_path,
+                        lookup_file=client.file_info,
+                        video_exts=video_exts, threshold_bytes=threshold_bytes,
+                    ):
+                        cleaned, _installed_fingerprint = _install_video_candidate(
+                            file, rel_dir, target, base_url, strm_root, source_key,
+                            existing_by_id, existing_by_path,
+                        )
+                        if cleaned and current_before_install:
+                            refresh_paths.append(str(_row_field(current_before_install, "strm_path", "")))
+                    else:
+                        cleanup = _remove_indexed_rows(
+                            source_key, [current_before_install] if current_before_install else [],
+                            strm_root, refresh_policy=refresh_policy,
+                        )
+                        if cleanup["errors"]:
+                            raise cleanup["errors"][0][1]
+                        refresh_paths = cleanup["removed_paths"]
                 elif action == "metadata":
                     metadata_job = _metadata_queue_payload(
                         file, rel_dir, strm_root, source_id=source["id"],
