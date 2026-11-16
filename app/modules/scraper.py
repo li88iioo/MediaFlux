@@ -533,9 +533,20 @@ _AVAILABILITY_TAG = re.compile(
 # 混合整包只在“集范围 + TV/完结状态”后接受完整的已知附加项；不能把
 # 真实括号副标题或独立 OVA/S00 当作整包范围。整段由既有清洗链记录到
 # noise_tokens，原始发布名和特别篇位置解析保持独立。
+# 下载隔离目录 MF-<请求ID>-<发布名>：请求号与包装不是作品身份，只在目录名上剥离，
+# 且须早于年份、季号和发布组解析；真实文件名即使同形也保留，原始名称留给快照和规则作用域。
+_STAGING_DIRECTORY_PREFIX = re.compile(r"^MF-(?:[1-9][0-9]*|download)-")
+
+
+def strip_staging_directory_prefix(name: str) -> str:
+    """去掉系统下载隔离目录的 MF-<请求ID>- 包装；仅用于目录名。"""
+    return _STAGING_DIRECTORY_PREFIX.sub("", (name or "").strip())
+
+
 _BRACKET_EPISODE_RANGE = re.compile(
     r"(?i)^\s*(?:(?:e?p?\s*)?\d{1,4}\s*[-~～–—]\s*\d{1,4}"
-    r"(?:(?:\s*(?:tv\s*)?[（(]?(?:fin(?:al)?|end|complete|全集)[）)]?|\s*tv)"
+    r"(?:\s*[（(]\s*\d{1,4}\s*[-~～–—]\s*\d{1,4}\s*[）)])?"
+    r"(?:(?:\s*(?:tv\s*)?[（(]?(?:fin(?:al)?|end|complete|全集|合集)[）)]?|\s*tv)"
     r"(?:\s*\+\s*(?:ova|oav|oad|sp|specials?|ncop|nced)"
     r"(?:[ ._-]*\d{1,3}(?:\s*[-~～–—]\s*\d{1,3})?)?)*)?|"
     r"第\s*\d{1,3}\s*[-~～–—]\s*\d{1,3}\s*(?:集|[话話]))\s*$"
@@ -618,7 +629,7 @@ _TRAILING_RELEASE_COMPLETION = re.compile(
 )
 _TRAILING_BRACKET_RELEASE_COMPLETION = re.compile(
     r"(?i)(?P<separator>[\s._-]*)(?:[\[【(（])\s*"
-    r"(?P<tag>COMPLETE|END)\s*(?:[\]】)）])\s*$"
+    r"(?P<tag>COMPLETE|END|FIN(?:AL)?)\s*(?:[\]】)）])\s*$"
 )
 _PRIMARY_TRAILING_RELEASE_EDITION_NOISE = re.compile(
     r"(?ix)(?:[ ._\-—–:：]+|^)"
@@ -2067,10 +2078,8 @@ def _prefer_guessit_numeric_title(
 def _folder_context(
     parent_path: str, *, episode_context: bool = False,
 ) -> tuple[str, str, str, int | None]:
-    # 下载隔离目录使用 MF-<请求ID>-<发布名>，请求号/包装不是作品身份。
-    # 必须在年份、季号和发布组解析前去掉；原始 parent_path 仍留给快照和规则作用域。
     parts = [
-        re.sub(r"^MF-(?:[1-9][0-9]*|download)-", "", part.strip())
+        strip_staging_directory_prefix(part)
         for part in re.split(r"[\\/]+", (parent_path or "")) if part.strip()
     ]
     media_type = ""

@@ -82,6 +82,23 @@ class ManualScrapeCleanApiTests(IsolatedDatabaseTestCase):
                     self.assertEqual(parsed.media_type, 'tv' if position else 'movie')
                     self.assertEqual(parsed.source_episode, 1 if position else None)
 
+    def test_options_list_full_name_then_single_language_names(self):
+        cases = (
+            (MOVIE_RELEASE, ['血玫瑰 Bloody Rose 1988', '血玫瑰 1988', 'Bloody Rose 1988']),
+            ('[豌豆字幕组&LoliHouse] 关于我转生变成史莱姆这档事 第四季 _ Tensei Shitara Slime Datta Ken '
+             '4th Season [01-24(73-96) 合集][WebRip 1080p HEVC-10bit AAC][简繁内封字幕][Fin]',
+             ['关于我转生变成史莱姆这档事 Tensei Shitara Slime Datta Ken', '关于我转生变成史莱姆这档事',
+              'Tensei Shitara Slime Datta Ken']),
+            ('Toy Story 3', ['Toy Story 3']),
+            ('[1080p][AAC]', []),
+        )
+        with patch.object(TMDBScraper, 'search', side_effect=AssertionError('清洗不能查询 TMDB')):
+            for raw, options in cases:
+                with self.subTest(raw=raw):
+                    body = json.loads(bytes(self.clean({'query': raw}).body))
+                    self.assertEqual(body['options'], options)
+                    self.assertEqual(body['query'], options[0] if options else '')
+
     def test_anonymous_requests_are_rejected(self):
         with self.assertRaises(HTTPException) as error:
             clean_scrape_query(Request({'type': 'http', 'session': {}}), {'query': 'Movie'})
@@ -207,6 +224,25 @@ class LocalManualScrapeCleanBrowserTests(IsolatedDatabaseTestCase):
         self.assertEqual([path for path, _ in self.requests], [CLEAN_ENDPOINT, '/api/local-media/search'])
         self.assertEqual(self.requests[-1][1]['query'], expected)
         self.assertTrue(self.page.locator('#lmExecuteBtn').is_disabled())
+        self.assertEqual(self.errors, [])
+
+    def test_repeat_clicks_switch_single_language_names_until_user_edits(self):
+        label = self.page.locator('#lmScrapeCleanBtn span')
+        query = self.page.locator('#lmSearchQuery')
+        self._click_clean()
+        self.assertEqual(query.input_value(), '血玫瑰 Bloody Rose 1988')
+        self.assertEqual(label.text_content(), '换一个名称')
+        for expected, step in (('血玫瑰 1988', '2/3'), ('Bloody Rose 1988', '3/3'), ('血玫瑰 Bloody Rose 1988', '1/3')):
+            with self.subTest(expected=expected):
+                self.requests.clear()
+                self._click_clean()
+                self.assertEqual(query.input_value(), expected)
+                self.assertIn(f'已切换搜索名称 {step}', self.page.locator('#lmScrapeStatus').inner_text())
+                # 已识别的候选名称在本地切换，只重新搜索，不重复清洗。
+                self.assertEqual([path for path, _ in self.requests], ['/api/local-media/search'])
+                self.assertEqual(self.requests[-1][1]['query'], expected)
+        query.fill('用户自定义名称')
+        self.assertEqual(label.text_content(), '一键精简')
         self.assertEqual(self.errors, [])
 
     def test_clean_title_gives_feedback_and_preserves_position_fields(self):

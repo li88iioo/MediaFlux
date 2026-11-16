@@ -2070,6 +2070,9 @@ html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: bloc
 textarea.form-input, .form-textarea { min-height: 80px; resize: vertical; }
 .form-input:hover, .form-select:hover, .form-textarea:hover { border-color: var(--border-strong); }
 .form-input:focus, .form-select:focus, .form-textarea:focus { background: var(--input-focus); }
+/* 搜索名称被“一键精简”替换时短暂高亮，让变化一眼可见。 */
+@keyframes form-input-cleaned { from { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); } to { box-shadow: 0 0 0 0 transparent; } }
+.form-input.is-cleaned { animation: form-input-cleaned 1.2s ease-out; }
 .form-input::placeholder, .form-textarea::placeholder { color: var(--placeholder); }
 input[type="password"].form-input { padding-right: 44px; }
 .form-input.has-secret-toggle { padding-right: 76px; }

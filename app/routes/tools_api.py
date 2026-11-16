@@ -258,6 +258,22 @@ def _serialize_match(result: MatchResult, detail: dict) -> dict:
     }
 
 
+def _clean_query_options(raw: str, cleaned: str) -> list[str]:
+    """完整清洗名在前，其后是识别器拆出的单语言名称，供“一键精简”依次切换。"""
+    if not cleaned:
+        return []
+    context = extract_recognition_context(raw)
+    year = (context.filename_year or "").strip()
+    options: list[str] = []
+    seen: set[str] = set()
+    for value in (cleaned, *(f"{item} {year}".strip() for item in generate_query_variants(context))):
+        key = " ".join(value.casefold().split())
+        if key and key not in seen:
+            seen.add(key)
+            options.append(value)
+    return options[:4]
+
+
 @router.post("/scrape/clean-query")
 def clean_scrape_query(request: Request, data: dict | None = Body(default=None)):
     """手动整理共用识别清洗，仅处理名称，不请求外部元数据。"""
@@ -270,11 +286,10 @@ def clean_scrape_query(request: Request, data: dict | None = Body(default=None))
         return api_error("搜索名称不能超过 1024 个字符", 400)
     scraper = TMDBScraper()
     try:
-        return api_response({"query": scraper.clean_title(
-            query, keep_year=True,
-        )})
+        cleaned = scraper.clean_title(query, keep_year=True)
     finally:
         _close_scraper(scraper)
+    return api_response({"query": cleaned, "options": _clean_query_options(query, cleaned)})
 
 
 @router.post("/scrape/preview")

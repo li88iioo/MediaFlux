@@ -16,7 +16,7 @@ from app.modules.directory_scrape_errors import (
 )
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot
 from app.modules.organize_postprocess import media_role, normalized_stem
-from app.modules.scraper import TMDBScraper
+from app.modules.scraper import TMDBScraper, strip_staging_directory_prefix
 from app.modules.special_media import (
     is_sample_media_path,
     is_special_directory_name,
@@ -133,7 +133,9 @@ class DirectoryMediaInspector:
         ]
         visited: set[str] = set()
         scanned_entries = 0
-        parsed_dir = self._parse_for_rules(source.name, rules, "")
+        # 目录名作为作品名称参与识别时去掉下载隔离包装；展示与快照仍用原名。
+        identity_name = strip_staging_directory_prefix(source.name) or source.name
+        parsed_dir = self._parse_for_rules(identity_name, rules, "")
 
         def scan(
             current_id: str,
@@ -248,7 +250,7 @@ class DirectoryMediaInspector:
         special_only = bool(normalized_identities) and all(
             item.special for item in normalized_identities
         )
-        source_identity = str(parsed_dir.get("title") or source.name or "").strip()
+        source_identity = str(parsed_dir.get("title") or identity_name or "").strip()
         inferred_sequence = any(
             item.episode is not None and snapshots_by_id[item.file_id].episode is None
             and item.season != 0
@@ -346,7 +348,7 @@ class DirectoryMediaInspector:
                 season = contextual_season if contextual_season is not None else 1
                 season_inferred = True
         clean_fn = getattr(self.scraper, "clean_title", None)
-        clean_dir_name = self.scraper.clean_title(source.name) if callable(clean_fn) else ""
+        clean_dir_name = self.scraper.clean_title(identity_name) if callable(clean_fn) else ""
         selected_ids = {item.file_id for item in videos}
         primary_titles = [
             item.title
@@ -359,17 +361,17 @@ class DirectoryMediaInspector:
         parsed_dir_title = str(parsed_dir.get("title") or "").strip()
         if rules.nsfw_exclusive:
             suggested_query = (
-                self._nsfw_code(source.name, rules)
+                self._nsfw_code(identity_name, rules)
                 or primary_title
                 or parsed_dir_title
-                or source.name
+                or identity_name
             )
         else:
             suggested_query = (
                 (clean_dir_name if not self._weak_identity_title(clean_dir_name) else "")
                 or (parsed_dir_title if not self._weak_identity_title(parsed_dir_title) else "")
                 or primary_title
-                or source.name
+                or identity_name
             )
         return DirectoryInspection(
             directory_id=source_id,

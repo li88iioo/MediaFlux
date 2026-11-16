@@ -1268,6 +1268,25 @@ class DirectoryEpisodeTitleIdentityTests(IsolatedDatabaseTestCase):
         finally:
             scraper.close()
 
+    def test_staging_prefix_and_collection_markers_never_reach_suggested_query(self):
+        # 离线下载隔离目录曾把“MF 99 豌豆字幕组… 01 24 73 96 合集 Fin”直接填进手动搜索框。
+        release = (
+            "[豌豆字幕组&LoliHouse] 关于我转生变成史莱姆这档事 第四季 _ Tensei Shitara Slime Datta Ken "
+            "4th Season [01-24(73-96) 合集][WebRip 1080p HEVC-10bit AAC][简繁内封字幕][Fin]"
+        )
+        names = [
+            f"[LoliHouse] Tensei Shitara Slime Datta Ken 4th Season - {episode} [WebRip 1080p].mkv"
+            for episode in (73, 74)
+        ]
+        for prefix in ("MF-99-", "MF-download-"):
+            with self.subTest(prefix=prefix):
+                inspection = self.inspect_names(names, directory=prefix + release)
+                self.assertEqual(inspection.directory_name, prefix + release)
+                self.assertEqual(
+                    inspection.suggested_query,
+                    "关于我转生变成史莱姆这档事 Tensei Shitara Slime Datta Ken",
+                )
+
     def test_real_release_names_with_episode_titles_keep_one_media_identity(self):
         # 真实云盘发布名样本；使用正式解析器，不用返回预设标题的替身。
         cases = [

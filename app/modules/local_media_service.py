@@ -78,7 +78,7 @@ from app.modules.organize_postprocess import media_role
 from app.modules.organize_scan import OrganizeScanResult, ScannedVideo
 from app.modules.process_lock import CrossProcessLock
 from app.modules.qb_control import qb_control_write_lease
-from app.modules.scraper import MatchResult, TMDBScraper
+from app.modules.scraper import MatchResult, TMDBScraper, strip_staging_directory_prefix
 from app.modules.special_media import (
     is_special_media_name,
     is_special_path,
@@ -494,8 +494,10 @@ class LocalMediaService:
             if not suggested_query:
                 suggested_query = primary_video.path.stem
         else:
+            # 多视频目录以目录名为作品名称；去掉下载隔离包装再识别。
+            identity_name = strip_staging_directory_prefix(selected.name) or selected.name
             try:
-                parsed = self.scraper.parse_media(selected.name)
+                parsed = self.scraper.parse_media(identity_name)
             except Exception:
                 parsed = None
             if parsed is not None:
@@ -516,9 +518,9 @@ class LocalMediaService:
                         detected_media_type = "tv"
             clean_title = getattr(self.scraper, "clean_title", None)
             if not suggested_query and callable(clean_title):
-                suggested_query = str(clean_title(selected.name) or "").strip()
+                suggested_query = str(clean_title(identity_name) or "").strip()
             if not suggested_query:
-                suggested_query = selected.name
+                suggested_query = identity_name
         if detected_media_type not in {"movie", "tv"}:
             detected_media_type = "movie"
             for item in videos[:8]:
