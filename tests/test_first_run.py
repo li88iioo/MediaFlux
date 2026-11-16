@@ -507,7 +507,10 @@ class FirstRunTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_login_page_explains_activation_failure_and_can_retry(self):
+        from fastapi import FastAPI
+
         with self._new_client() as client:
+            assert isinstance(client.app, FastAPI)
             page = self._setup_page(client)
             response = client.post('/setup', data=self._fields(page), follow_redirects=False)
             self.assertEqual(response.status_code, 303)
