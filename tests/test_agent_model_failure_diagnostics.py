@@ -87,7 +87,7 @@ def assert_failure(result, *, kind, phase, protocol, attempts, emitted,
     assert type(failure.emitted) is bool and failure.emitted is emitted
     assert failure.http_status == http_status
     assert type(failure.elapsed_ms) is int and failure.elapsed_ms >= 0
-    assert failure.idle_timeout_seconds == 30
+    assert failure.idle_timeout_seconds == 120
     assert failure.deadline_seconds == deadline
     assert_safe(str(error), json.dumps(asdict(failure), ensure_ascii=False))
     return failure
@@ -193,7 +193,7 @@ def test_failure_before_headers_retains_retry_budget_and_has_diagnostic(agent_ll
     for client in result['clients']:
         timeout = client._client.timeout
         assert timeout.connect == 4
-        assert timeout.read == timeout.write == timeout.pool == 30
+        assert timeout.read == timeout.write == timeout.pool == 120
 
 
 def test_error_response_body_read_timeout_retains_http_status_and_transport_kind(agent_llm_enabled):
