@@ -860,22 +860,26 @@ def release_unsubmitted_rss_entries(rows: Sequence[sqlite3.Row], *, submitted_at
             # 单条内部可能已绑定新请求再于发送前取消。仅接纳底层明确
             # 记为取消且未受理的请求；已受理、未知结果与他批领取保持原状。
             current = conn.execute(
-                "SELECT e.download_request_id,e.download_request_key,e.download_backend "
+                "SELECT e.download_request_id,e.download_request_key,e.download_backend,r.status AS request_status "
                 "FROM rss_entries e JOIN download_requests r ON r.id=e.download_request_id "
                 "WHERE e.id=? AND e.status='submitting' AND COALESCE(e.processed,0)=0 "
-                "AND e.submitted_at=? AND r.status='failed' "
+                "AND e.submitted_at=? AND ((r.status='failed' "
                 f"AND {_rss_delivery_retry_sql()} "
-                "AND r.error=e.download_backend || ': 操作已取消，未提交下载后端'",
+                "AND r.error=e.download_backend || ': 操作已取消，未提交下载后端') "
+                "OR (r.status='cancelled' AND r.error='操作已取消，未提交下载后端'))",
                 (row["id"], submitted_at),
             ).fetchone()
             identity = current if current is not None else row
+            restored_identity = row if current is not None and current["request_status"] == "cancelled" else identity
             restored += conn.execute(
                 "UPDATE rss_entries SET status=?,submitted_at=?,failure_code=?,failure_retryable=?,"
-                "failed_at=?,retry_count=? WHERE id=? AND status='submitting' AND COALESCE(processed,0)=0 "
+                "failed_at=?,retry_count=?,download_request_id=?,download_request_key=?,download_backend=? "
+                "WHERE id=? AND status='submitting' AND COALESCE(processed,0)=0 "
                 "AND submitted_at=? AND COALESCE(download_request_id,0)=? "
                 "AND download_request_key=? AND download_backend=?",
                 (row["status"], row["submitted_at"], row["failure_code"], row["failure_retryable"],
-                 row["failed_at"], row["retry_count"], row["id"], submitted_at,
+                 row["failed_at"], row["retry_count"], restored_identity["download_request_id"],
+                 restored_identity["download_request_key"], restored_identity["download_backend"], row["id"], submitted_at,
                  identity["download_request_id"] or 0, identity["download_request_key"], identity["download_backend"]),
             ).rowcount
     return restored
