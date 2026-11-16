@@ -62,7 +62,7 @@ from .model import (
     ModelToolCall,
     ProviderState,
 )
-from .provider_model import ModelProviderError, OpenAICompatibleModelAdapter, UncommittableModelTurn
+from .provider_model import ModelConfigurationError, ModelProviderError, OpenAICompatibleModelAdapter, UncommittableModelTurn
 from .session_guard import foreground_execution_guard, session_scope_guard
 from .task_state import TaskPatch, task_projection
 
@@ -247,6 +247,8 @@ class AgentTurn:
                 await self.failure("effect_in_progress", "已确认的写操作正在执行，请等待完成后再继续。")
             except ToolPipelineError as exc:
                 await self.failure(exc.code, str(exc))
+            except ModelConfigurationError as exc:
+                await self.failure("model_not_configured", str(exc))
             except ModelProviderError as exc:
                 logger.warning("Agent model provider failed type=%s diagnostic=%s", type(exc).__name__, exc.failure)
                 await self.failure("model_provider_error", _provider_failure_message(exc))

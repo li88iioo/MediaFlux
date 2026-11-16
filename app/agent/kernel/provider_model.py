@@ -80,6 +80,14 @@ class ModelProviderError(RuntimeError):
     failure: ProviderFailure | None = None
 
 
+class ModelConfigurationError(ValueError):
+    """模型连接必填项尚未配置；可安全展示给已授权用户。"""
+
+    def __init__(self, missing: Sequence[str]) -> None:
+        super().__init__("Media Agent 模型尚未配置：缺少" + "、".join(missing)
+                         + "。请在 Web「设置 → Media Agent」填写并保存后重试；历史对话仍可查看。")
+
+
 class UncommittableModelTurn(ModelProviderError):
     """当前原生回合不能提交；只允许 Kernel 从之前完整历史有界重建。"""
 
@@ -189,9 +197,11 @@ class ProviderSettings:
         parse_budget_profiles(self.budget_profiles_json)
         if self.reasoning_effort and self.reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("reasoning_effort is invalid")
-        if not (self.api_url or "").strip():
-            raise ValueError("api_url is required")
-        if not (self.model or "").strip() or len(self.model) > 200:
+        missing = [name for name, value in (("API Base URL", self.api_url), ("模型名称", self.model))
+                   if not (value or "").strip()]
+        if missing:
+            raise ModelConfigurationError(missing)
+        if len(self.model) > 200:
             raise ValueError("model is invalid")
         _, minimum, maximum = INT_SETTING_BOUNDS["AGENT_LLM_TIMEOUT_SECONDS"]
         if not minimum <= self.timeout_seconds <= maximum:
