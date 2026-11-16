@@ -150,13 +150,14 @@ def publish_probe_acknowledged(job: dict) -> None:
 
 
 def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
-                        partial: bool = False, error: str = "") -> bool:
+                        partial: bool = False, error: str = "", strm_run_id: int | None = None) -> bool:
     """复用已存在父消息；成功仅更新稳定状态，不按 file/run 新建消息。
 
     错误不被随后单文件成功覆盖，未知初次发送不盲重试。缺父线程时只发
     一条按父/接收范围隔离的脱敏异常线程，legacy 只进默认管理通知范围。
     """
     from app.modules.telegram_notification_center import (
+        NotificationPublishResult,
         get_notification_thread_snapshot,
         publish_notification_thread,
     )
@@ -164,7 +165,7 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
         NotificationImportance,
         NotificationTopic,
     )
-    from app.notifier import NotificationEvent
+    from app.notifier import NotificationEvent, safe_int
 
     context = probe_repository.normalize_notification_context(scope.get("context"))
     if not scope.get("notify_override", True) or (context and not context["notify_enabled"]):
@@ -201,7 +202,7 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
                 ref["topic"] == "organize" and previous.event.lifecycle.get("parent")
                 and not _event_downstream_failed(previous.event)
             )
-            if not failed and not can_project_parent and previous.event.state != "confirmation_batch" and (previous.event.state == "partial" or str(previous.event.title).startswith(("⚠️", "⏳"))):
+            if strm_run_id is None and not failed and not can_project_parent and previous.event.state != "confirmation_batch" and (previous.event.state == "partial" or str(previous.event.title).startswith(("⚠️", "⏳"))):
                 handled = True
                 continue
             safe_error = "后台规格补全后的 STRM 同步异常，请在 Web 运行记录中查看。" if scoped_failed else ""
@@ -214,6 +215,7 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
                 result = update_organize_lifecycle_downstream(
                     ref["task_id"], chat_id=chat, strm_status=scoped_status, media_refresh=scoped_refresh,
                     partial=scoped_failed, error=safe_error, topic_enabled=ref["topic_enabled"],
+                    strm_run_id=strm_run_id,
                 )
             elif ref["topic"] == "confirmation":
                 from app.modules.organize_confirmations import (
@@ -222,19 +224,37 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
                 result = update_confirmation_lifecycle_downstream(
                     ref["token"], chat_id=chat, strm_status=scoped_status, media_refresh=scoped_refresh,
                     partial=scoped_failed, error=safe_error,
+                    strm_run_id=strm_run_id,
                 )
             else:
                 # 下载补全不重写 request 的业务终态，只原位更新其通知下游字段。
-                fields = tuple((label, scoped_status if label == "STRM" else scoped_refresh if label == "媒体库" else value)
-                               for label, value in previous.event.fields)
-                event = replace(previous.event, fields=fields)
-                if scoped_failed:
-                    event = replace(event, title="⚠️ 下载入库链路部分完成", footer=safe_error, state="partial")
-                result = publish_notification_thread(
-                    ref["thread_key"], event, topic=NotificationTopic.DOWNLOAD, chat_id=chat,
-                    importance=NotificationImportance.ERROR if scoped_failed else NotificationImportance.RESULT,
-                    topic_enabled=ref["topic_enabled"],
-                )
+                for _ in range(3):
+                    if previous is None:
+                        result = NotificationPublishResult(False, status="missing_thread")
+                        break
+                    downstream = previous.event.lifecycle.get("downstream", {})
+                    if strm_run_id is not None and strm_run_id < safe_int(downstream.get("strm_run_id"), 0, minimum=0):
+                        result = NotificationPublishResult(False, status="stale_run")
+                        break
+                    current_refresh = media_refresh or next((str(value) for label, value in previous.event.fields
+                                                            if label in {"媒体库", "媒体库刷新"}), "")
+                    fields = tuple((label, scoped_status if label == "STRM" else current_refresh if label == "媒体库" else value)
+                                   for label, value in previous.event.fields)
+                    event = replace(previous.event, fields=fields)
+                    if strm_run_id is not None:
+                        event = replace(event, lifecycle={**event.lifecycle, "downstream": {
+                            **downstream, "strm_run_id": strm_run_id,
+                        }})
+                    if scoped_failed:
+                        event = replace(event, title="⚠️ 下载入库链路部分完成", footer=safe_error, state="partial")
+                    result = publish_notification_thread(
+                        ref["thread_key"], event, topic=NotificationTopic.DOWNLOAD, chat_id=chat,
+                        importance=NotificationImportance.ERROR if scoped_failed else NotificationImportance.RESULT,
+                        topic_enabled=ref["topic_enabled"], expected_revision=previous.revision,
+                    )
+                    if result or result.status != "invalid":
+                        break
+                    previous = get_notification_thread_snapshot(thread_key, topic=ref["topic"], chat_id=chat)
             # 缺父时绝不把成功降级为独立汇总；ERROR 的兜底仍使用固定逻辑键。
             if getattr(result, "status", "") == "missing_thread":
                 missing_chats.add(chat)

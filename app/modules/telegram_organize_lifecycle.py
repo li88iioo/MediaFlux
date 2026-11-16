@@ -630,6 +630,7 @@ def update_organize_lifecycle_downstream(
     error: str = "",
     topic_enabled: bool = True,
     refresh_handoff: dict[str, Any] | None = None,
+    strm_run_id: int | None = None,
 ) -> NotificationPublishResult:
     thread_key = f"organize:{task_id!s}"
     for _ in range(3):
@@ -640,18 +641,23 @@ def update_organize_lifecycle_downstream(
             return NotificationPublishResult(False, status="missing_thread")
         previous = snapshot.event
         downstream = previous.lifecycle.get("downstream", {})
-        receipt = previous.lifecycle.get("refresh")
+        previous_run_id = safe_int(downstream.get("strm_run_id"), 0, minimum=0)
+        if strm_run_id is not None and strm_run_id < previous_run_id:
+            return NotificationPublishResult(False, status="stale_run")
+        new_run = strm_run_id is not None and strm_run_id > previous_run_id
+        receipt = None if new_run else previous.lifecycle.get("refresh")
         if refresh_handoff:
             entries = set(tuple(item) for item in (receipt or {}).get("entries", []))
             entries.update((path, refresh_handoff["allow_emby"]) for path in refresh_handoff["paths"])
             receipt = {"entries": sorted(entries), "pending_label": media_refresh, "error": error}
         # 刷新错误单独结算；后续单批成功不能清掉前批非刷新错误。
-        preserve_failure = bool(refresh_handoff) or not (partial or error)
+        preserve_failure = not new_run and (bool(refresh_handoff) or not (partial or error))
         event, importance = _project_downstream(
             previous, strm_status=strm_status, media_refresh=media_refresh,
             partial=bool(downstream.get("partial")) if preserve_failure else partial,
             error=str(downstream.get("error") or "") if preserve_failure else error,
             refresh_handoff=receipt,
+            strm_run_id=strm_run_id,
         )
         result = publish_notification_thread(
             thread_key, event, topic=NotificationTopic.ORGANIZE,
@@ -667,6 +673,7 @@ def update_organize_lifecycle_downstream(
 def _project_downstream(
     previous: NotificationEvent, *, strm_status: str, media_refresh: str,
     partial: bool = False, error: str = "", refresh_handoff: dict[str, Any] | None = None,
+    strm_run_id: int | None = None,
 ) -> tuple[NotificationEvent, str]:
     # 老消息没有分层事实，保留原结论；不能把无法归因的警告推断成成功。
     parent = previous.lifecycle.get("parent") or {
@@ -684,7 +691,11 @@ def _project_downstream(
     if refresh_handoff:
         media_refresh = refresh_handoff["pending_label"]
     fields = _replace_field(fields, "媒体库", media_refresh)
-    lifecycle = {"parent": parent, "downstream": {"partial": partial, "error": error}}
+    lifecycle = {"parent": parent, "downstream": {
+        **previous.lifecycle.get("downstream", {}), "partial": partial, "error": error,
+    }}
+    if strm_run_id is not None:
+        lifecycle["downstream"]["strm_run_id"] = strm_run_id
     if refresh_handoff:
         lifecycle["refresh"] = refresh_handoff
     downstream_error = error or (refresh_handoff or {}).get("error", "")

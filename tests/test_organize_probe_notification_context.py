@@ -463,6 +463,104 @@ class ProbeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.edit.call_args.kwargs["chat_id"], "chat-a")
         self.assertEqual({row["chat_id"] for row in self.rows()}, {"chat-a"})
 
+    def test_probe_forwards_run_id_to_both_parent_domains(self):
+        from app.modules.organize_probe_notifications import build_notification_context, publish_probe_scope
+        from app.notifier import NotificationEvent
+
+        for topic, identity in (("organize", "parent-run"), ("confirmation", "confirmation-run")):
+            with self.subTest(topic=topic):
+                context = build_notification_context(
+                    task_id=identity if topic == "organize" else "",
+                    confirmation_token=identity if topic == "confirmation" else "", chat_id="chat-a",
+                )
+                self.center.publish_notification_thread(
+                    f"{topic}:{identity}", NotificationEvent("父消息", fields=(("STRM", "等待"),)),
+                    topic=topic, chat_id="chat-a",
+                )
+                target = ("app.modules.telegram_organize_lifecycle.update_organize_lifecycle_downstream"
+                          if topic == "organize" else
+                          "app.modules.organize_confirmations.update_confirmation_lifecycle_downstream")
+                with patch(target, return_value=True) as update:
+                    self.assertTrue(publish_probe_scope(
+                        self.scope(context), strm_status="完成", media_refresh="已刷新", strm_run_id=20,
+                    ))
+                self.assertEqual(update.call_args.kwargs["strm_run_id"], 20)
+
+    def test_download_tracker_preserves_probe_fence_and_late_probe_is_rejected(self):
+        from app.modules.organize_probe_notifications import build_notification_context, publish_probe_scope
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        request_id, _created = download_requests_repo.create_download_request(
+            "download-probe-run-fence", "magnet", chat_id="chat-a",
+        )
+        download_requests_repo.update_download_request(
+            request_id, status="completed", qb_status="completed", strm_status="completed",
+        )
+        self.assertTrue(publish_download_lifecycle(request_id, media_refresh="等待刷新"))
+        context = build_notification_context(download_request_ids=[request_id])
+        self.assertEqual(context["notification_threads"][0]["topic"], "download")
+        request = download_requests_repo.get_download_request(request_id)
+        self.assertIsNotNone(request)
+        original_request = dict(request)
+        scope = self.scope(context)
+        self.assertTrue(publish_probe_scope(
+            scope, strm_status="完成", media_refresh="Emby 已刷新", strm_run_id=20,
+        ))
+        self.assertTrue(publish_download_lifecycle(request_id))
+        before = self.rows()[0]
+        event = json.loads(before["event_json"])
+        self.assertEqual(event["lifecycle"]["downstream"]["strm_run_id"], 20)
+        self.assertEqual(dict(event["fields"])["媒体库"], "Emby 已刷新")
+        self.assertTrue(publish_probe_scope(
+            scope, strm_status="完成", media_refresh="旧运行失败", partial=True,
+            error="旧运行失败", strm_run_id=10,
+        ))
+        self.assertEqual(self.rows()[0], before)
+        current_request = download_requests_repo.get_download_request(request_id)
+        self.assertIsNotNone(current_request)
+        self.assertEqual(dict(current_request), original_request)
+        # 无 run ACK 不得抹掉已有围栏；同一 run 的后续终态仍应接纳。
+        self.assertTrue(publish_probe_scope(scope, strm_status="完成", media_refresh=""))
+        self.assertEqual(json.loads(self.rows()[0]["event_json"])["lifecycle"]["downstream"]["strm_run_id"], 20)
+        self.assertTrue(publish_probe_scope(
+            scope, strm_status="完成", media_refresh="同运行更新", strm_run_id=20,
+        ))
+        self.assertEqual(dict(json.loads(self.rows()[0]["event_json"])["fields"])["媒体库"], "同运行更新")
+
+    def test_download_probe_revision_conflict_rechecks_new_run(self):
+        from app.modules import organize_probe_notifications as notifications
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        request_id, _created = download_requests_repo.create_download_request(
+            "download-probe-cas-race", "magnet", chat_id="chat-a",
+        )
+        self.assertTrue(publish_download_lifecycle(request_id, media_refresh="等待"))
+        scope = self.scope(notifications.build_notification_context(download_request_ids=[request_id]))
+        self.assertTrue(notifications.publish_probe_scope(scope, strm_status="完成", media_refresh="完成", strm_run_id=10))
+        publish = self.center.publish_notification_thread
+        attempts = []
+
+        def interleaved(thread_key, event, **kwargs):
+            run_id = event.lifecycle["downstream"]["strm_run_id"]
+            attempts.append(run_id)
+            if run_id == 11:
+                self.assertTrue(notifications.publish_probe_scope(
+                    scope, strm_status="完成", media_refresh="最新运行", strm_run_id=12,
+                ))
+            return publish(thread_key, event, **kwargs)
+
+        with patch.object(self.center, "publish_notification_thread", side_effect=interleaved):
+            self.assertTrue(notifications.publish_probe_scope(
+                scope, strm_status="完成", media_refresh="迟到失败", partial=True,
+                error="迟到失败", strm_run_id=11,
+            ))
+        self.assertEqual(attempts, [11, 12])
+        row = self.rows()[0]
+        self.assertEqual(row["revision"], 3)
+        event = json.loads(row["event_json"])
+        self.assertEqual(dict(event["fields"])["媒体库"], "最新运行")
+        self.assertEqual(event["lifecycle"]["downstream"]["strm_run_id"], 12)
+
     def test_exhausted_probe_publishes_error_without_remote_io(self):
         context = self.context()
         self.parent(context)

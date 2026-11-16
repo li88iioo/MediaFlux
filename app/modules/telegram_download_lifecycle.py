@@ -420,6 +420,7 @@ def publish_download_lifecycle(
             verification_result=verification_result,
             probe_progress=_load_probe_progress(row),
         )
+        event = replace(event, lifecycle=snapshot.event.lifecycle if snapshot is not None else {})
         importance = {
             "attention": NotificationImportance.ACTION,
             "error": NotificationImportance.ERROR,

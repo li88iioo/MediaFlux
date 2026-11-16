@@ -88,6 +88,116 @@ def _outbox(task_id, chat_id):
     return row
 
 
+@pytest.fixture
+def fenced_parent(offline):
+    from app.modules import telegram_organize_lifecycle as lifecycle
+
+    stopped = threading.Event()
+    stopped.set()
+    with (
+        patch("app.modules.telegram_notification_policy.notifications_enabled", return_value=True),
+        patch("app.modules.telegram_notification_policy.notification_level", return_value="standard"),
+        patch.object(center, "_dispatch_stop", stopped),
+    ):
+        assert publish_organize_lifecycle(
+            "fenced-parent", {"total": 2, "moved": 1, "need_confirm": 1,
+                              "delivery_route": {"chat_id": "100", "message_thread_id": 500}},
+            source_name="隔离来源", chat_id="100",
+        )
+        yield lifecycle
+
+
+@pytest.mark.parametrize("latest_refresh", ["Emby 已排队", "Emby 已刷新"])
+def test_late_strm_run_does_not_publish_over_new_parent(fenced_parent, latest_refresh):
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh=latest_refresh,
+        strm_run_id=20,
+    )
+    before = _outbox("fenced-parent", "100")
+    result = update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="Jellyfin 失败",
+        partial=True, error="旧运行晚回执", strm_run_id=10,
+    )
+    assert result.status == "stale_run"
+    assert _outbox("fenced-parent", "100") == before
+    assert json.loads(before["event_json"])["lifecycle"]["downstream"]["strm_run_id"] == 20
+
+
+def test_new_run_replaces_old_receipt_but_preserves_parent_attention(fenced_parent):
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="旧刷新待接管",
+        partial=True, error="旧运行失败", strm_run_id=10,
+        refresh_handoff={"paths": ["/isolated/old"], "allow_emby": True},
+    )
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="Emby 已刷新",
+        strm_run_id=20,
+    )
+    event = json.loads(_outbox("fenced-parent", "100")["event_json"])
+    assert event["lifecycle"]["downstream"] == {"partial": False, "error": "", "strm_run_id": 20}
+    assert "refresh" not in event["lifecycle"]
+    assert dict(event["fields"])["媒体库"] == "Emby 已刷新"
+    assert event["lifecycle"]["parent"]["state"] == "partial"
+    assert event["state"] == "partial"
+
+
+def test_revision_conflict_rechecks_latest_run_before_retry(fenced_parent):
+    lifecycle = fenced_parent
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="第一批完成",
+        strm_run_id=10,
+    )
+    publish = lifecycle.publish_notification_thread
+    attempts = []
+
+    def interleaved(thread_key, event, **kwargs):
+        run_id = event.lifecycle["downstream"]["strm_run_id"]
+        attempts.append(run_id)
+        if run_id == 11:
+            assert update_organize_lifecycle_downstream(
+                "fenced-parent", chat_id="100", strm_status="完成", media_refresh="最新运行完成",
+                strm_run_id=12,
+            )
+        return publish(thread_key, event, **kwargs)
+
+    with patch.object(lifecycle, "publish_notification_thread", side_effect=interleaved):
+        result = update_organize_lifecycle_downstream(
+            "fenced-parent", chat_id="100", strm_status="完成", media_refresh="迟到失败",
+            partial=True, error="迟到失败", strm_run_id=11,
+        )
+    assert result.status == "stale_run"
+    assert attempts == [11, 12]
+    row = _outbox("fenced-parent", "100")
+    assert row["revision"] == 3
+    event = json.loads(row["event_json"])
+    assert dict(event["fields"])["媒体库"] == "最新运行完成"
+    assert event["lifecycle"]["downstream"]["strm_run_id"] == 12
+
+
+def test_ack_confirmation_rollup_and_refresh_recovery_keep_run_marker(fenced_parent):
+    lifecycle = fenced_parent
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="等待刷新交接",
+        refresh_handoff={"paths": ["/isolated/refresh"], "allow_emby": True}, strm_run_id=20,
+    )
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="等待刷新交接",
+    )
+    assert lifecycle.update_organize_lifecycle_confirmations(
+        "fenced-parent", chat_id="100", baseline={"total": 2, "moved": 1, "confirm": 1},
+        outcomes={"resolved_files": 1, "moved": 1, "groups": 1},
+    )
+    assert lifecycle.reconcile_organize_refresh_notifications() == 1
+    event = json.loads(_outbox("fenced-parent", "100")["event_json"])
+    assert event["lifecycle"]["downstream"]["strm_run_id"] == 20
+    assert "refresh" not in event["lifecycle"]
+    assert event["_delivery_route"] == {"chat_id": "100", "message_thread_id": 500}
+    assert update_organize_lifecycle_downstream(
+        "fenced-parent", chat_id="100", strm_status="完成", media_refresh="同运行终态",
+        strm_run_id=20,
+    )
+
+
 @pytest.mark.parametrize("chat_id,thread_id,source_thread_id", [
     (100, 500, 500), (100, 500, None), (100, 500, 600),
     (100, None, 500), (100, None, None), (-100, None, None), (-100, 500, 500),
