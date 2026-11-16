@@ -1178,7 +1178,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         original_get = strm.get
         self.enterContext(patch.object(strm, "get", side_effect=lambda key, default="":
             str(self.root) if key == "STRM_ROOT" else original_get(key, default)))
-        self.rules = OrganizeRules(link_strm=True, emby_refresh=False)
+        self.rules = OrganizeRules(link_strm=True, emby_refresh=True)
         self.enterContext(patch.object(OrganizeRules, "from_config", return_value=self.rules))
         self.sync = self.enterContext(patch.object(Organizer, "_post_organize_link"))
         self.wake = self.enterContext(patch("app.modules.strm_metadata_worker.get_strm_metadata_worker"))
@@ -1255,16 +1255,30 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.pending(), [])
         refresh = strm_repo.list_strm_refresh_entries()
         self.assertTrue(refresh)
-        self.assertTrue(all(not row["allow_emby"] for row in refresh))
+        self.assertTrue(all(row["allow_emby"] for row in refresh))
         self.wake.return_value.wake.assert_called_once()
         calls = self.client.delete.call_count
         with self.assertRaises(ValueError):
             self.delete(log_id)
         self.assertEqual(self.client.delete.call_count, calls)
-        repeated = strm.cleanup_deleted_cloud_files({f.file_id for f in files}, allow_emby=False)
+        repeated = strm.cleanup_deleted_cloud_files({f.file_id for f in files}, refresh_enabled=True)
         self.assertEqual(repeated["cleaned"], 0)
         self.assertEqual(repeated["metadata_cleaned"], 0)
         self.assertEqual(self.client.delete.call_count, calls)
+
+    def test_disabled_refresh_cleans_video_and_metadata_without_new_provider_work(self):
+        log_id, files = self.seed(subtitle=True)
+        paths = [self.index(file) for file in files]
+        with patch.object(OrganizeRules, "from_config", return_value=OrganizeRules(
+            link_strm=True, emby_refresh=False,
+        )):
+            result = self.delete(log_id)
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(result["warnings"], [])
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(strm_repo.list_strm_refresh_entries(), [])
+        self.wake.assert_not_called()
 
     def test_only_confirmed_cloud_deletions_are_cleaned_after_partial_failure(self):
         log_id, files = self.seed(subtitle=True)
@@ -1302,7 +1316,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         self.wake.assert_not_called()
         # 人工核对恢复受管内容后，只重试本地收尾，无须重放云盘删除。
         path.write_text("managed-video")
-        recovery = strm.cleanup_deleted_cloud_files({"video"}, allow_emby=False)
+        recovery = strm.cleanup_deleted_cloud_files({"video"}, refresh_enabled=True)
         self.assertEqual(recovery["cleaned"], 1)
         self.assertFalse(path.exists())
         self.assertEqual(self.pending(), [])
@@ -1436,7 +1450,7 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         self.assertFalse(path.exists())
         self.assertEqual(len(self.pending()), 1)
         self.assertTrue(strm_repo.list_strm_refresh_entries())
-        restored = strm.cleanup_deleted_cloud_files({"video"}, allow_emby=False)
+        restored = strm.cleanup_deleted_cloud_files({"video"}, refresh_enabled=True)
         self.assertEqual(restored["cleaned"], 0)
         self.assertEqual(self.pending(), [])
         self.assertEqual(self.client.delete.call_count, 1)

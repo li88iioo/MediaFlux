@@ -2213,7 +2213,7 @@ class OrganizeCorrectionService:
         rules = OrganizeRules.from_config()
         if deleted and rules.link_strm:
             try:
-                cleanup = cleanup_deleted_cloud_files(deleted, allow_emby=rules.emby_refresh)
+                cleanup = cleanup_deleted_cloud_files(deleted, refresh_enabled=rules.emby_refresh)
                 warnings = list(cleanup.get("error_samples") or [])
             except Exception as exc:
                 logger.warning("日志删除后 STRM 收尾失败 log=%s type=%s", log_id, type(exc).__name__)

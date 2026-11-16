@@ -3642,7 +3642,7 @@ class Organizer:
                     "detail_notify_override": (
                         not probe_completion and rules.notify_enabled and rules.strm_detail_notify
                     ),
-                    "emby_refresh_override": rules.emby_refresh,
+                    "media_server_refresh_override": rules.emby_refresh,
                     "download_request_ids": download_request_ids,
                     "organize_changes": list(stats.get("strm_changes") or []),
                     "force_full": False if force_incremental else (

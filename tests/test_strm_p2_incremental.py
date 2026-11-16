@@ -1018,7 +1018,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
             "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths"
         ) as enqueue:
             result = STRMScheduler._refresh_media_servers(
-                emby_enabled=False, has_changes=True
+                has_changes=True
             )
 
         self.assertEqual(result, {})

@@ -13,6 +13,7 @@ from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.modules.media_refresh import MAX_REFRESH_TARGETS, plan_refresh_targets
 from app.modules.media_server_path_mapping import MediaServerPathMapping
+from app.repositories.strm import StrmRefreshPolicy
 
 ROOT = "/data/strm/光鸭云盘"
 
@@ -1360,7 +1361,7 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
 
         self.assertTrue(enqueue.call_args.kwargs["immediate"])
 
-    def test_legacy_emby_override_only_disables_emby(self):
+    def test_frozen_provider_boundary_only_disables_emby(self):
         from app.modules.scheduler import STRMScheduler
 
         settings = self._settings()
@@ -1372,7 +1373,7 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             return_value={"Jellyfin": "queued"},
         ) as enqueue:
             results = STRMScheduler._refresh_media_servers(
-                emby_enabled=False,
+                refresh_policy=StrmRefreshPolicy(allow_emby=False),
                 has_changes=True,
                 changed_dirs=[f"{ROOT}/剧集/作品 A"],
             )
@@ -1391,7 +1392,7 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
         ) as enqueue:
             result = STRMScheduler._refresh_media_servers(
-                media_server_refresh_enabled=False,
+                refresh_policy=StrmRefreshPolicy(enabled=False),
                 has_changes=True,
                 changed_paths=[f"{ROOT}/剧集/作品 A/Season 01/E01.strm"],
             )

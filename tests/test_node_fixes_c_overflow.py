@@ -5,6 +5,7 @@ from typing import Any
 from typing import cast
 from app.clients.guangya import GuangYaClient
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,8 +57,12 @@ def test_C02_saturated_sync_delivers_every_library_with_policy(tmp_path, mode, p
         stack.enter_context(patch.object(strm, "_MAX_TRACKED_OVERFLOW_DIRS", 1))
         handoff = stack.enter_context(patch("app.modules.media_refresh_coordinator.enqueue_media_refresh_paths", return_value={"Jellyfin": "failed"}))
         execute = scheduler._execute_locked
+        freeze_policy = scheduler._refresh_overflow_sink
+        stack.enter_context(patch.object(scheduler, "_refresh_overflow_sink", side_effect=lambda root=None: replace(
+            freeze_policy(root), allow_emby=allow_emby,
+        )))
         def execute_with_policy(trigger, run_id):
-            scheduler._run_options.update(media_server_refresh_override=refresh_enabled, emby_refresh_override=allow_emby)
+            scheduler._run_options.update(media_server_refresh_override=refresh_enabled)
             return execute(trigger, run_id)
         stack.enter_context(patch.object(scheduler, "_execute_locked", side_effect=execute_with_policy))
         original_track = strm._track_change
@@ -134,17 +139,17 @@ def test_C02_exact_spill_survives_real_refresh_queue_and_consumers(tmp_path, all
 
     with isolated_test_database(), ExitStack() as stack:
         scheduler = STRMScheduler()
-        scheduler._run_options.update(emby_refresh_override=allow_emby)
         stack.enter_context(patch("app.modules.scheduler.get", side_effect=lambda k, d="": str(tmp_path) if k == "STRM_ROOT" else d))
+        policy = replace(scheduler._refresh_overflow_sink(), allow_emby=allow_emby)
         stack.enter_context(patch.object(strm, "_MAX_TRACKED_CHANGED_PATHS", 1))
         stack.enter_context(patch.object(strm, "_MAX_TRACKED_OVERFLOW_DIRS", 1))
         stats = {}
         paths = [tmp_path / strm.STRM_SUBDIR / f"Library{i}" / "E.strm" for i in range(6)]
         for path in paths:
-            strm._record_changed_path(stats, path, on_refresh_paths=scheduler._refresh_overflow_sink())
+            strm._record_changed_path(stats, path, on_refresh_paths=policy)
         strm.finalize_changed_paths(stats)
         scheduler._refresh_media_servers(changed_paths=stats["changed_strm_paths"],
-            changed_dirs=stats["changed_dirs"], emby_enabled=allow_emby, persist_only=True)
+            changed_dirs=stats["changed_dirs"], refresh_policy=policy, persist_only=True)
         assert strm_repo.count_strm_refresh_paths() == 6
         worker = coordinator.MediaRefreshCoordinator()
         stack.enter_context(patch.object(coordinator, "get_media_refresh_coordinator", return_value=worker))
@@ -237,11 +242,10 @@ def test_C02_scheduler_retries_failed_spill_on_stop_without_consuming(tmp_path, 
         stack.enter_context(patch.object(strm, "_MAX_TRACKED_CHANGED_PATHS", 1))
         stack.enter_context(patch.object(strm, "_MAX_TRACKED_OVERFLOW_DIRS", 1))
         handoff = stack.enter_context(patch("app.modules.media_refresh_coordinator.enqueue_media_refresh_paths", return_value={"Jellyfin": "queued"}))
-        execute = scheduler._execute_locked
-        def execute_with_policy(trigger, run_id):
-            scheduler._run_options.update(emby_refresh_override=allow_emby)
-            return execute(trigger, run_id)
-        stack.enter_context(patch.object(scheduler, "_execute_locked", side_effect=execute_with_policy))
+        freeze_policy = scheduler._refresh_overflow_sink
+        stack.enter_context(patch.object(scheduler, "_refresh_overflow_sink", side_effect=lambda root=None: replace(
+            freeze_policy(root), allow_emby=allow_emby,
+        )))
         original_enqueue = strm_repo.enqueue_strm_refresh_paths
         attempts = []
         def flaky(paths, **kw):

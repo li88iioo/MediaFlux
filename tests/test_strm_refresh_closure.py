@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -41,7 +42,8 @@ def _tree(*, flat=False, etag="e"):
 
 
 def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
-         flat=False, retire=False, configured_text=None, queue_only=False):
+         flat=False, retire=False, configured_text=None, queue_only=False,
+         trigger_type="manual", metadata_exts=None):
     """经真实 scheduler 注入策略；不直接为安装器伪造刷新行为。"""
     scheduler = STRMScheduler()
     sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}], prefixes={"s": ""})
@@ -57,22 +59,27 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
         stack.enter_context(patch.object(scheduler_module, "get_int", return_value=0))
         stack.enter_context(patch.object(scheduler_module, "configured_strm_source_plans", return_value=(sources, "" if sources else "来源为空")))
         for name, value in (("validate_config", ""), ("_source_dirs", sources),
-                            ("_video_exts", {"mkv"}), ("_metadata_exts", set())):
+                            ("_video_exts", {"mkv"}), ("_metadata_exts", set(metadata_exts or ()))):
             stack.enter_context(patch.object(scheduler, name, return_value=value))
         for name in ("_notify_success", "_notify_details", "_notify_failure", "_schedule_persisted_change_queue"):
             stack.enter_context(patch.object(scheduler, name))
         stack.enter_context(patch.object(scheduler_module, "sync_strm", side_effect=lambda **kw: strm.sync_strm(client=cast(GuangYaClient, client), **kw)))
         stack.enter_context(patch.object(scheduler_module, "sync_strm_incremental", side_effect=lambda **kw: strm.sync_strm_incremental(client=cast(GuangYaClient, client), **kw)))
         execute = scheduler._execute_locked
+        freeze_policy = scheduler._refresh_overflow_sink
+        # 历史 provider 边界直接装入冻结策略，不恢复已下线的运行时单 provider 开关。
+        stack.enter_context(patch.object(scheduler, "_refresh_overflow_sink", side_effect=lambda root=None: replace(
+            freeze_policy(root), allow_emby=allow_emby,
+        )))
 
         def execute_with_policy(trigger, run_id):
-            scheduler._run_options.update(media_server_refresh_override=enabled, emby_refresh_override=allow_emby)
+            scheduler._run_options.update(media_server_refresh_override=enabled)
             return execute(trigger, run_id)
 
         stack.enter_context(patch.object(scheduler, "_execute_locked", side_effect=execute_with_policy))
         changes = [{"source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
                     "parent_id": "s" if flat else "d", "name": "Movie.mkv", "rel_dir": "" if flat else "Film"}]
-        return scheduler.run_blocking("manual", sync_mode=mode, organize_changes=changes if mode == "fast" and not queue_only else None)
+        return scheduler.run_blocking(trigger_type, sync_mode=mode, organize_changes=changes if mode == "fast" and not queue_only else None)
 
 
 @contextmanager
@@ -104,6 +111,72 @@ def _consume(*, providers, expected_paths):
         assert client.refresh_for_paths.call_args.kwargs["allow_global_fallback"] is False
     assert repository.count_strm_refresh_paths() == 0
     assert media_refresh_queue_status()["paths"] == 0
+
+
+@pytest.mark.parametrize("trigger_type", ["organize", "manual", "cron"])
+def test_organize_refresh_off_survives_recovery_and_metadata_without_affecting_independent_sync(tmp_path, trigger_type):
+    from tests.test_strm_metadata_root_policy import _Response
+
+    tree = _tree()
+    tree["d"].append(GuangYaFile("nfo", "Movie.nfo", False, 8, "n1", "d"))
+    with isolated_test_database(), _providers("jellyfin", "emby"):
+        get_bool = refresh.config.get_bool
+        with patch.object(scheduler_module, "get_bool", side_effect=lambda key, default=False: (
+            False if key == "GY_ORGANIZE_EMBY_REFRESH" else get_bool(key, default)
+        )), patch.object(refresh, "enqueue_media_refresh_paths", return_value={"Jellyfin": "pending", "Emby": "pending"}):
+            # 模拟进程重启后的持久变化领取：没有原始内存 override。
+            repository.enqueue_strm_change_targets([{
+                "source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
+                "parent_id": "d", "name": "Movie.mkv", "rel_dir": "Film",
+            }])
+            result = _run(tmp_path, enabled=None, tree=tree, trigger_type=trigger_type, metadata_exts={"nfo"})
+        assert result["ok"] and result["stats"]["generated"] == 1
+        jobs = repository.list_strm_metadata_queue()
+        assert len(jobs) == 1
+        enabled = trigger_type != "organize"
+        assert json.loads(jobs[0]["refresh_policy_json"])["enabled"] is enabled
+        entries = repository.list_strm_refresh_entries()
+        assert bool(entries) is enabled
+        assert all(entry["allow_emby"] for entry in entries)
+        repository.acknowledge_strm_refresh_paths(entries)
+        worker = STRMMetadataWorker()
+        worker._client = cast(GuangYaClient, _TreeClient(tree))
+        with patch("app.modules.strm_metadata_worker.get_bool", return_value=True), patch(
+            "app.modules.strm_metadata_worker.get", side_effect=lambda key, default="": (
+                str(tmp_path) if key == "STRM_ROOT" else "nfo" if key == "STRM_METADATA_EXTS" else default
+            ),
+        ), patch("app.modules.strm.requests.get", return_value=_Response()), patch.object(
+            refresh, "enqueue_media_refresh_paths", return_value={"Jellyfin": "pending", "Emby": "pending"},
+        ):
+            assert worker._process_one()
+        assert (tmp_path / strm.STRM_SUBDIR / "Film" / "Movie.nfo").is_file()
+        entries = repository.list_strm_refresh_entries()
+        assert bool(entries) is enabled
+        assert all(entry["allow_emby"] for entry in entries)
+        if enabled:
+            _consume(providers=("jellyfin", "emby"), expected_paths=[entry["path"] for entry in entries])
+        else:
+            worker._flush_media_refresh(force=True)
+            assert media_refresh_queue_status()["paths"] == 0
+
+
+@pytest.mark.parametrize("switches", [(False, True), (True, False)])
+def test_coalesced_organize_requests_never_reenable_a_disabled_batch(tmp_path, switches):
+    with isolated_test_database(), patch.object(scheduler_module.threading, "Thread"):
+        scheduler = STRMScheduler()
+        for index, enabled in enumerate(switches):
+            assert scheduler.trigger(
+                "organize", media_server_refresh_override=enabled, debounce_seconds=1,
+                organize_changes=[{"source_id": "s", "file_id": str(index), "kind": "video", "action": "upsert"}],
+            )["ok"]
+        options = scheduler._pending_organize_options
+        assert options is not None and len(options["organize_changes"]) == 2
+        scheduler._run_options = options
+        policy = scheduler._refresh_overflow_sink(str(tmp_path))
+        path = Path(policy.media_root) / "Film" / "Movie.strm"
+        repository.upsert_strm_index("guangya:s", "v", "e", 1, "Movie.mkv", str(path), refresh_policy=policy)
+        policy([str(path.parent)])
+        assert repository.list_strm_refresh_entries() == []
 
 
 _CHILD = r'''
@@ -175,7 +248,9 @@ def test_empty_provider_keeps_intent_until_configuration_recovers(tmp_path, orig
             assert worker._refresh_retry_pending
         else:
             with patch.object(scheduler_module, "get", side_effect=lambda k, d="": str(tmp_path) if k == "STRM_ROOT" else d):
-                result = STRMScheduler._refresh_media_servers(changed_dirs=[target], emby_enabled=False)
+                result = STRMScheduler._refresh_media_servers(
+                    changed_dirs=[target], refresh_policy=repository.StrmRefreshPolicy(allow_emby=False),
+                )
             assert result == {"媒体库": "pending"}
         assert repository.count_strm_refresh_paths() == 1
         assert media_refresh_queue_status()["paths"] == 0
@@ -351,13 +426,13 @@ def test_real_scheduler_entry_retires_last_source_without_config_short_circuit(t
 def test_commit_and_overflow_share_frozen_policy_and_do_not_duplicate_paths(tmp_path):
     with isolated_test_database():
         scheduler = STRMScheduler()
-        scheduler._run_options = {"media_server_refresh_override": True, "emby_refresh_override": False}
-        first = scheduler._refresh_overflow_sink(str(tmp_path / "first"))
+        scheduler._run_options = {"media_server_refresh_override": True}
+        first = replace(scheduler._refresh_overflow_sink(str(tmp_path / "first")), allow_emby=False)
         path = Path(first.media_root) / "Film" / "Movie.strm"
         repository.upsert_strm_index("guangya:s", "v", "e", 1, "Movie.mkv", str(path), refresh_policy=first)
         first([str(path.parent)])
         assert repository.count_strm_refresh_paths() == 2
-        scheduler._run_options = {"media_server_refresh_override": False, "emby_refresh_override": True}
+        scheduler._run_options = {"media_server_refresh_override": False}
         disabled = scheduler._refresh_overflow_sink(str(tmp_path / "second"))
         disabled([str(Path(disabled.media_root) / "Film")])
         # 后一轮开关/根改变，不能污染上一轮已捕获策略；同一路径重复交接不产生副本。
@@ -365,7 +440,7 @@ def test_commit_and_overflow_share_frozen_policy_and_do_not_duplicate_paths(tmp_
         assert {(entry["path"], entry["allow_emby"]) for entry in repository.list_strm_refresh_entries()} == {
             (str(path), False), (str(path.parent), False),
         }
-        scheduler._run_options = {"media_server_refresh_override": True, "emby_refresh_override": True}
+        scheduler._run_options = {"media_server_refresh_override": True}
         second = scheduler._refresh_overflow_sink(str(tmp_path / "second"))
         second([str(Path(second.media_root) / "Film")])
         assert {(entry["path"], entry["allow_emby"]) for entry in repository.list_strm_refresh_entries()} == {

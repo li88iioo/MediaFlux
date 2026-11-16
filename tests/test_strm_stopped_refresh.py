@@ -3,6 +3,7 @@
 from typing import cast
 from app.clients.guangya import GuangYaClient
 from contextlib import ExitStack
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -48,11 +49,14 @@ def test_committed_strm_stop_retains_refresh_for_skip_only_replay(tmp_path, mode
         change = {"source_id": "source", "kind": "video", "action": "upsert", "file_id": "v1",
                   "parent_id": "source", "name": "Movie.mkv", "rel_dir": ""}
         execute = scheduler._execute_locked
+        freeze_policy = scheduler._refresh_overflow_sink
+        stack.enter_context(patch.object(scheduler, "_refresh_overflow_sink", side_effect=lambda root=None: replace(
+            freeze_policy(root), allow_emby=allow_emby,
+        )))
 
         def execute_with_policy(trigger_type, run_id):
             scheduler._run_options.update(
                 media_server_refresh_override=refresh_enabled,
-                emby_refresh_override=allow_emby,
             )
             return execute(trigger_type, run_id)
 

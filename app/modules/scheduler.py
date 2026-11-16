@@ -490,7 +490,6 @@ class STRMScheduler:
                 {
                     "notify_override": False,
                     "detail_notify_override": False,
-                    "emby_refresh_override": None,
                     "media_server_refresh_override": None,
                     "download_request_ids": [],
                     "organize_changes": [],
@@ -738,6 +737,9 @@ class STRMScheduler:
                     )
                 elif key == "notification_scopes":
                     pending[key] = merge_notification_scopes(pending.get(key), value)
+                elif key == "media_server_refresh_override":
+                    # 合并后的路径无法再分辨各请求归属，任一关闭都不得扩大刷新范围。
+                    pending[key] = pending.get(key) is not False and bool(value)
                 elif key == "force_full":
                     pending[key] = bool(pending.get(key)) or bool(value)
                 elif key == "sync_mode":
@@ -832,7 +834,6 @@ class STRMScheduler:
     def trigger(self, trigger_type: str = "manual", *,
                 notify_override: bool | None = None,
                 detail_notify_override: bool | None = None,
-                emby_refresh_override: bool | None = None,
                 media_server_refresh_override: bool | None = None,
                 on_progress=None,
                 download_request_ids: list[int] | None = None,
@@ -874,7 +875,6 @@ class STRMScheduler:
             options = {
                 "notify_override": notify_override,
                 "detail_notify_override": detail_notify_override,
-                "emby_refresh_override": emby_refresh_override,
                 "media_server_refresh_override": media_server_refresh_override,
                 "on_progress": on_progress,
                 "download_request_ids": list(download_request_ids or []),
@@ -1350,18 +1350,14 @@ class STRMScheduler:
 
     def _refresh_overflow_sink(self, strm_root: str | None = None):
         """同一冻结策略用于索引提交、溢出批次与旧路径恢复，不读取后续轮次。"""
-        from app.repositories.strm import StrmRefreshPolicy
-
         with self._state_lock:
             options = dict(self._run_options)
             request_owners = deepcopy(options.get("download_request_owners"))
         enabled = options.get("media_server_refresh_override")
-        allow_emby = options.get("emby_refresh_override")
         root = get("STRM_ROOT", "") if strm_root is None else strm_root
-        return StrmRefreshPolicy(
+        return strm_repo.StrmRefreshPolicy(
             media_root=str((Path(root).expanduser() / STRM_SUBDIR).resolve()),
             enabled=True if enabled is None else bool(enabled),
-            allow_emby=True if allow_emby is None else bool(allow_emby),
             request_owners=request_owners,
         )
 
@@ -1746,6 +1742,13 @@ class STRMScheduler:
         lease_heartbeat: _ChangeTargetLeaseHeartbeat | None = None
         started = datetime.now()
         try:
+            if options.get("media_server_refresh_override") is None:
+                # 重启恢复没有内存 override；仅整理队列继承整理开关，人工/定时同步独立。
+                options["media_server_refresh_override"] = (
+                    trigger_type != "organize" or get_bool("GY_ORGANIZE_EMBY_REFRESH", True)
+                )
+                with self._state_lock:
+                    self._run_options["media_server_refresh_override"] = options["media_server_refresh_override"]
             _update_strm_requests(
                 options, strm_run_id=run_id, strm_status="running",
                 strm_error="", strm_finished_at=None,
@@ -1961,12 +1964,10 @@ class STRMScheduler:
                 media_refresh = {}
                 if has_changes:
                     media_refresh = self._refresh_media_servers(
-                        emby_enabled=options.get("emby_refresh_override"),
-                        media_server_refresh_enabled=options.get("media_server_refresh_override"),
+                        refresh_policy=self._refresh_overflow_sink(strm_root),
                         changed_paths=list(aggregate.get("changed_strm_paths") or []),
                         changed_dirs=list(aggregate.get("changed_dirs") or []),
                         persist_only=True,
-                        request_owners=options.get("download_request_owners"),
                     )
                 with self._state_lock:
                     for row in self._source_runtime:
@@ -2022,15 +2023,11 @@ class STRMScheduler:
             refresh_started = monotonic()
             refresh_entries: list[dict[str, Any]] = []
             media_refresh = self._refresh_media_servers(
-                emby_enabled=options.get("emby_refresh_override"),
-                media_server_refresh_enabled=options.get(
-                    "media_server_refresh_override"
-                ),
+                refresh_policy=self._refresh_overflow_sink(strm_root),
                 has_changes=has_changes,
                 changed_paths=list(stats.get("changed_strm_paths") or []),
                 changed_dirs=list(stats.get("changed_dirs") or []),
                 immediate=trigger_type in {"manual", "telegram"},
-                request_owners=options.get("download_request_owners"),
                 handoff_entries=refresh_entries,
             )
             stats["refresh_elapsed_seconds"] = round(
@@ -2198,32 +2195,30 @@ class STRMScheduler:
 
     @staticmethod
     def _refresh_media_servers(
-        emby_enabled: bool | None = None,
         has_changes: bool = True,
         changed_paths: list[str] | None = None,
         changed_dirs: list[str] | None = None,
-        media_server_refresh_enabled: bool | None = None,
+        refresh_policy: strm_repo.StrmRefreshPolicy | None = None,
         immediate: bool = False,
         persist_only: bool = False,
-        request_owners: Iterable[dict[str, Any]] | None = None,
         handoff_entries: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """统一规划并保存刷新意图；关停时仅落盘，不唤醒消费者。"""
         if not has_changes:
             logger.debug("STRM 本轮无增量变化，跳过媒体库刷新")
             return {}
-        allow_media_server_refresh = (
-            True if media_server_refresh_enabled is None
-            else media_server_refresh_enabled
-        )
-        if not allow_media_server_refresh:
+        if refresh_policy is None:
+            strm_root = get("STRM_ROOT", "")
+            refresh_policy = strm_repo.StrmRefreshPolicy(
+                media_root=str(Path(strm_root) / STRM_SUBDIR) if strm_root else "",
+            )
+        if not refresh_policy.enabled:
             logger.info("整理联动已关闭媒体服务器刷新，跳过 Jellyfin/Emby")
             return {}
-        strm_root = get("STRM_ROOT", "")
         plan = plan_refresh_targets(
             changed_paths or [],
             changed_dirs or [],
-            media_roots=[str(Path(strm_root) / STRM_SUBDIR)] if strm_root else [],
+            media_roots=[refresh_policy.media_root] if refresh_policy.media_root else [],
         )
         if plan.reason:
             logger.info("媒体库精准刷新规划 reason=%s", plan.reason)
@@ -2237,11 +2232,10 @@ class STRMScheduler:
         from app.modules.media_refresh_coordinator import enqueue_media_refresh_paths
 
         targets = list(plan.targets)
-        allow_emby = True if emby_enabled is None else emby_enabled
         # STRM 已经落盘，媒体库刷新必须独立交接。先写 durable outbox，再尝试
         # 投递统一刷新队列；投递失败只重试刷新，绝不重新生成 STRM。
-        owner_kwargs: _RefreshOwnerOptions = {"request_owners": request_owners} if request_owners else {}
-        entries = strm_repo.enqueue_strm_refresh_paths(targets, allow_emby=allow_emby, **owner_kwargs)
+        owner_kwargs: _RefreshOwnerOptions = {"request_owners": refresh_policy.request_owners} if refresh_policy.request_owners else {}
+        entries = strm_repo.enqueue_strm_refresh_paths(targets, allow_emby=refresh_policy.allow_emby, **owner_kwargs)
         if handoff_entries is not None:
             handoff_entries.extend(entries)
         if persist_only:
@@ -2250,7 +2244,7 @@ class STRMScheduler:
             results = enqueue_media_refresh_paths(
                 targets,
                 immediate=immediate,
-                allow_emby=allow_emby,
+                allow_emby=refresh_policy.allow_emby,
             )
         except Exception as exc:
             logger.warning(

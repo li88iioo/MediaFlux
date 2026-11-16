@@ -270,23 +270,25 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
             }],
             "strm_force_full": False,
         }
-        rules = OrganizeRules(
-            link_strm=True, notify_enabled=True, strm_detail_notify=True,
-            emby_refresh=True,
-        )
         scheduler = unittest.mock.Mock()
         scheduler.trigger.return_value = {"ok": True}
         values = {"GY_STRM_BASE_URL": "http://media.invalid", "STRM_ROOT": "/tmp/strm"}
         with patch(
             "app.modules.organize.get", side_effect=lambda key, default="": values.get(key, default)
         ), patch("app.modules.scheduler.get_scheduler", return_value=scheduler):
-            Organizer._post_organize_link(stats, rules, download_request_ids=[7])
-
-        scheduler.trigger.assert_called_once_with(
-            "organize", notify_override=True, detail_notify_override=True,
-            emby_refresh_override=True, download_request_ids=[7],
-            organize_changes=stats["strm_changes"], force_full=False,
-        )
+            for refresh_enabled in (True, False):
+                with self.subTest(refresh_enabled=refresh_enabled):
+                    scheduler.reset_mock()
+                    rules = OrganizeRules(
+                        link_strm=True, notify_enabled=True, strm_detail_notify=True,
+                        emby_refresh=refresh_enabled,
+                    )
+                    Organizer._post_organize_link(stats, rules, download_request_ids=[7])
+                    scheduler.trigger.assert_called_once_with(
+                        "organize", notify_override=True, detail_notify_override=True,
+                        media_server_refresh_override=refresh_enabled, download_request_ids=[7],
+                        organize_changes=stats["strm_changes"], force_full=False,
+                    )
         assert isinstance(stats['strm'], dict)
         self.assertTrue(stats["strm"]["ok"])
 
@@ -925,7 +927,7 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
                 "organize",
                 notify_override=True,
                 detail_notify_override=True,
-                emby_refresh_override=True,
+                media_server_refresh_override=True,
                 download_request_ids=[1],
                 organize_changes=[{
                     "source_id": "archive", "kind": "video",
@@ -938,7 +940,7 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
                 "organize",
                 notify_override=False,
                 detail_notify_override=False,
-                emby_refresh_override=False,
+                media_server_refresh_override=False,
                 download_request_ids=[2, 1],
                 organize_changes=[{
                     "source_id": "archive", "kind": "video",
@@ -961,7 +963,7 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         self.assertTrue(started[0][1]["detail_notify_override"])
         self.assertTrue(started[0][1]["uses_default_notification_scope"])
         self.assertTrue(started[0][1]["has_silent_notification_scope"])
-        self.assertFalse(started[0][1]["emby_refresh_override"])
+        self.assertFalse(started[0][1]["media_server_refresh_override"])
         self.assertEqual(started[0][1]["download_request_ids"], [1, 2])
         self.assertEqual(started[0][1]["organize_changes"], [{
             "source_id": "archive", "kind": "video",

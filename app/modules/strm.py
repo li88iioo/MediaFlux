@@ -1399,7 +1399,7 @@ def _remove_indexed_rows(
     return result
 
 
-def cleanup_deleted_cloud_files(file_ids: set[str], *, allow_emby: bool) -> dict:
+def cleanup_deleted_cloud_files(file_ids: set[str], *, refresh_enabled: bool) -> dict:
     """按已确认回收的对象精准收尾，复用旧路径凭据，不扫描云端来源。"""
     stats: dict = {"cleaned": 0, "metadata_cleaned": 0}
     if not file_ids:
@@ -1415,7 +1415,7 @@ def cleanup_deleted_cloud_files(file_ids: set[str], *, allow_emby: bool) -> dict
         if sources and not strm_root:
             raise ValueError("未配置 STRM 本地根目录，已保留清理凭据")
         policy = StrmRefreshPolicy(
-            media_root=str(Path(strm_root) / STRM_SUBDIR), allow_emby=allow_emby,
+            media_root=str(Path(strm_root) / STRM_SUBDIR), enabled=refresh_enabled,
         )
         for source in sources:
             recover_pending_paths(
@@ -1424,8 +1424,8 @@ def cleanup_deleted_cloud_files(file_ids: set[str], *, allow_emby: bool) -> dict
             )
     finally:
         STRM_OPERATION_LOCK.release()
-    # 只唤醒既有刷新 outbox 消费者；没有本地路径变化就不启动后处理。
-    if stats.get("changed_strm_paths"):
+    # 只有本次产生刷新意图才唤醒消费者；关闭刷新不启动无关后处理。
+    if policy.enabled and stats.get("changed_strm_paths"):
         from app.modules.strm_metadata_worker import get_strm_metadata_worker
 
         get_strm_metadata_worker().wake()
