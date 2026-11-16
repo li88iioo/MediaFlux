@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
-from contextlib import chdir
+from contextlib import chdir, contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -209,6 +209,27 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 )
             failures = db.list_strm_failures(status="open", limit=20)
             selected_id = next(row["id"] for row in failures if row["file_id"] == "video-1")
+            # 单条恢复的读取成本不能随同源无关库存线性增长。
+            with db.get_conn() as conn:
+                conn.executemany(
+                    "INSERT INTO strm_index(source,file_id,etag,size,filename,strm_path,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    ((f"guangya:{source_id}", f"unrelated-{index}", "e", 1, f"{index}.mkv",
+                      str(Path(root) / f"unrelated-{index}.strm"), db.now()) for index in range(2000)),
+                )
+            original_conn = db.get_conn
+            vm_steps = 0
+
+            @contextmanager
+            def measured_conn():
+                nonlocal vm_steps
+                with original_conn() as conn:
+                    def step():
+                        nonlocal vm_steps
+                        vm_steps += 1000
+                        return 0
+                    conn.set_progress_handler(step, 1000)
+                    yield conn
 
             values = {
                 "GY_STRM_SOURCE_DIRS": '[{"id":"source-retry","name":"待重试源"}]',
@@ -225,13 +246,14 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 "app.modules.strm.get_int",
                 create=True,
                 side_effect=lambda key, default=0: int(values.get(key, default) or 0),
-            ):
+            ), patch.object(db, "get_conn", measured_conn):
                 retried = strm_module.retry_strm_failures(
                     [selected_id], "manual", client=cast(GuangYaClient, client)
                 )
 
             self.assertEqual(retried["resolved"], 1)
             self.assertEqual(retried["failed"], 0)
+            self.assertLess(vm_steps, 10000, "单条失败恢复不应遍历同源无关库存")
             open_rows = db.list_strm_failures(status="open", limit=20)
             self.assertEqual([row["file_id"] for row in open_rows], ["video-2"])
             resolved = db.list_strm_failures(status="resolved", limit=20)
@@ -1435,16 +1457,21 @@ class StrmRetryBatchAndSchedulerSafetyTests(IsolatedDatabaseTestCase):
             )
             for index in range(1005)
         ]
+        # 台账按新到旧分页；file-0 在第二页覆盖第一页的同目标文件。
+        files[1000].name = files[0].name
         client = _TreeClient({"source-batch": files})
         progress_events = []
-        with tempfile.TemporaryDirectory() as root, patch(
-            "app.modules.strm._install_video_candidate", return_value=(0, "")
-        ), patch("app.modules.strm._update_video_index_snapshot", return_value=None):
+        with tempfile.TemporaryDirectory() as root:
             result = strm_module.retry_all_strm_failures(
                 "source-batch", "generate", "web",
                 client=cast(GuangYaClient, client), runtime_config=self._bulk_runtime(root),
                 on_progress=lambda *event: progress_events.append(event),
             )
+            rows = strm_repo.list_strm_index("guangya:source-batch")
+            self.assertEqual(len(rows), 1004)
+            self.assertNotIn("file-1000", {row["file_id"] for row in rows})
+            winner = next(row for row in rows if row["file_id"] == "file-0")
+            self.assertIn("file-0", Path(winner["strm_path"]).read_text())
 
         self.assertTrue(result["ok"])
         self.assertEqual(client.list_calls, ["source-batch"])
@@ -1471,7 +1498,7 @@ class StrmRetryBatchAndSchedulerSafetyTests(IsolatedDatabaseTestCase):
             "app.modules.strm._scan_limits", return_value=(10, 1, 10000, 30.0)
         ), patch(
             "app.modules.strm._install_video_candidate", return_value=(0, "")
-        ), patch("app.modules.strm._update_video_index_snapshot", return_value=None):
+        ):
             result = strm_module.retry_all_strm_failures(
                 "source-batch", "generate", "web",
                 client=cast(GuangYaClient, client), runtime_config=self._bulk_runtime(root),

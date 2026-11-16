@@ -3482,7 +3482,6 @@ def _process_claimed_strm_failures(
     progress_offset: int,
     progress_total: int,
     should_stop: Callable[[], bool] | None = None,
-    index_maps: dict | None = None,
 ) -> None:
     """处理已 claim 的失败项；扫描结果可由单选或“全部”重试共享。"""
     located = lookup.located
@@ -3493,8 +3492,6 @@ def _process_claimed_strm_failures(
         enabled=bool(runtime.get("media_server_refresh", True)),
         allow_emby=bool(runtime.get("allow_emby", True)),
     )
-    # “全部”重试跨 claim 分页共享，避免每 1000 项重新全读来源索引。
-    index_maps = {} if index_maps is None else index_maps
     for completed, row in enumerate(rows, 1):
         failure_id = int(row["id"])
         try:
@@ -3550,19 +3547,13 @@ def _process_claimed_strm_failures(
                 refresh_paths = [str(target)]
                 if action == "generate":
                     source_key = source["source_key"]
-                    maps = index_maps.get(source_key)
-                    if maps is None:
-                        maps = _build_video_index_maps(strm_repo.list_strm_index(source_key))
-                        index_maps[source_key] = maps
-                    existing_by_id, existing_by_path = maps
+                    existing_by_id, existing_by_path = _build_video_index_maps(
+                        strm_repo.list_strm_installation_rows(source_key, file.file_id, str(target))
+                    )
                     current_before_install = existing_by_id.get(file.file_id)
-                    cleaned, installed_fingerprint = _install_video_candidate(
+                    cleaned, _installed_fingerprint = _install_video_candidate(
                         file, rel_dir, target, base_url, strm_root, source_key,
                         existing_by_id, existing_by_path,
-                    )
-                    _update_video_index_snapshot(
-                        existing_by_id, existing_by_path, file, target,
-                        installed_fingerprint,
                     )
                     if cleaned and current_before_install:
                         refresh_paths.append(str(_row_field(current_before_install, "strm_path", "")))
@@ -3679,7 +3670,6 @@ def _retry_strm_failures_locked(
         progress = _BoundedProgress(on_progress)
         total = len(snapshot)
         progress.emit("retry", 0, total, "重试失败项")
-        index_maps: dict = {}
         for offset in range(0, total, 1000):
             batch = snapshot[offset:offset + 1000]
             rows = db.claim_strm_failures([failure_id for failure_id, _, _ in batch], limit=1000)
@@ -3689,7 +3679,7 @@ def _retry_strm_failures_locked(
             _process_claimed_strm_failures(
                 rows, client=runtime_client, runtime=runtime, lookup=lookup,
                 result=result, progress=progress, progress_offset=offset,
-                progress_total=total, should_stop=should_stop, index_maps=index_maps,
+                progress_total=total, should_stop=should_stop,
             )
             progress.emit("retry", min(offset + len(batch), total), total, "重试失败项")
         return result
