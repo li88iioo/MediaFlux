@@ -184,7 +184,9 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
                         instance_id, request, {**body, "api_key": submitted},
                     ))
                     self.assertEqual(response.status_code, 200)
-                    self.assertEqual(repository.get_media_proxy_instance(instance_id)["api_key"], expected)
+                    saved = repository.get_media_proxy_instance(instance_id)
+                    self.assertIsNotNone(saved)
+                    self.assertEqual(saved["api_key"], expected)
                     instance = json.loads(bytes(response.body))["instance"]
                     self.assertEqual(instance["has_api_key"], bool(expected))
                     self.assertEqual(instance["api_key"], "********" if expected else "")
@@ -223,7 +225,12 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
                     guangya_file_id="file",
                 )
                 manager = media_proxy.MediaProxyManager()
-                runtime = SimpleNamespace(instance_id=instance_id)
+                runtime = media_proxy.ProxyRuntime(
+                    instance_id=instance_id,
+                    bind=("127.0.0.1", port),
+                    server=MagicMock(), task=MagicMock(), sock=MagicMock(),
+                    signed_urls=MagicMock(), app=MagicMock(),
+                )
                 manager._runtimes[instance_id] = runtime
                 request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
                     background_services_enabled=True,
@@ -249,6 +256,7 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
                     disabled = asyncio.run(media_proxy_api.update_instance(instance_id, request, body))
                     self.assertEqual(disabled.status_code, 200, bytes(disabled.body))
                     stopped = repository.get_media_proxy_instance(instance_id)
+                    self.assertIsNotNone(stopped)
                     self.assertEqual(stopped["enabled"], 0)
                     self.assertEqual(stopped["status"], "stopped")
                     stop.assert_awaited_once_with(runtime)
@@ -261,7 +269,9 @@ class MediaProxyInstanceApiTests(IsolatedDatabaseTestCase):
                         instance_id, request, {**body, "enabled": True},
                     ))
                     self.assertEqual(enabled.status_code, 400)
-                    self.assertEqual(repository.get_media_proxy_instance(instance_id)["enabled"], 0)
+                    current = repository.get_media_proxy_instance(instance_id)
+                    self.assertIsNotNone(current)
+                    self.assertEqual(current["enabled"], 0)
 
 
 class MediaProxyProbeApiTests(unittest.TestCase):

@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import unittest
+from collections.abc import Mapping
+from typing import Any
 
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
 
@@ -25,13 +27,13 @@ def _record(status_code: int = 206, *, failure_stage: str = "") -> dict:
 
 class PlaybackRecordWriterTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_before_insert_finishes_updates_same_receipt_once(self):
-        calls = []
+        calls: list[tuple[str, dict] | tuple[str, int, str, str]] = []
 
-        def write(payload):
+        def write(payload: Mapping[str, Any]) -> int:
             calls.append(("insert", dict(payload)))
             return 73
 
-        def update(record_id, *, failure_stage, error):
+        def update(record_id: int, *, failure_stage: str, error: str) -> bool:
             calls.append(("update", record_id, failure_stage, error))
             return True
 
@@ -66,6 +68,7 @@ class PlaybackRecordWriterTests(unittest.IsolatedAsyncioTestCase):
         writer = PlaybackRecordWriter(write_record=write, update_record=update)
         await writer.start()
         receipt = writer.enqueue(_record())
+        self.assertIsNotNone(receipt)
         self.assertTrue(writer.fail(receipt, failure_stage="upstream_stream", error="read reset"))
         self.assertTrue(await writer.stop())
         self.assertEqual(receipt.record_id, 91)

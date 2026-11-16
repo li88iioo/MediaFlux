@@ -4392,7 +4392,7 @@ def create_proxy_app(
             if scope["type"] != "http":
                 return await self.app(scope, receive, send)
             request = Request(scope, receive)
-            status_code = 0
+            status_code: int = 0
             headers_at = None
             receipt = None
             record_started = False

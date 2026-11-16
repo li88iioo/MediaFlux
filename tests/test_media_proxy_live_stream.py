@@ -50,7 +50,9 @@ class LivePlaybackRecordTests(unittest.IsolatedAsyncioTestCase):
                     name=ending, server_type="jellyfin", upstream_url="http://upstream.invalid:8096",
                     api_key="fake", listen_host="127.0.0.1", listen_port=18096 + len(ending),
                 )
-                instance = dict(repository.get_media_proxy_instance(identifier))
+                stored_instance = repository.get_media_proxy_instance(identifier)
+                self.assertIsNotNone(stored_instance)
+                instance = dict(stored_instance)
                 with patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(upstream), **kw)), \
                         patch.object(media_proxy, "_pin_upstream_target", side_effect=pinned), \
                         patch.object(media_proxy, "_pin_signed_media_target", side_effect=pinned), \
