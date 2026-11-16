@@ -412,8 +412,12 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_instance_resolution_failure_is_recorded_and_included_in_total_latency(self):
         records = []
+        def write_playback_record(row) -> int:
+            records.append(dict(row))
+            return len(records)
+
         recorder = media_proxy.PlaybackRecordWriter(
-            write_record=lambda row: records.append(dict(row))
+            write_record=write_playback_record
         )
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
@@ -734,6 +738,56 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertEqual(request.headers["X-Emby-Token"], "emby-token")
         self.assertNotIn("Authorization", request.headers)
+
+    def test_dualstack_probe_uses_remaining_validated_addresses(self):
+        addresses = (
+            (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("::1", 8096, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 8096)),
+        )
+        attempts = []
+        original_client = httpx.AsyncClient
+
+        def upstream(request):
+            attempts.append(request)
+            if request.url.host == "::1":
+                raise httpx.ConnectError("isolated IPv6 refusal")
+            return httpx.Response(200, json={"ServerName": "fixture"})
+
+        row = {**self._instance(), "upstream_url": "http://localhost:8096"}
+        with patch("app.repositories.media_proxy.get_media_proxy_instance", return_value=row), \
+                patch.object(socket, "getaddrinfo", return_value=addresses) as dns, \
+                patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kw: original_client(transport=httpx.MockTransport(upstream), **kw)):
+            result = asyncio.run(media_proxy.probe_media_proxy_instance(7))
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual([r.url.host for r in attempts], ["::1", "127.0.0.1"])
+        self.assertTrue(all(r.headers["host"] == "localhost:8096" and r.extensions["sni_hostname"] == "localhost" for r in attempts))
+        dns.assert_called_once()
+
+    def test_pinned_connection_fallback_preserves_post_and_never_retries_read_failure(self):
+        async def scenario(failure):
+            requests = []
+
+            def upstream(request):
+                requests.append(request)
+                if request.url.host == "::1":
+                    raise failure("isolated failure")
+                return httpx.Response(204)
+
+            target = media_proxy._PinnedUpstreamTarget("http://host.invalid/action", "http://[::1]/action", "host.invalid", "host.invalid", ("::1", "127.0.0.1"))
+            async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+                request = client.build_request("POST", target.connect_url, headers={"Host": target.host_header}, content=b"body", extensions={"sni_hostname": target.sni_hostname})
+                if failure is httpx.ReadError:
+                    with self.assertRaises(httpx.ReadError):
+                        await media_proxy._send_pinned_request(client, request, target)
+                else:
+                    result = await media_proxy._send_pinned_request(client, request, target)
+                    self.assertEqual(result.status_code, 204)
+            return requests
+
+        connected = asyncio.run(scenario(httpx.ConnectError))
+        self.assertEqual([r.url.host for r in connected], ["::1", "127.0.0.1"])
+        self.assertTrue(all(r.method == "POST" and r.content == b"body" and r.headers["Host"] == "host.invalid" for r in connected))
+        self.assertEqual(len(asyncio.run(scenario(httpx.ReadError))), 1)
 
     def test_saved_instance_probe_closes_oversize_response(self):
         upstream = _FakeUpstreamResponse(
@@ -5561,7 +5615,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                         self._instance(),
                         signed_urls=cache,
                         playback_record_writer=media_proxy.PlaybackRecordWriter(
-                            write_record=lambda _: None
+                            write_record=lambda _: 1
                         ),
                     )
                     credential_lock = guangya_module._shared_token_process_lock(token_file)
@@ -8308,8 +8362,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         captured = []
+        def write_playback_record(record) -> int:
+            captured.append(dict(record))
+            return len(captured)
+
         recorder = media_proxy.PlaybackRecordWriter(
-            write_record=lambda record: captured.append(dict(record))
+            write_record=write_playback_record
         )
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
@@ -8381,8 +8439,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
         ]
         captured = []
+        def write_playback_record(record) -> int:
+            captured.append(dict(record))
+            return len(captured)
+
         recorder = media_proxy.PlaybackRecordWriter(
-            write_record=lambda record: captured.append(dict(record))
+            write_record=write_playback_record
         )
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
@@ -8535,8 +8597,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
         ]
         captured = []
+        def write_playback_record(record) -> int:
+            captured.append(dict(record))
+            return len(captured)
+
         recorder = media_proxy.PlaybackRecordWriter(
-            write_record=lambda record: captured.append(dict(record))
+            write_record=write_playback_record
         )
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
@@ -8601,8 +8667,12 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
         ]
         captured = []
+        def write_playback_record(record) -> int:
+            captured.append(dict(record))
+            return len(captured)
+
         recorder = media_proxy.PlaybackRecordWriter(
-            write_record=lambda record: captured.append(dict(record))
+            write_record=write_playback_record
         )
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
@@ -8655,8 +8725,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         ]
         authorize = AsyncMock(return_value=False)
         captured = []
+        def write_playback_record(record) -> int:
+            captured.append(dict(record))
+            return len(captured)
+
         recorder = media_proxy.PlaybackRecordWriter(
-            write_record=lambda record: captured.append(dict(record))
+            write_record=write_playback_record
         )
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
@@ -8867,6 +8941,139 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(second.headers["location"], first.headers["location"])
         self.assertEqual(len(_FakeAsyncClient.requests), 1)
         authorize.assert_not_awaited()
+
+    def test_progress_renews_long_playback_only_for_exact_live_session(self):
+        now = [0.0]
+        for registry in (self.app.state.playback_sessions, self.app.state.playback_grants,
+                         self.app.state.dynamic_mappings, self.app.state.item_level_scopes):
+            registry._clock = lambda: now[0]
+        payload = {"PlaySessionId": "long-session", "MediaSources": [
+            {"Id": "cloud", "Path": "/playgy/long-file/e/1/a.mkv"},
+        ]}
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(
+            body=json.dumps(payload).encode(), content_type="application/json",
+        )]
+        stack, client = self._client()
+        with stack, patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None), \
+                patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient), client:
+            playback = client.get("/Items/long-item/PlaybackInfo?api_key=client-token")
+            url = playback.json()["MediaSources"][0]["DirectStreamUrl"]
+            self.assertEqual(client.get(url, follow_redirects=False).status_code, 302)
+            progress = {"ItemId": "long-item", "MediaSourceId": "cloud", "PlaySessionId": "long-session"}
+            for now[0] in (300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0):
+                _FakeAsyncClient.responses.append(_FakeUpstreamResponse(status_code=204, body=b""))
+                response = client.post("/Sessions/Playing/Progress?api_key=client-token", json=progress)
+                self.assertEqual(response.status_code, 204)
+            now[0] = 1801.0
+            self.assertEqual(client.get(url, follow_redirects=False).status_code, 302)
+            # 其它用户、session、item、source的200心跳不能延长当前URL。
+            for token, change in (("other-token", {}), ("client-token", {"PlaySessionId": "other"}),
+                                  ("client-token", {"ItemId": "other"}),
+                                  ("client-token", {"MediaSourceId": "other"})):
+                now[0] = 2600.0
+                _FakeAsyncClient.responses.append(_FakeUpstreamResponse(status_code=204, body=b""))
+                self.assertEqual(client.post(f"/Sessions/Playing/Progress?api_key={token}",
+                                            json={**progress, **change}).status_code, 204)
+            now[0] = 2702.0
+            self.assertEqual(client.get(url, follow_redirects=False).status_code, 401)
+            # 已过期的授权不能靠迟到的合法心跳复活。
+            _FakeAsyncClient.responses.append(_FakeUpstreamResponse(status_code=204, body=b""))
+            client.post("/Sessions/Playing/Progress?api_key=client-token", json=progress)
+            self.assertEqual(client.get(url, follow_redirects=False).status_code, 401)
+
+    def test_progress_cannot_extend_absolute_playback_expiry(self):
+        now = [0.0]
+        for registry in (self.app.state.playback_sessions, self.app.state.playback_grants,
+                         self.app.state.dynamic_mappings, self.app.state.item_level_scopes):
+            registry._clock = lambda: now[0]
+            if hasattr(registry, "_max_ttl_seconds"):
+                registry._max_ttl_seconds = 1200
+        self.app.state.playback_sessions._capability_max_ttl_seconds = 1200
+        payload = {"PlaySessionId": "bounded-session", "MediaSources": [
+            {"Id": "cloud", "Path": "/playgy/bounded-file/e/1/a.mkv"},
+        ]}
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=json.dumps(payload).encode(), content_type="application/json")]
+        stack, client = self._client()
+        with stack, patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None), \
+                patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient), client:
+            url = client.get("/Items/bounded-item/PlaybackInfo?api_key=client-token").json()["MediaSources"][0]["DirectStreamUrl"]
+            self.assertEqual(client.get(url, follow_redirects=False).status_code, 302)
+            for now[0] in (300.0, 600.0, 900.0, 1100.0):
+                _FakeAsyncClient.responses.append(_FakeUpstreamResponse(status_code=204, body=b""))
+                client.post("/Sessions/Playing/Progress?api_key=client-token", json={
+                    "ItemId": "bounded-item", "MediaSourceId": "cloud", "PlaySessionId": "bounded-session",
+                })
+            now[0] = 1201.0
+            self.assertEqual(client.get(url, follow_redirects=False).status_code, 401)
+
+    def test_single_long_relay_keeps_seek_authorization_then_expires_when_idle(self):
+        now = [0.0]
+        app = self.app
+        original_client = httpx.AsyncClient
+        other_url = []
+        for registry in (self.app.state.playback_sessions, self.app.state.playback_grants,
+                         self.app.state.dynamic_mappings, self.app.state.item_level_scopes):
+            registry._clock = lambda: now[0]
+
+        class LongResponse(_FakeUpstreamResponse):
+            async def aiter_raw(self):
+                for moment in (300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0):
+                    now[0] = moment
+                    if moment == 600.0:
+                        async with original_client(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as probe:
+                            result = await probe.head(other_url[0])
+                            assert result.status_code == 200
+                    await asyncio.sleep(0.01)
+                    yield b"chunk"
+
+        payload = {"PlaySessionId": "relay-session", "MediaSources": [
+            {"Id": "cloud", "Path": "/playgy/relay-file/e/1/a.mkv", "SupportsDirectPlay": False},
+            {"Id": "alternate", "Path": "/playgy/alternate-file/e/1/a.mkv", "SupportsDirectPlay": False},
+        ]}
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(body=json.dumps(payload).encode(), content_type="application/json"),
+            LongResponse(status_code=206, content_type="video/mp4"),
+            _FakeUpstreamResponse(status_code=206, headers={"Content-Range": "bytes 0-1023/2048", "Content-Length": "1024"}),
+            _FakeUpstreamResponse(status_code=206, body=b"seek", content_type="video/mp4"),
+        ]
+        stack, client = self._client()
+        with stack, patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None), \
+                patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient), \
+                patch.object(media_proxy, "_pin_signed_media_target", side_effect=self._signed_target), \
+                patch.object(media_proxy, "_PLAYBACK_KEEPALIVE_INTERVAL_SECONDS", 0.001), client:
+            sources = client.get("/Items/relay-item/PlaybackInfo?api_key=client-token", headers={"X-Emby-Client": "Jellyfin Web"}).json()["MediaSources"]
+            url = sources[0]["DirectStreamUrl"]
+            other_url.append(sources[1]["DirectStreamUrl"])
+            first = client.get(url)
+            self.assertEqual(first.status_code, 206)
+            self.assertEqual(first.content, b"chunk" * 6)
+            now[0] = 1801.0
+            seek = client.get(url, headers={"Range": "bytes=5-"})
+            self.assertEqual(seek.status_code, 206)
+            self.assertEqual(seek.content, b"seek")
+            now[0] = 2702.0
+            self.assertEqual(client.get(url).status_code, 401)
+
+    def test_capability_expiring_during_ownership_check_cannot_authorize_stream(self):
+        now = [0.0]
+        sessions = self.app.state.playback_sessions
+        sessions._clock = lambda: now[0]
+        payload = {"MediaSources": [{"Id": "cloud", "Path": "/playgy/expired-file/e/1/a.mkv"}]}
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=json.dumps(payload).encode(), content_type="application/json")]
+        stack, client = self._client()
+        with stack, patch("app.repositories.media_proxy.get_media_proxy_binding", return_value=None), \
+                patch.object(media_proxy.httpx, "AsyncClient", _FakeAsyncClient), client:
+            url = client.get("/Items/expired-item/PlaybackInfo?api_key=client-token").json()["MediaSources"][0]["DirectStreamUrl"]
+            resolve = sessions.resolve_capability
+
+            def expire_between_checks(*args, **kwargs):
+                if kwargs.get("renew") is not False:
+                    now[0] = 900.0
+                return resolve(*args, **kwargs)
+
+            with patch.object(sessions, "resolve_capability", side_effect=expire_between_checks):
+                self.assertEqual(client.get(url, follow_redirects=False).status_code, 401)
+        self.assertEqual(_FakeGuangYaClient.calls, [])
 
     def test_client_supplied_mfps_cannot_mint_browser_capability(self):
         payload = {
@@ -9205,7 +9412,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 content_type="application/json",
             )
         ]
-        recorder = media_proxy.PlaybackRecordWriter(write_record=lambda _record: None)
+        recorder = media_proxy.PlaybackRecordWriter(write_record=lambda _record: 1)
         app = media_proxy.create_proxy_app(
             self._instance(), playback_record_writer=recorder
         )

@@ -404,6 +404,46 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
         return record_id
 
 
+def fail_media_proxy_playback_attempt(
+    record_id: int, *, failure_stage: str, error: str,
+) -> bool:
+    """把已记录的响应头修正为上游取流失败，不增加请求或重建已清理记录。"""
+    stage = (failure_stage or "upstream_stream").strip()[:64] or "upstream_stream"
+    safe_error = _redact_media_proxy_record_error(error)
+    with db.get_conn() as conn:
+        # 读旧状态、修正记录与会话计数属于同一写事务；并发重复失败只折算一次。
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT session_id,status_code FROM media_proxy_playback_records WHERE id=?",
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        status = int(row["status_code"])
+        if status == 0:
+            return True
+        conn.execute(
+            "UPDATE media_proxy_playback_records SET status_code=0,failure_stage=?,error=? WHERE id=?",
+            (stage, safe_error, record_id),
+        )
+        if row["session_id"] is not None:
+            session_id = int(row["session_id"])
+            conn.execute(
+                "UPDATE media_proxy_playback_sessions SET "
+                "success_count=success_count-?,error_count=error_count+?,"
+                "last_status_code=CASE WHEN ?=("
+                "SELECT MAX(id) FROM media_proxy_playback_records WHERE session_id=?"
+                ") THEN 0 ELSE last_status_code END,"
+                "last_failure_stage=?,last_error=? WHERE id=?",
+                (
+                    1 if 200 <= status <= 399 else 0,
+                    0 if status >= 400 else 1,
+                    record_id, session_id, stage, safe_error, session_id,
+                ),
+            )
+        return True
+
+
 def _playback_filter_clauses(*, instance_id: int | None, status: str,
                              source: str, status_column: str,
                              source_column: str) -> tuple[list[str], list]:

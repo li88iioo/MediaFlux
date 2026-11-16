@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.repositories import media_proxy as media_proxy_repo
@@ -14,8 +15,39 @@ _DEFAULT_CAPACITY = 256
 _DEFAULT_DRAIN_TIMEOUT_SECONDS = 3.0
 
 
-def _write_record(payload: Mapping[str, Any]) -> None:
-    media_proxy_repo.record_media_proxy_playback_attempt(**dict(payload))
+def _write_record(payload: Mapping[str, Any]) -> int:
+    return media_proxy_repo.record_media_proxy_playback_attempt(**dict(payload))
+
+
+def _update_record(record_id: int, *, failure_stage: str, error: str) -> bool:
+    return media_proxy_repo.fail_media_proxy_playback_attempt(
+        record_id, failure_stage=failure_stage, error=error,
+    )
+
+
+@dataclass(slots=True)
+class PlaybackRecordReceipt:
+    """仅随请求和队列存活的回执，不维护进程级记录ID映射。"""
+
+    _payload: dict[str, Any] = field(repr=False)
+    record_id: int | None = None
+    _insert_failed: bool = False
+    _failure_queued: bool = False
+
+
+@dataclass(slots=True)
+class _RecordFailure:
+    receipt: PlaybackRecordReceipt
+    failure_stage: str
+    error: str
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            **self.receipt._payload,
+            "status_code": 0,
+            "failure_stage": self.failure_stage,
+            "error": self.error,
+        }
 
 
 class PlaybackRecordWriter:
@@ -26,12 +58,14 @@ class PlaybackRecordWriter:
         *,
         capacity: int = _DEFAULT_CAPACITY,
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
-        write_record: Callable[[Mapping[str, Any]], None] | None = None,
+        write_record: Callable[[Mapping[str, Any]], int] | None = None,
+        update_record: Callable[..., bool] | None = None,
         task_name: str = "media-proxy-playback-records",
     ) -> None:
         self._capacity = max(2, capacity)
         self._drain_timeout_seconds = max(0.05, float(drain_timeout_seconds))
         self._write_record = write_record or _write_record
+        self._update_record = update_record or _update_record
         self._task_name = task_name
         self._queue: asyncio.Queue[object] = asyncio.Queue(maxsize=self._capacity)
         self._task: asyncio.Task[None] | None = None
@@ -41,6 +75,8 @@ class PlaybackRecordWriter:
         self._counters = {
             "enqueued": 0,
             "written": 0,
+            "updates_enqueued": 0,
+            "updated": 0,
             "failed": 0,
             "dropped_full": 0,
             "dropped_low_priority": 0,
@@ -77,23 +113,44 @@ class PlaybackRecordWriter:
             self._last_drained = True
             self._task = asyncio.create_task(self._run(), name=self._task_name)
 
-    def enqueue(self, payload: Mapping[str, Any]) -> bool:
+    def enqueue(self, payload: Mapping[str, Any]) -> PlaybackRecordReceipt | None:
         record = dict(payload)
         if not self._accepting:
             self._count_drop(record, "dropped_stopping")
-            return False
+            return None
 
         # 为错误状态保留一个槽位；低价值成功诊断先丢弃，但绝不阻塞播放请求。
         if not self._is_critical(record) and self._queue.qsize() >= self._capacity - 1:
             self._count_drop(record, "dropped_full")
             self._counters["dropped_low_priority"] += 1
-            return False
+            return None
+        receipt = PlaybackRecordReceipt(record)
         try:
-            self._queue.put_nowait(record)
+            self._queue.put_nowait(receipt)
         except asyncio.QueueFull:
             self._count_drop(record, "dropped_full")
-            return False
+            return None
         self._counters["enqueued"] += 1
+        return receipt
+
+    def fail(
+        self, receipt: PlaybackRecordReceipt | None, *, failure_stage: str, error: str,
+    ) -> bool:
+        if receipt is None:
+            return False
+        if receipt._failure_queued:
+            return True
+        failure = _RecordFailure(receipt, failure_stage, error)
+        if not self._accepting:
+            self._count_drop(failure.payload(), "dropped_stopping")
+            return False
+        try:
+            self._queue.put_nowait(failure)
+        except asyncio.QueueFull:
+            self._count_drop(failure.payload(), "dropped_full")
+            return False
+        receipt._failure_queued = True
+        self._counters["updates_enqueued"] += 1
         return True
 
     async def _run(self) -> None:
@@ -102,19 +159,34 @@ class PlaybackRecordWriter:
             try:
                 if item is _STOP:
                     return
-                payload = dict(item) if isinstance(item, Mapping) else {}
                 try:
-                    await asyncio.to_thread(self._write_record, payload)
+                    if isinstance(item, PlaybackRecordReceipt):
+                        item.record_id = await asyncio.to_thread(self._write_record, item._payload)
+                        self._counters["written"] += 1
+                    elif isinstance(item, _RecordFailure):
+                        receipt = item.receipt
+                        if receipt._insert_failed:
+                            # 原始写入失败时没有记录可更新，只补写一条真实错误。
+                            receipt.record_id = await asyncio.to_thread(self._write_record, item.payload())
+                            self._counters["written"] += 1
+                        else:
+                            assert receipt.record_id is not None
+                            updated = await asyncio.to_thread(
+                                self._update_record, receipt.record_id,
+                                failure_stage=item.failure_stage, error=item.error,
+                            )
+                            if updated:
+                                self._counters["updated"] += 1
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if isinstance(item, PlaybackRecordReceipt):
+                        item._insert_failed = True
                     self._counters["failed"] += 1
                     logger.warning(
                         "媒体反代播放记录异步写入失败 type=%s",
                         type(exc).__name__,
                     )
-                else:
-                    self._counters["written"] += 1
             finally:
                 self._queue.task_done()
 
@@ -125,8 +197,10 @@ class PlaybackRecordWriter:
             except asyncio.QueueEmpty:
                 return
             try:
-                if isinstance(item, Mapping):
-                    self._count_drop(item, "dropped_shutdown")
+                if isinstance(item, PlaybackRecordReceipt):
+                    self._count_drop(item._payload, "dropped_shutdown")
+                elif isinstance(item, _RecordFailure):
+                    self._count_drop(item.payload(), "dropped_shutdown")
             finally:
                 self._queue.task_done()
 

@@ -67,6 +67,7 @@ _MEDIA_MIME_OVERRIDES = {
 _STREAM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/stream(?:\.[^/]+)?/?$", re.IGNORECASE)
 _VIDEO_ITEM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/", re.IGNORECASE)
 _PLAYBACK_INFO_RE = re.compile(r"^(?:/emby)?/Items/([^/]+)/PlaybackInfo/?$", re.IGNORECASE)
+_PLAYBACK_PROGRESS_RE = re.compile(r"^(?:/emby)?/Sessions/Playing/Progress/?$", re.IGNORECASE)
 _PLAYGY_RE = re.compile(r"^(?:/emby)?/playgy/([^/]+)(?:/.*)?$", re.IGNORECASE)
 _HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -96,6 +97,7 @@ _PLAYBACK_SESSION_QUERY_KEY = "_mfps"
 _PLAYBACK_SOURCE_QUERY_KEY = "_mfss"
 _PLAYBACK_AUTHORIZATION_TTL_SECONDS = 15 * 60
 _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS = 12 * 60 * 60
+_PLAYBACK_KEEPALIVE_INTERVAL_SECONDS = 60.0
 _PLAYBACK_INFO_PREFERENCE_PARSE_MAX_BYTES = 1024 * 1024
 _SENSITIVE_QUERY_KEYS = {
     "api_key", "apikey", "x-emby-token", "x-mediabrowser-token",
@@ -1073,6 +1075,16 @@ class ItemLevelBindingScopes:
                 return True
             return False
 
+    def renew(self, auth_scope: str, instance_id: int, item_id: str, source_id: str) -> None:
+        key = (auth_scope, instance_id, _normalized_media_identifier(item_id),
+               _normalized_media_identifier(source_id))
+        with self._lock:
+            now = self._clock()
+            self._prune_expired_locked(now)
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._touch_locked(key, entry, now)
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -1921,6 +1933,22 @@ class PlaybackSessionRegistry:
                 for signature in allowed
             )
 
+    def renew(self, entry: _PlaybackSessionLink, source_id: str) -> None:
+        """仅为仍存活的精确播放续期；旧 capability 的绝对期限不能被心跳重置。"""
+        key = (entry.auth_scope, entry.instance_id, entry.token)
+        with self._lock:
+            now = self._clock()
+            if self._entries.get(key) is not entry or entry.expires_at <= now:
+                return
+            self._prune_capabilities_locked(now)
+            for capability_key in self._entry_capabilities.get(key, ()):
+                linked_key, _expires_at, maximum = self._capability_index[capability_key]
+                self._capability_index[capability_key] = (
+                    linked_key, min(maximum, now + self._capability_ttl_seconds), maximum,
+                )
+            self._refresh_capability_expiry_locked(key)
+            self._touch_locked(key, entry, source_id=source_id)
+
     def resolve_capability(
         self,
         instance_id: int,
@@ -1929,6 +1957,7 @@ class PlaybackSessionRegistry:
         item_id: str = "",
         source_id: str = "",
         source_signature: str = "",
+        renew: bool = True,
     ) -> _PlaybackSessionLink | None:
         """用服务端生成的短时 token 恢复认证 scope，不保存或暴露原始凭据。"""
         normalized_instance = instance_id
@@ -1972,6 +2001,8 @@ class PlaybackSessionRegistry:
                 source_signature, expected_source_signature
             ):
                 return None
+            if not renew:
+                return entry
             renewed_expires_at = min(
                 capability_max_expires_at,
                 now + self._capability_ttl_seconds,
@@ -2513,6 +2544,26 @@ def _pin_upstream_target(upstream: str, request_path: str) -> _PinnedUpstreamTar
     )
 
 
+async def _send_pinned_request(
+    client: httpx.AsyncClient, request: httpx.Request, pinned: _PinnedUpstreamTarget,
+    *, stream: bool = False,
+) -> httpx.Response:
+    """仅在连接未建立时回退到同一已校验DNS快照的其它地址，不重放已发送请求。"""
+    for index, address in enumerate(pinned.addresses):
+        candidate = request if index == 0 else httpx.Request(
+            request.method, request.url.copy_with(host=address), headers=request.headers,
+            content=request.content, extensions=dict(request.extensions),
+        )
+        try:
+            if stream:
+                return await client.send(candidate, stream=True)
+            return await client.send(candidate)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            if index == len(pinned.addresses) - 1:
+                raise
+    raise ValueError("上游域名没有可用地址")
+
+
 def _validate_signed_media_address(
     address: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> None:
@@ -2589,7 +2640,7 @@ async def probe_media_proxy_instance(
             headers=headers,
             extensions={"sni_hostname": pinned.sni_hostname},
         )
-        response = await client.send(request, stream=True)
+        response = await _send_pinned_request(client, request, pinned, stream=True)
         try:
             await _read_bounded_upstream_body(
                 response, _playback_info_response_limit()
@@ -3892,17 +3943,29 @@ class _UpstreamStreamingResponse(StreamingResponse):
         response: httpx.Response,
         *,
         upstream_client: httpx.AsyncClient | None = None,
+        keep_playback_alive: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
         self._upstream_response = response
         self._upstream_client = upstream_client
+        self._keep_playback_alive = keep_playback_alive
         super().__init__(response.aiter_raw(), **kwargs)
 
     async def __call__(self, scope, receive, send) -> None:
+        async def keep_alive() -> None:
+            while True:
+                await asyncio.sleep(_PLAYBACK_KEEPALIVE_INTERVAL_SECONDS)
+                assert self._keep_playback_alive is not None
+                self._keep_playback_alive()
+
+        heartbeat = asyncio.create_task(keep_alive()) if self._keep_playback_alive else None
         try:
             await super().__call__(scope, receive, send)
         finally:
             with anyio.CancelScope(shield=True):
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
                 try:
                     await getattr(self.body_iterator, "aclose")()
                 finally:
@@ -4208,7 +4271,7 @@ async def _client_is_authorized(
                 headers=headers,
                 extensions={"sni_hostname": pinned.sni_hostname},
             )
-            response = await client.send(upstream_request)
+            response = await _send_pinned_request(client, upstream_request, pinned)
         return 200 <= response.status_code < 300
     except (TimeoutError, httpx.TimeoutException) as exc:
         if raise_timeout:
@@ -4287,317 +4350,88 @@ def create_proxy_app(
         _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY
     )
 
-    @app.middleware("http")
-    async def record_playback_attempt(request: Request, call_next):
-        route_class = classify_proxy_route(request.url.path, request.method)
-        started = time.monotonic()
-        response: Response | None = None
-        error_type = ""
-        try:
-            credential = _request_auth_credential(request)
-            credential_conflict = _request_auth_has_conflict(request)
-            auth_scope = _auth_scope_fingerprint(credential)
-            playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
-            stream_match = _STREAM_RE.match(request.url.path)
-            video_match = (
-                _VIDEO_ITEM_RE.match(request.url.path)
-                if route_class == "upstream_hls"
-                else None
-            )
-            media_match = playback_match or stream_match or video_match
-            item_id = media_match.group(1) if media_match else ""
-            source_values = _request_query_values(request, "MediaSourceId")
-            source_id = source_values[0] if source_values else ""
-            source_ambiguous = _request_query_has_conflicting_values(
-                request, "MediaSourceId"
-            )
-            file_id = _extract_guangya_file_id(str(request.url)) or ""
-            media_name = (
-                _safe_media_name(str(request.url), path_value=True)
-                if route_class == "guangya_direct" else ""
-            )
-            capability_token = _request_query_value(request, _PLAYBACK_SESSION_QUERY_KEY)
-            source_signature = _request_query_value(request, _PLAYBACK_SOURCE_QUERY_KEY)
-            upstream_session_token = _request_query_value(request, "PlaySessionId")
-            upstream_session_ambiguous = _request_query_has_conflicting_values(
-                request, "PlaySessionId"
-            )
-            device_id = _request_device_id(request)
-            device_id_ambiguous = _request_device_id_has_conflict(request)
-            playback_parameters_ambiguous = bool(
-                ((stream_match or video_match) and source_ambiguous)
-                or (
-                    (stream_match or playback_match or video_match)
-                    and (upstream_session_ambiguous or device_id_ambiguous)
-                )
-            )
-            capability_authorized = False
-            capability_rejected = False
-            playback_session = None
-            native_stream_resolution = (
-                "credential" if stream_match and auth_scope else "anonymous"
-            )
-            request.state.proxy_source_ambiguous = source_ambiguous
-            request.state.proxy_playback_session_token = ""
-            request.state.proxy_playback_session_key = ""
-            request.state.proxy_browser_relay = False
-            request.state.proxy_browser_direct_redirect = False
-            request.state.proxy_native_cross_protocol_relay = False
-            request.state.proxy_native_signed_media_relay = False
-            request.state.proxy_media_item_id = item_id
-            request.state.proxy_media_source_id = source_id
-            request.state.proxy_guangya_file_id = file_id
-            request.state.proxy_media_name = media_name
-            request.state.proxy_route_class = route_class
-            request.state.proxy_source = {
-                "guangya_direct": "guangya",
-                "playback_info": "playback_info",
-                "upstream_hls": "hls",
-            }.get(route_class, "upstream")
-            request.state.proxy_action = {
-                "guangya_direct": "guangya_302",
-                "playback_info": "playback_passthrough",
-                "upstream_hls": "upstream_hls",
-                "stream": "upstream_stream",
-            }.get(route_class, "upstream_passthrough")
-            request.state.proxy_cache_hit = False
-            request.state.proxy_upstream_latency_ms = 0
-            request.state.proxy_failure_stage = ""
-            if credential_conflict:
-                request.state.proxy_failure_stage = "client_auth"
-            elif playback_parameters_ambiguous:
-                request.state.proxy_failure_stage = "query_parameters"
-            if credential_conflict:
-                response = JSONResponse(
-                    {"error": "媒体服务器凭据参数冲突"}, status_code=400
-                )
-                return response
-            if playback_parameters_ambiguous:
-                response = JSONResponse(
-                    {"error": "播放参数重复或冲突"}, status_code=400
-                )
-                return response
-            try:
-                request.state.proxy_instance = await asyncio.to_thread(_resolved_instance, app)
-            except ValueError as exc:
-                retired_capability = isinstance(exc, _ProxyAppRetired) and (capability_token or upstream_session_token)
-                response = JSONResponse({"error": str(exc)}, status_code=401 if retired_capability else 503)
-                return response
-            if route_class == "playback_info":
-                # 仅在上游 PlaybackInfo 成功且即将返回重写响应时签发 capability；
-                # 失败/非法响应不得占用 capability 索引或驱逐正在播放的会话。
-                playback_session = None
-            elif capability_token:
-                playback_session = None
-                if stream_match and request.method in {"GET", "HEAD"}:
-                    candidate = playback_sessions.resolve_capability(
-                        instance_id,
-                        capability_token,
-                        item_id=item_id,
-                        source_id=source_id,
-                        source_signature=source_signature,
-                    )
-                    candidate_allowed = (
-                        candidate is not None
-                        and (not auth_scope or candidate.auth_scope == auth_scope)
-                    )
-                    if (
-                        candidate_allowed
-                        and candidate is not None
-                        and not auth_scope
-                        and (
-                            candidate.native_cross_protocol_relay
-                            or candidate.native_signed_media_relay
-                        )
-                    ):
-                        native_client_fingerprint = _request_client_fingerprint(
-                            request
-                        )
-                        candidate_allowed = bool(
-                            candidate.native_verified_auth_scope
-                            and native_client_fingerprint
-                            and hmac.compare_digest(
-                                candidate.native_client_fingerprint,
-                                native_client_fingerprint,
-                            )
-                        )
-                    if candidate_allowed and candidate is not None:
-                        playback_session = candidate
-                        if not auth_scope:
-                            auth_scope = candidate.auth_scope
-                            capability_authorized = True
-                    else:
-                        capability_rejected = True
-                else:
-                    capability_rejected = True
-            elif (
-                not auth_scope
-                and upstream_session_token
-                and stream_match
-                and request.method in {"GET", "HEAD"}
-            ):
-                # Jellyfin Android 的 ExoPlayer 可能不在视频 DataSource 请求中携带
-                # access token，但一定会回传 PlaybackInfo 的 PlaySessionId。只接受
-                # 本进程刚签发、item/source 精确匹配的短时会话，不做跨会话猜测。
-                session_scope = _upstream_playback_session_scope(
-                    instance_id, upstream_session_token, device_id
-                )
-                playback_session = playback_sessions.resolve(
-                    session_scope,
-                    instance_id,
-                    token=upstream_session_token,
-                    item_id=item_id,
-                    source_id=source_id,
-                    create=False,
-                )
-                native_client_fingerprint = _request_client_fingerprint(request)
-                if (
-                    playback_session is not None
-                    and playback_session.native_cross_protocol_relay
-                    and playback_session.native_verified_auth_scope
-                    and native_client_fingerprint
-                    and hmac.compare_digest(
-                        playback_session.native_client_fingerprint,
-                        native_client_fingerprint,
-                    )
-                ):
-                    auth_scope = session_scope
-                    capability_authorized = True
-                    native_stream_resolution = "device_scope"
-                else:
-                    native_stream_resolution = (
-                        "device_scope_rejected"
-                        if playback_session is not None
-                        else "device_scope_missing"
-                    )
-                    # Android 2.7 的 PlaybackInfo 请求并不保证携带 DeviceId，而视频
-                    # URL 又可能补上 DeviceId。设备标识只是客户端元数据，不能让它
-                    # 阻断已经由上游返回、同客户端地址、精确 item/source 绑定的
-                    # PlaySessionId bearer 会话，因此设备 scope 未命中时统一回退到
-                    # token scope。
-                    token_scope = _upstream_playback_token_scope(
-                        instance_id, upstream_session_token
-                    )
-                    playback_session = playback_sessions.resolve(
-                        token_scope,
-                        instance_id,
-                        token=upstream_session_token,
-                        item_id=item_id,
-                        source_id=source_id,
-                        create=False,
-                    )
-                    if (
-                        playback_session is not None
-                        and playback_session.native_cross_protocol_relay
-                        and playback_session.native_verified_auth_scope
-                        and native_client_fingerprint
-                        and hmac.compare_digest(
-                            playback_session.native_client_fingerprint,
-                            native_client_fingerprint,
-                        )
-                    ):
-                        auth_scope = token_scope
-                        capability_authorized = True
-                        native_stream_resolution = "token_scope"
-                    else:
-                        native_stream_resolution = (
-                            "token_scope_rejected"
-                            if playback_session is not None
-                            else "token_scope_missing"
-                        )
-                        playback_session = playback_sessions.resolve(
-                            "",
-                            instance_id,
-                            token=upstream_session_token,
-                            item_id=item_id,
-                            source_id=source_id,
-                            create=True,
-                        )
-            elif route_class == "guangya_direct" and not upstream_session_token:
-                playback_session = playback_sessions.begin(
-                    auth_scope, instance_id, file_id=file_id, media_name=media_name
-                )
-            else:
-                playback_session = playback_sessions.resolve(
-                    auth_scope,
-                    instance_id,
-                    token=upstream_session_token,
-                    item_id=item_id,
-                    source_id=source_id,
-                    file_id=file_id,
-                    media_name=media_name,
-                    create=(
-                        bool(upstream_session_token)
-                        or route_class in {"stream", "guangya_direct"}
-                    ),
-                )
-            request.state.proxy_auth_scope = auth_scope
-            request.state.proxy_native_stream_resolution = native_stream_resolution
-            request.state.proxy_capability_authorized = capability_authorized
-            _apply_playback_session(request, playback_session, playback_sessions)
-            if stream_match and not source_id:
-                # 请求未指定 MediaSourceId 时不得继承同一 PlaySession 上一次触碰的
-                # source。保持为空，让后续 mapping/grant 只在该 item 恰有唯一来源时
-                # 自动消歧，避免多源条目误复用旧来源直链。
-                request.state.proxy_media_source_id = ""
-            if capability_rejected:
-                request.state.proxy_failure_stage = "playback_capability"
-                response = JSONResponse({"error": "播放会话无效或已过期"}, status_code=401)
-                return response
-            response = await call_next(request)
-            return response
-        except Exception as exc:
-            error_type = type(exc).__name__
-            request.state.proxy_failure_stage = (
-                getattr(request.state, "proxy_failure_stage", "") or "proxy"
-            )
-            raise
-        finally:
-            total_latency_ms = round((time.monotonic() - started) * 1000)
-            status_code = int(
-                getattr(response, "status_code", 500 if error_type else 0) or 0
-            )
-            if status_code >= 400 and not getattr(request.state, "proxy_failure_stage", ""):
-                request.state.proxy_failure_stage = "proxy"
-            diagnostic = {
-                "route": getattr(request.state, "proxy_route_class", route_class),
-                "action": getattr(request.state, "proxy_action", "upstream_passthrough"),
-                "method": (request.method or "GET").upper(),
-                "status": status_code,
-                "range": _range_diagnostic(request.headers.get("range", "")),
-                "if_range": int(bool(request.headers.get("if-range", ""))),
-                "ua": int(bool(request.headers.get("user-agent", ""))),
-                "cache_hit": int(bool(getattr(request.state, "proxy_cache_hit", False))),
-                "upstream_ms": int(
-                    getattr(request.state, "proxy_upstream_latency_ms", 0) or 0
-                ),
-                "total_ms": total_latency_ms,
-                "failure_stage": getattr(request.state, "proxy_failure_stage", "") or "none",
-            }
-            logger.debug(
-                "media_proxy_diag instance=%s route=%s action=%s method=%s "
-                "status=%s range=%s if_range=%s ua=%s cache_hit=%s "
-                "upstream_ms=%s total_ms=%s failure_stage=%s",
-                instance_id,
-                diagnostic["route"], diagnostic["action"], diagnostic["method"],
-                diagnostic["status"], diagnostic["range"], diagnostic["if_range"],
-                diagnostic["ua"], diagnostic["cache_hit"], diagnostic["upstream_ms"],
-                diagnostic["total_ms"], diagnostic["failure_stage"],
-            )
-            if route_class != "upstream":
-                recorder.enqueue({
+    def renew_playback(entry: _PlaybackSessionLink | None, source_id: str = "", file_id: str = "") -> None:
+        if entry is None or not entry.item_id:
+            return
+        source_id = _normalized_media_identifier(source_id) or entry.source_id
+        if not source_id:
+            return
+        if not playback_grants.matches(entry.auth_scope, instance_id, entry.item_id, source_id, file_id=file_id):
+            return
+        dynamic_mappings.get(instance_id, entry.item_id, source_id)
+        item_level_scopes.renew(entry.auth_scope, instance_id, entry.item_id, source_id)
+        playback_sessions.renew(entry, source_id)
+
+    def renew_progress(request: Request, payload: dict[str, Any]) -> None:
+        auth_scope = _auth_scope_fingerprint(_request_auth_credential(request))
+        token = str(_diagnostic_dict_value(payload, "PlaySessionId") or "").strip()
+        item_id = _normalized_media_identifier(_diagnostic_dict_value(payload, "ItemId"))
+        source_id = _normalized_media_identifier(_diagnostic_dict_value(payload, "MediaSourceId"))
+        if not auth_scope or not token or not item_id:
+            return
+        entry = playback_sessions.resolve(auth_scope, instance_id, token=token, item_id=item_id)
+        if entry is None or entry.upstream_session_token != token or entry.item_id != item_id:
+            return
+        renew_playback(entry, source_id)
+        # 官方 Android 视频请求可能使用由同一用户验证过的 token/device scope。
+        for scope in dict.fromkeys((
+            _upstream_playback_token_scope(instance_id, token),
+            _upstream_playback_session_scope(instance_id, token, _request_device_id(request)),
+        )):
+            if not scope:
+                continue
+            native = playback_sessions.resolve(scope, instance_id, token=token, item_id=item_id)
+            if native is not None and native.native_verified_auth_scope == auth_scope:
+                renew_playback(native, source_id or entry.source_id)
+
+    class PlaybackMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return await self.app(scope, receive, send)
+            request = Request(scope, receive)
+            status_code = 0
+            headers_at = None
+            receipt = None
+            record_started = False
+
+            async def send_response(message):
+                nonlocal status_code, headers_at, receipt, record_started
+                if message["type"] == "http.response.start":
+                    status_code = message["status"]
+                    headers_at = time.monotonic()
+                    if status_code >= 400 and not getattr(request.state, "proxy_failure_stage", ""):
+                        request.state.proxy_failure_stage = "proxy"
+                try:
+                    await send(message)
+                except OSError:
+                    request.state.proxy_failure_stage = "client_disconnect"
+                    raise
+                if message["type"] == "http.response.start" and route_class not in {"upstream", "guangya_quality"}:
+                    receipt = recorder.enqueue(record_payload(status_code))
+                    record_started = True
+
+            quality_request = bool(_PLAYGY_RE.match(request.url.path) and (
+                "view" in request.query_params or "quality" in request.query_params
+            ))
+            route_class = "guangya_quality" if quality_request else classify_proxy_route(request.url.path, request.method)
+            started = time.monotonic()
+            response: Response | None = None
+            error_type = ""
+            def record_payload(status_code, error_type=""):
+                total_latency_ms = round(((headers_at if headers_at is not None else time.monotonic()) - started) * 1000)
+                return {
                     "instance_id": instance_id,
-                    "route_class": diagnostic["route"],
-                    "method": diagnostic["method"],
+                    "route_class": getattr(request.state, "proxy_route_class", route_class),
+                    "method": (request.method or "GET").upper(),
                     "status_code": status_code,
                     "source": getattr(request.state, "proxy_source", "upstream"),
-                    "cache_hit": bool(diagnostic["cache_hit"]),
-                    "upstream_latency_ms": diagnostic["upstream_ms"],
+                    "cache_hit": bool(getattr(request.state, "proxy_cache_hit", False)),
+                    "upstream_latency_ms": int(getattr(request.state, "proxy_upstream_latency_ms", 0) or 0),
                     "total_latency_ms": total_latency_ms,
-                    "failure_stage": (
-                        "" if diagnostic["failure_stage"] == "none"
-                        else diagnostic["failure_stage"]
-                    ),
+                    "failure_stage": (getattr(request.state, "proxy_failure_stage", "") or ""),
                     "error": error_type,
                     "playback_session_key": getattr(
                         request.state, "proxy_playback_session_key", ""
@@ -4610,7 +4444,322 @@ def create_proxy_app(
                         request.state, "proxy_guangya_file_id", ""
                     ),
                     "media_name": getattr(request.state, "proxy_media_name", ""),
-                })
+                }
+
+            try:
+                credential = _request_auth_credential(request)
+                credential_conflict = _request_auth_has_conflict(request)
+                auth_scope = _auth_scope_fingerprint(credential)
+                playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
+                stream_match = _STREAM_RE.match(request.url.path)
+                video_match = (
+                    _VIDEO_ITEM_RE.match(request.url.path)
+                    if route_class == "upstream_hls"
+                    else None
+                )
+                media_match = playback_match or stream_match or video_match
+                item_id = media_match.group(1) if media_match else ""
+                source_values = _request_query_values(request, "MediaSourceId")
+                source_id = source_values[0] if source_values else ""
+                source_ambiguous = _request_query_has_conflicting_values(
+                    request, "MediaSourceId"
+                )
+                file_id = _extract_guangya_file_id(str(request.url)) or ""
+                media_name = (
+                    _safe_media_name(str(request.url), path_value=True)
+                    if route_class == "guangya_direct" else ""
+                )
+                capability_token = _request_query_value(request, _PLAYBACK_SESSION_QUERY_KEY)
+                source_signature = _request_query_value(request, _PLAYBACK_SOURCE_QUERY_KEY)
+                upstream_session_token = _request_query_value(request, "PlaySessionId")
+                upstream_session_ambiguous = _request_query_has_conflicting_values(
+                    request, "PlaySessionId"
+                )
+                device_id = _request_device_id(request)
+                device_id_ambiguous = _request_device_id_has_conflict(request)
+                playback_parameters_ambiguous = bool(
+                    ((stream_match or video_match) and source_ambiguous)
+                    or (
+                        (stream_match or playback_match or video_match)
+                        and (upstream_session_ambiguous or device_id_ambiguous)
+                    )
+                )
+                capability_authorized = False
+                capability_rejected = False
+                playback_session = None
+                native_stream_resolution = (
+                    "credential" if stream_match and auth_scope else "anonymous"
+                )
+                request.state.proxy_source_ambiguous = source_ambiguous
+                request.state.proxy_playback_session_token = ""
+                request.state.proxy_playback_session_key = ""
+                request.state.proxy_browser_relay = False
+                request.state.proxy_browser_direct_redirect = False
+                request.state.proxy_native_cross_protocol_relay = False
+                request.state.proxy_native_signed_media_relay = False
+                request.state.proxy_media_item_id = item_id
+                request.state.proxy_media_source_id = source_id
+                request.state.proxy_guangya_file_id = file_id
+                request.state.proxy_media_name = media_name
+                request.state.proxy_route_class = route_class
+                request.state.proxy_source = {
+                    "guangya_direct": "guangya",
+                    "playback_info": "playback_info",
+                    "upstream_hls": "hls",
+                }.get(route_class, "upstream")
+                request.state.proxy_action = {
+                    "guangya_direct": "guangya_302",
+                    "playback_info": "playback_passthrough",
+                    "upstream_hls": "upstream_hls",
+                    "stream": "upstream_stream",
+                }.get(route_class, "upstream_passthrough")
+                request.state.proxy_cache_hit = False
+                request.state.proxy_upstream_latency_ms = 0
+                request.state.proxy_failure_stage = ""
+                if credential_conflict:
+                    request.state.proxy_failure_stage = "client_auth"
+                elif playback_parameters_ambiguous:
+                    request.state.proxy_failure_stage = "query_parameters"
+                if credential_conflict:
+                    response = JSONResponse(
+                        {"error": "媒体服务器凭据参数冲突"}, status_code=400
+                    )
+                    return await response(scope, receive, send_response)
+                if playback_parameters_ambiguous:
+                    response = JSONResponse(
+                        {"error": "播放参数重复或冲突"}, status_code=400
+                    )
+                    return await response(scope, receive, send_response)
+                try:
+                    request.state.proxy_instance = await asyncio.to_thread(_resolved_instance, app)
+                except ValueError as exc:
+                    retired_capability = isinstance(exc, _ProxyAppRetired) and (capability_token or upstream_session_token)
+                    response = JSONResponse({"error": str(exc)}, status_code=401 if retired_capability else 503)
+                    return await response(scope, receive, send_response)
+                if route_class == "playback_info":
+                    # 仅在上游 PlaybackInfo 成功且即将返回重写响应时签发 capability；
+                    # 失败/非法响应不得占用 capability 索引或驱逐正在播放的会话。
+                    playback_session = None
+                elif capability_token:
+                    playback_session = None
+                    if stream_match and request.method in {"GET", "HEAD"}:
+                        candidate = playback_sessions.resolve_capability(
+                            instance_id,
+                            capability_token,
+                            item_id=item_id,
+                            source_id=source_id,
+                            source_signature=source_signature,
+                            renew=False,
+                        )
+                        candidate_allowed = (
+                            candidate is not None
+                            and (not auth_scope or candidate.auth_scope == auth_scope)
+                        )
+                        if (
+                            candidate_allowed
+                            and candidate is not None
+                            and not auth_scope
+                            and (
+                                candidate.native_cross_protocol_relay
+                                or candidate.native_signed_media_relay
+                            )
+                        ):
+                            native_client_fingerprint = _request_client_fingerprint(
+                                request
+                            )
+                            candidate_allowed = bool(
+                                candidate.native_verified_auth_scope
+                                and native_client_fingerprint
+                                and hmac.compare_digest(
+                                    candidate.native_client_fingerprint,
+                                    native_client_fingerprint,
+                                )
+                            )
+                        if candidate_allowed and candidate is not None:
+                            playback_session = playback_sessions.resolve_capability(
+                                instance_id, capability_token, item_id=item_id,
+                                source_id=source_id, source_signature=source_signature,
+                            )
+                            if playback_session is None:
+                                capability_rejected = True
+                            elif not auth_scope:
+                                auth_scope = candidate.auth_scope
+                                capability_authorized = True
+                        else:
+                            capability_rejected = True
+                    else:
+                        capability_rejected = True
+                elif (
+                    not auth_scope
+                    and upstream_session_token
+                    and stream_match
+                    and request.method in {"GET", "HEAD"}
+                ):
+                    # Jellyfin Android 的 ExoPlayer 可能不在视频 DataSource 请求中携带
+                    # access token，但一定会回传 PlaybackInfo 的 PlaySessionId。只接受
+                    # 本进程刚签发、item/source 精确匹配的短时会话，不做跨会话猜测。
+                    session_scope = _upstream_playback_session_scope(
+                        instance_id, upstream_session_token, device_id
+                    )
+                    playback_session = playback_sessions.resolve(
+                        session_scope,
+                        instance_id,
+                        token=upstream_session_token,
+                        item_id=item_id,
+                        source_id=source_id,
+                        create=False,
+                    )
+                    native_client_fingerprint = _request_client_fingerprint(request)
+                    if (
+                        playback_session is not None
+                        and playback_session.native_cross_protocol_relay
+                        and playback_session.native_verified_auth_scope
+                        and native_client_fingerprint
+                        and hmac.compare_digest(
+                            playback_session.native_client_fingerprint,
+                            native_client_fingerprint,
+                        )
+                    ):
+                        auth_scope = session_scope
+                        capability_authorized = True
+                        native_stream_resolution = "device_scope"
+                    else:
+                        native_stream_resolution = (
+                            "device_scope_rejected"
+                            if playback_session is not None
+                            else "device_scope_missing"
+                        )
+                        # Android 2.7 的 PlaybackInfo 请求并不保证携带 DeviceId，而视频
+                        # URL 又可能补上 DeviceId。设备标识只是客户端元数据，不能让它
+                        # 阻断已经由上游返回、同客户端地址、精确 item/source 绑定的
+                        # PlaySessionId bearer 会话，因此设备 scope 未命中时统一回退到
+                        # token scope。
+                        token_scope = _upstream_playback_token_scope(
+                            instance_id, upstream_session_token
+                        )
+                        playback_session = playback_sessions.resolve(
+                            token_scope,
+                            instance_id,
+                            token=upstream_session_token,
+                            item_id=item_id,
+                            source_id=source_id,
+                            create=False,
+                        )
+                        if (
+                            playback_session is not None
+                            and playback_session.native_cross_protocol_relay
+                            and playback_session.native_verified_auth_scope
+                            and native_client_fingerprint
+                            and hmac.compare_digest(
+                                playback_session.native_client_fingerprint,
+                                native_client_fingerprint,
+                            )
+                        ):
+                            auth_scope = token_scope
+                            capability_authorized = True
+                            native_stream_resolution = "token_scope"
+                        else:
+                            native_stream_resolution = (
+                                "token_scope_rejected"
+                                if playback_session is not None
+                                else "token_scope_missing"
+                            )
+                            playback_session = playback_sessions.resolve(
+                                "",
+                                instance_id,
+                                token=upstream_session_token,
+                                item_id=item_id,
+                                source_id=source_id,
+                                create=True,
+                            )
+                elif route_class == "guangya_direct" and not upstream_session_token:
+                    playback_session = playback_sessions.begin(
+                        auth_scope, instance_id, file_id=file_id, media_name=media_name
+                    )
+                else:
+                    playback_session = playback_sessions.resolve(
+                        auth_scope,
+                        instance_id,
+                        token=upstream_session_token,
+                        item_id=item_id,
+                        source_id=source_id,
+                        file_id=file_id,
+                        media_name=media_name,
+                        create=(
+                            bool(upstream_session_token)
+                            or route_class in {"stream", "guangya_direct"}
+                        ),
+                    )
+                request.state.proxy_auth_scope = auth_scope
+                request.state.proxy_native_stream_resolution = native_stream_resolution
+                request.state.proxy_capability_authorized = capability_authorized
+                _apply_playback_session(request, playback_session, playback_sessions)
+                if stream_match and not source_id:
+                    # 请求未指定 MediaSourceId 时不得继承同一 PlaySession 上一次触碰的
+                    # source。保持为空，让后续 mapping/grant 只在该 item 恰有唯一来源时
+                    # 自动消歧，避免多源条目误复用旧来源直链。
+                    request.state.proxy_media_source_id = ""
+                if capability_rejected:
+                    request.state.proxy_failure_stage = "playback_capability"
+                    response = JSONResponse({"error": "播放会话无效或已过期"}, status_code=401)
+                    return await response(scope, receive, send_response)
+                await self.app(scope, receive, send_response)
+                return
+            except asyncio.CancelledError:
+                error_type = "CancelledError"
+                request.state.proxy_failure_stage = "stream_cancelled"
+                raise
+            except Exception as exc:
+                error_type = type(exc).__name__
+                request.state.proxy_failure_stage = (
+                    getattr(request.state, "proxy_failure_stage", "")
+                    or ("client_disconnect" if isinstance(exc, ClientDisconnect) else
+                        "upstream_stream" if status_code and isinstance(exc, httpx.HTTPError) else "proxy")
+                )
+                raise
+            finally:
+                total_latency_ms = round(((headers_at if headers_at is not None else time.monotonic()) - started) * 1000)
+                stage = getattr(request.state, "proxy_failure_stage", "")
+                if error_type and stage not in {"client_disconnect", "stream_cancelled"}:
+                    status_code = 0 if headers_at is not None else 500
+                if status_code >= 400 and not getattr(request.state, "proxy_failure_stage", ""):
+                    request.state.proxy_failure_stage = "proxy"
+                diagnostic = {
+                    "route": getattr(request.state, "proxy_route_class", route_class),
+                    "action": getattr(request.state, "proxy_action", "upstream_passthrough"),
+                    "method": (request.method or "GET").upper(),
+                    "status": status_code,
+                    "range": _range_diagnostic(request.headers.get("range", "")),
+                    "if_range": int(bool(request.headers.get("if-range", ""))),
+                    "ua": int(bool(request.headers.get("user-agent", ""))),
+                    "cache_hit": int(bool(getattr(request.state, "proxy_cache_hit", False))),
+                    "upstream_ms": int(
+                        getattr(request.state, "proxy_upstream_latency_ms", 0) or 0
+                    ),
+                    "total_ms": total_latency_ms,
+                    "failure_stage": getattr(request.state, "proxy_failure_stage", "") or "none",
+                }
+                logger.debug(
+                    "media_proxy_diag instance=%s route=%s action=%s method=%s "
+                    "status=%s range=%s if_range=%s ua=%s cache_hit=%s "
+                    "upstream_ms=%s total_ms=%s failure_stage=%s",
+                    instance_id,
+                    diagnostic["route"], diagnostic["action"], diagnostic["method"],
+                    diagnostic["status"], diagnostic["range"], diagnostic["if_range"],
+                    diagnostic["ua"], diagnostic["cache_hit"], diagnostic["upstream_ms"],
+                    diagnostic["total_ms"], diagnostic["failure_stage"],
+                )
+                if route_class not in {"upstream", "guangya_quality"}:
+                    stage = getattr(request.state, "proxy_failure_stage", "")
+                    if not record_started and stage not in {"client_disconnect", "stream_cancelled"}:
+                        recorder.enqueue(record_payload(status_code, error_type))
+                    elif error_type and stage not in {"client_disconnect", "stream_cancelled"}:
+                        if receipt is not None:
+                            recorder.fail(receipt, failure_stage=stage or "proxy", error=error_type)
+                        else:
+                            recorder.enqueue(record_payload(0, error_type))
+
+    app.add_middleware(PlaybackMiddleware)
 
     async def _relay_signed_media(
         request: Request,
@@ -4681,10 +4830,7 @@ def create_proxy_app(
                     extensions={"sni_hostname": pinned.sni_hostname},
                 )
                 try:
-                    response = await relay_client.send(
-                        upstream_request,
-                        stream=True,
-                    )
+                    response = await _send_pinned_request(relay_client, upstream_request, pinned, stream=True)
                 except httpx.TimeoutException as exc:
                     await close_relay_client()
                     request.state.proxy_failure_stage = "signed_url_timeout"
@@ -4774,9 +4920,19 @@ def create_proxy_app(
                         headers=response_headers,
                     )
                 streaming_client, relay_client = relay_client, None
+                entry = playback_sessions.resolve(
+                    getattr(request.state, "proxy_auth_scope", ""), instance_id,
+                    token=getattr(request.state, "proxy_playback_session_token", ""),
+                    item_id=getattr(request.state, "proxy_media_item_id", ""),
+                )
                 return _UpstreamStreamingResponse(
                     response,
                     upstream_client=streaming_client,
+                    keep_playback_alive=(
+                        partial(renew_playback, entry, getattr(request.state, "proxy_media_source_id", ""),
+                                getattr(request.state, "proxy_guangya_file_id", ""))
+                        if entry is not None and response.status_code in {200, 206} else None
+                    ),
                     status_code=response.status_code,
                     headers=response_headers,
                 )
@@ -5419,7 +5575,7 @@ def create_proxy_app(
         )
         upstream_started = time.monotonic()
         try:
-            response = await client.send(upstream_request, stream=True)
+            response = await _send_pinned_request(client, upstream_request, pinned, stream=True)
         except Exception as exc:
             request.state.proxy_failure_stage = "upstream_connect"
             logger.warning(
@@ -5429,6 +5585,10 @@ def create_proxy_app(
         request.state.proxy_upstream_latency_ms = round(
             (time.monotonic() - upstream_started) * 1000
         )
+
+        if (request.method == "POST" and _PLAYBACK_PROGRESS_RE.match(request.url.path)
+                and 200 <= response.status_code < 300):
+            renew_progress(request, _playback_info_request_payload(body))
 
         if playback_match and 200 <= response.status_code < 300:
             request.state.proxy_source = "playback_info"
@@ -5505,10 +5665,7 @@ def create_proxy_app(
                     )
                     retry_response: httpx.Response | None = None
                     try:
-                        retry_response = await client.send(
-                            retry_request,
-                            stream=True,
-                        )
+                        retry_response = await _send_pinned_request(client, retry_request, pinned, stream=True)
                         if 200 <= retry_response.status_code < 300:
                             retry_raw = await _read_bounded_upstream_body(
                                 retry_response,
@@ -6016,7 +6173,9 @@ class MediaProxyManager:
                     rows[instance_id] = row
                     continue
                 try:
-                    rows[instance_id] = resolve_proxy_instance(row)
+                    resolved = resolve_proxy_instance(row)
+                    _proxy_upstream_identity(resolved)
+                    rows[instance_id] = resolved
                 except ValueError as exc:
                     message = str(exc)
                     failed[instance_id] = message

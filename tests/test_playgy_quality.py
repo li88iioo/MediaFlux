@@ -172,7 +172,12 @@ class PlayGyQualityTests(unittest.TestCase):
             stack.enter_context(patch.object(media_proxy, "close_guangya_client"))
             authorized = stack.enter_context(patch.object(media_proxy, "_client_is_authorized",
                 new=AsyncMock(return_value=False)))
-            recorder = media_proxy.PlaybackRecordWriter(write_record=lambda _payload: None)
+            self.proxy_records = []
+            def write_playback_record(payload) -> int:
+                self.proxy_records.append(dict(payload))
+                return len(self.proxy_records)
+
+            recorder = media_proxy.PlaybackRecordWriter(write_record=write_playback_record)
             app = media_proxy.create_proxy_app(
                 {
                     "id": 7,
@@ -312,6 +317,18 @@ class PlayGyQualityTests(unittest.TestCase):
             self.assertEqual(upstream, [])
         self.factory.assert_not_called()
         self.assertEqual(self.provider.calls, [])
+
+    def test_quality_json_never_records_a_media_relay_or_cache_miss(self):
+        with self._proxy_http() as (http, upstream, authorized):
+            response = http.post("/Items/quality-item/PlaybackInfo?api_key=client-token")
+            source_url = response.json()["MediaSources"][0]["MediaFluxPlayback"]["source_url"]
+            variants = http.get(self._url(base=source_url, view="variants"))
+            resolved = http.get(self._url(base=source_url, view="resolve", quality="original"))
+            self.assertEqual(variants.status_code, 200)
+            self.assertEqual(resolved.status_code, 200)
+            authorized.assert_not_awaited()
+            self.assertEqual(len(upstream), 1)
+        self.assertEqual([row["route_class"] for row in self.proxy_records], ["playback_info"])
 
     def test_proxy_disabled_instance_rejects_signed_quality_requests_before_network(self):
         base = build_play_url(_PUBLIC_BASE, _FILE_ID, _ETAG, _SIZE, _FILENAME)

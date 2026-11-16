@@ -659,6 +659,26 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["started"], [9])
         start.assert_awaited_once_with(media_proxy.resolve_proxy_instance(row))
 
+    async def test_invalid_upstream_cannot_block_another_runtime_stopping(self):
+        from app.modules import media_proxy
+
+        bad = {"id": 9, "enabled": 1, "upstream_url": "http://127.0.0.1:8096/?invalid=1"}
+        disabled = {"id": 10, "enabled": 0}
+        manager = media_proxy.MediaProxyManager()
+        first, second = MagicMock(), MagicMock()
+        manager._runtimes = {9: first, 10: second}
+        with patch("app.repositories.media_proxy.list_media_proxy_instances", return_value=[bad, disabled]), \
+                patch("app.repositories.media_proxy.update_media_proxy_instance") as update, \
+                patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop, \
+                patch.object(manager, "_start_runtime", new=AsyncMock()) as start:
+            result = await manager.reconcile()
+        self.assertEqual(manager._runtimes, {})
+        self.assertEqual(stop.await_count, 2)
+        self.assertEqual(result["stopped"], [9, 10])
+        self.assertIn(9, result["failed"])
+        self.assertTrue(any(call.args == (10, {"status": "stopped", "last_error": ""}) for call in update.call_args_list))
+        start.assert_not_awaited()
+
     async def test_reconcile_restarts_a_runtime_whose_task_exited(self):
         from app.modules import media_proxy
 
@@ -881,6 +901,7 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 connect_url="http://127.0.0.1:8096/Users/Me",
                 host_header="media.invalid:8096",
                 sni_hostname="media.invalid",
+                addresses=("127.0.0.1",),
             )
 
         class FakeClient:

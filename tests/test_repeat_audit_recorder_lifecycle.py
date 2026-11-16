@@ -12,7 +12,11 @@ from tests.support import isolated_test_database
 class RecorderLifecycleAuditTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_stop_does_not_leave_a_stop_marker_for_next_start(self):
         records = []
-        writer = PlaybackRecordWriter(write_record=lambda payload: records.append(dict(payload)))
+        def write_playback_record(payload) -> int:
+            records.append(dict(payload))
+            return len(records)
+
+        writer = PlaybackRecordWriter(write_record=write_playback_record)
         await writer.start()
         try:
             self.assertEqual(await asyncio.gather(writer.stop(), writer.stop()), [True, True])
@@ -35,6 +39,7 @@ class RecorderLifecycleAuditTests(unittest.IsolatedAsyncioTestCase):
                 if not release.wait(3):
                     raise TimeoutError('synthetic write barrier')
             records.append(dict(payload))
+            return len(records)
 
         writer = PlaybackRecordWriter(write_record=write, drain_timeout_seconds=2)
         await writer.start()
@@ -60,7 +65,11 @@ class RecorderLifecycleAuditTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_concurrent_shutdown_keeps_all_accepted_records(self):
         records = []
-        writer = PlaybackRecordWriter(write_record=lambda payload: records.append(dict(payload)))
+        def write_playback_record(payload) -> int:
+            records.append(dict(payload))
+            return len(records)
+
+        writer = PlaybackRecordWriter(write_record=write_playback_record)
         try:
             for index in range(4):
                 await writer.start()

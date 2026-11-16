@@ -167,7 +167,7 @@ def test_native_probe_uses_original_fixed_probe_http_boundary(backend, code, exp
         return httpx.Response(code, headers={"Location": "http://no-follow.invalid"}, content=b"diagnostic")
     factory = httpx.AsyncClient
     with (patch.object(service, "_pin_upstream_target", return_value=SimpleNamespace(
-            connect_url="http://127.0.0.1/System/Info", host_header="upstream.invalid:8096", sni_hostname="upstream.invalid")),
+            connect_url="http://127.0.0.1/System/Info", host_header="upstream.invalid:8096", sni_hostname="upstream.invalid", addresses=("127.0.0.1",))),
           patch.object(service.httpx, "AsyncClient", side_effect=lambda **kwargs: factory(transport=httpx.MockTransport(handler), **kwargs))):
         result = sdk.playback.test(identifier)
     assert result["data"]["instance_id"] == identifier

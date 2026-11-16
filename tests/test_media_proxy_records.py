@@ -903,6 +903,108 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             enabled=1,
         )
 
+    def test_upstream_failure_corrects_same_record_once_and_preserves_header_metrics(self):
+        record_id = media_proxy_repo.record_media_proxy_playback_attempt(
+            instance_id=self.instance_id,
+            playback_session_key="header-session",
+            media_item_id="item",
+            media_source_id="source",
+            route_class="guangya_direct",
+            method="GET",
+            status_code=206,
+            source="guangya",
+            cache_hit=True,
+            upstream_latency_ms=12,
+            total_latency_ms=18,
+        )
+        before = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=self.instance_id)["items"][0]
+        for _ in range(2):
+            self.assertTrue(media_proxy_repo.fail_media_proxy_playback_attempt(
+                record_id,
+                failure_stage="upstream_stream",
+                error="read failed https://signed.invalid/file?token=secret Authorization: Bearer hidden",
+            ))
+
+        records = media_proxy_repo.list_media_proxy_playback_records(instance_id=self.instance_id)
+        self.assertEqual(records["total"], 1)
+        row = records["items"][0]
+        self.assertEqual(row["id"], record_id)
+        self.assertEqual(row["status_code"], 0)
+        self.assertEqual(row["failure_stage"], "upstream_stream")
+        self.assertEqual(row["upstream_latency_ms"], 12)
+        self.assertEqual(row["total_latency_ms"], 18)
+        self.assertEqual(row["cache_hit"], 1)
+        for private in ("signed.invalid", "secret", "hidden"):
+            self.assertNotIn(private, row["error"])
+        session = media_proxy_repo.list_media_proxy_playback_sessions(
+            instance_id=self.instance_id, status="error",
+        )["items"][0]
+        self.assertEqual(session["request_count"], 1)
+        self.assertEqual(session["success_count"], 0)
+        self.assertEqual(session["error_count"], 1)
+        for field in ("cache_hit_count", "cache_miss_count", "average_total_latency_ms", "last_request_at"):
+            self.assertEqual(session[field], before[field])
+        self.assertEqual(session["last_status_code"], 0)
+
+    def test_late_stream_failure_does_not_override_newer_request_or_restore_cleared_records(self):
+        payload = {
+            "instance_id": self.instance_id,
+            "playback_session_key": "recovered-header-session",
+            "media_item_id": "item",
+            "route_class": "stream",
+            "method": "GET",
+            "status_code": 206,
+            "source": "upstream",
+        }
+        first_id = media_proxy_repo.record_media_proxy_playback_attempt(**payload)
+        latest_id = media_proxy_repo.record_media_proxy_playback_attempt(**payload)
+        self.assertTrue(media_proxy_repo.fail_media_proxy_playback_attempt(
+            first_id, failure_stage="upstream_stream", error="read failed",
+        ))
+        session = media_proxy_repo.list_media_proxy_playback_sessions(
+            instance_id=self.instance_id, status="success",
+        )["items"][0]
+        self.assertEqual((session["request_count"], session["success_count"], session["error_count"]), (2, 1, 1))
+        self.assertEqual(session["last_status_code"], 206)
+        self.assertTrue(media_proxy_repo.fail_media_proxy_playback_attempt(
+            latest_id, failure_stage="upstream_stream", error="read failed again",
+        ))
+        recovered_id = media_proxy_repo.record_media_proxy_playback_attempt(**payload)
+        self.assertTrue(media_proxy_repo.fail_media_proxy_playback_attempt(
+            latest_id, failure_stage="upstream_stream", error="duplicate failure",
+        ))
+        session = media_proxy_repo.list_media_proxy_playback_sessions(
+            instance_id=self.instance_id, status="success",
+        )["items"][0]
+        self.assertEqual((session["request_count"], session["success_count"], session["error_count"]), (3, 1, 2))
+        self.assertEqual(session["last_status_code"], 206)
+        media_proxy_repo.clear_media_proxy_playback_records(instance_id=self.instance_id)
+        self.assertFalse(media_proxy_repo.fail_media_proxy_playback_attempt(
+            recovered_id, failure_stage="upstream_stream", error="failure after clear",
+        ))
+        self.assertEqual(media_proxy_repo.list_media_proxy_playback_records(instance_id=self.instance_id)["total"], 0)
+        self.assertEqual(media_proxy_repo.list_media_proxy_playback_sessions(instance_id=self.instance_id)["total"], 0)
+
+    def test_failure_update_handles_existing_http_error_and_unlinked_record(self):
+        for index, (status, session_key) in enumerate(((502, "already-error"), (206, ""))):
+            with self.subTest(status=status, linked=bool(session_key)):
+                record_id = media_proxy_repo.record_media_proxy_playback_attempt(
+                    instance_id=self.instance_id,
+                    playback_session_key=session_key,
+                    route_class="stream",
+                    method="GET",
+                    status_code=status,
+                    source="upstream",
+                )
+                self.assertTrue(media_proxy_repo.fail_media_proxy_playback_attempt(
+                    record_id, failure_stage="upstream_stream", error="read failed",
+                ))
+                records = media_proxy_repo.list_media_proxy_playback_records(instance_id=self.instance_id)
+                self.assertEqual(records["total"], index + 1)
+                self.assertEqual(next(row for row in records["items"] if row["id"] == record_id)["status_code"], 0)
+        session = media_proxy_repo.list_media_proxy_playback_sessions(instance_id=self.instance_id)["items"][0]
+        self.assertEqual((session["request_count"], session["success_count"], session["error_count"]), (1, 0, 1))
+
     def test_record_is_redacted_and_list_never_returns_urls_or_credentials(self):
         record_id = media_proxy_repo.record_media_proxy_playback_attempt(
             instance_id=self.instance_id,
