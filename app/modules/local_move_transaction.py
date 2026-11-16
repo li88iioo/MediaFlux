@@ -102,6 +102,12 @@ class LocalMoveTransaction:
             Path, tuple[Path, tuple[int, int, int, int], Path]
         ] = {}
 
+    def _temporary_path(self, path: Path, kind: str) -> Path:
+        # 合法 basename 可能已接近 NAME_MAX；内部名称只用有界摘要，
+        # 完整源/目标路径继续由事务快照和审计记录持有。
+        digest = hashlib.sha256(os.fsencode(f"{self.operation_token}\0{path.name}")).hexdigest()
+        return path.with_name(f".{digest[:16]}.mediaflux-{kind}-{digest[16:28]}")
+
     @staticmethod
     def _within_any(path: Path, roots: Sequence[Path]) -> Path:
         errors: list[Exception] = []
@@ -346,7 +352,7 @@ class LocalMoveTransaction:
     ) -> tuple[Path, str]:
         if LocalFilesystemAdapter.available_space(target.parent) < snapshot.size:
             raise LocalMoveError(f"目标磁盘空间不足: {target.parent}")
-        partial = target.with_name(f".{target.name}.mediaflux-partial-{self.operation_token[:12]}")
+        partial = self._temporary_path(target, "partial")
         if partial.exists():
             raise FileExistsError(f"发现未清理的移动临时文件: {partial}")
         try:
@@ -391,9 +397,7 @@ class LocalMoveTransaction:
             raise LocalMoveError(
                 f"源文件在处理期间发生变化: {snapshot.relative_path}"
             ) from exc
-        retired = source.with_name(
-            f".{source.name}.mediaflux-retire-{self.operation_token[:12]}"
-        )
+        retired = self._temporary_path(source, "retire")
         if retired.exists():
             raise FileExistsError(f"发现未清理的来源退役文件: {retired}")
         os.replace(source, retired)
@@ -420,9 +424,7 @@ class LocalMoveTransaction:
         transaction_target: Path,
     ) -> tuple[Path, tuple[int, int, int, int]]:
         """原子退役旧版本，并记录其真实恢复位置供事务回滚。"""
-        backup_display = retire_display.with_name(
-            f".{retire_display.name}.mediaflux-replaced-{self.operation_token[:12]}"
-        )
+        backup_display = self._temporary_path(retire_display, "replaced")
         with self._pinned_entry(
             retire_display, self.target_roots,
         ) as (_retire_display, retire), self._pinned_entry(
@@ -668,9 +670,7 @@ class LocalMoveTransaction:
                 return
             size = moved.published_identity[0]
             fingerprint = self._quick_fingerprint(target, size)
-            partial = source.with_name(
-                f".{source.name}.mediaflux-rollback-{self.operation_token[:12]}"
-            )
+            partial = self._temporary_path(source, "rollback")
             try:
                 with target.open("rb") as src, partial.open("xb") as dst:
                     shutil.copyfileobj(src, dst, length=self.chunk_size)

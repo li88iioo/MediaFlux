@@ -252,7 +252,9 @@ class LocalMediaCandidateTests(unittest.TestCase):
                 if not moved_once and kwargs.get("dst_dir_fd") is not None:
                     moved_once = True
                     candidate.write_bytes(b"new producer data")
-                    (root / ".mediaflux-trash" / str(dst)).write_bytes(b"changed trash data")
+                    fd = os.open(dst, os.O_WRONLY | os.O_TRUNC, dir_fd=kwargs["dst_dir_fd"])
+                    with os.fdopen(fd, "wb") as retained_file:
+                        retained_file.write(b"changed trash data")
                 return result
 
             with patch(
@@ -266,11 +268,11 @@ class LocalMediaCandidateTests(unittest.TestCase):
                 )
 
             self.assertEqual(candidate.read_bytes(), b"new producer data")
-            retained = list((root / ".mediaflux-trash").iterdir())
+            retained = [path for path in (root / ".mediaflux-trash").rglob("*") if path.is_file()]
             self.assertEqual(len(retained), 1)
             self.assertEqual(retained[0].read_bytes(), b"changed trash data")
             # 滞留回收区的条目必须可追溯，不能静默。
-            self.assertIn(retained[0].name, "\n".join(logs.output))
+            self.assertIn(retained[0].parent.name + "/" + retained[0].name, "\n".join(logs.output))
 
     def test_transient_trash_path_swap_cannot_redirect_media_outside_source(self) -> None:
         with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:

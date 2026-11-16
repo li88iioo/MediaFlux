@@ -321,12 +321,15 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
 
     trash_root = root / LOCAL_MEDIA_TRASH_DIR
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    destination_name = f"{timestamp}-{uuid.uuid4().hex[:10]}-{selected.name}"
-    destination = trash_root / destination_name
+    run_name = f"{timestamp}-{uuid.uuid4().hex[:10]}"
+    destination_name = selected.name
+    destination = trash_root / run_name / destination_name
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     root_fd: int | None = None
     trash_fd: int | None = None
+    run_fd: int | None = None
+    run_created = False
     moved = False
     try:
         root_fd = os.open(root, directory_flags)
@@ -346,14 +349,18 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
         except FileExistsError:
             pass
         trash_fd = os.open(LOCAL_MEDIA_TRASH_DIR, directory_flags, dir_fd=root_fd)
+        # 每次回收独立短目录，条目保留完整原名，不给合法长 basename 加前缀。
+        os.mkdir(run_name, mode=0o700, dir_fd=trash_fd)
+        run_created = True
+        run_fd = os.open(run_name, directory_flags, dir_fd=trash_fd)
         os.replace(
             selected.name,
             destination_name,
             src_dir_fd=root_fd,
-            dst_dir_fd=trash_fd,
+            dst_dir_fd=run_fd,
         )
         moved = True
-        published = os.stat(destination_name, dir_fd=trash_fd, follow_symlinks=False)
+        published = os.stat(destination_name, dir_fd=run_fd, follow_symlinks=False)
         published_identity = {
             "size": published.st_size,
             "mtime_ns": published.st_mtime_ns,
@@ -364,7 +371,7 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
             move_entry_no_replace_at(
                 destination_name,
                 selected.name,
-                source_dir_fd=trash_fd,
+                source_dir_fd=run_fd,
                 target_dir_fd=root_fd,
                 is_directory=is_directory,
             )
@@ -374,23 +381,30 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
     except (NotImplementedError, TypeError) as exc:
         raise PathMappingError("当前运行环境不支持安全回收操作") from exc
     except Exception:
-        if moved and root_fd is not None and trash_fd is not None:
+        if moved and root_fd is not None and run_fd is not None:
             try:
                 move_entry_no_replace_at(
                     destination_name,
                     selected.name,
-                    source_dir_fd=trash_fd,
+                    source_dir_fd=run_fd,
                     target_dir_fd=root_fd,
                     is_directory=is_directory,
                 )
             except Exception as restore_exc:
                 logger.error(
                     "本地回收失败且未能恢复原位置，条目滞留回收区 trash=%s name=%s type=%s",
-                    LOCAL_MEDIA_TRASH_DIR, destination_name, type(restore_exc).__name__,
+                    LOCAL_MEDIA_TRASH_DIR, f"{run_name}/{destination_name}", type(restore_exc).__name__,
                 )
         raise
     finally:
+        if run_fd is not None:
+            os.close(run_fd)
         if trash_fd is not None:
+            if run_created:
+                try:
+                    os.rmdir(run_name, dir_fd=trash_fd)
+                except OSError:
+                    pass  # 已回收或保留的恢复副本使目录非空，不能清除。
             os.close(trash_fd)
         if root_fd is not None:
             os.close(root_fd)

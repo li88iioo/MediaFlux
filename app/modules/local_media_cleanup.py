@@ -170,7 +170,7 @@ def delete_cleanup_items(
         for candidate in candidates:
             path = assert_within(candidate.snapshot.path, root)
             relative_path = path.relative_to(root)
-            quarantine_name = f"{uuid.uuid4().hex}-{path.name}"
+            quarantine_name = uuid.uuid4().hex
             moved = False
             source_parent_fd: int | None = None
             try:
