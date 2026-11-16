@@ -418,8 +418,6 @@
         excludeTagInput.setTagsFromString(config.OFFLINE_EXCLUDE_KEYWORDS || '');
         allowedExtsTagInput.setTagsFromString(config.OFFLINE_ALLOWED_EXTS || '');
         secondaryTagInput.setTagsFromString(config.OFFLINE_SECONDARY_KEYWORDS || '');
-        if(!config.OFFLINE_MAGNET_ENABLED)form.querySelector('[data-key="OFFLINE_MAGNET_ENABLED"]').checked=true;
-        if(!config.OFFLINE_ED2K_ENABLED)form.querySelector('[data-key="OFFLINE_ED2K_ENABLED"]').checked=true;
         renderDirs();
     }).catch(error=>{
         saveState.className='is-error';

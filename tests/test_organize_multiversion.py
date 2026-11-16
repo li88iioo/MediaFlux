@@ -1784,6 +1784,8 @@ class MultiVersionConfigApiTests(IsolatedDatabaseTestCase):
             "GY_ORGANIZE_KEEP_MULTI_VERSIONS": "1",
             "GY_ORGANIZE_KEEP_REMUX_VARIANT": "1",
             "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET": "balanced",
+            # 空 Cron 会被通用保存拒绝；整页提交时它总带有效计划。
+            "GY_ORGANIZE_SCHEDULE_CRON": "0 4 * * *",
         })
 
         with patch("app.routes.api.config.set_and_save") as save:

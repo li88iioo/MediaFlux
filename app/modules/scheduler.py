@@ -27,6 +27,7 @@ from app.repositories import strm as strm_repo
 from app.repositories import organize_probe as organize_probe_repo
 from app.repositories import strm_request_ownership as strm_request_ownership_repo
 from app.config import get, get_bool, get_int
+from app.defaults import DEFAULT_SCHEDULE_CRON
 from app.logger import get_logger, log_throttled
 from app.modules.media_refresh import plan_refresh_targets
 from app.modules.organize_probe_notifications import (
@@ -1072,7 +1073,7 @@ class STRMScheduler:
     def status(self) -> dict:
         """返回调度器状态和最近运行记录。"""
         enabled = get_bool("STRM_SCHEDULE_ENABLED", False)
-        cron_expr = get("STRM_SCHEDULE_CRON", "0 4 * * *").strip()
+        cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
         error = self.validate_config(auto_only=False)
         next_run = self._calculate_next(cron_expr) if enabled and not error else None
         last = db.get_last_task_run(TASK_NAME)
@@ -1179,7 +1180,7 @@ class STRMScheduler:
             return "未配置 STRM 本地根目录"
         if sources and not base_url:
             return "未配置 STRM 播放服务地址"
-        cron_expr = get("STRM_SCHEDULE_CRON", "0 4 * * *").strip()
+        cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
         if not STRMScheduler.validate_cron(cron_expr):
             return "cron 表达式无效，需使用 5 段格式：分 时 日 月 周"
         return ""
@@ -1333,7 +1334,7 @@ class STRMScheduler:
                 "STRM 定时任务配置无效: %s", error,
             )
             return
-        cron_expr = get("STRM_SCHEDULE_CRON", "0 4 * * *").strip()
+        cron_expr = get("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON).strip()
         now = datetime.now()
         with self._state_lock:
             if self._next_run is None or self._loaded_cron != cron_expr:
@@ -1745,7 +1746,7 @@ class STRMScheduler:
             if options.get("media_server_refresh_override") is None:
                 # 重启恢复没有内存 override；仅整理队列继承整理开关，人工/定时同步独立。
                 options["media_server_refresh_override"] = (
-                    trigger_type != "organize" or get_bool("GY_ORGANIZE_EMBY_REFRESH", True)
+                    trigger_type != "organize" or get_bool("GY_ORGANIZE_EMBY_REFRESH")
                 )
                 with self._state_lock:
                     self._run_options["media_server_refresh_override"] = options["media_server_refresh_override"]
@@ -2510,7 +2511,7 @@ class STRMScheduler:
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
                         has_silent_notification_scope: bool = False) -> None:
-        enabled = get_bool("STRM_NOTIFY_ENABLED", True) and notify_override is not False
+        enabled = get_bool("STRM_NOTIFY_ENABLED") and notify_override is not False
         if trigger_type == "telegram" or not enabled:
             return
         recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
@@ -2573,10 +2574,10 @@ class STRMScheduler:
                         uses_default_notification_scope: bool | None = None,
                         has_silent_notification_scope: bool = False) -> None:
         """仅为整理联动发送有界文件明细，同时遵守 STRM 通知总开关。"""
-        if trigger_type != "organize" or not get_bool("STRM_NOTIFY_ENABLED", True):
+        if trigger_type != "organize" or not get_bool("STRM_NOTIFY_ENABLED"):
             return
         enabled = (
-            get_bool("GY_ORGANIZE_STRM_DETAIL_NOTIFY", True)
+            get_bool("GY_ORGANIZE_STRM_DETAIL_NOTIFY")
             if enabled_override is None else enabled_override
         )
         if not enabled:
@@ -2632,7 +2633,7 @@ class STRMScheduler:
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
                         has_silent_notification_scope: bool = False) -> None:
-        enabled = get_bool("STRM_NOTIFY_ENABLED", True) and notify_override is not False
+        enabled = get_bool("STRM_NOTIFY_ENABLED") and notify_override is not False
         if trigger_type != "telegram" and enabled:
             event = NotificationEvent(
                 "❌ STRM 同步失败",

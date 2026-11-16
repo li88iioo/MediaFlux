@@ -972,12 +972,8 @@
         if(!config.GY_ORGANIZE_SMALL_FILE_MB)document.getElementById('r_small').value='10';
         if(!config.GY_ORGANIZE_NSFW_CATEGORY_NAME)document.getElementById('r_nsfw_category').value='成人内容';
         if(!config.GY_ORGANIZE_NSFW_TIMEOUT_SECONDS)document.getElementById('r_nsfw_timeout').value='8';
-        if(!config.GY_ORGANIZE_SCHEDULE_CRON)document.getElementById('r_schedule_cron').value='0 4 * * *';
         if(!config.GY_ORGANIZE_CONFLICT_STRATEGY)document.getElementById('r_conflict').value='1';
         if(!config.GY_ORGANIZE_AUTOMATIC_MATCH_PRESET)document.getElementById('r_automatic_match_preset').value='balanced';
-        ['r_region','r_year','r_remux','r_res','r_dolby','r_clean','r_notify','r_library_notify','r_strm','r_strm_notify','r_emby'].forEach(id=>{
-            const field=document.getElementById(id);const key=field.dataset.key;if(config[key]===undefined||config[key]==='')field.checked=true;
-        });
         finishConfigLoad(true);updateDependencies();syncNsfwPanel({collapseWhenDisabled:true});
     }).catch(()=>{updateDependencies();syncNsfwPanel({collapseWhenDisabled:true});finishConfigLoad(false);});
     startPolling();
@@ -993,9 +989,6 @@
     loadAppConfig().then(config=>{
         fillConfigFields(workspace,config);sources=parseSources(config.GY_ORGANIZE_SOURCE_DIRS);syncSources();renderSources();
         renderTarget(config.GY_ORGANIZE_TARGET_DIR||'',config.GY_ORGANIZE_TARGET_DIR_NAME||'');
-        if(cleanCheckbox&&config.GY_ORGANIZE_CLEAN_EMPTY!==undefined&&config.GY_ORGANIZE_CLEAN_EMPTY!==''){
-            cleanCheckbox.checked=String(config.GY_ORGANIZE_CLEAN_EMPTY)==='true'||config.GY_ORGANIZE_CLEAN_EMPTY===true||config.GY_ORGANIZE_CLEAN_EMPTY==='1'||config.GY_ORGANIZE_CLEAN_EMPTY===1;
-        }
         finishConfigLoad(true);
     }).catch(()=>{finishConfigLoad(false);});
     startPolling();

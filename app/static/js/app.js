@@ -791,7 +791,8 @@
                 '.secret-input-toggle'
             ).forEach((button) => { button.disabled = managed; });
             if (field.type === 'checkbox') {
-                field.checked = ['1', 'true', 'yes'].includes(String(value).toLowerCase());
+                // 与后端 config.get_bool 的真值集合一致；缺失默认由 GET /api/config 提供。
+                field.checked = ['1', 'true', 'yes', 'on', 'y'].includes(String(value).trim().toLowerCase());
             } else if (field.dataset.secretField === 'true' && String(value) === '********') {
                 field.value = '';
                 field.type = 'password';

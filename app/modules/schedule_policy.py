@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from app import config
+from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_SCHEDULE_CRON
 from app.logger import get_logger
 from app.modules.organize_scheduler import OrganizeScheduler, get_organize_scheduler
 from app.modules.scheduler import STRMScheduler
@@ -17,13 +18,13 @@ logger = get_logger(__name__)
 _TARGETS: dict[str, dict[str, tuple[str, Any]]] = {
     "strm": {
         "enabled": ("STRM_SCHEDULE_ENABLED", False),
-        "cron": ("STRM_SCHEDULE_CRON", "0 4 * * *"),
-        "notify_enabled": ("STRM_NOTIFY_ENABLED", True),
+        "cron": ("STRM_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON),
+        "notify_enabled": ("STRM_NOTIFY_ENABLED", DEFAULT_BOOL_CONFIG_VALUES["STRM_NOTIFY_ENABLED"]),
     },
     "organize": {
         "enabled": ("GY_ORGANIZE_SCHEDULE_ENABLED", False),
-        "cron": ("GY_ORGANIZE_SCHEDULE_CRON", "0 4 * * *"),
-        "notify_enabled": ("GY_ORGANIZE_NOTIFY_ENABLED", True),
+        "cron": ("GY_ORGANIZE_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON),
+        "notify_enabled": ("GY_ORGANIZE_NOTIFY_ENABLED", DEFAULT_BOOL_CONFIG_VALUES["GY_ORGANIZE_NOTIFY_ENABLED"]),
     },
     "patrol": {
         "enabled": ("AGENT_LIBRARY_PATROL_ENABLED", False),
@@ -82,7 +83,8 @@ def current_policy(kind: str) -> dict[str, Any]:
             minimum, maximum = _BOUNDS[name]
             policy[name] = max(minimum, min(config.get_int(key, default), maximum))
         else:
-            policy[name] = config.get(key, default).strip() or default
+            # 缺失用默认；存量空 Cron 保持为空，如实反映运行时没有生效的计划。
+            policy[name] = config.get(key, default).strip()
     return policy
 
 

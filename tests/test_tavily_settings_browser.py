@@ -75,11 +75,11 @@ class TavilySettingsBrowserTests(unittest.TestCase):
                 self.assertEqual(errors, [])
 
     def test_local_read_controls_are_independent_responsive_and_save_only_their_draft(self):
-        from app.routes.api import _AGENT_SETTINGS_DEFAULTS
+        from app.routes.api import _UI_DEFAULTS
 
         for width in (320, 390, 1280):
             with self.subTest(width=width):
-                page, errors = self._page(width, _AGENT_SETTINGS_DEFAULTS)
+                page, errors = self._page(width, _UI_DEFAULTS)
                 self._resolve_config(page)
                 page.locator('[data-settings-target="agent"]').click()
                 search = page.locator('[data-key="WEB_SEARCH_ENABLED"]')

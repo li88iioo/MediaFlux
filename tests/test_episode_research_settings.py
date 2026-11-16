@@ -140,7 +140,7 @@ class EpisodeResearchSettingsTests(unittest.TestCase):
         for key, default in ((ENABLED, "0"), (LIMIT, "10")):
             with self.subTest(key=key):
                 self.assertIn(key, self.api["_CONFIG_UI_SAVEABLE_KEYS"])
-                self.assertEqual(self.api["_AGENT_SETTINGS_DEFAULTS"].get(key), default)
+                self.assertEqual(self.api["_UI_DEFAULTS"].get(key), default)
 
     def test_boolean_normalization_roundtrips_without_enabling_dependencies(self):
         for raw, expected in ((True, "1"), (False, "0"), (" on ", "1"), ("off", "0"), ("YES", "1"), ("n", "0")):
@@ -261,9 +261,9 @@ class EpisodeResearchSettingsUiTests(unittest.TestCase):
         self.assertNotIn(f"{ENABLED}:", script)
         ready = script.split("function setConfigReady(){", 1)[1].split("function setConfigLoadError", 1)[0]
         self.assertLess(ready.index("syncEpisodeResearchAvailability()"), ready.index("revealConfigFields()"))
-        normalize = script.split("loadAppConfig().then(config=>{", 1)[1].split("fillConfigFields(form,config)", 1)[0]
-        self.assertIn("episodeResearchToggle", normalize)
-        self.assertIn("episodeResearchDependencies", normalize)
+        # 开关值由共享 fillConfigFields 按 get_bool 真值集合回填，页面不再预先改写 config。
+        before_fill = script.split("loadAppConfig().then(config=>{", 1)[1].split("fillConfigFields(form,config)", 1)[0]
+        self.assertEqual(before_fill.strip(), "")
 
     @unittest.skipUnless(shutil.which("node"), "静态依赖状态验证需要 Node.js")
     def test_dependency_events_preserve_values_and_dom_in_node(self):

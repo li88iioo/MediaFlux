@@ -131,10 +131,8 @@ class AgentSettingsUiTests(unittest.TestCase):
         from app.routes.api import _UI_DEFAULTS
 
         self.assertEqual(_UI_DEFAULTS["AGENT_STREAM_DISPLAY_ENABLED"], "1")
-        self.assertIn(
-            "const streamDisplayToggle=form.querySelector('[data-key=\"AGENT_STREAM_DISPLAY_ENABLED\"]')",
-            html,
-        )
+        # 回填由共享 fillConfigFields 完成，设置页不再为单个开关做本地规范化。
+        self.assertIn('data-key="AGENT_STREAM_DISPLAY_ENABLED"', html)
         for key in (
             "AGENT_LIBRARY_PATROL_ENABLED",
             "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED",
@@ -1166,10 +1164,10 @@ class AgentSettingsUiTests(unittest.TestCase):
             persist.assert_not_called()
 
     def test_local_reader_settings_validate_and_save_without_changing_tavily(self):
-        from app.routes.api import _AGENT_SETTINGS_DEFAULTS, _validate_web_access_updates
+        from app.routes.api import _UI_DEFAULTS, _validate_web_access_updates
 
-        self.assertEqual(_AGENT_SETTINGS_DEFAULTS["WEB_READ_ENABLED"], "1")
-        self.assertEqual(_AGENT_SETTINGS_DEFAULTS["WEB_SEARCH_ENABLED"], "0")
+        self.assertEqual(_UI_DEFAULTS["WEB_READ_ENABLED"], "1")
+        self.assertEqual(_UI_DEFAULTS["WEB_SEARCH_ENABLED"], "0")
         values = {"WEB_READ_ENABLED": "0", "WEB_READ_TIMEOUT_SECONDS": "15", "WEB_READ_CACHE_TTL_SECONDS": "120"}
         self.assertEqual(_validate_web_access_updates(values), values)
         for key, value in (("WEB_READ_ENABLED", "invalid"), ("WEB_READ_TIMEOUT_SECONDS", "1"),
@@ -1179,7 +1177,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                 _validate_web_access_updates({key: value})
         with (
             initialized_web_runtime(),
-            patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda key, default="": _AGENT_SETTINGS_DEFAULTS.get(key, default))),
+            patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(lambda key, default="": _UI_DEFAULTS.get(key, default))),
             patch("app.routes.api.config.has_external_override", return_value=False),
             patch("app.routes.api.config.set_and_save") as persist,
             patch("app.services.clear_dashboard_cache"),

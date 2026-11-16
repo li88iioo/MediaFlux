@@ -95,10 +95,6 @@ _TOOL_PROGRESS_LABELS = {
 }
 
 
-def _enabled(value: object) -> bool:
-    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
-
-
 def telegram_user_is_allowed(user_id: object) -> bool:
     user = str(user_id or "").strip()
     return bool(_ALLOWED_USER_RE.fullmatch(user) and user in configured_telegram_user_ids())
@@ -111,7 +107,7 @@ def telegram_agent_control_access(chat_id: object, user_id: object) -> str:
 
 
 def telegram_agent_access(chat_id: object, user_id: object) -> str:
-    if not is_agent_enabled() or not _enabled(config.get("TG_AGENT_ENABLED", "0")):
+    if not is_agent_enabled() or not config.get_bool("TG_AGENT_ENABLED", False):
         return "disabled"
     return telegram_agent_control_access(chat_id, user_id)
 
@@ -1122,7 +1118,7 @@ def _control_markup(
     message_thread_id: object = None,
 ) -> Any:
     globally_enabled = is_agent_enabled()
-    telegram_enabled = _enabled(config.get("TG_AGENT_ENABLED", "0"))
+    telegram_enabled = config.get_bool("TG_AGENT_ENABLED", False)
     actions: list[tuple[str, str, dict[str, Any]]] = []
     if not globally_enabled:
         actions.append(("开启全部", "preview", {"action": "enable_all"}))
@@ -1169,7 +1165,7 @@ def handle_agent_guide(
         return
     global_status = "已开启" if is_agent_enabled() else "已关闭"
     telegram_status = (
-        "已开启" if _enabled(config.get("TG_AGENT_ENABLED", "0")) else "已关闭"
+        "已开启" if config.get_bool("TG_AGENT_ENABLED", False) else "已关闭"
     )
     text = (
         "<b>Media Agent</b>\n"

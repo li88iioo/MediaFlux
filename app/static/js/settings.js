@@ -41,7 +41,6 @@
     const indexerSiteInputs=[...(indexerSiteBox?.querySelectorAll('[data-indexer-site]')||[])];
     const resourceResultsToggle=form.querySelector('[data-key="DISCOVERY_RESOURCE_RESULTS_ENABLED"]');
     const indexerSearchToggle=form.querySelector('[data-key="INDEXER_SEARCH_ENABLED"]');
-    const streamDisplayToggle=form.querySelector('[data-key="AGENT_STREAM_DISPLAY_ENABLED"]');
     const doubanDbcl2Input=form.querySelector('[data-key="DOUBAN_DBCL2"]');
     const doubanDbcl2Status=form.querySelector('[data-douban-dbcl2-status]');
     let doubanDbcl2StatusGeneration=0;
@@ -223,14 +222,6 @@
     });
 
     loadAppConfig().then(config=>{
-        // 与执行端 get_bool 一致，避免部署环境使用 on/y 时授权已生效却显示关闭。
-        [recognitionReviewToggle,nsfwCleanReviewToggle,episodeResearchToggle,streamDisplayToggle,
-            ...episodeResearchDependencies.filter(field=>field?.type==='checkbox'),
-        ].filter(Boolean).forEach(field=>{
-            const key=field.dataset.key;
-            if(config[key]===undefined)return;
-            config[key]=['1','true','yes','on','y'].includes(String(config[key]).trim().toLowerCase())?'1':'0';
-        });
         fillConfigFields(form,config);
         loadIndexerSiteSelection(config);
         setConfigReady();

@@ -260,9 +260,10 @@ def notify_local_media_task(
     chat_id: str = "",
 ) -> bool:
     """读取任务上下文并发送通知；任务不存在时静默跳过。"""
-    notifications_enabled = config.get_bool(
-        "GY_ORGANIZE_NOTIFY_ENABLED", True
-    ) and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)
+    notifications_enabled = (
+        config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED")
+        and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY")
+    )
     if not notifications_enabled:
         schedule_local_media_task_review(
             task_id, result, owner=owner, chat_id=chat_id
@@ -324,8 +325,8 @@ def notify_local_media_task(
             importance=importance,
             chat_id=chat_id,
             topic_enabled=(
-                config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
-                and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)
+                config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED")
+                and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY")
             ),
         )
     )

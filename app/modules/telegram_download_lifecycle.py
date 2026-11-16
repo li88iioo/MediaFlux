@@ -425,7 +425,7 @@ def publish_download_lifecycle(
             "error": NotificationImportance.ERROR,
             "partial": NotificationImportance.ERROR,
         }.get(event.state, NotificationImportance.RESULT)
-        topic_enabled = config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
+        topic_enabled = config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED")
         # 下载异常和人工处理不应被“整理成功通知”开关吞掉；全局通知总开关仍生效。
         if importance in {NotificationImportance.ACTION, NotificationImportance.ERROR}:
             topic_enabled = True

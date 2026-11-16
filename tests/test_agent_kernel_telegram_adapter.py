@@ -403,6 +403,16 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
                 self.assertFalse(any(kwargs.get("reply_markup") for _, kwargs in messages))
                 start.assert_not_called()
 
+    def test_telegram_agent_switch_uses_shared_truth_values(self):
+        # 准入与 /agent 状态文案都按 config.get_bool 解析；曾经的私有解析不认 y。
+        for raw, expected in (("y", True), (" On ", True), ("YES", True), ("0", False), ("", False), ("no", False)):
+            with self.subTest(raw=raw):
+                self.config_values["TG_AGENT_ENABLED"] = raw
+                access = self._patch_access()
+                with access[0], access[1]:
+                    allowed = adapter.telegram_agent_access(-100, 7)
+                self.assertEqual(allowed != "disabled", expected)
+
     def test_disabled_agent_does_not_capture_normal_telegram_text(self):
         bot = FakeBot()
         with patch.object(adapter, "is_agent_enabled", return_value=False):

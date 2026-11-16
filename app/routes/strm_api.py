@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Request
 
 from app import config
+from app.defaults import DEFAULT_SCHEDULE_CRON
 from app import database as db
 from app.logger import get_logger
 from app.modules.scheduler import STRMScheduler, get_scheduler
@@ -203,7 +204,7 @@ def schedule_status(request: Request):
 @router.put("/schedule")
 def update_schedule(request: Request, data: dict = Body(...)):
     require_api_login(request)
-    cron_expr = str(data.get("cron", "0 4 * * *")).strip()
+    cron_expr = str(data.get("cron", DEFAULT_SCHEDULE_CRON)).strip()
     if not STRMScheduler.validate_cron(cron_expr):
         return api_error("cron 表达式无效，需使用 5 段格式：分 时 日 月 周", 400)
     updates = {

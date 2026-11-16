@@ -20,10 +20,8 @@ from app.defaults import (
     INT_SETTING_BOUNDS,
     DEFAULT_BOOL_CONFIG_VALUES,
     DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT,
-    DEFAULT_AGENT_EPISODE_RESEARCH_ENABLED,
-    DEFAULT_AGENT_LLM_ENABLED,
-    DEFAULT_AGENT_STREAM_DISPLAY_ENABLED,
     DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
+    DEFAULT_SCHEDULE_CRON,
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
 from app.discovery.models import ProviderError
@@ -40,7 +38,6 @@ from app.modules.telegram_notification_policy import DEFAULT_NOTIFICATION_LEVEL,
 from app.modules.feature_config import (
     AGENT_EPISODE_RESEARCH_KEYS,
     AI_RECOGNITION_KEYS,
-    BOOLEAN_VALUES,
     FEATURES,
     MEDIA_SERVER_PROFILE_KEYS,
     NSFW_ORGANIZE_KEYS,
@@ -121,16 +118,12 @@ _MEDIA_SERVER_REFRESH_KEYS = {
     "EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK",
 }
 _AGENT_SETTINGS_DEFAULTS = {
-    "AGENT_ENABLED": "0",
-    "AGENT_LLM_ENABLED": "1" if DEFAULT_AGENT_LLM_ENABLED else "0",
     "AGENT_LLM_PROTOCOL": "auto",
     "AGENT_LLM_TIMEOUT_SECONDS": "12",
     "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "128000",
     "AGENT_LLM_GENERATION_PROFILES": "[]",
     "AGENT_LLM_BUDGET_PROFILES": "[]",
     "AGENT_LLM_REASONING_EFFORT": "",
-    "WEB_SEARCH_ENABLED": "0",
-    "WEB_READ_ENABLED": "1",
     "WEB_READ_TIMEOUT_SECONDS": str(POLICY_BY_KEY["WEB_READ_TIMEOUT_SECONDS"].default),
     "WEB_READ_CACHE_TTL_SECONDS": str(POLICY_BY_KEY["WEB_READ_CACHE_TTL_SECONDS"].default),
     "TAVILY_SEARCH_DEPTH": str(POLICY_BY_KEY["TAVILY_SEARCH_DEPTH"].default),
@@ -138,14 +131,7 @@ _AGENT_SETTINGS_DEFAULTS = {
     "TAVILY_CACHE_TTL_SECONDS": str(POLICY_BY_KEY["TAVILY_CACHE_TTL_SECONDS"].default),
     "TAVILY_DAILY_CREDIT_LIMIT": str(POLICY_BY_KEY["TAVILY_DAILY_CREDIT_LIMIT"].default),
     "TAVILY_TIMEOUT_SECONDS": str(POLICY_BY_KEY["TAVILY_TIMEOUT_SECONDS"].default),
-    "AGENT_LIBRARY_PATROL_ENABLED": "0",
-    "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED": "0",
-    "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "1",
-    "AGENT_RECOGNITION_REVIEW_ENABLED": "0",
-    "AGENT_EPISODE_RESEARCH_ENABLED": "1" if DEFAULT_AGENT_EPISODE_RESEARCH_ENABLED else "0",
     "AGENT_EPISODE_RESEARCH_DAILY_LIMIT": str(DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT),
-    "AGENT_STREAM_DISPLAY_ENABLED": str(int(DEFAULT_AGENT_STREAM_DISPLAY_ENABLED)),
-    "AGENT_NSFW_CLEAN_REVIEW_ENABLED": "0",
     "AGENT_LIBRARY_PATROL_INTERVAL_HOURS": "24",
     "AGENT_LIBRARY_PATROL_MAX_SERIES": "50",
 }
@@ -281,12 +267,10 @@ def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
         updates["TG_AGENT_ENABLED"] = normalize_boolean(
             "TG_AGENT_ENABLED", data["TG_AGENT_ENABLED"]
         )
-    effective_enabled = updates.get(
-        "TG_AGENT_ENABLED",
-        BOOLEAN_VALUES.get(
-            config.get("TG_AGENT_ENABLED", "0").strip().lower(), "0"
-        ),
-    ) == "1"
+    effective_enabled = (
+        updates["TG_AGENT_ENABLED"] == "1" if "TG_AGENT_ENABLED" in updates
+        else config.get_bool("TG_AGENT_ENABLED", False)
+    )
 
     if "TG_AGENT_ALLOWED_USER_IDS" in data:
         updates["TG_AGENT_ALLOWED_USER_IDS"] = _normalize_telegram_agent_user_ids(
@@ -984,10 +968,16 @@ def _ui_defaults() -> dict[str, str]:
     defaults.update({key: str(bounds[0]) for key, bounds in INT_SETTING_BOUNDS.items()})
     defaults["AI_RECOGNITION_CONFIDENCE_THRESHOLD"] = str(AI_RECOGNITION_CONFIDENCE_BOUNDS[0])
     defaults["TG_NOTIFICATION_LEVEL"] = DEFAULT_NOTIFICATION_LEVEL
+    defaults.update(dict.fromkeys(_CRON_KEYS, DEFAULT_SCHEDULE_CRON))
     return {key: value for key, value in defaults.items() if key in _CONFIG_UI_SAVEABLE_KEYS}
 
 
+_CRON_KEYS = ("STRM_SCHEDULE_CRON", "GY_ORGANIZE_SCHEDULE_CRON")
 _UI_DEFAULTS = _ui_defaults()
+# 布尔开关与 Cron 的显式空值有运行时含义（关闭 / 无计划），页面如实回填，不替换为默认。
+_EMPTY_PRESERVED_UI_KEYS = frozenset(
+    {*DEFAULT_BOOL_CONFIG_VALUES, *(key for key, _, _ in FEATURES.values()), *_CRON_KEYS}
+)
 
 
 @router.get("/config")
@@ -1009,11 +999,11 @@ def get_config(request: Request):
         managed_field_set.add("INDEXER_ENABLED_SITES")
     managed_fields = sorted(managed_field_set)
     managed_field_set = set(managed_fields)
-    # 页面字段按运行时语义展示：缺失或空值取后端权威默认值；布尔开关（*_ENABLED）
-    # 的显式空值在 get_bool 中即为关闭，保持原样。新授权（成人复核、季集研究等）
-    # 独立默认关闭，不继承旧开关。
+    # 页面字段按运行时语义展示：缺失取后端权威默认值；布尔开关与 Cron 的显式空值
+    # 在运行时即为关闭 / 无计划，保持原样，其余字段的空值仍回填默认。新授权（成人
+    # 复核、季集研究等）独立默认关闭，不继承旧开关。
     for key, default in _UI_DEFAULTS.items():
-        if key not in items or (items[key] == "" and not key.endswith("_ENABLED")):
+        if key not in items or (items[key] == "" and key not in _EMPTY_PRESERVED_UI_KEYS):
             items[key] = default
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
@@ -1333,13 +1323,12 @@ def save_config(request: Request, data: Any = Body(default=None)):
         for key, (module_name, class_name) in cron_validators.items():
             if key not in data:
                 continue
-            value = str(data[key] or "").strip()
-            if value:
-                import importlib
+            # 提交的空值也必须拒绝：存为空串不会回退默认，计划会静默失效。
+            import importlib
 
-                validator = getattr(importlib.import_module(module_name), class_name)
-                if not validator.validate_cron(value):
-                    return api_error(f"{key} 必须是有效的 5 段 cron 表达式", 400)
+            validator = getattr(importlib.import_module(module_name), class_name)
+            if not validator.validate_cron(str(data[key] or "").strip()):
+                return api_error(f"{key} 必须是有效的 5 段 cron 表达式", 400)
         integer_limits = {
             "STRM_SKIP_THRESHOLD_MB": (0, None),
             "GY_ORGANIZE_SMALL_FILE_MB": (0, None),

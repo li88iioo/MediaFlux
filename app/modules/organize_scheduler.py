@@ -13,6 +13,7 @@ from typing import Callable
 from croniter import croniter
 
 from app.config import get, get_bool
+from app.defaults import DEFAULT_SCHEDULE_CRON
 from app.logger import get_logger, log_throttled
 from app.modules.organize import OrganizeRules
 from app.modules.organize_sources import normalize_organize_sources
@@ -221,7 +222,7 @@ class OrganizeScheduler:
             self._active_task_id = ""
 
     def _cron_expr(self) -> str:
-        return (self._get_value("GY_ORGANIZE_SCHEDULE_CRON", "0 4 * * *") or "").strip()
+        return (self._get_value("GY_ORGANIZE_SCHEDULE_CRON", DEFAULT_SCHEDULE_CRON) or "").strip()
 
     def _configured_sources(self) -> list[dict[str, str]]:
         sources, error = normalize_organize_sources(

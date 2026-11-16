@@ -817,8 +817,6 @@
 
     loadAppConfig().then(cfg=>{
         fillConfigFields(form,cfg);
-        if(!cfg.STRM_SCHEDULE_CRON)cron.value='0 4 * * *';
-        if(!cfg.STRM_NOTIFY_ENABLED)form.querySelector('[data-key="STRM_NOTIFY_ENABLED"]').checked=true;
 
         // Init Tag Inputs
         videoTagInput.setTagsFromString(cfg.STRM_VIDEO_EXTS || 'mkv,mp4,ts,m2ts');

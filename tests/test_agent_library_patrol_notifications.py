@@ -123,27 +123,29 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
         self.assertEqual(captured[0].actions, ())
 
     def test_delivery_keeps_actions_for_configured_telegram_agent(self):
-        values = {
-            "TG_AGENT_ENABLED": "1",
-            "TG_CHAT_ID": "-100",
-            "TG_AGENT_ALLOWED_USER_IDS": "200,201",
-        }
-        captured = []
-        with patch(
-            "app.modules.agent_library_patrol_notifications.get",
-            side_effect=lambda key, default="": values.get(key, default),
-        ), patch(
-            "app.modules.telegram_notification_center.publish_notification_event",
-            side_effect=lambda _key, event, **_kwargs: (
-                captured.append(event)
-                or NotificationPublishResult(True, delivered=True, status="sent")
-            ),
-        ):
-            self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
-        self.assertEqual(
-            [action.callback_data for action in captured[0].actions],
-            ["agp:summary", "agp:resources"],
-        )
+        # 按钮资格与 TG 准入共用 config.get_bool 的真值集合（含 y 与首尾空白）。
+        for enabled, expected in (("1", True), ("y", True), (" On ", True), ("0", False), ("", False)):
+            values = {
+                "TG_AGENT_ENABLED": enabled,
+                "TG_CHAT_ID": "-100",
+                "TG_AGENT_ALLOWED_USER_IDS": "200,201",
+            }
+            fake_get = lambda key, default="": values.get(key, default)  # noqa: E731
+            captured = []
+            with self.subTest(enabled=enabled), patch("app.config.get", side_effect=fake_get), patch(
+                "app.modules.agent_library_patrol_notifications.get", side_effect=fake_get,
+            ), patch(
+                "app.modules.telegram_notification_center.publish_notification_event",
+                side_effect=lambda _key, event, **_kwargs: (
+                    captured.append(event)
+                    or NotificationPublishResult(True, delivered=True, status="sent")
+                ),
+            ):
+                self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
+                self.assertEqual(
+                    [action.callback_data for action in captured[0].actions],
+                    ["agp:summary", "agp:resources"] if expected else [],
+                )
 
     def test_up_to_date_event_has_no_candidate_lines_or_actions(self):
         projection = _projection()

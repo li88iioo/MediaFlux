@@ -8,7 +8,7 @@ from dataclasses import replace
 from typing import Any
 
 from app.modules.library_patrol import validate_persisted_patrol_projection
-from app.config import get
+from app.config import get, get_bool
 from app.notifier import NotificationAction, NotificationEvent, TelegramSendResult
 
 _FINGERPRINT_SCHEMA_VERSION = 1
@@ -114,8 +114,7 @@ def build_library_patrol_event(projection: Any) -> NotificationEvent:
 
 
 def _patrol_actions_configured() -> bool:
-    enabled = (get("TG_AGENT_ENABLED", "0") or "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    if not get_bool("TG_AGENT_ENABLED", False):
         return False
     chat_id = (get("TG_CHAT_ID", "") or "").strip()
     if not _ALLOWED_TELEGRAM_ID_RE.fullmatch(chat_id):
