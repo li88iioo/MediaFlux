@@ -7,6 +7,38 @@ from dataclasses import dataclass
 _INVALID_NAME = re.compile(r'[\\/:*?"<>|]')
 _TOKEN = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]*)\}|\{([A-Za-z][A-Za-z0-9_]*)\}")
 
+
+def movie_part_position(value: str, *, title: str = "", metadata: dict | None = None) -> tuple[int | None, bool]:
+    """返回分片编号和歧义标记；原名/别名或发行信息才可证明 Part/PT 的边界。"""
+    title_matched = 0
+    metadata = metadata or {}
+    titles = [title, metadata.get("original_title"), metadata.get("original_name"), *(metadata.get("aliases") or [])]
+    for title in sorted((name for name in titles if isinstance(name, str) and name.strip()), key=len, reverse=True):
+        words = [word for word in re.split(r"[\W_]+", title) if word]
+        if not words:
+            continue
+        pattern = r"[\W_]+".join(re.escape(word) for word in words)
+        value, title_matched = re.subn(rf"^{pattern}(?=$|[\W_])", "", value, count=1, flags=re.IGNORECASE)
+        if title_matched:
+            break
+    years = list(re.finditer(r"(?<!\d)(?:19|20)\d{2}(?!\d)", value))
+    markers = list(re.finditer(r"(?i)\{tmdb-\d+\}", value))
+    boundary = years[-1].end() if years else markers[-1].end() if markers else 0
+    matches = list(re.finditer(
+        r"(?i)(?:^|[._ \-])(?P<label>CD|DISC|DISK|PART|PT)[._ \-]*(?P<part>\d{1,2})(?=$|[._ \-])",
+        value or "",
+    ))
+    eligible = [match for match in matches if match.group("label").upper() not in {"PART", "PT"}
+               or (boundary and match.start() >= boundary) or (not years and title_matched)]
+    if not eligible:
+        return None, bool(matches and not years and not title_matched)
+    indices = {int(match.group("part")) for match in eligible}
+    if len(indices) != 1:
+        return None, True
+    index = indices.pop()
+    return (index, False) if 1 <= index <= 99 else (None, True)
+
+
 MOVIE_DEFAULT = "${showTitle}${yearDotSuffix}${mediaInfoDotSuffix}.${ext}"
 TV_DEFAULT = "${showTitle}${yearDotSuffix}.${seasonEpisode}${mediaInfoSuffix}.${ext}"
 MOVIE_DIR_DEFAULT = "${showTitle}${yearSuffix} ${identityTag}"

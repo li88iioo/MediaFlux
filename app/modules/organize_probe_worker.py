@@ -175,7 +175,7 @@ class OrganizeProbeWorker:
     def _desired_plan(
         self, job: dict, log: dict, video: dict, remote: GuangYaFile, profile,
     ):
-        from app.modules.nsfw import extract_nsfw_part_index
+        from app.modules.naming import movie_part_position
         from app.modules.organize import OrganizePlan, Organizer
         from app.modules.scraper import MatchResult
 
@@ -208,8 +208,8 @@ class OrganizeProbeWorker:
         # 前台已将 part/CD 统一为归档名中的 CDn；仅恢复已验证的视频名
         # 中的身份，不重新识别标题，也不让规格补全吞掉分片。
         part = (
-            extract_nsfw_part_index(remote.name)
-            if organizer._match_provider(match) in {"metatube", "clean_title"} else None
+            movie_part_position(remote.name, title=match.title)[0]
+            if match.media_type == "movie" else None
         )
         organizer._apply_media_profile_to_move_plan(
             plan, remote, rules, match,

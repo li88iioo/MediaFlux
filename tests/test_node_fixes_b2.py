@@ -12,7 +12,7 @@ from app import database as db
 from app.repositories import organize_probe as organize_probe_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.media_probe import MediaProfile
-from app.modules.nsfw import extract_nsfw_part_index
+from app.modules.naming import movie_part_position
 from app.modules.organize import (
     OrganizePlan,
     Organizer,
@@ -29,7 +29,7 @@ class ProbePreservesMultipart(IsolatedDatabaseTestCase):
     def test_background_probe_preserves_initially_planned_part_marker(self):
         for provider, original_name, part in (
             (provider, name, part)
-            for provider in ("metatube", "clean_title")
+            for provider in ("metatube", "clean_title", "tmdb")
             for name, part in (
                 ("ABC-123.CD1.mp4", 1),
                 ("ABC-123.part2.mp4", 2),
@@ -71,7 +71,7 @@ class ProbePreservesMultipart(IsolatedDatabaseTestCase):
                     {"season": None, "episode": None, "part": part},
                     None,
                 )
-                self.assertEqual(extract_nsfw_part_index(initial.new_name), part)
+                self.assertEqual(movie_part_position(initial.new_name)[0], part)
                 current = GuangYaFile(
                     original.file_id,
                     initial.new_name,
@@ -178,7 +178,7 @@ class ProbePreservesMultipart(IsolatedDatabaseTestCase):
                         "queue_status": job["status"],
                     }
                 )
-                self.assertEqual(extract_nsfw_part_index(after), part)
+                self.assertEqual(movie_part_position(after)[0], part)
                 expected = replace(initial)
                 organizer._apply_media_profile_to_move_plan(
                     expected,

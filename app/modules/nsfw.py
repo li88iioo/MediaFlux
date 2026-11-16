@@ -376,18 +376,6 @@ def extract_nsfw_multipart(value: str, strip_domains: str = "") -> NsfwMultipart
     return None
 
 
-def extract_nsfw_part_index(value: str) -> int | None:
-    """从已归档名称读取 ``CDn`` 分段，用于目标目录冲突判定。"""
-    matches = list(re.finditer(
-        r"(?i)(?:^|[._ \-])CD(\d{1,2})(?=$|[._ \-])",
-        (value or ""),
-    ))
-    if not matches:
-        return None
-    index = int(matches[-1].group(1))
-    return index if 1 <= index <= 99 else None
-
-
 def clean_nsfw_archive_title(value: str, strip_domains: str = "") -> str:
     """生成无元数据时可直接归档的安全标题。
 

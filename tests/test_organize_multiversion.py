@@ -642,6 +642,112 @@ class _VersionedTvVariantTreeClient(_TvVariantTreeClient):
 
 
 class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
+    def test_yearless_movie_parts_use_original_title_or_remain_manual(self):
+        for metadata, should_move in (({"original_title": "A Movie"}, True), ({"aliases": ["A Movie"]}, True), ({}, False)):
+            with self.subTest(metadata=metadata):
+                first = GuangYaFile("cd1", "A.Movie.Part1.mkv", False, 1000, "part1", "source")
+                second = GuangYaFile("cd2", "A.Movie.Part2.mkv", False, 900, "part2", "source")
+                client = _VariantTreeClient(first, second)
+                client.tree["movie"] = []
+                second.parent_id = "source"
+                client.tree["source"].append(second)
+                for part in (1, 2):
+                    client.tree["source"].append(GuangYaFile(
+                        f"sub{part}", f"A.Movie.Part{part}.zh.srt", False, 50, f"sub{part}", "source",
+                    ))
+                scraper = _VariantScraper()
+                scraper.match_result = MatchResult(
+                    tmdb_id="123", title="一部电影", year="2026", media_type="movie", confidence=1.0, metadata=metadata,
+                )
+                organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, scraper))
+                self.addCleanup(organizer.close)
+                with patch("app.modules.media_probe.probe_media_profiles_batch", return_value={}):
+                    plans, stats = organizer.organize(
+                        "source", self._rules(recycle_duplicates_enabled=True), dry_run=False, post_actions=False,
+                    )
+                self.assertEqual(client.deleted, [])
+                self.assertEqual(stats["duplicate_recycled"], 0)
+                if should_move:
+                    self.assertEqual((stats["moved"], stats["need_confirm"]), (2, 0))
+                    self.assertEqual([plan.multipart_index for plan in plans], [1, 2])
+                    for part in (1, 2):
+                        self.assertEqual(client._find(f"cd{part}")[1].name, f"一部电影.2026.CD{part}.mkv")
+                        self.assertEqual(client._find(f"sub{part}")[1].name, f"一部电影.2026.CD{part}.zh.srt")
+                        self.assertEqual(client._find(f"cd{part}")[0], client._find(f"sub{part}")[0])
+                else:
+                    self.assertEqual((stats["moved"], stats["need_confirm"]), (0, 2))
+                    self.assertTrue(all(plan.action == "skip" and plan.match.need_confirm for plan in plans))
+                    self.assertEqual(len(client.tree["source"]), 4)
+                    self.assertEqual(client.moves, [])
+
+    def test_localized_movie_title_does_not_turn_original_part_title_into_a_segment(self):
+        for year_suffix, suffix, part in ((".2010", "", None), ("", "", None), (".2010", ".CD2", 2), (".2010", ".Part.2", 2)):
+            with self.subTest(year_suffix=year_suffix, suffix=suffix):
+                name = f"Harry.Potter.and.the.Deathly.Hallows.Part.1{year_suffix}{suffix}.mkv"
+                incoming = GuangYaFile("video", name, False, 1000, "video-etag", "source")
+                client = _VariantTreeClient(incoming, GuangYaFile("unused", "unused.mkv", False, 1))
+                client.tree["movie"] = []
+                subtitle = GuangYaFile("subtitle", name[:-4] + ".zh.srt", False, 50, "subtitle-etag", "source")
+                client.tree["source"].append(subtitle)
+                scraper = _VariantScraper()
+                scraper.match_result = MatchResult(
+                    tmdb_id="123", title="哈利·波特与死亡圣器（上）", year="2010", media_type="movie",
+                    confidence=1.0, metadata={"original_title": "Harry Potter and the Deathly Hallows: Part 1"},
+                )
+                organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, scraper))
+                self.addCleanup(organizer.close)
+                with patch("app.modules.media_probe.probe_media_profiles_batch", return_value={}):
+                    plans, stats = organizer.organize(
+                        "source", self._rules(recycle_duplicates_enabled=True), dry_run=False, post_actions=False,
+                    )
+                self.assertEqual(plans[0].multipart_index, part)
+                expected = f"哈利·波特与死亡圣器（上）.2010{'.CD2' if part else ''}"
+                self.assertEqual(client._find("video")[1].name, expected + ".mkv")
+                self.assertEqual(client._find("subtitle")[1].name, expected + ".zh.srt")
+                self.assertEqual(client._find("video")[0], client._find("subtitle")[0])
+                self.assertEqual((stats["moved"], stats["metadata_moved"], stats["duplicate_recycled"]), (1, 1, 0))
+
+    def test_movie_cd_parts_move_without_recycling_each_other(self):
+        first = GuangYaFile("cd1", "Variant.Movie.2026.CD1.mkv", False, 1000, "part1", "source")
+        second = GuangYaFile("cd2", "Variant.Movie.2026.CD2.mkv", False, 900, "part2", "source")
+        client = _VariantTreeClient(first, second)
+        client.tree["movie"] = []
+        second.parent_id = "source"
+        client.tree["source"].append(second)
+        organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _VariantScraper()))
+        self.addCleanup(organizer.close)
+        rules = self._rules(conflict_strategy=1, recycle_duplicates_enabled=True)
+        with patch("app.modules.media_probe.probe_media_profiles_batch", return_value={}):
+            preview, _ = organizer.organize("source", rules, dry_run=True, post_actions=False)
+            self.assertEqual([plan.action for plan in preview], ["move", "move"])
+            self.assertEqual([plan.multipart_index for plan in preview], [1, 2])
+            before = db.latest_organize_log_id()
+            _, stats = organizer.organize("source", rules, dry_run=False, post_actions=False)
+        self.assertEqual((stats["moved"], stats["failed"], stats["duplicate_recycled"]), (2, 0, 0))
+        self.assertEqual(client.deleted, [])
+        self.assertEqual({item.name for item in client.tree["movie"]}, {
+            "Variant Movie.2026.CD1.mkv", "Variant Movie.2026.CD2.mkv",
+        })
+        self.assertEqual([row["status"] for row in db.list_organize_logs_after(before)], ["success", "success"])
+
+    def test_duplicate_copy_only_competes_with_its_movie_part(self):
+        first = GuangYaFile("cd1", "Variant.Movie.2026.CD1.mkv", False, 1000, "part1", "source")
+        copy = GuangYaFile("copy", "Variant.Movie.2026.CD1.mp4", False, 2000, "copy", "source")
+        second = GuangYaFile("cd2", "Variant.Movie.2026.CD2.mkv", False, 900, "part2", "source")
+        client = _VariantTreeClient(first, second)
+        client.tree["movie"] = []
+        second.parent_id = "source"
+        client.tree["source"].extend([copy, second])
+        organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, _VariantScraper()))
+        self.addCleanup(organizer.close)
+        with patch("app.modules.media_probe.probe_media_profiles_batch", return_value={}):
+            _, stats = organizer.organize(
+                "source", self._rules(recycle_duplicates_enabled=True), dry_run=False, post_actions=False,
+            )
+        self.assertEqual((stats["moved"], stats["failed"], stats["duplicate_recycled"]), (2, 0, 1))
+        self.assertEqual(client.deleted, ["cd1"])
+        self.assertEqual({item.file_id for item in client.tree["movie"]}, {"copy", "cd2"})
+
     def test_historical_identity_is_not_lost_behind_large_audit_history(self):
         from app import database as db
 

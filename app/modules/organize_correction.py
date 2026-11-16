@@ -599,6 +599,12 @@ class OrganizeCorrectionService:
             source_values=(video.original_name, video.current_name, parent_path),
         )
         parsed = self.organizer._parse_media_fields(source_name)
+        if match.media_type == "movie" and not rules.nsfw_exclusive:
+            from app.modules.naming import movie_part_position
+
+            parsed["part"], ambiguous = movie_part_position(source_name, title=match.title, metadata=match.metadata)
+            if ambiguous:
+                raise ValueError("文件分片顺序无法确认，请先核对原名并明确 CD 编号")
         if rules.nsfw_exclusive:
             from app.modules.nsfw import extract_nsfw_multipart
             multipart = extract_nsfw_multipart(

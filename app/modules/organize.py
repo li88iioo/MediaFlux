@@ -1197,7 +1197,7 @@ class Organizer:
         configured_template = rules.tv_template if is_tv else rules.movie_template
 
         def with_part_marker(rendered: str) -> str:
-            if self._match_provider(match) not in {"metatube", "clean_title"}:
+            if match.media_type != "movie":
                 return rendered
             part = parsed.get("part")
             try:
@@ -1206,8 +1206,8 @@ class Organizer:
                 part_index = None
             if part_index is None or not (1 <= part_index <= 99):
                 return rendered
-            from app.modules.nsfw import extract_nsfw_part_index
-            if extract_nsfw_part_index(rendered) == part_index:
+            from app.modules.naming import movie_part_position
+            if movie_part_position(rendered, title=title)[0] == part_index:
                 return rendered
             stem, separator, suffix = rendered.rpartition(".")
             # 年份为空的自定义模板可能在扩展名前留下连续点号；插入 CD 标记时
@@ -5963,6 +5963,12 @@ class Organizer:
                 plan.multipart_ambiguous = multipart.ambiguous
             if plan.multipart_index is not None:
                 parsed["part"] = plan.multipart_index
+        elif match.media_type == "movie":
+            from app.modules.naming import movie_part_position
+
+            parsed["part"], plan.multipart_ambiguous = movie_part_position(
+                file.name, title=match.title, metadata=match.metadata,
+            )
         source_season = release_parse.source_season
         source_episode = release_parse.source_episode
         if source_position_override is not None:
@@ -5993,6 +5999,12 @@ class Organizer:
             effective_parsed_override=effective_parsed_override,
             source_position_override=source_position_override,
         )
+        if match.media_type == "movie" and not rules.nsfw_exclusive and plan.multipart_ambiguous:
+            plan.require_confirmation(
+                "文件含 Part/PT 分片标记，但无法确认原名边界；请核对并明确标为 CD1/CD2 后重新整理",
+                constraint="movie_multipart_ambiguous",
+            )
+            return None
         parsed_season = safe_int(parsed.get("season"), None, minimum=0)
         parsed_episode = safe_int(parsed.get("episode"), None, minimum=0)
         source_season_value = safe_int(source_season, None, minimum=0)
@@ -6719,11 +6731,21 @@ class Organizer:
             )
             if auxiliary:
                 return False
+            from app.modules.naming import movie_part_position
+
+            candidate_part, ambiguous = movie_part_position(candidate.name, title=title, metadata=plan.match.metadata)
+            if ambiguous or plan.multipart_ambiguous:
+                return False
+            incoming_part = plan.multipart_index
+            if incoming_part is None:
+                incoming_part, ambiguous = movie_part_position(
+                    plan.new_name or plan.original_name, title=title, metadata=plan.match.metadata,
+                )
+                if ambiguous:
+                    return False
+            if incoming_part != candidate_part:
+                return False
             if self._match_provider(plan.match) in {"metatube", "clean_title"}:
-                from app.modules.nsfw import extract_nsfw_part_index
-                candidate_part = extract_nsfw_part_index(candidate.name)
-                if plan.multipart_index is not None or candidate_part is not None:
-                    return plan.multipart_index == candidate_part
                 # 成人媒体目录已由 provider + 番号身份隔离；目录内未分段视频
                 # 视为同一作品的版本候选，继续沿用现有冲突策略。
                 return True

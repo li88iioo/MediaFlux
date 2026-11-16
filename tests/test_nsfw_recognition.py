@@ -26,7 +26,7 @@ from app.repositories import local_media as local_media_repo
 from app.clients.guangya import GuangYaFile
 from app.modules.directory_scrape import DirectoryScrapeService, FixedMatchScraper
 from app.modules.local_media_service import LocalMediaService
-from app.modules.naming import build_context
+from app.modules.naming import build_context, movie_part_position
 from app.modules.nsfw import (
     MetaTubeClient,
     MetaTubeError,
@@ -38,7 +38,6 @@ from app.modules.nsfw import (
     clear_nsfw_cache,
     extract_nsfw_identifier,
     extract_nsfw_multipart,
-    extract_nsfw_part_index,
     validate_category_name,
 )
 from app.modules.organize import (
@@ -682,7 +681,7 @@ class NsfwMultipartAndFallbackTests(unittest.TestCase):
         assert ambiguous is not None
         self.assertTrue(ambiguous.ambiguous)
         self.assertIsNone(ambiguous.part_index)
-        self.assertEqual(extract_nsfw_part_index("FJIN-140.CD2.mkv"), 2)
+        self.assertEqual(movie_part_position("FJIN-140.CD2.mkv")[0], 2)
 
     def test_numeric_prefix_multipart_and_cleaning_reuse_shared_chain(self):
         part = extract_nsfw_multipart("300MIUM-1474-CD2.mp4")
@@ -712,7 +711,7 @@ class NsfwMultipartAndFallbackTests(unittest.TestCase):
         self.assertEqual(candidate["external_id"], "ATID-675")
         self.assertEqual(candidate["title"], "ATID-675")
 
-    def test_adult_part_marker_is_inserted_without_affecting_tmdb(self):
+    def test_movie_part_marker_is_shared_without_guessing_unlabelled_numbers(self):
         organizer = Organizer(client=cast(GuangYaClient, object()), scraper=TMDBScraper())
         file = GuangYaFile("f1", "FJIN-140-1.mp4", False, 1, "e", "p")
         rules = OrganizeRules(naming_scope="both")
@@ -728,9 +727,10 @@ class NsfwMultipartAndFallbackTests(unittest.TestCase):
             organizer.build_new_name(adult, file, {"part": 1}, rules),
             "FJIN-140.CD1.mp4",
         )
-        self.assertNotIn(".CD1.", organizer.build_new_name(
+        self.assertIn(".CD1.", organizer.build_new_name(
             ordinary, file, {"part": 1}, rules,
         ))
+        self.assertNotIn(".CD1.", organizer.build_new_name(ordinary, file, {}, rules))
 
     def test_ambiguous_multipart_group_requires_manual_confirmation(self):
         organizer = Organizer(client=cast(GuangYaClient, object()), scraper=TMDBScraper())
