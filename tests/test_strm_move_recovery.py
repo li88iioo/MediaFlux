@@ -271,6 +271,8 @@ class StrmMoveRecoveryTests(unittest.TestCase):
                         self.assertEqual(len(strm_repo.list_strm_index("guangya:source")), 1)
 
     def test_metadata_update_finds_relative_target_owner_and_rolls_back_original_index(self):
+        from tests.test_strm_metadata_queue import _TreeClient
+
         for relative in (False, True):
             for conflict in (False, True):
                 with self.subTest(relative=relative, conflict=conflict), isolated_test_database(), tempfile.TemporaryDirectory() as root:
@@ -283,6 +285,13 @@ class StrmMoveRecoveryTests(unittest.TestCase):
                         "old-etag", 12, file.name, stored, strm._content_fingerprint(target))
                     original = dict(strm_repo.list_strm_index("guangya-meta:source")[0])
                     db.init_db()
+                    client = _TreeClient({"source": [GuangYaFile("series", "New", True, parent_id="source")], "series": [file]})
+                    stats = strm.sync_strm("source", BASE_URL, root, client=cast(GuangYaClient, client),
+                                          metadata_exts={"nfo"}, refresh_policy=StrmRefreshPolicy(enabled=False))
+                    self.assertEqual(stats["metadata_queued"], 1, stats)
+                    self.assertEqual(stats["metadata_cleaned"], 0, stats)
+                    self.assertEqual(target.read_bytes(), b"old metadata")
+                    self.assertEqual(dict(strm_repo.list_strm_index("guangya-meta:source")[0]), original)
                     job = {"file_id": file.file_id, "source_id": "source", "rel_dir": "New", "refresh_policy": {"enabled": False}}
                     for fail in (True, False):
                         temp = target.with_suffix(".prepared")

@@ -2860,10 +2860,8 @@ def _sync_strm_impl(
                     metadata_cleanup_ids = set(metadata_seen_ids)
                     if pending_metadata_targets:
                         metadata_cleanup_ids.update(
-                            str(row["file_id"])
-                            for row in existing_metadata_rows
-                            if str(row["strm_path"] or "")
-                            in pending_metadata_targets
+                            file_id for path in pending_metadata_targets
+                            for file_id in metadata_rows_by_path.get(path, {})
                         )
                     metadata_cleanup = clean_invalid_strm(
                         strm_root,
