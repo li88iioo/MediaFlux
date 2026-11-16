@@ -119,7 +119,6 @@ _MEDIA_SERVER_REFRESH_KEYS = {
 }
 _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_LLM_PROTOCOL": "auto",
-    "AGENT_LLM_TIMEOUT_SECONDS": "12",
     "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "128000",
     "AGENT_LLM_GENERATION_PROFILES": "[]",
     "AGENT_LLM_BUDGET_PROFILES": "[]",
@@ -512,7 +511,7 @@ def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
         normalized["AGENT_LLM_REASONING_EFFORT"] = effort
 
     limits = {
-        "AGENT_LLM_TIMEOUT_SECONDS": (2, 120),
+        "AGENT_LLM_TIMEOUT_SECONDS": INT_SETTING_BOUNDS["AGENT_LLM_TIMEOUT_SECONDS"][1:],
         "AGENT_LLM_CONTEXT_WINDOW_TOKENS": (16_384, 2_000_000),
     }
     for key, (minimum, maximum) in limits.items():

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Body, Path, Query, Request
 from fastapi.responses import Response
 
 from app import config
+from app.defaults import INT_SETTING_BOUNDS
 from app.repositories import recognition as recognition_repo
 from app.concurrency import run_awaitable_sync
 from app.agent.model_catalog import fetch_ai_models
@@ -1014,18 +1015,20 @@ def _normalize_tmdb_api_url(raw_value: object) -> str:
 
 
 def _ai_model_test_timeout(raw_value: Any) -> int:
+    _, minimum, maximum = INT_SETTING_BOUNDS["AGENT_LLM_TIMEOUT_SECONDS"]
+    invalid = f"请求超时必须是 {minimum}–{maximum} 秒的整数"
     if isinstance(raw_value, bool):
-        raise ValueError("请求超时必须是 2–120 秒的整数")
+        raise ValueError(invalid)
     if isinstance(raw_value, float) and not raw_value.is_integer():
-        raise ValueError("请求超时必须是 2–120 秒的整数")
+        raise ValueError(invalid)
     if isinstance(raw_value, str) and not re.fullmatch(r"\d+", raw_value.strip()):
-        raise ValueError("请求超时必须是 2–120 秒的整数")
+        raise ValueError(invalid)
     try:
         timeout_seconds = int(raw_value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("请求超时必须是 2–120 秒的整数") from exc
-    if not 2 <= timeout_seconds <= 120:
-        raise ValueError("请求超时必须在 2–120 秒之间")
+        raise ValueError(invalid) from exc
+    if not minimum <= timeout_seconds <= maximum:
+        raise ValueError(f"请求超时必须在 {minimum}–{maximum} 秒之间")
     return timeout_seconds
 
 
@@ -1365,7 +1368,7 @@ def ai_model_test(request: Request, data: dict | None = Body(default=None)):
     timeout_raw = (
         data.get("timeout_seconds")
         if "timeout_seconds" in data
-        else config.get_int("AGENT_LLM_TIMEOUT_SECONDS", 12)
+        else config.get_int_setting("AGENT_LLM_TIMEOUT_SECONDS")
     )
     reasoning_effort = str(
         data.get("reasoning_effort")

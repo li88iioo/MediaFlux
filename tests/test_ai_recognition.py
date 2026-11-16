@@ -653,9 +653,9 @@ class AIFallbackPipelineTests(IsolatedDatabaseTestCase):
             "AGENT_LLM_MODEL": "shared-model",
             "AGENT_LLM_TIMEOUT_SECONDS": "9",
         }
-        with patch(
-            "app.modules.scraper.get",
-            side_effect=lambda key, default="": values.get(key, default),
+        fake_get = lambda key, default="": values.get(key, default)  # noqa: E731
+        with patch("app.modules.scraper.get", side_effect=fake_get), patch(
+            "app.config.get", side_effect=fake_get,
         ):
             provider = TMDBScraper._ai_provider_settings()
 
@@ -670,7 +670,7 @@ class AIFallbackPipelineTests(IsolatedDatabaseTestCase):
     def test_ai_provider_is_disabled_without_media_agent_connection(self):
         from app.modules.scraper import TMDBScraper
 
-        with patch("app.modules.scraper.get", return_value=""):
+        with patch("app.modules.scraper.get", return_value=""), patch("app.config.get", return_value=""):
             provider = TMDBScraper._ai_provider_settings()
 
         self.assertEqual(provider, ("", "", "", 12, "auto"))

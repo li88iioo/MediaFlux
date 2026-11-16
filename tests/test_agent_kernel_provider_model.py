@@ -17,7 +17,7 @@ from app.agent.kernel.provider_model import (
     ModelProviderError,
     OpenAICompatibleModelAdapter,
     ProviderSettings,
-    _network_idle_timeout_seconds,
+    network_idle_timeout_seconds,
     _stream_deadline_seconds,
     iter_protocol_model_events,
 )
@@ -438,10 +438,10 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0].text, "recovered")
 
     def test_network_idle_timeout_has_model_safe_floor_and_upper_bound(self) -> None:
-        self.assertEqual(_network_idle_timeout_seconds(2), 30)
-        self.assertEqual(_network_idle_timeout_seconds(30), 30)
-        self.assertEqual(_network_idle_timeout_seconds(90), 90)
-        self.assertEqual(_network_idle_timeout_seconds(240), 120)
+        self.assertEqual(network_idle_timeout_seconds(2), 30)
+        self.assertEqual(network_idle_timeout_seconds(30), 30)
+        self.assertEqual(network_idle_timeout_seconds(90), 90)
+        self.assertEqual(network_idle_timeout_seconds(240), 120)
 
     def test_provider_settings_accepts_2_to_120_second_timeout_range(self) -> None:
         for timeout_seconds in (2, 12, 30, 120):
@@ -469,10 +469,10 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_stream_deadline_seconds(30), 120)
         self.assertEqual(_stream_deadline_seconds(120), 300)
         self.assertEqual(
-            _stream_deadline_seconds(_network_idle_timeout_seconds(2)), 120
+            _stream_deadline_seconds(network_idle_timeout_seconds(2)), 120
         )
         self.assertEqual(
-            _stream_deadline_seconds(_network_idle_timeout_seconds(120)), 300
+            _stream_deadline_seconds(network_idle_timeout_seconds(120)), 300
         )
 
     async def test_chat_stream_rejects_eof_after_stop_without_done(self) -> None:

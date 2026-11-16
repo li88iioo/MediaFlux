@@ -38,7 +38,7 @@ from app.clients.openai_compatible import (
     resolve_protocol,
 )
 from app.clients.tmdb import TMDBClient, close_tmdb_client
-from app.config import get, get_bool
+from app.config import get, get_bool, get_int_setting
 from app.defaults import AI_RECOGNITION_CONFIDENCE_BOUNDS
 from app.discovery.models import (
     ProviderRateLimited,
@@ -6463,14 +6463,6 @@ class TMDBScraper:
         return max(minimum, min(value, maximum))
 
     @staticmethod
-    def _ai_timeout_seconds() -> int:
-        try:
-            value = int(get("AGENT_LLM_TIMEOUT_SECONDS", "12") or 12)
-        except (TypeError, ValueError):
-            value = 12
-        return max(2, min(value, 30))
-
-    @staticmethod
     def _shared_ai_endpoint_is_valid(api_url: str) -> bool:
         """复用 Media Agent 管理员配置的模型端点。"""
         try:
@@ -6489,10 +6481,10 @@ class TMDBScraper:
                 agent_url,
                 agent_model,
                 (get("AGENT_LLM_API_KEY", "") or ""),
-                cls._ai_timeout_seconds(),
+                get_int_setting("AGENT_LLM_TIMEOUT_SECONDS"),
                 resolve_protocol(get("AGENT_LLM_PROTOCOL", "auto"), agent_url),
             )
-        return "", "", "", cls._ai_timeout_seconds(), "auto"
+        return "", "", "", get_int_setting("AGENT_LLM_TIMEOUT_SECONDS"), "auto"
 
     @staticmethod
     def _ai_client_fingerprint(client_key: AIClientKey) -> str:

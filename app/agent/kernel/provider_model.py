@@ -16,6 +16,7 @@ from app.agent.feature_gate import is_agent_llm_enabled
 from app.agent.model_catalog import provider_channel_fingerprint
 from app.agent.model_context_budget import conservative_tokens
 from app.clients.http import FixedHostHttpClient
+from app.defaults import INT_SETTING_BOUNDS
 from app.clients.openai_compatible import (
     PROTOCOL_FALLBACK_MAX_BYTES,
     PROTOCOL_FALLBACK_STATUS_CODES,
@@ -139,7 +140,7 @@ _RETRYABLE_MODEL_STATUS_CODES = frozenset({408, 425, 500, 502, 503, 504})
 _MODEL_RETRY_DELAY_SECONDS = 0.25
 
 
-def _network_idle_timeout_seconds(configured_timeout_seconds: int) -> int:
+def network_idle_timeout_seconds(configured_timeout_seconds: int) -> int:
     """将配置值映射为网络空闲预算：保留 30 秒下限，并限制在 120 秒内。"""
     return min(
         120, max(_MODEL_IDLE_TIMEOUT_FLOOR_SECONDS, configured_timeout_seconds)
@@ -175,7 +176,7 @@ class ProviderSettings:
     model: str
     api_key: str = ""
     protocol: str = "auto"
-    timeout_seconds: int = 30
+    timeout_seconds: int = INT_SETTING_BOUNDS["AGENT_LLM_TIMEOUT_SECONDS"][0]
     max_response_bytes: int = 2 * 1024 * 1024
     generation_profiles_json: str = ""
     telegram_channel: str = ""
@@ -192,7 +193,8 @@ class ProviderSettings:
             raise ValueError("api_url is required")
         if not (self.model or "").strip() or len(self.model) > 200:
             raise ValueError("model is invalid")
-        if not 2 <= self.timeout_seconds <= 120:
+        _, minimum, maximum = INT_SETTING_BOUNDS["AGENT_LLM_TIMEOUT_SECONDS"]
+        if not minimum <= self.timeout_seconds <= maximum:
             raise ValueError("timeout_seconds out of range")
 
     @classmethod
@@ -207,10 +209,6 @@ class ProviderSettings:
         ))
         effort = (values.get("AGENT_LLM_REASONING_EFFORT", "") or "").strip().lower()
         try:
-            timeout = int(values["AGENT_LLM_TIMEOUT_SECONDS"] or 30)
-        except ValueError:
-            timeout = 30
-        try:
             context = int(values["AGENT_LLM_CONTEXT_WINDOW_TOKENS"] or 128_000)
         except ValueError:
             context = 128_000
@@ -220,7 +218,7 @@ class ProviderSettings:
             model=(values.get("AGENT_LLM_MODEL", "") or "").strip(),
             api_key=(values.get("AGENT_LLM_API_KEY", "") or "").strip(),
             protocol=(values.get("AGENT_LLM_PROTOCOL", "auto") or "auto").strip(),
-            timeout_seconds=max(2, min(120, timeout)),
+            timeout_seconds=config.int_setting_value("AGENT_LLM_TIMEOUT_SECONDS", values["AGENT_LLM_TIMEOUT_SECONDS"]),
             telegram_channel=provider_channel_fingerprint(values),
             context_window_tokens=max(16_384, min(2_000_000, context)),
             budget_profiles_json=values["AGENT_LLM_BUDGET_PROFILES"],
@@ -818,7 +816,7 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
             if bound_protocols:
                 # 原生组只能由其原协议续传，不能剥离私有状态后重放工具历史。
                 configured = next(iter(bound_protocols))
-        network_idle_timeout = _network_idle_timeout_seconds(
+        network_idle_timeout = network_idle_timeout_seconds(
             self.settings.timeout_seconds
         )
         client = self.client_factory(

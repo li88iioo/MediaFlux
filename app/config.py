@@ -179,9 +179,19 @@ def get_int_clamped(key: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(get_int(key, default), maximum))
 
 
+def int_setting_value(key: str, raw: str) -> int:
+    """按 INT_SETTING_BOUNDS 解析已读取的原始值；空/非法回退默认，越界截断。"""
+    default, minimum, maximum = INT_SETTING_BOUNDS[key]
+    try:
+        value = int(raw or default)
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
 def get_int_setting(key: str) -> int:
     """按 INT_SETTING_BOUNDS 读取已登记的整数设置。"""
-    return get_int_clamped(key, *INT_SETTING_BOUNDS[key])
+    return int_setting_value(key, get(key))
 
 
 def get_bool(key: str, default: bool | None = None) -> bool:

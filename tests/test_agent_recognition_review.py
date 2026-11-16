@@ -184,6 +184,32 @@ class RecognitionReviewKernelTests(IsolatedDatabaseTestCase):
         model.assert_not_called()
         scraper.assert_not_called()
 
+    def test_review_deadline_covers_two_actual_model_network_waits(self) -> None:
+        # 网络空闲等待不低于 30 秒，复核 deadline 按实际等待计算，最长 90 秒。
+        real_wait_for = asyncio.wait_for
+        for configured, deadline in ((2, 70), (12, 70), (30, 70), (35, 80), (120, 90)):
+            captured = []
+
+            async def record(awaitable, timeout):
+                if getattr(getattr(awaitable, "cr_code", None), "co_name", "") == "consume":
+                    captured.append(timeout)
+                return await real_wait_for(awaitable, timeout)
+
+            settings = SimpleNamespace(model="test-model", timeout_seconds=configured)
+            with self.subTest(configured=configured), patch(
+                "app.modules.agent_recognition_review.ProviderSettings.from_config",
+                return_value=settings,
+            ), patch(
+                "app.modules.agent_recognition_review.OpenAICompatibleModelAdapter",
+                return_value=_approval_model(),
+            ), patch(
+                "app.modules.agent_recognition_review.TMDBScraper",
+                return_value=_FakeScraper(),
+            ), patch("app.modules.agent_recognition_review.asyncio.wait_for", side_effect=record):
+                decision = asyncio.run(_review_async(_review_payload()))
+                self.assertTrue(decision.approved)
+                self.assertEqual(captured, [deadline])
+
     def test_internal_kernel_approves_only_after_read_evidence(self) -> None:
         model = _approval_model()
         scraper = _FakeScraper()

@@ -51,6 +51,8 @@ INT_SETTING_BOUNDS: dict[str, tuple[int, int, int]] = {
     "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT": (20, 1, 100_000),
     # 索引器下载候选的有效期；TG 会话与订阅候选各自再留余量。
     "INDEXER_RESULT_TTL_SECONDS": (600, 60, 3600),
+    # 模型单次请求超时：Agent、AI 辅助识别与连接测试共用。
+    "AGENT_LLM_TIMEOUT_SECONDS": (12, 2, 120),
 }
 AI_RECOGNITION_CONFIDENCE_BOUNDS = (0.8, 0.5, 0.99)
 DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS = 0

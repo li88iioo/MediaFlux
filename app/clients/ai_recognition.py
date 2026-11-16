@@ -16,6 +16,7 @@ from app.concurrency import (
     run_awaitable_sync,
 )
 from app.clients.http import FixedHostHttpClient, HttpError
+from app.defaults import INT_SETTING_BOUNDS
 from app.clients.openai_compatible import (
     PROTOCOLS,
     SUPPORTED_PROTOCOLS_TEXT,
@@ -301,7 +302,7 @@ class AIRecognitionClient:
         model: str,
         api_key: str = "",
         protocol: str | None = None,
-        timeout_seconds: int = 15,
+        timeout_seconds: int = INT_SETTING_BOUNDS["AGENT_LLM_TIMEOUT_SECONDS"][0],
         proxy_url: str = "",
         session: requests.Session | Any | None = None,
     ) -> None:
@@ -326,7 +327,7 @@ class AIRecognitionClient:
         if not self.model or len(self.model) > 200:
             raise AIRecognitionError("未配置有效的 AI 模型")
         self.api_key = (api_key or "").strip()
-        self.timeout_seconds = max(2, min((timeout_seconds or 15), 60))
+        self.timeout_seconds = timeout_seconds
         # 注入 Session 仅作为测试缝；生产请求统一走管理员配置的固定端点客户端。
         self.session = session
         if session is not None:

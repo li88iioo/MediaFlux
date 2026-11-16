@@ -32,6 +32,7 @@ from app.agent.kernel.projection import DefaultProjector
 from app.agent.kernel.provider_model import (
     OpenAICompatibleModelAdapter,
     ProviderSettings,
+    network_idle_timeout_seconds,
 )
 from app.agent.kernel.session import SessionLimits
 from app.logger import get_logger
@@ -766,7 +767,8 @@ async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
             session_id=f"review-{secrets.token_urlsafe(10)}",
             channel="internal",
         )
-        timeout = max(20, min(90, settings.timeout_seconds * 2 + 10))
+        # 至少容纳两次实际网络空闲等待（含 30 秒下限），整次复核最长 90 秒。
+        timeout = min(90, network_idle_timeout_seconds(settings.timeout_seconds) * 2 + 10)
 
         async def consume() -> None:
             nonlocal tool_calls, failure_code

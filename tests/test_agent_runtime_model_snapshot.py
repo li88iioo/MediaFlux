@@ -353,11 +353,57 @@ def test_existing_global_limits_unchanged(harness, raw, context, cap):
     assert output(harness.requests[0]['body']) == cap
 
 
-@pytest.mark.parametrize('raw,expected', [('', 30), ('bad', 30), ('0', 2), ('1', 2), ('2', 2),
-    ('30', 30), ('120', 120), ('121', 120), (' 60 ', 60)])
-def test_timeout_semantics_unchanged(harness, raw, expected):
-    config.set_and_save({'AGENT_LLM_TIMEOUT_SECONDS': raw})
-    assert ProviderSettings.from_config().timeout_seconds == expected
+@pytest.mark.parametrize('raw,expected', [(None, 12), ('', 12), ('bad', 12), ('0', 2), ('1', 2), ('2', 2),
+    ('12', 12), ('30', 30), (' 60 ', 60), ('120', 120), ('121', 120)])
+def test_timeout_shares_one_default_and_range_at_every_model_client(local_config, raw, expected):
+    """缺失/空/非法回退 12，越界截断到 2–120；断言各链路 HTTP 客户端实际收到的超时。"""
+    from app.clients.ai_recognition import AIRecognitionClient
+    from app.modules.scraper import TMDBScraper
+    from app.routes import tools_api
+
+    if raw is not None:
+        config.set_and_save({'AGENT_LLM_TIMEOUT_SECONDS': raw})
+    settings = ProviderSettings.from_config()
+    assert settings.timeout_seconds == expected
+
+    # Agent 流式请求：网络空闲等待保留设置页已说明的 30 秒下限，不低于配置值。
+    wire, agent_timeouts = Wire(), []
+    def factory(**kwargs):
+        agent_timeouts.append(kwargs['timeout_seconds'])
+        return wire.factory(**kwargs)
+    adapter = OpenAICompatibleModelAdapter(settings, client_factory=factory)
+    async def stream():
+        return [e async for e in adapter.stream(
+            ModelRequest(system_prompt='offline', messages=(), tools=()), cancellation=CancellationToken())]
+    assert asyncio.run(stream())[-1].type.value == 'finish'
+    assert agent_timeouts == [max(30, expected)]
+
+    # AI 辅助识别：按设置值请求，不再静默截断到 30/60 秒。
+    ai_timeout = TMDBScraper._ai_provider_settings()[3]
+    posted = []
+    session = SimpleNamespace(post=lambda *args, **kwargs: posted.append(kwargs['timeout']))
+    client = AIRecognitionClient(api_url=BASE + '/chat/completions', model=MODEL,
+                                 timeout_seconds=ai_timeout, session=session)
+    client._post(client.api_url, protocol=client.protocol, body={})
+    assert posted == [(min(5, expected), expected)]
+
+    # 连接测试未带草稿超时时使用同一有效值，而非对存量值另行报错。
+    probe_timeouts = []
+    class FakeClient:
+        def __init__(self, **kwargs):
+            probe_timeouts.append(kwargs['timeout_seconds'])
+        async def post_json(self, url, **kwargs):
+            return SimpleNamespace(status_code=401, text='{}')
+        async def aclose(self):
+            pass
+    request = SimpleNamespace(session={}, client=SimpleNamespace(host='127.0.0.1'), headers={})
+    with patch.object(tools_api, 'require_api_login', return_value=None), patch.object(
+        tools_api.agent_rate_limiter, 'allow', return_value=True), patch.object(
+        tools_api, 'FixedHostHttpClient', FakeClient):
+        response = tools_api.ai_model_test(request, {
+            'base_url': BASE, 'api_key': 'fixture', 'protocol': 'responses', 'model': MODEL})
+    assert response.status_code == 502
+    assert probe_timeouts == [expected]
 
 
 @pytest.mark.parametrize('raw,error', [(object(), TypeError), (float('inf'), OverflowError)])
@@ -419,7 +465,7 @@ def test_provider_settings_is_one_real_config_snapshot(harness, monkeypatch):
     assert not writer.is_alive() and not errors
     assert published.is_set()
     assert (result.api_url, result.model, result.protocol, result.timeout_seconds, result.generation_profiles_json) == (
-        BASE + '/chat/completions', MODEL, 'chat_completions', 30, '')
+        BASE + '/chat/completions', MODEL, 'chat_completions', 12, '')
 
 
 def test_direct_provider_settings_never_read_live_channel(harness):
