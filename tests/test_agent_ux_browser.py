@@ -591,20 +591,28 @@ class AgentUXBrowserTests(unittest.TestCase):
         submit = card.locator('.agent-download-submit')
         submit.wait_for()
         card.locator('.agent-download-target').select_option('both')
-        width = submit.bounding_box()['width']
+        initial_bounds = submit.bounding_box()
+        assert initial_bounds is not None
+        width = initial_bounds['width']
         submit.click()
         card.locator('.agent-download-meta', has_text='qB 提交失败').wait_for()
-        self.assertFalse('is-done' in card.get_attribute('class'))
+        failed_classes = card.get_attribute('class')
+        assert failed_classes is not None
+        self.assertNotIn('is-done', failed_classes)
         self.assertTrue(submit.is_enabled())
         self.assertEqual(submit.inner_text(), '重试提交')
         self.assertEqual(card.locator('.agent-download-target').input_value(), 'both')
-        self.assertEqual(submit.bounding_box()['width'], width)
+        retry_bounds = submit.bounding_box()
+        assert retry_bounds is not None
+        self.assertEqual(retry_bounds['width'], width)
         self.assertEqual(card.get_by_role('link', name='查看下载记录').get_attribute('href'), '/downloads?view=issues')
         page.evaluate("window.__kernelConfig.directSubmit = {ok:true,status:'submitted',request_id:10,succeeded:['qb','guangya'],summary:'下载请求 #10 已提交'}")
         submit.click()
         card.locator('.agent-download-meta', has_text='下载请求 #10 已提交').wait_for()
-        self.assertIn('is-done', card.get_attribute('class'))
-        self.assertNotIn('is-error', card.get_attribute('class'))
+        completed_classes = card.get_attribute('class')
+        assert completed_classes is not None
+        self.assertIn('is-done', completed_classes)
+        self.assertNotIn('is-error', completed_classes)
         self.assertEqual(card.locator('.agent-download-submit').count(), 0)
 
     def test_direct_download_nonretryable_receipts_keep_facts_and_review_without_resubmission(self):
@@ -621,8 +629,12 @@ class AgentUXBrowserTests(unittest.TestCase):
                     'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
                 card = page.locator('.agent-download-card')
                 card.locator('.agent-download-submit').click()
-                card.locator('.agent-download-meta', has_text=receipt['error']).wait_for()
-                self.assertNotIn('is-done', card.get_attribute('class'))
+                error = receipt['error']
+                assert isinstance(error, str)
+                card.locator('.agent-download-meta', has_text=error).wait_for()
+                classes = card.get_attribute('class')
+                assert classes is not None
+                self.assertNotIn('is-done', classes)
                 self.assertFalse(card.locator('.agent-download-submit').is_visible())
                 self.assertTrue(card.get_by_role('link', name='查看下载记录').is_visible())
                 if status == 'partial':
@@ -665,7 +677,9 @@ class AgentUXBrowserTests(unittest.TestCase):
                 card.locator('.agent-download-meta', has_text='本次未提交' if retryable else '提交状态未知').wait_for()
                 self.assertEqual(card.locator('.agent-download-submit').is_visible(), retryable)
                 self.assertEqual(card.locator('.agent-download-target').input_value(), 'both')
-                self.assertNotIn('is-done', card.get_attribute('class'))
+                classes = card.get_attribute('class')
+                assert classes is not None
+                self.assertNotIn('is-done', classes)
                 self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
                 page.close()
 
