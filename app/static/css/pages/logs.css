@@ -30,7 +30,6 @@
 .confirmation-review-row.is-active { background: var(--accent-soft); border-left-color: var(--accent); }
 .confirmation-review-check { display: grid; place-items: center; flex: 0 0 44px; min-height: 44px; cursor: pointer; }
 .confirmation-review-open { display: grid; gap: 4px; flex: 1; min-width: 0; padding: 4px 0; color: var(--text-primary); background: transparent; border: 0; border-radius: var(--radius-sm); text-align: left; cursor: pointer; }
-.confirmation-review-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .confirmation-review-open strong { overflow: hidden; font-size: 13px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
 .confirmation-review-open small { overflow: hidden; color: var(--text-secondary); font-size: 11px; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
 .confirmation-review-row-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-height: 20px; color: var(--text-secondary); font-size: 11px; }
