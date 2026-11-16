@@ -199,6 +199,11 @@ class ProviderSettings:
 
     @classmethod
     def from_config(cls) -> ProviderSettings:
+        return cls(**cls.configuration_values())
+
+    @staticmethod
+    def configuration_values() -> dict[str, Any]:
+        """读取同一份配置值；仅构建模型时校验必填连接信息。"""
         from app import config
 
         values = config.get_many((
@@ -212,7 +217,7 @@ class ProviderSettings:
             context = int(values["AGENT_LLM_CONTEXT_WINDOW_TOKENS"] or 128_000)
         except ValueError:
             context = 128_000
-        return cls(
+        return dict(
             api_url=(values.get("AGENT_LLM_API_URL", "") or "").strip(),
             generation_profiles_json=values.get("AGENT_LLM_GENERATION_PROFILES", ""),
             model=(values.get("AGENT_LLM_MODEL", "") or "").strip(),

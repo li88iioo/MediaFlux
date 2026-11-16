@@ -238,20 +238,26 @@ def _build_agent_kernel_runtime(
     if not workspace_error:
         # 普通代码仅在镜像已配置的隔离工作区执行，不退回语言白名单或主进程执行。
         catalog.register(run_code_tool(pipeline))
+    model_factory = None
     if model is not None:
         bool(model)  # Preserve one observable evaluation, never use it to route.
         active_model = model
         limits = _session_limits_from_config()
     else:
-        settings = ProviderSettings.from_config()
-        active_model = OpenAICompatibleModelAdapter(settings)
+        settings = ProviderSettings.configuration_values()
+        active_model = None
+        # 配置值已绑定本次运行快照；历史读取不构建模型，也不借用后续的新配置。
+        def model_factory() -> ModelAdapter:
+            return OpenAICompatibleModelAdapter(ProviderSettings(**settings))
+
         limits = SessionLimits(
-            context_window_tokens=settings.context_window_tokens,
+            context_window_tokens=settings["context_window_tokens"],
             # 推理 token 计入输出额度；放宽到既有上限，避免思考挤掉工具调用。
-            max_output_tokens=16_000 if settings.reasoning_effort else 6_000,
+            max_output_tokens=16_000 if settings["reasoning_effort"] else 6_000,
         )
     session = AgentSession(
         model=active_model,
+        model_factory=model_factory,
         catalog=catalog,
         model_tools=tuple(tool.name for tool in catalog.visible() if tool.name == "agent.run_code"),
         pipeline=pipeline,

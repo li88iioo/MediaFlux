@@ -10,6 +10,7 @@ import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
 from contextlib import aclosing, nullcontext, suppress
 from dataclasses import dataclass, replace
+from functools import cached_property
 from typing import Any, Protocol
 
 from app.agent.errors import ToolPipelineError
@@ -132,7 +133,7 @@ class AgentSession:
     def __init__(
         self,
         *,
-        model: ModelAdapter,
+        model: ModelAdapter | None,
         catalog: ToolCatalog,
         pipeline: ToolPipeline,
         state_store: SessionStateStore,
@@ -145,12 +146,18 @@ class AgentSession:
         model_selector: Callable[[AgentInput, ModelAdapter], str] | None = None,
         stream_display: Callable[[], bool] | None = None,
         user_memory: Callable[[str], str] | None = None,
+        model_factory: Callable[[], ModelAdapter] | None = None,
     ) -> None:
         if pipeline.catalog is not catalog:
             raise ValueError("AgentSession and ToolPipeline must share one catalog")
         if pipeline.state_store is not state_store:
             raise ValueError("AgentSession and ToolPipeline must share one state store")
-        self.model = model
+        if model is not None:
+            self.model = model
+        elif model_factory is not None:
+            self._model_factory = model_factory
+        else:
+            raise ValueError("AgentSession requires a model or model factory")
         self.metrics = KernelMetrics()
         self.catalog = catalog
         # 宿主显式限定模型入口；内部EffectExecutor目录仍保存全部SDK写能力。
@@ -173,6 +180,11 @@ class AgentSession:
         # Web轮次及已确认操作脱离观察者后仍持有强引用直到可信终态。
         # 其它入口的普通轮次继续遵循各自的消费者取消约定。
         self._detached_tasks: set[asyncio.Task[None]] = set()
+
+    @cached_property
+    def model(self) -> ModelAdapter:
+        """历史与会话控制复用同一 Kernel，实际查询才初始化模型。"""
+        return self._model_factory()
 
     def visible_model_tools(self, context: Mapping[str, Any]) -> tuple[KernelToolSpec, ...]:
         """小catalog直接使用；生产通过构造参数限定为工作区和会话控制。"""

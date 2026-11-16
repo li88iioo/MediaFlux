@@ -101,6 +101,56 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertNotIn("<span>Agent</span>", dashboard.text)
 
+    def test_history_without_model_configuration_preserves_web_and_telegram_reads(self):
+        import asyncio
+
+        from app import config
+        from app.agent.kernel import bootstrap
+        from app.agent.kernel.persistence import SQLiteKernelStore
+        from app.agent.owner_routes import web_kernel_owner
+
+        config.set_and_save({"TG_CHAT_ID": "1001", "TG_AGENT_ALLOWED_USER_IDS": "1001"})
+        self._login()
+        owner = web_kernel_owner(web_credentials()[0])
+        session_id = "session_history_without_model"
+        store = SQLiteKernelStore()
+
+        async def seed_history():
+            for principal, identity, content in (
+                (owner, session_id, "历史核对：Web 已保存的结果"),
+                ("tg:v1:1001\x1f1001", "tg_history_without_model", "历史核对：Telegram 已保存的结果"),
+            ):
+                lease, _state = await store.begin_turn(owner=principal, session_id=identity, request_id="seed-history")
+                await store.commit(lease, conversation=[{"role": "user", "content": "历史核对"},
+                                                       {"role": "assistant", "content": content}])
+
+        asyncio.run(seed_history())
+        self.addCleanup(bootstrap.invalidate_agent_kernel_runtime)
+        with patch.object(bootstrap, "OpenAICompatibleModelAdapter", side_effect=AssertionError("历史不能初始化模型")) as model:
+            for enabled in ("1", "0"):
+                with self.subTest(agent_enabled=enabled):
+                    config.set_and_save({"AGENT_LLM_ENABLED": enabled, "AGENT_LLM_API_URL": "", "AGENT_LLM_MODEL": ""})
+                    bootstrap.invalidate_agent_kernel_runtime()
+                    page = self.client.get("/agent", follow_redirects=False)
+                    self.assertEqual(page.status_code, 200 if enabled == "1" else 303)
+                    listing = self.client.get("/api/agent/sessions")
+                    self.assertEqual(listing.status_code, 200, listing.text)
+                    self.assertEqual(listing.json()["main_session_id"], session_id)
+                    detail = self.client.get(f"/api/agent/sessions/{session_id}")
+                    self.assertEqual(detail.status_code, 200, detail.text)
+                    self.assertEqual(detail.json()["messages"][-1]["content"], "历史核对：Web 已保存的结果")
+                    channels = self.client.get("/api/agent/channels")
+                    self.assertEqual(channels.status_code, 200, channels.text)
+                    key = channels.json()["channels"][0]["key"]
+                    channel = self.client.get(f"/api/agent/channels/{key}")
+                    self.assertEqual(channel.status_code, 200, channel.text)
+                    self.assertTrue(channel.json()["read_only"])
+                    self.assertEqual(channel.json()["messages"][-1]["content"], "历史核对：Telegram 已保存的结果")
+                    search = self.client.get("/api/agent/search", params={"q": "历史核对"})
+                    self.assertEqual(search.status_code, 200, search.text)
+                    self.assertEqual({hit["kind"] for hit in search.json()["results"]}, {"main", "channel"})
+                    model.assert_not_called()
+
     def test_authenticated_agent_renders_stable_semantic_shell(self):
         self._login()
         response = self.client.get("/agent")
