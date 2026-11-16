@@ -427,14 +427,16 @@ class STRMMetadataWorker:
                     "STRM 落盘后的媒体库刷新入队失败，将保留变更稍后重试"
                 )
                 continue
-            if not results or any(value != "queued" for value in results.values()):
+            if results != {"媒体库": "skipped"} and (
+                not results or any(value != "queued" for value in results.values())
+            ):
                 retry_pending = True
                 logger.warning(
                     "STRM 已落盘，但媒体库刷新未全部入队，将稍后重试"
                 )
                 continue
-            # 统一刷新队列已持久接管这些路径；后续媒体服务器失败由刷新消费者收尾，
-            # 不再让 STRM 或元数据 worker 重复提交同一文件变化。
+            # 队列已持久接管，或当前无需刷新；均按原事件令牌收尾。
+            # 后续媒体服务器失败由刷新消费者处理，不重复提交同一文件变化。
             try:
                 strm_repo.acknowledge_strm_refresh_paths(batch)
             except Exception:

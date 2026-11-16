@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
+from app.modules.media_refresh_coordinator import MediaRefreshCoordinator, enqueue_media_refresh_paths
 from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
     clear_media_refresh_queue,
@@ -335,6 +335,25 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
 class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         clear_media_refresh_queue()
+
+    def test_no_eligible_automatic_provider_skips_without_queue_or_worker(self):
+        cases = (
+            ({}, True),
+            ({"JELLYFIN_ENABLED": True, "JELLYFIN_URL": "http://fixture.invalid"}, True),
+            ({"EMBY_ENABLED": True, "EMBY_URL": "http://fixture.invalid", "EMBY_TOKEN": "synthetic"}, False),
+        )
+        for settings, allow_emby in cases:
+            with self.subTest(settings=settings, allow_emby=allow_emby), patch(
+                "app.modules.media_refresh_coordinator.config.get_bool",
+                side_effect=lambda key, default=False: bool(settings.get(key, default)),
+            ), patch(
+                "app.modules.media_refresh_coordinator.config.get",
+                side_effect=lambda key, default="": settings.get(key, default),
+            ), patch("app.modules.media_refresh_coordinator.get_media_refresh_coordinator") as worker:
+                result = enqueue_media_refresh_paths(["/media/Film.strm"], allow_emby=allow_emby)
+            self.assertEqual(result, {"媒体库": "skipped"})
+            self.assertEqual(media_refresh_queue_status()["paths"], 0)
+            worker.assert_not_called()
 
     def test_transient_startup_recovery_failure_retries_without_losing_refresh(self):
         enqueue_media_refresh("jellyfin", ["/media/A.strm"], debounce_seconds=0)

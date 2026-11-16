@@ -236,29 +236,37 @@ def test_commit_crash_replays_refresh_without_rewriting_current_strm(tmp_path, m
             assert media_refresh_queue_status()["paths"] == 0
 
 
-@pytest.mark.parametrize("origin", ["outbox", "foreground"])
-def test_empty_provider_keeps_intent_until_configuration_recovers(tmp_path, origin):
+@pytest.mark.parametrize("origin", ["outbox", "foreground", "task"])
+def test_empty_provider_finishes_without_pending_refresh_or_later_replay(tmp_path, origin):
     target = str(tmp_path / strm.STRM_SUBDIR / "Film")
     with isolated_test_database(), _providers():
         if origin == "outbox":
             repository.enqueue_strm_refresh_paths([target], allow_emby=False)
             worker = STRMMetadataWorker()
             worker._flush_media_refresh(force=True)
-            assert worker._refresh_retry_pending
-        else:
+            assert not worker._refresh_retry_pending
+        elif origin == "foreground":
             with patch.object(scheduler_module, "get", side_effect=lambda k, d="": str(tmp_path) if k == "STRM_ROOT" else d):
                 result = STRMScheduler._refresh_media_servers(
                     changed_dirs=[target], refresh_policy=repository.StrmRefreshPolicy(allow_emby=False),
                 )
-            assert result == {"媒体库": "pending"}
-        assert repository.count_strm_refresh_paths() == 1
+            assert result == {}
+        else:
+            result = _run(tmp_path)
+            assert result["stats"]["generated"] == 1
+            assert result["ok"] and not result["partial"]
+            assert not result["refresh_pending"] and result["media_refresh"] == {}
+            assert db.get_last_task_run("strm_sync")["status"] == "success"
+        assert repository.count_strm_refresh_paths() == 0
         assert media_refresh_queue_status()["paths"] == 0
-        _consume(providers=("jellyfin",), expected_paths=[target])
+        with _providers("jellyfin"):
+            STRMMetadataWorker()._flush_media_refresh(force=True)
+        assert claim_due_media_refreshes(owner="later", force=True) == []
 
 
 @pytest.mark.parametrize("removal", ["cloud-delete", "retirement"])
 def test_single_source_root_file_create_delete_and_refresh(tmp_path, removal):
-    with isolated_test_database(), _providers():
+    with isolated_test_database(), _providers("jellyfin"):
         created = _run(tmp_path, flat=True, allow_emby=False)
         path = tmp_path / strm.STRM_SUBDIR / "Movie.strm"
         assert created["stats"]["generated"] == 1 and path.is_file()
@@ -274,7 +282,7 @@ def test_single_source_root_file_create_delete_and_refresh(tmp_path, removal):
 
 @pytest.mark.parametrize("existing", [False, True])
 def test_failed_file_index_outbox_commit_retries_instead_of_becoming_current(tmp_path, existing):
-    with isolated_test_database(), _providers():
+    with isolated_test_database(), _providers("jellyfin"):
         path = tmp_path / strm.STRM_SUBDIR / "Film" / "Movie.strm"
         if existing:
             _run(tmp_path, enabled=False, tree=_tree(etag="old"))
@@ -300,7 +308,7 @@ def test_failed_file_index_outbox_commit_retries_instead_of_becoming_current(tmp
 
 
 def test_failed_delete_restores_file_and_index_until_refresh_is_durable(tmp_path):
-    with isolated_test_database(), _providers():
+    with isolated_test_database(), _providers("jellyfin"):
         _run(tmp_path, enabled=False)
         with patch.object(repository, "_enqueue_strm_refresh_paths", side_effect=sqlite3.OperationalError("outbox unavailable")):
             _run(tmp_path, tree={"s": []})
@@ -359,7 +367,7 @@ def test_delete_commit_crash_retains_refresh_after_index_disappears(tmp_path, re
 
 
 def test_move_from_root_keeps_old_file_refresh_until_recovery_handoff(tmp_path):
-    with isolated_test_database(), _providers():
+    with isolated_test_database(), _providers("jellyfin"):
         _run(tmp_path, flat=True, enabled=False)
         previous = tmp_path / strm.STRM_SUBDIR / "Movie.strm"
         result = _run(tmp_path, allow_emby=False)
@@ -416,10 +424,13 @@ def test_real_scheduler_entry_retires_last_source_without_config_short_circuit(t
             assert result["stats"]["cleaned"] == result["stats"]["retired_sources"] == 1
             assert not repository.list_strm_index("guangya:s") and not db.list_strm_retired_sources()
             assert not list(tmp_path.rglob("*.strm"))
-            assert repository.count_strm_refresh_paths() == 1
+            assert repository.count_strm_refresh_paths() == 0
+            assert run["status"] == "success" and result["media_refresh"] == {}
         finally:
             assert scheduler.stop(timeout=5)
-        _consume(providers=("jellyfin",), expected_paths=[str(tmp_path / strm.STRM_SUBDIR / "Movie.strm")])
+        with _providers("jellyfin"):
+            STRMMetadataWorker()._flush_media_refresh(force=True)
+        assert claim_due_media_refreshes(owner="later", force=True) == []
 
 
 def test_commit_and_overflow_share_frozen_policy_and_do_not_duplicate_paths(tmp_path):
@@ -471,7 +482,9 @@ def test_pending_refresh_event_is_partial_without_generation_failures(refresh_re
 
 @pytest.mark.parametrize("restricted", [False, True])
 def test_notification_pending_standalone_publish_cannot_claim_completion(tmp_path, restricted):
-    with isolated_test_database(), _providers():
+    with isolated_test_database(), patch.object(
+        refresh, "enqueue_media_refresh_paths", return_value={"媒体库": "pending"},
+    ):
         result = _run(tmp_path, allow_emby=False)
         assert result["partial"] and not result["strm_partial"]
         assert result["media_refresh"] == {"媒体库": "pending"}

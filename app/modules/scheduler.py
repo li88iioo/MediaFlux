@@ -2254,28 +2254,31 @@ class STRMScheduler:
             )
             return {"媒体库": "failed"}
 
-        refresh_handed_off = bool(results) and all(
-            value == "queued" for value in results.values()
+        refresh_not_required = results == {"媒体库": "skipped"}
+        refresh_handed_off = refresh_not_required or (
+            bool(results) and all(value == "queued" for value in results.values())
         )
         if refresh_handed_off:
             try:
                 strm_repo.acknowledge_strm_refresh_paths(entries)
             except Exception:
-                # 统一刷新队列已经持久接管；保留 outbox 只会触发幂等补投，
-                # 不能反向把本轮 STRM 标记为失败。
+                # 已排队或明确无需刷新；保留原事件供 worker 幂等收尾，
+                # 不能反向把已完成的 STRM 生成标记为失败。
                 logger.exception(
-                    "媒体库刷新已入队，但 STRM outbox 确认失败，将幂等重试"
+                    "媒体库刷新交接已结束，但 STRM outbox 确认失败，将幂等重试"
                 )
         else:
             logger.warning(
                 "媒体库刷新未全部入队，STRM 变化已保留等待后台重试"
             )
         logger.info(
-            "媒体库刷新已提交统一队列 immediate=%s targets=%s providers=%s",
+            "媒体库刷新交接结果 immediate=%s targets=%s providers=%s",
             immediate,
             len(targets),
             ",".join(f"{name}:{status}" for name, status in results.items()) or "none",
         )
+        if refresh_not_required:
+            return {}
         return results or {"媒体库": "pending"}
 
     @staticmethod

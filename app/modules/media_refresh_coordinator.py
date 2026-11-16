@@ -70,7 +70,7 @@ def enqueue_media_refresh_paths(
     immediate: bool = False,
     allow_emby: bool = True,
 ) -> dict[str, str]:
-    """把变化路径持久加入统一队列，返回逐 provider 的排队状态。"""
+    """持久登记刷新；无可用自动目标时明确返回全局 skipped，不创建待办。"""
     selected = tuple(dict.fromkeys(
         (item or "").strip().lower()
         for item in (
@@ -79,6 +79,8 @@ def enqueue_media_refresh_paths(
         )
         if (item or "").strip()
     ))
+    if not selected:
+        return {"媒体库": "skipped"}
     results: dict[str, str] = {}
     delay = 0 if immediate else _debounce_seconds()
     for provider in selected:
