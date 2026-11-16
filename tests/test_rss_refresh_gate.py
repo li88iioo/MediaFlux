@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import socket
@@ -156,6 +157,41 @@ class RSSRefreshCommitTests(IsolatedDatabaseTestCase):
                         self.assertEqual(current["media_default_season"], 2)
                         self.assertEqual(current["last_refreshed_at"], "2000-01-01 00:00:00")
                     self.assertEqual(self._stored_state()["rss_entries"], [])
+
+    def test_cancellation_stops_sources_and_rolls_back_all_refresh_writes(self):
+        for stage in ("parse", "_bound_tv_title_keys", "_existing_library_episodes", "entry", "marker"):
+            with self.subTest(stage=stage):
+                sid = self._subscription()
+                rss_repo.update_rss_subscription(sid, {"urls": "https://example.invalid/first\nhttps://example.invalid/second"})
+                before = self._stored_state()
+                cancelled = False
+
+                def check_cancelled():
+                    if cancelled:
+                        raise asyncio.CancelledError()
+
+                if stage == "parse":
+                    target, name = self.engine.parser, "parse"
+                elif stage in {"entry", "marker"}:
+                    target, name = rss_repo, "add_rss_entry_with_media" if stage == "entry" else "update_rss_subscription"
+                else:
+                    target, name = self.engine, stage
+                original = getattr(target, name)
+
+                def cancel_after(*args, **kwargs):
+                    nonlocal cancelled
+                    result = original(*args, **kwargs)
+                    cancelled = True
+                    return result
+
+                with patch.object(target, name, side_effect=cancel_after) as operation:
+                    with self.assertRaises(asyncio.CancelledError):
+                        self.engine.refresh(sid, check_cancelled=check_cancelled)
+                    if stage == "parse":
+                        operation.assert_called_once()
+                self.assertEqual(self._stored_state(), before)
+                # 同一订阅可以继续刷新，证明取消释放了单飞门与写事务。
+                self.assertNotIn("error", self.engine.refresh(sid))
 
     def test_batch_failure_rolls_back_entries_media_reopens_and_refresh_marker(self):
         sid = self._subscription()

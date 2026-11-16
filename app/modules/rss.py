@@ -641,8 +641,13 @@ class RSSEngine:
         }
 
     # ===== 刷新 =====
-    def refresh(self, sub_id: int, *, expected_revision: str = "") -> dict:
+    def refresh(
+        self, sub_id: int, *, expected_revision: str = "",
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> dict:
         """刷新单个订阅：同一进程内按订阅单飞，去重入库并返回统计。"""
+        if check_cancelled is not None:
+            check_cancelled()
         if not _try_acquire_rss_refresh(sub_id):
             return {"error": RSS_REFRESH_BUSY_ERROR, "busy": True}
 
@@ -676,6 +681,8 @@ class RSSEngine:
             parsed_entries: list[RSSEntry] = []
             refresh_deadline = time.monotonic() + _RSS_REFRESH_DEADLINE_SECONDS
             for index, url in enumerate(urls):
+                if check_cancelled is not None:
+                    check_cancelled()
                 remaining = refresh_deadline - time.monotonic()
                 if remaining <= 0:
                     failed_sources += len(urls) - index
@@ -692,6 +699,8 @@ class RSSEngine:
                     failed_sources += 1
                     continue
                 parsed_entries.extend(entries)
+            if check_cancelled is not None:
+                check_cancelled()
             if failed_sources == len(urls):
                 logger.warning("RSS 刷新失败 sub#%s: 全部 %s 个源不可用", sub_id, failed_sources)
                 return {
@@ -725,6 +734,8 @@ class RSSEngine:
                     binding_bypass_reason = "episode_unresolved"
             mixed_feed_bypassed = binding_bypass_reason == "mixed_feed"
             skip_existing = (skip_existing_requested and binding_allowed)
+            if check_cancelled is not None:
+                check_cancelled()
             if skip_existing:
                 library_positions, library_check = self._existing_library_episodes(media_tmdb_id)
             elif media_binding_bypassed:
@@ -738,6 +749,8 @@ class RSSEngine:
             library_skipped = semantic_duplicates = identity_unresolved = 0
             # 网络抓取、TMDB 识别及库存查询已结束；持有写锁后再校验快照，
             # 条目（含语义重开）与刷新时间共用此事务，失败时整批回滚。
+            if check_cancelled is not None:
+                check_cancelled()
             with db.get_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 current = rss_repo.get_rss_subscription(sub_id, connection=conn)
@@ -746,6 +759,8 @@ class RSSEngine:
                 ):
                     return {"error": RSS_REFRESH_CONFLICT_ERROR, "conflict": True}
                 for entry in parsed_entries:
+                    if check_cancelled is not None:
+                        check_cancelled()
                     total += 1
                     if self._excluded(entry.title, exclude):
                         skipped += 1
@@ -799,7 +814,11 @@ class RSSEngine:
                                 library_skipped += 1
                             else:
                                 semantic_duplicates += 1
+                if check_cancelled is not None:
+                    check_cancelled()
                 rss_repo.update_rss_subscription(sub_id, {"last_refreshed_at": db.now()}, connection=conn)
+                if check_cancelled is not None:
+                    check_cancelled()
             logger.info(
                 "RSS 刷新 sub#%s: 拉取 %s 新增 %s 排除 %s 库内 %s 语义重复 %s 失败源 %s",
                 sub_id, total, new, skipped, library_skipped, semantic_duplicates, failed_sources,

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError as FutureCancelledError,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import asdict
 from typing import Any
 
@@ -364,7 +370,7 @@ def execute(
     if operation == "refresh":
         run_id = db.add_task_run("rss_refresh", "manual")
         try:
-            result = _refresh(state)
+            result = _refresh(state, check_cancelled=check_cancelled)
             result["data"]["run_id"] = run_id
             db.finish_task_run(
                 run_id, result["status"], result=json.dumps(result, ensure_ascii=False)
@@ -522,20 +528,27 @@ def submission_result(raw: dict[str, Any], *, kind: str, target: str) -> dict:
     }
 
 
-def _refresh(state: dict[str, Any]) -> dict:
+def _refresh(state: dict[str, Any], *, check_cancelled=None) -> dict:
     states = list(state["states"])
     results: list[dict[str, Any]] = []
     totals = {"total": 0, "new": 0, "skipped": 0}
     succeeded = 0
     partial_subscriptions = 0
     failed_sources = 0
+    cancelled = 0
 
     def refresh_one(item: dict[str, Any]) -> dict[str, Any]:
         try:
+            options: dict[str, Any] = {"expected_revision": str(item.get("revision") or "")}
+            if check_cancelled is not None:
+                check_cancelled()
+                options["check_cancelled"] = check_cancelled
             return RSSEngine().refresh(
                 int(item["subscription_id"]),
-                expected_revision=str(item.get("revision") or ""),
+                **options,
             )
+        except asyncio.CancelledError:
+            return {"cancelled": True}
         except Exception as exc:  # noqa: BLE001 -- 单个源异常记录为失败，保留同批其他刷新结果
             logger.warning(
                 "RSS 批量刷新异常 subscription_id=%s type=%s",
@@ -544,48 +557,86 @@ def _refresh(state: dict[str, Any]) -> dict:
             )
             return {"error": "RSS 刷新异常"}
 
-    for offset in range(0, len(states), 32):
-        batch = states[offset : offset + 32]
-        with ThreadPoolExecutor(
-            max_workers=min(4, len(batch)), thread_name_prefix="rss-refresh"
-        ) as executor:
-            futures = [executor.submit(refresh_one, item) for item in batch]
-            batch_results = [future.result() for future in futures]
-        for item, raw in zip(batch, batch_results):
-            if raw.get("busy"):
-                status = "busy"
-            elif raw.get("conflict"):
-                status = "conflict"
-            elif raw.get("error"):
-                status = "failed"
-            else:
-                is_partial = bool(raw.get("partial"))
-                status = "partial" if is_partial else "completed"
-                succeeded += 1
-                totals["total"] += max(0, int(raw.get("total") or 0))
-                totals["new"] += max(0, int(raw.get("new") or 0))
-                totals["skipped"] += max(0, int(raw.get("skipped") or 0))
-                if is_partial:
-                    partial_subscriptions += 1
-                    failed_sources += max(0, int(raw.get("failed_sources") or 0))
-            result_row = {
-                "subscription_id": int(item["subscription_id"]),
-                "name": str(item.get("name") or ""),
-                "status": status,
-            }
-            if status == "partial":
-                result_row["failed_sources"] = max(
-                    0, int(raw.get("failed_sources") or 0)
-                )
-            results.append(result_row)
+    raw_results: dict[int, dict[str, Any]] = {}
+    if states:
+        with ThreadPoolExecutor(max_workers=min(4, len(states)), thread_name_prefix="rss-refresh") as executor:
+            queued = iter(enumerate(states))
+            futures = {}
+            stopped = False
+
+            def submit_next():
+                nonlocal stopped
+                if stopped:
+                    return
+                try:
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    index, item = next(queued)
+                except StopIteration:
+                    return
+                except asyncio.CancelledError:
+                    stopped = True
+                    return
+                futures[executor.submit(refresh_one, item)] = index
+
+            for _ in range(min(4, len(states))):
+                submit_next()
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = futures.pop(future)
+                    try:
+                        raw = future.result()
+                    except FutureCancelledError:
+                        raw = {"cancelled": True}
+                    raw_results[index] = raw
+                    stopped = stopped or bool(raw.get("cancelled"))
+                for _ in done:
+                    submit_next()
+                if stopped:
+                    for future in futures:
+                        future.cancel()
+    for index, item in enumerate(states):
+        raw = raw_results.get(index, {"cancelled": True})
+        if raw.get("cancelled"):
+            status = "cancelled"
+            cancelled += 1
+        elif raw.get("busy"):
+            status = "busy"
+        elif raw.get("conflict"):
+            status = "conflict"
+        elif raw.get("error"):
+            status = "failed"
+        else:
+            is_partial = bool(raw.get("partial"))
+            status = "partial" if is_partial else "completed"
+            succeeded += 1
+            totals["total"] += max(0, int(raw.get("total") or 0))
+            totals["new"] += max(0, int(raw.get("new") or 0))
+            totals["skipped"] += max(0, int(raw.get("skipped") or 0))
+            if is_partial:
+                partial_subscriptions += 1
+                failed_sources += max(0, int(raw.get("failed_sources") or 0))
+        result_row = {
+            "subscription_id": int(item["subscription_id"]),
+            "name": str(item.get("name") or ""),
+            "status": status,
+        }
+        if status == "partial":
+            result_row["failed_sources"] = max(
+                0, int(raw.get("failed_sources") or 0)
+            )
+        results.append(result_row)
     requested = len(states)
-    failed = requested - succeeded
+    failed = requested - succeeded - cancelled
     has_partial = partial_subscriptions > 0
     status = (
-        "failed"
+        "cancelled"
+        if cancelled and succeeded == 0
+        else "failed"
         if succeeded == 0
         else "partial"
-        if failed > 0 or has_partial
+        if failed > 0 or has_partial or cancelled
         else "completed"
     )
     return {
@@ -596,11 +647,12 @@ def _refresh(state: dict[str, Any]) -> dict:
             f"；{partial_subscriptions} 个订阅部分完成，暂不可用源 {failed_sources}"
             if has_partial
             else ""
-        ),
+        ) + (f"；另有 {cancelled} 个订阅已按取消停止" if cancelled else ""),
         "data": {
             "requested": requested,
             "refreshed": succeeded,
             "failed": failed,
+            **({"cancelled": cancelled} if cancelled else {}),
             "partial_subscriptions": partial_subscriptions,
             "failed_sources": failed_sources,
             **totals,

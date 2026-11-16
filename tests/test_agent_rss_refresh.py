@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from app.modules import rss_delivery
 
 from unittest.mock import patch
@@ -13,7 +15,7 @@ from app.database import media_owner_digest
 from app.agent.errors import AgentToolError
 from app.modules.rss_subscriptions import RSSSubscriptionError
 from app.agent.rate_limit import agent_rate_limiter
-from app.modules.rss import RSS_REFRESH_BUSY_ERROR, RSSEngine
+from app.modules.rss import MikanParser, RSS_REFRESH_BUSY_ERROR, RSSEngine
 from tests.agent_kernel_test_harness import (
     get_kernel_test_service as get_agent_service,
 )
@@ -59,6 +61,70 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             "PRIVATE_FILTER",
         ):
             self.assertNotIn(secret, serialized)
+
+
+    def test_bulk_refresh_cancellation_stops_remaining_sources_and_subscriptions(self):
+        ids = [self.sid] + [
+            rss_repo.add_rss_subscription(f"cancel-{index}", f"https://example.invalid/{index}")
+            for index in range(32)
+        ]
+        cancelled = threading.Event()
+        parsed = []
+
+        def check_cancelled():
+            if cancelled.is_set():
+                raise asyncio.CancelledError()
+
+        def parse(url):
+            parsed.append(url)
+            cancelled.set()
+            return []
+
+        with patch.object(MikanParser, "parse", side_effect=parse):
+            result = rss_delivery.execute("refresh", {"subscription_ids": ids}, check_cancelled=check_cancelled)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["data"]["refreshed"], 0)
+        self.assertEqual(result["data"]["failed"], 0)
+        self.assertEqual(result["data"]["cancelled"], len(ids))
+        self.assertLessEqual(len(parsed), 4)
+        self.assertTrue(all(not rss_repo.get_rss_subscription(sid)["last_refreshed_at"] for sid in ids))
+        self.assertEqual({item["status"] for item in result["data"]["subscriptions"]}, {"cancelled"})
+        run = db.get_task_run(result["data"]["run_id"])
+        self.assertEqual(run["status"], "cancelled")
+        self.assertEqual(json.loads(run["result"])["data"]["cancelled"], len(ids))
+
+    def test_refresh_cancellation_preserves_completed_subscription_and_task_receipt(self):
+        second = rss_repo.add_rss_subscription("second", "https://example.invalid/second")
+        completed = threading.Event()
+        cancelled = threading.Event()
+        refresh = RSSEngine.refresh
+
+        def check_cancelled():
+            if cancelled.is_set():
+                raise asyncio.CancelledError()
+
+        def refresh_and_signal(engine, sid, **kwargs):
+            result = refresh(engine, sid, **kwargs)
+            if sid == self.sid:
+                completed.set()
+            return result
+
+        def parse(url):
+            if url.endswith("/second"):
+                self.assertTrue(completed.wait(3))
+                cancelled.set()
+            return []
+
+        with patch.object(RSSEngine, "refresh", refresh_and_signal), patch.object(MikanParser, "parse", side_effect=parse):
+            result = rss_delivery.execute("refresh", {"subscription_ids": [self.sid, second]}, check_cancelled=check_cancelled)
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["refreshed"], 1)
+        self.assertEqual(result["data"]["cancelled"], 1)
+        self.assertEqual(result["data"]["failed"], 0)
+        self.assertTrue(rss_repo.get_rss_subscription(self.sid)["last_refreshed_at"])
+        self.assertFalse(rss_repo.get_rss_subscription(second)["last_refreshed_at"])
+        self.assertEqual(db.get_task_run(result["data"]["run_id"])["status"], "partial")
 
 
     def test_single_subscription_confirm_executes_once_and_returns_aggregate_only(self):
