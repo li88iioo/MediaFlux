@@ -16,6 +16,28 @@ from app.modules.media_server_profiles import MediaServerProfile
 
 
 class MediaRuntimeTests(unittest.TestCase):
+    def test_configured_refresh_client_preserves_user_and_path_scope(self):
+        from app.modules import media_refresh_coordinator as coordinator
+        from app.modules.media_server_path_mapping import MediaServerPathMapping
+
+        for kind in ("jellyfin", "emby"):
+            with self.subTest(kind=kind):
+                profile = MediaServerProfile(
+                    f"configured:{kind}", kind, kind.title(), "http://media.invalid", "fixture", True, "family",
+                )
+                options = {"path_mappings": (MediaServerPathMapping("/local", "/remote"),),
+                           "allow_global_refresh_fallback": True}
+                with patch.object(coordinator, "list_configured_profiles", return_value=[profile]), \
+                     patch.object(coordinator, "configured_media_server_refresh_options", return_value=options), \
+                     patch("requests.Session.get", side_effect=AssertionError("unexpected HTTP")):
+                    client = coordinator.MediaRefreshCoordinator._client_for(kind)
+                    assert client is not None
+                    with client:
+                        self.assertEqual(client._user_id(), "family")
+                        self.assertEqual(client.path_mappings, options["path_mappings"])
+                        self.assertTrue(client.allow_global_refresh_fallback)
+                        self.assertEqual(client.timeout, 10)
+
     def test_dashboard_reuses_complete_recent_snapshot_including_empty_results(self):
         for client_type in (JellyfinClient, EmbyClient):
             for recent in ([], [MediaItem(id="movie", name="测试电影", type="Movie")]):

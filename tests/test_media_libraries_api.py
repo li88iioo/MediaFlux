@@ -106,7 +106,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         profile = self._profiles()[0]
         client = Mock()
         client.list_virtual_folders.return_value = []
-        with patch("app.routes.media_libraries_api._client_for", return_value=client):
+        with patch("app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=client):
             provider, libraries, error = media_libraries_api._probe_profile(profile)
         self.assertEqual((provider, libraries, error), ("jellyfin", [], ""))
         client.close.assert_called_once_with()
@@ -492,7 +492,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         }
         with (
             patch("app.routes.media_libraries_api.list_configured_profiles", return_value=[profile]),
-            patch("app.routes.media_libraries_api._client_for", return_value=client),
+            patch("app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=client),
         ):
             matched = self.client.post(
                 "/api/media-libraries/path-test",
@@ -547,7 +547,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         broken_client.list_virtual_folders.side_effect = ConnectionError("private upstream")
         with (
             patch("app.routes.media_libraries_api.list_configured_profiles", return_value=[profile]),
-            patch("app.routes.media_libraries_api._client_for", return_value=broken_client),
+            patch("app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=broken_client),
         ):
             upstream = self.client.post(
                 "/api/media-libraries/path-test", headers=headers, json=valid,

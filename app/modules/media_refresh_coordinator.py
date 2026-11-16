@@ -235,23 +235,7 @@ class MediaRefreshCoordinator:
         profile = profiles.get(provider)
         if profile is None:
             return None
-        if provider == "jellyfin":
-            from app.clients.jellyfin import JellyfinClient
-
-            return JellyfinClient(
-                profile.url,
-                profile.credential,
-                **configured_media_server_refresh_options("jellyfin"),
-            )
-        if provider == "emby":
-            from app.clients.emby import EmbyClient
-
-            return EmbyClient(
-                profile.url,
-                profile.credential,
-                **configured_media_server_refresh_options("emby"),
-            )
-        return None
+        return profile.create_client(**configured_media_server_refresh_options(provider))
 
     @staticmethod
     def _resolve_library_binding(client, group: dict[str, Any]) -> tuple[str, ...]:

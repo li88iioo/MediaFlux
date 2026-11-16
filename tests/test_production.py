@@ -3271,11 +3271,11 @@ class DashboardCacheTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.get_bool", side_effect=lambda key: values.get(key, False)
+                "app.config.get_many", side_effect=lambda keys: {key: str(values.get(key, strings.get(key, ""))) for key in keys}
             ),
             patch("app.services.get", side_effect=lambda key: strings.get(key, "")),
-            patch("app.services.EmbyClient") as emby,
-            patch("app.services.JellyfinClient") as jellyfin,
+            patch("app.clients.emby.EmbyClient") as emby,
+            patch("app.clients.jellyfin.JellyfinClient") as jellyfin,
         ):
             emby.return_value.get_dashboard.return_value = emby_board
             jellyfin.return_value.get_dashboard.return_value = jellyfin_board

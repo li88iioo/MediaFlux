@@ -25,8 +25,6 @@ from app.clients.base import (
     SeriesSearchResult,
     close_media_server_client,
 )
-from app.clients.emby import EmbyClient
-from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.registry import COLLECTION_CATEGORIES, list_filter_definitions, validate_filters
@@ -229,45 +227,22 @@ def _load_dashboard(
 
 def _dashboard_jobs(*, reuse_recent: bool = True) -> list[Callable[[], DashboardData]]:
     jobs: list[Callable[[], DashboardData]] = []
-    if get_bool("EMBY_ENABLED"):
-        url, token = get("EMBY_URL"), get("EMBY_TOKEN")
-        if url and token:
+    for profile in sorted(list_configured_profiles(), key=lambda item: item.server_type):
+        if not profile.enabled:
+            continue
+        if profile.configured:
             jobs.append(
-                lambda url=url, token=token: _load_dashboard(
-                    EmbyClient(url, token),
-                    server_type="emby",
-                    web_url=url,
-                    reuse_recent=reuse_recent,
+                lambda profile=profile: _load_dashboard(
+                    profile.create_client(), server_type=profile.server_type,
+                    web_url=profile.url, reuse_recent=reuse_recent,
                 )
             )
         else:
             jobs.append(
-                lambda url=url: DashboardData(
-                    server_name="Emby / Jellyfin 10.x",
-                    server_type="emby",
-                    web_url=url,
-                    error="未配置 URL/Token 或 API Key",
-                )
-            )
-
-    if get_bool("JELLYFIN_ENABLED"):
-        url, key = get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")
-        if url and key:
-            jobs.append(
-                lambda url=url, key=key: _load_dashboard(
-                    JellyfinClient(url, key),
-                    server_type="jellyfin",
-                    web_url=url,
-                    reuse_recent=reuse_recent,
-                )
-            )
-        else:
-            jobs.append(
-                lambda url=url: DashboardData(
-                    server_name="Jellyfin",
-                    server_type="jellyfin",
-                    web_url=url,
-                    error="未配置 URL/API Key",
+                lambda profile=profile: DashboardData(
+                    server_name="Emby / Jellyfin 10.x" if profile.server_type == "emby" else profile.label,
+                    server_type=profile.server_type, web_url=profile.url,
+                    error="未配置 URL/Token 或 API Key" if profile.server_type == "emby" else "未配置 URL/API Key",
                 )
             )
     return jobs
@@ -365,14 +340,9 @@ def _configured_media_sources() -> list[tuple[str, str, str, MediaServerClient]]
     """构造已完整配置的媒体服务器客户端，不返回凭证。"""
     sources: list[tuple[str, str, str, MediaServerClient]] = []
     try:
-        if get_bool("EMBY_ENABLED"):
-            url, token = get("EMBY_URL"), get("EMBY_TOKEN")
-            if url and token:
-                sources.append(("emby", "Emby", url, EmbyClient(url, token)))
-        if get_bool("JELLYFIN_ENABLED"):
-            url, token = get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")
-            if url and token:
-                sources.append(("jellyfin", "Jellyfin", url, JellyfinClient(url, token)))
+        for profile in sorted(list_configured_profiles(), key=lambda item: item.server_type):
+            if profile.enabled and profile.configured:
+                sources.append((profile.server_type, profile.label, profile.url, profile.create_client()))
         return sources
     except Exception:
         for _server_type, _server_name, _web_url, client in sources:

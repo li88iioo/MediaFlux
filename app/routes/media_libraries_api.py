@@ -53,18 +53,6 @@ _CATEGORY_LABELS = {
 }
 
 
-def _client_for(profile: MediaServerProfile):
-    if profile.server_type == "jellyfin":
-        from app.clients.jellyfin import JellyfinClient
-
-        return JellyfinClient(profile.url, profile.credential)
-    if profile.server_type == "emby":
-        from app.clients.emby import EmbyClient
-
-        return EmbyClient(profile.url, profile.credential)
-    raise ValueError("媒体服务器类型无效")
-
-
 def _library_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(item.get("id") or "").strip(),
@@ -94,7 +82,7 @@ def _probe_profile(profile: MediaServerProfile) -> tuple[str, list[dict[str, Any
         return profile.server_type, [], "媒体服务器配置不完整"
     client = None
     try:
-        client = _client_for(profile)
+        client = profile.create_client()
         libraries = [_library_payload(item) for item in client.list_virtual_folders()]
         return profile.server_type, libraries, ""
     except Exception as exc:
@@ -479,7 +467,7 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
         return api_error("媒体服务器未启用或配置不完整", 400)
     client = None
     try:
-        client = _client_for(profile)
+        client = profile.create_client()
         libraries = [_library_payload(item) for item in client.list_virtual_folders()]
     except Exception as exc:
         logger.warning(

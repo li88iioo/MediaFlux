@@ -35,15 +35,15 @@ class MediaServerClientLifecycleTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.get_bool",
-                side_effect=lambda key, default=False: enabled.get(key, default),
+                "app.config.get_many",
+                side_effect=lambda keys: {key: str(enabled.get(key, values.get(key, ""))) for key in keys},
             ),
             patch(
                 "app.services.get",
                 side_effect=lambda key, default="": values.get(key, default),
             ),
-            patch("app.services.EmbyClient", return_value=emby_client),
-            patch("app.services.JellyfinClient", return_value=jellyfin_client),
+            patch("app.clients.emby.EmbyClient", return_value=emby_client),
+            patch("app.clients.jellyfin.JellyfinClient", return_value=jellyfin_client),
         ):
             boards = services._fetch_dashboards()
 
@@ -59,6 +59,20 @@ class MediaServerClientLifecycleTests(unittest.TestCase):
             self.assertIs(entered, client)
 
         client.close.assert_called_once_with()
+
+    def test_dashboard_incomplete_profiles_keep_public_errors_and_order(self):
+        from app import services
+        from app.modules.media_server_profiles import MediaServerProfile
+
+        profiles = [MediaServerProfile(f"configured:{kind}", kind, kind.title(), "", "", True)
+                    for kind in ("jellyfin", "emby")]
+        with patch.object(services, "list_configured_profiles", return_value=profiles), \
+             patch.object(MediaServerProfile, "create_client", side_effect=AssertionError("incomplete profile")):
+            boards = [job() for job in services._dashboard_jobs()]
+        self.assertEqual([(board.server_type, board.server_name, board.error) for board in boards], [
+            ("emby", "Emby / Jellyfin 10.x", "未配置 URL/Token 或 API Key"),
+            ("jellyfin", "Jellyfin", "未配置 URL/API Key"),
+        ])
 
     def test_context_manager_close_failure_preserves_business_exception(self) -> None:
         client = object.__new__(MediaServerClient)
@@ -83,15 +97,15 @@ class MediaServerClientLifecycleTests(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.get_bool",
-                side_effect=lambda key, default=False: enabled.get(key, default),
+                "app.config.get_many",
+                side_effect=lambda keys: {key: str(enabled.get(key, values.get(key, ""))) for key in keys},
             ),
             patch(
                 "app.services.get",
                 side_effect=lambda key, default="": values.get(key, default),
             ),
-            patch("app.services.EmbyClient", return_value=emby_client),
-            patch("app.services.JellyfinClient", side_effect=RuntimeError("constructor failed")),
+            patch("app.clients.emby.EmbyClient", return_value=emby_client),
+            patch("app.clients.jellyfin.JellyfinClient", side_effect=RuntimeError("constructor failed")),
             self.assertRaisesRegex(RuntimeError, "constructor failed"),
         ):
             services._configured_media_sources()

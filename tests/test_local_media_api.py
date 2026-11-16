@@ -469,9 +469,9 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
 
     def test_media_server_library_endpoints_only_expose_enabled_profiles(self):
         self.login()
-        profile = SimpleNamespace(
-            server_type="jellyfin", label="Jellyfin", url="http://jellyfin",
-            credential="secret", enabled=True, configured=True,
+        from app.modules.media_server_profiles import MediaServerProfile
+        profile = MediaServerProfile(
+            "configured:jellyfin", "jellyfin", "Jellyfin", "http://jellyfin", "secret", True,
         )
         client = Mock()
         client.list_virtual_folders.return_value = [{

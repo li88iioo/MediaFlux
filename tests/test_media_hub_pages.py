@@ -47,6 +47,49 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers.get("location"), "/")
 
+    def test_recent_and_dashboard_use_configured_user_without_admin_fallback(self):
+        from app import config, services
+        from app.clients.emby import EmbyClient
+        from app.clients.jellyfin import JellyfinClient
+        import requests
+
+        self._login()
+        self.addCleanup(services.clear_dashboard_cache)
+        for configured_user, unavailable in (("family", False), ("family", True), ("", False)):
+            with self.subTest(user=configured_user, unavailable=unavailable):
+                config.set_and_save({
+                    "JELLYFIN_ENABLED": "1", "JELLYFIN_URL": "http://media.invalid",
+                    "JELLYFIN_API_KEY": "fixture", "JELLYFIN_USER_ID": configured_user,
+                    "EMBY_ENABLED": "1", "EMBY_URL": "http://legacy.invalid",
+                    "EMBY_TOKEN": "fixture", "EMBY_USER_ID": configured_user,
+                })
+                calls = []
+
+                def request(client, path, **_kwargs):
+                    calls.append((client.display_name, path))
+                    if path in ("/Users", "/Users/Public"):
+                        return [{"Id": "admin", "Policy": {"IsAdministrator": True}}, {"Id": "family"}]
+                    if path.startswith("/System/Info"):
+                        return {"ServerName": "fixture", "ProductName": "Jellyfin", "Version": "12.3.0"}
+                    if unavailable and path.startswith("/Users/family/"):
+                        raise requests.HTTPError("configured user unavailable")
+                    return {"Items": [], "TotalRecordCount": 0}
+
+                with patch.object(JellyfinClient, "_request", request), patch.object(EmbyClient, "_request", request), \
+                     patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
+                    for route in ("/media/recent", "/api/dashboard"):
+                        services.clear_dashboard_cache()
+                        calls.clear()
+                        response = self.client.get(route, headers={"X-Requested-With": "MediaFlux"})
+                        self.assertEqual(response.status_code, 200)
+                        expected_user = configured_user or "admin"
+                        for server in (JellyfinClient.display_name, EmbyClient.display_name):
+                            paths = [path for label, path in calls if label == server and path.startswith("/Users/")]
+                            self.assertTrue(paths, (route, server, calls))
+                            self.assertTrue(all(path.startswith(f"/Users/{expected_user}/") for path in paths), paths)
+                        if configured_user:
+                            self.assertFalse(any(path in ("/Users", "/Users/Public") for _, path in calls))
+
     @staticmethod
     def _dashboard() -> DashboardData:
         return DashboardData(

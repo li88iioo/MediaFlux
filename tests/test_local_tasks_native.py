@@ -264,17 +264,18 @@ def media_server(backend, monkeypatch):
     client = Mock()
     client.list_virtual_folders.return_value = [{"id": "real-library-id", "name": "剧集"}]
     client.refresh_for_paths.return_value = {"ok": True, "scope": "item", "matched": 1}
-    profile = SimpleNamespace(server_type="jellyfin", enabled=True, configured=True, label="测试服务", url="https://media.invalid", credential="private-key")
+    profile = SimpleNamespace(server_type="jellyfin", enabled=True, configured=True, label="测试服务", url="https://media.invalid", credential="private-key", user_id="", create_client=lambda **kwargs: client)
     options = {"path_mappings": (), "allow_global_refresh_fallback": True}
     monkeypatch.setattr(library, "list_configured_profiles", lambda: [profile])
     monkeypatch.setattr(library, "configured_media_server_refresh_options", lambda _: options)
-    monkeypatch.setattr(library, "_client_for_provider", lambda *args, **kwargs: client)
     return selected, client, profile, options
 
 
-@pytest.mark.parametrize("change", ["none", "endpoint", "credential", "mapping", "target", "cancel"])
+@pytest.mark.parametrize("change", ["none", "endpoint", "credential", "user", "user-switch", "user-clear", "mapping", "target", "cancel"])
 def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, media_server, change):
     selected, client, profile, options = media_server
+    if change in ("user-switch", "user-clear"):
+        profile.user_id = "family"
     async def check():
         effects = executor()
         context = await context_for(effects)
@@ -285,6 +286,8 @@ def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, med
             profile.url = "https://changed.invalid"
         elif change == "credential":
             profile.credential = "changed-private-key"
+        elif change in ("user", "user-switch", "user-clear"):
+            profile.user_id = {"user": "family", "user-switch": "other", "user-clear": ""}[change]
         elif change == "mapping":
             options["path_mappings"] = (MediaServerPathMapping("/nas", "/changed"),)
         elif change == "target":
@@ -307,7 +310,7 @@ def test_refresh_cold_confirmation_freezes_binding_config_and_paths(backend, med
 def test_bound_local_refresh_preserves_exact_movie_path_with_strict_scope(backend, media_server, monkeypatch):
     from app.clients.jellyfin import JellyfinClient
 
-    selected, _, _, _ = media_server
+    selected, _, profile, _ = media_server
     client = JellyfinClient("http://media.invalid", "fixture-key")
     client.list_virtual_folders = lambda: [{"id": "real-library-id", "name": "剧集", "locations": ["/nas/Shows"]}]
     client._library_items_with_paths = lambda library_id: [
@@ -317,7 +320,7 @@ def test_bound_local_refresh_preserves_exact_movie_path_with_strict_scope(backen
     refresh = Mock(return_value=True)
     client.refresh_library = refresh
     client.refresh_all = Mock(side_effect=AssertionError("global refresh forbidden"))
-    monkeypatch.setattr(library, "_client_for_provider", lambda *args, **kwargs: client)
+    monkeypatch.setattr(profile, "create_client", lambda **kwargs: client)
     preview = library.prepare_local_task_refresh(selected)
     result = library.refresh_local_task_library(selected, expected_fingerprint=preview["fingerprint"])
     assert result["status"] == "completed"

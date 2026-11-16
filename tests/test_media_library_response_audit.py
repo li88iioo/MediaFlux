@@ -96,7 +96,7 @@ class MediaLibraryResponseAuditTests(TestCase):
             patch.object(client, "close") as close,
         ):
             with patch(
-                "app.routes.media_libraries_api._client_for", return_value=client
+                "app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=client
             ):
                 provider, libraries, error = _probe_profile(profile)
             self.assertEqual(provider, "jellyfin")
@@ -166,7 +166,7 @@ class MediaLibraryHttpResponseAuditTests(IsolatedDatabaseTestCase):
                     return_value=[profile],
                 ),
                 patch(
-                    "app.routes.media_libraries_api._client_for", return_value=client
+                    "app.modules.media_server_profiles.MediaServerProfile.create_client", return_value=client
                 ),
             ):
                 failed = web_client.post(

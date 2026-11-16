@@ -12,14 +12,12 @@ from app import database as db
 from app.repositories import local_media as local_media_repo
 from app.modules.local_media_service import LocalMediaServiceError
 from app.clients.base import close_media_server_client
-from app.clients.emby import EmbyClient
-from app.clients.jellyfin import JellyfinClient
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
     MediaServerRefreshOptions,
     configured_media_server_refresh_options,
 )
-from app.modules.media_server_profiles import list_configured_profiles
+from app.modules.media_server_profiles import MediaServerProfile, list_configured_profiles
 from app.modules.web_secret import get_web_secret
 
 
@@ -32,24 +30,14 @@ def _path_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _client_for_provider(
-    provider: str, profile: Any, *, refresh_options: MediaServerRefreshOptions
-) -> Any:
-    if provider == "jellyfin":
-        return JellyfinClient(profile.url, profile.credential, **refresh_options)
-    if provider == "emby":
-        return EmbyClient(profile.url, profile.credential, **refresh_options)
-    raise LocalMediaServiceError("绑定的媒体服务器类型不受支持")
-
-
 def _server_config_digest(
-    provider: str, profile: Any, refresh_options: MediaServerRefreshOptions
+    provider: str, profile: MediaServerProfile, refresh_options: MediaServerRefreshOptions
 ) -> str:
     mappings = refresh_options.get("path_mappings") or ()
     canonical = {
         "provider": provider,
-        "url": str(profile.url or "").strip().rstrip("/"),
-        "credential": str(profile.credential or ""),
+        "url": profile.url.strip().rstrip("/"),
+        "credential": profile.credential,
         "path_mappings": [
             {
                 "local_prefix": str(getattr(item, "local_prefix", "")),
@@ -59,6 +47,8 @@ def _server_config_digest(
         ],
         "allow_global_refresh_fallback": (refresh_options.get("allow_global_refresh_fallback", False)),
     }
+    if profile.user_id:
+        canonical["user_id"] = profile.user_id
     try:
         secret = get_web_secret().encode("utf-8")
     except Exception:
@@ -142,7 +132,7 @@ def bound_local_task_library(task: Any) -> dict[str, Any]:
             "绑定的媒体服务器当前未启用或未配置"
         )
     refresh_options = configured_media_server_refresh_options(provider)
-    client = _client_for_provider(provider, profile, refresh_options=refresh_options)
+    client = profile.create_client(**refresh_options)
     try:
         try:
             folders = client.list_virtual_folders()

@@ -163,7 +163,7 @@ def test_real_config_save_and_runtime_rebuild_refresh_search_and_episode_invento
     calls = []
 
     class Media:
-        def __init__(self, url, _token):
+        def __init__(self, url, _token, **_options):
             self.url = url
 
         def search_media(self, _query, *, cancelled=None, **options):
@@ -195,7 +195,7 @@ def test_real_config_save_and_runtime_rebuild_refresh_search_and_episode_invento
     async def scenario():
         with (
             initialized_web_runtime(),
-            patch("app.services.JellyfinClient", Media),
+            patch("app.clients.jellyfin.JellyfinClient", Media),
             patch.object(episode_audit, "TMDBClient", TMDB),
             patch("socket.socket.connect", side_effect=AssertionError("network forbidden")),
         ):

@@ -238,12 +238,7 @@ def list_media_server_libraries(provider: str, request: Request):
             raise ValueError("媒体服务器类型无效")
         if not profile.enabled or not profile.configured:
             raise ValueError(f"{profile.label} 未启用或未配置")
-        if normalized == "jellyfin":
-            from app.clients.jellyfin import JellyfinClient
-            client = JellyfinClient(profile.url, profile.credential)
-        else:
-            from app.clients.emby import EmbyClient
-            client = EmbyClient(profile.url, profile.credential)
+        client = profile.create_client()
         try:
             return {"provider": normalized, "libraries": client.list_virtual_folders()}
         finally:
