@@ -1359,6 +1359,93 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         )
         self.assertTrue(page.locator("#mediaSubSaveBtn").is_enabled())
 
+    def test_subscription_runs_clear_cancel_success_and_empty_on_desktop_and_mobile(self):
+        from playwright.sync_api import expect
+
+        path = '/api/subscriptions/runs'
+        for width in (1280, 390):
+            with self.subTest(width=width):
+                if self.context:
+                    self.context.close()
+                self.requests.clear()
+                self.replies[('GET', path)] = [(200, [
+                    {'id': 2, 'title': '运行中媒体', 'status': 'running'},
+                    {'id': 1, 'title': '历史媒体', 'status': 'satisfied'},
+                ]), (200, [{'id': 2, 'title': '运行中媒体', 'status': 'running'}]), (200, [])]
+                self.replies[('DELETE', path)] = [
+                    (200, {'success': True, 'deleted': 150, 'retained': 1}),
+                    (200, {'success': True, 'deleted': 1, 'retained': 0}),
+                ]
+                page = self.make_page('rss', width)
+                page.locator('#subscriptionTabRuns').click()
+                clear = page.locator('#clearSubscriptionRuns')
+                expect(clear).to_be_enabled()
+                clear.click()
+                expect(page.locator('#appConfirmModal')).to_contain_text('含未显示的历史记录')
+                page.locator('#appConfirmCancel').click()
+                expect(clear).to_be_focused()
+                self.assertFalse(any(item['method'] == 'DELETE' for item in self.requests))
+                expect(page.locator('.subscription-run-row')).to_have_count(2)
+                bounds = clear.bounding_box()
+                self.assertIsNotNone(bounds)
+                self.assertLessEqual(bounds['x'] + bounds['width'], width)
+
+                clear.click()
+                self.hold_reply(path, 'clear', method='DELETE')
+                page.locator('#appConfirmSubmit').click()
+                self.wait_reply('clear')
+                expect(clear).to_be_disabled()
+                busy_bounds = clear.bounding_box()
+                assert busy_bounds is not None and bounds is not None
+                self.assertAlmostEqual(busy_bounds['width'], bounds['width'], delta=1)
+                self.assertAlmostEqual(busy_bounds['height'], bounds['height'], delta=1)
+                self.release_reply('clear')
+                expect(page.locator('.subscription-run-row')).to_have_count(1)
+                expect(page.locator('#subscriptionRunList')).to_contain_text('运行中媒体')
+                expect(page.locator('.app-toast').last).to_contain_text('已清除 150 条记录，保留 1 条运行中记录')
+
+                # 下一轮完成后再次清理，正确进入空态；订阅卡片不受影响。
+                clear.click()
+                page.locator('#appConfirmSubmit').click()
+                expect(page.locator('#subscriptionRunList')).to_contain_text('暂无巡检记录')
+                expect(clear).to_be_disabled()
+                page.locator('#subscriptionTabMedia').click()
+                expect(page.locator('[data-subscription-id]')).to_have_count(2)
+                self.assertEqual(sum(item['method'] == 'DELETE' for item in self.requests), 2)
+
+    def test_subscription_runs_clear_failure_and_stale_refresh_do_not_erase_or_restore_history(self):
+        from playwright.sync_api import expect
+
+        path = '/api/subscriptions/runs'
+        rows = [{'id': 1, 'title': '历史媒体', 'status': 'failed'}]
+        self.replies[('GET', path)] = [(200, rows), (200, rows), (200, [])]
+        self.replies[('DELETE', path)] = [
+            (503, {'error': '清除暂不可用'}),
+            (200, {'success': True, 'deleted': 1, 'retained': 0}),
+        ]
+        page = self.make_page('rss')
+        page.locator('#subscriptionTabRuns').click()
+        clear = page.locator('#clearSubscriptionRuns')
+        clear.click()
+        page.locator('#appConfirmSubmit').click()
+        expect(page.locator('#subscriptionRunList')).to_contain_text('历史媒体')
+        expect(page.get_by_role('alertdialog')).to_contain_text('清除暂不可用')
+        page.get_by_role('button', name='知道了').click()
+        expect(clear).to_be_enabled()
+
+        clear.click()
+        self.hold_reply(path, 'delete', method='DELETE')
+        page.locator('#appConfirmSubmit').click()
+        self.wait_reply('delete')
+        self.hold_reply(path, 'old-refresh', method='GET')
+        page.locator('#refreshSubscriptionRuns').click()
+        self.wait_reply('old-refresh')
+        self.release_reply('delete')
+        expect(page.locator('#subscriptionRunList')).to_contain_text('暂无巡检记录')
+        self.release_reply('old-refresh')
+        expect(page.locator('#subscriptionRunList')).to_contain_text('暂无巡检记录')
+        expect(clear).to_be_disabled()
+
     def test_subscription_center_automatically_loads_all_cursor_pages(self):
         media = [{**SUBSCRIPTIONS[0], "id": number, "tmdb_id": str(number)} for number in range(1, 202)]
         watch = [{"provider": "tmdb", "external_id": str(number), "media_type": "tv",

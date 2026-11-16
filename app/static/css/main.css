@@ -6687,6 +6687,7 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
 .subscription-refresh,
 .subscription-create { height: 36px; min-height: 36px; }
 .subscription-refresh { width: auto; min-width: 84px; }
+.subscription-run-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .subscription-panel-actions .subscription-create {
     width: auto;
     min-width: 142px;
@@ -7356,10 +7357,12 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
         gap: 10px;
     }
     #subscriptionPanelWatchlist > .subscription-panel-head > .subscription-refresh,
-    #subscriptionPanelRuns > .subscription-panel-head > .subscription-refresh {
+    #subscriptionPanelRuns > .subscription-panel-head > .subscription-run-actions {
         width: auto;
         flex: 0 0 auto;
     }
+    #subscriptionPanelRuns > .subscription-panel-head { flex-wrap: wrap; }
+    .subscription-run-actions { margin-left: auto; }
     .subscription-panel-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; width: 100%; align-items: center; }
     .subscription-panel-actions .form-select { grid-column: auto; width: 100%; min-width: 0; height: 38px; min-height: 38px; font-size: 12px; }
     .subscription-refresh { height: 38px; min-height: 38px; padding-inline: 10px; min-width: 0; gap: 5px; font-size: 12px; }

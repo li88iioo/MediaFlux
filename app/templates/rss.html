@@ -126,7 +126,13 @@
     </section>
 
     <section class="subscription-panel" id="subscriptionPanelRuns" role="tabpanel" aria-labelledby="subscriptionTabRuns" data-subscription-panel="runs" hidden>
-        <header class="subscription-panel-head"><div class="subscription-heading"><div class="subscription-heading-line"><span class="subscription-eyebrow">AUDIT LOG</span><span class="subscription-heading-divider" aria-hidden="true">/</span><h2>媒体巡检记录</h2></div><p>记录每次库存核验、缺集判断、资源候选与自动提交结果。</p></div><button type="button" class="jump-btn subscription-refresh" id="refreshSubscriptionRuns"><i data-lucide="refresh-cw"></i><span>刷新</span></button></header>
+        <header class="subscription-panel-head">
+            <div class="subscription-heading"><div class="subscription-heading-line"><span class="subscription-eyebrow">AUDIT LOG</span><span class="subscription-heading-divider" aria-hidden="true">/</span><h2>媒体巡检记录</h2></div><p>记录每次库存核验、缺集判断、资源候选与自动提交结果。</p></div>
+            <div class="subscription-run-actions">
+                <button type="button" class="jump-btn subscription-refresh" id="refreshSubscriptionRuns"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+                <button type="button" class="jump-btn subscription-refresh danger" id="clearSubscriptionRuns" disabled><i data-lucide="eraser"></i><span>清除</span></button>
+            </div>
+        </header>
         <div class="subscription-list-frame" aria-live="polite" aria-busy="false"><div class="subscription-run-list" id="subscriptionRunList"></div></div>
     </section>
 </div>

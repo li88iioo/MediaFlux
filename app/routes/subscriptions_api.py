@@ -237,6 +237,12 @@ def list_media_subscription_runs(
     ))
 
 
+@router.delete("/runs")
+def clear_media_subscription_runs(request: Request):
+    require_api_login(request)
+    return api_response({"success": True, **media_subscriptions_repo.clear_media_subscription_runs()})
+
+
 @router.get("/watchlist")
 def list_watchlist(request: Request, limit: int = Query(default=200, ge=1, le=200),
                    before_number: int | None = Query(default=None, ge=1)):

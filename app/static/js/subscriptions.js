@@ -15,6 +15,7 @@
         mediaController: null,
         watchlistController: null,
         runsController: null,
+        runsClearing: false,
         statsController: null,
         candidateController: null,
         editingId: null,
@@ -46,6 +47,7 @@
         mediaRefresh: document.getElementById('refreshMediaSubscriptions'),
         watchlistRefresh: document.getElementById('refreshSubscriptionWatchlist'),
         runsRefresh: document.getElementById('refreshSubscriptionRuns'),
+        runsClear: document.getElementById('clearSubscriptionRuns'),
         createMedia: document.getElementById('createMediaSubscription'),
         mediaModal: document.getElementById('mediaSubModal'),
         mediaForm: document.getElementById('mediaSubForm'),
@@ -660,6 +662,7 @@
         const frame = elements.runs.closest('.subscription-list-frame');
         frame?.setAttribute('aria-busy', 'true');
         buttonBusy(elements.runsRefresh, true, '刷新');
+        elements.runsClear.disabled = true;
         const hadContent = elements.runs.childElementCount > 0;
         let timer = null;
         if (!hadContent || !preserve) timer = window.setTimeout(() => {
@@ -688,7 +691,31 @@
                 frame?.setAttribute('aria-busy', 'false');
                 buttonBusy(elements.runsRefresh, false);
                 state.runsController = null;
+                elements.runsClear.disabled = state.runsClearing || !state.runs.length;
             }
+        }
+    }
+
+    async function clearRuns() {
+        if (state.runsClearing) return;
+        state.runsClearing = true;
+        try {
+            const confirmed = await appConfirm({
+                title: '清除运行记录',
+                message: '清除全部已结束的媒体巡检记录（含未显示的历史记录），保留运行中的记录。订阅、候选资源、下载任务和媒体文件不受影响。',
+                confirmText: '清除记录', danger: true, trigger: elements.runsClear,
+            });
+            if (!confirmed) return;
+            buttonBusy(elements.runsClear, true, '清除');
+            const result = await apiJSON('/api/subscriptions/runs', {method: 'DELETE'});
+            await loadRuns({preserve: true});
+            window.showToast?.(`已清除 ${result.deleted} 条记录${result.retained ? `，保留 ${result.retained} 条运行中记录` : ''}`, 'success');
+        } catch (error) {
+            appAlert?.({type: 'error', title: '清除运行记录失败', message: error.message});
+        } finally {
+            state.runsClearing = false;
+            buttonBusy(elements.runsClear, false);
+            elements.runsClear.disabled = Boolean(state.runsController) || !state.runs.length;
         }
     }
 
@@ -1259,6 +1286,7 @@
     elements.mediaRefresh.addEventListener('click', () => loadMedia({preserve: true}));
     elements.watchlistRefresh.addEventListener('click', () => loadWatchlist({preserve: true}));
     elements.runsRefresh.addEventListener('click', () => loadRuns({preserve: true}));
+    elements.runsClear.addEventListener('click', clearRuns);
     elements.createMedia.addEventListener('click', () => openCreateMedia(elements.createMedia));
     elements.mediaForm.addEventListener('submit', saveMediaSubscription);
     fields.mediaType.addEventListener('change', syncMediaForm);

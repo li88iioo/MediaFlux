@@ -9,6 +9,7 @@ from starlette.requests import Request
 import asyncio
 import json
 import re
+import sqlite3
 import threading
 import unittest
 from pathlib import Path
@@ -115,6 +116,8 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
     def test_api_requires_login_and_csrf_for_mutations(self) -> None:
         self.assertEqual(self.client.get("/api/subscriptions/media").status_code, 401)
         self.assertEqual(self.client.get("/api/subscriptions/stats").status_code, 401)
+        self.assertEqual(self.client.get("/api/subscriptions/runs").status_code, 401)
+        self.assertEqual(self.client.delete("/api/subscriptions/runs").status_code, 401)
         self.assertEqual(
             self.client.post("/api/subscriptions/media", json={"tmdb_id": "1"}).status_code,
             401,
@@ -128,6 +131,172 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
             self.client.delete("/api/subscriptions/media/1").status_code,
             403,
         )
+        self.assertEqual(self.client.delete("/api/subscriptions/runs").status_code, 403)
+        self.assertEqual(self.client.delete(
+            "/api/subscriptions/runs", headers={"X-CSRF-Token": "invalid"},
+        ).status_code, 403)
+
+    def test_clear_runs_deletes_all_finished_history_and_is_idempotent(self) -> None:
+        headers = self.login()
+        subscription_ids = [media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id=str(number), tmdb_id=str(number),
+            media_type="movie", title=f"清除测试 {number}",
+        ) for number in (1, 2, 3)]
+        statuses = ("satisfied", "missing", "inconclusive", "failed", "cancelled")
+        with db.get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO media_subscription_runs(subscription_id,status,started_at,finished_at) "
+                "VALUES(?,?,?,?)",
+                [(subscription_ids[number % 3], statuses[number % len(statuses)], db.now(), None)
+                 for number in range(305)],
+            )
+        self.assertTrue(media_subscriptions_repo.delete_media_subscription(subscription_ids[2]))
+        running_ids = [media_subscriptions_repo.claim_media_subscription_check_run(sid)
+                       for sid in subscription_ids[:2]]
+        self.assertNotIn(None, running_ids)
+        with db.get_conn() as conn:
+            subscriptions = conn.execute("SELECT * FROM media_subscriptions ORDER BY id").fetchall()
+            running = conn.execute(
+                "SELECT * FROM media_subscription_runs WHERE status='running' ORDER BY id"
+            ).fetchall()
+        listed = self.client.get("/api/subscriptions/runs")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(len(listed.json()), 100)
+        self.assertEqual(listed.json()[0]["id"], running_ids[-1])
+        self.assertEqual(listed.json()[0]["payload"], {})
+        self.assertEqual(len(self.client.get(
+            "/api/subscriptions/runs", params={"subscription_id": subscription_ids[0], "limit": 300},
+        ).json()), 103)
+
+        response = self.client.delete("/api/subscriptions/runs", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"success": True, "deleted": 305, "retained": 2})
+        self.assertEqual(self.client.delete("/api/subscriptions/runs", headers=headers).json(),
+                         {"success": True, "deleted": 0, "retained": 2})
+        self.assertEqual({item["id"] for item in self.client.get("/api/subscriptions/runs").json()},
+                         set(running_ids))
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT * FROM media_subscriptions ORDER BY id").fetchall(),
+                             subscriptions)
+            self.assertEqual(conn.execute("SELECT * FROM media_subscription_runs ORDER BY id").fetchall(),
+                             running)
+
+    def test_clear_runs_preserves_live_check_downloads_and_notifications(self) -> None:
+        from app.modules.media_subscription_notifications import drain_media_subscription_notifications
+        from app.notifier import TelegramSendResult
+        from app.repositories import download_requests as downloads_repo
+        from app.repositories import media_experience as experience_repo
+
+        headers = self.login()
+        sid = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="1", tmdb_id="1", media_type="movie", title="清除通知测试",
+        )
+        rule = experience_repo.get_notification_rule(sid)
+        assert rule is not None
+        self.assertIsNotNone(experience_repo.set_notification_rule(
+            sid, expected_rule_revision=rule["revision"],
+            expected_subscription_revision=rule["subscription_revision"], updates={"enabled": True},
+        ))
+        revision = rule["subscription_revision"]
+
+        def finalize(run_id: int) -> None:
+            self.assertTrue(media_subscriptions_repo.finalize_media_subscription_check(
+                sid, run_id, status="missing", run_status="missing", summary="发现缺失",
+                payload={"status": "missing", "candidate_count": 1}, interval_minutes=60,
+                expected_count=1, local_count=0, missing_count=1, missing_json="[]", result_json="{}",
+                subscription_revision=revision,
+            ))
+
+        previous_run = media_subscriptions_repo.claim_media_subscription_check_run(sid)
+        assert previous_run is not None
+        candidate_id = seed_media_subscription_candidates(
+            sid, "tmdb:1:movie", season=None, episode=None,
+            candidates=[{"result_id": "clear-runs", "title": "候选"}], expires_at="2099-01-01 00:00:00",
+        )[0]
+        admission_id = media_subscriptions_repo.claim_media_download_admission(
+            media_key="tmdb:1:movie", tmdb_id="1", media_type="movie", subscription_id=sid,
+            candidate_id=candidate_id, season=None, episode=None, subscription_revision=revision,
+            require_active_check=True, check_run_id=previous_run,
+        )
+        assert admission_id is not None and admission_id > 0
+        self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
+            admission_id, subscription_id=sid, subscription_revision=revision,
+            require_active_check=True, check_run_id=previous_run,
+        ))
+        request_id, created = downloads_repo.create_download_request(
+            "clear-runs-download", "magnet", title="候选", admission_id=admission_id,
+        )
+        self.assertTrue(created)
+        media_subscriptions_repo.update_media_subscription_candidate(
+            candidate_id, status="submitted", request_id=request_id,
+        )
+        downloads_repo.add_download_log("qb", title="候选", request_id=request_id)
+        finalize(previous_run)
+        live_run = media_subscriptions_repo.claim_media_subscription_check_run(sid)
+        assert live_run is not None
+        tables = ("media_subscriptions", "media_subscription_candidates", "media_download_admissions",
+                  "download_requests", "download_log", "media_subscription_notification_rules")
+        with db.get_conn() as conn:
+            before = {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                      for table in tables}
+        notification = dict(experience_repo.list_notification_outbox()[0])
+
+        response = self.client.delete("/api/subscriptions/runs", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"success": True, "deleted": 1, "retained": 1})
+        with db.get_conn() as conn:
+            for table in tables:
+                self.assertEqual(conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall(),
+                                 before[table], table)
+        self.assertEqual(dict(experience_repo.list_notification_outbox()[0]),
+                         {**notification, "run_id": None})
+        self.assertTrue(media_subscriptions_repo.media_subscription_check_is_active(sid, revision, run_id=live_run))
+        self.assertIsNone(media_subscriptions_repo.claim_media_subscription_check_run(sid))
+        finalize(live_run)
+        self.assertEqual(self.client.get(f"/api/subscriptions/media/{sid}").json()["status"], "missing")
+        self.assertEqual(self.client.get("/api/subscriptions/runs").json()[0]["status"], "missing")
+        self.assertEqual(self.client.delete("/api/subscriptions/runs", headers=headers).json(),
+                         {"success": True, "deleted": 1, "retained": 0})
+        self.assertEqual(self.client.delete("/api/subscriptions/runs", headers=headers).json(),
+                         {"success": True, "deleted": 0, "retained": 0})
+        self.assertEqual(self.client.get("/api/subscriptions/runs").json(), [])
+        notifications = experience_repo.list_notification_outbox()
+        self.assertEqual({row["event_key"] for row in notifications},
+                         {f"media-subscription-run:{run}:missing" for run in (previous_run, live_run)})
+        self.assertTrue(all(row["run_id"] is None and row["status"] == "pending" for row in notifications))
+        with patch("app.modules.telegram_notification_center.notification_target_chat_id", return_value="100"), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True, message_id=51),
+        ) as send:
+            self.assertTrue(drain_media_subscription_notifications())
+            self.assertTrue(drain_media_subscription_notifications())
+        self.assertEqual(send.call_count, 2)
+        self.assertTrue(all(row["status"] == "sent" for row in experience_repo.list_notification_outbox()))
+
+    def test_clear_runs_rolls_back_on_delete_failure(self) -> None:
+        headers = self.login()
+        sid = media_subscriptions_repo.add_media_subscription(
+            provider="tmdb", external_id="1", tmdb_id="1", media_type="movie", title="清除回滚测试",
+        )
+        with db.get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO media_subscription_runs(subscription_id,status,started_at) VALUES(?,?,?)",
+                [(sid, status, db.now()) for status in ("satisfied", "failed")],
+            )
+            before = conn.execute("SELECT * FROM media_subscription_runs ORDER BY id").fetchall()
+            conn.execute(
+                "CREATE TRIGGER reject_history_clear BEFORE DELETE ON media_subscription_runs "
+                "WHEN OLD.status='failed' BEGIN SELECT RAISE(FAIL, 'clear failed'); END"
+            )
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "clear failed"):
+                self.client.delete("/api/subscriptions/runs", headers=headers)
+            with db.get_conn() as conn:
+                self.assertEqual(conn.execute("SELECT * FROM media_subscription_runs ORDER BY id").fetchall(),
+                                 before)
+        finally:
+            with db.get_conn() as conn:
+                conn.execute("DROP TRIGGER reject_history_clear")
 
     def test_media_form_defaults_match_creation_and_leave_saved_values_unchanged(self) -> None:
         headers = self.login()

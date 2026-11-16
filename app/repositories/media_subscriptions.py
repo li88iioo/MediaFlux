@@ -947,6 +947,19 @@ def list_media_subscription_runs(
         ).fetchall()
 
 
+def clear_media_subscription_runs() -> dict[str, int]:
+    """原子清除已结束的巡检审计，保留运行租约和独立通知 outbox。"""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        deleted = conn.execute(
+            "DELETE FROM media_subscription_runs WHERE status!='running'"
+        ).rowcount
+        retained = conn.execute(
+            "SELECT COUNT(*) FROM media_subscription_runs WHERE status='running'"
+        ).fetchone()[0]
+        return {"deleted": deleted, "retained": retained}
+
+
 def _expire_media_subscription_candidates_conn(
     conn: sqlite3.Connection,
     *,
