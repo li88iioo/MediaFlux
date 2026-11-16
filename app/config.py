@@ -264,7 +264,7 @@ def use_runtime_config_snapshot(snapshot: RuntimeConfigSnapshot):
 
 
 @contextmanager
-def runtime_config_publication(updates: Mapping[str, str]):
+def runtime_config_publication(updates: Mapping[str, str | None]):
     """Revoke before file publication; only the outer successful owner stabilizes."""
     _validate_runtime_updates(updates, include_override_keys=True)
     from app import database as db
@@ -958,11 +958,11 @@ def _transactional_recovery_update(
 
 def update_env_file(
     path: Path,
-    updates: Mapping[str, str],
+    updates: Mapping[str, str | None],
     *,
     expected: bytes | None,
 ) -> EnvUpdateResult:
-    """基于启动快照安全合并配置，绝不以 replace 覆盖竞争者。"""
+    """基于快照 CAS 合并配置；None 恢复键缺失，空字符串保持显式空值。"""
     target = Path(path)
     with _lock:
         if expected is not None:
@@ -975,7 +975,12 @@ def update_env_file(
         else:
             current = {}
         merged = dict(current)
-        merged.update({key: value for key, value in updates.items()})
+        for key, value in updates.items():
+            _validate_env_item(key, "" if value is None else value)
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
         if expected is None:
             try:
                 payload = write_env_file(target, merged, replace=False)
@@ -994,21 +999,21 @@ def has_external_override(key: str) -> bool:
     return normalized in _STARTUP_ENV_OVERRIDES and bool(os.environ.get(normalized))
 
 
-def _validate_runtime_updates(updates: Mapping[str, str], *, include_override_keys: bool = False) -> None:
+def _validate_runtime_updates(updates: Mapping[str, str | None], *, include_override_keys: bool = False) -> None:
     externally_managed = sorted(filter(has_external_override, updates))
     if externally_managed and include_override_keys:
         raise ExternalConfigOverrideError(
             "目标配置由运行环境覆盖: " + ", ".join(externally_managed[:5])
         )
     for key, value in updates.items():
-        _validate_env_item(key, value)
+        _validate_env_item(key, "" if value is None else value)
     if externally_managed:
         raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
 
 
 def update_runtime_env_file(
     path: Path,
-    updates: Mapping[str, str],
+    updates: Mapping[str, str | None],
     *,
     expected: bytes | None,
 ) -> EnvUpdateResult:
@@ -1024,7 +1029,10 @@ def update_runtime_env_file(
             if target == Path(ENV_FILE):
                 _cache = dict(result.data)
             for key, value in normalized.items():
-                os.environ[key] = value
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
             return result
 
     if target != Path(ENV_FILE):
@@ -1053,8 +1061,8 @@ def reload_after_restore() -> None:
         _cache = None
 
 
-def set_and_save(updates: dict[str, str]) -> None:
-    """基于读取快照 CAS 更新当前 user.env，拒绝覆盖并发写入。"""
+def set_and_save(updates: Mapping[str, str | None]) -> None:
+    """CAS 更新 user.env；None 移除键以恢复继承，拒绝覆盖并发写入。"""
     _validate_runtime_updates(updates, include_override_keys=True)
     with _lock:
         expected, _current = read_env_snapshot(ENV_FILE)

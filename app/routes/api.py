@@ -1418,16 +1418,17 @@ def save_config(request: Request, data: Any = Body(default=None)):
         from app.modules.local_media_service import LOCAL_MEDIA_RUNTIME_KEYS
 
         local_media_keys = set(LOCAL_MEDIA_RUNTIME_KEYS) & updates.keys()
+        previous_file_values = config.all_items()
         persisted_updates = {
             key: value
             for key, value in updates.items()
-            if config.get(key, "") != value
+            if config.get(key, "") != value or (value == "" and key not in previous_file_values)
         }
         changed_keys = frozenset(persisted_updates)
         retired_source_ids: list[str] = []
         persist_ms = 0
         if persisted_updates:
-            previous_values = {key: config.get(key, "") for key in changed_keys}
+            previous_values = {key: previous_file_values.get(key) for key in changed_keys}
             persist_started = time.perf_counter()
             strm_reconcile_required = new_strm_sources is not None and "GY_STRM_SOURCE_DIRS" in changed_keys
             retirement = nullcontext([])

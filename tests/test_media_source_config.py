@@ -201,7 +201,7 @@ class MediaConfigSaveTests(unittest.TestCase):
             yield ["11"]
             raise RuntimeError("commit failed")
 
-        with patch("app.routes.api.require_api_login"), patch(
+        with patch("app.routes.api.config.all_items", return_value={"GY_STRM_SOURCE_DIRS": old_sources}), patch("app.routes.api.require_api_login"), patch(
             "app.routes.api.config.get",
             side_effect=lambda key, default="": {
                 "GY_STRM_SOURCE_DIRS": old_sources,

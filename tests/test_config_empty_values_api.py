@@ -121,3 +121,38 @@ class ConfigEmptyValueApiTests(unittest.TestCase):
         payload = self._config()
         self.assertEqual([payload[key] for key in CRON_KEYS], ["", ""])
         self.assertIn("STRM_SCHEDULE_CRON=''", config.ENV_FILE.read_text(encoding="utf-8"))
+
+    def test_explicit_empty_overrides_missing_inherited_values_and_is_idempotent(self):
+        from app.modules.offline import OfflineRules
+
+        self._write_raw(RSS_QB_CATEGORY="rss", RSS_QB_SAVE_PATH="/rss", RSS_GY_TARGET_DIR="123")
+        updates = dict.fromkeys(("TG_QB_CATEGORY", "TG_QB_SAVE_PATH", "OFFLINE_TARGET_DIR"), "")
+        self.assertTrue(set(updates).isdisjoint(config.all_items()))
+        self.assertEqual(OfflineRules.from_config().target_dir_id, "123")
+        saved = self.client.post("/api/config", json=updates, headers=self.headers)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual({key: config.all_items().get(key) for key in updates}, updates)
+        self.assertEqual(config.get("TG_QB_CATEGORY", config.get("RSS_QB_CATEGORY")), "")
+        self.assertEqual(config.get("TG_QB_SAVE_PATH", config.get("RSS_QB_SAVE_PATH")), "")
+        self.assertEqual(OfflineRules.from_config().target_dir_id, "0")
+        with patch("app.routes.api.config.set_and_save") as persist:
+            repeated = self.client.post("/api/config", json=updates, headers=self.headers)
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        persist.assert_not_called()
+
+    def test_failed_publication_restores_missing_keys_without_changing_inheritance(self):
+        from app.modules.offline import OfflineRules
+
+        self._write_raw(RSS_QB_CATEGORY="rss", RSS_QB_SAVE_PATH="/rss", RSS_GY_TARGET_DIR="123")
+        before = config.all_items()
+        updates = {"TG_QB_CATEGORY": "tg", "TG_QB_SAVE_PATH": "/tg", "OFFLINE_TARGET_DIR": "456"}
+        with patch("app.agent.feature_gate.invalidate_agent_runtime_generation", side_effect=RuntimeError("abort")):
+            response = self.client.post("/api/config", json=updates, headers=self.headers)
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(config.all_items(), before)
+        self.assertEqual(config.get("TG_QB_CATEGORY", config.get("RSS_QB_CATEGORY")), "rss")
+        self.assertEqual(config.get("TG_QB_SAVE_PATH", config.get("RSS_QB_SAVE_PATH")), "/rss")
+        self.assertEqual(OfflineRules.from_config().target_dir_id, "123")
+        saved = self.client.post("/api/config", json=updates, headers=self.headers)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(OfflineRules.from_config().target_dir_id, "456")
