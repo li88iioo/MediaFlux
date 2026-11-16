@@ -80,6 +80,10 @@ class DownloadRequestCreationError(RuntimeError):
     """下载请求未能持久化。"""
 
 
+class DirectDownloadPreconditionError(ValueError):
+    """直接下载前置校验拒绝，尚未创建请求或调用下载后端。"""
+
+
 class DownloadSnapshotChanged(IndexerValidationError):
     code = "confirmation_stale"
     default_public_message = "资源或下载配置已变化，请重新预检"
@@ -815,7 +819,10 @@ def submit_direct_download(item: DownloadInput, target: str, *, origin: str,
                            expected_snapshot: dict | None = None,
                            check_cancelled: Callable[[], None] | None = None) -> dict:
     """直接链接或种子只准入首次提交；已有活跃请求不会隐式补投失败后端。"""
-    preview, snapshot = preview_direct_download(item, target)
+    try:
+        preview, snapshot = preview_direct_download(item, target)
+    except ValueError as exc:
+        raise DirectDownloadPreconditionError(str(exc)) from exc
     if expected_snapshot is not None and snapshot != expected_snapshot:
         raise DownloadSnapshotChanged()
     if check_cancelled is not None:

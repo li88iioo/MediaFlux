@@ -530,23 +530,44 @@
         submit.disabled = !firstReady;
         const cancel = element('button', 'agent-download-cancel', '取消');
         cancel.type = 'button';
+        const review = element('a', 'jump-btn', '查看下载记录');
+        review.href = '/downloads?view=issues';
+        review.hidden = true;
         const actions = element('div', 'agent-download-actions');
-        actions.append(select, submit, cancel);
+        actions.append(select, submit, cancel, review);
         card.append(actions);
+        const showRecovery = (retryable) => {
+            select.hidden = submit.hidden = !retryable;
+            select.disabled = submit.disabled = !retryable;
+            submit.textContent = '重试提交';
+            cancel.disabled = false;
+            cancel.textContent = retryable ? '取消' : '关闭';
+            review.hidden = false;
+            card.classList.add('is-error');
+        };
         cancel.addEventListener('click', () => view.item.remove());
         submit.addEventListener('click', async () => {
             submit.disabled = cancel.disabled = select.disabled = true;
             submit.textContent = '正在提交…';
+            card.classList.remove('is-error');
             try {
                 const result = await fetchJSON('/api/downloads/direct/submit', {method: 'POST', body: directDownloadForm(source, select.value)});
-                meta.textContent = String(result.summary || `下载请求 #${result.request_id} 已受理`);
-                actions.remove();
-                card.classList.add('is-done');
+                const status = String(result.status || 'manual_review');
+                const succeeded = (result.succeeded || []).map(target => DOWNLOAD_TARGET_LABELS[target]).filter(Boolean);
+                meta.textContent = [result.summary || `下载请求 #${result.request_id} 受理结果待核对`,
+                    succeeded.length ? `已提交：${succeeded.join('、')}` : '', result.error || ''].filter(Boolean).join(' · ');
+                if (status === 'submitted' && result.ok === true) {
+                    actions.remove();
+                    card.classList.add('is-done');
+                } else {
+                    review.href = status === 'duplicate' ? '/downloads' : '/downloads?view=issues';
+                    showRecovery(status === 'failed' && result.ok === false && !succeeded.length);
+                }
             } catch (error) {
-                meta.textContent = error?.message || '提交失败，请稍后在下载页核对';
-                submit.disabled = cancel.disabled = select.disabled = false;
-                submit.textContent = '重试提交';
-                card.classList.add('is-error');
+                const notSubmitted = error?.status === 400 && error?.payload?.code === 'download_not_submitted';
+                meta.textContent = notSubmitted ? `本次未提交：${error.message}。可修改目标或返回重新选择资源。`
+                    : `提交状态未知，请先在下载页核对，勿重复提交。${error?.message || ''}`;
+                showRecovery(notSubmitted);
             }
         });
         scrollToBottom(true);
@@ -1997,6 +2018,7 @@
         }
         if (!response.ok) {
             const error = new Error(payload.error || (typeof payload.detail === 'string' ? payload.detail : '') || `请求失败（HTTP ${response.status}）`);
+            error.status = response.status;
             error.payload = payload;
             throw error;
         }

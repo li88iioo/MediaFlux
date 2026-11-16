@@ -379,6 +379,24 @@ class DirectDownloadApiTests(LoggedInDownloadsApiCase):
                                         data={"target": "nope", "url": "magnet:?xt=urn:btih:" + "b" * 40})
         self.assertEqual(response.status_code, 400)
         self.assertIn("下载目标无效", response.text)
+        self.assertNotIn("code", response.json())
+
+    def test_submit_reports_known_preflight_rejection_without_creating_a_request(self):
+        from app.indexers import downloads
+
+        headers = self._headers()
+        url = "magnet:?xt=urn:btih:" + "c" * 40
+        with isolated_test_database(), patch.object(downloads, "download_target_readiness", side_effect=[
+            {"qb": True, "guangya": False}, {"qb": False},
+        ]), patch("app.modules.download_dispatcher._submit_qb") as backend:
+            preview = self.client.post("/api/downloads/direct/preview", headers=headers, data={"url": url})
+            self.assertEqual(preview.status_code, 200, preview.text)
+            response = self.client.post("/api/downloads/direct/submit", headers=headers, data={"url": url, "target": "qb"})
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["code"], "download_not_submitted")
+            self.assertIn("尚未配置", response.json()["error"])
+            self.assertEqual(self._request_count(), 0)
+            backend.assert_not_called()
 
     def test_confirmed_torrent_keeps_bytes_and_deduplicates_equivalent_magnets(self):
         from tests.test_torrent_manifest import _bencode, _torrent

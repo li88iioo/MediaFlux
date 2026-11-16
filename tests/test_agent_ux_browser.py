@@ -560,7 +560,8 @@ class AgentUXBrowserTests(unittest.TestCase):
     def test_attached_torrent_becomes_a_download_card_without_calling_the_model(self):
         page = self.page({'directPreview': {'kind': 'torrent', 'title': '诛仙.S04E15.2160p', 'file_count': 2,
                                             'total_size': 1_524_000_000, 'backends': {'qb': True, 'guangya': False}},
-                          'directSubmit': {'request_id': 9, 'summary': '下载请求 #9 已提交'}})
+                          'directSubmit': {'ok': True, 'status': 'submitted', 'succeeded': ['qb'],
+                                           'request_id': 9, 'summary': '下载请求 #9 已提交'}})
         self.assertTrue(page.locator('#agentAttach').is_visible())
         page.locator('#agentAttachFile').set_input_files(files=[{
             'name': 'zhuxian.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'd4:infod4:name1:aee'}])
@@ -578,6 +579,95 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(forms[1], [['file', 'zhuxian.torrent'], ['target', 'qb']])
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
         self.assertEqual(card.locator('.agent-download-submit').count(), 0)
+
+    def test_direct_download_rejection_keeps_retry_and_clears_error_after_acceptance(self):
+        page = self.page({'directPreview': {'kind': 'torrent', 'title': 'Film', 'file_count': 1,
+                                            'backends': {'qb': True, 'guangya': True}},
+                          'directSubmit': {'ok': False, 'status': 'failed', 'request_id': 9,
+                                           'summary': '下载请求 #9 未完成提交', 'error': 'qB 提交失败'}})
+        page.locator('#agentAttachFile').set_input_files(files=[{
+            'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+        card = page.locator('.agent-download-card')
+        submit = card.locator('.agent-download-submit')
+        submit.wait_for()
+        card.locator('.agent-download-target').select_option('both')
+        width = submit.bounding_box()['width']
+        submit.click()
+        card.locator('.agent-download-meta', has_text='qB 提交失败').wait_for()
+        self.assertFalse('is-done' in card.get_attribute('class'))
+        self.assertTrue(submit.is_enabled())
+        self.assertEqual(submit.inner_text(), '重试提交')
+        self.assertEqual(card.locator('.agent-download-target').input_value(), 'both')
+        self.assertEqual(submit.bounding_box()['width'], width)
+        self.assertEqual(card.get_by_role('link', name='查看下载记录').get_attribute('href'), '/downloads?view=issues')
+        page.evaluate("window.__kernelConfig.directSubmit = {ok:true,status:'submitted',request_id:10,succeeded:['qb','guangya'],summary:'下载请求 #10 已提交'}")
+        submit.click()
+        card.locator('.agent-download-meta', has_text='下载请求 #10 已提交').wait_for()
+        self.assertIn('is-done', card.get_attribute('class'))
+        self.assertNotIn('is-error', card.get_attribute('class'))
+        self.assertEqual(card.locator('.agent-download-submit').count(), 0)
+
+    def test_direct_download_nonretryable_receipts_keep_facts_and_review_without_resubmission(self):
+        for status, receipt in (
+            ('partial', {'ok': True, 'succeeded': ['qb'], 'failed': ['guangya'], 'error': '光鸭提交失败'}),
+            ('manual_review', {'ok': False, 'error': '受理结果待核对，请勿重复提交'}),
+            ('duplicate', {'ok': False, 'duplicate': True, 'error': '已有下载请求正在处理'}),
+        ):
+            with self.subTest(status=status):
+                page = self.page({'directPreview': {'kind': 'torrent', 'title': 'Film', 'file_count': 1,
+                                                    'backends': {'qb': True, 'guangya': True}},
+                                  'directSubmit': {**receipt, 'status': status, 'request_id': 9, 'summary': f'下载请求 #9 {status}'}})
+                page.locator('#agentAttachFile').set_input_files(files=[{
+                    'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+                card = page.locator('.agent-download-card')
+                card.locator('.agent-download-submit').click()
+                card.locator('.agent-download-meta', has_text=receipt['error']).wait_for()
+                self.assertNotIn('is-done', card.get_attribute('class'))
+                self.assertFalse(card.locator('.agent-download-submit').is_visible())
+                self.assertTrue(card.get_by_role('link', name='查看下载记录').is_visible())
+                if status == 'partial':
+                    self.assertIn('已提交：qBittorrent', card.inner_text())
+                self.assertEqual(page.evaluate('window.__directForms.length'), 2)
+                page.close()
+
+    def test_direct_download_transport_failure_requires_review_before_another_submission(self):
+        page = self.page({'directPreview': {'kind': 'torrent', 'title': 'Film', 'file_count': 1,
+                                            'backends': {'qb': True, 'guangya': False}}})
+        page.locator('#agentAttachFile').set_input_files(files=[{
+            'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+        page.evaluate("""() => { const previous=window.fetch; window.fetch=(url, options)=>String(url)==='/api/downloads/direct/submit'
+            ? Promise.reject(new TypeError('connection interrupted')) : previous(url, options); }""")
+        card = page.locator('.agent-download-card')
+        card.locator('.agent-download-submit').click()
+        card.locator('.agent-download-meta', has_text='提交状态未知').wait_for()
+        self.assertFalse(card.locator('.agent-download-submit').is_visible())
+        self.assertTrue(card.get_by_role('link', name='查看下载记录').is_visible())
+
+    def test_direct_download_only_known_preflight_rejection_allows_another_submission(self):
+        for http_status, payload, retryable in (
+            (400, {'error': 'qBittorrent 尚未配置或登录', 'code': 'download_not_submitted'}, True),
+            (400, {'error': '下载提交失败'}, False),
+            (503, {'error': '服务不可用', 'code': 'download_not_submitted'}, False),
+        ):
+            with self.subTest(http_status=http_status, retryable=retryable):
+                page = self.page({'directPreview': {'kind': 'torrent', 'title': 'Film', 'file_count': 1,
+                                                    'backends': {'qb': True, 'guangya': True}}},
+                                 viewport={'width': 390, 'height': 844})
+                page.locator('#agentAttachFile').set_input_files(files=[{
+                    'name': 'film.torrent', 'mimeType': 'application/x-bittorrent', 'buffer': b'fixture'}])
+                card = page.locator('.agent-download-card')
+                card.locator('.agent-download-target').select_option('both')
+                page.evaluate("""({status,payload}) => { const previous=window.fetch;
+                    window.fetch=(url,options)=>String(url)==='/api/downloads/direct/submit'
+                        ? Promise.resolve(new Response(JSON.stringify(payload), {status,headers:{'Content-Type':'application/json'}}))
+                        : previous(url,options); }""", {'status': http_status, 'payload': payload})
+                card.locator('.agent-download-submit').click()
+                card.locator('.agent-download-meta', has_text='本次未提交' if retryable else '提交状态未知').wait_for()
+                self.assertEqual(card.locator('.agent-download-submit').is_visible(), retryable)
+                self.assertEqual(card.locator('.agent-download-target').input_value(), 'both')
+                self.assertNotIn('is-done', card.get_attribute('class'))
+                self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+                page.close()
 
     def test_pasting_a_long_magnet_creates_a_card_instead_of_hitting_the_prompt_limit(self):
         magnet = 'magnet:?xt=urn:btih:' + 'a' * 40 + '&dn=Show&tr=' + 'udp%3A%2F%2Ftracker.example%3A1337' * 40

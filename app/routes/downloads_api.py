@@ -667,7 +667,13 @@ def submit_direct_download(request: Request, target: str = Form(""), url: str = 
     from app.indexers import downloads
 
     try:
-        result = downloads.submit_direct_download(_direct_item(url, file), target, origin="web")
+        item = _direct_item(url, file)
+    except ValueError as exc:
+        return api_response({"error": str(exc), "code": "download_not_submitted"}, 400)
+    try:
+        result = downloads.submit_direct_download(item, target, origin="web")
+    except downloads.DirectDownloadPreconditionError as exc:
+        return api_response({"error": str(exc), "code": "download_not_submitted"}, 400)
     except ValueError as exc:
         return api_error(str(exc), 400)
     return api_response(result)

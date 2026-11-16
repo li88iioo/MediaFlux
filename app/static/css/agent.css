@@ -2020,7 +2020,7 @@ body.agent-page-body::after { display: none; }
 .agent-download-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
 .agent-download-target { height: 38px; padding: 0 10px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border-strong); border-radius: 9px; font: inherit; font-size: 13px; }
 .agent-download-submit, .agent-download-cancel { height: 38px; padding: 0 14px; border-radius: 9px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
-.agent-download-submit { color: #ffffff; background: var(--accent); border: 1px solid var(--accent); }
+.agent-download-submit { min-width: 8em; color: #ffffff; background: var(--accent); border: 1px solid var(--accent); }
 .agent-download-submit:disabled { opacity: .55; cursor: default; }
 .agent-download-cancel { color: var(--text-secondary); background: transparent; border: 1px solid var(--agent-line); }
 @media (max-width: 680px) {
