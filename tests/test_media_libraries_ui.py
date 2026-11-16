@@ -4,11 +4,24 @@ from __future__ import annotations
 import mimetypes
 import unittest
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TypedDict
 from urllib.parse import unquote, urlsplit
 
 from jinja2 import Environment, FileSystemLoader
 
 from tests import test_agent_kernel_browser as browser_support
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, Page, Route
+
+
+class _PathTestFixture(TypedDict):
+    response: dict[str, object]
+    calls: list[dict[str, str]]
+    unexpected: list[str]
+    errors: list[str]
+    pending: list[Route]
+    hold: bool
 
 
 class MediaLibrariesUIContractTests(unittest.TestCase):
@@ -117,8 +130,10 @@ class MediaLibrariesUIContractTests(unittest.TestCase):
 
 @unittest.skipIf(browser_support.sync_playwright is None, "系统环境未安装 Playwright")
 class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
+    browser: Browser
+
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         browser_support.AgentKernelBrowserTests.setUpClass.__func__(cls)
         env = Environment(loader=FileSystemLoader(browser_support.ROOT / "app/templates"), autoescape=True)
         cls.html = env.get_template("media_libraries.html").render(
@@ -127,20 +142,23 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
             url_for=lambda name: "/" + name.split(".")[-1],
         )
 
-    def make_page(self, width, source_kind="strm"):
+    def make_page(self, width: int, source_kind: Literal["strm", "local"] = "strm") -> tuple[Page, _PathTestFixture]:
         context = self.browser.new_context(
             viewport={"width": width, "height": 900}, reduced_motion="reduce", service_workers="block",
         )
         self.addCleanup(context.close)
-        fixture = {"response": {}, "calls": [], "unexpected": [], "errors": [], "pending": [], "hold": False}
+        fixture: _PathTestFixture = {"response": {}, "calls": [], "unexpected": [], "errors": [], "pending": [], "hold": False}
         libraries = [
             {"id": "a", "name": "电影 A", "locations": ["/media/movies"]},
             {"id": "b", "name": "电影 B", "locations": ["/media/movies"]},
         ]
-        overview = {
-            "servers": [{"server_type": "jellyfin", "label": "Jellyfin", "enabled": True,
-                         "configured": True, "mapping_key": "JELLYFIN_PATH_MAPPINGS", "libraries": libraries,
-                         "mappings": [{"local": "/data/strm", "server": "/media/movies"}]}],
+        server: dict[str, object] = {
+            "server_type": "jellyfin", "label": "Jellyfin", "enabled": True,
+            "configured": True, "mapping_key": "JELLYFIN_PATH_MAPPINGS", "libraries": libraries,
+            "mappings": [{"local": "/data/strm", "server": "/media/movies"}],
+        }
+        overview: dict[str, object] = {
+            "servers": [server],
             "summary": {"configured_servers": 1, "online_servers": 1, "libraries": 2,
                         "total_mappings": 1, "path_mappings": 1, "local_bindings": 0, "local_sources": 0},
             "strm": {"output_root": "/data/strm", "sources": []},
@@ -148,13 +166,13 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
             "local_bindings": [],
         }
         if source_kind == "local":
-            overview["servers"][0]["mappings"] = []
+            server["mappings"] = []
             overview["local_bindings"] = [{
                 "source_id": 1, "category": "movie", "local_path": "/data/strm", "server_path": "/media/movies",
                 "provider": "jellyfin", "library_id": "a", "library_name": "电影 A",
             }]
 
-        def route(request):
+        def route(request: Route) -> None:
             url = urlsplit(request.request.url)
             path = unquote(url.path)
             if url.netloc == "media-libraries.test":
@@ -173,7 +191,10 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
                     request.fulfill(json=overview)
                     return
                 if path == "/api/media-libraries/path-test":
-                    fixture["calls"].append(request.request.post_data_json)
+                    payload = request.request.post_data_json
+                    assert isinstance(payload, dict)
+                    assert all(isinstance(key, str) and isinstance(value, str) for key, value in payload.items())
+                    fixture["calls"].append(payload)
                     if fixture["hold"]:
                         fixture["pending"].append(request)
                     else:
@@ -193,7 +214,7 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
         return page, fixture
 
     def test_path_test_requires_unique_selected_match_on_desktop_and_mobile(self):
-        cases = (
+        cases: tuple[tuple[str, list[str], str, str], ...] = (
             ("ambiguous", ["a", "b"], "is-warning", "自动刷新将跳过"),
             ("matched", ["a"], "is-success", "映射有效"),
             ("matched", ["b"], "is-warning", "不是当前选择"),
@@ -223,7 +244,9 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
                     self.assertEqual(page.evaluate(geometry), initial)
                     fixture["pending"].pop().fulfill(json=fixture["response"])
                     page.wait_for_function("text => document.querySelector('[data-mapping-result]').textContent.includes(text)", arg=text)
-                    self.assertIn(expected_class, result.get_attribute("class"))
+                    result_class = result.get_attribute("class")
+                    assert result_class is not None
+                    self.assertIn(expected_class, result_class)
                     self.assertEqual(result.get_attribute("role"), "status")
                     self.assertFalse(button.is_disabled())
                     self.assertEqual(page.evaluate(geometry), initial)
@@ -255,7 +278,9 @@ class MediaLibrariesPathTestBrowserTests(unittest.TestCase):
                     "local_path": "/data/strm", "server_path": "/media/movies", "sample_path": "/data/strm",
                 }])
                 result = page.locator("[data-mapping-result]")
-                self.assertIn("is-success", result.get_attribute("class"))
+                result_class = result.get_attribute("class")
+                assert result_class is not None
+                self.assertIn("is-success", result_class)
                 self.assertNotIn("跳过", result.inner_text())
                 self.assertEqual(fixture["errors"], [])
                 self.assertEqual(fixture["unexpected"], [])
