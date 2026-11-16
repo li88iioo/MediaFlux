@@ -336,6 +336,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         self.assertEqual(selected_row["name"], "selected")
         self.assertEqual(other_row["name"], "other")
 
+    @patch.dict("os.environ", {"QB_URL": "http://qb.invalid"})
     def test_subscription_api_does_not_report_unknown_write_as_success(self):
         from app.routes import rss_api
         sid = rss_repo.add_rss_subscription("existing", "https://example.invalid/existing")
@@ -385,6 +386,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                         self.assertNotIn(sid, [row["id"] for row in rss_repo.list_due_rss_subscriptions(before)])
                         self.assertIn(sid, [row["id"] for row in rss_repo.list_due_rss_subscriptions(due.strftime("%Y-%m-%d %H:%M:%S"))])
 
+    @patch.dict("os.environ", {"QB_URL": "http://qb.invalid"})
     def test_subscription_enabled_api_directly_pauses_and_resumes_scheduled_refresh(self) -> None:
         subscription_id = rss_repo.add_rss_subscription(
             "toggle", "https://example.invalid/toggle", refresh_interval_minutes=10
@@ -429,6 +431,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                 )
                 self.assertEqual(wake_scheduler.call_count, 2)
 
+    @patch.dict("os.environ", {"QB_URL": "http://qb.invalid"})
     def test_rss_api_rejects_nonempty_cron_preserves_legacy_value_and_keeps_interval_schedule(self) -> None:
         timestamp = db.now()
         with db.get_conn() as conn:

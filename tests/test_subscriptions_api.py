@@ -568,7 +568,10 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         self.assertEqual({row["event_key"] for row in notifications},
                          {f"media-subscription-run:{run}:missing" for run in (previous_run, live_run)})
         self.assertTrue(all(row["run_id"] is None and row["status"] == "pending" for row in notifications))
-        with patch("app.modules.telegram_notification_center.notification_target_chat_id", return_value="100"), patch(
+        # 本用例验证即时投递，独立于同进程其它用例留下的后台关停事件。
+        with patch("app.modules.telegram_notification_center._dispatch_stop", threading.Event()), patch(
+            "app.modules.telegram_notification_center.notification_target_chat_id", return_value="100",
+        ), patch(
             "app.modules.telegram_notification_center.send_event_result",
             return_value=TelegramSendResult(ok=True, message_id=51),
         ) as send:
