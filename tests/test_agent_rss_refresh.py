@@ -87,9 +87,13 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["data"]["failed"], 0)
         self.assertEqual(result["data"]["cancelled"], len(ids))
         self.assertLessEqual(len(parsed), 4)
-        self.assertTrue(all(not rss_repo.get_rss_subscription(sid)["last_refreshed_at"] for sid in ids))
+        for sid in ids:
+            subscription = rss_repo.get_rss_subscription(sid)
+            assert subscription is not None
+            self.assertFalse(subscription["last_refreshed_at"])
         self.assertEqual({item["status"] for item in result["data"]["subscriptions"]}, {"cancelled"})
         run = db.get_task_run(result["data"]["run_id"])
+        assert run is not None
         self.assertEqual(run["status"], "cancelled")
         self.assertEqual(json.loads(run["result"])["data"]["cancelled"], len(ids))
 
@@ -122,9 +126,14 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["data"]["refreshed"], 1)
         self.assertEqual(result["data"]["cancelled"], 1)
         self.assertEqual(result["data"]["failed"], 0)
-        self.assertTrue(rss_repo.get_rss_subscription(self.sid)["last_refreshed_at"])
-        self.assertFalse(rss_repo.get_rss_subscription(second)["last_refreshed_at"])
-        self.assertEqual(db.get_task_run(result["data"]["run_id"])["status"], "partial")
+        first_row = rss_repo.get_rss_subscription(self.sid)
+        second_row = rss_repo.get_rss_subscription(second)
+        assert first_row is not None and second_row is not None
+        self.assertTrue(first_row["last_refreshed_at"])
+        self.assertFalse(second_row["last_refreshed_at"])
+        run = db.get_task_run(result["data"]["run_id"])
+        assert run is not None
+        self.assertEqual(run["status"], "partial")
 
 
     def test_single_subscription_confirm_executes_once_and_returns_aggregate_only(self):

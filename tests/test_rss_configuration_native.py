@@ -45,6 +45,7 @@ def test_unbound_media_configuration_is_canonical_and_write_verification_complet
         result = service.apply_change(kind, arguments, expected_snapshot=prepared["snapshot"])
         assert result["ok"] and result["status"] == "completed"
         row = rss_repo.get_rss_subscription(result["data"]["subscription_id"])
+        assert row is not None
         assert row["media_tmdb_id"] == "" and row["media_default_season"] == 1
         assert not row["skip_existing_episodes"]
 
@@ -69,14 +70,17 @@ def test_web_updates_preflight_the_effective_download_target(method, enabled, fi
         rss_api, "require_api_login"
     ), patch.object(config, "_cache", {"QB_URL": qb_url}):
         sid = rss_repo.add_rss_subscription("Existing", "https://example.invalid/rss", download_method=method, enabled=enabled)
-        before = dict(rss_repo.get_rss_subscription(sid))
+        original = rss_repo.get_rss_subscription(sid)
+        assert original is not None
+        before = dict(original)
         response = rss_api.update_sub(sid, Mock(), fields)
         assert response.status_code == expected
+        row = rss_repo.get_rss_subscription(sid)
+        assert row is not None
         if expected == 400:
-            assert json.loads(response.body)["code"] == "qb_not_configured"
-            assert dict(rss_repo.get_rss_subscription(sid)) == before
+            assert json.loads(bytes(response.body))["code"] == "qb_not_configured"
+            assert dict(row) == before
         else:
-            row = rss_repo.get_rss_subscription(sid)
             assert row["enabled"] == fields.get("enabled", enabled)
             assert row["download_method"] == fields.get("download_method", method)
 
@@ -87,7 +91,7 @@ def test_web_disabled_qb_creation_keeps_existing_setup_requirement():
     with isolated_test_database(), patch.object(rss_api, "require_api_login"), patch.object(config, "_cache", {"QB_URL": ""}):
         response = rss_api.create_sub(Mock(), {"name": "Draft", "urls": "https://example.invalid/rss", "download_method": "qb", "enabled": False})
         assert response.status_code == 400
-        assert json.loads(response.body)["code"] == "qb_not_configured"
+        assert json.loads(bytes(response.body))["code"] == "qb_not_configured"
         assert rss_repo.list_rss_subscriptions() == []
 
 

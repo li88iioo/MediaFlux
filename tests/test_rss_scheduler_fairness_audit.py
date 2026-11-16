@@ -39,18 +39,17 @@ class RSSSchedulerProjectionTests(unittest.TestCase):
         self.enterContext(patch.object(module.RSSScheduler, "_notify_issue"))
 
     def test_due_projection_runs_bound_refresh_and_auto_download(self):
-        bindings = [
-            {},
-            {"media_tmdb_id": "123"},
-            {"media_tmdb_id": "123", "media_default_season": 0},
-            {"media_tmdb_id": "123", "skip_existing_episodes": 1},
-        ]
+        bindings: tuple[tuple[str, int, int], ...] = (
+            ("", 1, 0), ("123", 1, 0), ("123", 0, 0), ("123", 1, 1),
+        )
         for action in ("subscribe", "download"):
-            for binding in bindings:
-                with self.subTest(action=action, binding=binding):
+            for tmdb_id, season, skip_existing in bindings:
+                with self.subTest(action=action, tmdb_id=tmdb_id, season=season, skip_existing=skip_existing):
                     sid = rss_repo.add_rss_subscription(
                         "scheduled", "https://example.invalid/feed",
-                        action=action, refresh_interval_minutes=10, **binding,
+                        action=action, refresh_interval_minutes=10,
+                        media_tmdb_id=tmdb_id, media_default_season=season,
+                        skip_existing_episodes=skip_existing,
                     )
                     due = rss_repo.list_due_rss_subscriptions()
                     self.assertEqual([row["id"] for row in due], [sid])

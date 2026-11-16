@@ -166,7 +166,11 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
                 if operation == "retry":
                     for entry_id in ids:
                         rss_repo.record_rss_entry_failure(entry_id, "qb_unavailable", True)
-                before = {entry_id: dict(rss_repo.get_rss_entry(entry_id)) for entry_id in ids}
+                before = {}
+                for entry_id in ids:
+                    row = rss_repo.get_rss_entry(entry_id)
+                    assert row is not None
+                    before[entry_id] = dict(row)
                 cancelled = False
                 prepare = indexer_downloads.prepare_download_input
 
@@ -192,7 +196,9 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
                 with db.get_conn() as conn:
                     self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 0)
                 for entry_id in ids:
-                    self.assertEqual(dict(rss_repo.get_rss_entry(entry_id)), before[entry_id])
+                    current = rss_repo.get_rss_entry(entry_id)
+                    assert current is not None
+                    self.assertEqual(dict(current), before[entry_id])
 
     def test_cancellation_after_login_stops_add_and_releases_current_claim(self):
         for operation in ("download", "retry"):
@@ -204,7 +210,9 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
                 if operation == "retry":
                     with patch.object(QBittorrentClient, "add_torrent_detailed", return_value=TorrentAddResult(False, "qb_unavailable", True)):
                         self.assertFalse(rss_delivery.execute("download", {"entry_ids": [entry_id]})["ok"])
-                    source_id = rss_repo.get_rss_entry(entry_id)["download_request_id"]
+                    source = rss_repo.get_rss_entry(entry_id)
+                    assert source is not None
+                    source_id = source["download_request_id"]
                     self.assertTrue(source_id)
                 cancelled = False
                 client = QBittorrentClient("http://qb.invalid", username="test", password="test")
@@ -226,15 +234,19 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["status"], "cancelled")
                 self.assertEqual(result["data"]["cancelled"], 1)
                 current = rss_repo.get_rss_entry(entry_id)
+                assert current is not None
                 self.assertEqual(current["status"], "failed" if source_id else "pending")
                 self.assertEqual(current["failure_code"], "qb_unavailable" if source_id else "")
                 self.assertTrue(current["download_request_id"])
                 request = download_requests_repo.get_download_request(current["download_request_id"])
+                assert request is not None
                 self.assertEqual(request["qb_status"], "failed")
                 self.assertEqual(request["status"], "failed")
                 if source_id:
                     self.assertNotEqual(current["download_request_id"], source_id)
-                    self.assertEqual(download_requests_repo.get_download_request(source_id)["status"], "failed")
+                    source_request = download_requests_repo.get_download_request(source_id)
+                    assert source_request is not None
+                    self.assertEqual(source_request["status"], "failed")
 
     def test_preparation_cancellation_preserves_previous_accepted_item(self):
         sid = self._subscription()
@@ -263,8 +275,13 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["data"]["submitted"], 1)
         self.assertEqual(result["data"]["cancelled"], 2)
-        self.assertEqual(rss_repo.get_rss_entry(ids[-1])["status"], "downloaded")
-        self.assertTrue(all(rss_repo.get_rss_entry(identifier)["status"] == "pending" for identifier in ids[:-1]))
+        accepted = rss_repo.get_rss_entry(ids[-1])
+        assert accepted is not None
+        self.assertEqual(accepted["status"], "downloaded")
+        for identifier in ids[:-1]:
+            current = rss_repo.get_rss_entry(identifier)
+            assert current is not None
+            self.assertEqual(current["status"], "pending")
 
     def test_cancellation_after_request_creation_restores_entry_and_can_resume(self):
         sid = self._subscription()
@@ -289,11 +306,13 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         add.assert_not_called()
         self.assertEqual(result["status"], "cancelled")
         current = rss_repo.get_rss_entry(entry_id)
+        assert current is not None
         self.assertEqual(current["status"], "pending")
         self.assertFalse(current["download_request_id"])
         self.assertFalse(current["download_request_key"])
         with db.get_conn() as conn:
             request = conn.execute("SELECT * FROM download_requests").fetchone()
+            assert request is not None
             self.assertEqual(request["status"], "cancelled")
         with patch.object(QBittorrentClient, "add_torrent_detailed", return_value=TorrentAddResult(True)) as resumed:
             self.assertEqual(rss_delivery.execute("download", {"entry_ids": [entry_id]})["status"], "completed")

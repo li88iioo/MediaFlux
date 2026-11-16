@@ -119,13 +119,15 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
         from playwright.sync_api import expect
 
         self._open()
-        for result, tone in (
-            ({"status": "missing", "summary": "发现资源", "missing_count": 1, "candidate_count": 1}, "success"),
-            ({"status": "inconclusive", "summary": "媒体服务器不可用", "missing_count": 0, "candidate_count": 0}, "warning"),
-            ({"status": "satisfied", "summary": "媒体库完整", "missing_count": 0, "candidate_count": 0}, "success"),
-            ({"status": "error", "summary": "索引器不可用", "missing_count": 1, "candidate_count": 0}, "error"),
+        for status, summary, missing_count, candidate_count, tone in (
+            ("missing", "发现资源", 1, 1, "success"),
+            ("inconclusive", "媒体服务器不可用", 0, 0, "warning"),
+            ("satisfied", "媒体库完整", 0, 0, "success"),
+            ("error", "索引器不可用", 1, 0, "error"),
         ):
-            with self.subTest(status=result["status"]), patch.object(
+            result = {"status": status, "summary": summary, "missing_count": missing_count,
+                      "candidate_count": candidate_count}
+            with self.subTest(status=status), patch.object(
                 MediaSubscriptionService, "check_subscription",
                 AsyncMock(return_value={"subscription": {"id": self.subscription_id}, "result": result}),
             ):
@@ -134,10 +136,10 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
                 self.page.wait_for_function("window.receipts.length === 1")
                 receipt = self.page.evaluate("window.receipts[0]")
                 self.assertEqual(receipt["type"], tone)
-                self.assertIn(result["summary"], receipt["message"])
-                self.assertIn(f'缺失 {result["missing_count"]} 项 · 候选 {result["candidate_count"]} 项', receipt["message"])
+                self.assertIn(summary, receipt["message"])
+                self.assertIn(f'缺失 {missing_count} 项 · 候选 {candidate_count} 项', receipt["message"])
                 expect(self.page.locator("#appMessageModal")).to_have_class(re.compile(f"is-{tone}"))
-                expect(self.page.locator("#appMessageText")).to_contain_text(result["summary"])
+                expect(self.page.locator("#appMessageText")).to_contain_text(summary)
                 self.page.locator("#appMessageClose").click()
                 expect(self.page.locator('[data-media-action="check"]')).to_be_enabled()
         with patch.object(MediaSubscriptionService, "check_subscription", AsyncMock(
@@ -224,6 +226,7 @@ class SubscriptionReceiptBrowserTests(IsolatedDatabaseTestCase):
             subscription_id=self.subscription_id, candidate_id=candidate_id,
             season=None, episode=None, subscription_revision=1,
         )
+        assert admission_id is not None
         self.assertTrue(media_subscriptions_repo.begin_media_download_dispatch(
             admission_id, subscription_id=self.subscription_id, subscription_revision=1,
         ))

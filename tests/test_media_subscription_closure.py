@@ -147,17 +147,24 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                     expires_at="2099-01-01 00:00:00",
                 )[0]
                 self.assertEqual(same_id, candidate_id)
-                self.assertEqual(media_subscriptions_repo.get_media_subscription_candidate(same_id)["status"], "submitted")
+                cached_candidate = media_subscriptions_repo.get_media_subscription_candidate(same_id)
+                assert cached_candidate is not None
+                self.assertEqual(cached_candidate["status"], "submitted")
                 new_id = seed_media_subscription_candidates(
                     subscription, media_key, season=1, episode=1,
                     candidates=[{"result_id": "fresh-result", "title": "新检索候选", "download_state": "ready"}],
                     expires_at="2099-01-01 00:00:00",
                 )[0]
                 self.assertNotEqual(new_id, same_id)
-                self.assertEqual(media_subscriptions_repo.get_media_subscription_candidate(new_id)["status"], "available")
-                self.assertEqual(media_subscriptions_repo.get_media_subscription_candidate(candidate_id)["request_id"], request_id)
+                fresh_candidate = media_subscriptions_repo.get_media_subscription_candidate(new_id)
+                assert fresh_candidate is not None
+                self.assertEqual(fresh_candidate["status"], "available")
+                original_candidate = media_subscriptions_repo.get_media_subscription_candidate(candidate_id)
+                assert original_candidate is not None
+                self.assertEqual(original_candidate["request_id"], request_id)
                 if target == "qb":
                     source = download_requests_repo.get_download_request(request_id)
+                    assert source is not None
                     capability = download_dispatcher.download_resubmit_capabilities(source)["qb"]
                     self.assertFalse(capability["enabled"])
                     self.assertIn("当前没有下载失败或待核对事项", capability["reason"])

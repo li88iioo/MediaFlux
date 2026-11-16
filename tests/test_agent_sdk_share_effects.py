@@ -83,8 +83,8 @@ def test_transfer_cancel_during_staging_finishes_request_without_restore(backend
         assert plan is not None and not client.restore_calls
         create = client.create_dir
 
-        def create_then_cancel(*args, **kwargs):
-            directory_id = create(*args, **kwargs)
+        def create_then_cancel(name: str, parent_id: str = "0") -> str:
+            directory_id = create(name, parent_id)
             context.cancellation.cancel()
             return directory_id
 
@@ -94,11 +94,14 @@ def test_transfer_cancel_during_staging_finishes_request_without_restore(backend
         assert client.restore_calls == []
         with db.get_conn() as conn:
             row = conn.execute("SELECT * FROM download_requests WHERE kind='guangya_share'").fetchone()
+        assert row is not None
         assert row["status"] == row["gy_status"] == "failed"
         assert row["gy_target_dir"] == "staging-target"
         assert row["gy_staging_cleanup_status"] == "retained"
         db.init_db()
-        assert requests.get_download_request(row["id"])["status"] == "failed"
+        restored = requests.get_download_request(row["id"])
+        assert restored is not None
+        assert restored["status"] == "failed"
         with pytest.raises(ToolPipelineError):
             await effects.execute_confirmed(plan.plan_id, context=replace(context, cancellation=CancellationToken()))
         assert len(client.create_dir_calls) == 1 and client.restore_calls == []

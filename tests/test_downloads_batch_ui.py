@@ -5,6 +5,29 @@ import re
 import shutil
 import unittest
 from pathlib import Path
+from typing import NotRequired, TypedDict
+
+
+class DownloadRetryTargetFixture(TypedDict):
+    enabled: bool
+    reason: str
+
+
+class DownloadListRowFixture(TypedDict):
+    id: int
+    title: str | None
+    status: str
+    stages: NotRequired[list[dict[str, str]]]
+    source: NotRequired[str]
+    retry_targets: NotRequired[dict[str, DownloadRetryTargetFixture]]
+
+
+class DownloadListPageFixture(TypedDict):
+    items: list[DownloadListRowFixture]
+    total: int
+    page: int
+    pages: int
+    through_id: int
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -246,8 +269,9 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
         html += "<style>" + STYLES.read_text(encoding="utf-8") + "</style>" + content
         script = (ROOT / "app/static/js/downloads.js").read_text(encoding="utf-8")
 
-        def result(kind, title=None, page=1, total=None):
-            row = ({"id": 41, "title": title, "status": "failed", "stages": []}
+        def result(kind: str, title: str | None = None, page: int = 1,
+                   total: int | None = None) -> DownloadListPageFixture:
+            row: DownloadListRowFixture = ({"id": 41, "title": title, "status": "failed", "stages": []}
                    if kind == "issues" else
                    {"id": 51, "title": title, "source": "qb", "status": "failed"})
             count = (1 if title else 0) if total is None else total
@@ -268,7 +292,7 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                 with self.subTest(width=width):
                     page = browser.new_page(viewport={"width": width, "height": 960})
                     errors, calls, held = [], [], []
-                    state = {kind: result(kind) for kind in ("issues", "logs")}
+                    state: dict[str, DownloadListPageFixture] = {kind: result(kind) for kind in ("issues", "logs")}
                     batch_receipt = {}
                     batch_posts = []
                     hold = set()
@@ -370,10 +394,11 @@ class DownloadLogCleanupBrowserTests(unittest.TestCase):
                         expect(page.locator(page_info)).to_contain_text("第 2 / 2 页")
                         if kind == "issues":
                             # 重复/失败回执保留选择，混合受理仅取消已受理项的勾选。
-                            state[kind] = {**result(kind, total=4), "page": 1, "items": [
+                            batch_page: DownloadListPageFixture = {**result(kind, total=4), "page": 1, "items": [
                                 {"id": id, "title": f"批量请求{id}", "status": "failed", "stages": []}
                                 for id in range(41, 45)
                             ]}
+                            state[kind] = batch_page
                             page.locator("#refreshBtn").click()
                             expect(page.locator("#issueList [data-issue-select]")).to_have_count(4)
                             page.wait_for_function("!loading")

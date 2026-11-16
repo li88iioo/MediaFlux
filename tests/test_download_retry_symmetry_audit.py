@@ -74,15 +74,15 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
 
     def test_in_place_qb_retry_restores_only_unambiguous_rss_directory(self):
         cases = (
-            (("qb",), {}, "/downloads/rss"),
-            (("qb",), {"qb_save_path": "/downloads/manual"}, "/downloads/manual"),
-            (("qb",), {"qb_save_path": ""}, ""),
-            (("guangya",), {}, None),
-            ((), {}, None),
-            (("qb", "qb"), {}, None),
+            (("qb",), None, "/downloads/rss"),
+            (("qb",), "/downloads/manual", "/downloads/manual"),
+            (("qb",), "", ""),
+            (("guangya",), None, None),
+            ((), None, None),
+            (("qb", "qb"), None, None),
         )
-        for backends, options, expected in cases:
-            with self.subTest(backends=backends, options=options):
+        for backends, qb_save_path, expected in cases:
+            with self.subTest(backends=backends, qb_save_path=qb_save_path):
                 request_id = self.request()
                 row = download_requests_repo.get_download_request(request_id)
                 assert row is not None
@@ -101,7 +101,7 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
                 with patch.object(dispatcher, "_submit_qb", return_value={
                     "ok": True, "task_id": "b" * 40,
                 }) as submit:
-                    result = dispatcher.resubmit_download_request(request_id, "qb", **options)
+                    result = dispatcher.resubmit_download_request(request_id, "qb", qb_save_path=qb_save_path)
                 self.assertTrue(result["ok"], result)
                 self.assertFalse(result["created"])
                 self.assertEqual(result["request_id"], request_id)
