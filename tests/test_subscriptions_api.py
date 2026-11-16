@@ -26,6 +26,37 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class SubscriptionAPITests(IsolatedDatabaseTestCase):
+    def test_watchlist_remains_manageable_when_discovery_page_is_disabled(self):
+        from app.discovery.service import DiscoveryService
+        from app.routes.discovery_image import encode_poster_token
+
+        path = "/api/subscriptions/watchlist/tmdb/tv/9917"
+        with patch.dict("os.environ", {"DISCOVERY_ENABLED": "0"}), patch(
+            "app.routes.subscriptions_api.get_discovery_service", return_value=DiscoveryService
+        ):
+            self.assertEqual(self.client.delete(path).status_code, 401)
+            headers = self.login()
+            discovery_repo.add_media_watchlist("tmdb", "9917", "tv", "收藏作品", "2026", "poster.jpg")
+            subscription_id = media_subscriptions_repo.add_media_subscription(
+                provider="tmdb", external_id="9917", tmdb_id="9917", media_type="tv", title="收藏作品"
+            )
+            self.assertEqual(self.client.get("/api/discovery/watchlist").status_code, 404)
+            self.assertEqual(self.client.delete(path).status_code, 403)
+            token = encode_poster_token("tmdb", "poster.jpg")
+            upstream = Mock(status_code=200, headers={"Content-Type": "image/jpeg"})
+            upstream.iter_content.return_value = iter([b"\xff\xd8\xff\x00"])
+            with patch("app.routes.discovery_image._get_poster_session") as session:
+                session.return_value.get.return_value = upstream
+                poster = self.client.get(f"/api/subscriptions/poster/tmdb/{token}")
+            self.assertEqual(poster.status_code, 200)
+            self.assertEqual(poster.content, b"\xff\xd8\xff\x00")
+            removed = self.client.delete(path, headers=headers)
+            self.assertEqual(removed.json(), {"success": True, "removed": True})
+            self.assertIsNone(discovery_repo.get_media_watchlist("tmdb", "9917", "tv"))
+            self.assertEqual(self.client.get(f"/api/subscriptions/media/{subscription_id}").status_code, 200)
+            self.assertEqual(self.client.delete(path, headers=headers).json(), {"success": True, "removed": False})
+            self.assertEqual(self.client.delete("/api/subscriptions/watchlist/evil/tv/1", headers=headers).status_code, 400)
+
     def test_complete_lists_use_stable_cursors_and_page_identity_subscription_lookup(self):
         from app.discovery.service import DiscoveryService
 

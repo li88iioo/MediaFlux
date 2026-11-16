@@ -14,7 +14,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="subscription-center" data-subscription-center data-rss-form-defaults="{{ rss_subscription_defaults | tojson | forceescape }}">
+<div class="subscription-center" data-subscription-center data-discovery-enabled="{{ 'true' if discovery_enabled else 'false' }}" data-rss-form-defaults="{{ rss_subscription_defaults | tojson | forceescape }}">
     <section class="subscription-overview" aria-label="订阅运行概览">
         <article class="subscription-metric">
             <span class="subscription-metric-icon"><i data-lucide="layers-3"></i></span>

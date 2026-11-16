@@ -1,6 +1,7 @@
 (function () {
     const root = document.querySelector('[data-subscription-center]');
     if (!root) return;
+    const discoveryEnabled = root.dataset.discoveryEnabled === 'true';
 
     const state = {
         activeTab: 'media',
@@ -504,7 +505,7 @@
         elements.watchlist.replaceChildren();
         document.getElementById('subscriptionWatchlistBadge').textContent = String(rows.length);
         if (!rows.length) {
-            elements.watchlist.append(emptyState('bookmark', '收藏清单为空', '在探索页收藏媒体后，可在这里转为追更订阅。'));
+            elements.watchlist.append(emptyState('bookmark', '收藏清单为空', '收藏媒体后，可在这里转为追更订阅。'));
             renderIcons(elements.watchlist);
             return;
         }
@@ -514,8 +515,10 @@
             card.dataset.externalId = item.external_id || '';
             card.dataset.mediaType = item.media_type || '';
             const poster = node('a', 'subscription-watch-poster');
-            poster.href = watchlistLink(item);
-            poster.dataset.mediaProfileLink = '';
+            if (discoveryEnabled) {
+                poster.href = watchlistLink(item);
+                poster.dataset.mediaProfileLink = '';
+            }
             if (item.poster_url) {
                 const image = document.createElement('img');
                 image.src = item.poster_url; image.alt = `${item.title || '媒体'} 海报`; image.loading = 'lazy'; image.width = 180; image.height = 270;
@@ -524,8 +527,10 @@
             } else poster.append(icon(item.media_type === 'movie' ? 'film' : 'tv'));
             const body = node('div', 'subscription-watch-body');
             const title = node('a', '', item.title || '未命名媒体');
-            title.href = watchlistLink(item);
-            title.dataset.mediaProfileLink = '';
+            if (discoveryEnabled) {
+                title.href = watchlistLink(item);
+                title.dataset.mediaProfileLink = '';
+            }
             const meta = node('div', 'subscription-watch-meta');
             [item.year, item.provider?.toUpperCase(), item.media_type === 'movie' ? '电影' : '剧集'].filter(Boolean).forEach((value) => meta.append(node('span', '', value)));
             body.append(title, meta);
@@ -549,11 +554,11 @@
             primary.dataset.watchAction = item.subscription ? 'manage' : 'subscribe';
             primary.prepend(icon(item.subscription ? 'settings-2' : 'bell-plus'));
             actions.append(primary);
-            [
+            (discoveryEnabled ? [
                 ['panel-top-open', '媒体档案', watchlistLink(item)],
                 ['search', '搜索资源', watchlistLink(item, true)],
                 ['download', '打开资源工作台', watchlistLink(item, true)],
-            ].forEach(([iconName, label, href]) => {
+            ] : []).forEach(([iconName, label, href]) => {
                 const action = node('a', 'icon-action subscription-watch-icon');
                 action.href = href;
                 action.dataset.mediaProfileLink = '';
@@ -1233,7 +1238,7 @@
             const provider = encodeURIComponent(item.provider || '');
             const mediaType = encodeURIComponent(item.media_type || '');
             const externalId = encodeURIComponent(item.external_id || '');
-            await apiJSON(`/api/discovery/watchlist/${provider}/${mediaType}/${externalId}`, {method: 'DELETE'});
+            await apiJSON(`/api/subscriptions/watchlist/${provider}/${mediaType}/${externalId}`, {method: 'DELETE'});
             await loadWatchlist({preserve: true});
         } catch (error) { appAlert?.({type: 'error', title: '取消收藏失败', message: error.message}); }
     }

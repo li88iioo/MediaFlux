@@ -16,12 +16,14 @@ from app.modules.media_subscriptions import (
     MediaSubscriptionError,
     get_media_subscription_service,
 )
-from app.routes.discovery_image import encode_poster_token
+from app.routes.discovery_image import encode_poster_token, poster
 from app.web import api_error, api_response, require_api_login
 from app.discovery.models import DISCOVERY_PROVIDERS
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/subscriptions")
+# 收藏属于订阅中心；复用签名海报处理，不受探索页面开关影响。
+router.add_api_route("/poster/{provider}/{token}", poster, methods=["GET"])
 _ALLOWED_LIST_STATUS = {"", "new", "checking", "satisfied", "missing", "inconclusive", "error", "paused"}
 _ALLOWED_MEDIA_TYPES = {"movie", "tv"}
 _WATCHLIST_SUBSCRIPTION_FIELDS = {
@@ -79,7 +81,7 @@ def _watchlist_row(
     subscription = subscription_map.get((tmdb_id, media_type)) if tmdb_id else None
     poster_key = str(row.get("poster_key") or "")
     poster_url = (
-        f"/discovery-poster/{provider}/{encode_poster_token(provider, poster_key)}"
+        f"/api/subscriptions/poster/{provider}/{encode_poster_token(provider, poster_key)}"
         if poster_key else ""
     )
     return {
@@ -265,6 +267,16 @@ def list_watchlist(request: Request, limit: int = Query(default=200, ge=1, le=20
         _watchlist_row(row, subscription_map, external_id_map)
         for row in rows
     ]})
+
+
+@router.delete("/watchlist/{provider}/{media_type}/{external_id}")
+def remove_watchlist(request: Request, provider: str, media_type: str, external_id: str):
+    require_api_login(request)
+    try:
+        removed = get_discovery_service().remove_watchlist(provider, media_type, external_id)
+        return api_response({"success": True, "removed": removed})
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
 
 
 @router.post("/media/from-watchlist")

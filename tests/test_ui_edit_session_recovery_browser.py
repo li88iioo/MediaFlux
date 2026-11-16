@@ -1446,6 +1446,25 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         expect(page.locator('#subscriptionRunList')).to_contain_text('暂无巡检记录')
         expect(clear).to_be_disabled()
 
+    def test_watchlist_without_discovery_can_subscribe_and_remove_without_dead_links(self):
+        from playwright.sync_api import expect
+
+        path = "/api/subscriptions/watchlist"
+        item = {"provider": "tmdb", "external_id": "9917", "media_type": "tv",
+                "title": "收藏作品", "year": "2026", "poster_url": "", "subscription": None}
+        self.replies[("GET", path)] = [(200, {"items": [item], "has_more": False, "total": 1})]
+        self.replies[("DELETE", path + "/tmdb/tv/9917")] = [(200, {"success": True, "removed": True})]
+        page = self.make_page("rss")
+        page.locator('#subscriptionTabWatchlist').click()
+        card = page.locator('.subscription-watch-card')
+        expect(card).to_contain_text("收藏作品")
+        expect(card.locator('a[href*="/discovery"]')).to_have_count(0)
+        expect(card.locator('[data-watch-action="subscribe"]')).to_be_enabled()
+        card.locator('[data-watch-action="remove"]').click()
+        page.locator('#appConfirmSubmit').click()
+        expect(page.locator('#subscriptionWatchlist')).to_contain_text("收藏清单为空")
+        self.assertTrue(any(row['method'] == 'DELETE' and row['path'] == path + '/tmdb/tv/9917' for row in self.requests))
+
     def test_subscription_center_automatically_loads_all_cursor_pages(self):
         media = [{**SUBSCRIPTIONS[0], "id": number, "tmdb_id": str(number)} for number in range(1, 202)]
         watch = [{"provider": "tmdb", "external_id": str(number), "media_type": "tv",
