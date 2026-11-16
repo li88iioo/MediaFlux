@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import httpx
 import telebot
 from starlette.requests import Request
 
@@ -358,7 +359,9 @@ def test_existing_global_limits_unchanged(harness, raw, context, cap):
     ('12', 12), ('30', 30), (' 60 ', 60), ('120', 120), ('121', 120)])
 def test_timeout_shares_one_default_and_range_at_every_model_client(local_config, raw, expected):
     """缺失/空/非法回退 12，越界截断到 2–120；断言各链路 HTTP 客户端实际收到的超时。"""
-    from app.clients.ai_recognition import AIRecognitionClient
+    from app.clients import ai_recognition
+    from app.clients.http import FixedHostHttpClient
+    import socket
     from app.modules.scraper import TMDBScraper
     from app.routes import tools_api
 
@@ -382,11 +385,20 @@ def test_timeout_shares_one_default_and_range_at_every_model_client(local_config
     # AI 辅助识别：按设置值请求，不再静默截断到 30/60 秒。
     ai_timeout = TMDBScraper._ai_provider_settings()[3]
     posted = []
-    session = SimpleNamespace(post=lambda *args, **kwargs: posted.append(kwargs['timeout']))
-    client = AIRecognitionClient(api_url=BASE + '/chat/completions', model=MODEL,
-                                 timeout_seconds=ai_timeout, session=session)
-    client._post(client.api_url, protocol=client.protocol, body={})
-    assert posted == [(min(5, expected), expected)]
+    async def ai_response(request):
+        posted.append(request.extensions['timeout'])
+        return httpx.Response(200, json={})
+    def ai_factory(**kwargs):
+        return FixedHostHttpClient(
+            **kwargs, transport=httpx.MockTransport(ai_response),
+            resolver=lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('203.0.113.1', port))],
+        )
+    client = ai_recognition.AIRecognitionClient(api_url=BASE + '/chat/completions', model=MODEL,
+                                               timeout_seconds=ai_timeout)
+    with patch.object(ai_recognition, 'FixedHostHttpClient', ai_factory):
+        client._post(client.api_url, protocol=client.protocol, body={})
+    assert len(posted) == 1
+    assert {key: posted[0][key] for key in ('read', 'write', 'pool')} == dict.fromkeys(('read', 'write', 'pool'), expected)
 
     # 连接测试未带草稿超时时使用同一有效值，而非对存量值另行报错。
     probe_timeouts = []

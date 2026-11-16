@@ -353,6 +353,7 @@ class AIRecognitionClient:
             allowed_hosts={self.location.host},
             configured_origin=self.location.base_url,
             timeout_seconds=self.timeout_seconds,
+            get_timeout_retries=0,
             max_response_bytes=64 * 1024,
             max_redirects=0,
             user_agent="MediaFlux-AIRecognition/1.0",
