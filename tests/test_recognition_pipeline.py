@@ -3066,6 +3066,125 @@ def _merged_four_season_timeline() -> dict:
 
 
 class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
+    def test_streaming_source_and_explicit_alias_release_names_match_verified_movies(self):
+        scraper = self.recognition_module()
+        cases = (
+            (
+                "Hoppers.2026.2160p.iT.WEB-DL.HDR.H.265.DDP7.1-QuickIO.mkv",
+                "Hoppers", "2026", ("Hoppers",),
+                {"title": "河狸变身计划", "original_title": "Hoppers"},
+            ),
+            (
+                "The Devil's Backbone AKA El espinazo del diablo 2001 UHD BluRay REMUX "
+                "2160p HEVC DoVi HDR DTS-HD MA5.1-DreamHD.mkv",
+                "The Devil's Backbone AKA El espinazo del diablo", "2001",
+                ("The Devil's Backbone", "El espinazo del diablo"),
+                {"title": "鬼童院", "original_title": "El espinazo del diablo",
+                 "alternative_titles": {"titles": [{"title": "The Devil's Backbone"}]}},
+            ),
+        )
+        for filename, title, year, queries, fields in cases:
+            with self.subTest(filename=filename):
+                candidate = {"id": 901, "media_type": "movie", "release_date": year + "-01-01", **fields}
+                unrelated = {**candidate, "id": 900, "title": "另一部电影", "original_title": "Unrelated Movie",
+                             "alternative_titles": {}}
+                client = _QueryDeterministicClient(
+                    {query: [unrelated, candidate] for query in queries},
+                    {str(item["id"]): item for item in (unrelated, candidate)},
+                )
+                parser = scraper.TMDBScraper(cast(TMDBClient, client))
+                self.addCleanup(parser.close)
+                parsed = parser.parse_media(filename)
+                self.assertEqual(parsed.context.normalized_title, title)
+                self.assertEqual(parsed.year, year)
+                self.assertEqual(parsed.media_type, "movie")
+                self.assertEqual((parsed.source_season, parsed.source_episode), (None, None))
+                result = parser.deterministic_recognize(filename)
+                self.assertEqual(result.status, "matched")
+                self.assertFalse(result.need_confirm)
+                self.assertEqual(result.tmdb_id, "901")
+                self.assertTrue(set(queries).issubset({query for query, _, _ in client.search_calls}))
+                self.assertFalse(scraper.has_unresolved_candidate_title_remainder(parsed.context, result, candidate))
+
+    def test_explicit_alias_candidates_still_require_complete_identity_and_unique_year(self):
+        scraper = self.recognition_module()
+        filename = (
+            "The Devil's Backbone AKA El espinazo del diablo 2001 UHD BluRay REMUX "
+            "2160p HEVC DoVi HDR DTS-HD MA5.1-DreamHD.mkv"
+        )
+        base = {"id": 901, "media_type": "movie", "title": "The Devil's Backbone",
+                "original_title": "El espinazo del diablo", "release_date": "2001-01-01"}
+        cases = (
+            [{**base, "original_title": "Different Original Title"}],
+            [{**base, "release_date": "1990-01-01"}],
+            [base, {**base, "id": 902}],
+        )
+        for candidates in cases:
+            with self.subTest(candidates=candidates):
+                client = _QueryDeterministicClient(
+                    {query: candidates for query in ("The Devil's Backbone", "El espinazo del diablo")},
+                    {str(item["id"]): item for item in candidates},
+                )
+                parser = scraper.TMDBScraper(cast(TMDBClient, client))
+                self.addCleanup(parser.close)
+                result = parser.deterministic_recognize(filename)
+                self.assertTrue(result.need_confirm)
+                self.assertNotEqual(result.status, "matched")
+
+    def test_short_streaming_source_is_only_removed_from_explained_metadata_tail(self):
+        scraper = self.recognition_module()
+        cases = (
+            ("It.2017.1080p.iT.WEB-DL.H.264.mkv", "It"),
+            ("Bring.It.On.2000.1080p.WEB-DL.H.264.mkv", "Bring It On"),
+            ("AKA.2023.1080p.WEB-DL.H.264.mkv", "AKA"),
+            ("A.Movie.2024.1080p.BluRay.H.265.mkv", "A Movie"),
+            ("The.Example.2024.It.Secret.Chapter.1080p.WEB-DL.mkv", "The Example It Secret Chapter"),
+        )
+        for filename, title in cases:
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename)
+                self.assertEqual(context.normalized_title, title)
+                self.assertIsNone(context.season)
+                self.assertIsNone(context.episode)
+
+        for filename in ("Example.Show - 264 [1080p].mkv", "Example.Show.S01E264.H.264.AAC2.0.mkv"):
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename)
+                self.assertEqual(context.episode, 264)
+                self.assertEqual(context.normalized_title, "Example Show")
+
+        dotted_alias = scraper.extract_recognition_context(
+            "The First Movie a.k.a. Le Premier Film.2024.1080p.BluRay.mkv"
+        )
+        self.assertEqual(scraper.generate_query_variants(dotted_alias)[1:], [
+            "The First Movie", "Le Premier Film",
+        ])
+
+    def test_alias_marker_cannot_approve_only_the_long_half_of_a_movie_title(self):
+        scraper = self.recognition_module()
+        primary = "An Extraordinary Journey Through Ancient Cities And Forgotten Kingdoms"
+        for marker in ("AKA", "a.k.a."):
+            for complete_title in (False, True):
+                with self.subTest(marker=marker, complete_title=complete_title):
+                    source_title = f"{primary} {marker} Red"
+                    candidate = {"id": 901, "media_type": "movie", "release_date": "2024-01-01",
+                                 "title": source_title if complete_title else primary}
+                    client = _DeterministicClient([candidate], {"901": candidate})
+                    parser = scraper.TMDBScraper(cast(TMDBClient, client))
+                    self.addCleanup(parser.close)
+                    result = parser.deterministic_recognize(f"{source_title}.2024.1080p.BluRay.mkv")
+                    self.assertEqual(result.need_confirm, not complete_title)
+                    self.assertEqual(result.status == "matched", complete_title)
+
+        candidate = {"id": 901, "media_type": "movie", "title": "The Invisible Guests",
+                     "release_date": "2024-01-01"}
+        client = _DeterministicClient([candidate], {"901": candidate})
+        parser = scraper.TMDBScraper(cast(TMDBClient, client))
+        self.addCleanup(parser.close)
+        fuzzy = parser.deterministic_recognize("The Invisible Guest.2024.1080p.BluRay.mkv")
+        self.assertEqual(fuzzy.status, "matched")
+        self.assertFalse(fuzzy.need_confirm)
+
     def test_cleaned_instance_movie_matches_and_still_checks_ambiguous_identity(self):
         scraper = self.recognition_module()
         candidate = {

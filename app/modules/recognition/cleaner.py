@@ -10,7 +10,9 @@ _AUDIO_CODEC_PATTERN = (
     r'ddp|eac3|ac3|aac|flac|mp3|opus)'
     r'(?:[ ._-]*atmos)?(?:[ ._-]*[1-8][ ._-]?[01](?:[ ._-][24])?)?'
 )
-_AUDIO_CODEC_TOKEN = re.compile(rf'(?i)\b{_AUDIO_CODEC_PATTERN}\b')
+_VIDEO_CODEC_PATTERN = r'(?:h[ ._-]?26[45]|x26[45]|hevc|avc|vc[ ._-]?1|mpeg[ ._-]?2)'
+_CODEC_TOKEN = re.compile(rf'(?i)\b(?:{_AUDIO_CODEC_PATTERN}|{_VIDEO_CODEC_PATTERN})\b')
+_EXPLICIT_TITLE_SEPARATOR = re.compile(r"[|｜]|\s+(?i:a[ .]*k[ .]*a\.?)\s+")
 
 
 _MEDIA_FILE_SUFFIX = re.compile(
@@ -75,13 +77,14 @@ def _split_title_variants(title: str) -> list[str]:
     title = re.sub(r"\s+", " ", (title or "")).strip()
     if not title:
         return []
-    pipe_parts = [
+    # 保留整段来源标题；拆出的别名仍由候选的官方标题/别名共同核验。
+    delimited_parts = [
         re.sub(r"\s+", " ", part).strip()
-        for part in re.split(r"[|｜]", title)
+        for part in _EXPLICIT_TITLE_SEPARATOR.split(title)
         if part.strip()
     ]
     explicit_parts: list[str] = []
-    for part in pipe_parts or [title]:
+    for part in delimited_parts or [title]:
         slash_parts = [
             re.sub(r"\s+", " ", item).strip()
             for item in re.split(r"[/／]", part)
@@ -93,7 +96,7 @@ def _split_title_variants(title: str) -> list[str]:
             explicit_parts.extend(slash_parts)
         else:
             explicit_parts.append(part)
-    variants: list[str] = [title, *pipe_parts, *explicit_parts]
+    variants: list[str] = [title, *delimited_parts, *explicit_parts]
     for part in explicit_parts or [title]:
         cjk = " ".join(re.findall(r"[\u3400-\u9fff]+", part))
         # 日文混合标题不能再拆出单个汉字变体（如“僕”）；否则它会与大量

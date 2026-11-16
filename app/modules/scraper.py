@@ -57,7 +57,9 @@ from app.modules.episode_mapping import (
 )
 from app.modules.recognition.cleaner import (
     _AUDIO_CODEC_PATTERN,
-    _AUDIO_CODEC_TOKEN,
+    _CODEC_TOKEN,
+    _EXPLICIT_TITLE_SEPARATOR,
+    _VIDEO_CODEC_PATTERN,
     _comparison_key,
     _split_title_variants,
     _unique_text,
@@ -180,7 +182,7 @@ _NOISE = re.compile(
     r'hdr10plus|hdr10|hdr|dolby|atmos|'
     + _AUDIO_CODEC_PATTERN + r'|'
     r'ddp5|ddp7|(?:2|3|5|7)[ ._-]?1|'
-    r'h[ ._-]?264|h[ ._-]?265|x264|x265|hevc|avc|vc[ ._-]?1|mpeg[ ._-]?2|'
+    + _VIDEO_CODEC_PATTERN + r'|'
     r'nvenc|vp9|av1|10bit|10-bit|8bit|'
     r'23\.976fps|24fps|25fps|30fps|60fps|fps|'
     r'netflix|nf|amazon|amzn|disney|dsnp|hbo[ ._-]?max|hbo|hulu|atvp|'
@@ -637,7 +639,7 @@ _RELEASE_TECHNICAL_METADATA = re.compile(
     r"remaster(?:ed)?|imax|dc|director'?s[ ._-]+cut|v\d{1,3}|"
     r"(?:ai[ ._-]+)?hybrid|upscaled?|dovi|dv(?:[ ._-]*p[ ._-]?\d{1,2})?|"
     r"p[ ._-]?\d{1,2}|mnhd|halfcd|multi(?:-?subs?)?|msubs?|ass|srt|pgs|"
-    r"usa|ger|portuguese|english|chinese|mandarin|cantonese|japanese|korean)"
+    r"it|usa|ger|portuguese|english|chinese|mandarin|cantonese|japanese|korean)"
     r"(?![A-Za-z0-9])"
 )
 _RELEASE_SOURCE_BRACKET = re.compile(
@@ -1329,7 +1331,7 @@ def _strip_known_episode_suffix(
     def replace(match: re.Match) -> str:
         if any(
             token.start() <= match.start(1) < token.end()
-            for token in _AUDIO_CODEC_TOKEN.finditer(match.string)
+            for token in _CODEC_TOKEN.finditer(match.string)
         ):
             return match.group(0)
         try:
@@ -3607,8 +3609,10 @@ def score_candidate(context: RecognitionContext, candidate: dict) -> CandidateSc
         not rejected
         and matched_query_key not in anchor_keys
         and best_title_score >= 0.9
-        and primary_title_score < 0.9
-        and best_title_score - primary_title_score >= 0.08
+        and (
+            (primary_title_score < 0.9 and best_title_score - primary_title_score >= 0.08)
+            or any(_EXPLICIT_TITLE_SEPARATOR.search(query) for query in anchor_queries)
+        )
         and _has_distinctive_title_remainder(anchor_queries, matched_query)
         and not _explicit_quoted_title_matches(anchor_queries, matched_query)
         and not _known_season_alias_remainder(
