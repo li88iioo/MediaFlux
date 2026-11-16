@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import os
 import re
 import unittest
 from unittest.mock import patch
@@ -41,9 +40,8 @@ def login(client: TestClient) -> dict[str, str]:
 
 
 def write_raw(**values: str) -> None:
-    """走真实发布器写入 user.env；进程环境在退出后恢复，后续读取只看文件。"""
-    with patch.dict(os.environ):
-        config.set_and_save(values)
+    """走真实发布器同步文件与运行时；由外层安装夹具恢复环境。"""
+    config.set_and_save(values)
 
 
 class ConfigEmptyValueApiTests(unittest.TestCase):

@@ -85,13 +85,14 @@ class NativeRecommendationTests(unittest.TestCase):
                        if item['provider'] == 'tmdb' and item['category'] == 'discover')
         self.assertTrue(catalog['supports_collection'])
         self.assertEqual(set(catalog['media_types']), {'movie', 'tv'})
-        self.assertTrue(all(not item['enabled'] for item in sources['catalogs'] if item['provider'] == 'douban'))
+        self.assertTrue(any(item['provider'] == 'douban' for item in sources['catalogs']))
+        self.assertFalse(any(item['provider'] == 'douban' for item in sources['sections']))
         for item in sources['catalogs']:
             if not item['supports_collection']:
                 continue
             for media_type in item['media_types']:
                 service = PagedDiscoveryService({1: _page([])})
-                with _recommend_fixture(service):
+                with _recommend_fixture(service), patch('app.config.get_bool', return_value=False):
                     result = sdk.media.catalog(item['provider'], item['category'], media_type, limit=10)
                 self.assertEqual(result['status'], 'empty')
 

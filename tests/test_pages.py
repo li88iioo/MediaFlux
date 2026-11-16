@@ -117,7 +117,7 @@ class PagesUiContractTests(unittest.TestCase):
             html,
         )
         self.assertIn(
-            '<span class="telemetry-command-code">/status</span><span class="telemetry-command-desc">状态遥测</span>',
+            '<span class="telemetry-command-code">/status</span><span class="telemetry-command-desc">运行状态</span>',
             html,
         )
         # 确认旧指令已从速查面板中替换

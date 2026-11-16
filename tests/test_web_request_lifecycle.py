@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
+from app import config
 from app.repositories import agent_web_search as agent_web_search_repo
 from app.modules import web_evidence as read
 from app.modules import web_evidence as search
@@ -30,7 +31,7 @@ class WebRequestLifecycleTests(IsolatedDatabaseTestCase):
             "TAVILY_DAILY_CREDIT_LIMIT": "100",
             "TAVILY_MAX_RESULTS": "5",
         }
-        for module in (read, search, hints):
+        for module in (search, hints, config):
             stack.enter_context(
                 patch.object(
                     module, "get", side_effect=lambda k, d="": values.get(k, d)

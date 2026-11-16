@@ -62,25 +62,7 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         with self.assertRaises(TypeError):
             sdk.METHODS["resources.sources"](debug=True)
 
-    def test_disabled_state_does_not_construct_service(self):
-        with (
-            patch(
-                "app.indexers.runtime.config.get_bool",
-                return_value=False,
-            ),
-            patch(
-                "app.indexers.runtime.get_indexer_service"
-            ) as service_factory,
-        ):
-            result = sdk.resources.sources()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status"], "disabled")
-        self.assertFalse(result["indexer_enabled"])
-        self.assertFalse(result["network_accessed"])
-        self.assertFalse(result["filesystem_accessed"])
-        service_factory.assert_not_called()
-
-    def test_ready_projection_reports_effective_capabilities_without_network(self):
+    def test_page_hidden_still_reports_effective_capabilities_without_network(self):
         service = _Service(
             {
                 "nyaa": _Adapter(
@@ -97,7 +79,7 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         )
         with (
             patch(
-                "app.indexers.runtime.config.get_bool", return_value=True
+                "app.indexers.runtime.config.get_bool", return_value=False
             ),
             patch(
                 "app.indexers.runtime.get_indexer_service",
@@ -106,6 +88,9 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
         ):
             result = sdk.resources.sources()
         self.assertTrue(result["ok"])
+        self.assertTrue(result["indexer_enabled"])
+        self.assertFalse(result["network_accessed"])
+        self.assertFalse(result["filesystem_accessed"])
         self.assertEqual(result["status"], "ready")
         self.assertEqual(
             result["counts"],
@@ -214,6 +199,6 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
             unavailable = sdk.resources.sources()
         serialized = json.dumps(unavailable, ensure_ascii=False)
         self.assertEqual(unavailable["status"], "unavailable")
-        self.assertIsNone(unavailable["indexer_enabled"])
+        self.assertTrue(unavailable["indexer_enabled"])
         self.assertNotIn("INDEXER_CONFIG_SECRET", serialized)
         self.assertNotIn("/srv/config/private", serialized)

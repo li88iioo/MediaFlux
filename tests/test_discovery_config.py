@@ -36,7 +36,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         def get_value(key, default=""):
             return existing.get(key, default)
 
-        with patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(get_value)), patch(
+        with patch("app.routes.api.config.all_items", return_value=existing), patch("app.routes.api.config.get", side_effect=preserve_web_auth_config(get_value)), patch(
             "app.routes.api.config.set_and_save"
         ) as persist, patch("app.services.clear_dashboard_cache"), patch(
             "app.modules.scheduler.get_scheduler"
@@ -310,14 +310,15 @@ class DiscoveryConfigTests(unittest.TestCase):
         persist.assert_not_called()
 
     def test_public_douban_config_save_restarts_discovery_service(self):
-        response, persist, shutdown = self._save(
-            {"DISCOVERY_DOUBAN_ENABLED": "1", "DOUBAN_DBCL2": ""},
-        )
-
-        self.assertEqual(response, {"success": True})
-        # 未变化的空 Cookie 不再触发磁盘写入；只持久化真实变化。
-        persist.assert_called_once_with({"DISCOVERY_DOUBAN_ENABLED": "1"})
-        shutdown.assert_called_once_with()
+        for existing in ({}, {"DOUBAN_DBCL2": ""}):
+            with self.subTest(existing=existing):
+                values = {"DISCOVERY_DOUBAN_ENABLED": "1", "DOUBAN_DBCL2": ""}
+                response, persist, shutdown = self._save(values, existing=existing)
+                self.assertEqual(response, {"success": True})
+                # 已存空值无需重写；缺失键显式提交为空则与统一保存语义一致。
+                expected = {"DISCOVERY_DOUBAN_ENABLED": "1"} if existing else values
+                persist.assert_called_once_with(expected)
+                shutdown.assert_called_once_with()
 
     def test_bangumi_user_agent_rejects_blank_or_header_injection(self):
         for value in ("   ", "MediaFlux/1.0\r\nX-Test: injected"):

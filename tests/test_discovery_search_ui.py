@@ -2188,6 +2188,8 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         html = templates.get_template("rss.html").render(
             active="rss", discovery_enabled=True, resource_results_enabled=False,
+            rss_defaults={"default_method": "qb", "category": "", "default_save_path": ""},
+            rss_inherited_dir_id="0", rss_inherited_dir_name="根目录",
             csrf_token=lambda: "test", url_for=lambda name: "/" + name.split(".")[-1],
             static_url=lambda path: "/static/" + path,
         )

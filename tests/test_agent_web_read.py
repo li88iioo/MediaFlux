@@ -601,7 +601,7 @@ blocked = ("app.agent.domains", "app.agent.kernel", "app.routes", "fastapi")
 with patch.dict(sys.modules, dict.fromkeys(blocked)), patch("socket.socket.connect", side_effect=AssertionError("offline")):
     from app.modules import web_evidence
     from app.clients.http import HttpResponse
-    with patch.object(web_evidence, "get", return_value="0"):
+    with patch.object(web_evidence, "get", return_value="0"), patch("app.config.get", return_value="0"):
         disabled = web_evidence.read_web("https://example.com/article")
     page = HttpResponse("https://example.com/article", 200, {"content-type": "text/plain"}, b"full body " * 3000)
     result = web_evidence._map_page_response(page, {"url": page.url, "max_chars": 2000000}, 1)

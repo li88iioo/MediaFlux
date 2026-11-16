@@ -125,6 +125,10 @@ def test_real_web_search_http_failure_preserves_observation_and_model_answer(sta
                 resolver=lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))])
 
         settings = {"WEB_SEARCH_ENABLED": "1", "TAVILY_API_KEY": "offline-key", "TAVILY_DAILY_CREDIT_LIMIT": "100"}
+        from app import config
+
+        configured_get = config.get
+        read_setting = lambda key, default="": settings.get(key, configured_get(key, default))  # noqa: E731
         original = actions._search_tavily
         from app import sdk
         from app.agent.kernel.capabilities import KernelToolSpec, ToolEffect
@@ -133,7 +137,7 @@ def test_real_web_search_http_failure_preserves_observation_and_model_answer(sta
             effect=ToolEffect.READ, read=lambda args, context: sdk.web.search(**args))
         query = f"offline outage {status}"
         model = ScriptedModel([round_calls([ModelToolCall("lookup", tool.model_name, {"query": query})]), FINAL])
-        with patch.object(actions, "get", side_effect=lambda key, default="": settings.get(key, default)), patch.object(
+        with patch.object(actions, "get", side_effect=read_setting), patch.object(config, "get", side_effect=read_setting), patch.object(
             actions, "_search_tavily", partial(original, client_factory=factory),
         ):
             events = await collect(session_for(model, tool, store).run(AgentInput(

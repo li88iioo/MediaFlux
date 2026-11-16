@@ -330,7 +330,9 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         message = SimpleNamespace(chat=SimpleNamespace(id=-100), from_user=SimpleNamespace(id=9))
         for width in (1280, 390):
             with self.subTest(width=width):
+                config.set_and_save({"AGENT_LLM_ENABLED": "1"})
                 self._write(AGENT_LLM_ENABLED="0", TG_AGENT_ENABLED="0", TG_CHAT_ID="-100", TG_AGENT_ALLOWED_USER_IDS="")
+                self.assertEqual(config.get("AGENT_LLM_ENABLED"), "0")
                 page = self._open("/settings#telegram")
                 page.set_viewport_size({"width": width, "height": 900})
                 page.locator('[data-settings-target="telegram"]').click()
