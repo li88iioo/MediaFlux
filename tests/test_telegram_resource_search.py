@@ -398,7 +398,8 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertNotIn("作品 A [1080p]", bot.edits[0][0][0])
         self.assertEqual(bot.answers[0][0][1], "已切换资源范围")
 
-    def test_target_picker_uses_qb_guangya_both_and_back_actions(self):
+    @patch("app.bot.handlers.get", return_value="离线")
+    def test_target_picker_uses_qb_guangya_both_and_back_actions(self, _config):
         text, markup = _resource_target_view(
             _TELEBOT,
             self.session_id,
@@ -412,7 +413,7 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertIn("选择下载目标", text)
         self.assertEqual(
             [button.text for button in markup.buttons],
-            ["qBittorrent", "光鸭云盘", "光鸭默认 + qBittorrent", "返回资源列表"],
+            ["qBittorrent", "光鸭·离线", "光鸭·离线 + qBittorrent", "返回资源列表"],
         )
         resolved = [
             self.store.resolve_action(button.callback_data.split(":", 1)[1], "100", "9")

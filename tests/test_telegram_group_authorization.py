@@ -627,6 +627,40 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         self.assertTrue(bot.edits[0][1]["reply_markup"] is None)
         self.assertTrue(bot.answers[-1][1]["show_alert"])
 
+    def test_download_picker_uses_saved_directory_name_without_changing_targets(self):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import (
+            get_telegram_write_confirmation_store,
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+
+        reset_telegram_write_confirmation_store_for_tests()
+        for configured, displayed in (
+            ("", "默认目录"),
+            (" \n ", "默认目录"),
+            ("  离线\n下载  ", "离线 下载"),
+            ("电影 & <收藏>", "电影 & <收藏>"),
+            ("长" * 50, "长" * 39 + "…"),
+        ):
+            with (
+                self.subTest(directory=configured),
+                patch("app.bot.handlers.get", return_value=configured),
+                patch("app.bot.handlers._nsfw_download_sources", return_value=[
+                    {"id": "adult-only", "name": "成人专区"},
+                ]),
+            ):
+                markup = handlers._download_target_picker_markup(
+                    fake_telebot_types(), request_id=77, chat_id="100", user_id="9",
+                )
+                self.assertEqual([item.text for item in markup.buttons], [
+                    f"光鸭·{displayed}", "qBittorrent", "光鸭·NSFW · 成人专区",
+                    f"光鸭·{displayed} + qBittorrent", "取消",
+                ])
+                action = get_telegram_write_confirmation_store().claim(
+                    markup.buttons[3].callback_data[4:], chat_id="100", user_id="9",
+                )
+                self.assertEqual(action["value"], {"request_id": 77, "target": "both"})
+
     def test_single_nsfw_source_is_named_and_stored_in_ticket(self):
         from app.bot import handlers
         from app.modules.telegram_write_confirmations import (
@@ -784,7 +818,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         self.assertIn("未配置 NSFW", bot.answers[-1][0][1])
         replacement = bot.edits[-1][1]["reply_markup"]
         self.assertTrue(any(item.text == "qBittorrent" for item in replacement.buttons))
-        self.assertTrue(any(item.text == "光鸭默认 + qBittorrent" for item in replacement.buttons))
+        self.assertTrue(any(item.text == "光鸭·默认目录 + qBittorrent" for item in replacement.buttons))
         self.assertTrue(any(item.text == "光鸭·NSFW" for item in replacement.buttons))
 
     def test_stale_nsfw_choice_refreshes_picker_without_submitting(self):

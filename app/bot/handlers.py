@@ -70,7 +70,6 @@ _sync_running = False
 _organize_running = False
 _local_organize_running = False
 _ORGANIZE_LIFECYCLE_WAIT_SECONDS = 30 * 60
-_BOTH_DOWNLOAD_LABEL = "光鸭默认 + qBittorrent"
 
 
 def _organize_group_progress(task_state: dict) -> tuple[int, int, str, str]:
@@ -200,6 +199,16 @@ def _nsfw_download_source(source_id: str) -> dict[str, str] | None:
     )
 
 
+def _download_target_labels() -> dict[str, str]:
+    from app.modules.offline import DEFAULT_TARGET_DIR_NAME
+
+    name = " ".join((get("OFFLINE_TARGET_DIR_NAME", "") or "").split()) or DEFAULT_TARGET_DIR_NAME
+    if len(name) > 40:
+        name = name[:39].rstrip() + "…"
+    cloud = f"光鸭·{name}"
+    return {"qb": "qBittorrent", "guangya": cloud, "both": f"{cloud} + qBittorrent"}
+
+
 def _download_target_picker_markup(
     telebot,
     *,
@@ -213,12 +222,12 @@ def _download_target_picker_markup(
         get_telegram_write_confirmation_store,
     )
 
+    labels = _download_target_labels()
     ordinary = [
-        ("光鸭云盘", "confirm", {"request_id": request_id, "target": "guangya"}),
-        ("qBittorrent", "confirm", {"request_id": request_id, "target": "qb"}),
-        (_BOTH_DOWNLOAD_LABEL, "confirm", {"request_id": request_id, "target": "both"}),
-        ("取消", "cancel", {"request_id": request_id}),
+        (labels[target], "confirm", {"request_id": request_id, "target": target})
+        for target in ("guangya", "qb", "both")
     ]
+    ordinary.append(("取消", "cancel", {"request_id": request_id}))
     if allow_guangya:
         sources = _nsfw_download_sources()
         rows = [ordinary[:2]]
@@ -661,11 +670,7 @@ def _resource_target_view(
     )
     text = f"<b>选择下载目标</b>\n{title}\n{html.escape(_resource_item_meta(item))}"
     markup = telebot.types.InlineKeyboardMarkup(row_width=3)
-    for label, target in (
-        ("qBittorrent", "qb"),
-        ("光鸭云盘", "guangya"),
-        (_BOTH_DOWNLOAD_LABEL, "both"),
-    ):
+    for target, label in _download_target_labels().items():
         markup.add(
             _resource_action_button(
                 telebot,
@@ -2390,11 +2395,7 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
             )
             if item is None:
                 raise TelegramResourceSearchError("资源结果已失效，请重新搜索")
-            labels = {
-                "qb": "qBittorrent",
-                "guangya": "光鸭云盘",
-                "both": _BOTH_DOWNLOAD_LABEL,
-            }
+            labels = _download_target_labels()
             markup = _write_confirmation_markup(
                 telebot,
                 chat_id=chat_id,
