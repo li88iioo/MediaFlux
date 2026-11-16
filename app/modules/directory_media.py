@@ -135,7 +135,7 @@ class DirectoryMediaInspector:
         scanned_entries = 0
         # 目录名作为作品名称参与识别时去掉下载隔离包装；展示与快照仍用原名。
         identity_name = strip_staging_directory_prefix(source.name) or source.name
-        parsed_dir = self._parse_for_rules(identity_name, rules, "")
+        parsed_dir = self._parse_for_rules(source.name, rules, "", is_directory=True)
 
         def scan(
             current_id: str,
@@ -165,6 +165,7 @@ class DirectoryMediaInspector:
                         resolved_dir.name,
                         rules,
                         self._recognition_parent_path(source.name, relative_dir),
+                        is_directory=True,
                     )
                     child_season = self._optional_season(parsed_child.get("season"))
                     scan(
@@ -521,9 +522,13 @@ class DirectoryMediaInspector:
             return ""
         return (parent.name or "").strip()
 
-    def _parse(self, filename: str, parent_path: str = "") -> dict[str, Any]:
+    def _parse(
+        self, filename: str, parent_path: str = "", *, is_directory: bool = False,
+    ) -> dict[str, Any]:
         try:
-            parsed = self.scraper.parse_media(filename, parent_path, filename_only=True)
+            parsed = self.scraper.parse_media(
+                filename, parent_path, filename_only=True, is_directory=is_directory,
+            )
             if parsed.context.cleaned_components.get("release_format_conflicts"):
                 raise DirectoryScrapeConflictError("发布格式存在冲突，请核对并停用冲突格式后重新检查")
             return {
@@ -551,19 +556,21 @@ class DirectoryMediaInspector:
         filename: str,
         rules: OrganizeRules,
         parent_path: str = "",
+        *, is_directory: bool = False,
     ) -> dict[str, Any]:
         if not rules.nsfw_exclusive:
-            return self._parse(filename, parent_path)
+            return self._parse(filename, parent_path, is_directory=is_directory)
 
         # 成人专用来源不进入普通影视季集解析。番号末尾的数字（如 675）
         # 否则会被 guessit/通用解析器误判为 S06E75，并污染单文件检查。
-        code = self._nsfw_code(filename, rules)
+        identity_name = strip_staging_directory_prefix(filename) if is_directory else filename
+        code = self._nsfw_code(identity_name, rules)
         if code:
             title = code
         else:
             from app.modules.nsfw import clean_nsfw_release_text
 
-            source = (filename or "").strip()
+            source = (identity_name or "").strip()
             stem, separator, extension = source.rpartition(".")
             if separator and extension.casefold() in self.organizer.video_exts(rules):
                 source = stem
@@ -571,7 +578,9 @@ class DirectoryMediaInspector:
                 source, rules.nsfw_strip_domains,
             ).strip(" ._@-[]()【】")
             if not title:
-                title = str(self._parse(filename, parent_path).get("title") or "").strip()
+                title = str(self._parse(
+                    filename, parent_path, is_directory=is_directory,
+                ).get("title") or "").strip()
         return {
             "title": title,
             "year": "",

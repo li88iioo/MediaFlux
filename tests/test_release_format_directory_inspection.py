@@ -56,9 +56,9 @@ class _RecordingScraper:
     def close(self) -> None:
         self.inner.close()
 
-    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False):
+    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
         self.parse_calls.append((filename, parent_path))
-        return self.inner.parse_media(filename, parent_path, match, filename_only=filename_only)
+        return self.inner.parse_media(filename, parent_path, match, filename_only=filename_only, is_directory=is_directory)
 
 
 def teaching_rule(parent_path: str) -> dict:

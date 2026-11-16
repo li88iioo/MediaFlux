@@ -18,7 +18,7 @@ import pytest
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
-from app.modules.scraper import Candidate, MatchResult
+from app.modules.scraper import Candidate, MatchResult, strip_staging_directory_prefix
 
 _TEST_DATABASE_LOCK = threading.RLock()
 
@@ -410,9 +410,10 @@ class _ParsingScraper:
         }
 
     @classmethod
-    def parse_media(cls, filename: str, parent_path: str = "", match=None, *, filename_only=False):
+    def parse_media(cls, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
+        identity_name = strip_staging_directory_prefix(filename) if is_directory else filename
         return release_parse_result(
-            cls._fields(filename), filename=filename, parent_path=parent_path
+            cls._fields(identity_name), filename=filename, parent_path=parent_path
         )
 
 
@@ -519,9 +520,10 @@ class _DirectoryScrapeTMDB:
             threshold=1.0,
         )
 
-    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False):
+    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
+        identity_name = strip_staging_directory_prefix(filename) if is_directory else filename
         return release_parse_result(
-            _ParsingScraper._fields(filename),
+            _ParsingScraper._fields(identity_name),
             filename=filename, parent_path=parent_path,
         )
 

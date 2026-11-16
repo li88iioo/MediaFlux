@@ -497,7 +497,7 @@ class LocalMediaService:
             # 多视频目录以目录名为作品名称；去掉下载隔离包装再识别。
             identity_name = strip_staging_directory_prefix(selected.name) or selected.name
             try:
-                parsed = self.scraper.parse_media(identity_name)
+                parsed = self.scraper.parse_media(selected.name, is_directory=True)
             except Exception:
                 parsed = None
             if parsed is not None:

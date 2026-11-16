@@ -2359,11 +2359,14 @@ def _parse_release_surface(
 def _parse_release_core(
     filename: str, parent_path: str = "", *, include_release: bool = False,
     _format_rules: list[dict] | None = None, filename_only: bool = False,
+    is_directory: bool = False,
 ) -> _ReleaseParseCore:
     """构造一次事实解析，并按需提供 release 领域投影。"""
     raw_name = (filename or "")
     raw_parent_path = "" if filename_only else (parent_path or "")
-    parse_name = _strip_explicit_tmdb_markers(raw_name)
+    # 目录包装只影响身份投影；格式匹配与预处理规则仍读取原始名称。
+    identity_name = strip_staging_directory_prefix(raw_name) if is_directory else raw_name
+    parse_name = _strip_explicit_tmdb_markers(identity_name)
     parse_parent_path = _strip_explicit_tmdb_markers_from_path(raw_parent_path)
     filename_stem = strip_media_file_suffix(parse_name)
     surface = _parse_release_surface(filename_stem, context_mode=True)
@@ -4900,10 +4903,13 @@ class TMDBScraper:
 
     def parse_media(
         self, filename: str, parent_path: str = "", match: MatchResult | None = None,
-        *, filename_only: bool = False,
+        *, filename_only: bool = False, is_directory: bool = False,
     ) -> ReleaseParseResult:
         """生成统一解析结果；目录组检查只采文件独立证据，父目录仍限定格式作用域。"""
-        core = _parse_release_core(filename, parent_path, include_release=True, filename_only=filename_only)
+        core = _parse_release_core(
+            filename, parent_path, include_release=True,
+            filename_only=filename_only, is_directory=is_directory,
+        )
         context = core.context
         fields = dict(core.release_fields or {})
         processed = self.prepare_recognition(filename, context.parent_path, _core=core)

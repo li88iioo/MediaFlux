@@ -1287,6 +1287,28 @@ class DirectoryEpisodeTitleIdentityTests(IsolatedDatabaseTestCase):
                     "关于我转生变成史莱姆这档事 Tensei Shitara Slime Datta Ken",
                 )
 
+    def test_staging_directory_keeps_original_name_for_season_override_rules(self):
+        from app.modules import recognition_preprocess_rules
+
+        rule = recognition_preprocess_rules.create_rule({
+            "name": "下载批次第二季", "matcher_type": "regex",
+            "pattern": r"^MF-(?:99|2026)-", "scope": "filename",
+            "action": "season_override", "numeric_value": 2,
+            "priority": 100, "disabled": False,
+        })
+        self.addCleanup(recognition_preprocess_rules.delete_rule, rule["id"])
+        names = ["Example.Show.E01.mkv", "Example.Show.E02.mkv"]
+        for prefix in ("MF-99-", "MF-2026-"):
+            with self.subTest(prefix=prefix):
+                inspection = self.inspect_names(names, directory=prefix + "Example Show")
+                self.assertEqual(inspection.season, 2)
+                self.assertFalse(inspection.season_inferred)
+                self.assertEqual(inspection.directory_name, prefix + "Example Show")
+                self.assertEqual(inspection.suggested_query, "Example Show")
+                self.assertEqual(inspection.media_type, "tv")
+                self.assertIsNone(inspection.episode)
+                self.assertEqual([item.episode for item in inspection.videos], [1, 2])
+
     def test_real_release_names_with_episode_titles_keep_one_media_identity(self):
         # 真实云盘发布名样本；使用正式解析器，不用返回预设标题的替身。
         cases = [
@@ -3257,8 +3279,8 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
     class SeasonScraper(_DirectoryScrapeTMDB):
         _parser = TMDBScraper()
 
-        def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False):
-            return self._parser.parse_media(filename, parent_path, match, filename_only=filename_only)
+        def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
+            return self._parser.parse_media(filename, parent_path, match, filename_only=filename_only, is_directory=is_directory)
 
         def get_detail_with_credits(self, tmdb_id: str, media_type: str) -> dict:
             if media_type == "tv":
@@ -3990,8 +4012,8 @@ class SingleEpisodeOverrideTests(IsolatedDatabaseTestCase):
     class EpisodeScraper(_DirectoryScrapeTMDB):
         _parser = TMDBScraper()
 
-        def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False):
-            return self._parser.parse_media(filename, parent_path, match, filename_only=filename_only)
+        def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
+            return self._parser.parse_media(filename, parent_path, match, filename_only=filename_only, is_directory=is_directory)
 
         def get_detail_with_credits(self, tmdb_id: str, media_type: str) -> dict:
             if media_type == "tv":

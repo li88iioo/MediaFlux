@@ -64,7 +64,7 @@ class FakeScraper:
         return MatchResult(tmdb_id=tmdb_id, title=self.result.title, year=self.result.year,
                            media_type=media_type, confidence=1.0, status="matched")
 
-    def parse_media(self, filename: str, parent_path: str = "", match=None):
+    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
         import re
         season = re.search(r"(?i)S(\d{1,2})", filename)
         episode = re.search(r"(?i)E(\d{1,3})", filename)
@@ -89,10 +89,15 @@ class FakeScraper:
 class SharedPositionFakeScraper(FakeScraper):
     """固定媒体身份，但复用正式共享季集解析器。"""
 
-    def parse_media(self, filename: str, parent_path: str = "", match=None):
-        from app.modules.scraper import extract_recognition_context
-
-        context = extract_recognition_context(filename, parent_path)
+    def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
+        parser = TMDBScraper(cast(TMDBClient, "offline-fixture"))
+        try:
+            context = parser.parse_media(
+                filename, parent_path, match,
+                filename_only=filename_only, is_directory=is_directory,
+            ).context
+        finally:
+            parser.close()
         return release_parse_result(
             {
                 "season": context.season,
@@ -243,7 +248,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_directory_inspection_keeps_source_and_effective_positions_distinct(self):
         class SourceEffectiveScraper(FakeScraper):
-            def parse_media(self, filename, parent_path="", match=None):
+            def parse_media(self, filename, parent_path="", match=None, *, filename_only=False, is_directory=False):
                 del match
                 return release_parse_result(
                     {
@@ -350,7 +355,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_directory_inspection_keeps_source_position_when_parse_media_fails(self):
         class FallbackScraper(FakeScraper):
-            def parse_media(self, filename, parent_path="", match=None):
+            def parse_media(self, filename, parent_path="", match=None, *, filename_only=False, is_directory=False):
                 del filename, parent_path, match
                 raise RuntimeError("parse_media fixture failure")
 
@@ -396,7 +401,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_directory_inspection_does_not_fabricate_position_after_both_parsers_fail(self):
         class NoPositionScraper(FakeScraper):
-            def parse_media(self, filename, parent_path="", match=None):
+            def parse_media(self, filename, parent_path="", match=None, *, filename_only=False, is_directory=False):
                 del filename, parent_path, match
                 raise RuntimeError("parse_media fixture failure")
 
@@ -949,6 +954,43 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         self.assertEqual(inspection["media_type"], "tv")
         self.assertEqual(inspection["parsed_episode"], 6)
 
+    def test_auto_staging_directory_keeps_original_name_for_season_override_rules(self):
+        from app.modules import recognition_preprocess_rules
+
+        rule = recognition_preprocess_rules.create_rule({
+            "name": "下载批次第二季", "matcher_type": "regex",
+            "pattern": r"^MF-(?:99|2026)-", "scope": "filename",
+            "action": "season_override", "numeric_value": 2,
+            "priority": 100, "disabled": False,
+        })
+        self.addCleanup(recognition_preprocess_rules.delete_rule, rule["id"])
+        for prefix in ("MF-99-", "MF-2026-"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as root_raw:
+                root = Path(root_raw)
+                source_root = root / (prefix + "Example Show")
+                target_root = root / "library"
+                source_root.mkdir()
+                target_root.mkdir()
+                for episode in (1, 2):
+                    (source_root / f"Example.Show.E{episode:02d}.mkv").write_bytes(b"video")
+                source_id = self._source(source_root, target_root, "tv")
+                source = local_media_repo.get_local_media_source(source_id, owner="admin")
+                assert source is not None
+                self.assertEqual(source.media_type, "auto")
+                parser = TMDBScraper(cast(TMDBClient, "offline-fixture"))
+                self.addCleanup(parser.close)
+                service = LocalMediaService(scraper=parser)
+                self.addCleanup(service.close)
+                inspection = service.inspect_source("admin", source_id, source_root)
+                self.assertEqual(inspection["parsed_season"], 2)
+                self.assertIsNone(inspection["parsed_episode"])
+                self.assertEqual(inspection["suggested_query"], "Example Show")
+                self.assertEqual(inspection["media_type"], "tv")
+                self.assertEqual(inspection["video_count"], 2)
+                self.assertEqual(sorted(path.name for path in source_root.iterdir()), [
+                    "Example.Show.E01.mkv", "Example.Show.E02.mkv",
+                ])
+
     def test_movie_preview_uses_independent_media_directory_and_organizer_naming(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "downloads"; target_root = root / "movies"
@@ -974,8 +1016,8 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         self.addCleanup(parser.close)
 
         class SequenceScraper(SharedPositionFakeScraper):
-            def parse_media(self, filename, parent_path="", match=None):
-                return parser.parse_media(filename, parent_path, match)
+            def parse_media(self, filename, parent_path="", match=None, *, filename_only=False, is_directory=False):
+                return parser.parse_media(filename, parent_path, match, filename_only=filename_only, is_directory=is_directory)
 
             def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
                 return {
@@ -1046,7 +1088,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_manual_directory_rejects_two_distinct_media_titles(self):
         class MixedTitleScraper(FakeScraper):
-            def parse_media(self, filename: str, parent_path: str = "", match=None):
+            def parse_media(self, filename: str, parent_path: str = "", match=None, *, filename_only=False, is_directory=False):
                 title = "Alpha Show" if "Alpha" in filename else "Beta Show"
                 return release_parse_result(
                     {
@@ -1638,8 +1680,8 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_manual_tmdb_selection_does_not_apply_preprocess_position_offsets(self):
         class PositionAwareScraper(FakeScraper):
-            def parse_media(self, filename, parent_path="", match=None):
-                parsed = super().parse_media(filename, parent_path, match)
+            def parse_media(self, filename, parent_path="", match=None, *, filename_only=False, is_directory=False):
+                parsed = super().parse_media(filename, parent_path, match, filename_only=filename_only, is_directory=is_directory)
                 return dataclasses.replace(
                     parsed,
                     source_season=1,
