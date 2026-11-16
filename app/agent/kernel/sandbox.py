@@ -28,10 +28,10 @@ from app.sdk import METHODS, METHOD_EFFECTS, call_owner, describe_methods, descr
 from app.sensitive_data import redact_sensitive_text
 
 from .capabilities import KernelToolSpec, ToolEffect
-from .projection import ToolOutcome, _json_safe
+from .projection import ToolOutcome, _arguments_safe, _json_safe
 from .state_types import SessionBusyError, _PublicationUnprotected
 from .task_state import identity, observation_patch, read_observations
-from .tool_calls import PipelineResult
+from .tool_calls import PipelineResult, SDKReadRetry
 
 if TYPE_CHECKING:
     from .effects import EffectExecutor
@@ -44,8 +44,35 @@ _CHILD = Path(__file__).with_name("sandbox_child.py")
 _CLIENT = Path(__file__).with_name("workspace_client.py")
 _SKILLS = Path(__file__).parent.parent / "skills"
 _OUTPUT_CHARS = 16_000
+_CODE_MAX_CHARS = 64_000
 _REQUEST_BYTES = 4 * 1024 * 1024
 _REQUEST_NAME = re.compile(r"[0-9a-f]{32}\.json\Z")
+
+
+def resumed_sdk_read_arguments(invocation) -> dict[str, Any]:
+    """签名等待只恢复一次已绑定的 READ；原脚本及其后续语句不参与生成。"""
+    if not isinstance(invocation, dict) or set(invocation) != {"v", "method", "arguments", "rpc_id"}:
+        raise ValueError("invalid SDK read wait")
+    method, arguments, rpc_id = (invocation[key] for key in ("method", "arguments", "rpc_id"))
+    if (type(invocation["v"]) is not int or invocation["v"] != 1
+            or not isinstance(method, str) or method not in METHODS or METHOD_EFFECTS.get(method) != "read"
+            or not isinstance(rpc_id, str) or not _REQUEST_NAME.fullmatch(rpc_id)
+            or not isinstance(arguments, dict) or _arguments_safe(arguments) != arguments):
+        raise ValueError("SDK read wait no longer available")
+    try:
+        bound = inspect.signature(METHODS[method]).bind(**arguments)
+        bound.apply_defaults()
+    except TypeError as exc:
+        raise ValueError("SDK read signature changed") from exc
+    if {key: value for key, value in bound.arguments.items() if value is not Ellipsis} != arguments:
+        raise ValueError("SDK read defaults changed")
+    namespace, name = method.split(".")
+    encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+    code = ("import json, mf\n"
+            f"print(json.dumps(getattr(getattr(mf, {namespace!r}), {name!r})(**json.loads({encoded!r})), ensure_ascii=False))")
+    if len(code) > _CODE_MAX_CHARS:
+        raise ValueError("SDK read exceeds the native entry capacity")
+    return {"language": "python", "code": code}
 
 
 def _sdk_activity(identity, method, arguments, *, status="running", result=None, error=""):
@@ -164,7 +191,7 @@ class _SDKRequests:
         self.context = context
         self.root = root
         self.calls: list[dict[str, Any]] = []
-        self.completed_reads: list[tuple[str, dict[str, Any]]] = []
+        self.completed_responses: list[tuple[str, dict[str, Any]]] = []
         self.patches = []
         self.pending: dict[str, asyncio.Task] = {}
         self.accepted: set[str] = set()
@@ -174,6 +201,10 @@ class _SDKRequests:
         self.presentation = ResourcePresentation(context, effects, self.session_service.snapshots)
         self.proposal: PipelineResult | None = None
         self.approval_ready = asyncio.Event()
+        self.read_wait_ready = asyncio.Event()
+        self.read_retry: SDKReadRetry | None = None
+        self.refused_reads: dict[str, str] = {}
+        self.settled_confirmations: list[str] = []
         self.effect_lock = asyncio.Lock()
         self.uid = None
         for name, mode in (("mf-requests", 0o700), ("mf-responses", 0o755)):
@@ -258,6 +289,8 @@ class _SDKRequests:
         current_task = self.context.current_task
         observation: dict[str, Any] = {}
         checkpoint: dict[str, Any] | None = None
+        read_key = ""
+        prior_refusal = None
         stopped = threading.Event()
         loop = asyncio.get_running_loop()
 
@@ -291,6 +324,9 @@ class _SDKRequests:
             bound = inspect.signature(function).bind(**arguments)
             bound.apply_defaults()
             normalized = {key: value for key, value in bound.arguments.items() if value is not Ellipsis}
+            if effect == "read":
+                read_key = json.dumps([method, normalized], ensure_ascii=False, sort_keys=True, allow_nan=False)
+                prior_refusal = self.refused_reads.get(read_key)
             self.context.cancellation.raise_if_cancelled()
             current_task = self.context.current_task
             if not method.startswith("session.") and method not in {"skills.save", "skills.restore"} and self.context.task_budget is not None:
@@ -315,6 +351,8 @@ class _SDKRequests:
                         # 免确认写仍复用冻结、一次领取和持久回执；不终止脚本或生成用户卡片。
                         try:
                             prepared = await self.effects.execute_confirmed(prepared.effect_plan.plan_id, context=self.context)
+                            assert prepared.effect_plan is not None
+                            self.settled_confirmations.append(prepared.effect_plan.plan_id)
                         finally:
                             await self.effects.state_store.commit(self.context.lease, updates=(_PublicationUnprotected("", None),))
                         prepared = replace(prepared, effect_plan=None)
@@ -328,7 +366,30 @@ class _SDKRequests:
                     result = dict(prepared.outcome.public_content)
             else:
                 if effect == "read":
-                    await self.effects.admit_call(method, normalized, self.context, effect=ToolEffect.READ)
+                    try:
+                        await self.effects.admit_call(method, normalized, self.context, effect=ToolEffect.READ)
+                    except _ReadPermitRejected as exc:
+                        # 无持久任务的脚本仍可自行catch额度错误；有任务时仅冻结本次未进后端的调用。
+                        # 并发脚本保留原响应语义，不能为等待一项而丢弃其它在途RPC。
+                        if (exc.rate_limit.get("reason") != "quota" or self.context.current_task is None
+                                or self.context.continuation_binding is None or self.proposal is not None
+                                or (self.context.read_only and not self.context.lease.continuation_id)
+                                or len(self.pending) > 1):
+                            raise
+                        invocation = {
+                            "v": 1, "method": method, "arguments": json.loads(json.dumps(normalized, allow_nan=False)),
+                            "rpc_id": name,
+                        }
+                        try:
+                            resumed_sdk_read_arguments(invocation)
+                        except ValueError:
+                            raise exc  # 无法无损保存时维持原可 catch 的拒绝响应。
+                        self.read_retry = SDKReadRetry(exc, invocation, tuple(self.settled_confirmations))
+                        self.calls.append({"method": method, "ok": False, "status": "rate_limited", "execution_started": False})
+                        await self.context.report_progress({"activity": _sdk_activity(name, method, arguments,
+                            status="failed", error=str(exc))})
+                        self.read_wait_ready.set()
+                        return
                 operation_id = await self.presentation.begin(method)
                 snapshot = await self.presentation.snapshot() if method == "resources.present" and bound.arguments.get("result_ids") else None
                 def invoke():
@@ -351,6 +412,9 @@ class _SDKRequests:
             self.context.cancellation.raise_if_cancelled()
             status = str(result.get("status") or ("partial" if result.get("partial") else "success"))
             ok = result.get("ok") is not False
+            # 只有拒绝后新发起的同参数读取可清算；拒绝前已在途的成功不能冒充重试。
+            if prior_refusal is not None and ok and self.refused_reads.get(read_key) == prior_refusal:
+                self.refused_reads.pop(read_key)
             activity = _sdk_activity(name, method, arguments,
                 status="failed" if not ok else "partial" if result.get("partial") or status == "partial" else "success",
                 result=result)
@@ -367,7 +431,7 @@ class _SDKRequests:
                 self.write(name, json.dumps(checkpoint, ensure_ascii=False, allow_nan=False).encode())
                 call = {"method": method, "ok": checkpoint["result"].get("ok") is not False, "status": "partial", "called_at": observation["called_at"]}
                 self.calls.append(call)
-                self.completed_reads.append((name, call))
+                self.completed_responses.append((name, call))
             raise
         except Exception as exc:
             if exc is budget_error:
@@ -382,6 +446,7 @@ class _SDKRequests:
             if isinstance(exc, _ReadPermitRejected):
                 error["execution_started"] = False
                 call["execution_started"] = False
+                self.refused_reads[read_key] = name
             execution_started = getattr(exc, "execution_started", None)
             if isinstance(execution_started, bool):
                 error["execution_started"] = execution_started
@@ -401,8 +466,8 @@ class _SDKRequests:
             if patch is not None:
                 self.patches.append(patch)
         self.write(name, encoded)
-        if observation:
-            self.completed_reads.append((name, call))
+        if observation or METHOD_EFFECTS.get(method) == "write":
+            self.completed_responses.append((name, call))
 
     async def poll(self):
         while True:
@@ -412,7 +477,7 @@ class _SDKRequests:
                     task.result()  # 响应写入等基础设施错误交给父端立即停止执行。
             with os.scandir(self.requests_fd) as entries:
                 for entry in entries:
-                    if len(self.pending) >= 4:
+                    if len(self.pending) >= 4 or self.read_retry is not None:
                         break
                     name = entry.name
                     if not _REQUEST_NAME.fullmatch(name) or name in self.accepted:
@@ -432,7 +497,7 @@ class _SDKRequests:
         results = await asyncio.gather(*pending, return_exceptions=True)
         error = next((result for result in results if isinstance(result, OSError)), None)
         try:
-            for name, call in self.completed_reads:
+            for name, call in self.completed_responses:
                 target = self.root / "output" / (uuid.uuid4().hex + ".sdk.json")
                 try:
                     # worker 已退出；搬移同一普通文件，客户端的单链接校验保持不变。
@@ -477,7 +542,7 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
     timeout = arguments.get("timeout_seconds", 120)
     process = None
     io_error = None
-    finished = stopped = poller = approval = None
+    finished = stopped = poller = approval = read_wait = None
     try:
         try:
             with paths["stdout"].open("wb") as stdout, paths["stderr"].open("wb") as stderr:
@@ -494,7 +559,8 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
                 finished = asyncio.create_task(process.wait())
                 stopped = asyncio.create_task(context.cancellation.wait())
                 approval = asyncio.create_task(rpc.approval_ready.wait())
-                await asyncio.wait((finished, stopped, poller, approval), return_when=asyncio.FIRST_COMPLETED)
+                read_wait = asyncio.create_task(rpc.read_wait_ready.wait())
+                await asyncio.wait((finished, stopped, poller, approval, read_wait), return_when=asyncio.FIRST_COMPLETED)
                 context.cancellation.raise_if_cancelled()
                 if poller.done():
                     poller.result()
@@ -509,10 +575,10 @@ async def _execute(root: Path, arguments: dict, context: ToolCallContext, effect
                 await process.wait()
             archive_error = await rpc.close()
             io_error = io_error or archive_error
-            for task in (finished, stopped, approval):
+            for task in (finished, stopped, approval, read_wait):
                 if task is not None and not task.done():
                     task.cancel()
-            await asyncio.gather(*(t for t in (finished, stopped, approval) if t is not None), return_exceptions=True)
+            await asyncio.gather(*(t for t in (finished, stopped, approval, read_wait) if t is not None), return_exceptions=True)
             for name in ("mf-requests", "mf-responses"):
                 shutil.rmtree(root / "run" / name)
         context.cancellation.raise_if_cancelled()
@@ -589,9 +655,25 @@ async def run_code(pipeline: ToolPipeline, arguments: dict[str, Any], context: T
         assert proposal.effect_plan is not None
         await pipeline.discard_unpublished_effect(plan=proposal.effect_plan, context=context)
         proposal = None
-    content = {"ok": not data.get("error"), "status": "failed" if data.get("error") else "approval_required" if proposal else "success",
-               "summary": data["error"]["message"] if data.get("error") else "脚本已在确认处结束，确认后执行预览中的操作；后续命令可读取原工作文件。" if proposal else f"命令已退出（退出码 {data['exit_code']}）",
-               "data": data}
+    retry = rpc.read_retry if not data.get("error") else None
+    resumed_failure = (next((call for call in rpc.calls if call.get("ok") is False), None)
+                       if context.read_only and context.lease.continuation_id and retry is None else None)
+    if context.read_only and context.lease.continuation_id and data["exit_code"] and resumed_failure is None and retry is None:
+        resumed_failure = {"status": "tool_execution_failed"}
+    if data.get("error"):
+        status, summary = "failed", data["error"]["message"]
+    elif proposal:
+        status, summary = "approval_required", "脚本已在确认处结束，确认后执行预览中的操作；后续命令可读取原工作文件。"
+    elif retry:
+        status, summary = "rate_limited", "读取受到本地额度限制；原脚本已暂停，先前回执与文件保留，后续代码未执行。"
+    elif resumed_failure:
+        status, summary = resumed_failure["status"], "等待的只读调用未取得完整结果；原执行回执已保留。"
+    elif rpc.refused_reads:
+        status, summary = "partial", "部分读取受到本地额度限制，尚未完成；已保留各项回执。"
+    else:
+        status, summary = "success", f"命令已退出（退出码 {data['exit_code']}）"
+    content = {"ok": not data.get("error") and retry is None and resumed_failure is None,
+               "status": status, "summary": summary, "data": data}
     if proposal is not None:
         assert proposal.effect_plan is not None
         content["approval"] = proposal.effect_plan.public_dict()
@@ -607,7 +689,8 @@ async def run_code(pipeline: ToolPipeline, arguments: dict[str, Any], context: T
     outcome = ToolOutcome(model_content=json.dumps(model, ensure_ascii=False), public_content=safe)
     return PipelineResult(tool=pipeline.catalog.get(RUN_CODE_TOOL), arguments=arguments,
                           outcome=outcome, task_patch=patch,
-                          effect_plan=proposal.effect_plan if proposal else None)
+                          effect_plan=proposal.effect_plan if proposal else None,
+                          sdk_read_retry=retry)
 
 
 def run_code_tool(pipeline: ToolPipeline) -> KernelToolSpec:
@@ -635,7 +718,7 @@ def run_code_tool(pipeline: ToolPipeline) -> KernelToolSpec:
                      "任务资料保存到 /work，已验证的长期经验用 mf.skills 保存；远端写入遵循确认授权。"
                      f"\nSDK 范围：\n{namespaces}\n已安装流程文档：\n{skills}"),
         input_schema={"type": "object", "required": ["code"], "additionalProperties": False, "properties": {
-            "code": {"type": "string", "minLength": 1, "maxLength": 64_000},
+            "code": {"type": "string", "minLength": 1, "maxLength": _CODE_MAX_CHARS},
             "language": {"type": "string", "enum": ["python", "shell"], "default": "python"},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "default": 120},
         }}, read=read,

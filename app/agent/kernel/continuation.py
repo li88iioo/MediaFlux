@@ -22,7 +22,7 @@ from .session_guard import publication_execution_active
 from .session_state import SessionState
 from .state_types import PublicationLease, StalePublicationError, StateUpdate
 from .task_state import identity
-from .tool_calls import PipelineResult
+from .tool_calls import PipelineResult, SDKReadRetry
 
 MAX_WAIT_SEGMENTS = 3
 MAX_WAIT_SECONDS = 180
@@ -128,7 +128,37 @@ def history_call(state, record):
                if candidate == anchor]
     if len(matches) != 1:
         raise ValueError("read wait history changed")
+    if "sdk_read" in record:
+        from .sandbox import RUN_CODE_TOOL, resumed_sdk_read_arguments
+        resumed_sdk_read_arguments(record["sdk_read"])
+        if anchor["tool"] != RUN_CODE_TOOL or matches[0].get("name") not in {RUN_CODE_TOOL, RUN_CODE_TOOL.replace(".", "__")}:
+            raise ValueError("SDK wait requires the original native call")
     return deepcopy(matches[0])
+
+
+def park_anchor(state, record, lease, value):
+    retry = value.get("sdk_read_retry")
+    record.pop("sdk_read", None)
+    record.pop("settled_publication", None)
+    if retry is None:
+        return anchor_for(state, value["call_id"], value["permit"].tool_name)
+    from .sandbox import RUN_CODE_TOOL
+    if (not isinstance(retry, SDKReadRetry) or retry.permit is not value["permit"]
+            or retry.invocation.get("method") != retry.permit.tool_name):
+        raise ValueError("untrusted SDK read wait")
+    anchor = anchor_for(state, value["call_id"], RUN_CODE_TOOL)
+    record["sdk_read"] = deepcopy(dict(retry.invocation))
+    history_call(state, {"anchor": anchor, "sdk_read": record["sdk_read"]})
+    confirmed = state.metadata.get("confirmed_publication") or {}
+    if lease.continuation_kind != "effect" and confirmed.get("generation") == state.generation:
+        marker = state.metadata.get("active_publication") or {}
+        if (confirmed.get("plan_id") not in retry.settled_confirmations
+                or confirmed.get("turn_id") != lease.turn_id
+                or marker.get("generation") != lease.generation or marker.get("turn_id") != lease.turn_id
+                or marker.get("request_id") != lease.request_id or marker.get("protected")):
+            raise ValueError("SDK write receipt has not settled")
+        record["settled_publication"] = {"confirmed": deepcopy(confirmed), "active": deepcopy(marker)}
+    return anchor
 
 
 def check_claim(state, lease, now, conn=None, *, publication=False):
@@ -298,7 +328,7 @@ def apply_actions(state, lease, updates, now, conn=None):
                 raise ValueError("read wait budget or eligibility rejected")
             if record["state"] in ACTIVE and not lease.continuation_id:
                 raise ValueError("another read wait is active")
-            anchor = anchor_for(state, value["call_id"], permit.tool_name)
+            anchor = park_anchor(state, record, lease, value)
             from app.agent.owner_routes import normalize_delivery_route
             route = normalize_delivery_route(value["delivery_route"], channel=value["channel"], owner=state.owner)
             first = record.get("first_park_at", now)
@@ -344,7 +374,10 @@ def claim(state: SessionState, candidate, now, binding, conn=None):
     if not same_candidate and not reclaimable:
         return None
     confirmed = state.metadata.get("confirmed_publication") or {}
-    if state.pending_effect_plan_id or confirmed.get("generation") == state.generation:
+    marker = state.metadata.get("active_publication") or {}
+    settled = ("sdk_read" in record and not marker.get("protected")
+               and record.get("settled_publication") == {"confirmed": confirmed, "active": marker})
+    if state.pending_effect_plan_id or (confirmed.get("generation") == state.generation and not settled):
         if same_candidate:
             revoke(state, "effect_conflict")
         return None
@@ -562,7 +595,7 @@ def apply_effect_action(state, lease, update, now):
                 or budget["wait_seconds_spent"] + due - now > MAX_WAIT_SECONDS):
             raise ValueError("effect continuation wait budget exhausted")
         # Only an acquire refusal is resumable; no started external call is retried here.
-        anchor = anchor_for(state, value["call_id"], permit.tool_name)
+        anchor = park_anchor(state, record, lease, value)
         reserve_budget_values(budget, {"stop": True}, now)
         budget["wait_segments"] += 1
         budget["wait_seconds_spent"] += due - now

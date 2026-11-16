@@ -644,7 +644,11 @@ class AgentTurn:
             if record.get("anchor"):
                 self.pending_resume_call = history_call(self.state, record)
                 self.resumed_tool = self.session.catalog.get(record["anchor"]["tool"])
-                if self.resumed_tool.effect is not ToolEffect.READ or self.resumed_tool.name.startswith("agent."):
+                if "sdk_read" in record:
+                    from .sandbox import resumed_sdk_read_arguments
+                    self.pending_resume_call["arguments"] = resumed_sdk_read_arguments(record["sdk_read"])
+                    self.tool_context = replace(self.tool_context, read_only=True)
+                elif self.resumed_tool.effect is not ToolEffect.READ or self.resumed_tool.name.startswith("agent."):
                     raise ToolPipelineError("等待能力不可恢复。", code="read_resume_invalid")
         await self.publish(
             AgentEventType.CAPABILITIES_SELECTED,

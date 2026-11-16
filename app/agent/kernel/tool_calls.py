@@ -11,7 +11,7 @@ from .capabilities import ToolEffect
 
 if TYPE_CHECKING:
     from asyncio import Timeout
-    from app.agent.errors import ToolPipelineError
+    from app.agent.errors import ToolPipelineError, _ReadPermitRejected
     from app.agent.kernel.state_types import CancellationToken, PublicationLease
 
     from .capabilities import KernelToolSpec
@@ -80,6 +80,16 @@ class EffectPlan:
 
 ProgressSink = Callable[[Mapping[str, Any]], Awaitable[None]]
 
+
+@dataclass(frozen=True, slots=True)
+class SDKReadRetry:
+    """宿主在真实 READ 准入被拒时捕获；不从模型或工作区 JSON 解码。"""
+
+    permit: _ReadPermitRejected
+    invocation: Mapping[str, Any]
+    settled_confirmations: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class ToolCallContext:
     owner: str
@@ -131,6 +141,7 @@ class PipelineResult:
     elapsed_ms: int = 0
     task_patch: TaskPatch | None = None
     prepared_effect: PreparedEffect | None = None
+    sdk_read_retry: SDKReadRetry | None = None
 
 
 def independent_read(tool, task=None) -> bool:

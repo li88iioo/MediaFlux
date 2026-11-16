@@ -92,6 +92,7 @@ class ToolPipeline(EffectExecutor):
         # 组合只读工具复用同一执行结果，证据仍由外层原有回执事务提交。
         patch = value.task_patch if isinstance(value, PipelineResult) else value if isinstance(value, TaskPatch) else None
         plan = value.effect_plan if isinstance(value, PipelineResult) else None
+        sdk_read_retry = value.sdk_read_retry if isinstance(value, PipelineResult) else None
         if isinstance(value, PipelineResult):
             value = value.outcome
         if tool.observe is not None and context.current_task is not None:
@@ -148,4 +149,5 @@ class ToolPipeline(EffectExecutor):
             elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
             task_patch=patch,
             effect_plan=plan,
+            sdk_read_retry=sdk_read_retry,
         )

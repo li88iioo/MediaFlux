@@ -121,6 +121,50 @@ def admit_calls(turn: AgentTurn, reply: _ModelRound) -> None:
     )
 
 
+async def park_read(turn: AgentTurn, call: ModelToolCall, calls: tuple[ModelToolCall, ...], *,
+                    result: PipelineResult | None = None, error: ToolPipelineError | None = None) -> bool:
+    """真实准入拒绝沿同一事务保存原回执、任务观察与等待身份。"""
+    retry = result.sdk_read_retry if result is not None else None
+    permit = retry.permit if retry is not None else error
+    lease = turn.tool_context.lease
+    # 接力未携带持久化 scope；混合批次还有未结算调用时也不能转成恢复回合。
+    if not (isinstance(permit, _ReadPermitRejected) and not turn.agent_input.initial_read_tool
+            and turn.session.continuation_binding is not None
+            and turn.task_budget is not None and not turn.confirming and not turn.explaining
+            and (not turn.attempted_write or (
+                lease.continuation_kind == "effect" and lease.continuation_id
+                and turn.confirmed_result is not None and public_result_state(turn.confirmed_result) == "failed"
+            )) and not turn.state.pending_effect_plan_id
+            and all(c.call_id in turn.completed_call_ids for c in calls if c is not call)):
+        return False
+    message = (ModelMessage(role="tool", content=result.outcome.model_message(),
+                           tool_call_id=call.call_id, tool_name=call.name)
+               if result is not None else tool_error_message(call, permit))
+    staged, done = [*turn.messages, message], turn.completed_call_ids | {call.call_id}
+    try:
+        await persist_conversation(turn, staged_messages=staged, staged_completed=done,
+            task_patch=result.task_patch if result is not None else permit.task_patch,
+            wait_action=_ContinuationAction("", {
+                "operation": "park", "permit": permit, "call_id": call.call_id,
+                "sdk_read_retry": retry, "channel": turn.agent_input.channel,
+                "delivery_route": turn.agent_input.delivery_route, "model_policy": turn.selected_model,
+            }, binding=turn.session.continuation_binding))
+    except ValueError:
+        return False  # 无法完整保存的结果不能宣布已进入等待。
+    turn.messages, turn.completed_call_ids, turn.active_calls = staged, done, ()
+    payload: dict[str, Any] = {"code": permit.code, "message": str(permit)}
+    if result is not None:
+        payload["result"] = result.outcome.audit_result()
+    await turn.publish_tool(AgentEventType.TOOL_FAILED, call, **payload)
+    await turn.publish(AgentEventType.TURN_COMPLETED, {
+        "status": "waiting", "answer": "查询受到本地额度限制，已保存等待；尚未完成。",
+        "retry_at_epoch": (turn.state.metadata["effect_waits"][lease.continuation_id]["continuation"]
+                           if lease.continuation_kind == "effect" else turn.state.metadata["read_wait"])["due_at"],
+        "model_calls": turn.model_calls, "tool_calls": turn.total_tool_calls,
+    })
+    return True
+
+
 async def execute_calls(turn: AgentTurn, reply: _ModelRound, round_task: Mapping[str, Any] | None,
                         business_batch_calls: int, write_batch_calls: int, *, server_read: bool = False) -> bool:
     calls, resuming_read = reply.calls, reply.resuming_read
@@ -202,36 +246,8 @@ async def execute_calls(turn: AgentTurn, reply: _ModelRound, round_task: Mapping
                 raise outcome
             result = outcome
         except ToolPipelineError as exc:
-            # 接力未携带持久化 scope，不能借旧任务额度停泊成无 scope 的恢复回合。
-            if (isinstance(exc, _ReadPermitRejected) and not turn.agent_input.initial_read_tool
-                    and turn.session.continuation_binding is not None
-                    and turn.task_budget is not None and not turn.confirming and not turn.explaining
-                    and (not turn.attempted_write or (
-                        lease.continuation_kind == "effect" and lease.continuation_id
-                        and turn.confirmed_result is not None and public_result_state(turn.confirmed_result) == "failed"
-                    )) and not turn.state.pending_effect_plan_id
-                    and all(c.call_id in turn.completed_call_ids for c in calls if c is not call)):
-                staged = [*turn.messages, tool_error_message(call, exc)]
-                done = turn.completed_call_ids | {call.call_id}
-                try:
-                    await persist_conversation(turn, staged_messages=staged, staged_completed=done,
-                        wait_action=_ContinuationAction("", {
-                            "operation": "park", "permit": exc, "call_id": call.call_id,
-                            "channel": turn.agent_input.channel,
-                            "delivery_route": turn.agent_input.delivery_route,
-                            "model_policy": turn.selected_model,
-                        }, binding=turn.session.continuation_binding))
-                except ValueError:
-                    pass  # Invalid retry/capacity/legacy state is never advertised as waiting.
-                else:
-                    turn.messages, turn.completed_call_ids, turn.active_calls = staged, done, ()
-                    await turn.publish_tool(AgentEventType.TOOL_FAILED, call, code=exc.code, message=str(exc))
-                    await turn.publish(AgentEventType.TURN_COMPLETED, {
-                        "status": "waiting", "answer": "查询受到本地额度限制，已保存等待；尚未完成。",
-                        "retry_at_epoch": (turn.state.metadata["effect_waits"][lease.continuation_id]["continuation"] if lease.continuation_kind == "effect" else turn.state.metadata["read_wait"])["due_at"],
-                        "model_calls": turn.model_calls, "tool_calls": turn.total_tool_calls,
-                    })
-                    return True
+            if await park_read(turn, call, calls, error=exc):
+                return True
             staged = [*turn.messages, tool_error_message(call, exc, input_schema=tool.input_schema)]
             done = turn.completed_call_ids | {call.call_id}
             await persist_conversation(turn, close_pending=True, task_patch=exc.task_patch,
@@ -269,6 +285,8 @@ async def execute_calls(turn: AgentTurn, reply: _ModelRound, round_task: Mapping
                       tool_call_id=call.call_id, tool_name=call.name,
                       effect_plan_id=result.effect_plan.plan_id if result.effect_plan else "")]
             done = turn.completed_call_ids | {call.call_id}
+            if result.sdk_read_retry is not None and await park_read(turn, call, calls, result=result):
+                return True
             # 回执与任务补丁共同提交成功后，才发布事实、清算错误和计入观察。
             await persist_conversation(turn, close_pending=True, task_patch=result.task_patch,
                                        staged_messages=staged, staged_completed=done,
@@ -328,12 +346,18 @@ async def execute_calls(turn: AgentTurn, reply: _ModelRound, round_task: Mapping
             return True
         record_result(turn, tool.name, arguments, result.outcome.audit_result())
         await turn.publish_tool_result(canonical_call, result)
+        if resuming_read and result.sdk_read_retry is not None:
+            raise result.sdk_read_retry.permit  # 已保存完整失败回执，不能绕过原等待预算继续请求模型。
+        if resuming_read and turn.tool_context.read_only and result.outcome.public_content.get("ok") is False:
+            raise ToolPipelineError(str(result.outcome.public_content["summary"]),
+                                    code=str(result.outcome.public_content["status"]))
         if (result.tool.effect is ToolEffect.READ
                 and not result.tool.metadata.get("kernel_utility")
                 and public_result_state(result.outcome.public_content) == "success"):
             turn.observed_reads.add((result.tool.name, json.dumps(dict(result.arguments), sort_keys=True, ensure_ascii=False)))
     if resuming_read:
         turn.resume_read_done = True
+        turn.tool_context = replace(turn.tool_context, read_only=bool(turn.agent_input.initial_read_tool))
     turn.active_calls = ()
     await persist_conversation(turn)
     return False
