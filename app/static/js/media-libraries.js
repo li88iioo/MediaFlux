@@ -20,7 +20,9 @@
         rows: [],
         refreshing: false,
         initialized: false,
-        dirty: false,
+        savedRows: '[]',
+        saving: false,
+        get dirty() { return JSON.stringify(this.rows) !== this.savedRows; },
     };
 
     function icons(root = document) {
@@ -227,7 +229,7 @@
         }
         rows.push(...groupedBindings.values());
         state.rows = rows;
-        state.dirty = false;
+        state.savedRows = JSON.stringify(state.rows);
     }
 
     function renderSummary() {
@@ -345,7 +347,7 @@
         const addButton = $('[data-add-library-mapping]');
         const saveButton = $('[data-save-mappings]');
         if (addButton) addButton.disabled = !canAddMapping();
-        if (saveButton) saveButton.disabled = !state.initialized || !state.dirty;
+        if (saveButton) saveButton.disabled = state.saving || !state.initialized || !state.dirty;
     }
 
     function renderRows() {
@@ -363,18 +365,14 @@
         icons(list);
     }
 
-    function applyOverview({reloadRows = true} = {}) {
-        renderSummary();
-        if (reloadRows) hydrateRows();
-        renderRows();
-    }
-
-    async function loadAll({manual = false, reloadRows = true} = {}) {
-        if (state.refreshing) return;
+    async function loadAll({manual = false} = {}) {
+        if (state.refreshing || (manual && state.saving)) return;
         if (manual && state.dirty) {
             window.showToast?.('存在尚未保存的媒体库映射，请先保存后再刷新', 'warning', 4200);
             return;
         }
+        const draft = JSON.stringify(state.rows);
+        const replaceRows = !state.dirty;
         state.refreshing = true;
         const button = $('#mlRefreshBtn');
         if (manual) setBusy(button, true, '刷新中');
@@ -389,7 +387,11 @@
             state.overview = overview;
             state.initialized = true;
             if (firstLoad) setInitialLoading(false);
-            applyOverview({reloadRows});
+            renderSummary();
+            if (replaceRows && draft === state.savedRows && !state.dirty) {
+                hydrateRows();
+                renderRows();
+            }
             if (manual) window.showToast?.('媒体库与路径映射已刷新', 'success');
         } catch (error) {
             window.showToast?.(error.message, 'error', 4200);
@@ -470,7 +472,6 @@
                 const localPath = String(selected?.id || '').trim();
                 if (!localPath || localPath === '__roots__') return false;
                 row.local = localPath;
-                state.dirty = true;
                 renderRows();
                 const renderedRow = $(`[data-mapping-row="${index}"]`, $('#mlMappingList'));
                 $('[data-pick-directory]', renderedRow)?.focus();
@@ -511,7 +512,6 @@
         };
         if (choice) applyChoiceToRow(row, choice);
         state.rows.push(row);
-        state.dirty = true;
         renderRows();
         const rows = $$('[data-mapping-row]', $('#mlMappingList'));
         $('[data-pick-directory]', rows.at(-1))?.focus();
@@ -570,6 +570,7 @@
     }
 
     async function saveMappings(button) {
+        if (state.saving) return;
         const rowElements = $$('[data-mapping-row]', $('#mlMappingList'));
         rowElements.forEach(syncRow);
         const seenStrm = new Set();
@@ -627,18 +628,21 @@
                 server_path: row.server,
             })));
 
+        const submitted = JSON.stringify(state.rows);
+        state.saving = true;
         setBusy(button, true, '保存中');
         try {
             await api('/api/media-libraries/mappings', {
                 method: 'POST',
                 body: JSON.stringify({strm_mappings: strmMappings, local_bindings: localBindings}),
             });
-            state.dirty = false;
+            state.savedRows = submitted;
             window.showToast?.('媒体库与路径映射已保存', 'success');
-            await loadAll({reloadRows: true});
+            await loadAll();
         } catch (error) {
             window.showToast?.(error.message, 'error', 4200);
         } finally {
+            state.saving = false;
             setBusy(button, false, '保存映射');
             updateActions();
         }
@@ -672,7 +676,6 @@
             }
             row.local = '';
             row.legacy = false;
-            state.dirty = true;
             renderRows();
             const renderedRow = $(`[data-mapping-row="${index}"]`, $('#mlMappingList'));
             $('[data-toggle-mapping-source]', renderedRow)?.focus();
@@ -689,7 +692,6 @@
         }
         if (event.target.closest('[data-remove-mapping]')) {
             state.rows.splice(index, 1);
-            state.dirty = true;
             renderRows();
         }
     });
@@ -723,7 +725,6 @@
                     applyChoiceToRow(row, choice, {replaceServer});
                 }
             }
-            state.dirty = true;
             renderRows();
             const renderedRow = $(`[data-mapping-row="${index}"]`, $('#mlMappingList'));
             $('[data-mapping-library]', renderedRow)?.focus();
@@ -731,7 +732,6 @@
         }
 
         syncRow(rowElement);
-        state.dirty = true;
         resetResult(rowElement);
         updateActions();
     });
@@ -740,7 +740,6 @@
         const rowElement = event.target.closest('[data-mapping-row]');
         if (!rowElement || !event.target.matches('[data-mapping-server]')) return;
         syncRow(rowElement);
-        state.dirty = true;
         resetResult(rowElement);
         updateActions();
     });

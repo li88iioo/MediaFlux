@@ -82,9 +82,7 @@ class MediaLibrariesUIContractTests(unittest.TestCase):
         self.assertNotIn("data-mapping-tab", self.js)
         self.assertNotIn("data-add-strm-mapping", self.js)
 
-    def test_refresh_preserves_unsaved_edits_and_initial_load_is_stable(self):
-        self.assertIn("manual && state.dirty", self.js)
-        self.assertIn("存在尚未保存的媒体库映射", self.js)
+    def test_initial_load_has_stable_placeholders(self):
         self.assertIn("state.overview ? Promise.resolve() : sleep(320)", self.js)
         self.assertIn("setInitialLoading(true)", self.js)
         self.assertIn("min-height: 300px", self.css)

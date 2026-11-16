@@ -1,4 +1,6 @@
-"""编辑/刮削会话恢复：原始 Jinja + Chromium，全请求 fake，不导入应用或访问 DB。
+"""编辑/刮削会话恢复：原始 Jinja + Chromium，隔离传输，不访问真实服务。
+
+STRM 使用隔离 SQLite 和真实 router；不启动 app.main。
 
 直接运行本文件即可；UI_SESSION_EVIDENCE_DIR 可选保存截图与请求证据。
 响应体闸门模拟响应已读取但业务 continuation 尚未执行的竞态：即使 abort
@@ -123,7 +125,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 static_url=lambda value: "/static/" + value,
                 url_for=lambda name: "/" + name.split(".")[-1],
             )
-            for name in ("rss", "guangya", "media_proxy", "guangya_strm")
+            for name in ("rss", "guangya", "media_proxy", "guangya_strm", "media_libraries")
         }
 
     def setUp(self):
@@ -182,6 +184,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             "guangya": '[data-media-id="A"]',
             "media_proxy": '[data-select-instance="1"]',
             "guangya_strm": '#saveStrmBtn:not(:disabled)',
+            "media_libraries": '[data-mapping-server]',
         }[template]
         self.page.locator(ready).wait_for()
         return self.page
@@ -216,6 +219,19 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 status, payload = self.replies[key].pop(0)
                 entry["status"] = status
                 route.fulfill(status=status, json=payload)
+                return
+            if path == "/api/media-libraries/overview":
+                route.fulfill(json=self.mapping_overview)
+                return
+            if path == "/api/media-libraries/mappings":
+                assert body is not None
+                for server in self.mapping_overview["servers"]:
+                    server["mappings"] = body["strm_mappings"].get(server["server_type"], server["mappings"])
+                self.mapping_overview["local_bindings"] = body["local_bindings"]
+                route.fulfill(json={"ok": True})
+                return
+            if path in ("/api/media-libraries/strm-directories", "/api/media-libraries/local-directories"):
+                route.fulfill(json={"directories": [{"id": "/fixture/archive", "name": "归档目录", "is_dir": True}]})
                 return
             if path.startswith("/api/strm/failures"):
                 assert self.strm_client is not None
@@ -325,6 +341,157 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.page.evaluate(
             "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
         )
+
+    def make_mapping_page(self, width):
+        if self.context:
+            self.context.close()
+        self.requests.clear()
+        self.mapping_overview = {
+            "servers": [{
+                "server_type": "jellyfin", "label": "Jellyfin", "enabled": True, "configured": True,
+                "mapping_key": "JELLYFIN_PATH_MAPPINGS",
+                "libraries": [
+                    {"id": "movies", "name": "电影", "collection_type": "movies", "locations": ["/library/movies"]},
+                    {"id": "shows", "name": "剧集", "collection_type": "tvshows", "locations": ["/library/shows"]},
+                ],
+                "mappings": [{"local": "/fixture/strm", "server": "/library/movies"}],
+            }],
+            "strm": {"output_root": "/fixture/strm"},
+            "local_sources": [{"id": 1, "name": "隔离本地来源"}], "local_bindings": [],
+            "summary": {"configured_servers": 1, "libraries": 2, "path_mappings": 1, "total_mappings": 1},
+        }
+        page = self.make_page("media_libraries", width)
+        page.wait_for_function("document.querySelector('#mediaLibrariesPage').dataset.loading==='false'")
+        return page
+
+    def mapping_late_drafts(self, width):
+        cases = [(operation, edit) for operation in ("save", "refresh")
+                 for edit in ("path", "empty", "remove", "source", "library", "directory")]
+        for operation, edit in [*cases, ("error", "path")]:
+            with self.subTest(operation=operation, edit=edit, width=width):
+                page = self.make_mapping_page(width)
+                field = page.locator('[data-mapping-server]').first
+                save = page.locator('[data-save-mappings]')
+                if operation == "refresh":
+                    self.hold_reply('/api/media-libraries/overview', 'mapping-old', method='GET')
+                    page.locator('#mlRefreshBtn').click()
+                else:
+                    field.fill('/library/submitted-A')
+                    self.hold_reply('/api/media-libraries/mappings', 'mapping-old',
+                        payload={"error": "fixture save unavailable"} if operation == "error" else None,
+                        status=503 if operation == "error" else 200)
+                    save.click()
+                self.wait_reply('mapping-old')
+                if edit == "path":
+                    field.fill('/library/unsaved-B')
+                elif edit == "empty":
+                    page.locator('[data-add-library-mapping]').click()
+                    page.locator('[data-mapping-library]').last.select_option('')
+                elif edit == "remove":
+                    page.locator('[data-remove-mapping]').click()
+                elif edit == "source":
+                    page.locator('[data-toggle-mapping-source]').click()
+                    self.assertIn('本地', page.locator('[data-toggle-mapping-source]').get_attribute('aria-label') or '')
+                elif edit == "library":
+                    page.locator('[data-mapping-library]').select_option('jellyfin:shows')
+                else:
+                    page.locator('[data-pick-directory]').click()
+                    page.locator('#mediaLibraryStrmDirModal .settings-dir-select').click()
+                    self.assertEqual(page.locator('[data-mapping-local-path]').input_value(), '/fixture/archive')
+                retained = page.locator('[data-mapping-row]').element_handles()
+                draft = page.locator('#mlMappingList').inner_html()
+                focus = page.evaluate_handle('document.activeElement')
+                self.release_reply('mapping-old')
+                page.wait_for_function("!document.querySelector('[data-save-mappings]').classList.contains('is-loading') && !document.querySelector('#mlRefreshBtn').classList.contains('is-loading')")
+                self.assertTrue(all(row.evaluate('node => node.isConnected') for row in retained))
+                self.assertEqual(page.locator('#mlMappingList').inner_html(), draft)
+                self.assertTrue(focus.evaluate('node => node===document.activeElement'))
+                if edit == "path":
+                    self.assertEqual(field.input_value(), '/library/unsaved-B')
+                elif edit == "empty":
+                    self.assertEqual(page.locator('[data-mapping-row]').count(), 2)
+                    self.assertEqual(page.locator('[data-mapping-library]').last.input_value(), '')
+                elif edit == "remove":
+                    self.assertEqual(page.locator('[data-mapping-row]').count(), 0)
+                self.assertTrue(save.is_enabled())
+                self.assertEqual(len([row for row in self.requests if row['method']=='POST']), 0 if operation=='refresh' else 1)
+
+    def test_mapping_late_replies_preserve_full_draft_desktop(self):
+        self.mapping_late_drafts(1280)
+
+    def test_mapping_late_replies_preserve_full_draft_mobile(self):
+        self.mapping_late_drafts(390)
+
+    def mapping_save_admission_and_recovery(self, width):
+        page = self.make_mapping_page(width)
+        save = page.locator('[data-save-mappings]')
+        field = page.locator('[data-mapping-server]').first
+        self.assertTrue(save.is_disabled())
+        page.locator('[data-add-library-mapping]').click()
+        page.locator('[data-remove-mapping]').last.click()
+        self.assertTrue(save.is_disabled(), '撤销空行编辑后应回到已保存基线')
+        field.fill('/library/submitted-A')
+        before = save.bounding_box()
+        self.hold_reply('/api/media-libraries/mappings', 'mapping-save')
+        save.click()
+        self.wait_reply('mapping-save')
+        field.fill('/library/unsaved-B')
+        self.assertTrue(save.is_disabled())
+        save.dispatch_event('click')
+        self.assertEqual(len([row for row in self.requests if row['method']=='POST']), 1)
+        self.hold_reply('/api/media-libraries/overview', 'mapping-readback', method='GET')
+        self.release_reply('mapping-save')
+        self.wait_reply('mapping-readback')
+        self.assertTrue(save.is_disabled())
+        field.fill('/library/unsaved-C')
+        self.release_reply('mapping-readback')
+        page.wait_for_function("!document.querySelector('[data-save-mappings]').disabled")
+        self.assertEqual(field.input_value(), '/library/unsaved-C')
+        self.assertEqual(save.bounding_box(), before)
+        self.hold_reply('/api/media-libraries/mappings', 'mapping-failure', payload={'error':'fixture save unavailable'}, status=503)
+        save.click()
+        self.wait_reply('mapping-failure')
+        field.fill('/library/retry-D')
+        self.release_reply('mapping-failure')
+        page.wait_for_function("!document.querySelector('[data-save-mappings]').disabled")
+        self.assertEqual(field.input_value(), '/library/retry-D')
+        save.click()
+        page.wait_for_function("!document.querySelector('[data-save-mappings]').classList.contains('is-loading') && document.querySelector('[data-save-mappings]').disabled")
+        self.assertEqual(field.input_value(), '/library/retry-D')
+        posts = [row['body'] for row in self.requests if row['method']=='POST']
+        self.assertEqual([body['strm_mappings']['jellyfin'][0]['server'] for body in posts],
+                         ['/library/submitted-A', '/library/unsaved-C', '/library/retry-D'])
+        self.assertEqual(self.mapping_overview['servers'][0]['mappings'][0]['server'], '/library/retry-D')
+
+        # 旧刷新看到 X，但保存 A 已改变服务端；用户重新输入 X 仍是未保存草稿。
+        page = self.make_mapping_page(width)
+        field = page.locator('[data-mapping-server]')
+        save = page.locator('[data-save-mappings]')
+        self.hold_reply('/api/media-libraries/overview', 'refresh-X', method='GET')
+        page.locator('#mlRefreshBtn').click()
+        self.wait_reply('refresh-X')
+        field.fill('/library/submitted-A')
+        self.hold_reply('/api/media-libraries/mappings', 'save-A')
+        save.click()
+        self.wait_reply('save-A')
+        field.fill('/library/movies')
+        self.release_reply('save-A')
+        page.wait_for_function("!document.querySelector('[data-save-mappings]').disabled")
+        self.release_reply('refresh-X')
+        page.wait_for_function("!document.querySelector('#mlRefreshBtn').classList.contains('is-loading')")
+        self.assertEqual(field.input_value(), '/library/movies')
+        self.assertEqual(self.mapping_overview['servers'][0]['mappings'][0]['server'], '/library/submitted-A')
+        self.assertTrue(save.is_enabled(), '旧刷新不能把尚未提交的 X 冒充已保存')
+        save.click()
+        page.wait_for_function("!document.querySelector('[data-save-mappings]').classList.contains('is-loading') && document.querySelector('[data-save-mappings]').disabled")
+        self.assertEqual(self.mapping_overview['servers'][0]['mappings'][0]['server'], '/library/movies')
+        self.assertEqual(len([row for row in self.requests if row['method']=='POST']), 2)
+
+    def test_mapping_save_admission_and_error_recovery_desktop(self):
+        self.mapping_save_admission_and_recovery(1280)
+
+    def test_mapping_save_admission_and_error_recovery_mobile(self):
+        self.mapping_save_admission_and_recovery(390)
 
     def make_strm_page(self, width, count=241):
         from fastapi import FastAPI
