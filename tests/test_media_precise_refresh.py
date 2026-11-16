@@ -1360,6 +1360,9 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
         self.ack_outbox = patch(
             "app.repositories.strm.acknowledge_strm_refresh_paths"
         ).start()
+        self.register_handoff = patch(
+            "app.repositories.media_refresh_queue.register_media_refresh_handoff"
+        ).start()
         self.addCleanup(patch.stopall)
 
     @staticmethod
@@ -1369,6 +1372,12 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
     def test_changed_paths_are_queued_after_precise_planning(self):
         from app.modules.scheduler import STRMScheduler
 
+        entries = [{
+            "path": f"{ROOT}/剧集/作品 A/Season 01/E01.strm",
+            "allow_emby": True,
+            "event_token": "a" * 32,
+        }]
+        self.enqueue_outbox.return_value = entries
         settings = self._settings()
         with patch(
             "app.modules.scheduler.get",
@@ -1387,11 +1396,15 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
         self.enqueue_outbox.assert_called_once_with(
             [f"{ROOT}/剧集/作品 A/Season 01/E01.strm"], allow_emby=True
         )
-        self.ack_outbox.assert_called_once_with(self.enqueue_outbox.return_value)
+        self.register_handoff.assert_called_once()
+        self.assertEqual(self.register_handoff.call_args.args, (entries,))
+        self.assertIsNone(self.register_handoff.call_args.kwargs["run_id"])
+        self.ack_outbox.assert_called_once_with(entries)
         enqueue.assert_called_once_with(
             [f"{ROOT}/剧集/作品 A/Season 01/E01.strm"],
             immediate=False,
             allow_emby=True,
+            source_entries=entries,
         )
 
     def test_manual_refresh_is_queued_without_quiet_window(self):
