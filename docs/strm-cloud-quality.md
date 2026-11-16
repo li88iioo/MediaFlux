@@ -1,6 +1,19 @@
 # 客户端直连 STRM 的云盘画质切换
 
-适用于客户端连接原 Jellyfin 或 MediaFlux 媒体反代，取得 MediaFlux 签名 STRM 地址，再直接播放云盘内容的场景。不需要修改 Jellyfin 插件，也不需要为不同画质生成多个 STRM。
+适用于客户端连接原 Jellyfin 或 MediaFlux 媒体反代，取得 MediaFlux 签名 STRM 地址，再直接播放云盘内容的场景。不需要修改 Jellyfin 插件，也不需要为不同画质生成多个 STRM。**CDN 直连描述视频数据路径，不等于必须收到 HTTP 302**：客户端也可通过 JSON 解析临时 CDN URL 后直接取流。
+
+## 已验证客户端：Pathfin（Android）
+
+[Pathfin 官方仓库](https://github.com/li88iioo/Pathfin)提供 Android 手机和平板客户端，安装包见 [GitHub Releases](https://github.com/li88iioo/Pathfin/releases)。按[官方 README](https://github.com/li88iioo/Pathfin/blob/main/README.md)，STRM 直放与云盘画质切换的已验证范围为 **MediaFlux 生成的 STRM + 光鸭云盘**，其他来源未验证。
+
+开启 Pathfin 的 **STRM 原始地址**后，两种连接方式都支持光鸭 CDN 直连：
+
+| 连接服务器 | 画质查询入口与条件 |
+| --- | --- |
+| MF 媒体反代，例如 `:18096` | 使用 `MediaFluxPlayback` 的签名 path/query，加上当前连接服务器的 origin；MF 反代须支持画质查询，手机无需另行访问 STRM 内的面板地址 |
+| 原 Jellyfin，例如 `:8096` | 使用原 STRM URL，手机必须能访问该 URL |
+
+两者共用下述 `variants` / `resolve` 流程：MF 返回临时 CDN URL，手机直接请求 CDN，视频数据不经 MF 中转，也不要求先发生媒体 GET 302。现有云端画质直连失败不会静默改为 Jellyfin 转码；普通服务器媒体仍按原能力协商。关闭“STRM 原始地址”后沿用 Jellyfin 播放协商。
 
 ## 请求流程
 
@@ -13,7 +26,7 @@
 
 ### 通过 MediaFlux 媒体反代发现入口
 
-反代会改写 `Path`、`DirectStreamUrl` 用于普通 302 播放，同时在对应的 `MediaSource` 上保留独立的画质入口：
+反代会按普通客户端播放策略改写 `Path`、`DirectStreamUrl`，同时在对应的 `MediaSource` 上保留独立的画质入口：
 
 ```json
 "MediaFluxPlayback": {
@@ -26,7 +39,7 @@
 
 前置 nginx/FRP 可能改写 Host，导致服务端拿不到原公网端口。消费这个反代扩展时，客户端应使用当前已连接服务器的协议、主机和端口替换 `source_url` 的 origin，保留原有编码路径和完整签名查询参数；不要根据返回地址重新猜测公网入口。此规则只用于 `MediaFluxPlayback` 扩展，直接连接原 Jellyfin 获得的普通 STRM `Path` 仍使用其原地址。
 
-Pathfin 仍需开启“STRM 原始地址”。关闭时沿用 Jellyfin 画质协商；开启后原服务器和反代服务器共用云盘切档流程。忽略此扩展的客户端继续原有播放链路，不保证都会采用 302。通过公网反代连接时，支持此扩展的客户端无需访问 STRM 中的内网面板端口，也无需重新生成 STRM；画质查询经过反代，取得的 CDN 资源由客户端直接播放。若前面还有 HTTPS 反向代理，应保留公网 Host，并在可信代理配置下正确传递 `X-Forwarded-Proto`。直接连接原 Jellyfin 时，原 STRM 地址仍需能由客户端访问。
+忽略此扩展的客户端继续原有播放链路，不保证都会采用 302。通过公网反代连接且正确使用该扩展时，无需重新生成 STRM；若前面还有 HTTPS 反向代理，应保留公网 Host，并在可信代理配置下正确传递 `X-Forwarded-Proto`。
 
 Web 中的入口与播放路线说明见[使用指南：媒体反代](使用指南.md#63-媒体反代与手动播放映射)。手动播放映射在具体实例的 ⋯ 菜单中维护；它不代替本接口的签名验证和文件归属检查。
 
@@ -86,15 +99,15 @@ GET /playgy/<file>/<etag>/<size>/<filename>?v=1&sig=<signature>&view=resolve&qua
 
 ## Pathfin / Media3 接入点
 
-现有 `PlaybackResolver` 已可选用 `MediaSource.Path`，`PlaybackViewModel` 已会把 `ResolvedPlayback.mimeType` 传给 `MediaItem.Builder.setMimeType()`，并支持带位置更换媒体。可复用这些路径：
+Pathfin 已实现上述云盘画质流程。其他 Media3 客户端接入时应保持以下边界：
 
 - **画质来源分开**：普通媒体的 `PlaybackQuality.HIGH/STANDARD/DATA_SAVER` 表示 Jellyfin 转码码率上限；支持协议的云盘 STRM 在同一菜单中使用真实 `variants` 列表。云盘切档调用 `resolve`，不通过 `api.playbackInfo(quality=...)` 触发 Jellyfin 转码。
 - **短时资源与原始来源分开**：保留原始签名 STRM URL 用于下次枚举/解析，播放 URI 才换成 CDN URL；切档仍属于同一 Jellyfin item/source，正常上报播放进度。
 - **显式 MIME**：光鸭 HLS 地址未必以 `.m3u8` 结尾。构建 `ResolvedPlayback` 时设置 `mimeType = response.variant.mime_type`、`trustedServer = false`；HLS 必须显式 `application/x-mpegURL`。
-- **保留时间和状态**：复用现有切源/失败回退流程；不要清零播放进度。转码资源内的音轨可能与原文件不同，应读取新流的真实轨道，不能直接照搬原文件轨道索引。
+- **保留时间和状态**：切档保留位置与播放状态，失败时先恢复正在播放的云端资源，不静默回退 Jellyfin 转码。云端压缩资源的音轨可能与原文件不同，应读取新流的真实轨道，不能直接照搬原文件轨道索引。
 - **网络隔离**：调用 MediaFlux 和 CDN 时不发送 Jellyfin Token/Cookie。沿用已有逐跳凭据隔离；HLS 非 BYTERANGE 分片不要强加原文件 Range。
 
-发现接口时应关闭自动重定向，并验证 HTTP 200、JSON Content-Type 和 `protocol`。旧 MediaFlux 不识别 `view` 时可能返回原画 302，不能跟随该响应把整部电影当 JSON 下载。发现不可用只隐藏云端画质入口，保留原播放行为；不改变普通本地媒体的 Jellyfin 画质功能。
+发现接口时应关闭自动重定向，并验证 HTTP 200、JSON Content-Type 和 `protocol`。旧 MediaFlux 不识别 `view` 时可能返回原画 302，不能跟随该响应把整部电影当 JSON 下载。发现不可用只隐藏云端画质入口，保留原始 STRM 播放方式；不改变普通本地媒体的 Jellyfin 画质功能。
 
 本接口不依赖客户端额外配置云盘账号；签名 STRM URL 本身是播放凭据。不要在日志、截图、遥测中记录完整签名地址或 CDN URL。
 

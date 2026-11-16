@@ -1,270 +1,140 @@
+// 固定业务层次与节点坐标；使用 neato -n2 -Tsvg 重建，勿用 dot 自动重排。
+// 节点表示业务职责；跨区连接保留实际调用、状态交接与视频流向。
 digraph MediaFluxFullChain {
-  graph [
-    rankdir=TB, bgcolor="#F8FAFC", fontname="Noto Sans CJK SC",
-    fontsize=22, fontcolor="#0F172A", labelloc=t, labeljust=l,
-    label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="0" CELLPADDING="4">
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="22">MediaFlux · 全链路功能与模块拓扑  |  2026-11-17</FONT></TD></TR>
-      <TR><TD ALIGN="LEFT"><FONT POINT-SIZE="12">实线：主要调用 / 数据流　虚线：可选 / 异步交接　[编号]：跨区连接　无箭头的相邻卡片不是串行步骤</FONT></TD></TR>
-    </TABLE>>,
-    pad=0.35, nodesep=0.28, ranksep=0.55, splines=ortho,
-    newrank=false, compound=true, pack=18, packmode="array_ul1"
-  ];
-  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC",
-    fontsize=11, fontcolor="#0F172A", color="#CBD5E1", fillcolor="#FFFFFF",
-    penwidth=1.15, width=3.45, height=1.15, margin="0.14,0.13"];
-  edge [color="#64748B", penwidth=1.3, arrowsize=0.7];
-  // 每区内实线表示主调用/数据流。跨区以 [编号] 对接；无连线卡片不是串行步骤。
-  // 代码名省略 app/modules/ 等共同前缀；完整路径见同目录 Markdown 与模块地图。
-
-  subgraph cluster_A {
-    sortv=1;
-    label="A  运行与入口\l启动按上排顺序；下排是独立接入面，按编号进入业务链路\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#64748B";
-    color="#64748B"; fillcolor="#F1F5F9"; style="rounded,filled"; margin=20;
-    { rank=same;
-      A1 [group="col0", label="A1  容器 / CLI\npackaging/scripts/docker-entrypoint.sh\nmediaflux.py → app/cli.py\n解析路径、权限与启动参数"];
-      A2 [group="col1", label="A2  运行目录与配置\nruntime_paths.py / config.py\n环境变量 → user.env → 默认值\n单进程 / 单 Worker 准入"];
-      A3 [group="col2", label="A3  应用与生命周期\napp/main.py · create_app / lifespan\nFastAPI 路由、中间件\n/healthz · /readyz"];
-      A4 [group="col3", label="A4  恢复与消费者\n恢复 Agent、刷新、整理任务\n先启动通知 / 确认消费者\n持久状态与恢复见 [H]"];
-      A5 [group="col4", label="A5  后台生产者\nRSS / 订阅 / 下载跟踪 / 整理\nSTRM / 本地 / Agent 条件启用\nTelegram 与反代按配置运行"];
-    }
-    A1 -> A2 -> A3 -> A4 -> A5 [style=invis, weight=50];
-    { rank=same;
-      A6 [group="col0", label="A6  Web 控制台\ntemplates + static JS/CSS\n页面、表单、NDJSON / SSE\n请求进入 [A7]"];
-      A7 [group="col1", label="A7  HTTP 接口\napp/routes/*\nSession / CSRF / 参数校验\n发现 [B] · 整理 [C] · Agent [F]"];
-      A8 [group="col2", label="A8  Telegram 用户\n命令 / 磁力 / 分享 / 自然语言\n消息与 inline callback\n更新进入 [A9]"];
-      A9 [group="col3", label="A9  Bot 接入\nbot/handlers.py / progress.py\n下载 [B3] · 整理确认 [C9]\nAgent [F1] · 通知 [H9]"];
-      A10 [group="col4", label="A10  设置与连接\n看板：媒体服务器连接\n媒体库与路径映射 → [E7]\nWeb 显示开关不关闭 TG / Agent"];
-    }
-    A6 -> A7 -> A8 -> A9 -> A10 [style=invis, weight=50];
-    A1 -> A6 [style=invis, weight=100];
-    A2 -> A7 [style=invis, weight=100];
-    A3 -> A8 [style=invis, weight=100];
-    A4 -> A9 [style=invis, weight=100];
-    A5 -> A10 [style=invis, weight=100];
-    A1 -> A2 -> A3 -> A4 -> A5 [color="#64748B", weight=60];
-    A6 -> A7 [color="#64748B", weight=60];
-    A8 -> A9 [color="#64748B", weight=60];
-  }
-  subgraph cluster_B {
-    sortv=2;
-    label="B  发现、下载与完成跟踪\l先持久化请求；qB 与光鸭独立提交、独立完成，不把受理当完成\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#C2410C";
-    color="#C2410C"; fillcolor="#FFF7ED"; style="rounded,filled"; margin=20;
-    { rank=same;
-      B1 [group="col0", label="B1  发现 / 订阅 / 资源站\napp/discovery / app/indexers\nrss.py / media_subscriptions.py\nTMDB · 豆瓣 · Bangumi · 站点"];
-      B2 [group="col1", label="B2  候选与过滤\nRSS 周期 / 追更条件 / 资源搜索\n排除词、季集、已入库检查\nWeb / TG / Agent 选择资源"];
-      B3 [group="col2", label="B3  统一下载编排\ndownload_dispatcher.py\n磁力 / 种子 / HTTP / 分享\n幂等键与各目标状态先落库"];
-      B4 [group="col3", label="B4  目标分发与默认值\nqB 路线 → [B6] · 光鸭 → [B9]\nboth 分别提交，补投失败目标\nRSS 与 Bot 分类允许不同"];
-      B5 [group="col4", label="B5  下载异常处理\n请求详情 / 下载待处理\n失败、部分失败、未知待核对\n后处理失败不要求重复下载"];
-    }
-    B1 -> B2 -> B3 -> B4 -> B5 [style=invis, weight=50];
-    { rank=same;
-      B6 [group="col0", label="B6  qBittorrent\nclients/qbittorrent.py\n磁力 / 种子 / HTTP 下载\n返回 torrent hash 与进度"];
-      B7 [group="col1", label="B7  qB 完成核验\ndownload_tracker.py\n检查真实完成与内容路径\n匹配本地来源与接管条件"];
-      B8 [group="col2", label="B8  本地任务交接\nlocal_media_service.py\n创建 / 恢复本地整理任务\n识别 [C1] → 本地执行 [D1]"];
-      B9 [group="col3", label="B9  光鸭离线 / 分享转存\nclients/guangya.py\n目标目录与文件树过滤\n接受任务后继续跟踪"];
-      B10 [group="col4", label="B10  光鸭完成核验\ndownload_tracker.py\n远端任务、文件与目录回读\n识别 [C1] → 云端执行 [D6]"];
-    }
-    B6 -> B7 -> B8 -> B9 -> B10 [style=invis, weight=50];
-    B1 -> B6 [style=invis, weight=100];
-    B2 -> B7 [style=invis, weight=100];
-    B3 -> B8 [style=invis, weight=100];
-    B4 -> B9 [style=invis, weight=100];
-    B5 -> B10 [style=invis, weight=100];
-    B1 -> B2 -> B3 -> B4 [color="#C2410C", weight=60];
-    B6 -> B7 -> B8 [color="#C2410C", weight=60];
-    B9 -> B10 [color="#C2410C", weight=60];
-  }
-  subgraph cluster_C {
-    sortv=3;
-    label="C  统一识别、规则与待确认\l自动整理、手动识别与日志纠正共用领域服务；确定的计划交给 [D]\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#7C3AED";
-    color="#7C3AED"; fillcolor="#F5F3FF"; style="rounded,filled"; margin=20;
-    { rank=same;
-      C1 [group="col0", label="C1  扫描与文件上下文\norganize_scan.py / directory_media.py\n本地或云端文件、父目录\n文件身份、快照与当前来源"];
-      C2 [group="col1", label="C2  标题与字段抽取\nrecognition/* / scraper.py\n预处理规则、发布格式、映射知识\n标题 / 年份 / 原始季集 / 规格"];
-      C3 [group="col2", label="C3  元数据与外部线索\nTMDB 搜索 / 详情 / 季集\n豆瓣 / Bangumi / AI 辅助线索\n成人专用来源：MetaTube"];
-      C4 [group="col3", label="C4  身份与季集核验\n候选评分、标题完整度、季集边界\n证据不足 / 冲突 → [C6]\n确定身份后生成规则计划"];
-      C5 [group="col4", label="C5  命名与版本计划\norganize_rules.py / naming.py\n分类目录、季目录、媒体规格\n冲突仲裁后交给 [D1] / [D6]"];
-    }
-    C1 -> C2 -> C3 -> C4 -> C5 [style=invis, weight=50];
-    { rank=same;
-      C6 [group="col0", label="C6  持久待确认案例\norganize_confirmations.py\n冻结文件 / 候选；光鸭人工 → [C8]\n保留原位；本地沿原单项确认"];
-      C7 [group="col1", label="C7  只读 Agent 复核（可选）\nagent_recognition_review.py\n单组按已授范围校验后 → [C9]\n同次光鸭整理多组建议 → [C8]"];
-      C8 [group="col2", label="C8  光鸭 Web / TG / SDK 批次审阅\norganize_confirmation_batches.py\n逐组选择、跨页预览、批量确认\n建议与人工选择均纳入快照"];
-      C9 [group="col3", label="C9  确认执行权与复验\nowner / revision / 一次性执行权\n变更选择则旧预览失效\n单组失败只拒绝该组"];
-      C10 [group="col4", label="C10  后台执行与状态回传\n确认受理后交回 [D1] / [D6]\n队列完成与后处理分别跟踪\nTG 摘要 / Web 状态经 [H6] 更新"];
-    }
-    C6 -> C7 -> C8 -> C9 -> C10 [style=invis, weight=50];
-    C1 -> C6 [style=invis, weight=100];
-    C2 -> C7 [style=invis, weight=100];
-    C3 -> C8 [style=invis, weight=100];
-    C4 -> C9 [style=invis, weight=100];
-    C5 -> C10 [style=invis, weight=100];
-    C1 -> C2 -> C3 -> C4 -> C5 [color="#7C3AED", weight=60];
-    C6 -> C7 -> C8 [color="#7C3AED", style=dashed, weight=60];
-    C8 -> C9 -> C10 [color="#7C3AED", weight=60];
-  }
-  subgraph cluster_D {
-    sortv=4;
-    label="D  本地与云端执行、冲突清理\l执行器分别处理存储事务；共享 [C] 的识别与规则，不承诺所有操作可整体回滚\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#0F766E";
-    color="#0F766E"; fillcolor="#F0FDFA"; style="rounded,filled"; margin=20;
-    { rank=same;
-      D1 [group="col0", label="D1  本地任务执行\nlocal_media_service.py\n复验来源、归档目标和文件\n检查 qB 接管状态"];
-      D2 [group="col1", label="D2  本地 Writer 与计划\nWriter 锁 / 冲突复核\n暂停关联 qB 任务\n字幕跟随主媒体进入计划"];
-      D3 [group="col2", label="D3  本地移动事务\nlocal_move_transaction.py\n同盘移动；跨盘临时文件与校验\n提交目标后清理源，失败尝试补偿"];
-      D4 [group="col3", label="D4  qB 与来源收尾\n移除任务：delete_files=False\n清理明确垃圾与范围内空目录\n未知文件、字体、疑似样片保留"];
-      D5 [group="col4", label="D5  本地执行结果\n日志 / 操作步骤 → [H2]\n本地变化路径 → [E6]\n异常按实际状态恢复或人工核验"];
-    }
-    D1 -> D2 -> D3 -> D4 -> D5 [style=invis, weight=50];
-    { rank=same;
-      D6 [group="col0", label="D6  光鸭任务协调\norganize_service.py / organize_tasks.py\nOrganizeTaskManager / Organizer\n源目标、快照、任务归属复验"];
-      D7 [group="col1", label="D7  云端逐项执行\norganize_execution.py\nmkdir / move / rename / 回读\n步骤持久化，未知结果不盲目重放"];
-      D8 [group="col2", label="D8  同版本落选文件\n自动回收开关与冲突策略\n核验保留方后走日志删除事务\n回收媒体及专属伴随；其他 → [D9]"];
-      D9 [group="col3", label="D9  暂存目录收尾\n沿已核验空父链清理\n可收尾到所属 MF-请求根目录\n长期来源根 / 非空目录保留"];
-      D10 [group="col4", label="D10  云端执行结果\norganize_postprocess.py\n可信变化 → STRM [E1]\n审计 [H2] · 通知 [H6]"];
-    }
-    D6 -> D7 -> D8 -> D9 -> D10 [style=invis, weight=50];
-    D1 -> D6 [style=invis, weight=100];
-    D2 -> D7 [style=invis, weight=100];
-    D3 -> D8 [style=invis, weight=100];
-    D4 -> D9 [style=invis, weight=100];
-    D5 -> D10 [style=invis, weight=100];
-    D1 -> D2 -> D3 -> D4 -> D5 [color="#0F766E", weight=60];
-    D6 -> D7 -> D8 -> D9 -> D10 [color="#0F766E", weight=60];
-  }
-  subgraph cluster_E {
-    sortv=5;
-    label="E  STRM 镜像与媒体库刷新\l来源隔离目录按 ID 持久保留；刷新交接成功不等于媒体服务器已完成扫描\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#15803D";
-    color="#15803D"; fillcolor="#F0FDF4"; style="rounded,filled"; margin=20;
-    { rank=same;
-      E1 [group="col0", label="E1  STRM 触发与队列\nscheduler.py / strm.py\n整理增量、快速同步消费变化\n完整校准 / Cron 遍历来源"];
-      E2 [group="col1", label="E2  来源与本地层级\n源 ID → 固定隔离目录\nSTRM_ROOT/光鸭云盘/来源/相对路径\n增减来源不改变其他来源层级"];
-      E3 [group="col2", label="E3  扫描与清理依据\n读取云端目录 / 文件 / etag\n完整扫描才据缺失清理旧镜像\n扫描异常不推断远端已删除"];
-      E4 [group="col3", label="E4  镜像写入与索引\n写 .strm，校准改名 / 移动\n索引 / 变化队列 / 失败账本\n变化 → [E6] · 播放入口 → [G6]"];
-      E5 [group="col4", label="E5  伴随元数据与变化\nstrm_metadata_worker.py\nNFO / 图片等独立排队处理\n刷新无需等待元数据队列全部完成"];
-    }
-    E1 -> E2 -> E3 -> E4 -> E5 [style=invis, weight=50];
-    { rank=same;
-      E6 [group="col0", label="E6  持久刷新交接\nmedia_refresh_coordinator.py\n合并变化路径、租约与去重\n去重窗口内新变化延后交接"];
-      E7 [group="col1", label="E7  路径映射与库绑定\nmedia_refresh.py / clients/base.py\nMF 路径 → Jellyfin / Emby 路径\n同路径可直配；歧义不跨库猜测"];
-      E8 [group="col2", label="E8  定位最小适用范围\n电影自身；剧集优先整剧\n无整剧条目退单集 / 季 / 目录\n新作品可扫所属根，不扩无关库"];
-      E9 [group="col3", label="E9  提交服务器扫描\nJellyfin / Emby 刷新 API\n默认元数据 / 图片补缺\n整剧扫描更新新集汇总日期"];
-      E10 [group="col4", label="E10  结算与用户可见结果\n成功路径出队；去重延期保留\n未匹配 / 上游失败告警后结束\n用户手动刷新；DB 中断可恢复"];
-    }
-    E6 -> E7 -> E8 -> E9 -> E10 [style=invis, weight=50];
-    E1 -> E6 [style=invis, weight=100];
-    E2 -> E7 [style=invis, weight=100];
-    E3 -> E8 [style=invis, weight=100];
-    E4 -> E9 [style=invis, weight=100];
-    E5 -> E10 [style=invis, weight=100];
-    E1 -> E2 -> E3 -> E4 [color="#15803D", weight=60];
-    E4 -> E5 [color="#15803D", style=dashed, weight=60];
-    E6 -> E7 -> E8 -> E9 -> E10 [color="#15803D", weight=60];
-  }
-  subgraph cluster_F {
-    sortv=6;
-    label="F  Agent 模型、工作区与写门禁\l业务复用 [B]—[E]；批准后执行冻结操作，避免重放脚本后半段\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#A16207";
-    color="#A16207"; fillcolor="#FFFBEB"; style="rounded,filled"; margin=20;
-    { rank=same;
-      F1 [group="col0", label="F1  自然语言与宿主身份\nWeb / Telegram / 后台授权任务\n绑定 owner、会话、话题\n检查 Media Agent 总开关与子授权"];
-      F2 [group="col1", label="F2  会话与上下文\nagent/kernel/session.py\n历史、引用、预算、取消与续行\n按需读取 /skills 与 /work 资料"];
-      F3 [group="col2", label="F3  模型请求与工具循环\nmodel_rounds.py / provider_model.py\nResponses / Chat / Anthropic\n普通聊天模型只获得 agent.run_code"];
-      F4 [group="col3", label="F4  隔离代码工作区\nsandbox.py · Bubblewrap + seccomp\nPython / Shell / 资源限制\nstdout/stderr 完整输出留在 /output"];
-      F5 [group="col4", label="F5  SDK RPC 调用入口\napp/sdk.py · sdk_method\n真实函数签名生成 help 与分类\n参数绑定，未登记方法拒绝 → [F6]"];
-    }
-    F1 -> F2 -> F3 -> F4 -> F5 [style=invis, weight=50];
-    { rank=same;
-      F6 [group="col0", label="F6  方法分类与预算\nread / control / local_write / write\n只读与会话资料 → [F7]\n业务写入 → [F8]"];
-      F7 [group="col1", label="F7  查询与工作区操作\n领域查询、读取预算与限流\n会话控制、技能版本、工作文件\n事实与错误返回 [F10]"];
-      F8 [group="col2", label="F8  写入预检与冻结\nports/sdk_effects.py / EffectPlan\n冻结对象、参数与配置快照\n按声明确认；需确认则停止脚本"];
-      F9 [group="col3", label="F9  授权后确定性执行\nEffectExecutor / 原领域执行器\n复验冻结状态，保存执行回执\n免交互确认写入也走同一门禁"];
-      F10 [group="col4", label="F10  结果、等待与续行\n公开投影 / AgentEvent / 持久状态\nWeb NDJSON · TG 消息更新 [H9]\n后台任务查实后续行，未知不重放"];
-    }
-    F6 -> F7 -> F8 -> F9 -> F10 [style=invis, weight=50];
-    F1 -> F6 [style=invis, weight=100];
-    F2 -> F7 [style=invis, weight=100];
-    F3 -> F8 [style=invis, weight=100];
-    F4 -> F9 [style=invis, weight=100];
-    F5 -> F10 [style=invis, weight=100];
-    F1 -> F2 -> F3 -> F4 -> F5 [color="#A16207", weight=60];
-    F6 -> F7 [color="#A16207", weight=60];
-    F8 -> F9 -> F10 [color="#A16207", weight=60];
-  }
-  subgraph cluster_G {
-    sortv=7;
-    label="G  播放协商与三种实际取流路线\l区分 PlaybackInfo 与视频 GET；直连的持续视频流量不经过 MF\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#0369A1";
-    color="#0369A1"; fillcolor="#F0F9FF"; style="rounded,filled"; margin=20;
-    { rank=same;
-      G1 [group="col0", label="G1  播放客户端\nJellyfin Web / 官方 App\nPathfin / Infuse / VidHub 等\n连接所选媒体反代实例"];
-      G2 [group="col1", label="G2  实例与手动绑定\nmedia_proxy.py / media_proxy_api.py\n独立监听端口与上游服务器\n有效手动映射优先于自动识别"];
-      G3 [group="col2", label="G3  上游播放信息\nJellyfin / Emby · PlaybackInfo\n媒体源、字幕、客户端播放能力\n上游耗时与 MF 内部分别计量"];
-      G4 [group="col3", label="G4  播放合同与链接改写\n识别可用光鸭 STRM 与文件\nWeb 保留上游播放能力选择\n原生按兼容直放合同改写"];
-      G5 [group="col4", label="G5  按本次条件选择路线\n云盘 302 → [G6]—[G10]\nMF 原始流转发 → [G11]—[G13]\n本地 / HLS / 转码 → [G14]—[G15]"];
-    }
-    G1 -> G2 -> G3 -> G4 -> G5 [style=invis, weight=50];
-    { rank=same;
-      G6 [group="col0", label="G6  签名 STRM / 授权流入口\n/playgy/{id}/{etag}/{size}/{name}\n或实例 /Videos/{item}/stream\nGET 取流；HEAD 独立探测"];
-      G7 [group="col1", label="G7  两类入口分别校验\nSTRM：v / sig + id / etag / size\n实例流：凭据 / 播放会话授权\n绑定或动态映射，范围不能越权"];
-      G8 [group="col2", label="G8  获取 CDN signedURL\n光鸭客户端 / 短时缓存\n回读文件并获取播放直链\n失败返回真实错误，不猜地址"];
-      G9 [group="col3", label="G9  HTTP 302 响应\nLocation 指向云盘 CDN\n播放器跟随重定向\nMF 不持续搬运此路视频数据"];
-      G10 [group="col4", label="G10  云盘直连数据流\n光鸭 CDN → 实际播放器\n客户端可达性与协议决定结果\n日志显示：云盘直连（302）"];
-    }
-    G6 -> G7 -> G8 -> G9 -> G10 [style=invis, weight=50];
-    { rank=same;
-      G11 [group="col0", label="G11  MF 转发入口\n兼容客户端的取流请求\n媒体原始流经 MF\n此路线不是客户端 CDN 直连"];
-      G12 [group="col1", label="G12  云盘流经过 MF\nCDN → MediaFlux 转发\nRange / 响应头 / 数据流处理\nMF 承担持续传输，不在 MF 转码"];
-      G13 [group="col2", label="G13  客户端接收转发\nMF → 播放器\n日志显示：MF 转发\n耗时分别看取流与 PlaybackInfo"];
-      G14 [group="col3", label="G14  媒体服务器播放\n本地 Direct Play / Direct Stream\n或 Jellyfin / Emby HLS / 转码\nMF 透传对应请求与响应"];
-      G15 [group="col4", label="G15  客户端接收上游资源\n上游资源经所选请求链交付\n字幕、封装、编码按能力处理\n播放日志 → [H2]，不把无 302 当失败"];
-    }
-    G11 -> G12 -> G13 -> G14 -> G15 [style=invis, weight=50];
-    G1 -> G6 [style=invis, weight=100];
-    G2 -> G7 [style=invis, weight=100];
-    G3 -> G8 [style=invis, weight=100];
-    G4 -> G9 [style=invis, weight=100];
-    G5 -> G10 [style=invis, weight=100];
-    G6 -> G11 [style=invis, weight=100];
-    G7 -> G12 [style=invis, weight=100];
-    G8 -> G13 [style=invis, weight=100];
-    G9 -> G14 [style=invis, weight=100];
-    G10 -> G15 [style=invis, weight=100];
-    G1 -> G2 -> G3 -> G4 -> G5 [color="#0369A1", weight=60];
-    G6 -> G7 -> G8 -> G9 -> G10 [color="#0369A1", weight=60];
-    G11 -> G12 -> G13 [color="#0369A1", weight=60];
-    G14 -> G15 [color="#0369A1", weight=60];
-  }
-  subgraph cluster_H {
-    sortv=8;
-    label="H  持久化、并发、通知与恢复\l各业务共享此层；按领域状态恢复，不把未知写入或上游刷新失败统一重试\l";
-    labelloc=t; labeljust=l; fontsize=16; fontcolor="#475569";
-    color="#475569"; fillcolor="#F1F5F9"; style="rounded,filled"; margin=20;
-    { rank=same;
-      H1 [group="col0", label="H1  数据库与仓储\ndatabase.py / schema / migrations\nrepositories/* · SQLite + WAL\n事务、CAS、索引与忙等待"];
-      H2 [group="col1", label="H2  领域持久状态\n下载请求 / 整理步骤 / 删除审计\nSTRM 索引 / 队列 / 刷新 outbox\nAgent 会话 / 代理记录 / 订阅"];
-      H3 [group="col2", label="H3  运行文件与配置\nRuntimePaths：data / config / logs\nuser.env、Token、缓存、工作区\n本地媒体与 STRM 使用独立目录"];
-      H4 [group="col3", label="H4  并发与执行约束\nprocess / lifecycle / Writer 锁\n任务 lease / owner / revision\n单 Worker；过期快照需重新预检"];
-      H5 [group="col4", label="H5  备份与启动恢复\nSQLite 一致性快照与迁移前备份\n恢复中断任务、租约与未结算状态\n未知写入先回读，不自动重放"];
-    }
-    H1 -> H2 -> H3 -> H4 -> H5 [style=invis, weight=50];
-    { rank=same;
-      H6 [group="col0", label="H6  领域结果与通知事件\n下载 / 整理 / STRM / Agent\nNotificationEvent 与执行事实\n按阶段与业务归属构建消息"];
-      H7 [group="col1", label="H7  持久通知 outbox\ntelegram_notification_center.py\n确认摘要与通知队列\n投递版本、去重、租约"];
-      H8 [group="col2", label="H8  投递与消息编辑\n后台 dispatcher 消费\n合并进度、编辑摘要、清理按钮\n失败按投递策略重试"];
-      H9 [group="col3", label="H9  Web / Telegram 反馈\nTelegram API 消息与回调\nWeb 从日志 / 快照 / 事件读状态\n确认受理、执行、后处理分别展示"];
-      H10 [group="col4", label="H10  异常与恢复分流\n可重试失败：各领域预算 / 退避\n未知结果：查实后决定下一步\n用户处理项：说明原因，不无限重放"];
-    }
-    H6 -> H7 -> H8 -> H9 -> H10 [style=invis, weight=50];
-    H1 -> H6 [style=invis, weight=100];
-    H2 -> H7 [style=invis, weight=100];
-    H3 -> H8 [style=invis, weight=100];
-    H4 -> H9 [style=invis, weight=100];
-    H5 -> H10 [style=invis, weight=100];
-    H6 -> H7 -> H8 -> H9 [color="#475569", weight=60];
-  }
+  graph [splines=ortho, overlap=true, bgcolor="#F8FAFC", fontname="Noto Sans CJK SC", fontsize=20, fontcolor="#0F172A", labelloc=t, labeljust=l, pad=0.35, nodesep=0.32, ranksep=0.9, label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="1600"><TR><TD ALIGN="LEFT">MediaFlux · 业务全链路拓扑</TD></TR><TR><TD ALIGN="LEFT"><FONT POINT-SIZE="12">实线：调用 / 数据　虚线：异步 / 调度　点线：持久化 / 恢复　绿色粗线：CDN 视频直达播放器</FONT></TD></TR></TABLE>>];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=11, fontcolor="#0F172A", width=4.0, height=0.95, margin="0.16,0.12", penwidth=1.1];
+  edge [fontname="Noto Sans CJK SC", fontsize=9, arrowsize=0.7, penwidth=1.2];
+  boot [label="容器 / CLI 启动\nmediaflux.py → app/cli.py\n配置、路径、权限与进程锁", color="#64748B", fillcolor="#F1F5F9", pos="0,2380!", pin=true];
+  app [label="FastAPI 生命周期\napp/main.py · create_app / lifespan\n路由、中间件、/healthz、/readyz", color="#64748B", fillcolor="#F1F5F9", pos="360,2380!", pin=true];
+  schedule [label="后台调度与任务恢复\nRSS / 下载跟踪 / 整理 / STRM / 刷新\n启动恢复、任务租约、单进程单 Worker", color="#64748B", fillcolor="#F1F5F9", pos="720,2380!", pin=true];
+  web [label="Web 控制台 / API\nJinja2 + static + app/routes/*\nSession / CSRF · JSON / NDJSON / SSE\n提交资源、手动整理 / 纠正、同步", color="#2563EB", fillcolor="#EFF6FF", pos="0,2240!", pin=true];
+  tg [label="Telegram 用户 / Bot\nbot/handlers.py / progress.py\n命令、磁力、种子、自然语言、确认回调\n/sync_gy 同步 · 通知卡片更新", color="#2563EB", fillcolor="#EFF6FF", pos="360,2240!", pin=true];
+  discovery [label="发现、订阅与资源筛选\ndiscovery / indexers / rss.py\n季集、排期、排除词、库内检查", color="#EA580C", fillcolor="#FFF7ED", pos="720,2240!", pin=true];
+  sources [label="RSS / 蜜柑 / 多站资源\nTMDB · 豆瓣 · Bangumi\n订阅、搜索、榜单与外部资料", color="#64748B", fillcolor="#F1F5F9", pos="1080,2240!", pin=true];
+  agent [label="Media Agent 会话与模型\nAgentSession / model_rounds\n身份、历史、引用、预算、取消", color="#B45309", fillcolor="#FFFBEB", pos="0,2100!", pin=true];
+  sdk [label="agent.run_code → SDK RPC\nBubblewrap + seccomp · /work /skills /output\n真实签名生成帮助；未登记方法拒绝", color="#B45309", fillcolor="#FFFBEB", pos="0,1960!", pin=true];
+  effects [label="写入预检、冻结与执行\nEffectExecutor / sdk_effects.py\n按合同确认，仅执行冻结计划并留回执", color="#B45309", fillcolor="#FFFBEB", pos="0,1820!", pin=true];
+  dispatch [label="统一下载请求与目标分发\ndownload_dispatcher.py\n协议识别、幂等、目标独立状态、补投", color="#EA580C", fillcolor="#FFF7ED", pos="720,2100!", pin=true];
+  qb [label="qBittorrent\n磁力 / 种子 / HTTP\n保留 RSS、Telegram 各自默认分类", color="#64748B", fillcolor="#F1F5F9", pos="360,1960!", pin=true];
+  offline [label="光鸭离线 / 分享转存\n目标目录、文件树筛选\n任务已受理后继续跟踪完成状态", color="#64748B", fillcolor="#F1F5F9", pos="1080,1960!", pin=true];
+  tracker [label="下载完成跟踪\ndownload_tracker.py\n回读任务与文件，真实完成才交接整理", color="#EA580C", fillcolor="#FFF7ED", pos="720,1820!", pin=true];
+  scan [label="本地 / 云端任务扫描\n各自任务入口，共享文件上下文\n文件、父目录、媒体规格与来源快照", color="#7C3AED", fillcolor="#F5F3FF", pos="720,1680!", pin=true];
+  recognize [label="统一识别、规则与版本计划\nrecognition / scraper / naming\n标题、年份、季集、候选复核、命名与冲突", color="#7C3AED", fillcolor="#F5F3FF", pos="720,1540!", pin=true];
+  metadata [label="元数据与辅助线索\nTMDB 搜索 / 详情 / 季集\n豆瓣 / Bangumi / AI；成人来源 MetaTube", color="#64748B", fillcolor="#F1F5F9", pos="1080,1540!", pin=true];
+  pending [label="待确认案例与文件快照\norganize_confirmations.py\n证据不足保留原位；本地单项确认", color="#7C3AED", fillcolor="#F5F3FF", pos="360,1400!", pin=true];
+  review [label="可选 Agent 只读复核\nagent_recognition_review.py\n单组按既有授权；光鸭多组只给建议", color="#B45309", fillcolor="#FFFBEB", pos="0,1400!", pin=true];
+  confirm [label="确认认领与复验\nWeb / TG / SDK；光鸭跨页批次审阅\n冻结候选与建议，改选使旧预览失效", color="#7C3AED", fillcolor="#F5F3FF", pos="360,1260!", pin=true];
+  local [label="本地执行器 / 移动事务\nlocal_media_service / local_move_transaction\nWriter 锁、目标复验、移动、失败补偿", color="#2563EB", fillcolor="#EFF6FF", pos="360,1120!", pin=true];
+  cloud [label="光鸭执行器 / 逐项回读\norganize_tasks / organize_execution\nmkdir / move / rename，未知结果不盲重放", color="#0F766E", fillcolor="#F0FDFA", pos="1080,1120!", pin=true];
+  local_finish [label="本地归档与下载收尾\n提交媒体 / 字幕，移除 qB 不删文件\n清理明确垃圾与空目录，保留未知文件", color="#2563EB", fillcolor="#EFF6FF", pos="360,980!", pin=true];
+  cloud_finish [label="云端后处理与暂存收尾\norganize_postprocess.py\n按开关回收同版本落选文件，核验空父链到 MF 根", color="#0F766E", fillcolor="#F0FDFA", pos="1080,980!", pin=true];
+  strm [label="STRM 增量同步 / 完整校准\nstrm.py / scheduler.py\n来源 ID 固定本地层级；完整扫描才判缺失", color="#15803D", fillcolor="#F0FDF4", pos="1080,840!", pin=true];
+  files [label="本地媒体 / STRM 文件\n媒体库目录 / STRM_ROOT\n.strm、NFO、图片、字幕，供媒体库读取", color="#64748B", fillcolor="#F1F5F9", pos="360,700!", pin=true];
+  refresh [label="持久刷新交接与路径映射\nmedia_refresh_coordinator / media_refresh\n合并、租约、去重；MF → 媒体库路径\n电影自身 / 剧集优先整剧；失败告警结束", color="#15803D", fillcolor="#F0FDF4", pos="720,700!", pin=true];
+  sidecar [label="伴随元数据队列\nstrm_metadata_worker.py\nNFO / 图片独立排队；刷新不等待队列清空", color="#15803D", fillcolor="#F0FDF4", pos="1080,700!", pin=true];
+  server [label="Jellyfin / Emby 媒体库\n扫描、补缺元数据与图片，更新剧集汇总日期\nPlaybackInfo / 上游直放、HLS / 转码", color="#64748B", fillcolor="#F1F5F9", pos="720,560!", pin=true];
+  proxy [label="MF 媒体反代 / 播放协商\nmedia_proxy.py · HTTP / WS / PlaybackInfo\n按客户端与媒体源选择直连、转发或上游", color="#0891B2", fillcolor="#ECFEFF", pos="360,420!", pin=true];
+  quality [label="签名播放入口 / 云盘画质\n/playgy · playgy_signing.py\n普通 GET → 302；variants / resolve → JSON", color="#0891B2", fillcolor="#ECFEFF", pos="720,280!", pin=true];
+  cdn [label="光鸭 CDN\n短时视频地址 · 原画 / 可用云端画质\n实际视频数据由这里传出", color="#64748B", fillcolor="#F1F5F9", pos="1080,140!", pin=true];
+  pathfin [label="Pathfin · Android（已验证）\n开启 STRM 原始地址；接 MF 或原 Jellyfin\n取得 CDN 地址后直连，不要求媒体请求 302", color="#059669", fillcolor="#ECFDF5", pos="720,0!", pin=true, URL="https://github.com/li88iioo/Pathfin", target="_blank"];
+  players [label="其他播放器 / Web / 官方 App\n能否直连取决于能力与协商\nMF 转发不转码；HLS / 转码交给上游", color="#059669", fillcolor="#ECFDF5", pos="360,0!", pin=true];
+  gy [label="光鸭 API / 云端文件\nclients/guangya.py\n离线状态、目录快照、移动改名、signedURL", color="#64748B", fillcolor="#F1F5F9", pos="1440,1120!", pin=true];
+  db [label="SQLite / WAL · Repository\n下载、整理、确认、STRM、刷新、Agent\n回执、播放审计、通知 outbox 持久化", color="#64748B", fillcolor="#F1F5F9", pos="1440,1680!", pin=true];
+  notify [label="领域事件 → 通知 outbox\n候选、摘要、进度、终态\n租约、重试、revision；失败不回滚业务", color="#BE185D", fillcolor="#FFF1F2", pos="1440,1400!", pin=true];
+  delivery [label="Telegram 消息投递\nnotification dispatcher\n发送 / 编辑摘要 / 按钮更新", color="#BE185D", fillcolor="#FFF1F2", pos="1440,1260!", pin=true];
+  subgraph cluster_runtime { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">运行与启动</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#64748B"; color="#64748B"; style="rounded,filled"; fillcolor="#F1F5F9"; margin=18; bb="-160,2332,880,2445"; boot; app; schedule; }
+  subgraph cluster_access { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">接入与资源来源</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#2563EB"; color="#2563EB"; style="rounded,filled"; fillcolor="#EFF6FF"; margin=18; bb="-160,2192,1240,2305"; web; tg; discovery; sources; }
+  subgraph cluster_agent { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">Agent 工作区与写门禁</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#B45309"; color="#B45309"; style="rounded,filled"; fillcolor="#FFFBEB"; margin=18; bb="-160,1772,160,2165"; agent; sdk; effects; }
+  subgraph cluster_download { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">统一下载 · 两个目标各自完成</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#EA580C"; color="#EA580C"; style="rounded,filled"; fillcolor="#FFF7ED"; margin=18; bb="200,1772,1240,2165"; dispatch; qb; offline; tracker; }
+  subgraph cluster_recognition { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">识别、规则与人工确认</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#7C3AED"; color="#7C3AED"; style="rounded,filled"; fillcolor="#F5F3FF"; margin=18; bb="-160,1212,1240,1745"; scan; recognize; metadata; pending; review; confirm; }
+  subgraph cluster_execute { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">执行与收尾 · 本地 / 光鸭分流</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#0F766E"; color="#0F766E"; style="rounded,filled"; fillcolor="#F0FDFA"; margin=18; bb="200,932,1240,1185"; local; cloud; local_finish; cloud_finish; }
+  subgraph cluster_strm { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">镜像、元数据与刷新交接</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#15803D"; color="#15803D"; style="rounded,filled"; fillcolor="#F0FDF4"; margin=18; bb="200,652,1240,905"; strm; files; refresh; sidecar; }
+  subgraph cluster_play { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">媒体库与实际播放链路</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#0891B2"; color="#0891B2"; style="rounded,filled"; fillcolor="#ECFEFF"; margin=18; bb="200,-48,1240,625"; server; proxy; quality; cdn; pathfin; players; }
+  subgraph cluster_state { label=<<TABLE BORDER="0" CELLBORDER="0" WIDTH="310"><TR><TD ALIGN="LEFT">持久化与通知</TD></TR></TABLE>>; labeljust=l; fontname="Noto Sans CJK SC"; fontsize=14; fontcolor="#BE185D"; color="#BE185D"; style="rounded,filled"; fillcolor="#FFF1F2"; margin=18; bb="1280,1212,1600,1745"; db; notify; delivery; }
+  boot -> app [xlabel="启动", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  app -> schedule [xlabel="lifespan", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  app -> web [xlabel="页面 / API", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  app -> tg [xlabel="Bot", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  schedule -> discovery [xlabel="订阅周期", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  sources -> discovery [xlabel="拉取 / 搜索", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  web -> agent [xlabel="自然语言", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  tg -> agent [xlabel="", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  agent -> sdk [xlabel="唯一工具入口", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  sdk -> effects [xlabel="write", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  sdk -> discovery [xlabel="read", color="#B45309", fontcolor="#B45309", style=solid, penwidth=1.15];
+  discovery -> dispatch [xlabel="资源候选", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  web -> discovery [xlabel="探索 / 订阅", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  web -> dispatch [xlabel="提交资源", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  tg -> dispatch [xlabel="链接 / 种子", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  effects -> dispatch [xlabel="SDK 下载", color="#B45309", fontcolor="#B45309", style=solid, penwidth=1.15];
+  dispatch -> qb [xlabel="qB 目标", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  dispatch -> offline [xlabel="光鸭目标", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  qb -> tracker [xlabel="进度 / 完成", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  offline -> tracker [xlabel="任务 / 文件回读", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  schedule -> tracker [xlabel="周期对账", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  tracker -> scan [xlabel="完成后交接", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  web -> scan [xlabel="", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  effects -> scan [xlabel="SDK 整理", color="#B45309", fontcolor="#B45309", style=solid, penwidth=1.15];
+  scan -> recognize [xlabel="文件上下文", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  metadata -> recognize [xlabel="查询 / 候选", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  recognize -> pending [xlabel="不确定 / 冲突", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  pending -> review [xlabel="启用复核时", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  pending -> confirm [xlabel="人工选择", color="#64748B", fontcolor="#64748B", style=solid, penwidth=1.15];
+  review -> confirm [xlabel="建议 / 单组授权复验", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  tg -> scan [xlabel="整理命令", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  web -> confirm [xlabel="候选审阅", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  tg -> confirm [xlabel="确认回调", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  effects -> confirm [xlabel="SDK 确认", color="#B45309", fontcolor="#B45309", style=solid, penwidth=1.15];
+  recognize -> local [xlabel="确定计划 · 本地", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  recognize -> cloud [xlabel="确定计划 · 云端", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  confirm -> local [xlabel="本地执行", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  confirm -> cloud [xlabel="云端执行", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  local -> local_finish [xlabel="提交 / 补偿", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  cloud -> cloud_finish [xlabel="回读结果", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  local_finish -> files [xlabel="媒体落盘", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  local_finish -> refresh [xlabel="本地变化", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  cloud_finish -> strm [xlabel="可信变化 → 增量", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  strm -> files [xlabel="生成 .strm", color="#15803D", fontcolor="#15803D", style=solid, penwidth=1.15];
+  strm -> refresh [xlabel="STRM 变化", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  strm -> sidecar [xlabel="后台排队", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  sidecar -> files [xlabel="NFO / 图片", color="#15803D", fontcolor="#15803D", style=solid, penwidth=1.15];
+  refresh -> server [xlabel="按归属范围刷新", color="#15803D", fontcolor="#15803D", style=solid, penwidth=1.15];
+  files -> server [xlabel="扫描读取", color="#15803D", fontcolor="#15803D", style=solid, penwidth=1.15];
+  schedule -> strm [xlabel="定时 / 完整校准", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  web -> strm [xlabel="同步操作", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  tg -> strm [xlabel="", color="#2563EB", fontcolor="#2563EB", style=solid, penwidth=1.15];
+  effects -> strm [xlabel="SDK 同步", color="#B45309", fontcolor="#B45309", style=solid, penwidth=1.15];
+  sdk -> server [xlabel="库内查询", color="#B45309", fontcolor="#B45309", style=solid, penwidth=1.15];
+  offline -> gy [xlabel="", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  cloud -> gy [xlabel="", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  gy -> strm [xlabel="云端目录 / 文件快照", color="#0F766E", fontcolor="#0F766E", style=solid, penwidth=1.15];
+  server -> proxy [xlabel="媒体源 / HTTP / WS", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  proxy -> quality [xlabel="签名入口 / 解析", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  files -> quality [xlabel=".strm 播放地址", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  quality -> gy [xlabel="获取 signedURL", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  quality -> pathfin [xlabel="variants / resolve JSON", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  quality -> players [xlabel="兼容客户端：302", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  server -> pathfin [xlabel="", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  cdn -> pathfin [xlabel="视频数据直达", color="#059669", fontcolor="#059669", style=solid, penwidth=2.3];
+  cdn -> players [xlabel="直连视频数据", color="#059669", fontcolor="#059669", style=solid, penwidth=2.3];
+  cdn -> proxy [xlabel="兼容转发取流", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  proxy -> players [xlabel="MF 转发视频", color="#0891B2", fontcolor="#0891B2", style=solid, penwidth=1.15];
+  server -> players [xlabel="上游直放 / HLS / 转码", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  dispatch -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  pending -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  local_finish -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  cloud_finish -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  strm -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  refresh -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  agent -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  proxy -> db [xlabel="", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  db -> schedule [xlabel="启动恢复 / 中断租约", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  db -> web [xlabel="页面 / 会话状态回读", color="#94A3B8", fontcolor="#94A3B8", style=dotted, penwidth=1.15];
+  db -> notify [xlabel="领取 outbox", color="#64748B", fontcolor="#64748B", style=dashed, penwidth=1.15];
+  pending -> notify [xlabel="待确认事件", color="#BE185D", fontcolor="#BE185D", style=dashed, penwidth=1.15];
+  cloud_finish -> notify [xlabel="结果事件", color="#BE185D", fontcolor="#BE185D", style=dashed, penwidth=1.15];
+  local_finish -> notify [xlabel="结果事件", color="#BE185D", fontcolor="#BE185D", style=dashed, penwidth=1.15];
+  agent -> notify [xlabel="持久结果", color="#BE185D", fontcolor="#BE185D", style=dashed, penwidth=1.15];
+  notify -> delivery [xlabel="可靠投递", color="#BE185D", fontcolor="#BE185D", style=dashed, penwidth=1.15];
+  delivery -> tg [xlabel="", color="#BE185D", fontcolor="#BE185D", style=dashed, penwidth=1.15];
 }
