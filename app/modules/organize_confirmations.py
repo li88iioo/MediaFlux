@@ -592,6 +592,7 @@ def update_confirmation_lifecycle_downstream(
     media_refresh: str,
     partial: bool = False,
     error: str = "",
+    notify_enabled: bool = True,
 ) -> bool:
     """先保存 STRM/媒体库业务终态，再按通知偏好更新人工确认消息。"""
     from app.modules.telegram_notification_center import get_notification_thread_event
@@ -604,7 +605,7 @@ def update_confirmation_lifecycle_downstream(
     downstream = {"strm": strm_status, "media_refresh": media_refresh,
                   "partial": partial, "error": redact_sensitive_text(error)}
     organize_confirmations_repo.set_confirmation_downstream(token, downstream)
-    if not _confirmation_delivery_enabled(payload):
+    if not notify_enabled or not _confirmation_delivery_enabled(payload):
         return False
     batch_id = str(payload.get("_confirmation_batch") or "")
     if batch_id:

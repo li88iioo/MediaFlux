@@ -269,6 +269,51 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
         publish.assert_called_once_with("batch", chat_id="chat")
         self.assertEqual(batches.list_confirmations()["items"][0]["downstream"]["strm"], "完成")
 
+    def test_downstream_notification_scope_keeps_receipts_without_changing_payload(self):
+        for batch_id in ("", "batch"):
+            with self.subTest(batch=bool(batch_id)):
+                token = "scoped-batch" if batch_id else "scoped-single"
+                self.create(token, batch=batch_id)
+                organize_confirmations_repo.update_organize_confirmation(
+                    token, status="completed", result_json=json.dumps({"moved": 1}),
+                )
+                original_payload = self.row(token)["payload_json"]
+                previous = confirmations.NotificationEvent("确认完成", fields=(("STRM 状态", "等待"),))
+
+                def publish(*_args, **_kwargs):
+                    # 启用通知的默认调用仍必须先持久化回执，再投递。
+                    saved = json.loads(self.row(token)["result_json"])
+                    self.assertEqual(saved["_downstream"]["media_refresh"], "已完成")
+                    return True
+
+                with (patch("app.modules.telegram_notification_center.get_notification_thread_event", return_value=previous) as lookup,
+                      patch.object(confirmations, "publish_confirmation_event", side_effect=publish) as single,
+                      patch("app.modules.telegram_confirmation_batch.publish_batch_summary", side_effect=publish) as batch):
+                    self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
+                        token, chat_id="chat", strm_status="完成", media_refresh="刷新失败", partial=True,
+                        error="媒体库不可用", notify_enabled=False,
+                    ))
+                    lookup.assert_not_called()
+                    single.assert_not_called()
+                    batch.assert_not_called()
+                    row = self.row(token)
+                    self.assertEqual((row["status"], row["payload_json"]), ("completed", original_payload))
+                    saved = json.loads(row["result_json"])
+                    self.assertEqual(saved["moved"], 1)
+                    self.assertEqual(saved["_downstream"], {
+                        "strm": "完成", "media_refresh": "刷新失败", "partial": True, "error": "媒体库不可用",
+                    })
+                    self.assertTrue(confirmations.update_confirmation_lifecycle_downstream(
+                        token, chat_id="chat", strm_status="完成", media_refresh="已完成",
+                    ))
+                    self.assertEqual(self.row(token)["payload_json"], original_payload)
+                    if batch_id:
+                        batch.assert_called_once_with(batch_id, chat_id="chat")
+                        single.assert_not_called()
+                    else:
+                        single.assert_called_once()
+                        batch.assert_not_called()
+
     def test_silent_confirmation_keeps_handoff_and_faster_downstream_receipts(self):
         from app.clients.guangya import GuangYaFile
         from app.modules.scraper import MatchResult
