@@ -34,6 +34,7 @@ READY = {
     "/guangya/strm": "!document.getElementById('saveStrmBtn')?.disabled",
     "/guangya/offline": "!document.getElementById('saveOfflineBtn')?.disabled",
     "/settings": "document.getElementById('settingsForm')?.getAttribute('aria-busy') === 'false'",
+    "/rss": "typeof rssSubsLoaded !== 'undefined' && rssSubsLoaded === true",
 }
 
 
@@ -106,7 +107,7 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         page.set_default_timeout(5000)
         page.on("pageerror", lambda error: self.errors.append(str(error)))
         page.goto(ORIGIN + path)
-        page.wait_for_function(READY[path])
+        page.wait_for_function(READY[path.split("#")[0]])
         return page
 
     @staticmethod
@@ -193,6 +194,27 @@ class ConfigBackfillBrowserTests(unittest.TestCase):
         self.assertTrue(self._checked(settings, "AGENT_STREAM_DISPLAY_ENABLED"))
         self.assertFalse(self._checked(settings, "WEB_READ_ENABLED"))
         self.assertTrue(self._checked(settings, "WEB_SEARCH_ENABLED"))
+        self.assertEqual(self.config_posts, [])
+
+    def test_rss_inherited_guangya_directory_matches_offline_default(self):
+        # 与离线转存页一致：未保存或保存为 "0" 都显示未配置；已配置显示其名称。
+        for values, expected in (
+            ({}, ("继承全局目录", "未配置")),
+            ({"OFFLINE_TARGET_DIR": "1939382533671788571", "OFFLINE_TARGET_DIR_NAME": "离线"},
+             ("继承：离线", "离线转存默认目录")),
+            ({"OFFLINE_TARGET_DIR": "0"}, ("继承全局目录", "未配置")),
+        ):
+            with self.subTest(values=values):
+                if values:
+                    self._write(**values)
+                page = self._open("/rss#rss")
+                page.locator(".subscription-rss-create").first.click()
+                target = page.locator("#rssGyTargetValue")
+                target.wait_for(state="visible")
+                self.assertEqual(
+                    (target.locator("strong").inner_text(), target.locator("span").inner_text()), expected,
+                )
+                page.close()
         self.assertEqual(self.config_posts, [])
 
 

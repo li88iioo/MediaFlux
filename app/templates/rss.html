@@ -190,7 +190,7 @@
                 <span class="form-label" id="rssGyTargetLabel">光鸭目标目录</span>
                 <input type="hidden" id="f_gy_target">
                 <input type="hidden" id="f_gy_target_name">
-                <div class="rss-target-control"><div class="organize-target-value" id="rssGyTargetValue"><strong>继承全局目录</strong><span>未给该订阅指定独立目录</span></div><button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button></div>
+                <div class="rss-target-control"><div class="organize-target-value" id="rssGyTargetValue" data-inherited-name="{{ rss_inherited_dir_name }}"><strong>继承全局目录</strong><span>未配置</span></div><button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button></div>
             </div>
         </div>
         <div class="rss-modal-footer subscription-modal-footer">
@@ -319,7 +319,10 @@ function renderRssTarget(id,name){
     document.getElementById('f_gy_target_name').value=name||'';
     const box=document.getElementById('rssGyTargetValue');box.replaceChildren();
     const strong=document.createElement('strong');const span=document.createElement('span');
-    strong.textContent=name||'继承全局目录';span.textContent=id||'未给该订阅指定独立目录';box.append(strong,span);
+    const inherited=box.dataset.inheritedName||'';
+    strong.textContent=id?(name||id):(inherited?`继承：${inherited}`:'继承全局目录');
+    span.textContent=id?id:(inherited?'离线转存默认目录':'未配置');
+    box.append(strong,span);
 }
 
 function updateTargetRows(){
