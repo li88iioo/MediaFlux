@@ -17,6 +17,7 @@ from app import config
 from app import database as db
 from app.repositories import local_media as local_media_repo
 from app.clients.guangya import GuangYaFile
+from app.clients.qbittorrent import close_qbittorrent_client, is_qb_torrent_complete
 from app.logger import get_logger
 from app.modules.directory_media import (
     DirectoryInspection,
@@ -51,6 +52,7 @@ from app.modules.local_move_transaction import (
     MoveTransactionResult,
 )
 from app.modules.local_path_mapping import (
+    PathMapping,
     assert_within,
     require_container_absolute_path,
     is_windows_or_unc_path,
@@ -1875,6 +1877,49 @@ class LocalMediaService:
                     "该条目与未完成的本地媒体任务路径重叠，请先完成或清理相关任务"
                 )
 
+    @staticmethod
+    def _assert_no_downloading_qb_path(source, selected_path: Path) -> None:
+        """在 qB writer 内核对下载路径；目录自身快照不能证明子文件已停止写入。"""
+        if source.qb_profile and source.qb_profile not in {"qb", "configured:qb", "default"}:
+            return
+        from app.modules.qb_control import configured_qb_client
+
+        settings = config.get_many(("QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY"))
+        if not settings["QB_URL"].strip():
+            return
+        client = None
+        try:
+            client = configured_qb_client(settings)
+            tasks = client.list_torrents()
+            for task in tasks:
+                if is_qb_torrent_complete(task.state, task.progress):
+                    continue
+                # 与完成接管使用同一 PathMapping：显式前缀优先，空前缀允许
+                # 两端同路径或 task.save_path 到容器来源根的映射。
+                prefixes = ((source.qb_path_prefix,) if source.qb_path_prefix.strip()
+                            else (source.local_root, task.save_path))
+                raw_path = task.content_path.strip() or task.save_path.strip()
+                if not raw_path:
+                    raise LocalMediaServiceError("无法核验未完成的 qB 下载路径，已保留本地条目")
+                for prefix in prefixes:
+                    if not prefix:
+                        continue
+                    mapping = PathMapping(prefix, Path(source.local_root))
+                    if not mapping.matches(raw_path):
+                        continue
+                    download_path = mapping.local_root.joinpath(*mapping.relative_parts(raw_path))
+                    if local_media_paths_overlap(selected_path, download_path):
+                        raise LocalMediaServiceError(
+                            "该条目关联的 qB 下载尚未完成，下载完成或移除任务后再回收"
+                        )
+        except LocalMediaServiceError:
+            raise
+        except Exception as exc:
+            logger.warning("本地回收前核验 qB 下载失败 type=%s", type(exc).__name__)
+            raise LocalMediaServiceError("无法核验当前 qB 下载状态，已保留本地条目，请稍后重试") from exc
+        finally:
+            close_qbittorrent_client(client)
+
     @_local_media_operation
     def move_media_item_to_trash(
         self,
@@ -1893,7 +1938,9 @@ class LocalMediaService:
             if selected == root or selected.parent != root:
                 raise LocalMediaServiceError("仅允许删除来源根目录下的一级媒体条目")
             self._assert_no_active_task_path_overlap(owner, selected)
-            return move_candidate_to_trash(source, selected, expected_identity)
+            with qb_control_write_lease():
+                self._assert_no_downloading_qb_path(source, selected)
+                return move_candidate_to_trash(source, selected, expected_identity)
 
     @_local_media_operation
     def execute_task(self, owner: str, task_id: int, *, qb_client=None) -> dict[str, Any]:
