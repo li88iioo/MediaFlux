@@ -532,10 +532,13 @@ class LogsBatchCorrectionBrowserTests(LogsBrowserCase):
         self.page.locator("#organizeDetailModal").wait_for(state="visible")
         self.page.locator('#organizeDetailTitle').filter(has_text='#10').wait_for()
         self.assertEqual(self.page.locator('#organizeSafetyNotice button').inner_text(), '#11 · 已确认')
+        self.page.locator('.organize-detail-dialog').evaluate("""async node => {
+            await Promise.all(node.getAnimations().map(animation => animation.finished));
+        }""")
         # 状态文字曾以 flex:1 与按钮组平分底栏，把回收站挤到中间。
-        footer = self.page.locator('.organize-detail-footer').bounding_box()
-        delete = self.page.locator('#organizeDeleteBtn').bounding_box()
-        primary = self.page.locator('#organizeReorganizeBtn').bounding_box()
+        footer, delete, primary = self.page.evaluate("""() => [
+            '.organize-detail-footer', '#organizeDeleteBtn', '#organizeReorganizeBtn'
+        ].map(selector => document.querySelector(selector).getBoundingClientRect().toJSON())""")
         assert footer and delete and primary
         self.assertLessEqual(delete['x'] - footer['x'], 25)
         self.assertLessEqual(footer['x'] + footer['width'] - primary['x'] - primary['width'], 25)
