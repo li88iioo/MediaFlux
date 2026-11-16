@@ -1,6 +1,6 @@
 # Media Agent：工具与能力参考
 
-> 核对日期：2026-11-06。本文说明工作区 SDK 与会话控制方法；配置、权限和部署条件会影响实际可用能力。`mf --help` 查看分组，`mf <模块> --help` 查看方法，完整签名以 `mf <模块.方法> --help` 为准。
+> 核对日期：2026-11-17。本文说明工作区 SDK 与会话控制方法；配置、权限和部署条件会影响实际可用能力。`mf --help` 查看分组，`mf <模块> --help` 查看方法，完整签名以 `mf <模块.方法> --help` 为准。
 
 架构与操作流程见 [Agent 架构与使用实战](08_Agent架构与使用实战.md)。用户不必背工具名，直接描述目标；工具名主要供能力查询、排错和维护使用。
 
@@ -8,9 +8,9 @@
 
 - 普通生产模型只有 `agent.run_code`；业务与会话控制通过 Python/Shell 工作区中的 `mf` SDK 使用，Skills 按需读取。
 - 下表业务方法是工作区接口；完整签名以 `mf --help` 和 SDK methods 为准，不把内部执行目录作为模型工具集。
-- `LOW_WRITE` 进入确认执行器后仍按 WRITE 处理；已授予的范围授权按原范围、期限和次数生效。
+- 表中风险等级用于说明操作影响；SDK 方法类别唯一由 `sdk_method` 声明。`LOW_WRITE` 本身不免确认，已授予的范围授权按原范围、期限和次数生效。
 - `READ` 指不执行目标业务写入；仍可能发起外部请求、消耗搜索额度、写入会话引用或刷新缓存。它不等于完全离线、零成本。
-- `WRITE` / `DANGER` 表示普通聊天调用时先准备 EffectPlan，用户确认后才执行。带 `preview` 的只读工具只能冻结计划，不能替代执行确认。
+- `WRITE` / `DANGER` 默认先准备 EffectPlan，用户确认后才执行；`library.refresh` / `media.refresh` 明确免交互确认，仍经过冻结、执行与回执链路。只读预览不授权写入；是否可执行由对应方法的确认策略决定。
 - 各领域（包括光鸭）的可调用方法通过 `mf --help`、`mf <模块> --help` 和 SDK 方法文档发现；读取方法文档不会取得写入授权。
 - 参数、选择范围和当前条件以实际 SDK 签名、方法文档和确认卡为准。使用业务响应中的真实 ID 与版本；结果归档、卡片选择和补偿凭据各有专用语义，不是通用业务句柄，也不能绕过 owner 或快照校验。
 - 内部主动识别复核只使用专门的小型工具集，不等于后台自动取得下方全部权限。
@@ -34,6 +34,8 @@
 | `session.cancel_task(source)` | 取消持久验收跟踪；不取消确认卡、不停止后台业务、不撤销已执行操作。 |
 | `session.pending_plan(operation="inspect")` | `inspect/cancel` 查看或取消当前未执行确认卡；不接受模型指定 owner、plan_id 或确认指令。 |
 | `session.batch(steps)` | 将已声明可组合的写方法 `method/arguments` 冻结为一张确认卡，沿原逐项额度、快照和确认执行器；失败或 unknown 停止后项，不回滚或重放。 |
+| `skills.list()` / `skills.get(name)` | 读取当前身份的长期技能；正文按需获取，不改变业务权限。 |
+| `skills.save(...)` / `skills.restore(...)` | 保存或恢复身份隔离的技能版本；更新需提供版本号，属于工作区本地资料写入，不授予远端写权。 |
 
 `session.batch` 是业务确认写入口；任务方法仅更新会话验收状态。普通生产模型不再获得 `agent.task`。默认模型轮次与工具总次数均无额外次数上限，仍受 `SessionLimits` 的累计估算 Token、活跃时间、写调用限制及业务限流约束；具体预算见 [架构与使用实战](08_Agent架构与使用实战.md#32-一轮请求如何运行)。
 
@@ -53,12 +55,11 @@
 | `diagnostics.runtime()`（SDK） | READ | 只读返回 Media Agent 总开关、Telegram 接入和模型路由的当前启用状态，不返回令牌、密钥或供应商配置值。 |
 | `diagnostics.configuration()`（SDK） | READ | 完整读取媒体服务器、TMDB、下载器、STRM 与 AI 回退的配置事实、字段来源和全部问题；不返回配置键、值或凭据，不探测连通性。 |
 | `diagnostics.component(component)`（SDK） | READ | 读取一个白名单组件的完整状态、字段来源、缺项、校验错误、能力影响和安全下一步；功能开关共用公共功能配置服务。 |
-| `settings.features()`（SDK） | READ | 只读汇总媒体探索、资源检索与联网搜索的启用状态和依赖可用性，不返回配置值或供应商凭据。 |
+| `settings.features()`（SDK） | READ | 汇总白名单功能的配置状态、依赖可用性和环境托管标记；其中探索、豆瓣、站点资源为 Web 页面开关，不是 Agent 能力总开关。 |
 | `diagnostics.pipeline(limit=20, offset=0)`（SDK） | READ | 读取完整本地自动化汇总和 RSS 公共诊断，保留来源、错误及真实订阅 ID；RSS 关注项按 `limit`（1–100）与 `offset` 穷尽分页，部分来源失败仍保留其余事实。不访问外网或启动任务，不返回路径、配置值或凭据。 |
 | `recognition.rules(rule_type)`（SDK） | READ | 完整只读列出 `preprocess_rule/tmdb_regex_rule/release_format` 的真实 ID、启停状态和内容；格式包含 revision，类型间 ID 可重号，不初始化种子或使用临时编号。 |
 | `recognition.set_rule_enabled(rule_type, rule_id, enabled)`（SDK） | LOW_WRITE | 确认后单条启停三类规则，事务内复核业务行；格式仍走原 change 的 revision/注册表复验及启用回归检查。知识不在此接口，统一使用 `recognition.update_knowledge(entry_id, disabled=not enabled)`。不会改变内容、TMDB 或优先级，未知结果先回读，不重放旧卡或原脚本。 |
-| `resources.sources()`（SDK） | READ | 读取当前固定白名单资源站点的选择，仅返回站点 ID、展示名和数量。 |
-| `resources.configure_sites(site_ids, enable_search=None)`（SDK） | WRITE | 预检并在用户确认后更新固定白名单资源站点，不接受配置键、URL、凭据、Cookie 或路径。 |
+| `resources.configure_sites(site_ids, enable_search=None)`（SDK） | WRITE | 确认后保存 Web / TG / 订阅使用的手动站点选择；`enable_search` 控制 Web 资源展示，省略保留。Sukebei 需明确授权；不接受配置键、URL 或凭据。 |
 | `settings.test_notification` | WRITE | 预检并在用户确认后向当前已配置会话发送一条固定 Telegram 连接测试消息；不接受消息、凭据或会话参数。 |
 | `settings.policies` | READ | 读取 Agent 可安全管理的固定白名单策略，只返回公开值和环境托管状态。 |
 | `settings.set_policy` | WRITE | 预检并在用户确认后修改一项固定白名单非敏感策略，不接受任意配置键、凭据、URL 或路径。 |
@@ -84,6 +85,10 @@
 | `activity.follow(kind, identifier, hours=24)` | SDK确认写 | 按activity.search/timeline的持久kind/id持续跟踪任务，异常、已有阶段结束或到期时发送一次 Telegram 通知；只观察、不替任务重试。 |
 | `activity.follows()` | SDK只读 | 查看我持久保存的任务跟踪规则及启用状态和到期时间。 |
 | `activity.unfollow(rule_id)` | SDK确认写 | 停用我的活动跟踪通知，不停止或删除下载/整理任务。 |
+| `activity.organize_confirmations(...)` | READ | 按批次、任务或真实 `confirmation_ids` 查询光鸭待确认组、各组候选和建议；`status="all"` 可续查已受理项的执行结果。 |
+| `activity.review_organize_confirmations(confirmation_ids)` | 控制 | 将选定组排队做只读复核，需启用复核并配置模型；仅保存建议，不确认候选或修改文件。 |
+| `activity.confirm_organize(entries)` | WRITE | 按每组真实 `confirmation_id` 和该组 `candidate_index` 准备确认卡；确认后复验并逐项入队，受理不等于归档完成。 |
+| `activity.organize_detail(log_id)` / `activity.reorganize(...)` | READ / WRITE | 读取真实日志的身份、文件与可用动作；纠正身份或季集需确认，复用 Web 日志整理链路，不先改文件名，也不自动学习为人工纠正。 |
 
 ### 2.4 媒体库、缺集与批量核对
 
@@ -164,7 +169,7 @@
 
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
-| `resources.sources()`（SDK） | READ | 只读检查多站资源索引器的本地开关、启用站点与能力声明；不访问资源站、网络或文件系统，也不返回 URL、Cookie 或凭据。 |
+| `resources.sources()`（SDK） | READ | 读取 Agent 范围的站点就绪声明及 `configuration` 手动站点配置，不探测网络。Agent 使用全部公共站点，Sukebei 需授权；`ready` 不代表站点连通。 |
 | `resources.search(...)`（SDK） | READ | 使用共用索引服务检索资源；完整结果可在工作区过滤、保存，返回实际参与站点、部分失败与截取范围。 |
 | `resources.present(result_ids, ...)`（SDK） | READ | 只展示当前会话最近一次实际搜索批中的 0–50 个真实 ID，沿用查询规格和缺集复核目标；空列表明确撤卡。复用 Web/TG 批选与回复绑定，不下载、不新建确认。 |
 | `cloud.inspect_share(url)`（SDK） | READ | 完整读取分享顶层文件列表，返回真实文件 ID、数量与覆盖范围；分页无法完成时明确失败，不截取前 200 项冒充完整。 |
@@ -287,10 +292,11 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | 工具 | Kernel 风险 | 用途 |
 |---|---|---|
 | `cloud.account()`（工作区 SDK） | READ | 读取当前光鸭账号连接状态与容量摘要；返回总量、已用、可用字节及部分成功状态。 |
-| `guangya.recycle.list` | READ | 分页读取光鸭回收站，返回名称、类型、体积和会话绑定的 guangya_recycle_items_ref；不返回 Provider 文件 ID。 |
-| `guangya.recycle.restore` | WRITE | 对 guangya.recycle.list 返回的回收站引用按 index 冻结恢复计划。 |
-| `guangya.recycle.clear` | DANGER | 完整读取并冻结当前光鸭回收站后生成不可逆清空计划。 |
-| `guangya.operation.status` | READ | 使用回收站恢复、清空或其他 SDK 异步操作返回的 guangya_task_ref 查询 Provider 状态。 |
+| `cloud.recycle(max_items=20000)` | READ | 完整读取回收站，保留真实 `file_id/parent_id`；超出读取预算或翻页失败会报错，不截取一页冒充全量。 |
+| `cloud.restore(file_ids)` | WRITE | 对回收站中最多 200 个真实文件 ID 冻结恢复计划，确认后执行。 |
+| `cloud.clear_recycle()` | DANGER | 冻结全量集合后确认永久清空整个账号回收站；执行期间新进入回收站的对象也可能被删除。 |
+| `cloud.task(task_id)` | READ | 用恢复、清空或其他云盘异步操作返回的真实 `task_id` 查询 Provider 回执。 |
+| `cloud.operation(operation_ref)` | READ | 查询 `cloud.change` 等操作返回的 `GY-` 编号，跟踪当前用户的持久任务及逐项结果；与 Provider `task_id` 分开使用。 |
 | `cloud.shares()`（SDK） | READ | 完整读取当前账号自建分享；返回真实管理 `share_id`，不返回访问码。分页失败或超预算显式报错。 |
 | `cloud.share(file_ids, ...)`（SDK） | WRITE | 按 1–100 个真实 `file_id` 冻结对象、凭据与分享策略，确认后创建；链接和访问码只返回当前用户。 |
 | `cloud.revoke_share(share_ids)`（SDK） | WRITE | 按列表返回的真实管理 `share_id` 冻结撤销计划；确认后只撤销分享链接，不改动原文件。受理仍待验证，结果未知时先查询，不重复提交。 |
@@ -396,7 +402,7 @@ Shell 同样使用 `mf playback.instances`、`mf playback.failures --instance-id
 |---|---|---|
 | `library.counts(server="all", library_id="")` | SDK READ | 实时全库或指定库统计；指定真实库 ID 时必须明确 Jellyfin/Emby。保留已知计数和失败来源，未知不冒充零，多服务器记录不按作品去重。 |
 | `library.search(query, server="all", offset=0)` | READ | 使用媒体服务器原生搜索查询电影、剧集或单集，并返回可用的已校验 open_url。 |
-| `library.search(query, media_type="series")` | READ | 在媒体服务器中搜索剧集候选，并返回 TMDB 映射、对象引用和可用的已校验 open_url。 |
+| `library.search(query, media_type="series")` | READ | 在媒体服务器中搜索剧集候选，并返回 TMDB 映射、真实媒体 ID 和可用的已校验 open_url。 |
 | `library.episodes(series_id="…", server="jellyfin")` | READ | 读取先前选中剧集的本地季集位置，用于集数和缺集核验。 |
 | `media.refresh(item_id="…", server="jellyfin")` | LOW_WRITE | 用户明确要求后直接刷新已核实的单个媒体条目，不弹确认卡、不扩大为全库；支持 scan、missing、replace，默认保留图片与预览图。 |
 
@@ -465,7 +471,7 @@ SDK预览不保存目录TTL、序号或OBS/OBJ句柄。普通操作直接使用�
 
 ## 5. 维护这份清单
 
-1. 公开方法以 [`app/sdk.py`](../../app/sdk.py) 的 `METHODS`、真实签名与 `describe_methods()` 为准；普通模型入口以 [`kernel/bootstrap.py`](../../app/agent/kernel/bootstrap.py) 的显式集合为准，不按内部注册数量推断模型工具数量。
+1. 公开方法以 [`app/sdk.py`](../../app/sdk.py) 的真实签名与 `describe_methods()` 为准；`sdk_method` 是方法分类的唯一来源，`METHODS` / `WRITE_METHODS` 由公开命名空间自动收集。普通模型入口以 [`kernel/bootstrap.py`](../../app/agent/kernel/bootstrap.py) 的显式集合为准，不按内部注册数量推断模型工具数量。
 2. 业务写入同时核对 `WRITE_METHODS`、`build_tool_catalog()` 及 [`kernel/ports/sdk_effects.py`](../../app/agent/kernel/ports/sdk_effects.py) 的执行合同；媒体刷新明确声明无需交互确认，仍沿原执行器留存回执。其他操作不因 `LOW_WRITE` 自动取消确认；[`kernel/batch_effects.py`](../../app/agent/kernel/batch_effects.py) 负责组合确认。
 3. `session.*` 的宿主状态方法沿 [`kernel/session_service.py`](../../app/agent/kernel/session_service.py)，不把内部业务函数重复计为模型工具；SDK 业务对象必须沿真实 ID 和版本核验。
 4. 功能新增/退役时同步更新名称、用途、配置条件和本文核对日期；真实 SDK 签名、方法语义和确认卡优先，不恢复动态业务窗口或旧工具目录。

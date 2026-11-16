@@ -95,6 +95,8 @@ plugins/MediaFlux.Jellyfin/artifacts/MediaFlux.Jellyfin-0.1.4.0.zip.sha256
 
 `local` 是 **MF 容器内**路径，`server` 是 **当前 Jellyfin 实例可见**路径，不是 NAS 主机路径或 SMB URL。需要调整时，在 MediaFlux 配置 Jellyfin 路径映射，再回插件同步，不在插件中维护第二份映射。
 
+对应入口是侧栏“媒体库”（`/media-libraries`）中的“媒体库与路径映射”。媒体反代实例 ⋯ 菜单中的“手动播放映射”只绑定播放项目与光鸭文件，不能代替这里的本地/服务器路径映射，也不扩大删除范围。
+
 映射按完整路径片段、最长前缀匹配；同一 Jellyfin 前缀对应多个 MF 目录会被拒绝。映射后的文件仍需通过 MF 索引及两端内容指纹校验，不能只凭同名文件删除。缺少索引时先执行 MF STRM 同步，不要手工伪造索引。
 
 ## 失败、恢复与卸载

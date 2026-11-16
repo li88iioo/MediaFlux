@@ -1,6 +1,6 @@
 # Media Agent：架构、配置与使用实战
 
-> 核对日期：2026-11-06。本文描述当前源码的实现；实际部署能力取决于镜像版本。完整 SDK 方法、风险等级和操作边界见 [Agent 工具与能力参考](09_Agent工具与能力参考.md)。
+> 核对日期：2026-11-17。本文描述当前源码的实现；实际部署能力取决于镜像版本。完整 SDK 方法、风险等级和操作边界见 [Agent 工具与能力参考](09_Agent工具与能力参考.md)。
 >
 > **工具已注册 ≠ 外部服务已配置 ≠ 本次请求一定成功。** 模型负责理解和选择，真实结果由领域服务提供；写入受后端确认机制约束。
 
@@ -20,7 +20,7 @@ Media Agent 是现有媒体业务的自然语言入口，不是第二套下载�
 
 模型可以在会话工作区运行普通 Python 或 Shell（`agent.run_code`），使用标准库、子进程和文件完成分页、筛选、统计。`/work` 的资料跨调用保留；超出展示长度的 stdout/stderr 保存为文件，可以继续读取。脚本失败会返回实际退出码和错误，模型可直接修正重试。
 
-业务调用使用 `from mf import watchlist, library, media, resources` 或 `mf --help`，直接复用 MediaFlux 服务。脚本可查询媒体、完整排期、资源、云盘和运行活动，也可调用收藏修改、批量下载与云盘文件变更；远端写入经过同一套预检和确认。脚本遇到确认卡时结束，确认后只执行卡中的操作，不重放脚本。
+业务调用使用 `from mf import watchlist, library, media, resources` 或 `mf --help`，直接复用 MediaFlux 服务。脚本可查询媒体、完整排期、资源、云盘和运行活动，也可调用收藏修改、批量下载与云盘文件变更；业务写入经过同一套预检、冻结与回执链路，按方法声明决定是否交互确认。脚本遇到确认卡时结束，确认后只执行卡中的操作，不重放脚本。
 
 `/skills` 提供内置流程文档。当前任务资料保存到 `/work`；已验证、可复用的方法使用 `mf.skills.save` 保存，下一会话可通过 `list/get` 查阅，`restore` 可恢复历史版本。更新时传入读取的 `revision`，避免覆盖并发修改。普通会话重置会清理工作文件但保留长期技能；技能按身份隔离，正文按需读取。主机凭据和正式媒体目录不会挂进工作区，工作区也没有任意网络访问权。
 
@@ -36,7 +36,7 @@ Media Agent 是现有媒体业务的自然语言入口，不是第二套下载�
 
 在「设置 → Media Agent」中：
 
-1. 开启 Media Agent 和 Agent 模型。
+1. 开启 Media Agent 总开关。
 2. 填写 API Base URL、模型名称及服务要求的 API Key。
 3. 选择接口协议；不确定时先使用自动模式，再用页面的连接测试核对工具调用、流式输出等能力。
 4. 按模型实际支持的容量填写上下文窗口，保存后再发起新对话。
@@ -44,7 +44,7 @@ Media Agent 是现有媒体业务的自然语言入口，不是第二套下载�
 
 | 配置项 | 作用 |
 |---|---|
-| `AGENT_LLM_ENABLED` | Media Agent 总开关；历史 `AGENT_ENABLED` 已退役 |
+| `AGENT_LLM_ENABLED` | Media Agent 总开关，默认关闭；AI 回退、主动复核、TG 和后台巡检还需各自启用。关闭父级保留子项配置，但子功能不生效；历史 `AGENT_ENABLED` 已退役 |
 | `AGENT_LLM_API_URL` / `AGENT_LLM_API_KEY` / `AGENT_LLM_MODEL` | 模型服务与凭据；不要把 Key 粘贴到聊天中 |
 | `AGENT_LLM_PROTOCOL` | `auto`、`responses`、`chat_completions` 或 `anthropic_messages` |
 | `AGENT_LLM_CONTEXT_WINDOW_TOKENS` | 默认 `128000`，可配置范围 `16384`–`2000000`；不是要求模型输出这么多 Token |
@@ -89,7 +89,7 @@ AgentSession ───────── SessionState / ReferenceStore
     └─ ToolPipeline
            校验 → 解析引用 → 授权 → 限流 → 风险分类
            ├─ READ：调用 Domain Port → 现有业务 service/action
-           └─ WRITE / DANGER：预检 → 冻结 EffectPlan → 暂停等待确认
+           └─ WRITE / DANGER：预检 → 冻结 EffectPlan → 按声明确认或执行
                      │
                      ▼
                Projection + AgentEvent
@@ -118,7 +118,7 @@ MODEL → TOOL → MODEL → TOOL → … → FINAL
 ```
 
 - bootstrap 只向普通生产模型提供 `agent.run_code`；会话控制通过工作区 `session.*` SDK 使用，不发送业务写入 Schema 或完整能力索引。
-- 业务能力通过工作区 `mf --help`、SDK methods 和按需读取的 Skills 查找，工具未出现在模型首轮不表示 SDK 没有该能力。所有 SDK 写入仍由原 EffectExecutor 预检、冻结和确认。
+- 业务能力通过工作区 `mf --help`、SDK methods 和按需读取的 Skills 查找，工具未出现在模型首轮不表示 SDK 没有该能力。业务写入仍由原 EffectExecutor 预检、冻结并按声明确认。
 - 自定义小目录和专用 research 工具集按显式配置保留原功能；宿主固定的只读接力不扩展模型工具集。
 - `SessionLimits` 的模型轮次与工具总次数默认均为 `None`；**32轮不是默认硬上限**。显式限制可设1–32轮、1–128次工具调用，写调用限制字段默认16；默认还受累计估算 **1,000,000 Token**、**900活跃秒**及业务限流约束。模型请求按上下文估算加输出额度预留扣减，失败和取消不退还，不等于实际账单。
 - `agent.run_code` 提供真实隔离 Python/Shell 工作区，可 import SDK、保存完整结果并跨轮读取。业务读取沿原生 RPC，确认参数与持久状态由宿主保存；进程退出不等于业务写入完成。
@@ -156,7 +156,9 @@ MODEL → TOOL → MODEL → TOOL → … → FINAL
   → 写后校验、记录结果与后续复核
 ```
 
-**确认只授权当前冻结计划，执行参数不由模型追加或改写；完成后 Agent 会沿原任务继续。** 可跟踪后台任务会持续显示排队/运行状态，不能把“已启动”当成完成。后续写操作默认需要再次确认；停止后续对话不撤销已完成的操作。`LOW_WRITE` 标签本身不免确认，只有下述显式、限定范围的收藏预授权可自动执行。
+**确认只授权当前冻结计划，执行参数不由模型追加或改写；完成后 Agent 会沿原任务继续。** 可跟踪后台任务会持续显示排队/运行状态，不能把“已启动”当成完成。后续写操作默认需要再次确认；`LOW_WRITE` 标签本身不免确认。显式例外包括用户要求的 `library.refresh` / `media.refresh`，以及下述限定范围的收藏预授权；免确认仍保留冻结与执行回执。
+
+写前会重新校验身份、配置与 Agent 运行状态；关闭总开关会阻止新的受控写入。已提交到下载器或整理队列的业务任务需按原任务方式停止，取消聊天不会撤销已发生的操作。
 
 | 显示状态 | 应如何理解 |
 |---|---|
@@ -174,7 +176,7 @@ MODEL → TOOL → MODEL → TOOL → … → FINAL
 - 文件变更计划支持改名、移动、复制、移动并改名、批量规范命名、新建目录及 `trash`。
 - 通用 `trash` 的意图是**移入回收站**，不等于永久删除任意对象。
 - 恢复回收站、创建/撤销分享也要冻结预览并确认；登录凭据世代变化会使写入失效。
-- `guangya.recycle.clear` 是**整个账号回收站的永久清空**，不支持仅清空当前列表页或选中项。请先暂停其他删除操作；Provider 执行期间新进入回收站的对象也可能受到影响。
+- `cloud.clear_recycle()` 是**整个账号回收站的永久清空**，不支持仅清空当前列表页或选中项。请先暂停其他删除操作；Provider 执行期间新进入回收站的对象也可能受到影响。
 - 大目录复制可能是异步过程，短时可见性校验不等于完整子树或长期任务已全部验证。未完成的核验会影响最终状态，不应仅凭目标同名目录判断内容齐全。
 - 本地文件上传仍**不向 Agent 开放**。SDK 有上传方法，不代表模型有上传工具。
 
@@ -234,20 +236,22 @@ Web 与 Telegram 分别管理自己的会话历史与确认计划。TG 私聊话
 
 更新核对中的“最新本地季集”不等于“已收录多少集”；缺洞、跨季与特别篇不能直接用总数量换算。`library.updates`（SDK） 对照的是 Jellyfin / Emby 当前库存与 TMDB 已播记录，结果带检查时间；它不表示已检索资源站，更不证明“全网没有新资源”。需要可下载版本时，继续使用现有资源检索，并保留失败站点和季集映射不明确的状态。
 
-## 7. 主动识别复核：不是放开所有自动写入
+## 7. 主动识别复核与批次审阅
 
-普通聊天是“用户提出需求 → 模型规划 → 人工确认”。整理识别的主动复核则是**预先授予特定业务范围权限**后，由后台候选触发：
+普通聊天中的写入按第 4 节执行。整理识别的主动复核需**预先授予特定业务范围权限**，由后台候选触发：
 
 ```text
 整理器生成待确认案例
   → 检查 Agent / 模型 / 主动复核授权
   → 创建短生命周期 AgentSession
   → 只读核对案例、候选与季集，提出结构化决定
-  → 确定性校验、授权复核、竞争一次性执行权
-  → 原有整理执行器处理，记录确认执行者与结果
+  → 单组：确定性校验、授权复核、竞争一次性执行权
+  → 同次光鸭整理的多组：只保存建议，等待人工批次/逐组确认
+  → 原有整理执行器处理已确认项，记录执行者与结果
 ```
 
-- 内部会话复用同一 `AgentSession` 实现，只配备 `recognition.inspect_case`、`recognition.inspect_candidate`、`recognition.inspect_season`、`recognition.propose_review_decision` 四个私有 READ 工具，不继承聊天 Agent 的全部目录。
+- 内部会话复用同一 `AgentSession` 实现，只配备 `recognition.inspect_case`、`recognition.inspect_candidate`、`recognition.inspect_season`、`recognition.propose_review_decision` 四个专用 READ 工具。它们仅供内部复核会话使用，不是公开 `mf.recognition` SDK 方法；最后一个工具只记录建议。
+- 多组建议可在 Web 待确认队列、TG 批次摘要或经 SDK 确认卡审阅；只读复核不移动或改名文件。关闭 Agent / TG 后仍可在网页人工处理，入队后的状态与执行结果需另行查询。
 - 不保存为普通聊天历史；保留必要的**结构化审计**，并不是“用完后所有记录都删除”。
 - 不满足条件、候选不确定或快照失效时保留人工处理路径；模型不能凭一句“确认”越过执行边界。
 - 人工与自动处理竞争同一个持久确认执行权，不能各执行一次。
@@ -300,7 +304,7 @@ python tools/agent_doctor.py --json
 | [`kernel/session_service.py`](../../app/agent/kernel/session_service.py) | 宿主绑定的结果归档、确认卡控制与可选持久验收任务 |
 | [`agent_api.py`](../../app/routes/agent_api.py)、[`agent_adapter.py`](../../app/bot/agent_adapter.py) | Web 与 Telegram 入口和展示 |
 
-新增能力先复用公共服务，在 `app/sdk.py` 声明真实签名并加入 `METHODS`；业务写入再加入 `WRITE_METHODS` 和 bootstrap 的内部执行目录，沿原 EffectExecutor 冻结与确认。不要向普通生产模型添加业务工具 Schema、自然语言正则路由、专用第二循环或绕过确认的 HTTP 接口。
+新增能力先复用公共服务，在 `app/sdk.py` 以 `sdk_method` 声明真实签名与行为类别；公开命名空间自动生成 `METHODS` / `WRITE_METHODS`。业务写入还需在 bootstrap 的内部执行目录注册，沿原 EffectExecutor 冻结、按声明确认并保存回执。不要向普通生产模型添加业务工具 Schema、自然语言正则路由、专用第二循环或绕过执行门禁的 HTTP 接口。
 
 当前 Web 入口主要包括：
 
