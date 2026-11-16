@@ -96,6 +96,7 @@ def _view(row) -> dict:
         "selected_index": row["selected_index"], "error": redact_sensitive_text(row["error"] or ""),
         "execution": _execution_view(result), "completed_at": row["completed_at"],
         "downstream": result.get("_downstream") or {},
+        "downstream_run_id": result.get("_downstream_run_id") or 0,
     }
 
 

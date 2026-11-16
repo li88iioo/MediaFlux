@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from collections import Counter
 from hmac import compare_digest
@@ -52,7 +53,7 @@ def _downstream_counts(items: list[dict]) -> dict[str, int]:
             if any(any(word in state for word in ("失败", "异常", "failed", "error")) for state in states):
                 counts["partial"] += 1
             elif states[0] in {"完成", "已完成", "success", "completed"} and all(
-                re.search(r"(?:^|\s)(?:已排队|queued|(?:已)?完成|成功|已跳过|未启用(?:或无目标)?|无目标|skipped|disabled|success|completed)$", part.strip())
+                re.search(r"(?:^|\s)(?:已排队|queued|已刷新|(?:已)?完成|成功|已跳过|未启用(?:或无目标)?|无目标|skipped|disabled|success|completed)$", part.strip())
                 for part in states[1].split("/")
             ) and ("已排队" in states[1] or "queued" in states[1]):
                 # 队列接管是持久回执，不是缺回执；也不能据此声称媒体库扫描完成。
@@ -62,7 +63,7 @@ def _downstream_counts(items: list[dict]) -> dict[str, int]:
             )) for state in states):
                 counts["waiting"] += 1
             elif all(any(word in state for word in (
-                "完成", "成功", "跳过", "未启用", "未触发", "无变更", "关闭",
+                "完成", "成功", "已刷新", "跳过", "未启用", "未触发", "无变更", "关闭",
                 "completed", "success", "skipped", "disabled", "not_required",
             )) for state in states):
                 counts["completed"] += 1
@@ -152,6 +153,7 @@ def _button(label: str, token: str, action: str, value: object) -> NotificationA
 def _batch_event(
     batch_id: str, items: list[dict], *, chat_id: str, page: int, detail_token: str,
     truncated: bool = False,
+    downstream_digest: str,
 ) -> NotificationEvent:
     pages = max(1, (len(items) + _PAGE_SIZE - 1) // _PAGE_SIZE)
     page = max(1, min(page, pages))
@@ -164,6 +166,7 @@ def _batch_event(
     metadata: dict = {
         "batch_id": batch_id, "page": page, "detail_token": detail_token,
         "progress": dict(counts), "downstream": downstream_counts, "truncated": truncated,
+        "downstream_digest": downstream_digest,
     }
     detail = next((item for item in items if item["confirmation_id"] == detail_token), None) if not settled else None
     lines: list[str] = []
@@ -312,37 +315,46 @@ def _publish_batch_view(
     target = notification_target_chat_id(chat_id)
     if not target:
         return False
-    snapshot = get_notification_thread_snapshot(
-        _thread_key(batch_id), topic=NotificationTopic.CONFIRMATION, chat_id=target,
-    )
-    previous = snapshot.event.lifecycle.get("confirmation_batch", {}) if snapshot else {}
-    result = _batch_items(batch_id, target)
-    items = result["items"]
-    truncated = bool(result.get("selection_truncated") or result["total"] > len(items))
-    if not items:
-        return False
-    # 只读复核逐组落盘时先保留已展示的冻结按钮，最后一组完成再统一更新。
-    # 手动刷新与执行状态回执始终走 outbox；重启后仍可从持久状态重建。
-    if (not deliver_now and expected_confirmation_delivery is None and expected_revision is None
-            and snapshot and not previous.get("detail_token")
-            and previous.get("progress") == dict(Counter(item["status"] for item in items))
-            and previous.get("downstream") == _downstream_counts(items)
-            and previous.get("truncated") == truncated
-            and any(item.get("status") == "pending" and item.get("review_status") in {"waiting", "pending", "running"} for item in items)):
-        return True
-    event = _batch_event(
-        batch_id, items, chat_id=target,
-        page=page if page is not None else int(previous.get("page") or 1),
-        detail_token=detail_token if detail_token is not None else str(previous.get("detail_token") or ""),
-        truncated=truncated,
-    )
-    return bool(publish_notification_thread(
-        _thread_key(batch_id), event, topic=NotificationTopic.CONFIRMATION,
-        importance=NotificationImportance.ERROR if _downstream_counts(items)["partial"] else NotificationImportance.ACTION if any(item.get("status") == "pending" for item in items) else NotificationImportance.RESULT,
-        chat_id=target, preferred_message_id=message_id or 0, deliver_now=deliver_now,
-        expected_confirmation_delivery=expected_confirmation_delivery,
-        expected_revision=expected_revision if expected_revision is not None else snapshot.revision if snapshot else 0,
-    ))
+    for _ in range(3):
+        snapshot = get_notification_thread_snapshot(
+            _thread_key(batch_id), topic=NotificationTopic.CONFIRMATION, chat_id=target,
+        )
+        previous = snapshot.event.lifecycle.get("confirmation_batch", {}) if snapshot else {}
+        result = _batch_items(batch_id, target)
+        items = result["items"]
+        truncated = bool(result.get("selection_truncated") or result["total"] > len(items))
+        if not items:
+            return False
+        downstream_digest = hashlib.sha256(json.dumps([
+            (item["confirmation_id"], item.get("downstream_run_id", 0), item.get("downstream") or {})
+            for item in items
+        ], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        # 只读复核逐组落盘时先保留已展示的冻结按钮，最后一组完成再统一更新。
+        # 手动刷新与执行状态回执始终走 outbox；重启后仍可从持久状态重建。
+        if (not deliver_now and expected_confirmation_delivery is None and expected_revision is None
+                and snapshot and not previous.get("detail_token")
+                and previous.get("progress") == dict(Counter(item["status"] for item in items))
+                and previous.get("downstream") == _downstream_counts(items)
+                and previous.get("downstream_digest") == downstream_digest
+                and previous.get("truncated") == truncated
+                and any(item.get("status") == "pending" and item.get("review_status") in {"waiting", "pending", "running"} for item in items)):
+            return True
+        event = _batch_event(
+            batch_id, items, chat_id=target,
+            page=page if page is not None else int(previous.get("page") or 1),
+            detail_token=detail_token if detail_token is not None else str(previous.get("detail_token") or ""),
+            truncated=truncated, downstream_digest=downstream_digest,
+        )
+        published = publish_notification_thread(
+            _thread_key(batch_id), event, topic=NotificationTopic.CONFIRMATION,
+            importance=NotificationImportance.ERROR if _downstream_counts(items)["partial"] else NotificationImportance.ACTION if any(item.get("status") == "pending" for item in items) else NotificationImportance.RESULT,
+            chat_id=target, preferred_message_id=message_id or 0, deliver_now=deliver_now,
+            expected_confirmation_delivery=expected_confirmation_delivery,
+            expected_revision=expected_revision if expected_revision is not None else snapshot.revision if snapshot else 0,
+        )
+        if published or expected_revision is not None or published.status != "invalid":
+            return bool(published)
+    return False
 
 
 def publish_batch_summary(

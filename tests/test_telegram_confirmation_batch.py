@@ -504,6 +504,112 @@ class TelegramConfirmationBatchTests(IsolatedDatabaseTestCase):
         revision = self._snapshot().revision
         self.assertTrue(batch.publish_batch_summary(self.batch_id, chat_id="100"))
         self.assertEqual(self._snapshot().revision, revision)
+        for token in tokens:
+            confirmations.update_confirmation_lifecycle_downstream(
+                token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已刷新 / Emby 已跳过",
+            )
+        finished = self._snapshot().event
+        self.assertIn(("后续处理", "已完成 3"), finished.fields)
+        self.assertEqual(finished.actions, ())
+
+    def test_new_run_with_same_summary_rejects_inflight_old_receipt(self):
+        tokens = self._create(2)
+        for token, run_id in zip(tokens, (1, 999)):
+            organize_confirmations_repo.update_organize_confirmation(token, status="completed")
+            confirmations.update_confirmation_lifecycle_downstream(
+                token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已排队", strm_run_id=run_id,
+            )
+        baseline = self._snapshot()
+        read_items = batch._batch_items
+        interleaved = False
+        new_snapshot = None
+
+        def read_old_then_publish_new(*args, **kwargs):
+            nonlocal interleaved, new_snapshot
+            result = read_items(*args, **kwargs)
+            if not interleaved:
+                interleaved = True
+                self.assertTrue(confirmations.update_confirmation_lifecycle_downstream(
+                    tokens[0], chat_id="100", strm_status="完成", media_refresh="Jellyfin 已排队", strm_run_id=2,
+                ))
+                new_snapshot = self._snapshot()
+            return result
+
+        with patch.object(batch, "_batch_items", side_effect=read_old_then_publish_new):
+            self.assertTrue(confirmations.update_confirmation_lifecycle_downstream(
+                tokens[0], chat_id="100", strm_status="完成", media_refresh="旧运行失败",
+                partial=True, error="旧运行失败", strm_run_id=1,
+            ))
+        assert new_snapshot is not None
+        self.assertEqual(new_snapshot.event.fields, baseline.event.fields)
+        self.assertGreater(new_snapshot.revision, baseline.revision)
+        self.assertEqual(self._snapshot(), new_snapshot)
+        item = service.list_confirmations(batch_id=self.batch_id, status="all")["items"]
+        self.assertEqual(sorted(i["downstream_run_id"] for i in item), [2, 999])
+
+    def test_single_receipt_recovery_removes_only_its_own_refresh_warning(self):
+        for index, original_title in enumerate(("整理完成", "⚠️ 整理部分完成")):
+            with self.subTest(original_title=original_title):
+                group = self._group(index)
+                group.pop("_confirmation_batch")
+                token = confirmations.create_confirmation_actions(group, self.rules, chat_id="100")[0].callback_data.split(":")[1]
+                organize_confirmations_repo.update_organize_confirmation(token, status="completed")
+                self.assertTrue(confirmations.publish_confirmation_event(
+                    NotificationEvent(original_title, footer="原整理说明"), token=token, chat_id="100", deliver_now=False,
+                ))
+                confirmations.update_confirmation_lifecycle_downstream(
+                    token, chat_id="100", strm_status="完成", media_refresh="刷新失败",
+                    partial=True, error="旧刷新错误", strm_run_id=1,
+                )
+                confirmations.update_confirmation_lifecycle_downstream(
+                    token, chat_id="100", strm_status="完成", media_refresh="Jellyfin 已刷新", strm_run_id=2,
+                )
+                current = notifications.get_notification_thread_snapshot(
+                    f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+                )
+                assert current is not None
+                self.assertEqual((current.event.title, current.event.footer), (original_title, "原整理说明"))
+
+    def test_single_receipt_cas_rechecks_authoritative_run_after_publish_conflict(self):
+        for index, refresh in enumerate(("Jellyfin 已排队", "Jellyfin 已刷新")):
+            with self.subTest(refresh=refresh):
+                group = self._group(index)
+                group.pop("_confirmation_batch")
+                token = confirmations.create_confirmation_actions(group, self.rules, chat_id="100")[0].callback_data.split(":")[1]
+                organize_confirmations_repo.update_organize_confirmation(token, status="completed")
+                self.assertTrue(confirmations.publish_confirmation_event(
+                    NotificationEvent("整理完成", fields=(("STRM 状态", "等待"),)),
+                    token=token, chat_id="100", deliver_now=False,
+                ))
+                confirmations.update_confirmation_lifecycle_downstream(
+                    token, chat_id="100", strm_status="完成", media_refresh=refresh, strm_run_id=1,
+                )
+                publish = confirmations.publish_confirmation_event
+                interleaved = False
+                newer = None
+
+                def publish_old_after_new(event, **kwargs):
+                    nonlocal interleaved, newer
+                    if not interleaved:
+                        interleaved = True
+                        self.assertTrue(confirmations.update_confirmation_lifecycle_downstream(
+                            token, chat_id="100", strm_status="完成", media_refresh=refresh, strm_run_id=2,
+                        ))
+                        newer = notifications.get_notification_thread_snapshot(
+                            f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+                        )
+                    return publish(event, **kwargs)
+
+                with patch.object(confirmations, "publish_confirmation_event", side_effect=publish_old_after_new):
+                    self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
+                        token, chat_id="100", strm_status="完成", media_refresh="旧运行失败",
+                        partial=True, error="旧运行失败", strm_run_id=1,
+                    ))
+                assert newer is not None
+                self.assertEqual(notifications.get_notification_thread_snapshot(
+                    f"confirmation:{token}", topic=NotificationTopic.CONFIRMATION, chat_id="100",
+                ), newer)
+                self.assertEqual(newer.event.lifecycle["confirmation_downstream"]["run_id"], 2)
 
     def test_only_actionable_groups_keep_details_and_unsettled_strm_keeps_refresh(self):
         tokens = self._create(3)

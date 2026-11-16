@@ -286,7 +286,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
                     self.assertEqual(saved["_downstream"]["media_refresh"], "已完成")
                     return True
 
-                with (patch("app.modules.telegram_notification_center.get_notification_thread_event", return_value=previous) as lookup,
+                with (patch("app.modules.telegram_notification_center.get_notification_thread_snapshot", return_value=SimpleNamespace(event=previous, revision=1)) as lookup,
                       patch.object(confirmations, "publish_confirmation_event", side_effect=publish) as single,
                       patch("app.modules.telegram_confirmation_batch.publish_batch_summary", side_effect=publish) as batch):
                     self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
@@ -324,7 +324,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
                     token, status="completed", result_json=json.dumps(historical),
                 )
                 payload = self.row(token)["payload_json"]
-                with (patch("app.modules.telegram_notification_center.get_notification_thread_event") as lookup,
+                with (patch("app.modules.telegram_notification_center.get_notification_thread_snapshot") as lookup,
                       patch.object(confirmations, "publish_confirmation_event") as single,
                       patch("app.modules.telegram_confirmation_batch.publish_batch_summary") as batch):
                     for refresh in ("Emby 已排队", "Emby 已刷新"):
@@ -436,7 +436,7 @@ class ConfirmationBatchTests(IsolatedDatabaseTestCase):
 
     def test_non_batch_downstream_is_persisted_without_a_telegram_thread(self):
         self.create("no-thread")
-        with patch("app.modules.telegram_notification_center.get_notification_thread_event", return_value=None):
+        with patch("app.modules.telegram_notification_center.get_notification_thread_snapshot", return_value=None):
             self.assertFalse(confirmations.update_confirmation_lifecycle_downstream(
                 "no-thread", strm_status="完成", media_refresh="刷新失败", partial=True, error="媒体库不可用",
             ))

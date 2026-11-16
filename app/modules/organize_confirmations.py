@@ -596,7 +596,7 @@ def update_confirmation_lifecycle_downstream(
     strm_run_id: int | None = None,
 ) -> bool:
     """先保存 STRM/媒体库业务终态，再按通知偏好更新人工确认消息。"""
-    from app.modules.telegram_notification_center import get_notification_thread_event
+    from app.modules.telegram_notification_center import get_notification_thread_snapshot
     from app.modules.telegram_notification_policy import NotificationTopic
 
     row = organize_confirmations_repo.get_organize_confirmation(token)
@@ -614,40 +614,64 @@ def update_confirmation_lifecycle_downstream(
         from app.modules.telegram_confirmation_batch import publish_batch_summary
         return publish_batch_summary(batch_id, chat_id=chat_id)
     thread_key = f"confirmation:{(token or '').strip()}"
-    previous = get_notification_thread_event(
-        thread_key, topic=NotificationTopic.CONFIRMATION, chat_id=chat_id,
-    )
-    if previous is None:
-        return False
-    fields = list(previous.fields)
-    updates = (
-        (("STRM 状态", "STRM"), "STRM 状态", _terminal_status_label(strm_status)),
-        (("媒体库刷新", "媒体库"), "媒体库刷新", _terminal_status_label(
-            media_refresh, media_library=True,
-        )),
-    )
-    for aliases, label, value in updates:
-        replaced = False
-        for index, (current_label, _current_value) in enumerate(fields):
-            if str(current_label) in aliases:
-                fields[index] = (label, value)
-                replaced = True
-                break
-        if not replaced:
-            fields.append((label, value))
-    row = organize_confirmations_repo.get_organize_confirmation(token)
-    keep_actions = (row is not None and str(row["status"] or "") == "pending")
-    title = "⚠️ 人工确认整理链路部分完成" if partial or error else previous.title
-    footer = str(error or previous.footer)[:300]
-    event = NotificationEvent(
-        title, fields=tuple(fields), lines=previous.lines, footer=footer,
-        actions=previous.actions if keep_actions else (),
-        layout=previous.layout, field_emojis=previous.field_emojis,
-    )
-    return publish_confirmation_event(
-        event, chat_id=chat_id, token=token, terminal=True,
-        error=bool(partial or error),
-    )
+    for _ in range(3):
+        snapshot = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.CONFIRMATION, chat_id=chat_id,
+        )
+        if snapshot is None:
+            return False
+        row = organize_confirmations_repo.get_organize_confirmation(token)
+        if row is None:
+            return False
+        result = decode_json_object(row["result_json"])
+        current_run_id = safe_int(result.get("_downstream_run_id"), 0, minimum=0)
+        if strm_run_id is not None and strm_run_id < current_run_id:
+            return False
+        # 业务落盘与通知发布之间可能有新回执；冲突后只重读，不重写旧请求。
+        downstream = result.get("_downstream") or {}
+        strm_status, media_refresh = str(downstream.get("strm") or ""), str(downstream.get("media_refresh") or "")
+        partial, error = bool(downstream.get("partial")), str(downstream.get("error") or "")
+        previous = snapshot.event
+        fields = list(previous.fields)
+        updates = (
+            (("STRM 状态", "STRM"), "STRM 状态", _terminal_status_label(strm_status)),
+            (("媒体库刷新", "媒体库"), "媒体库刷新", _terminal_status_label(
+                media_refresh, media_library=True,
+            )),
+        )
+        for aliases, label, value in updates:
+            replaced = False
+            for index, (current_label, _current_value) in enumerate(fields):
+                if str(current_label) in aliases:
+                    fields[index] = (label, value)
+                    replaced = True
+                    break
+            if not replaced:
+                fields.append((label, value))
+        keep_actions = str(row["status"] or "") == "pending"
+        parent = previous.lifecycle.get("confirmation_downstream") or {
+            "title": str(previous.title), "footer": str(previous.footer),
+        }
+        title = "⚠️ 人工确认整理链路部分完成" if partial or error else parent["title"]
+        footer = str(error or parent["footer"])[:300]
+        event = NotificationEvent(
+            title, fields=tuple(fields), lines=previous.lines, footer=footer,
+            actions=previous.actions if keep_actions else (),
+            layout=previous.layout, field_emojis=previous.field_emojis,
+            lifecycle={**previous.lifecycle, "confirmation_downstream": {**parent, "run_id": current_run_id}},
+        )
+        published = publish_confirmation_event(
+            event, chat_id=chat_id, token=token, terminal=True,
+            error=bool(partial or error), expected_revision=snapshot.revision,
+        )
+        if published:
+            return True
+        latest = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.CONFIRMATION, chat_id=chat_id,
+        )
+        if latest is None or latest.revision == snapshot.revision:
+            return False
+    return False
 
 
 def create_confirmation_actions(
