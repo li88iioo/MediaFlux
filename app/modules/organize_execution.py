@@ -648,6 +648,8 @@ def execute_organize_plans(
             moved_companions.add(companion_key)
             stats["moved"] += 1
             directory_stats[p.original_path or "/"]["moved"] += 1
+            if p.identity_guard_required and p.media_root_path:
+                runtime.remember_root_identity(p.media_root_path, organizer._plan_identity(p))
             parsed = organizer._parse_media_fields(p.original_name)
             position_season, position_episode = resolved_plan_position(p, parsed)
             season_inventory = None

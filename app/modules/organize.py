@@ -2356,6 +2356,7 @@ class Organizer:
             self._preview_conflicts_with_inventory(
                 plans, rules, target_inventory_loader,
                 identity_history_loader=identity_history_loader,
+                preview_runtime=context.task_runtime if context.dry_run else None,
             )
         stats["conflict_check_elapsed_seconds"] = round(
             time.monotonic() - conflict_started, 3
@@ -7014,16 +7015,23 @@ class Organizer:
 
     @staticmethod
     def _directory_identity_key(provider: str, external_id: str, *number_sources: str) -> str:
-        """仅目录守卫按可信番号合并跨源身份；缺少番号时保留精确来源。"""
+        """仅目录守卫按明确单番号合并跨源身份；缺失或歧义时保留精确来源。"""
         if not provider or not external_id:
             return ""
         if provider in {"metatube", "clean_title"}:
-            from app.modules.nsfw import extract_nsfw_identifier
+            from app.modules.nsfw import clean_nsfw_release_text, extract_nsfw_identifier
             for source in number_sources:
                 # 只接受前导归档 token，不能把剧情中引用的其他番号当身份。
                 head = re.split(r"[^A-Za-z0-9._-]", source.strip(), maxsplit=1)[0]
                 identifier = extract_nsfw_identifier(head)
                 if identifier is not None and head.upper().startswith(identifier.matched_text.upper()):
+                    # 展示标题/文件名可能并列多个番号，不能把前导番号误当唯一身份。
+                    # metadata.number按调用方顺序先核验；明确单值仍优先于后续展示文字。
+                    remaining = clean_nsfw_release_text(source)
+                    while (other := extract_nsfw_identifier(remaining)) is not None:
+                        if other.code != identifier.code:
+                            return f"{provider}:{external_id}"
+                        remaining = clean_nsfw_release_text(remaining.replace(other.matched_text, " ", 1))
                     return f"nsfw:{identifier.code}"
         return f"{provider}:{external_id}"
 
@@ -7132,21 +7140,25 @@ class Organizer:
         identity_history_loader: Callable[
             [OrganizePlan], set[tuple[str, str]]
         ] | None = None,
+        preview_runtime: OrganizeTaskRuntime | None = None,
     ) -> None:
         """使用来源适配器提供的只读目标库存执行统一冲突仲裁。"""
         self._apply_identity_guards(
             plans, identity_history_loader=identity_history_loader,
         )
         inventory_cache: dict[
-            str, tuple[str | None, list[GuangYaFile], dict[str, str]]
-        ] = {}
+            tuple[str, str], tuple[str | None, list[GuangYaFile], dict[str, str]]
+        ] = preview_runtime.preview_inventories if preview_runtime is not None else {}
+        # 只撤销同一来源尚未提交的虚拟计划。跨来源前序赢家已提交，后来者只能替换。
         batch_plans_by_file_id: dict[str, OrganizePlan] = {}
-        identity_indexes: dict[str, _ConflictIdentityIndex] = {}
+        identity_indexes: dict[tuple[str, str], _ConflictIdentityIndex] = (
+            preview_runtime.preview_identity_indexes if preview_runtime is not None else {}
+        )
         for plan in plans:
             if plan.action != "move":
                 continue
             try:
-                inventory_key = (plan.target_path or "")
+                inventory_key = OrganizeTaskRuntime.target_path_key(rules.target_dir_id, plan.target_path)
                 cached_inventory = inventory_cache.get(inventory_key)
                 if cached_inventory is None:
                     target_id, loaded_files, loaded_evidence = inventory_loader(plan)
@@ -7256,6 +7268,12 @@ class Organizer:
                 plan.conflict_note = "目标版本扫描失败，禁止替换"
                 plan.note = plan.conflict_note
 
+        if preview_runtime is not None:
+            # 只把最终可归档计划视作前序来源的成功提交；落选或阻止的身份不占目录。
+            for plan in plans:
+                if plan.action == "move" and plan.identity_guard_required and plan.media_root_path:
+                    preview_runtime.remember_root_identity(plan.media_root_path, self._plan_identity(plan))
+
     def _preview_conflicts(self, plans: list[OrganizePlan], rules: OrganizeRules) -> None:
         """按计划涉及的光鸭目标目录做有界只读检查。"""
         directory_cache: dict[
@@ -7287,11 +7305,11 @@ class Organizer:
             return result
 
         self._preview_conflicts_with_inventory(plans, rules, load_inventory)
+        from app.modules.organize_postprocess import duplicate_cleanup_preview_notes
+
         for plan in plans:
-            if rules.recycle_duplicates_enabled and plan.action == "skip" and plan.conflict_decision in {"skip", "batch_superseded"}:
-                note = "正式执行核实保留版本后，自动回收来源新文件及其专属伴随文件"
-                plan.note = f"{plan.note}；{note}" if plan.note else note
-                plan.conflict_note = f"{plan.conflict_note}；{note}" if plan.conflict_note else note
+            for key, value in duplicate_cleanup_preview_notes(plan, rules).items():
+                setattr(plan, key, value)
 
     def _verify_remote_snapshot(self, expected: GuangYaFile, *, role: str) -> GuangYaFile:
         """在第一次写操作前复核远端对象，拒绝使用过期扫描快照。"""

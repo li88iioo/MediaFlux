@@ -642,6 +642,131 @@ class _VersionedTvVariantTreeClient(_TvVariantTreeClient):
 
 
 class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
+    def test_multi_source_nsfw_identity_tracks_only_successful_archives(self):
+        from app.modules import organize_service
+        from app.modules.nsfw import MetaTubeMetadata
+
+        for second_number, fail_first in (("IDPC-002", False), ("IDPC-001", False), ("IDPC-002", True)):
+            with self.subTest(second_number=second_number, fail_first=fail_first), isolated_test_database():
+                first = GuangYaFile("first", "IDPC-001.mkv", False, 1000, "first", "source")
+                second = GuangYaFile("second", f"{second_number}.mp4", False, 900, "second", "source2")
+                client = _VariantTreeClient(first, second)
+                client.tree["movie"] = []
+                second.parent_id = "source2"
+                client.tree["source2"] = [second]
+                roots = {key: GuangYaFile(key, key, True, parent_id="0") for key in ("source", "source2", "target")}
+                original_info = client.file_info
+                sources = [{"id": "source", "name": "A"}, {"id": "source2", "name": "B"}]
+                rules = self._rules(nsfw_enabled=True, nsfw_source_ids='["source","source2"]',
+                                    nsfw_metatube_endpoint="http://audit.invalid", nsfw_category_name="NSFW",
+                                    conflict_strategy=1, recycle_duplicates_enabled=True)
+
+                def metadata(_client, number):
+                    # 合法元数据可在同一展示标题中引用多个番号，真实身份仍由number确定。
+                    title = "IDPC-001 IDPC-002 合集"
+                    return [MetaTubeMetadata(provider="JavBus", external_id=number, number=number, title=title,
+                                             raw={"provider": "JavBus", "id": number, "number": number, "title": title})]
+
+                with (patch.object(client, "file_info", side_effect=lambda key: roots.get(key) or original_info(key)),
+                      patch("app.modules.nsfw.MetaTubeClient.search_exact", autospec=True, side_effect=metadata),
+                      patch("app.modules.media_probe.probe_media_profiles_batch", return_value={})):
+                    before = db.latest_organize_log_id()
+                    preview = organize_service.preview_sources(sources, rules, client=cast(GuangYaClient, client))
+                    self.assertEqual((client.moves, client.renames, client.deleted), ([], [], []))
+                    self.assertEqual(db.latest_organize_log_id(), before)
+                    rows = preview["plans"]
+                    self.assertEqual(rows[0]["action"], "move")
+                    self.assertEqual(rows[0]["target_path"], rows[1]["target_path"])
+                    different = second_number != "IDPC-001"
+                    self.assertEqual(rows[1]["conflict_decision"], "identity_blocked" if different else "skip")
+                    self.assertEqual("自动回收" in rows[1]["note"], not different)
+
+                    original_move = client.move
+
+                    def move(file_ids, parent_id):
+                        if fail_first and file_ids == ["first"] and parent_id != "source":
+                            raise RuntimeError("首来源移动失败")
+                        return original_move(file_ids, parent_id)
+
+                    runtime = OrganizeTaskRuntime()
+                    outcomes = []
+                    with patch.object(client, "move", side_effect=move):
+                        for source in sources:
+                            organizer = Organizer(client=cast(GuangYaClient, client))
+                            try:
+                                plans, stats = organizer.organize(source["id"], rules.for_source(source["id"]),
+                                    dry_run=False, post_actions=False, task_runtime=runtime)
+                                outcomes.append((plans, stats))
+                            finally:
+                                organizer.close()
+                    later_plans, later_stats = outcomes[1]
+                    if fail_first:
+                        self.assertEqual(outcomes[0][1]["moved"], 0)
+                        self.assertEqual(later_stats["moved"], 1)
+                        self.assertEqual(later_plans[0].action, "move")
+                    else:
+                        self.assertEqual(outcomes[0][1]["moved"], 1)
+                        self.assertEqual(later_plans[0].conflict_decision, rows[1]["conflict_decision"])
+                        self.assertEqual(later_stats["moved"], 0)
+                    self.assertEqual(client.deleted, [] if different else ["second"])
+                    if different and not fail_first:
+                        self.assertEqual(client._find("second")[0], "source2")
+                    if fail_first:
+                        # 002已归档后销毁本轮运行态。新任务只能依靠持久历史识别，不能猜标题首个001。
+                        del runtime
+                        later = GuangYaFile("third", "IDPC-002.mp4", False, 900, "third", "source2")
+                        client.tree["source2"] = [later]
+                        cold_sources = list(reversed(sources))
+                        cold_preview = organize_service.preview_sources(cold_sources, rules, client=cast(GuangYaClient, client))
+                        self.assertEqual([p["conflict_decision"] for p in cold_preview["plans"]], ["skip", "identity_blocked"])
+                        cold_runtime = OrganizeTaskRuntime()
+                        cold_plans = []
+                        for source in cold_sources:
+                            fresh = Organizer(client=cast(GuangYaClient, client))
+                            try:
+                                plans, _stats = fresh.organize(source["id"], rules.for_source(source["id"]),
+                                    dry_run=False, post_actions=False, task_runtime=cold_runtime)
+                                cold_plans.extend(plans)
+                            finally:
+                                fresh.close()
+                        self.assertEqual([p.conflict_decision for p in cold_plans], ["skip", "identity_blocked"])
+                        self.assertEqual(client.deleted, ["third"])
+                        self.assertEqual(client._find("first")[0], "source")
+
+    def test_multi_source_preview_matches_ordered_conflicts_and_recycle_switch(self):
+        from app.modules import organize_service
+
+        for strategy, recycle, second_size, decision in ((1, True, 900, "skip"),
+                                                        (1, False, 900, "skip"),
+                                                        (2, True, 2000, "replace")):
+            with self.subTest(strategy=strategy, recycle=recycle):
+                first = GuangYaFile("first", "Variant.Movie.2026.1080p.mkv", False, 1000, "first", "source")
+                second = GuangYaFile("second", "Variant.Movie.2026.1080p.mp4", False, second_size, "second", "source2")
+                client = _VariantTreeClient(first, second)
+                client.tree["movie"] = []
+                second.parent_id = "source2"
+                client.tree["source2"] = [second]
+                original_info = client.file_info
+                roots = {key: GuangYaFile(key, key, True, parent_id="0") for key in ("source", "source2", "target")}
+                sources = [{"id": "source", "name": "A"}, {"id": "source2", "name": "B"}]
+                rules = self._rules(conflict_strategy=strategy, recycle_duplicates_enabled=recycle)
+                before = db.latest_organize_log_id()
+                with (patch.object(client, "file_info", side_effect=lambda key: roots.get(key) or original_info(key)),
+                      patch.object(organize_service, "Organizer", side_effect=lambda **kwargs: Organizer(
+                          scraper=cast(TMDBScraper, _VariantScraper()), **kwargs))):
+                    preview = organize_service.preview_sources(sources, rules, client=client)
+                    again = organize_service.preview_sources(sources, rules, client=client)
+                rows = preview["plans"]
+                # 来源A在来源B执行前已经提交，后来者胜出应显示替换，不能倒改A为未移动。
+                self.assertEqual(rows[0]["action"], "move")
+                self.assertEqual(rows[1]["conflict_decision"], decision)
+                self.assertEqual(rows[1]["action"], "skip" if decision == "skip" else "move")
+                self.assertEqual("自动回收" in rows[1]["note"], recycle and decision == "skip")
+                self.assertEqual(preview["stats"]["matched"], 1 if decision == "skip" else 2)
+                self.assertEqual(preview["plans"], again["plans"])
+                self.assertEqual((client.moves, client.renames, client.deleted), ([], [], []))
+                self.assertEqual(db.latest_organize_log_id(), before)
+
     def test_yearless_movie_parts_use_original_title_or_remain_manual(self):
         for metadata, should_move in (({"original_title": "A Movie"}, True), ({"aliases": ["A Movie"]}, True), ({}, False)):
             with self.subTest(metadata=metadata):

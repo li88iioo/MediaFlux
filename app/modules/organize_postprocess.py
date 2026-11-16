@@ -14,6 +14,16 @@ from app.modules.media_identity import normalize_media_number as normalize_media
 SUBTITLE_EXTS = frozenset({"srt", "ass", "ssa", "sup", "vtt", "sub", "idx"})
 
 
+def duplicate_cleanup_preview_notes(plan, rules) -> dict[str, str]:
+    """把已开启的落选回收意图展示在预览，不执行回收或改变冲突判定。"""
+    if not (rules.recycle_duplicates_enabled and plan.action == "skip"
+            and plan.conflict_decision in {"skip", "batch_superseded"}):
+        return {}
+    note = "正式执行核实保留版本后，自动回收来源新文件及其专属伴随文件"
+    return {key: f"{getattr(plan, key)}；{note}" if getattr(plan, key) else note
+            for key in ("note", "conflict_note")}
+
+
 def normalized_stem(name: str) -> str:
     stem = name.rsplit(".", 1)[0].lower()
     stem = re.sub(

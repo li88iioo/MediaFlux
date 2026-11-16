@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from app.agent.errors import AgentToolError
 from app.modules.organize import Organizer, OrganizeRules
@@ -407,6 +407,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             post_actions=False,
             protected_source_ids={"secret-source-id"},
             protected_staging_ids=set(),
+            task_runtime=ANY,
         )
         manager.start.assert_not_called()
         serialized = str(result)

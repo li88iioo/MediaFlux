@@ -12,6 +12,8 @@ from app.repositories import download_requests as download_requests_repo
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot
+from app.modules.organize_runtime import OrganizeTaskRuntime
+from app.modules.organize_postprocess import duplicate_cleanup_preview_notes
 from app.modules.organize_sources import (
     configured_organize_sources,
     normalize_organize_source_ids,
@@ -87,6 +89,7 @@ def preview_sources(sources, rules, *, max_files=100, client=None) -> dict:
     remaining = max_files
     protected_staging_ids = download_requests_repo.list_protected_guangya_staging_ids()
     protected = _protected_source_ids(sources, staging_ids=protected_staging_ids)
+    preview_runtime = OrganizeTaskRuntime()
     for source in sources:
         if remaining <= 0:
             break
@@ -104,6 +107,7 @@ def preview_sources(sources, rules, *, max_files=100, client=None) -> dict:
                 post_actions=False,
                 protected_source_ids=protected,
                 protected_staging_ids=protected_staging_ids,
+                task_runtime=preview_runtime,
             )
         finally:
             organizer.close()
@@ -144,6 +148,7 @@ def preview_sources(sources, rules, *, max_files=100, client=None) -> dict:
                     "year": plan.match.year if plan.match else "",
                     "tmdb_id": plan.match.tmdb_id if plan.match else "",
                     "confidence": plan.match.confidence if plan.match else 0,
+                    **duplicate_cleanup_preview_notes(plan, source_rules),
                 }
             )
     return {

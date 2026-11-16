@@ -37,6 +37,9 @@ class OrganizeTaskRuntime:
         self.directory_chain_cache: dict[tuple[str, str], str] = {}
         self.target_episode_inventory_cache: dict[tuple[str, int], list[int]] = {}
         self.identity_history_cache: dict[str, set[tuple[str, str]]] = {}
+        # 顺序预演保留前序来源的虚拟提交；正式写入仍回读真实库存，不消费这些副本。
+        self.preview_inventories: dict[tuple[str, str], tuple[str | None, list[Any], dict[str, str]]] = {}
+        self.preview_identity_indexes: dict[tuple[str, str], Any] = {}
 
         self._recognition_condition = threading.Condition(threading.RLock())
         self._recognition_results: dict[Hashable, Any] = {}
@@ -45,6 +48,11 @@ class OrganizeTaskRuntime:
     @staticmethod
     def target_path_key(root_id: str, target_path: str) -> tuple[str, str]:
         return (root_id or ""), (target_path or "").strip("/")
+
+    def remember_root_identity(self, media_root_path: str, identity: tuple[str, str]) -> None:
+        """身份守卫已载入历史；归档成功后补入当前任务的新身份。"""
+        with self.inventory_lock:
+            self.identity_history_cache.setdefault(media_root_path.strip("/"), set()).add(identity)
 
     def remember_target_path(
         self, root_id: str, target_path: str, target_id: str | None,
